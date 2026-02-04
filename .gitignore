@@ -1,14 +1,20 @@
+__pycache__/
+
 debug/
 target/
 vendor/
 out/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
 *.py
 
 *.ply
+*.obj
+*.glb
+*.gltf
+*.fbx
+*.stl
 *.gcloud
 
 .DS_Store
@@ -19,7 +25,26 @@ headless_output/
 www/assets/
 
 assets/images/
-assets/models/
-assets/pca/
+**/assets/models/
+**/assets/pca/
+**/assets/weights/
+**/pretrained_weights/
+*.safetensors
+*.bpk
+*.bin
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pb
+*.tflite
+*.weights
+*.engine
+*.gguf
+*.ggml
 output/
 sandbox/

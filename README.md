@@ -6,22 +6,35 @@
 
 3d synthesis implemented in burn, view the [live demo](https://mosure.github.io/burn_3d_synth/)
 
+## example
+
+| Input | Output |
+| --- | --- |
+| ![Input chair](docs/output_chair_bg_removed.png) | ![Output chair (rendered mesh)](docs/output_chair_render.png) |
+
 
 ## features
 
+- [x] image to 3d
+- [x] text to 3d
+- [ ] web demo
 - [ ] text to image
-- [ ] image to 3d
-- [ ] text to 3d
 - [ ] image to composite-3d
 - [ ] many-3d to composite-3d
-- [ ] wasm bindings
 
 
 ## setup
 
-- `python tool/download.py`
-- ensure models are downloaded to `assets/models/*`
-- run import tooling `cargo run --bin import`
+- download TripoSG + RMBG weights (or set `TRIPOSG_WEIGHTS_ROOT` / `RMBG_WEIGHTS_ROOT`)
+- run the burnpack import tool `cargo run -p burn_3d_synth_tripo --bin triposg_import --features import`
+- run the bevy app with the burnpack weights
+
+
+## model import
+
+```
+cargo run -p burn_3d_synth_tripo --bin triposg_import --features import
+```
 
 
 ## references
