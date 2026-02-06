@@ -14,6 +14,7 @@ cuda = ["burn-cuda"]
 [dependencies]
 bevy = "0.17"
 bevy_panorbit_camera = "0.33.0"
+bevy_infinite_grid = "0.17"
 bevy_asset = "0.17"
 bevy_mesh = "0.17"
 bytemuck = "1.25"
@@ -23,7 +24,7 @@ burn_3d_synth_tripo = { path = "../burn_3d_synth_tripo", features = ["import"] }
 burn_3d_synth_bg_removal = { path = "../burn_3d_synth_bg_removal", features = ["import"] }
 burn-wgpu = { version = "0.19", optional = true }
 burn-cuda = { version = "0.19", optional = true }
-futures-lite = "2.6"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 safetensors = "0.6"
+meshopt = "0.6.2"

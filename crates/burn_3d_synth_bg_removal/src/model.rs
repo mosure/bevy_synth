@@ -1,6 +1,6 @@
-use burn::prelude::*;
-use burn::nn::{self, PaddingConfig2d};
 use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::{self, PaddingConfig2d};
+use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
 use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
@@ -15,7 +15,10 @@ pub struct RmbgConfig {
 
 impl RmbgConfig {
     pub fn rmbg_1_4() -> Self {
-        Self { in_ch: 3, out_ch: 1 }
+        Self {
+            in_ch: 3,
+            out_ch: 1,
+        }
     }
 
     #[cfg(feature = "import")]
@@ -46,7 +49,13 @@ pub struct RebnConv<B: Backend> {
 }
 
 impl<B: Backend> RebnConv<B> {
-    pub fn new(device: &B::Device, in_ch: usize, out_ch: usize, dirate: usize, stride: usize) -> Self {
+    pub fn new(
+        device: &B::Device,
+        in_ch: usize,
+        out_ch: usize,
+        dirate: usize,
+        stride: usize,
+    ) -> Self {
         let conv = Conv2dConfig::new([in_ch, out_ch], [3, 3])
             .with_stride([stride, stride])
             .with_dilation([dirate, dirate])
@@ -54,7 +63,11 @@ impl<B: Backend> RebnConv<B> {
             .init(device);
         let bn = nn::BatchNormConfig::new(out_ch).init(device);
         let relu = nn::Relu::new();
-        Self { conv_s1: conv, bn_s1: bn, relu_s1: relu }
+        Self {
+            conv_s1: conv,
+            bn_s1: bn,
+            relu_s1: relu,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
@@ -432,15 +445,25 @@ impl<B: Backend> BriaRmbg<B> {
         let hx6 = self.stage6.forward(hx);
         let hx6up = upsample_like(hx6.clone(), &hx5);
 
-        let hx5d = self.stage5d.forward(Tensor::cat(vec![hx6up, hx5.clone()], 1));
+        let hx5d = self
+            .stage5d
+            .forward(Tensor::cat(vec![hx6up, hx5.clone()], 1));
         let hx5dup = upsample_like(hx5d.clone(), &hx4);
-        let hx4d = self.stage4d.forward(Tensor::cat(vec![hx5dup, hx4.clone()], 1));
+        let hx4d = self
+            .stage4d
+            .forward(Tensor::cat(vec![hx5dup, hx4.clone()], 1));
         let hx4dup = upsample_like(hx4d.clone(), &hx3);
-        let hx3d = self.stage3d.forward(Tensor::cat(vec![hx4dup, hx3.clone()], 1));
+        let hx3d = self
+            .stage3d
+            .forward(Tensor::cat(vec![hx4dup, hx3.clone()], 1));
         let hx3dup = upsample_like(hx3d.clone(), &hx2);
-        let hx2d = self.stage2d.forward(Tensor::cat(vec![hx3dup, hx2.clone()], 1));
+        let hx2d = self
+            .stage2d
+            .forward(Tensor::cat(vec![hx3dup, hx2.clone()], 1));
         let hx2dup = upsample_like(hx2d.clone(), &hx1);
-        let hx1d = self.stage1d.forward(Tensor::cat(vec![hx2dup, hx1.clone()], 1));
+        let hx1d = self
+            .stage1d
+            .forward(Tensor::cat(vec![hx2dup, hx1.clone()], 1));
 
         let d1 = upsample_to(self.side1.forward(hx1d.clone()), &x);
         let d2 = upsample_to(self.side2.forward(hx2d.clone()), &x);
@@ -546,11 +569,7 @@ pub mod import {
 
     use burn::prelude::*;
     use burn_store::{
-        BurnpackStore,
-        KeyRemapper,
-        ModuleSnapshot,
-        PyTorchToBurnAdapter,
-        SafetensorsStore,
+        BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
 
     use super::{BriaRmbg, RmbgConfig};
@@ -578,7 +597,9 @@ pub mod import {
         Ok(model)
     }
 
-    pub fn load_rmbg_config(root: impl AsRef<Path>) -> Result<RmbgConfig, Box<dyn std::error::Error>> {
+    pub fn load_rmbg_config(
+        root: impl AsRef<Path>,
+    ) -> Result<RmbgConfig, Box<dyn std::error::Error>> {
         let path = root.as_ref().join("config.json");
         if path.exists() {
             return RmbgConfig::from_config_file(path);
@@ -609,7 +630,9 @@ pub mod import {
         }
         let bytes = fs::read(path)?;
         let config: super::super::preprocess::RmbgProcessorConfig = serde_json::from_slice(&bytes)?;
-        Ok(super::super::preprocess::RmbgImageProcessor::from_config(config))
+        Ok(super::super::preprocess::RmbgImageProcessor::from_config(
+            config,
+        ))
     }
 
     fn build_store(path: &Path) -> Result<SafetensorsStore, Box<dyn std::error::Error>> {

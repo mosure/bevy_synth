@@ -1,10 +1,4 @@
-use burn::{
-    module::Param,
-    nn,
-    prelude::*,
-    tensor::activation::softmax,
-    tensor::Distribution,
-};
+use burn::{module::Param, nn, prelude::*, tensor::Distribution, tensor::activation::softmax};
 
 use super::hooks::HookRecorder;
 
@@ -30,7 +24,11 @@ impl FrequencyPositionalEmbedding {
     }
 
     pub fn forward<B: Backend>(&self, coords: Tensor<B, 3>) -> Tensor<B, 3> {
-        let scale_pi = if self.include_pi { core::f32::consts::PI } else { 1.0 };
+        let scale_pi = if self.include_pi {
+            core::f32::consts::PI
+        } else {
+            1.0
+        };
         let device = coords.device();
         let mut freq_values = Vec::with_capacity(self.num_freq);
         for freq in 0..self.num_freq {
@@ -95,23 +93,22 @@ impl<B: Backend> CrossAttention<B> {
         num_heads: usize,
         use_norm_cross: bool,
         qk_norm: bool,
+        qkv_bias: bool,
         use_triposg_split: bool,
         is_cross_attention: bool,
     ) -> Self {
         let head_dim = dim / num_heads;
         let scale = (head_dim as f32).powf(-0.5);
         let to_q = nn::LinearConfig::new(dim, dim)
-            .with_bias(false)
+            .with_bias(qkv_bias)
             .init(device);
         let to_k = nn::LinearConfig::new(context_dim, dim)
-            .with_bias(false)
+            .with_bias(qkv_bias)
             .init(device);
         let to_v = nn::LinearConfig::new(context_dim, dim)
-            .with_bias(false)
+            .with_bias(qkv_bias)
             .init(device);
-        let to_out = nn::LinearConfig::new(dim, dim)
-            .with_bias(true)
-            .init(device);
+        let to_out = nn::LinearConfig::new(dim, dim).with_bias(true).init(device);
 
         let norm_cross = if use_norm_cross {
             nn::LayerNormConfig::new(context_dim).init(device).into()
@@ -177,8 +174,8 @@ impl<B: Backend> CrossAttention<B> {
                 let q = q
                     .reshape([b, n, self.num_heads, self.head_dim])
                     .permute([0, 2, 1, 3]);
-                let kv = Tensor::cat(vec![k, v], 2)
-                    .reshape([b, m, self.num_heads, self.head_dim * 2]);
+                let kv =
+                    Tensor::cat(vec![k, v], 2).reshape([b, m, self.num_heads, self.head_dim * 2]);
                 let k = kv
                     .clone()
                     .slice([0..b, 0..m, 0..self.num_heads, 0..self.head_dim])
@@ -193,8 +190,12 @@ impl<B: Backend> CrossAttention<B> {
                     .permute([0, 2, 1, 3]);
                 (q, k, v)
             } else {
-                let qkv = Tensor::cat(vec![q, k, v], 2)
-                    .reshape([b, n, self.num_heads, self.head_dim * 3]);
+                let qkv = Tensor::cat(vec![q, k, v], 2).reshape([
+                    b,
+                    n,
+                    self.num_heads,
+                    self.head_dim * 3,
+                ]);
                 let q = qkv
                     .clone()
                     .slice([0..b, 0..n, 0..self.num_heads, 0..self.head_dim])
@@ -246,10 +247,7 @@ impl<B: Backend> CrossAttention<B> {
         let attn = softmax(attn, 3);
         record_tensor(&mut hook, &format!("{hook_prefix}.attn"), &attn);
 
-        let out = attn
-            .matmul(v)
-            .permute([0, 2, 1, 3])
-            .reshape([b, n, c]);
+        let out = attn.matmul(v).permute([0, 2, 1, 3]).reshape([b, n, c]);
         let out = self.to_out.forward(out);
         record_tensor(&mut hook, &format!("{hook_prefix}.out"), &out);
         out
@@ -312,11 +310,8 @@ impl<B: Backend> DiagonalGaussianDistribution<B> {
 
     pub fn sample(&self) -> Tensor<B, 3> {
         let std = self.logvar.clone().mul_scalar(0.5).exp();
-        let noise = Tensor::<B, 3>::random(
-            std.shape(),
-            Distribution::Normal(0.0, 1.0),
-            &std.device(),
-        );
+        let noise =
+            Tensor::<B, 3>::random(std.shape(), Distribution::Normal(0.0, 1.0), &std.device());
         self.mean.clone() + std * noise
     }
 

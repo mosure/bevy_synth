@@ -6,11 +6,7 @@ use std::path::{Path, PathBuf};
 
 use safetensors::tensor::{SafeTensors, TensorView};
 
-use burn_3d_synth_bg_removal::pipeline::{
-    prepare_image_data,
-    PrepareImageConfig,
-    RmbgPipeline,
-};
+use burn_3d_synth_bg_removal::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_data};
 
 const RMBG_ROOT: &str = r"E:\repos\TripoSG\pretrained_weights\RMBG-1.4";
 const INPUT_IMAGE: &str = r"F:\repos\TRELLIS\assets\nano_banana\chair\chair_0.jpg";
@@ -61,16 +57,8 @@ fn rmbg_preprocess_matches_reference() -> Result<(), Box<dyn std::error::Error>>
         let weights_path = Path::new(RMBG_ROOT).join("model.safetensors");
         if weights_path.exists() {
             let weights = HookReference::load(weights_path.as_path())?;
-            debug_compare_weight(
-                "conv_in.weight",
-                &rmbg.model.conv_in.weight.val(),
-                &weights,
-            );
-            debug_compare_weight(
-                "side1.weight",
-                &rmbg.model.side1.weight.val(),
-                &weights,
-            );
+            debug_compare_weight("conv_in.weight", &rmbg.model.conv_in.weight.val(), &weights);
+            debug_compare_weight("side1.weight", &rmbg.model.side1.weight.val(), &weights);
         }
     }
     let prepared = prepare_image_data::<burn::backend::NdArray<f32>>(
@@ -83,11 +71,7 @@ fn rmbg_preprocess_matches_reference() -> Result<(), Box<dyn std::error::Error>>
     if debug {
         eprintln!("prepared bbox: {:?}", prepared.bbox);
         if alpha_ref.shape.len() == 2 {
-            let ref_bbox = bbox_from_mask(
-                &alpha_ref.data,
-                alpha_ref.shape[1],
-                alpha_ref.shape[0],
-            );
+            let ref_bbox = bbox_from_mask(&alpha_ref.data, alpha_ref.shape[1], alpha_ref.shape[0]);
             eprintln!("reference bbox: {:?}", ref_bbox);
             if let Some([x, y, w, h]) = ref_bbox {
                 let width = alpha_ref.shape[1];
@@ -122,7 +106,10 @@ fn rmbg_preprocess_matches_reference() -> Result<(), Box<dyn std::error::Error>>
                 );
             }
         } else {
-            eprintln!("reference bbox: unexpected alpha shape {:?}", alpha_ref.shape);
+            eprintln!(
+                "reference bbox: unexpected alpha shape {:?}",
+                alpha_ref.shape
+            );
         }
         if let Some(alpha_mask) = prepared.alpha_mask.as_ref() {
             let alpha_stats = compute_stats(alpha_mask, &alpha_ref.data);

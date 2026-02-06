@@ -1,18 +1,18 @@
-use burn::{
-    prelude::*,
-    tensor::Distribution,
-};
+use burn::{prelude::*, tensor::Distribution};
 
+#[cfg(feature = "import")]
+use crate::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
 use crate::model::triposg::{
     dit::TripoSGDiT,
     image_encoder::{DinoImageProcessor, TripoSGImageEncoder},
     scheduler::RectifiedFlowScheduler,
     vae::TripoSGVae,
 };
-#[cfg(feature = "import")]
-use crate::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
-use crate::pipeline::geometry::{hierarchical_extract_geometry, HierarchicalExtractConfig};
-use crate::pipeline::mesh::{grid_to_mesh, DenseGrid, Mesh};
+use crate::pipeline::geometry::{
+    FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
+    hierarchical_extract_geometry,
+};
+use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 use crate::pipeline::triposg::TripoSGPipelineOutput;
 
 #[derive(Debug)]
@@ -128,13 +128,8 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             .expect("failed to set timesteps");
 
         let num_channels = self.transformer.config().in_channels;
-        let mut latents = self.prepare_latents(
-            batch_size,
-            num_tokens,
-            num_channels,
-            &device,
-            latents,
-        );
+        let mut latents =
+            self.prepare_latents(batch_size, num_tokens, num_channels, &device, latents);
 
         let timesteps = self.scheduler.timesteps().to_vec();
         for &t in timesteps.iter() {
@@ -157,13 +152,14 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
 
             if do_guidance {
                 let half = batch_size;
-                let noise_uncond = noise_pred
-                    .clone()
-                    .slice([0..half, 0..num_tokens, 0..num_channels]);
-                let noise_cond = noise_pred
-                    .slice([half..(half * 2), 0..num_tokens, 0..num_channels]);
-                noise_pred = noise_uncond.clone()
-                    + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+                let noise_uncond =
+                    noise_pred
+                        .clone()
+                        .slice([0..half, 0..num_tokens, 0..num_channels]);
+                let noise_cond =
+                    noise_pred.slice([half..(half * 2), 0..num_tokens, 0..num_channels]);
+                noise_pred =
+                    noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
             }
 
             latents = self.scheduler.step(noise_pred, t, latents);
@@ -266,6 +262,35 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             mesh,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_mesh_flash(
+        &mut self,
+        image: Tensor<B, 4>,
+        text_embeds: Tensor<B, 3>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        config: &FlashExtractConfig,
+        latents: Option<Tensor<B, 3>>,
+    ) -> Result<TripoSGScribbleMeshOutput<B>, Box<dyn std::error::Error>> {
+        let output = self.sample(
+            image,
+            text_embeds,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            latents,
+        );
+        let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let mesh = sdf_to_mesh_diff_dmc(&grid);
+        Ok(TripoSGScribbleMeshOutput {
+            latents: output.latents,
+            grid,
+            mesh,
+        })
+    }
 }
 
 #[cfg(feature = "import")]
@@ -276,8 +301,7 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         use crate::model::triposg::dit::import::load_triposg_dit;
         use crate::model::triposg::image_encoder::import::{
-            load_dinov2_processor,
-            load_triposg_dinov2,
+            load_dinov2_processor, load_triposg_dinov2,
         };
         use crate::model::triposg::vae::import::load_triposg_vae;
 
@@ -288,23 +312,21 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
         let dino_path = root.join("image_encoder_dinov2/model.safetensors");
 
         let vae_config_path = root.join("vae/config.json");
-        let vae_config = crate::model::triposg::vae::TripoSGVaeConfig::from_config_file(
-            vae_config_path,
-        )
-        .unwrap_or_else(|_| crate::model::triposg::vae::TripoSGVaeConfig::midi_3d());
+        let vae_config =
+            crate::model::triposg::vae::TripoSGVaeConfig::from_config_file(vae_config_path)
+                .unwrap_or_else(|_| crate::model::triposg::vae::TripoSGVaeConfig::midi_3d());
         let vae = load_triposg_vae(&vae_config, device, vae_path)?;
 
         let dit_config_path = root.join("transformer/config.json");
-        let dit_config = crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(
-            dit_config_path,
-        )
-        .unwrap_or_else(|_| {
-            if dit_path.exists() {
-                crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained()
-            } else {
-                crate::model::triposg::dit::TripoSGDiTConfig::midi_3d()
-            }
-        });
+        let dit_config =
+            crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(dit_config_path)
+                .unwrap_or_else(|_| {
+                    if dit_path.exists() {
+                        crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained()
+                    } else {
+                        crate::model::triposg::dit::TripoSGDiTConfig::midi_3d()
+                    }
+                });
         let dit = load_triposg_dit(&dit_config, device, dit_path)?;
 
         let scheduler_config = RectifiedFlowSchedulerConfig::from_config_file(scheduler_path)?;

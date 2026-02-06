@@ -37,6 +37,13 @@ pub struct PreparedImageData {
     pub bbox: Option<[usize; 4]>,
 }
 
+impl PreparedImageData {
+    pub fn to_tensor<B: Backend>(&self, device: &B::Device) -> Tensor<B, 4> {
+        let flat = Tensor::<B, 1>::from_floats(self.data.as_slice(), device);
+        flat.reshape([1, 3, self.height as i32, self.width as i32])
+    }
+}
+
 #[derive(Debug)]
 pub struct PrepareImageError(pub String);
 
@@ -71,9 +78,11 @@ impl<B: Backend> RmbgPipeline<B> {
         let device = image.device();
         let processed = self.processor.preprocess(image);
         let output = self.model.forward(processed);
-        output.masks.first().cloned().unwrap_or_else(|| {
-            Tensor::<B, 4>::zeros([1, 1, 1, 1], &device)
-        })
+        output
+            .masks
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Tensor::<B, 4>::zeros([1, 1, 1, 1], &device))
     }
 
     #[cfg(feature = "import")]
@@ -81,11 +90,7 @@ impl<B: Backend> RmbgPipeline<B> {
         weights_root: impl AsRef<Path>,
         device: &B::Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use crate::model::import::{
-            load_rmbg,
-            load_rmbg_config,
-            load_rmbg_processor_config,
-        };
+        use crate::model::import::{load_rmbg, load_rmbg_config, load_rmbg_processor_config};
 
         let root = weights_root.as_ref();
         let config = load_rmbg_config(root)?;
@@ -133,13 +138,7 @@ pub fn prepare_image_data<B: Backend>(
         let pipeline = pipeline.ok_or_else(|| {
             PrepareImageError("RMBG pipeline required for images without alpha".to_string())
         })?;
-        let alpha = infer_alpha_mask(
-            pipeline,
-            &rgb,
-            width,
-            height,
-            config.min_component_size,
-        )?;
+        let alpha = infer_alpha_mask(pipeline, &rgb, width, height, config.min_component_size)?;
         (alpha.alpha_mask, Some(alpha.alpha_probs), Some(alpha.bbox))
     };
 
@@ -154,17 +153,12 @@ pub fn prepare_image_data<B: Backend>(
     let (x, y, w, h) = (bbox[0], bbox[1], bbox[2], bbox[3]);
 
     let cropped = crop_rgb(&rgb_f32, width, height, x, y, w, h)?;
-    let padded = pad_to_square(
-        &cropped,
-        w,
-        h,
-        config.padding_ratio,
-        config.bg_color[0],
-    );
+    let padded = pad_to_square(&cropped, w, h, config.padding_ratio, config.bg_color[0]);
 
     let padded_width = padded.1;
     let padded_height = padded.2;
     let mut output = padded.0;
+
     for value in &mut output {
         *value *= 255.0;
     }
@@ -187,12 +181,7 @@ pub fn prepare_image_tensor<B: Backend>(
 ) -> Result<Tensor<B, 4>, PrepareImageError> {
     let prepared = prepare_image_data(path, pipeline, config)?;
     let flat = Tensor::<B, 1>::from_floats(prepared.data.as_slice(), device);
-    Ok(flat.reshape([
-        1,
-        3,
-        prepared.height as i32,
-        prepared.width as i32,
-    ]))
+    Ok(flat.reshape([1, 3, prepared.height as i32, prepared.width as i32]))
 }
 
 fn load_image_rgb(path: &Path, max_dimension: usize) -> Result<LoadedImage, PrepareImageError> {
@@ -301,10 +290,7 @@ fn infer_alpha_mask<B: Backend>(
         }
     }
 
-    let max_value = resized
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_value = resized.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if max_value < 1e-3 {
         return Err(PrepareImageError(
             "invalid image: pure black image".to_string(),
@@ -332,9 +318,11 @@ fn infer_alpha_mask<B: Backend>(
     ]);
 
     let output = pipeline.model.forward(input);
-    let mask = output.masks.first().cloned().unwrap_or_else(|| {
-        Tensor::<B, 4>::zeros([1, 1, 1, 1], device)
-    });
+    let mask = output
+        .masks
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Tensor::<B, 4>::zeros([1, 1, 1, 1], device));
     let mask_data = mask
         .into_data()
         .convert::<f32>()
@@ -362,7 +350,10 @@ fn infer_alpha_mask<B: Backend>(
         max = max.max(*value);
     }
     let denom = (max - min).max(1e-6);
-    let normalized = data.iter().map(|value| (value - min) / denom).collect::<Vec<f32>>();
+    let normalized = data
+        .iter()
+        .map(|value| (value - min) / denom)
+        .collect::<Vec<f32>>();
 
     let mut alpha_u8 = normalized
         .iter()
@@ -370,8 +361,9 @@ fn infer_alpha_mask<B: Backend>(
         .collect::<Vec<u8>>();
 
     let mut thresh = otsu_threshold(&alpha_u8) as i32;
-    if let Some(bias) =
-        std::env::var("RMBG_OTSU_BIAS").ok().and_then(|v| v.parse::<i32>().ok())
+    if let Some(bias) = std::env::var("RMBG_OTSU_BIAS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
     {
         thresh = (thresh + bias).clamp(0, 255);
     }
@@ -396,13 +388,7 @@ fn infer_alpha_mask<B: Backend>(
     })
 }
 
-fn apply_alpha(
-    rgb: &mut [f32],
-    alpha: &[f32],
-    bg_color: [f32; 3],
-    width: usize,
-    height: usize,
-) {
+fn apply_alpha(rgb: &mut [f32], alpha: &[f32], bg_color: [f32; 3], width: usize, height: usize) {
     let pixels = width * height;
     for (idx, &a) in alpha.iter().enumerate().take(pixels) {
         for (c, &bg) in bg_color.iter().enumerate() {
@@ -515,12 +501,7 @@ fn otsu_threshold(values: &[u8]) -> u8 {
     threshold as u8
 }
 
-fn remove_small_objects(
-    mask: &[u8],
-    width: usize,
-    height: usize,
-    min_size: usize,
-) -> Vec<u8> {
+fn remove_small_objects(mask: &[u8], width: usize, height: usize, min_size: usize) -> Vec<u8> {
     let mut output = mask.to_vec();
     let mut visited = vec![false; mask.len()];
     let mut queue = VecDeque::new();
@@ -628,12 +609,7 @@ fn find_bounding_box(mask: &[u8], width: usize, height: usize) -> Option<[usize;
 
             if count > best_size {
                 best_size = count;
-                best_bbox = Some([
-                    min_x,
-                    min_y,
-                    max_x - min_x + 1,
-                    max_y - min_y + 1,
-                ]);
+                best_bbox = Some([min_x, min_y, max_x - min_x + 1, max_y - min_y + 1]);
             }
         }
     }

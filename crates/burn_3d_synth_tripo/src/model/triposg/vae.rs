@@ -1,15 +1,8 @@
-use burn::{
-    module::Ignored,
-    nn,
-    prelude::*,
-};
+use burn::{module::Ignored, nn, prelude::*};
 
 use super::{
     components::{
-        DiagonalGaussianDistribution,
-        FeedForward,
-        FrequencyPositionalEmbedding,
-        CrossAttention,
+        CrossAttention, DiagonalGaussianDistribution, FeedForward, FrequencyPositionalEmbedding,
         record_tensor,
     },
     hooks::HookRecorder,
@@ -155,13 +148,7 @@ impl<B: Backend> TripoSGVae<B> {
         features: Tensor<B, 3>,
         hook: Option<&mut HookRecorder>,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        self.encode_with_kv(
-            coords.clone(),
-            features.clone(),
-            coords,
-            features,
-            hook,
-        )
+        self.encode_with_kv(coords.clone(), features.clone(), coords, features, hook)
     }
 
     pub fn encode_with_kv(
@@ -181,28 +168,53 @@ impl<B: Backend> TripoSGVae<B> {
         record_tensor(&mut hook, "encoder.input", &input_q);
         record_tensor(&mut hook, "encoder.input.kv", &input_kv);
 
-        let hidden = self
-            .encoder
-            .forward(input_q, input_kv, hook.as_deref_mut());
+        let hidden = self.encoder.forward(input_q, input_kv, hook.as_deref_mut());
         record_tensor(&mut hook, "encoder.hidden", &hidden);
 
         let stats = self.quant.forward(hidden);
         record_tensor(&mut hook, "encoder.quant", &stats);
 
         let [b, n, _] = stats.shape().dims();
-        let mean = stats
-            .clone()
-            .slice([0..b, 0..n, 0..self.latent_channels]);
-        let logvar = stats.slice([
-            0..b,
-            0..n,
-            self.latent_channels..self.latent_channels * 2,
-        ]);
+        let mean = stats.clone().slice([0..b, 0..n, 0..self.latent_channels]);
+        let logvar = stats.slice([0..b, 0..n, self.latent_channels..self.latent_channels * 2]);
 
         record_tensor(&mut hook, "encoder.mean", &mean);
         record_tensor(&mut hook, "encoder.logvar", &logvar);
 
         (mean, logvar)
+    }
+
+    pub fn prepare_latent_projection(
+        &self,
+        latents: Tensor<B, 3>,
+        mut hook: Option<&mut HookRecorder>,
+    ) -> Tensor<B, 3> {
+        let latent_proj = self.post_quant.forward(latents);
+        record_tensor(&mut hook, "decoder.post_quant", &latent_proj);
+        latent_proj
+    }
+
+    pub fn build_kv_cache(
+        &self,
+        latent_proj: Tensor<B, 3>,
+        hook: Option<&mut HookRecorder>,
+    ) -> Tensor<B, 3> {
+        self.decoder.build_kv_cache(latent_proj, hook)
+    }
+
+    pub fn decode_with_latent_projection(
+        &self,
+        query_coords: Tensor<B, 3>,
+        latent_proj: Tensor<B, 3>,
+        kv_cache: Option<Tensor<B, 3>>,
+        mut hook: Option<&mut HookRecorder>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        let query_embed = self.freq_embed.forward(query_coords);
+        let query_tokens = self.decoder.proj_query.forward(query_embed);
+        record_tensor(&mut hook, "decoder.query", &query_tokens);
+
+        self.decoder
+            .forward(latent_proj, query_tokens, kv_cache, hook)
     }
 
     pub fn decode(
@@ -211,16 +223,9 @@ impl<B: Backend> TripoSGVae<B> {
         latents: Tensor<B, 3>,
         mut hook: Option<&mut HookRecorder>,
     ) -> Tensor<B, 3> {
-        let query_embed = self.freq_embed.forward(query_coords);
-        let query_tokens = self.decoder.proj_query.forward(query_embed);
-        record_tensor(&mut hook, "decoder.query", &query_tokens);
-
-        let latent_proj = self.post_quant.forward(latents);
-        record_tensor(&mut hook, "decoder.post_quant", &latent_proj);
-
-        let (output, _kv_cache) = self
-            .decoder
-            .forward(latent_proj, query_tokens, None, hook);
+        let latent_proj = self.prepare_latent_projection(latents, hook.as_deref_mut());
+        let (output, _kv_cache) =
+            self.decode_with_latent_projection(query_coords, latent_proj, None, hook);
         output
     }
 
@@ -309,10 +314,10 @@ impl<B: Backend> TripoSGEncoder<B> {
 
 #[derive(Module, Debug)]
 pub struct TripoSGEncoderBlock<B: Backend> {
-    pub norm1: nn::LayerNorm<B>,
-    pub attn1: CrossAttention<B>,
-    pub norm2: nn::LayerNorm<B>,
-    pub attn2: CrossAttention<B>,
+    pub norm1: Option<nn::LayerNorm<B>>,
+    pub attn1: Option<CrossAttention<B>>,
+    pub norm2: Option<nn::LayerNorm<B>>,
+    pub attn2: Option<CrossAttention<B>>,
     pub norm3: nn::LayerNorm<B>,
     pub ff: FeedForward<B>,
     use_cross: bool,
@@ -320,10 +325,19 @@ pub struct TripoSGEncoderBlock<B: Backend> {
 
 impl<B: Backend> TripoSGEncoderBlock<B> {
     pub fn new(device: &B::Device, width: usize, heads: usize, use_cross: bool) -> Self {
-        let norm1 = nn::LayerNormConfig::new(width).init(device);
-        let attn1 = CrossAttention::new(device, width, width, heads, false, false, true, false);
-        let norm2 = nn::LayerNormConfig::new(width).init(device);
-        let attn2 = CrossAttention::new(device, width, width, heads, true, false, true, true);
+        let (norm1, attn1, norm2, attn2) = if use_cross {
+            let norm2 = nn::LayerNormConfig::new(width).init(device);
+            let attn2 = CrossAttention::new(
+                device, width, width, heads, true, false, false, true, true,
+            );
+            (None, None, Some(norm2), Some(attn2))
+        } else {
+            let norm1 = nn::LayerNormConfig::new(width).init(device);
+            let attn1 = CrossAttention::new(
+                device, width, width, heads, false, false, false, true, false,
+            );
+            (Some(norm1), Some(attn1), None, None)
+        };
         let norm3 = nn::LayerNormConfig::new(width).init(device);
         let ff = FeedForward::new(device, width, width * 4);
 
@@ -347,22 +361,36 @@ impl<B: Backend> TripoSGEncoderBlock<B> {
     ) -> Tensor<B, 3> {
         let prefix = format!("encoder.blocks.{idx}");
         let attn = if self.use_cross {
-            let x_norm = self.norm2.forward(x.clone());
+            let norm2 = self.norm2.as_ref().expect("encoder cross norm2 missing");
+            let attn2 = self.attn2.as_ref().expect("encoder cross attn2 missing");
+            let x_norm = norm2.forward(x.clone());
             record_tensor(&mut hook, &format!("{prefix}.norm2"), &x_norm);
-            self.attn2
-                .forward(x_norm, context, hook.as_deref_mut(), &format!("{prefix}.attn2"))
+            attn2.forward(
+                x_norm,
+                context,
+                hook.as_deref_mut(),
+                &format!("{prefix}.attn2"),
+            )
         } else {
-            let x_norm = self.norm1.forward(x.clone());
+            let norm1 = self.norm1.as_ref().expect("encoder self norm1 missing");
+            let attn1 = self.attn1.as_ref().expect("encoder self attn1 missing");
+            let x_norm = norm1.forward(x.clone());
             record_tensor(&mut hook, &format!("{prefix}.norm1"), &x_norm);
-            self.attn1
-                .forward(x_norm.clone(), x_norm, hook.as_deref_mut(), &format!("{prefix}.attn1"))
+            attn1.forward(
+                x_norm.clone(),
+                x_norm,
+                hook.as_deref_mut(),
+                &format!("{prefix}.attn1"),
+            )
         };
         let x = x + attn;
         record_tensor(&mut hook, &format!("{prefix}.attn_out"), &x);
 
         let x_norm = self.norm3.forward(x.clone());
         record_tensor(&mut hook, &format!("{prefix}.norm3"), &x_norm);
-        let ff = self.ff.forward(x_norm, hook.as_deref_mut(), &format!("{prefix}.ff"));
+        let ff = self
+            .ff
+            .forward(x_norm, hook.as_deref_mut(), &format!("{prefix}.ff"));
         let x = x + ff;
         record_tensor(&mut hook, &format!("{prefix}.out"), &x);
         x
@@ -394,9 +422,7 @@ impl<B: Backend> TripoSGDecoder<B> {
         }
         blocks.push(TripoSGDecoderBlock::new(device, width, heads, true));
         let norm_out = nn::LayerNormConfig::new(width).init(device);
-        let proj_out = nn::LinearConfig::new(width, 1)
-            .with_bias(true)
-            .init(device);
+        let proj_out = nn::LinearConfig::new(width, 1).with_bias(true).init(device);
 
         Self {
             proj_query,
@@ -404,6 +430,21 @@ impl<B: Backend> TripoSGDecoder<B> {
             norm_out,
             proj_out,
         }
+    }
+
+    pub fn build_kv_cache(
+        &self,
+        sample: Tensor<B, 3>,
+        mut hook: Option<&mut HookRecorder>,
+    ) -> Tensor<B, 3> {
+        let mut hidden = sample;
+        let last_idx = self.blocks.len().saturating_sub(1);
+        for (idx, block) in self.blocks.iter().enumerate().take(last_idx) {
+            let context = hidden.clone();
+            hidden = block.forward(hidden, context, hook.as_deref_mut(), idx);
+        }
+        record_tensor(&mut hook, "decoder.kv_cache", &hidden);
+        hidden
     }
 
     pub fn forward(
@@ -416,14 +457,7 @@ impl<B: Backend> TripoSGDecoder<B> {
         let kv_cache = if let Some(cache) = kv_cache {
             cache
         } else {
-            let mut hidden = sample;
-            let last_idx = self.blocks.len().saturating_sub(1);
-            for (idx, block) in self.blocks.iter().enumerate().take(last_idx) {
-                let context = hidden.clone();
-                hidden = block.forward(hidden, context, hook.as_deref_mut(), idx);
-            }
-            record_tensor(&mut hook, "decoder.kv_cache", &hidden);
-            hidden
+            self.build_kv_cache(sample, hook.as_deref_mut())
         };
 
         let cross_idx = self.blocks.len().saturating_sub(1);
@@ -444,10 +478,10 @@ impl<B: Backend> TripoSGDecoder<B> {
 
 #[derive(Module, Debug)]
 pub struct TripoSGDecoderBlock<B: Backend> {
-    pub norm1: nn::LayerNorm<B>,
-    pub attn1: CrossAttention<B>,
-    pub norm2: nn::LayerNorm<B>,
-    pub attn2: CrossAttention<B>,
+    pub norm1: Option<nn::LayerNorm<B>>,
+    pub attn1: Option<CrossAttention<B>>,
+    pub norm2: Option<nn::LayerNorm<B>>,
+    pub attn2: Option<CrossAttention<B>>,
     pub norm3: nn::LayerNorm<B>,
     pub ff: FeedForward<B>,
     use_cross: bool,
@@ -455,10 +489,19 @@ pub struct TripoSGDecoderBlock<B: Backend> {
 
 impl<B: Backend> TripoSGDecoderBlock<B> {
     pub fn new(device: &B::Device, width: usize, heads: usize, use_cross: bool) -> Self {
-        let norm1 = nn::LayerNormConfig::new(width).init(device);
-        let attn1 = CrossAttention::new(device, width, width, heads, false, false, true, false);
-        let norm2 = nn::LayerNormConfig::new(width).init(device);
-        let attn2 = CrossAttention::new(device, width, width, heads, true, false, true, true);
+        let (norm1, attn1, norm2, attn2) = if use_cross {
+            let norm2 = nn::LayerNormConfig::new(width).init(device);
+            let attn2 = CrossAttention::new(
+                device, width, width, heads, true, false, false, true, true,
+            );
+            (None, None, Some(norm2), Some(attn2))
+        } else {
+            let norm1 = nn::LayerNormConfig::new(width).init(device);
+            let attn1 = CrossAttention::new(
+                device, width, width, heads, false, false, false, true, false,
+            );
+            (Some(norm1), Some(attn1), None, None)
+        };
         let norm3 = nn::LayerNormConfig::new(width).init(device);
         let ff = FeedForward::new(device, width, width * 4);
 
@@ -483,22 +526,36 @@ impl<B: Backend> TripoSGDecoderBlock<B> {
         let prefix = format!("decoder.blocks.{idx}");
 
         let attn = if self.use_cross {
-            let x_norm = self.norm2.forward(x.clone());
+            let norm2 = self.norm2.as_ref().expect("decoder cross norm2 missing");
+            let attn2 = self.attn2.as_ref().expect("decoder cross attn2 missing");
+            let x_norm = norm2.forward(x.clone());
             record_tensor(&mut hook, &format!("{prefix}.norm2"), &x_norm);
-            self.attn2
-                .forward(x_norm, context, hook.as_deref_mut(), &format!("{prefix}.attn2"))
+            attn2.forward(
+                x_norm,
+                context,
+                hook.as_deref_mut(),
+                &format!("{prefix}.attn2"),
+            )
         } else {
-            let x_norm = self.norm1.forward(x.clone());
+            let norm1 = self.norm1.as_ref().expect("decoder self norm1 missing");
+            let attn1 = self.attn1.as_ref().expect("decoder self attn1 missing");
+            let x_norm = norm1.forward(x.clone());
             record_tensor(&mut hook, &format!("{prefix}.norm1"), &x_norm);
-            self.attn1
-                .forward(x_norm.clone(), x_norm, hook.as_deref_mut(), &format!("{prefix}.attn1"))
+            attn1.forward(
+                x_norm.clone(),
+                x_norm,
+                hook.as_deref_mut(),
+                &format!("{prefix}.attn1"),
+            )
         };
         let x = x + attn;
         record_tensor(&mut hook, &format!("{prefix}.attn_out"), &x);
 
         let x_norm = self.norm3.forward(x.clone());
         record_tensor(&mut hook, &format!("{prefix}.norm3"), &x_norm);
-        let ff = self.ff.forward(x_norm, hook.as_deref_mut(), &format!("{prefix}.ff"));
+        let ff = self
+            .ff
+            .forward(x_norm, hook.as_deref_mut(), &format!("{prefix}.ff"));
         let x = x + ff;
         record_tensor(&mut hook, &format!("{prefix}.out"), &x);
         x
@@ -511,11 +568,7 @@ pub mod import {
 
     use burn::prelude::*;
     use burn_store::{
-        BurnpackStore,
-        KeyRemapper,
-        ModuleSnapshot,
-        PyTorchToBurnAdapter,
-        SafetensorsStore,
+        BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
 
     use super::{TripoSGVae, TripoSGVaeConfig};
@@ -602,7 +655,7 @@ pub mod import {
 
         let store = SafetensorsStore::from_file(path)
             .with_from_adapter(PyTorchToBurnAdapter)
-            .allow_partial(true)
+            .allow_partial(false)
             .remap(remapper)
             .validate(true);
 
@@ -611,22 +664,58 @@ pub mod import {
 
     fn key_remap_rules() -> &'static [(&'static str, &'static str)] {
         &[
-            (r"^(encoder\.blocks\.\d+\.attn1\.to_out)\.0\.(weight|bias)$", "$1.$2"),
-            (r"^(encoder\.blocks\.\d+\.attn2\.to_out)\.0\.(weight|bias)$", "$1.$2"),
-            (r"^(decoder\.blocks\.\d+\.attn1\.to_out)\.0\.(weight|bias)$", "$1.$2"),
-            (r"^(decoder\.blocks\.\d+\.attn2\.to_out)\.0\.(weight|bias)$", "$1.$2"),
-            (r"^(encoder\.blocks\.\d+\.ff)\.net\.0\.proj\.(weight|bias)$", "$1.proj.$2"),
-            (r"^(encoder\.blocks\.\d+\.ff)\.net\.2\.(weight|bias)$", "$1.out.$2"),
-            (r"^(decoder\.blocks\.\d+\.ff)\.net\.0\.proj\.(weight|bias)$", "$1.proj.$2"),
-            (r"^(decoder\.blocks\.\d+\.ff)\.net\.2\.(weight|bias)$", "$1.out.$2"),
+            (
+                r"^(encoder\.blocks\.\d+\.attn1\.to_out)\.0\.(weight|bias)$",
+                "$1.$2",
+            ),
+            (
+                r"^(encoder\.blocks\.\d+\.attn2\.to_out)\.0\.(weight|bias)$",
+                "$1.$2",
+            ),
+            (
+                r"^(decoder\.blocks\.\d+\.attn1\.to_out)\.0\.(weight|bias)$",
+                "$1.$2",
+            ),
+            (
+                r"^(decoder\.blocks\.\d+\.attn2\.to_out)\.0\.(weight|bias)$",
+                "$1.$2",
+            ),
+            (
+                r"^(encoder\.blocks\.\d+\.ff)\.net\.0\.proj\.(weight|bias)$",
+                "$1.proj.$2",
+            ),
+            (
+                r"^(encoder\.blocks\.\d+\.ff)\.net\.2\.(weight|bias)$",
+                "$1.out.$2",
+            ),
+            (
+                r"^(decoder\.blocks\.\d+\.ff)\.net\.0\.proj\.(weight|bias)$",
+                "$1.proj.$2",
+            ),
+            (
+                r"^(decoder\.blocks\.\d+\.ff)\.net\.2\.(weight|bias)$",
+                "$1.out.$2",
+            ),
             (r"^(encoder\.blocks\.\d+\.norm\d)\.weight$", "$1.gamma"),
             (r"^(encoder\.blocks\.\d+\.norm\d)\.bias$", "$1.beta"),
             (r"^(decoder\.blocks\.\d+\.norm\d)\.weight$", "$1.gamma"),
             (r"^(decoder\.blocks\.\d+\.norm\d)\.bias$", "$1.beta"),
-            (r"^(encoder\.blocks\.\d+\.attn2\.norm_cross)\.weight$", "$1.gamma"),
-            (r"^(encoder\.blocks\.\d+\.attn2\.norm_cross)\.bias$", "$1.beta"),
-            (r"^(decoder\.blocks\.\d+\.attn2\.norm_cross)\.weight$", "$1.gamma"),
-            (r"^(decoder\.blocks\.\d+\.attn2\.norm_cross)\.bias$", "$1.beta"),
+            (
+                r"^(encoder\.blocks\.\d+\.attn2\.norm_cross)\.weight$",
+                "$1.gamma",
+            ),
+            (
+                r"^(encoder\.blocks\.\d+\.attn2\.norm_cross)\.bias$",
+                "$1.beta",
+            ),
+            (
+                r"^(decoder\.blocks\.\d+\.attn2\.norm_cross)\.weight$",
+                "$1.gamma",
+            ),
+            (
+                r"^(decoder\.blocks\.\d+\.attn2\.norm_cross)\.bias$",
+                "$1.beta",
+            ),
             (r"^(encoder\.norm_out)\.weight$", "$1.gamma"),
             (r"^(encoder\.norm_out)\.bias$", "$1.beta"),
             (r"^(decoder\.norm_out)\.weight$", "$1.gamma"),

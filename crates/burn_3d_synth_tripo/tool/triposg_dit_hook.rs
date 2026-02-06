@@ -3,12 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy_args::{parse_args, Deserialize, Parser, Serialize};
+use bevy_args::{Deserialize, Parser, Serialize, parse_args};
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
 use burn_3d_synth_tripo::model::triposg::{
-    dit::{import::load_triposg_dit, TripoSGDiTConfig},
+    dit::{TripoSGDiTConfig, import::load_triposg_dit},
     hooks::HookRecorder,
 };
 
@@ -40,7 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = fs::read(&inputs)?;
     let tensors = SafeTensors::deserialize(&bytes)?;
 
-    let hidden_states = tensor_from_view_3d::<BackendImpl>(&tensors, "input.hidden_states", &device)?;
+    let hidden_states =
+        tensor_from_view_3d::<BackendImpl>(&tensors, "input.hidden_states", &device)?;
     let encoder_hidden_states =
         tensor_from_view_3d::<BackendImpl>(&tensors, "input.encoder_hidden_states", &device)?;
     let encoder_hidden_states_2 =

@@ -140,10 +140,23 @@ impl RectifiedFlowScheduler {
         let sigma_next = self.sigmas[step_index + 1];
 
         let output_dtype: FloatDType = model_output.dtype().into();
-        let sample_f32 = sample.cast(FloatDType::F32);
-        let model_f32 = model_output.cast(FloatDType::F32);
+        let needs_cast = output_dtype != FloatDType::F32;
+        let sample_f32 = if needs_cast {
+            sample.cast(FloatDType::F32)
+        } else {
+            sample
+        };
+        let model_f32 = if needs_cast {
+            model_output.cast(FloatDType::F32)
+        } else {
+            model_output
+        };
         let prev_sample = sample_f32.add(model_f32.mul_scalar(sigma - sigma_next));
-        let prev_sample = prev_sample.cast(output_dtype);
+        let prev_sample = if needs_cast {
+            prev_sample.cast(output_dtype)
+        } else {
+            prev_sample
+        };
         self.step_index = Some(step_index + 1);
         prev_sample
     }
@@ -158,7 +171,9 @@ impl RectifiedFlowScheduler {
             .div_scalar(self.config.num_train_timesteps as f32)
             .unsqueeze_dim::<2>(1)
             .unsqueeze_dim::<3>(2);
-        let scaled = original_samples.clone().sub(sigmas.clone() * original_samples);
+        let scaled = original_samples
+            .clone()
+            .sub(sigmas.clone() * original_samples);
         scaled.add(sigmas * noise)
     }
 

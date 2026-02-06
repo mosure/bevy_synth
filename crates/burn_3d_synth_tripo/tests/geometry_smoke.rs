@@ -1,7 +1,9 @@
 use burn::prelude::*;
 
 use burn_3d_synth_tripo::model::triposg::vae::TripoSGVaeConfig;
-use burn_3d_synth_tripo::pipeline::geometry::{hierarchical_extract_geometry, HierarchicalExtractConfig};
+use burn_3d_synth_tripo::pipeline::geometry::{
+    HierarchicalExtractConfig, hierarchical_extract_geometry,
+};
 
 #[test]
 fn hierarchical_extract_smoke() {

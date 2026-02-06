@@ -1,20 +1,8 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, path::Path};
 
-use burn::tensor::{
-    backend::Backend,
-    Tensor,
-    TensorData,
-};
+use burn::tensor::{Tensor, TensorData, backend::Backend};
 use bytemuck::cast_slice;
-use safetensors::{
-    serialize,
-    tensor::TensorView,
-    Dtype,
-};
+use safetensors::{Dtype, serialize, tensor::TensorView};
 
 #[derive(Debug, Clone)]
 pub struct HookTensor {

@@ -15,31 +15,16 @@ pub fn resize_chw_align_corners_false(
 
     match mode {
         InterpolateMode::Nearest => resize_nearest_align_corners_false(
-            input,
-            channels,
-            in_height,
-            in_width,
-            out_height,
-            out_width,
+            input, channels, in_height, in_width, out_height, out_width,
         ),
         InterpolateMode::Bicubic | InterpolateMode::Bilinear => {
             if out_height < in_height || out_width < in_width {
                 resize_area_align_corners_false(
-                    input,
-                    channels,
-                    in_height,
-                    in_width,
-                    out_height,
-                    out_width,
+                    input, channels, in_height, in_width, out_height, out_width,
                 )
             } else {
                 resize_bilinear_align_corners_false(
-                    input,
-                    channels,
-                    in_height,
-                    in_width,
-                    out_height,
-                    out_width,
+                    input, channels, in_height, in_width, out_height, out_width,
                 )
             }
         }
@@ -63,16 +48,11 @@ fn resize_nearest_align_corners_false(
         let out_base = c * out_height * out_width;
         for oy in 0..out_height {
             let in_y = ((oy as f32 + 0.5) * scale_y - 0.5).round();
-            let iy = in_y
-                .clamp(0.0, (in_height - 1) as f32)
-                .round() as usize;
+            let iy = in_y.clamp(0.0, (in_height - 1) as f32).round() as usize;
             for ox in 0..out_width {
                 let in_x = ((ox as f32 + 0.5) * scale_x - 0.5).round();
-                let ix = in_x
-                    .clamp(0.0, (in_width - 1) as f32)
-                    .round() as usize;
-                output[out_base + oy * out_width + ox] =
-                    input[in_base + iy * in_width + ix];
+                let ix = in_x.clamp(0.0, (in_width - 1) as f32).round() as usize;
+                output[out_base + oy * out_width + ox] = input[in_base + iy * in_width + ix];
             }
         }
     }
@@ -119,8 +99,7 @@ fn resize_bilinear_align_corners_false(
 
                 let top = v00 * (1.0 - wx) + v01 * wx;
                 let bottom = v10 * (1.0 - wx) + v11 * wx;
-                output[out_base + oy * out_width + ox] =
-                    top * (1.0 - wy) + bottom * wy;
+                output[out_base + oy * out_width + ox] = top * (1.0 - wy) + bottom * wy;
             }
         }
     }

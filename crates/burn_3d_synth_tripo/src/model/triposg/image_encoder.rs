@@ -3,7 +3,7 @@ use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 use image::{ImageBuffer, Rgb};
 
-use burn_dino::model::dino::{DinoVisionTransformer, DinoOutput};
+use burn_dino::model::dino::{DinoOutput, DinoVisionTransformer};
 
 #[derive(Module, Debug)]
 pub struct TripoSGImageEncoder<B: Backend> {
@@ -60,7 +60,9 @@ impl DinoImageProcessor {
         }
         let mut image = image;
 
-        if self.do_resize && let Some(shortest_edge) = self.size_shortest_edge {
+        if self.do_resize
+            && let Some(shortest_edge) = self.size_shortest_edge
+        {
             let [_, _, height, width] = image.shape().dims();
             let min_edge = height.min(width);
             if min_edge > 0 && min_edge != shortest_edge {
@@ -74,7 +76,9 @@ impl DinoImageProcessor {
             }
         }
 
-        if self.do_center_crop && let Some([crop_height, crop_width]) = self.crop_size {
+        if self.do_center_crop
+            && let Some([crop_height, crop_width]) = self.crop_size
+        {
             let [batch, channels, height, width] = image.shape().dims();
             if height >= crop_height && width >= crop_width {
                 let top = (height - crop_height) / 2;
@@ -126,17 +130,18 @@ impl DinoImageProcessor {
                 for x in 0..width {
                     for c in 0..3 {
                         let idx = c * height * width + y * width + x;
-                        let value = chw[idx].round().clamp(0.0, 255.0) as u8;
+                        let value = chw[idx].clamp(0.0, 255.0) as u8;
                         hwc.push(value);
                     }
                 }
             }
 
-            let mut image =
-                ImageBuffer::<Rgb<u8>, _>::from_vec(width as u32, height as u32, hwc)
-                    .expect("invalid image buffer");
+            let mut image = ImageBuffer::<Rgb<u8>, _>::from_vec(width as u32, height as u32, hwc)
+                .expect("invalid image buffer");
 
-            if self.do_resize && let Some(shortest) = self.size_shortest_edge {
+            if self.do_resize
+                && let Some(shortest) = self.size_shortest_edge
+            {
                 let (in_w, in_h) = (image.width() as usize, image.height() as usize);
                 let (short, long) = if in_w <= in_h {
                     (in_w, in_h)
@@ -160,7 +165,9 @@ impl DinoImageProcessor {
                 }
             }
 
-            if self.do_center_crop && let Some([crop_h, crop_w]) = self.crop_size {
+            if self.do_center_crop
+                && let Some([crop_h, crop_w]) = self.crop_size
+            {
                 let (in_w, in_h) = (image.width() as usize, image.height() as usize);
                 if in_h >= crop_h && in_w >= crop_w {
                     let top = (in_h - crop_h) / 2;
@@ -223,12 +230,7 @@ impl DinoImageProcessor {
         let flat = Tensor::<B, 1>::from_floats(output.as_slice(), &device);
         let out_height = final_height.unwrap_or(height);
         let out_width = final_width.unwrap_or(width);
-        flat.reshape([
-            batch as i32,
-            3,
-            out_height as i32,
-            out_width as i32,
-        ])
+        flat.reshape([batch as i32, 3, out_height as i32, out_width as i32])
     }
 }
 
@@ -243,16 +245,11 @@ pub mod import {
     use burn::prelude::*;
     use burn::tensor::ops::InterpolateMode;
     use burn_store::{
-        BurnpackStore,
-        KeyRemapper,
-        ModuleSnapshot,
-        PyTorchToBurnAdapter,
-        SafetensorsStore,
+        BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
     use safetensors::{
-        serialize,
+        Dtype, serialize,
         tensor::{SafeTensors, TensorView},
-        Dtype,
     };
 
     use super::{DinoImageProcessor, TripoSGImageEncoder};
@@ -322,10 +319,7 @@ pub mod import {
             do_rescale: config.do_rescale.unwrap_or(true),
             do_normalize: config.do_normalize.unwrap_or(true),
             do_resize: config.do_resize.unwrap_or(false),
-            size_shortest_edge: config
-                .size
-                .as_ref()
-                .and_then(|size| size.shortest_edge),
+            size_shortest_edge: config.size.as_ref().and_then(|size| size.shortest_edge),
             do_center_crop: config.do_center_crop.unwrap_or(false),
             crop_size: config.crop_size.map(|size| [size.height, size.width]),
             resize_mode,
@@ -414,9 +408,7 @@ pub mod import {
         num_channels: Option<usize>,
     }
 
-    fn build_store(
-        bytes: Vec<u8>,
-    ) -> Result<SafetensorsStore, Box<dyn std::error::Error>> {
+    fn build_store(bytes: Vec<u8>) -> Result<SafetensorsStore, Box<dyn std::error::Error>> {
         let mut remapper = KeyRemapper::new();
         for &(from, to) in key_remap_rules() {
             remapper = remapper
@@ -472,15 +464,15 @@ pub mod import {
         }
 
         for (layer, parts) in qkv_parts {
-            let q = parts.q_weight.ok_or_else(|| {
-                Dinov2ImportError(format!("missing q weight for layer {layer}"))
-            })?;
-            let k = parts.k_weight.ok_or_else(|| {
-                Dinov2ImportError(format!("missing k weight for layer {layer}"))
-            })?;
-            let v = parts.v_weight.ok_or_else(|| {
-                Dinov2ImportError(format!("missing v weight for layer {layer}"))
-            })?;
+            let q = parts
+                .q_weight
+                .ok_or_else(|| Dinov2ImportError(format!("missing q weight for layer {layer}")))?;
+            let k = parts
+                .k_weight
+                .ok_or_else(|| Dinov2ImportError(format!("missing k weight for layer {layer}")))?;
+            let v = parts
+                .v_weight
+                .ok_or_else(|| Dinov2ImportError(format!("missing v weight for layer {layer}")))?;
             let dim = parts
                 .dim
                 .ok_or_else(|| Dinov2ImportError(format!("missing dim for layer {layer}")))?;
@@ -495,15 +487,15 @@ pub mod import {
                 data: bytemuck::cast_slice(&qkv).to_vec(),
             });
 
-            let qb = parts.q_bias.ok_or_else(|| {
-                Dinov2ImportError(format!("missing q bias for layer {layer}"))
-            })?;
-            let kb = parts.k_bias.ok_or_else(|| {
-                Dinov2ImportError(format!("missing k bias for layer {layer}"))
-            })?;
-            let vb = parts.v_bias.ok_or_else(|| {
-                Dinov2ImportError(format!("missing v bias for layer {layer}"))
-            })?;
+            let qb = parts
+                .q_bias
+                .ok_or_else(|| Dinov2ImportError(format!("missing q bias for layer {layer}")))?;
+            let kb = parts
+                .k_bias
+                .ok_or_else(|| Dinov2ImportError(format!("missing k bias for layer {layer}")))?;
+            let vb = parts
+                .v_bias
+                .ok_or_else(|| Dinov2ImportError(format!("missing v bias for layer {layer}")))?;
             let mut qkv_bias = Vec::with_capacity(qb.len() + kb.len() + vb.len());
             qkv_bias.extend_from_slice(&qb);
             qkv_bias.extend_from_slice(&kb);
@@ -561,9 +553,9 @@ pub mod import {
         if parts[0] != "encoder" || parts[1] != "layer" {
             return Ok(None);
         }
-        let layer: usize = parts[2].parse().map_err(|_| {
-            Dinov2ImportError(format!("invalid layer index in {name}"))
-        })?;
+        let layer: usize = parts[2]
+            .parse()
+            .map_err(|_| Dinov2ImportError(format!("invalid layer index in {name}")))?;
 
         match parts[3] {
             "norm1" | "norm2" => {

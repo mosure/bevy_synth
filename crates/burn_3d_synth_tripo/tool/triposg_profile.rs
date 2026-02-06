@@ -1,9 +1,13 @@
+#![recursion_limit = "256"]
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use burn::prelude::*;
-use burn_3d_synth_bg_removal::pipeline::{prepare_image_tensor, PrepareImageConfig, RmbgPipeline};
-use burn_3d_synth_tripo::pipeline::geometry::{hierarchical_extract_geometry, HierarchicalExtractConfig};
+use burn_3d_synth_bg_removal::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_tensor};
+use burn_3d_synth_tripo::pipeline::geometry::{
+    HierarchicalExtractConfig, hierarchical_extract_geometry,
+};
 use burn_3d_synth_tripo::pipeline::mesh::grid_to_mesh;
 use burn_3d_synth_tripo::pipeline::triposg::TripoSGPipeline;
 
@@ -35,12 +39,22 @@ fn profile_with_backend<B: Backend>() {
         "TRIPOSG_WEIGHTS_ROOT",
         r"E:\\repos\\TripoSG\\pretrained_weights\\TripoSG",
     )
-    .or_else(|| resolve_weights_root("TRIPOSG_WEIGHTS_ROOT", "./crates/burn_3d_synth_tripo/assets/models/MIDI-3D"));
+    .or_else(|| {
+        resolve_weights_root(
+            "TRIPOSG_WEIGHTS_ROOT",
+            "./crates/burn_3d_synth_tripo/assets/models/MIDI-3D",
+        )
+    });
     let rmbg_root = resolve_weights_root(
         "RMBG_WEIGHTS_ROOT",
         r"E:\\repos\\TripoSG\\pretrained_weights\\RMBG-1.4",
     )
-    .or_else(|| resolve_weights_root("RMBG_WEIGHTS_ROOT", "./crates/burn_3d_synth_bg_removal/assets/models/RMBG-1.4"));
+    .or_else(|| {
+        resolve_weights_root(
+            "RMBG_WEIGHTS_ROOT",
+            "./crates/burn_3d_synth_bg_removal/assets/models/RMBG-1.4",
+        )
+    });
 
     let image_path = std::env::var("TRIPOSG_PROFILE_IMAGE")
         .map(PathBuf::from)
@@ -64,8 +78,8 @@ fn profile_with_backend<B: Backend>() {
     let t0 = Instant::now();
     let mut pipeline = TripoSGPipeline::from_pretrained(weights_root, &device)
         .expect("failed to load TripoSG weights");
-    let rmbg_pipeline = RmbgPipeline::from_pretrained(rmbg_root, &device)
-        .expect("failed to load RMBG weights");
+    let rmbg_pipeline =
+        RmbgPipeline::from_pretrained(rmbg_root, &device).expect("failed to load RMBG weights");
     B::sync(&device);
     let load_ms = elapsed_ms(t0);
 
@@ -99,15 +113,8 @@ fn profile_with_backend<B: Backend>() {
     let encode_ms = elapsed_ms(t0);
 
     let t0 = Instant::now();
-    let output = pipeline.sample_from_embeds(
-        embeds.clone(),
-        1,
-        steps,
-        tokens,
-        guidance,
-        None,
-        None,
-    );
+    let output =
+        pipeline.sample_from_embeds(embeds.clone(), 1, steps, tokens, guidance, None, None);
     B::sync(&device);
     let diffusion_ms = elapsed_ms(t0);
 
@@ -142,14 +149,7 @@ fn profile_with_backend<B: Backend>() {
 
     let t0 = Instant::now();
     let output_mesh = pipeline
-        .sample_mesh_hierarchical(
-            image_tensor,
-            steps,
-            tokens,
-            guidance,
-            &config,
-            None,
-        )
+        .sample_mesh_hierarchical(image_tensor, steps, tokens, guidance, &config, None)
         .expect("e2e mesh");
     B::sync(&device);
     let e2e_ms = elapsed_ms(t0);
@@ -162,7 +162,14 @@ fn profile_with_backend<B: Backend>() {
     println!("diffusion_ms: {diffusion_ms:.2}");
     println!("vae_decode_dense_ms: {dense_ms:.2}");
     println!("vae_decode_hier_ms: {hier_ms:.2}");
-    println!("mesh_ms: {mesh_ms:.2} (faces: {})", output_mesh.mesh.as_ref().map(|m| m.faces.len()).unwrap_or(0));
+    println!(
+        "mesh_ms: {mesh_ms:.2} (faces: {})",
+        output_mesh
+            .mesh
+            .as_ref()
+            .map(|m| m.faces.len())
+            .unwrap_or(0)
+    );
     println!("e2e_mesh_hier_ms: {e2e_ms:.2}");
 }
 

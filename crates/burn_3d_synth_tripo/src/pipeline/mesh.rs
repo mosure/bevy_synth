@@ -1,4 +1,10 @@
+use fast_surface_nets::ndshape::RuntimeShape;
+use fast_surface_nets::{SurfaceNetsBuffer, surface_nets};
 use marching_cubes::tables::{EDGE_TABLE, TRI_TABLE};
+use crate::pipeline::dmc_tables::{
+    DMCEDGEOFFSET, DMCQUAD, MCEDGEINDEX, MCEDGELOCATIONS, MCFIRSTEDGEINDEX,
+    MCFIRSTPATCHINDEX, MCCORNERS, PROBLEMATICCONFIGS,
+};
 
 #[derive(Debug, Clone)]
 pub struct Mesh {
@@ -12,6 +18,8 @@ pub struct DenseGrid {
     pub size: [usize; 3],
     pub bounds: [f32; 6],
 }
+
+type DmcOutput = Option<(Vec<[f32; 3]>, Vec<[u32; 4]>)>;
 
 impl DenseGrid {
     fn index(&self, x: usize, y: usize, z: usize) -> usize {
@@ -51,14 +59,30 @@ pub fn grid_to_mesh(grid: &DenseGrid, iso: f32) -> Option<Mesh> {
                 let v7 = grid.value_at(x, y + 1, z + 1);
 
                 let mut cube_index = 0usize;
-                if v0 < iso { cube_index |= 1; }
-                if v1 < iso { cube_index |= 2; }
-                if v2 < iso { cube_index |= 4; }
-                if v3 < iso { cube_index |= 8; }
-                if v4 < iso { cube_index |= 16; }
-                if v5 < iso { cube_index |= 32; }
-                if v6 < iso { cube_index |= 64; }
-                if v7 < iso { cube_index |= 128; }
+                if v0 < iso {
+                    cube_index |= 1;
+                }
+                if v1 < iso {
+                    cube_index |= 2;
+                }
+                if v2 < iso {
+                    cube_index |= 4;
+                }
+                if v3 < iso {
+                    cube_index |= 8;
+                }
+                if v4 < iso {
+                    cube_index |= 16;
+                }
+                if v5 < iso {
+                    cube_index |= 32;
+                }
+                if v6 < iso {
+                    cube_index |= 64;
+                }
+                if v7 < iso {
+                    cube_index |= 128;
+                }
 
                 let edge_mask = EDGE_TABLE[cube_index] as u16;
                 if edge_mask == 0 {
@@ -93,11 +117,7 @@ pub fn grid_to_mesh(grid: &DenseGrid, iso: f32) -> Option<Mesh> {
                     let a = tri[i] as usize;
                     let b = tri[i + 1] as usize;
                     let c = tri[i + 2] as usize;
-                    faces.push([
-                        edge_vertices[a],
-                        edge_vertices[b],
-                        edge_vertices[c],
-                    ]);
+                    faces.push([edge_vertices[a], edge_vertices[b], edge_vertices[c]]);
                     i += 3;
                 }
             }
@@ -115,6 +135,120 @@ pub fn grid_to_mesh(grid: &DenseGrid, iso: f32) -> Option<Mesh> {
     let scale_x = (bounds[3] - bounds[0]) / size_x;
     let scale_y = (bounds[4] - bounds[1]) / size_y;
     let scale_z = (bounds[5] - bounds[2]) / size_z;
+
+    for v in &mut vertices {
+        v[0] = bounds[0] + v[0] * scale_x;
+        v[1] = bounds[1] + v[1] * scale_y;
+        v[2] = bounds[2] + v[2] * scale_z;
+    }
+
+    Some(Mesh { vertices, faces })
+}
+
+pub fn sdf_to_mesh_surface_nets(grid: &DenseGrid) -> Option<Mesh> {
+    let [nx, ny, nz] = grid.size;
+    if nx < 2 || ny < 2 || nz < 2 {
+        return None;
+    }
+
+    let shape = RuntimeShape::<u32, 3>::new([nx as u32, ny as u32, nz as u32]);
+    let mut buffer = SurfaceNetsBuffer::default();
+    surface_nets(
+        grid.values.as_slice(),
+        &shape,
+        [0, 0, 0],
+        [nx as u32 - 1, ny as u32 - 1, nz as u32 - 1],
+        &mut buffer,
+    );
+
+    if buffer.indices.is_empty() {
+        return None;
+    }
+
+    let bounds = grid.bounds;
+    let scale_x = (bounds[3] - bounds[0]) / (nx as f32 - 1.0);
+    let scale_y = (bounds[4] - bounds[1]) / (ny as f32 - 1.0);
+    let scale_z = (bounds[5] - bounds[2]) / (nz as f32 - 1.0);
+
+    let mut vertices = Vec::with_capacity(buffer.positions.len());
+    for pos in &buffer.positions {
+        vertices.push([
+            bounds[0] + pos[0] * scale_x,
+            bounds[1] + pos[1] * scale_y,
+            bounds[2] + pos[2] * scale_z,
+        ]);
+    }
+
+    let mut faces = Vec::with_capacity(buffer.indices.len() / 3);
+    for chunk in buffer.indices.chunks(3) {
+        if let [a, b, c] = *chunk {
+            faces.push([a, b, c]);
+        }
+    }
+
+    Some(Mesh { vertices, faces })
+}
+
+pub fn sdf_to_mesh_diff_dmc(grid: &DenseGrid) -> Option<Mesh> {
+    let [nx, ny, nz] = grid.size;
+    if nx < 2 || ny < 2 || nz < 2 {
+        return None;
+    }
+
+    let iso = 0.0f32;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut saw_nan = false;
+    for &v in &grid.values {
+        if v.is_nan() {
+            saw_nan = true;
+            continue;
+        }
+        min = min.min(v);
+        max = max.max(v);
+    }
+    if !saw_nan && (min >= iso || max <= iso) {
+        return None;
+    }
+
+    let pad = iso + 1.0;
+    let px = nx + 2;
+    let py = ny + 2;
+    let pz = nz + 2;
+    let mut padded = vec![pad; px * py * pz];
+    for z in 0..nz {
+        for y in 0..ny {
+            let src_base = (z * ny + y) * nx;
+            let dst_base = ((z + 1) * py + (y + 1)) * px;
+            for x in 0..nx {
+                padded[dst_base + x + 1] = grid.values[src_base + x];
+            }
+        }
+    }
+
+    let (mut vertices, quads) = diff_dmc(&padded, [px, py, pz], iso)?;
+    if vertices.is_empty() || quads.is_empty() {
+        return None;
+    }
+
+    for v in &mut vertices {
+        v[0] -= 1.0;
+        v[1] -= 1.0;
+        v[2] -= 1.0;
+    }
+
+    let mut faces = triangulate_quads(&vertices, &quads);
+    if faces.is_empty() {
+        return None;
+    }
+    for face in &mut faces {
+        face.swap(0, 2);
+    }
+
+    let bounds = grid.bounds;
+    let scale_x = (bounds[3] - bounds[0]) / (nx as f32 - 1.0);
+    let scale_y = (bounds[4] - bounds[1]) / (ny as f32 - 1.0);
+    let scale_z = (bounds[5] - bounds[2]) / (nz as f32 - 1.0);
 
     for v in &mut vertices {
         v[0] = bounds[0] + v[0] * scale_x;
@@ -331,4 +465,365 @@ impl EdgeSlot {
             EdgeSlot::Z(idx) => z_edges[idx] = value,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct UsedCell {
+    x: usize,
+    y: usize,
+    z: usize,
+    code: u8,
+    num_patches: usize,
+    num_mc_verts: usize,
+}
+
+fn diff_dmc(
+    grid: &[f32],
+    dims: [usize; 3],
+    iso: f32,
+) -> DmcOutput {
+    let [nx, ny, nz] = dims;
+    if nx < 2 || ny < 2 || nz < 2 {
+        return None;
+    }
+    let cell_nx = nx - 1;
+    let cell_ny = ny - 1;
+    let cell_nz = nz - 1;
+    let n_cells = cell_nx * cell_ny * cell_nz;
+
+    let mut cell_codes = vec![0u8; n_cells];
+    for z in 0..cell_nz {
+        for y in 0..cell_ny {
+            for x in 0..cell_nx {
+                let idx = cell_index(x, y, z, cell_nx, cell_ny);
+                cell_codes[idx] = get_cell_code(grid, dims, x, y, z, iso);
+            }
+        }
+    }
+
+    let mut used_cells = Vec::new();
+    let mut cell_to_used = vec![usize::MAX; n_cells];
+
+    for z in 0..cell_nz {
+        for y in 0..cell_ny {
+            for x in 0..cell_nx {
+                let cell_idx = cell_index(x, y, z, cell_nx, cell_ny);
+                let raw = cell_codes[cell_idx];
+                if raw == 0 || raw == 255 {
+                    continue;
+                }
+                let good = get_good_cell_code(&cell_codes, [cell_nx, cell_ny, cell_nz], x, y, z, raw);
+
+                let num_patches = (MCFIRSTPATCHINDEX[good as usize + 1]
+                    - MCFIRSTPATCHINDEX[good as usize]) as usize;
+
+                let d0 = grid[grid_index(x, y, z, nx, ny)];
+                let dx = grid[grid_index(x + 1, y, z, nx, ny)];
+                let dy = grid[grid_index(x, y + 1, z, nx, ny)];
+                let dz = grid[grid_index(x, y, z + 1, nx, ny)];
+                let mut num_mc_verts = 0usize;
+                if (d0 < iso && dx >= iso) || (dx < iso && d0 >= iso) {
+                    num_mc_verts += 1;
+                }
+                if (d0 < iso && dy >= iso) || (dy < iso && d0 >= iso) {
+                    num_mc_verts += 1;
+                }
+                if (d0 < iso && dz >= iso) || (dz < iso && d0 >= iso) {
+                    num_mc_verts += 1;
+                }
+
+                let used_index = used_cells.len();
+                used_cells.push(UsedCell {
+                    x,
+                    y,
+                    z,
+                    code: good,
+                    num_patches,
+                    num_mc_verts,
+                });
+                cell_to_used[cell_idx] = used_index;
+            }
+        }
+    }
+
+    if used_cells.is_empty() {
+        return None;
+    }
+
+    let mut patch_start = Vec::with_capacity(used_cells.len());
+    let mut vert_start = Vec::with_capacity(used_cells.len());
+    let mut total_patches = 0usize;
+    let mut total_mc_verts = 0usize;
+    for cell in &used_cells {
+        patch_start.push(total_patches);
+        vert_start.push(total_mc_verts);
+        total_patches += cell.num_patches;
+        total_mc_verts += cell.num_mc_verts;
+    }
+
+    if total_patches == 0 || total_mc_verts == 0 {
+        return None;
+    }
+
+    let mut verts = vec![[0.0f32; 3]; total_patches];
+    for (used_index, cell) in used_cells.iter().enumerate() {
+        let mut out = patch_start[used_index];
+        let cube = cell.code as usize;
+        let start_patch = MCFIRSTPATCHINDEX[cube] as usize;
+        let end_patch = MCFIRSTPATCHINDEX[cube + 1] as usize;
+        for patch_index in start_patch..end_patch {
+            let edge_start = MCFIRSTEDGEINDEX[patch_index] as usize;
+            let edge_end = MCFIRSTEDGEINDEX[patch_index + 1] as usize;
+            let mut p = [0.0f32; 3];
+            let mut count = 0.0f32;
+            for &edge in MCEDGEINDEX[edge_start..edge_end].iter() {
+                let eid = edge as usize;
+                let loc = MCEDGELOCATIONS[eid];
+                let ex = loc[0] as isize;
+                let ey = loc[1] as isize;
+                let ez = loc[2] as isize;
+                let en = loc[3] as usize;
+                let vx = (cell.x as isize + ex) as usize;
+                let vy = (cell.y as isize + ey) as usize;
+                let vz = (cell.z as isize + ez) as usize;
+                let v = compute_mc_vert(grid, dims, vx, vy, vz, en, iso);
+                p[0] += v[0];
+                p[1] += v[1];
+                p[2] += v[2];
+                count += 1.0;
+            }
+            if count > 0.0 {
+                p[0] /= count;
+                p[1] /= count;
+                p[2] /= count;
+            }
+            verts[out] = p;
+            out += 1;
+        }
+    }
+
+    let mut mc_vert_to_cell = vec![0usize; total_mc_verts];
+    let mut mc_vert_type = vec![0u8; total_mc_verts];
+    for (used_index, cell) in used_cells.iter().enumerate() {
+        let d0 = grid[grid_index(cell.x, cell.y, cell.z, nx, ny)];
+        let ds = [
+            grid[grid_index(cell.x + 1, cell.y, cell.z, nx, ny)],
+            grid[grid_index(cell.x, cell.y + 1, cell.z, nx, ny)],
+            grid[grid_index(cell.x, cell.y, cell.z + 1, nx, ny)],
+        ];
+        let mut out = vert_start[used_index];
+        for (dim, &d) in ds.iter().enumerate() {
+            let entering = d0 < iso && d >= iso;
+            let exiting = d < iso && d0 >= iso;
+            if entering || exiting {
+                mc_vert_to_cell[out] = used_index;
+                mc_vert_type[out] = if exiting { (3 + dim) as u8 } else { dim as u8 };
+                out += 1;
+            }
+        }
+    }
+
+    let mut quads = Vec::with_capacity(total_mc_verts);
+    for quad_index in 0..total_mc_verts {
+        let used_index = mc_vert_to_cell[quad_index];
+        let cell = used_cells[used_index];
+        let vert_type = mc_vert_type[quad_index] as usize;
+        if vert_type >= DMCQUAD.len() {
+            continue;
+        }
+        let mut quad = [0u32; 4];
+        let mut valid = true;
+        for i in 0..4 {
+            let entry = DMCQUAD[vert_type][i];
+            let nx = cell.x as isize + entry[0] as isize;
+            let ny = cell.y as isize + entry[1] as isize;
+            let nz = cell.z as isize + entry[2] as isize;
+            if nx < 0 || ny < 0 || nz < 0 {
+                valid = false;
+                break;
+            }
+            let nxu = nx as usize;
+            let nyu = ny as usize;
+            let nzu = nz as usize;
+            if nxu >= cell_nx || nyu >= cell_ny || nzu >= cell_nz {
+                valid = false;
+                break;
+            }
+
+            let neighbor_cell = cell_index(nxu, nyu, nzu, cell_nx, cell_ny);
+            let neighbor_used = cell_to_used[neighbor_cell];
+            if neighbor_used == usize::MAX {
+                valid = false;
+                break;
+            }
+            let neighbor_code = used_cells[neighbor_used].code as usize;
+            let eid = entry[3] as usize;
+            let offset = DMCEDGEOFFSET[neighbor_code][eid] as isize;
+            if offset < 0 {
+                valid = false;
+                break;
+            }
+            let v_index = patch_start[neighbor_used] + offset as usize;
+            if v_index >= total_patches {
+                valid = false;
+                break;
+            }
+            quad[i] = v_index as u32;
+        }
+        if valid {
+            quads.push(quad);
+        }
+    }
+
+    Some((verts, quads))
+}
+
+fn cell_index(x: usize, y: usize, z: usize, nx: usize, ny: usize) -> usize {
+    (z * ny + y) * nx + x
+}
+
+fn grid_index(x: usize, y: usize, z: usize, nx: usize, ny: usize) -> usize {
+    (z * ny + y) * nx + x
+}
+
+fn get_cell_code(grid: &[f32], dims: [usize; 3], x: usize, y: usize, z: usize, iso: f32) -> u8 {
+    let mut code = 0u8;
+    for (i, corner) in MCCORNERS.iter().enumerate() {
+        let cx = (x as i32 + corner[0]) as usize;
+        let cy = (y as i32 + corner[1]) as usize;
+        let cz = (z as i32 + corner[2]) as usize;
+        let v = grid[grid_index(cx, cy, cz, dims[0], dims[1])];
+        if v >= iso {
+            code |= 1u8 << i;
+        }
+    }
+    code
+}
+
+fn get_good_cell_code(
+    cell_codes: &[u8],
+    cell_dims: [usize; 3],
+    x: usize,
+    y: usize,
+    z: usize,
+    raw: u8,
+) -> u8 {
+    let direction = PROBLEMATICCONFIGS[raw as usize];
+    if direction == 255 {
+        return raw;
+    }
+
+    let component = (direction >> 1) as isize;
+    let delta = if (direction & 1) == 1 { 1isize } else { -1isize };
+    let mut nx = x as isize;
+    let mut ny = y as isize;
+    let mut nz = z as isize;
+    match component {
+        0 => nx += delta,
+        1 => ny += delta,
+        2 => nz += delta,
+        _ => {}
+    }
+    if nx < 0
+        || ny < 0
+        || nz < 0
+        || nx >= cell_dims[0] as isize
+        || ny >= cell_dims[1] as isize
+        || nz >= cell_dims[2] as isize
+    {
+        return raw;
+    }
+    let neighbor_idx = cell_index(nx as usize, ny as usize, nz as usize, cell_dims[0], cell_dims[1]);
+    let neighbor_code = cell_codes[neighbor_idx];
+    if PROBLEMATICCONFIGS[neighbor_code as usize] != 255 {
+        raw ^ 0xff
+    } else {
+        raw
+    }
+}
+
+fn compute_mc_vert(
+    grid: &[f32],
+    dims: [usize; 3],
+    x: usize,
+    y: usize,
+    z: usize,
+    dim: usize,
+    iso: f32,
+) -> [f32; 3] {
+    let (ox, oy, oz) = match dim {
+        0 => (1, 0, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, 1),
+        _ => (0, 0, 0),
+    };
+    let v0 = grid[grid_index(x, y, z, dims[0], dims[1])];
+    let v1 = grid[grid_index(x + ox, y + oy, z + oz, dims[0], dims[1])];
+    let mut t = if (v1 - v0).abs() > 0.0 {
+        (iso - v0) / (v1 - v0)
+    } else {
+        0.5
+    };
+    t = t.clamp(0.0, 1.0);
+    let p0 = [x as f32, y as f32, z as f32];
+    let p1 = [
+        (x + ox) as f32,
+        (y + oy) as f32,
+        (z + oz) as f32,
+    ];
+    [
+        p0[0] + (p1[0] - p0[0]) * t,
+        p0[1] + (p1[1] - p0[1]) * t,
+        p0[2] + (p1[2] - p0[2]) * t,
+    ]
+}
+
+fn triangulate_quads(vertices: &[[f32; 3]], quads: &[[u32; 4]]) -> Vec<[u32; 3]> {
+    let mut faces = Vec::with_capacity(quads.len() * 2);
+    for quad in quads {
+        let [a, b, c, d] = *quad;
+        let va = vertices[a as usize];
+        let vb = vertices[b as usize];
+        let vc = vertices[c as usize];
+        let vd = vertices[d as usize];
+
+        let config1 = triangle_max_cos(va, vb, vd).max(triangle_max_cos(vb, vc, vd));
+        let config2 = triangle_max_cos(va, vb, vc).max(triangle_max_cos(va, vc, vd));
+
+        if config1 < config2 {
+            faces.push([a, b, d]);
+            faces.push([b, c, d]);
+        } else {
+            faces.push([a, b, c]);
+            faces.push([a, c, d]);
+        }
+    }
+    faces
+}
+
+fn triangle_max_cos(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let v01 = normalize(sub(b, a));
+    let v02 = normalize(sub(c, a));
+    let v12 = normalize(sub(c, b));
+    let v10 = normalize(sub(a, b));
+    let v20 = normalize(sub(a, c));
+    let v21 = normalize(sub(b, c));
+    let cos1 = dot(v01, v02);
+    let cos2 = dot(v12, v10);
+    let cos3 = dot(v20, v21);
+    cos1.max(cos2).max(cos3)
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let denom = len.max(1e-12);
+    [v[0] / denom, v[1] / denom, v[2] / denom]
 }

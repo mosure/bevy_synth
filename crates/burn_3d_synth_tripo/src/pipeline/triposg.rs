@@ -1,18 +1,18 @@
-use burn::{
-    prelude::*,
-    tensor::Distribution,
-};
+use burn::{prelude::*, tensor::Distribution};
 
+#[cfg(feature = "import")]
+use crate::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
 use crate::model::triposg::{
     dit::TripoSGDiT,
     image_encoder::{DinoImageProcessor, TripoSGImageEncoder},
     scheduler::RectifiedFlowScheduler,
     vae::TripoSGVae,
 };
-#[cfg(feature = "import")]
-use crate::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
-use crate::pipeline::geometry::{hierarchical_extract_geometry, HierarchicalExtractConfig};
-use crate::pipeline::mesh::{grid_to_mesh, DenseGrid, Mesh};
+use crate::pipeline::geometry::{
+    FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
+    hierarchical_extract_geometry,
+};
+use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 
 #[derive(Debug)]
 pub struct TripoSGPipeline<B: Backend> {
@@ -124,24 +124,23 @@ impl<B: Backend> TripoSGPipeline<B> {
             .expect("failed to set timesteps");
 
         let num_channels = self.transformer.config().in_channels;
-        let mut latents = self.prepare_latents(
-            batch_size,
-            num_tokens,
-            num_channels,
-            &device,
-            latents,
-        );
+        let mut latents =
+            self.prepare_latents(batch_size, num_tokens, num_channels, &device, latents);
 
         let timesteps = self.scheduler.timesteps().to_vec();
+        let model_batch = if do_guidance {
+            batch_size * 2
+        } else {
+            batch_size
+        };
+        let timestep_template = Tensor::<B, 1>::zeros([model_batch as i32], &device);
         for &t in timesteps.iter() {
             let latent_model_input = if do_guidance {
                 Tensor::cat(vec![latents.clone(), latents.clone()], 0)
             } else {
                 latents.clone()
             };
-            let model_batch = latent_model_input.shape().dims::<3>()[0];
-            let timestep_values = vec![t; model_batch];
-            let timestep = Tensor::<B, 1>::from_floats(timestep_values.as_slice(), &device);
+            let timestep = timestep_template.clone().add_scalar(t);
 
             let mut noise_pred = self.transformer.forward(
                 latent_model_input,
@@ -153,13 +152,14 @@ impl<B: Backend> TripoSGPipeline<B> {
 
             if do_guidance {
                 let half = batch_size;
-                let noise_uncond = noise_pred
-                    .clone()
-                    .slice([0..half, 0..num_tokens, 0..num_channels]);
+                let noise_uncond =
+                    noise_pred
+                        .clone()
+                        .slice([0..half, 0..num_tokens, 0..num_channels]);
                 let noise_cond =
                     noise_pred.slice([half..(half * 2), 0..num_tokens, 0..num_channels]);
-                noise_pred = noise_uncond.clone()
-                    + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+                noise_pred =
+                    noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
             }
 
             latents = self.scheduler.step(noise_pred, t, latents);
@@ -187,37 +187,37 @@ impl<B: Backend> TripoSGPipeline<B> {
         let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
 
         let mut coords = Vec::with_capacity(chunk_size * 3);
-        let mut indices = Vec::with_capacity(chunk_size);
+        let mut chunk_start = 0usize;
 
         for idx in 0..total {
             let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
             coords.push(bounds[0] + step_x * x as f32);
             coords.push(bounds[1] + step_y * y as f32);
             coords.push(bounds[2] + step_z * z as f32);
-            indices.push(idx);
-
-            if indices.len() >= chunk_size {
-                write_decoded_chunk(
+            let count = coords.len() / 3;
+            if count >= chunk_size {
+                let end = chunk_start + count;
+                write_decoded_chunk_contiguous(
                     &latents,
                     &self.vae,
                     &coords,
-                    &indices,
                     &device,
-                    &mut values,
+                    &mut values[chunk_start..end],
                 )?;
                 coords.clear();
-                indices.clear();
+                chunk_start = end;
             }
         }
 
-        if !indices.is_empty() {
-            write_decoded_chunk(
+        if !coords.is_empty() {
+            let count = coords.len() / 3;
+            let end = chunk_start + count;
+            write_decoded_chunk_contiguous(
                 &latents,
                 &self.vae,
                 &coords,
-                &indices,
                 &device,
-                &mut values,
+                &mut values[chunk_start..end],
             )?;
         }
 
@@ -258,6 +258,38 @@ impl<B: Backend> TripoSGPipeline<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Generate a mesh from precomputed image embeddings, bypassing the image encoder.
+    pub fn sample_mesh_from_embeds(
+        &mut self,
+        image_embeds: Tensor<B, 3>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        bounds: [f32; 6],
+        resolution: usize,
+        chunk_size: usize,
+        latents: Option<Tensor<B, 3>>,
+    ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
+        let batch_size = image_embeds.shape().dims::<3>()[0];
+        let output = self.sample_from_embeds(
+            image_embeds,
+            batch_size,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            latents,
+        );
+        let grid = self.decode_grid(output.latents.clone(), bounds, resolution, chunk_size)?;
+        let mesh = grid_to_mesh(&grid, 0.0);
+        Ok(TripoSGMeshOutput {
+            latents: output.latents,
+            grid,
+            mesh,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn sample_mesh_hierarchical(
         &mut self,
         image: Tensor<B, 4>,
@@ -277,6 +309,93 @@ impl<B: Backend> TripoSGPipeline<B> {
         );
         let grid = hierarchical_extract_geometry(output.latents.clone(), &self.vae, config)?;
         let mesh = grid_to_mesh(&grid, 0.0);
+        Ok(TripoSGMeshOutput {
+            latents: output.latents,
+            grid,
+            mesh,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Generate a mesh with hierarchical extraction from precomputed image embeddings.
+    pub fn sample_mesh_hierarchical_from_embeds(
+        &mut self,
+        image_embeds: Tensor<B, 3>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        config: &HierarchicalExtractConfig,
+        latents: Option<Tensor<B, 3>>,
+    ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
+        let batch_size = image_embeds.shape().dims::<3>()[0];
+        let output = self.sample_from_embeds(
+            image_embeds,
+            batch_size,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            latents,
+        );
+        let grid = hierarchical_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let mesh = grid_to_mesh(&grid, 0.0);
+        Ok(TripoSGMeshOutput {
+            latents: output.latents,
+            grid,
+            mesh,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_mesh_flash(
+        &mut self,
+        image: Tensor<B, 4>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        config: &FlashExtractConfig,
+        latents: Option<Tensor<B, 3>>,
+    ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
+        let output = self.sample(
+            image,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            latents,
+        );
+        let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let mesh = sdf_to_mesh_diff_dmc(&grid);
+        Ok(TripoSGMeshOutput {
+            latents: output.latents,
+            grid,
+            mesh,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Generate a mesh with flash extraction from precomputed image embeddings.
+    pub fn sample_mesh_flash_from_embeds(
+        &mut self,
+        image_embeds: Tensor<B, 3>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        config: &FlashExtractConfig,
+        latents: Option<Tensor<B, 3>>,
+    ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
+        let batch_size = image_embeds.shape().dims::<3>()[0];
+        let output = self.sample_from_embeds(
+            image_embeds,
+            batch_size,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            latents,
+        );
+        let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let mesh = sdf_to_mesh_diff_dmc(&grid);
         Ok(TripoSGMeshOutput {
             latents: output.latents,
             grid,
@@ -328,13 +447,12 @@ fn dense_grid_index_to_xyz(index: usize, resolution: usize) -> (usize, usize, us
     (x, y, z)
 }
 
-fn write_decoded_chunk<B: Backend>(
+fn write_decoded_chunk_contiguous<B: Backend>(
     latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     coords: &[f32],
-    indices: &[usize],
     device: &B::Device,
-    output: &mut [f32],
+    output_slice: &mut [f32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let count = coords.len() / 3;
     if count == 0 {
@@ -349,9 +467,7 @@ fn write_decoded_chunk<B: Backend>(
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|err| format!("failed to convert decoded grid: {err:?}"))?;
-    for (i, &dst) in indices.iter().enumerate() {
-        output[dst] = data[i];
-    }
+    output_slice.copy_from_slice(&data[..output_slice.len()]);
     Ok(())
 }
 
@@ -363,8 +479,7 @@ impl<B: Backend> TripoSGPipeline<B> {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         use crate::model::triposg::dit::import::load_triposg_dit;
         use crate::model::triposg::image_encoder::import::{
-            load_dinov2_processor,
-            load_triposg_dinov2,
+            load_dinov2_processor, load_triposg_dinov2,
         };
         use crate::model::triposg::vae::import::load_triposg_vae;
 
@@ -375,23 +490,21 @@ impl<B: Backend> TripoSGPipeline<B> {
         let dino_path = root.join("image_encoder_dinov2/model.safetensors");
 
         let vae_config_path = root.join("vae/config.json");
-        let vae_config = crate::model::triposg::vae::TripoSGVaeConfig::from_config_file(
-            vae_config_path,
-        )
-        .unwrap_or_else(|_| crate::model::triposg::vae::TripoSGVaeConfig::midi_3d());
+        let vae_config =
+            crate::model::triposg::vae::TripoSGVaeConfig::from_config_file(vae_config_path)
+                .unwrap_or_else(|_| crate::model::triposg::vae::TripoSGVaeConfig::midi_3d());
         let vae = load_triposg_vae(&vae_config, device, vae_path)?;
 
         let dit_config_path = root.join("transformer/config.json");
-        let dit_config = crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(
-            dit_config_path,
-        )
-        .unwrap_or_else(|_| {
-            if dit_path.exists() {
-                crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained()
-            } else {
-                crate::model::triposg::dit::TripoSGDiTConfig::midi_3d()
-            }
-        });
+        let dit_config =
+            crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(dit_config_path)
+                .unwrap_or_else(|_| {
+                    if dit_path.exists() {
+                        crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained()
+                    } else {
+                        crate::model::triposg::dit::TripoSGDiTConfig::midi_3d()
+                    }
+                });
         let dit = load_triposg_dit(&dit_config, device, dit_path)?;
 
         let scheduler_config = RectifiedFlowSchedulerConfig::from_config_file(scheduler_path)?;

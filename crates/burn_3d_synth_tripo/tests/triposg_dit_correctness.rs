@@ -1,12 +1,16 @@
 #![cfg(feature = "import")]
 
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
 use burn_3d_synth_tripo::model::triposg::{
-    dit::{import::load_triposg_dit, TripoSGDiTConfig},
+    dit::{TripoSGDiTConfig, import::load_triposg_dit},
     hooks::HookRecorder,
 };
 
@@ -29,8 +33,7 @@ fn triposg_dit_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
 
-    let weights_path =
-        resolve_weights_path("transformer/diffusion_pytorch_model.safetensors");
+    let weights_path = resolve_weights_path("transformer/diffusion_pytorch_model.safetensors");
     if !weights_path.exists() {
         eprintln!(
             "skipping: DiT weights file not found at {}",
@@ -45,8 +48,7 @@ fn triposg_dit_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>>
         .parent()
         .and_then(|path| TripoSGDiTConfig::from_config_file(path.join("config.json")).ok())
         .unwrap_or_else(TripoSGDiTConfig::midi_3d);
-    let model =
-        load_triposg_dit::<burn::backend::NdArray<f32>>(&config, &device, &weights_path)?;
+    let model = load_triposg_dit::<burn::backend::NdArray<f32>>(&config, &device, &weights_path)?;
 
     let hidden_states = reference
         .get_input("input.hidden_states")
@@ -61,7 +63,8 @@ fn triposg_dit_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>>
         .get_input("input.timestep")
         .ok_or("missing input.timestep in reference")?;
 
-    let hidden_states = tensor_from_data_3d::<burn::backend::NdArray<f32>>(&hidden_states, &device)?;
+    let hidden_states =
+        tensor_from_data_3d::<burn::backend::NdArray<f32>>(&hidden_states, &device)?;
     let encoder_hidden_states =
         tensor_from_data_3d::<burn::backend::NdArray<f32>>(&encoder_hidden_states, &device)?;
     let encoder_hidden_states_2 =
@@ -190,11 +193,7 @@ fn tensor_from_data_3d<B: Backend>(
         .try_into()
         .map_err(|_| "unexpected input rank")?;
     let data = Tensor::<B, 1>::from_floats(tensor.data.as_slice(), device);
-    Ok(data.reshape([
-        shape[0] as i32,
-        shape[1] as i32,
-        shape[2] as i32,
-    ]))
+    Ok(data.reshape([shape[0] as i32, shape[1] as i32, shape[2] as i32]))
 }
 
 struct MetricStats {

@@ -1,13 +1,17 @@
 #![cfg(feature = "import")]
 
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
 use burn_3d_synth_tripo::model::triposg::{
     hooks::HookRecorder,
-    vae::{import::load_triposg_vae, TripoSGVaeConfig},
+    vae::{TripoSGVaeConfig, import::load_triposg_vae},
 };
 
 const FALLBACK_WEIGHTS_PATH: &str = "assets/models/MIDI-3D/vae/diffusion_pytorch_model.safetensors";
@@ -43,11 +47,7 @@ fn triposg_vae_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>>
         .parent()
         .and_then(|path| TripoSGVaeConfig::from_config_file(path.join("config.json")).ok())
         .unwrap_or_else(TripoSGVaeConfig::midi_3d);
-    let model = load_triposg_vae::<burn::backend::NdArray<f32>>(
-        &config,
-        &device,
-        &weights_path,
-    )?;
+    let model = load_triposg_vae::<burn::backend::NdArray<f32>>(&config, &device, &weights_path)?;
 
     let coords = reference
         .get_input("input.coords")
@@ -166,11 +166,7 @@ fn tensor_from_data<B: Backend>(
         .try_into()
         .map_err(|_| "unexpected input rank")?;
     let data = Tensor::<B, 1>::from_floats(tensor.data.as_slice(), device);
-    Ok(data.reshape([
-        shape[0] as i32,
-        shape[1] as i32,
-        shape[2] as i32,
-    ]))
+    Ok(data.reshape([shape[0] as i32, shape[1] as i32, shape[2] as i32]))
 }
 
 struct MetricStats {

@@ -1,6 +1,10 @@
 #![cfg(feature = "import")]
 
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
@@ -10,8 +14,7 @@ use burn_3d_synth_tripo::model::triposg::{
     image_encoder::import::{load_dinov2_processor, load_triposg_dinov2},
 };
 
-const FALLBACK_WEIGHTS_PATH: &str =
-    "assets/models/MIDI-3D/image_encoder_dinov2/model.safetensors";
+const FALLBACK_WEIGHTS_PATH: &str = "assets/models/MIDI-3D/image_encoder_dinov2/model.safetensors";
 const TRIPOSG_ROOT: &str = r"E:\repos\TripoSG\pretrained_weights\TripoSG";
 
 const PATCH_MAX_ABS: f32 = 1.5;

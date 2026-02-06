@@ -10,15 +10,18 @@ use burn_3d_synth_bg_removal::model::import::{
     import_rmbg_burnpack, load_rmbg_config, resolve_rmbg_weights_root,
 };
 use burn_3d_synth_tripo::model::triposg::{
-    dit::{import::import_triposg_dit_burnpack, TripoSGDiTConfig},
+    dit::{TripoSGDiTConfig, import::import_triposg_dit_burnpack},
     image_encoder::import::{import_triposg_dinov2_burnpack, resolve_triposg_weights_root},
-    vae::{import::import_triposg_vae_burnpack, TripoSGVaeConfig},
+    vae::{TripoSGVaeConfig, import::import_triposg_vae_burnpack},
 };
 
 type Backend = NdArray<f32>;
 
 #[derive(Parser, Debug)]
-#[command(about = "Import TripoSG safetensors into Burnpack (.bpk) files", version)]
+#[command(
+    about = "Import TripoSG safetensors into Burnpack (.bpk) files",
+    version
+)]
 struct Args {
     #[arg(long)]
     weights_root: Option<PathBuf>,
@@ -46,52 +49,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dino_path = weights_root.join("image_encoder_dinov2/model.safetensors");
 
     let vae_config_path = weights_root.join("vae/config.json");
-    let vae_config =
-        TripoSGVaeConfig::from_config_file(vae_config_path).unwrap_or_else(|_| {
-            TripoSGVaeConfig::midi_3d()
-        });
+    let vae_config = TripoSGVaeConfig::from_config_file(vae_config_path)
+        .unwrap_or_else(|_| TripoSGVaeConfig::midi_3d());
 
     let dit_config_path = weights_root.join("transformer/config.json");
-    let dit_config =
-        TripoSGDiTConfig::from_config_file(dit_config_path).unwrap_or_else(|_| {
-            if dit_path.exists() {
-                TripoSGDiTConfig::triposg_pretrained()
-            } else {
-                TripoSGDiTConfig::midi_3d()
-            }
-        });
+    let dit_config = TripoSGDiTConfig::from_config_file(dit_config_path).unwrap_or_else(|_| {
+        if dit_path.exists() {
+            TripoSGDiTConfig::triposg_pretrained()
+        } else {
+            TripoSGDiTConfig::midi_3d()
+        }
+    });
 
-    import_if_needed(
-        "VAE",
-        &vae_path,
-        args.overwrite,
-        || import_triposg_vae_burnpack::<Backend>(&vae_config, &device, &vae_path),
-    )?;
+    import_if_needed("VAE", &vae_path, args.overwrite, || {
+        import_triposg_vae_burnpack::<Backend>(&vae_config, &device, &vae_path)
+    })?;
 
-    import_if_needed(
-        "DiT",
-        &dit_path,
-        args.overwrite,
-        || import_triposg_dit_burnpack::<Backend>(&dit_config, &device, &dit_path),
-    )?;
+    import_if_needed("DiT", &dit_path, args.overwrite, || {
+        import_triposg_dit_burnpack::<Backend>(&dit_config, &device, &dit_path)
+    })?;
 
-    import_if_needed(
-        "DINOv2",
-        &dino_path,
-        args.overwrite,
-        || import_triposg_dinov2_burnpack::<Backend>(&device, &dino_path),
-    )?;
+    import_if_needed("DINOv2", &dino_path, args.overwrite, || {
+        import_triposg_dinov2_burnpack::<Backend>(&device, &dino_path)
+    })?;
 
     if !args.skip_rmbg {
         let rmbg_root = args.rmbg_root.unwrap_or_else(resolve_rmbg_weights_root);
         let rmbg_weights = rmbg_root.join("model.safetensors");
         let rmbg_config = load_rmbg_config(&rmbg_root)?;
-        import_if_needed(
-            "RMBG",
-            &rmbg_weights,
-            args.overwrite,
-            || import_rmbg_burnpack::<Backend>(&device, &rmbg_weights, &rmbg_config),
-        )?;
+        import_if_needed("RMBG", &rmbg_weights, args.overwrite, || {
+            import_rmbg_burnpack::<Backend>(&device, &rmbg_weights, &rmbg_config)
+        })?;
     }
 
     Ok(())
@@ -124,7 +112,10 @@ where
 
     let burnpack = burnpack_path(weights_path);
     if burnpack.exists() && !overwrite {
-        println!("[IMPORT] {label} burnpack already exists at {}, skipping.", burnpack.display());
+        println!(
+            "[IMPORT] {label} burnpack already exists at {}, skipping.",
+            burnpack.display()
+        );
         return Ok(());
     }
 

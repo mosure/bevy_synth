@@ -44,7 +44,10 @@ impl RmbgImageProcessor {
             do_rescale: config.do_rescale.unwrap_or(true),
             do_normalize: config.do_normalize.unwrap_or(true),
             do_resize: config.do_resize.unwrap_or(true),
-            size: config.size.map(|s| [s.height, s.width]).or(Some([1024, 1024])),
+            size: config
+                .size
+                .map(|s| [s.height, s.width])
+                .or(Some([1024, 1024])),
             resize_mode,
         }
     }
@@ -52,7 +55,9 @@ impl RmbgImageProcessor {
     pub fn preprocess<B: Backend>(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
         let mut image = image;
 
-        if self.do_resize && let Some([height, width]) = self.size {
+        if self.do_resize
+            && let Some([height, width]) = self.size
+        {
             let options = InterpolateOptions {
                 mode: self.resize_mode.clone(),
             };

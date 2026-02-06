@@ -1,15 +1,19 @@
 #![cfg(feature = "import")]
 
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
+use burn_3d_synth_bg_removal::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_data};
 use burn_3d_synth_tripo::pipeline::{
-    mesh::{grid_to_mesh, DenseGrid, Mesh as TripoMesh},
+    mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh},
     triposg_scribble::TripoSGScribblePipeline,
 };
-use burn_3d_synth_bg_removal::pipeline::{prepare_image_data, PrepareImageConfig, RmbgPipeline};
 
 const TRIPOSG_SCRIBBLE_ROOT: &str = r"E:\repos\TripoSG\pretrained_weights\TripoSG-scribble";
 const RMBG_ROOT: &str = r"E:\repos\TripoSG\pretrained_weights\RMBG-1.4";
@@ -22,8 +26,7 @@ const GRID_MAX_ABS: f32 = 1e-1;
 
 #[test]
 fn triposg_scribble_pipeline_matches_reference() -> Result<(), Box<dyn std::error::Error>> {
-    let reference_path =
-        asset_path("assets/hooks/triposg_scribble_pipeline_reference.safetensors");
+    let reference_path = asset_path("assets/hooks/triposg_scribble_pipeline_reference.safetensors");
     if !reference_path.exists() {
         eprintln!(
             "skipping: scribble pipeline reference file not found at {}",
@@ -83,7 +86,8 @@ fn triposg_scribble_pipeline_matches_reference() -> Result<(), Box<dyn std::erro
     ];
 
     let input_image = tensor_from_data_4d::<burn::backend::NdArray<f32>>(&input_image, &device)?;
-    let input_latents = tensor_from_data_3d::<burn::backend::NdArray<f32>>(&input_latents, &device)?;
+    let input_latents =
+        tensor_from_data_3d::<burn::backend::NdArray<f32>>(&input_latents, &device)?;
     let text_embeds =
         tensor_from_data_3d::<burn::backend::NdArray<f32>>(&input_text_embeds, &device)?;
 
@@ -138,7 +142,8 @@ fn triposg_scribble_pipeline_matches_reference() -> Result<(), Box<dyn std::erro
     ) {
         let do_guidance = guidance_scale > 1.0;
         let guided_text = if do_guidance {
-            let zeros = Tensor::<burn::backend::NdArray<f32>, 3>::zeros(text_embeds.shape(), &device);
+            let zeros =
+                Tensor::<burn::backend::NdArray<f32>, 3>::zeros(text_embeds.shape(), &device);
             Tensor::cat(vec![zeros, text_embeds.clone()], 0)
         } else {
             text_embeds.clone()
@@ -184,10 +189,9 @@ fn triposg_scribble_pipeline_matches_reference() -> Result<(), Box<dyn std::erro
                 let noise_uncond = noise_pred
                     .clone()
                     .slice([0..half, 0..num_tokens, 0..channels]);
-                let noise_cond =
-                    noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
-                noise_pred = noise_uncond.clone()
-                    + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+                let noise_cond = noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
+                noise_pred =
+                    noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
             }
 
             let stats = compute_stats_from_tensor(&noise_pred, &step0_noise_ref)?;
@@ -246,7 +250,10 @@ fn triposg_scribble_pipeline_matches_reference() -> Result<(), Box<dyn std::erro
         size: [resolution, resolution, resolution],
         bounds,
     };
-    compare_meshes(&grid_to_mesh(&grid, 0.0), &grid_to_mesh(&reference_grid, 0.0))?;
+    compare_meshes(
+        &grid_to_mesh(&grid, 0.0),
+        &grid_to_mesh(&reference_grid, 0.0),
+    )?;
 
     Ok(())
 }
@@ -303,7 +310,9 @@ impl HookReference {
     }
 
     fn get_scalar(&self, name: &str) -> Option<f32> {
-        self.tensors.get(name).and_then(|tensor| tensor.data.first().copied())
+        self.tensors
+            .get(name)
+            .and_then(|tensor| tensor.data.first().copied())
     }
 
     fn get_vector(&self, name: &str) -> Option<Vec<f32>> {
@@ -331,11 +340,7 @@ fn tensor_from_data_3d<B: Backend>(
         .try_into()
         .map_err(|_| "unexpected input rank")?;
     let data = Tensor::<B, 1>::from_floats(tensor.data.as_slice(), device);
-    Ok(data.reshape([
-        shape[0] as i32,
-        shape[1] as i32,
-        shape[2] as i32,
-    ]))
+    Ok(data.reshape([shape[0] as i32, shape[1] as i32, shape[2] as i32]))
 }
 
 fn tensor_from_data_4d<B: Backend>(

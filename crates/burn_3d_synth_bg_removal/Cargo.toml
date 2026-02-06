@@ -11,7 +11,7 @@ default = []
 import = ["burn-store", "serde", "serde_json"]
 
 [dependencies]
-burn = { version = "0.19", default-features = true, features = ["ndarray", "std"] }
+burn = { version = "0.19", default-features = false, features = ["ndarray", "std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }

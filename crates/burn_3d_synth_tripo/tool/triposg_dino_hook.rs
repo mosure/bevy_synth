@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy_args::{parse_args, Deserialize, Parser, Serialize};
+use bevy_args::{Deserialize, Parser, Serialize, parse_args};
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
@@ -69,9 +69,7 @@ fn resolve_weights_path(arg: Option<&PathBuf>) -> PathBuf {
             if candidate.exists() {
                 return candidate;
             }
-            let nested = path
-                .join("image_encoder_dinov2")
-                .join("model.safetensors");
+            let nested = path.join("image_encoder_dinov2").join("model.safetensors");
             if nested.exists() {
                 return nested;
             }
@@ -122,10 +120,7 @@ fn resolve_output_path(path: PathBuf) -> PathBuf {
 
 fn resolve_weights_root_from_path(weights_path: &Path) -> PathBuf {
     if weights_path.is_dir() {
-        if weights_path
-            .join("feature_extractor_dinov2")
-            .exists()
-        {
+        if weights_path.join("feature_extractor_dinov2").exists() {
             return weights_path.to_path_buf();
         }
         if weights_path

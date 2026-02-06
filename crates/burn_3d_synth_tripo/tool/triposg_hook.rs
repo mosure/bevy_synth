@@ -3,13 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy_args::{parse_args, Deserialize, Parser, Serialize};
+use bevy_args::{Deserialize, Parser, Serialize, parse_args};
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
 use burn_3d_synth_tripo::model::triposg::{
     hooks::HookRecorder,
-    vae::{import::load_triposg_vae, TripoSGVaeConfig},
+    vae::{TripoSGVaeConfig, import::load_triposg_vae},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Parser)]
@@ -35,10 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = <BackendImpl as burn::tensor::backend::Backend>::Device::default();
     let inputs = resolve_io_path(args.inputs);
     let output = resolve_output_path(args.output);
-    let weights = resolve_weights_path(
-        args.weights,
-        "vae/diffusion_pytorch_model.safetensors",
-    );
+    let weights = resolve_weights_path(args.weights, "vae/diffusion_pytorch_model.safetensors");
 
     let bytes = fs::read(&inputs)?;
     let tensors = SafeTensors::deserialize(&bytes)?;
@@ -58,7 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hooks.record_tensor("input.features", &features);
     hooks.record_tensor("input.query_coords", &query_coords);
 
-    let _output = model.forward(coords, features, query_coords, args.use_mean, Some(&mut hooks));
+    let _output = model.forward(
+        coords,
+        features,
+        query_coords,
+        args.use_mean,
+        Some(&mut hooks),
+    );
     hooks.write_safetensors(&output)?;
 
     println!("Saved hook outputs to {}", output.display());

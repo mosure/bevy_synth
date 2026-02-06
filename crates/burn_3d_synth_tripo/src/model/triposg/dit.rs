@@ -1,16 +1,7 @@
-use burn::{
-    module::Ignored,
-    nn,
-    prelude::*,
-    tensor::Int,
-};
+use burn::{module::Ignored, nn, prelude::*, tensor::Int};
 
 use super::{
-    components::{
-        CrossAttention,
-        FeedForward,
-        record_tensor,
-    },
+    components::{CrossAttention, FeedForward, record_tensor},
     hooks::HookRecorder,
 };
 
@@ -155,8 +146,8 @@ pub struct TripoSGDiTBlock<B: Backend> {
     pub attn2_2: Option<CrossAttention<B>>,
     pub norm3: nn::LayerNorm<B>,
     pub ff: FeedForward<B>,
-    pub skip_norm: nn::LayerNorm<B>,
-    pub skip_linear: nn::Linear<B>,
+    pub skip_norm: Option<nn::LayerNorm<B>>,
+    pub skip_linear: Option<nn::Linear<B>>,
     use_self_attention: bool,
     use_cross_attention: bool,
     use_cross_attention_2: bool,
@@ -181,7 +172,9 @@ impl<B: Backend> TripoSGDiTBlock<B> {
         skip_norm_last: bool,
     ) -> Self {
         let norm1 = nn::LayerNormConfig::new(dim).init(device);
-        let attn1 = CrossAttention::new(device, dim, dim, num_heads, false, true, true, false);
+        let attn1 = CrossAttention::new(
+            device, dim, dim, num_heads, false, true, false, true, false,
+        );
         let norm2 = nn::LayerNormConfig::new(dim).init(device);
         let attn2 = CrossAttention::new(
             device,
@@ -190,13 +183,16 @@ impl<B: Backend> TripoSGDiTBlock<B> {
             num_heads,
             false,
             true,
+            false,
             true,
             true,
         );
         let (norm2_2, attn2_2) = if use_cross_attention_2 {
             let dim2 = cross_attention_2_dim.expect("cross_attention_2_dim required");
             let norm2_2 = nn::LayerNormConfig::new(dim).init(device);
-            let attn2_2 = CrossAttention::new(device, dim, dim2, num_heads, false, true, true, true);
+            let attn2_2 = CrossAttention::new(
+                device, dim, dim2, num_heads, false, true, false, true, true,
+            );
             (Some(norm2_2), Some(attn2_2))
         } else {
             (None, None)
@@ -204,10 +200,15 @@ impl<B: Backend> TripoSGDiTBlock<B> {
         let norm3 = nn::LayerNormConfig::new(dim).init(device);
         let ff = FeedForward::new(device, dim, dim * 4);
 
-        let skip_norm = nn::LayerNormConfig::new(dim).init(device);
-        let skip_linear = nn::LinearConfig::new(dim * 2, dim)
-            .with_bias(true)
-            .init(device);
+        let (skip_norm, skip_linear) = if use_skip {
+            let skip_norm = nn::LayerNormConfig::new(dim).init(device);
+            let skip_linear = nn::LinearConfig::new(dim * 2, dim)
+                .with_bias(true)
+                .init(device);
+            (Some(skip_norm), Some(skip_linear))
+        } else {
+            (None, None)
+        };
 
         Self {
             norm1,
@@ -243,6 +244,14 @@ impl<B: Backend> TripoSGDiTBlock<B> {
 
         if self.use_skip {
             let skip = skip.expect("skip tensor required for this block");
+            let skip_norm = self
+                .skip_norm
+                .as_ref()
+                .expect("skip_norm missing for skip block");
+            let skip_linear = self
+                .skip_linear
+                .as_ref()
+                .expect("skip_linear missing for skip block");
             let cat = if self.skip_concat_front {
                 Tensor::cat(vec![skip, hidden], 2)
             } else {
@@ -250,11 +259,11 @@ impl<B: Backend> TripoSGDiTBlock<B> {
             };
 
             if self.skip_norm_last {
-                let out = self.skip_linear.forward(cat);
-                hidden = self.skip_norm.forward(out);
+                let out = skip_linear.forward(cat);
+                hidden = skip_norm.forward(out);
             } else {
-                let out = self.skip_norm.forward(cat);
-                hidden = self.skip_linear.forward(out);
+                let out = skip_norm.forward(cat);
+                hidden = skip_linear.forward(out);
             }
 
             record_tensor(&mut hook, &format!("{prefix}.skip"), &hidden);
@@ -285,14 +294,8 @@ impl<B: Backend> TripoSGDiTBlock<B> {
                 );
 
                 let enc2 = encoder_hidden_states_2.expect("encoder_hidden_states_2 required");
-                let norm2_2 = self
-                    .norm2_2
-                    .as_ref()
-                    .expect("norm2_2 required");
-                let attn2_2 = self
-                    .attn2_2
-                    .as_ref()
-                    .expect("attn2_2 required");
+                let norm2_2 = self.norm2_2.as_ref().expect("norm2_2 required");
+                let attn2_2 = self.attn2_2.as_ref().expect("attn2_2 required");
                 let norm_hidden = norm2_2.forward(hidden.clone());
                 record_tensor(&mut hook, &format!("{prefix}.norm2_2"), &norm_hidden);
                 let attn2_2 = attn2_2.forward(
@@ -320,7 +323,9 @@ impl<B: Backend> TripoSGDiTBlock<B> {
 
         let norm_hidden = self.norm3.forward(hidden.clone());
         record_tensor(&mut hook, &format!("{prefix}.norm3"), &norm_hidden);
-        let ff = self.ff.forward(norm_hidden, hook.as_deref_mut(), &format!("{prefix}.ff"));
+        let ff = self
+            .ff
+            .forward(norm_hidden, hook.as_deref_mut(), &format!("{prefix}.ff"));
         let hidden = hidden + ff;
         record_tensor(&mut hook, &format!("{prefix}.out"), &hidden);
         hidden
@@ -440,11 +445,7 @@ pub mod import {
 
     use burn::prelude::*;
     use burn_store::{
-        BurnpackStore,
-        KeyRemapper,
-        ModuleSnapshot,
-        PyTorchToBurnAdapter,
-        SafetensorsStore,
+        BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
 
     use super::{TripoSGDiT, TripoSGDiTConfig};
@@ -530,7 +531,7 @@ pub mod import {
 
         let store = SafetensorsStore::from_file(path)
             .with_from_adapter(PyTorchToBurnAdapter)
-            .allow_partial(true)
+            .allow_partial(false)
             .remap(remapper)
             .validate(true);
 
@@ -541,8 +542,14 @@ pub mod import {
         &[
             (r"^(blocks\.\d+\.attn1\.to_out)\.0\.(weight|bias)$", "$1.$2"),
             (r"^(blocks\.\d+\.attn2\.to_out)\.0\.(weight|bias)$", "$1.$2"),
-            (r"^(blocks\.\d+\.attn2_2\.to_out)\.0\.(weight|bias)$", "$1.$2"),
-            (r"^(blocks\.\d+\.ff)\.net\.0\.proj\.(weight|bias)$", "$1.proj.$2"),
+            (
+                r"^(blocks\.\d+\.attn2_2\.to_out)\.0\.(weight|bias)$",
+                "$1.$2",
+            ),
+            (
+                r"^(blocks\.\d+\.ff)\.net\.0\.proj\.(weight|bias)$",
+                "$1.proj.$2",
+            ),
             (r"^(blocks\.\d+\.ff)\.net\.2\.(weight|bias)$", "$1.out.$2"),
             (r"^(blocks\.\d+\.norm1)\.weight$", "$1.gamma"),
             (r"^(blocks\.\d+\.norm1)\.bias$", "$1.beta"),
