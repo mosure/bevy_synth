@@ -32,13 +32,14 @@ default = []
 
 benchmark = ["burn/autotune", "burn/fusion"]
 import = ["bevy_args", "burn-store", "clap", "serde", "serde_json"]
+foreground = ["dep:burn_foreground"]
 cuda = ["burn-cuda"]
 report = []
 
 
 [dependencies]
 burn_dino = { version = "0.6", default-features = false, features = ["backend_ndarray"] }
-burn_foreground = { path = "../burn_foreground", features = ["import"] }
+burn_foreground = { path = "../burn_foreground", features = ["import"], optional = true }
 burn-store = { version = "0.19", optional = true }
 bevy_args = { version = "2.0", optional = true }
 bytemuck = "1.25"
@@ -109,6 +110,7 @@ criterion = { version = "0.6", features = ["html_reports"] }
 futures-intrusive = { version = "0.5.0" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = { version = "0.4.0" }
+burn_foreground = { path = "../burn_foreground", features = ["import"] }
 
 
 [lib]
@@ -137,7 +139,7 @@ required-features = ["import"]
 [[bin]]
 name = "triposg_profile"
 path = "tool/triposg_profile.rs"
-required-features = ["import"]
+required-features = ["import", "foreground"]
 
 [[bin]]
 name = "triposg_import"
@@ -152,7 +154,7 @@ required-features = ["import"]
 [[bin]]
 name = "triposg_report"
 path = "src/bin/triposg_report.rs"
-required-features = ["import", "report"]
+required-features = ["import", "report", "foreground"]
 
 [[bench]]
 name = "triposg_pipeline"

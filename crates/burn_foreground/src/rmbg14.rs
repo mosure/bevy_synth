@@ -602,7 +602,7 @@ pub mod import {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "Burnpack weights missing. Checked: {checked}. Run `triposg_import` to generate .bpk files."
+                "Burnpack weights missing. Checked: {checked}. Run `foreground_import` to generate .bpk files."
             )
             .into());
         };
@@ -652,12 +652,9 @@ pub mod import {
                 return path;
             }
         }
-        let tripo_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../burn_tripo/assets/models/RMBG-1.4");
-        if tripo_assets.exists() {
-            return tripo_assets;
-        }
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-1.4")
+        let foreground_assets =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-1.4");
+        foreground_assets
     }
 
     pub fn load_rmbg_processor_config(

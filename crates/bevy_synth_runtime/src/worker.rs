@@ -12,15 +12,15 @@ use burn::prelude::*;
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 
-#[cfg(target_arch = "wasm32")]
-use burn_foreground::model::import::{
-    load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_bytes,
-    load_rmbg_processor_from_json_bytes,
-};
 use burn_foreground::pipeline::{
     PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data, prepare_image_tensor,
 };
 use burn_foreground::rmbg2::Rmbg2Pipeline;
+#[cfg(target_arch = "wasm32")]
+use burn_foreground::rmbg14::import::{
+    load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_bytes,
+    load_rmbg_processor_from_json_bytes,
+};
 #[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::dit::TripoSGDiTConfig;
 #[cfg(target_arch = "wasm32")]
@@ -52,6 +52,7 @@ use burn_tripo::pipeline::{
 
 use crate::args::{
     AppArgs, BackendKind, DEFAULT_CHUNK_SIZE, DinoBackend, MeshMode, RmbgBackend, RmbgModel,
+    SynthesisModel,
 };
 use crate::io::load_text_embeds;
 use crate::paths::{resolve_rmbg_root, resolve_scribble_root, resolve_triposg_root};
@@ -74,10 +75,10 @@ pub fn start_worker(args: &AppArgs) -> InferenceWorker {
     let (event_tx, event_rx) = mpsc::channel();
     let args = args.clone();
     let _ = thread::Builder::new()
-        .name("triposg-worker".to_string())
+        .name("synth-worker".to_string())
         .stack_size(64 * 1024 * 1024)
         .spawn(move || worker_loop(args, command_rx, event_tx))
-        .expect("failed to spawn TripoSG worker thread");
+        .expect("failed to spawn synth worker thread");
     InferenceWorker {
         sender: command_tx,
         receiver: Mutex::new(event_rx),
@@ -202,6 +203,8 @@ struct PipelineState<B: Backend> {
     dino_cpu: Option<DinoCpuState>,
     triposg: Option<TripoSGPipeline<B>>,
     scribble: Option<TripoSGScribblePipeline<B>>,
+    synthesis_models: Vec<SynthesisModel>,
+    triposg_load_error: Option<String>,
     text_embeds: Option<Tensor<B, 3>>,
     bounds: [f32; 6],
     hierarchical: HierarchicalExtractConfig,
@@ -213,6 +216,34 @@ struct DinoCpuState {
     device: <burn::backend::NdArray<f32> as Backend>::Device,
     encoder: TripoSGImageEncoder<burn::backend::NdArray<f32>>,
     processor: DinoImageProcessor,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_rmbg14_pipelines<B: Backend>(
+    rmbg_root: &std::path::Path,
+    rmbg_backend: RmbgBackend,
+    device: &B::Device,
+) -> Result<
+    (
+        Option<RmbgPipeline<burn::backend::NdArray<f32>>>,
+        Option<RmbgPipeline<B>>,
+    ),
+    String,
+> {
+    match rmbg_backend {
+        RmbgBackend::Cpu => {
+            let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
+            let rmbg = RmbgPipeline::from_pretrained(rmbg_root, &cpu_device)
+                .map_err(|err| format!("failed to load RMBG-1.4 weights on CPU: {err}"))?;
+            Ok((Some(rmbg), None))
+        }
+        RmbgBackend::Gpu | RmbgBackend::Auto => {
+            let mut rmbg = RmbgPipeline::from_pretrained(rmbg_root, device)
+                .map_err(|err| format!("failed to load RMBG-1.4 weights: {err}"))?;
+            cap_rmbg14_processor_for_backend::<B>(&mut rmbg, rmbg_backend);
+            Ok((None, Some(rmbg)))
+        }
+    }
 }
 
 fn worker_loop_backend<B: Backend>(
@@ -316,50 +347,13 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         }
     }
 
-    let rmbg_model = args.rmbg_model;
-    let rmbg_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), rmbg_model);
-    let rmbg_backend = match args.rmbg_backend {
-        RmbgBackend::Auto => RmbgBackend::Gpu,
-        other => other,
-    };
-    let (rmbg14_cpu, rmbg14_device, rmbg2) = match rmbg_model {
-        RmbgModel::Rmbg14 => match rmbg_backend {
-            RmbgBackend::Cpu => {
-                let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-                let rmbg = RmbgPipeline::from_pretrained(&rmbg_root, &cpu_device)
-                    .map_err(|err| format!("failed to load RMBG-1.4 weights on CPU: {err}"))?;
-                (Some(rmbg), None, None)
-            }
-            RmbgBackend::Gpu | RmbgBackend::Auto => {
-                let mut rmbg = RmbgPipeline::from_pretrained(&rmbg_root, &device)
-                    .map_err(|err| format!("failed to load RMBG-1.4 weights: {err}"))?;
-                cap_rmbg14_processor_for_backend::<B>(&mut rmbg, rmbg_backend);
-                (None, Some(rmbg), None)
-            }
-        },
-        RmbgModel::Rmbg2 => {
-            let rmbg2 = Rmbg2Pipeline::from_pretrained(&rmbg_root)
-                .map_err(|err| format!("failed to load RMBG-2.0 ONNX model: {err}"))?;
-            (None, None, Some(rmbg2))
-        }
-    };
-
-    let chunk_size = tuned_chunk_size::<B>(args.chunk_size);
-    let hierarchical = HierarchicalExtractConfig {
-        bounds,
-        dense_octree_depth: args.dense_octree_depth,
-        hierarchical_octree_depth: args.hierarchical_octree_depth,
-        chunk_size,
-        band_threshold: args.band_threshold,
-    };
-    let flash = FlashExtractConfig {
-        bounds,
-        octree_depth: args.flash_octree_depth,
-        num_chunks: args.flash_num_chunks,
-        mc_level: args.flash_mc_level,
-        min_resolution: args.flash_min_resolution,
-        mini_grid_num: args.flash_mini_grid_num,
-    };
+    let synthesis_models = args.synthesis_models.clone();
+    let wants_triposg = synthesis_models
+        .iter()
+        .any(|model| matches!(model, SynthesisModel::Triposg));
+    let wants_trellis = synthesis_models
+        .iter()
+        .any(|model| matches!(model, SynthesisModel::Trellis));
 
     let dino_backend = match args.dino_backend {
         DinoBackend::Auto => {
@@ -380,6 +374,97 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
             }
         }
         other => other,
+    };
+
+    let chunk_size = tuned_chunk_size::<B>(args.chunk_size);
+    let hierarchical = HierarchicalExtractConfig {
+        bounds,
+        dense_octree_depth: args.dense_octree_depth,
+        hierarchical_octree_depth: args.hierarchical_octree_depth,
+        chunk_size,
+        band_threshold: args.band_threshold,
+    };
+    let flash = FlashExtractConfig {
+        bounds,
+        octree_depth: args.flash_octree_depth,
+        num_chunks: args.flash_num_chunks,
+        mc_level: args.flash_mc_level,
+        min_resolution: args.flash_min_resolution,
+        mini_grid_num: args.flash_mini_grid_num,
+    };
+    let requested_rmbg_model = args.rmbg_model;
+    let rmbg_backend = match args.rmbg_backend {
+        RmbgBackend::Auto => RmbgBackend::Gpu,
+        other => other,
+    };
+
+    if wants_trellis && !wants_triposg {
+        if args.text_embeds.is_some() || args.prompt.is_some() {
+            return Err(
+                "text/scribble mode currently requires TripoSG; include `triposg` in --synthesis-models"
+                    .to_string(),
+            );
+        }
+        warn!("Trellis backend selected, but Trellis inference is not implemented yet.");
+        return Ok(PipelineState {
+            device,
+            rmbg14_cpu: None,
+            rmbg14_device: None,
+            rmbg2: None,
+            rmbg_model: requested_rmbg_model,
+            rmbg_backend,
+            dino_backend,
+            dino_cpu: None,
+            triposg: None,
+            scribble: None,
+            synthesis_models,
+            triposg_load_error: None,
+            text_embeds: None,
+            bounds,
+            hierarchical,
+            chunk_size,
+            flash,
+        });
+    }
+
+    let mut active_rmbg_model = requested_rmbg_model;
+    let (rmbg14_cpu, rmbg14_device, rmbg2) = match requested_rmbg_model {
+        RmbgModel::Rmbg14 => {
+            let rmbg14_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), RmbgModel::Rmbg14);
+            let (cpu, device_pipeline) =
+                load_rmbg14_pipelines::<B>(&rmbg14_root, rmbg_backend, &device)?;
+            (cpu, device_pipeline, None)
+        }
+        RmbgModel::Rmbg2 => {
+            let rmbg2_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), RmbgModel::Rmbg2);
+            match Rmbg2Pipeline::from_pretrained(&rmbg2_root) {
+                Ok(rmbg2) => (None, None, Some(rmbg2)),
+                Err(rmbg2_err) => {
+                    let rmbg14_root =
+                        resolve_rmbg_root(args.bg_weights_root.as_ref(), RmbgModel::Rmbg14);
+                    warn!(
+                        "RMBG-2.0 unavailable at '{}': {}. Falling back to RMBG-1.4 at '{}'.",
+                        rmbg2_root.display(),
+                        rmbg2_err,
+                        rmbg14_root.display()
+                    );
+                    let (cpu, device_pipeline) =
+                        load_rmbg14_pipelines::<B>(&rmbg14_root, rmbg_backend, &device).map_err(
+                            |rmbg14_err| {
+                                format!(
+                                    "failed to load RMBG-2.0 at {}: {}; fallback RMBG-1.4 at {} also failed: {}",
+                                    rmbg2_root.display(),
+                                    rmbg2_err,
+                                    rmbg14_root.display(),
+                                    rmbg14_err
+                                )
+                            },
+                        )?;
+                    active_rmbg_model = RmbgModel::Rmbg14;
+                    (cpu, device_pipeline, None)
+                }
+            }
+        }
     };
 
     let wants_text = args.text_embeds.is_some() || args.prompt.is_some();
@@ -404,12 +489,14 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
             rmbg14_cpu,
             rmbg14_device,
             rmbg2,
-            rmbg_model,
+            rmbg_model: active_rmbg_model,
             rmbg_backend,
             dino_backend,
             dino_cpu: None,
             triposg: None,
             scribble: Some(scribble),
+            synthesis_models: synthesis_models.clone(),
+            triposg_load_error: None,
             text_embeds: Some(text_embeds),
             bounds,
             hierarchical,
@@ -443,12 +530,14 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         rmbg14_cpu,
         rmbg14_device,
         rmbg2,
-        rmbg_model,
+        rmbg_model: active_rmbg_model,
         rmbg_backend,
         dino_backend,
         dino_cpu,
         triposg: Some(triposg),
         scribble: None,
+        synthesis_models,
+        triposg_load_error: None,
         text_embeds: None,
         bounds,
         hierarchical,
@@ -487,8 +576,69 @@ async fn build_pipeline_state_wasm<B: Backend>(
         }
     }
 
+    let synthesis_models = args.synthesis_models.clone();
+    let wants_triposg = synthesis_models
+        .iter()
+        .any(|model| matches!(model, SynthesisModel::Triposg));
+    let wants_trellis = synthesis_models
+        .iter()
+        .any(|model| matches!(model, SynthesisModel::Trellis));
+
     if args.text_embeds.is_some() || args.prompt.is_some() {
         return Err("text/scribble mode is not supported on wasm yet".to_string());
+    }
+
+    let dino_backend = match args.dino_backend {
+        DinoBackend::Auto => {
+            if is_gpu_backend::<B>() {
+                DinoBackend::Gpu
+            } else {
+                DinoBackend::Cpu
+            }
+        }
+        other => other,
+    };
+    let chunk_size = tuned_chunk_size::<B>(args.chunk_size);
+    let hierarchical = HierarchicalExtractConfig {
+        bounds,
+        dense_octree_depth: args.dense_octree_depth,
+        hierarchical_octree_depth: args.hierarchical_octree_depth,
+        chunk_size,
+        band_threshold: args.band_threshold,
+    };
+    let flash = FlashExtractConfig {
+        bounds,
+        octree_depth: args.flash_octree_depth,
+        num_chunks: args.flash_num_chunks,
+        mc_level: args.flash_mc_level,
+        min_resolution: args.flash_min_resolution,
+        mini_grid_num: args.flash_mini_grid_num,
+    };
+    let rmbg_backend = match args.rmbg_backend {
+        RmbgBackend::Auto => RmbgBackend::Gpu,
+        other => other,
+    };
+    if wants_trellis && !wants_triposg {
+        send_worker_status(event_tx, "Trellis backend selected (not implemented yet).");
+        return Ok(PipelineState {
+            device,
+            rmbg14_cpu: None,
+            rmbg14_device: None,
+            rmbg2: None,
+            rmbg_model: args.rmbg_model,
+            rmbg_backend,
+            dino_backend,
+            dino_cpu: None,
+            triposg: None,
+            scribble: None,
+            synthesis_models,
+            triposg_load_error: None,
+            text_embeds: None,
+            bounds,
+            hierarchical,
+            chunk_size,
+            flash,
+        });
     }
 
     let mut totals = DownloadTotals::default();
@@ -505,10 +655,6 @@ async fn build_pipeline_state_wasm<B: Backend>(
 
     let rmbg_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), rmbg_model);
     let rmbg_root_url = normalize_web_path(&rmbg_root);
-    let rmbg_backend = match args.rmbg_backend {
-        RmbgBackend::Auto => RmbgBackend::Gpu,
-        other => other,
-    };
 
     let rmbg_burnpack = download_burnpack_asset(
         &join_web_path(&rmbg_root_url, "model.safetensors"),
@@ -526,7 +672,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
         load_rmbg_config_from_json_bytes(json.as_bytes())
             .map_err(|err| format!("failed to parse RMBG config: {err}"))?
     } else {
-        burn_foreground::model::RmbgConfig::rmbg_1_4()
+        burn_foreground::rmbg14::RmbgConfig::rmbg_1_4()
     };
     let rmbg_processor = if let Some(json) = rmbg_processor_json {
         load_rmbg_processor_from_json_bytes(json.as_bytes())
@@ -549,34 +695,6 @@ async fn build_pipeline_state_wasm<B: Backend>(
             cap_rmbg14_processor_for_backend::<B>(&mut pipeline, rmbg_backend);
             (None, Some(pipeline))
         }
-    };
-
-    let chunk_size = tuned_chunk_size::<B>(args.chunk_size);
-    let hierarchical = HierarchicalExtractConfig {
-        bounds,
-        dense_octree_depth: args.dense_octree_depth,
-        hierarchical_octree_depth: args.hierarchical_octree_depth,
-        chunk_size,
-        band_threshold: args.band_threshold,
-    };
-    let flash = FlashExtractConfig {
-        bounds,
-        octree_depth: args.flash_octree_depth,
-        num_chunks: args.flash_num_chunks,
-        mc_level: args.flash_mc_level,
-        min_resolution: args.flash_min_resolution,
-        mini_grid_num: args.flash_mini_grid_num,
-    };
-
-    let dino_backend = match args.dino_backend {
-        DinoBackend::Auto => {
-            if is_gpu_backend::<B>() {
-                DinoBackend::Gpu
-            } else {
-                DinoBackend::Cpu
-            }
-        }
-        other => other,
     };
 
     let triposg_root = resolve_triposg_root(args.weights_root.as_ref());
@@ -733,6 +851,8 @@ async fn build_pipeline_state_wasm<B: Backend>(
         dino_cpu,
         triposg: Some(triposg),
         scribble: None,
+        synthesis_models,
+        triposg_load_error: None,
         text_embeds: None,
         bounds,
         hierarchical,
@@ -976,6 +1096,20 @@ fn run_inference_with_state<B: Backend>(
         return Vec::new();
     }
 
+    let synthesis_backend = match select_synthesis_backend(state) {
+        Ok(backend) => backend,
+        Err(err) => return vec![Err(err); requests.len()],
+    };
+    if matches!(synthesis_backend, ActiveSynthesisBackend::Trellis) {
+        return vec![
+            Err(
+                "Trellis backend is selected but not implemented yet. Use --synthesis-models triposg for inference."
+                    .to_string(),
+            );
+            requests.len()
+        ];
+    }
+
     let device = state.device.clone();
     let prepare_config =
         prepare_image_config_for_backend::<B>(state.rmbg_model, state.rmbg_backend);
@@ -1021,6 +1155,40 @@ fn run_inference_with_state<B: Backend>(
         .into_iter()
         .map(|result| result.unwrap_or_else(|| Err("missing inference result".to_string())))
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveSynthesisBackend {
+    Triposg,
+    Trellis,
+}
+
+fn select_synthesis_backend<B: Backend>(
+    state: &PipelineState<B>,
+) -> Result<ActiveSynthesisBackend, String> {
+    let triposg_loaded = state.triposg.is_some() || state.scribble.is_some();
+    for model in state.synthesis_models.iter() {
+        match model {
+            SynthesisModel::Triposg => {
+                if triposg_loaded {
+                    return Ok(ActiveSynthesisBackend::Triposg);
+                }
+            }
+            SynthesisModel::Trellis => {
+                return Ok(ActiveSynthesisBackend::Trellis);
+            }
+        }
+    }
+
+    if triposg_loaded {
+        return Ok(ActiveSynthesisBackend::Triposg);
+    }
+
+    if let Some(err) = state.triposg_load_error.as_ref() {
+        return Err(format!("TripoSG backend is unavailable: {err}"));
+    }
+
+    Err("No synthesis backend is available.".to_string())
 }
 
 fn prepare_request<B: Backend>(

@@ -2262,6 +2262,8 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-store",
+ "burn-wgpu",
+ "clap",
  "criterion",
  "image",
  "ort",

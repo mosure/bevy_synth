@@ -128,7 +128,7 @@ pub(crate) fn run() {
     let status_message = if app_args.image.is_none() && app_args.mesh.is_none() {
         "Drag & drop an image (.png/.jpg) or mesh (.glb/.gltf/.obj) to begin.".to_string()
     } else {
-        "Initializing TripoSG viewer…".to_string()
+        "Initializing synth viewer…".to_string()
     };
 
     let mut app = App::new();
@@ -884,7 +884,7 @@ fn handle_inference_result(
         }
         Ok(None) => {
             warn!(
-                "TripoSG inference produced an empty mesh for {}",
+                "Synthesis inference produced an empty mesh for {}",
                 request.image_path.display()
             );
             if let Some(entry) = catalog.entry_mut(request.id) {
@@ -894,7 +894,7 @@ fn handle_inference_result(
         }
         Err(err) => {
             warn!(
-                "TripoSG inference failed for {}: {}",
+                "Synthesis inference failed for {}: {}",
                 request.image_path.display(),
                 err
             );

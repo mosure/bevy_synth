@@ -10,7 +10,7 @@ use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState};
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference};
 use bevy_synth_runtime::TripoMesh;
 use bevy_synth_runtime::args::{
-    AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend, RmbgModel,
+    AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend, RmbgModel, SynthesisModel,
 };
 use bevy_synth_runtime::cache::MeshCache;
 use bevy_synth_runtime::state::{
@@ -47,6 +47,7 @@ fn test_args() -> AppArgs {
         output: None,
         mesh: None,
         bg_weights_root: None,
+        synthesis_models: vec![SynthesisModel::Triposg],
         rmbg_model: RmbgModel::Rmbg14,
         backend: BackendKind::Cpu,
         rmbg_backend: RmbgBackend::Auto,

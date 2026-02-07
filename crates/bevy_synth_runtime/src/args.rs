@@ -4,9 +4,9 @@ use bevy::prelude::Resource;
 use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
-#[command(about = "TripoSG Bevy viewer", version)]
+#[command(about = "burn_synth Bevy viewer", version)]
 pub struct Args {
-    /// Path to an input image for TripoSG inference.
+    /// Path to an input image for mesh inference.
     #[arg(long)]
     pub image: Option<PathBuf>,
 
@@ -130,6 +130,15 @@ pub struct Args {
     #[arg(long)]
     pub bg_weights_root: Option<PathBuf>,
 
+    /// Synthesis backend models to enable (comma-delimited). Trellis is currently a placeholder.
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_values_t = [SynthesisModel::Triposg]
+    )]
+    pub synthesis_models: Vec<SynthesisModel>,
+
     /// Foreground model variant.
     #[arg(long, value_enum, default_value_t = RmbgModel::Rmbg2)]
     pub rmbg_model: RmbgModel,
@@ -162,6 +171,12 @@ pub enum RmbgBackend {
 pub enum RmbgModel {
     Rmbg14,
     Rmbg2,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynthesisModel {
+    Triposg,
+    Trellis,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -292,6 +307,7 @@ pub struct AppArgs {
     pub output: Option<PathBuf>,
     pub mesh: Option<PathBuf>,
     pub bg_weights_root: Option<PathBuf>,
+    pub synthesis_models: Vec<SynthesisModel>,
     pub rmbg_model: RmbgModel,
     pub backend: BackendKind,
     pub rmbg_backend: RmbgBackend,
@@ -360,6 +376,7 @@ pub fn build_app_args(args: Args) -> AppArgs {
         output: args.output,
         mesh: args.mesh,
         bg_weights_root: args.bg_weights_root,
+        synthesis_models: sanitize_synthesis_models(args.synthesis_models),
         rmbg_model: args.rmbg_model,
         backend: args.backend,
         rmbg_backend: args.rmbg_backend,
@@ -368,17 +385,31 @@ pub fn build_app_args(args: Args) -> AppArgs {
     }
 }
 
+fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel> {
+    let mut out = Vec::new();
+    for model in models {
+        if !out.contains(&model) {
+            out.push(model);
+        }
+    }
+    if out.is_empty() {
+        out.push(SynthesisModel::Triposg);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{Args, RmbgModel, build_app_args};
+    use super::{Args, RmbgModel, SynthesisModel, build_app_args};
 
     #[test]
     fn defaults_use_rmbg2_and_batch_one() {
         let args = Args::parse_from(["bevy_synth"]);
         let app_args = build_app_args(args);
         assert!(matches!(app_args.rmbg_model, RmbgModel::Rmbg2));
+        assert_eq!(app_args.synthesis_models, vec![SynthesisModel::Triposg]);
         assert_eq!(app_args.max_batch_size, 1);
     }
 
@@ -386,6 +417,8 @@ mod tests {
     fn cli_can_select_rmbg14_and_custom_batch_size() {
         let args = Args::parse_from([
             "bevy_synth",
+            "--synthesis-models",
+            "triposg,trellis",
             "--rmbg-model",
             "rmbg14",
             "--max-batch-size",
@@ -393,6 +426,10 @@ mod tests {
         ]);
         let app_args = build_app_args(args);
         assert!(matches!(app_args.rmbg_model, RmbgModel::Rmbg14));
+        assert_eq!(
+            app_args.synthesis_models,
+            vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
+        );
         assert_eq!(app_args.max_batch_size, 4);
     }
 
@@ -401,5 +438,19 @@ mod tests {
         let args = Args::parse_from(["bevy_synth", "--max-batch-size", "0"]);
         let app_args = build_app_args(args);
         assert_eq!(app_args.max_batch_size, 1);
+    }
+
+    #[test]
+    fn synthesis_models_are_deduplicated() {
+        let args = Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposg,triposg,trellis,trellis",
+        ]);
+        let app_args = build_app_args(args);
+        assert_eq!(
+            app_args.synthesis_models,
+            vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
+        );
     }
 }

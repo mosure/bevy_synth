@@ -4,7 +4,10 @@ pub mod pipeline;
 
 pub use io::{ImageSource, TextPrompt};
 pub use mesh::{Mesh, MeshLike, MeshStats, mesh_bounds, mesh_stats};
-pub use pipeline::{MeshOutput, PipelineInput, PipelineOutput};
+pub use pipeline::{
+    ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisModel,
+    sanitize_synthesis_models,
+};
 
 #[cfg(feature = "triposg")]
 pub use burn_tripo as triposg;

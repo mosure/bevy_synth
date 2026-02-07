@@ -39,25 +39,25 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 
 ## setup
 
-<!-- note: migrate this config section to be feature dependent, e.g. it is likely all models/features will not be used so please modularize the setup instructions/weight download -->
-
-- download TripoSG + RMBG weights (or set `TRIPOSG_WEIGHTS_ROOT` / `RMBG_WEIGHTS_ROOT`)
-- run the burnpack import tool `cargo run -p burn_tripo --bin triposg_import --features import`
-- run the bevy app with the burnpack weights
-
-
-
-## model import
-
-```
-cargo run -p burn_tripo --bin triposg_import --features import
-```
+- follow `docs/SETUP.md` for model-specific setup:
+  - RMBG-1.4
+  - RMBG-2.0
+  - TripoSG
+  - Trellis (planned, not implemented yet)
+- canonical foreground model paths and expected files:
+  - `crates/burn_foreground/assets/models/README.md`
+- import tooling split by model family:
+  - TripoSG: `cargo run -p burn_tripo --features import --bin triposg_import`
+  - RMBG: `cargo run -p burn_foreground --features import --bin foreground_import -- --rmbg-model rmbg2 --quantization both`
+- app default foreground model:
+  - `bevy_synth` defaults to `rmbg2` when available (native fallback to `rmbg14`, wasm fallback to `rmbg14`)
 
 
 ## references
 
 - [assembler](https://assembler3d.github.io/)
 - [burn_dino](https://github.com/mosure/burn_dino)
+- [lattice](https://arxiv.org/abs/2512.03052)
 - [midi](https://huanngzh.github.io/MIDI-Page/)
 - [trellis](https://github.com/microsoft/TRELLIS.2)
 - [triposg](https://yg256li.github.io/TripoSG-Page/)

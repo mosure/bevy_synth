@@ -8,11 +8,6 @@ use std::{
 use burn::backend::NdArray;
 use clap::{Parser, ValueEnum};
 
-use burn_foreground::model::{
-    RmbgConfig,
-    import::{import_rmbg_burnpack, load_rmbg_config, resolve_rmbg_weights_root},
-};
-use burn_foreground::rmbg2::import::{resolve_rmbg2_model_path, resolve_rmbg2_weights_root};
 use burn_tripo::model::triposg::{
     dit::{TripoSGDiTConfig, import::import_triposg_dit_burnpack},
     image_encoder::import::{import_triposg_dinov2_burnpack, resolve_triposg_weights_root},
@@ -28,12 +23,6 @@ enum Quantization {
     F32,
     F16,
     Both,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum RmbgModel {
-    Rmbg14,
-    Rmbg2,
 }
 
 impl Quantization {
@@ -54,15 +43,6 @@ impl Quantization {
 struct Args {
     #[arg(long)]
     weights_root: Option<PathBuf>,
-
-    #[arg(long)]
-    rmbg_root: Option<PathBuf>,
-
-    #[arg(long, value_enum, default_value_t = RmbgModel::Rmbg2)]
-    rmbg_model: RmbgModel,
-
-    #[arg(long)]
-    skip_rmbg: bool,
 
     #[arg(long)]
     overwrite: bool,
@@ -95,34 +75,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let rmbg = if args.skip_rmbg {
-        None
-    } else {
-        match args.rmbg_model {
-            RmbgModel::Rmbg14 => {
-                let rmbg_root = args
-                    .rmbg_root
-                    .clone()
-                    .unwrap_or_else(resolve_rmbg_weights_root);
-                let rmbg_weights = rmbg_root.join("model.safetensors");
-                let rmbg_config = load_rmbg_config(&rmbg_root)?;
-                Some((rmbg_weights, rmbg_config))
-            }
-            RmbgModel::Rmbg2 => {
-                let rmbg2_root = args
-                    .rmbg_root
-                    .clone()
-                    .unwrap_or_else(resolve_rmbg2_weights_root);
-                let model_path = resolve_rmbg2_model_path(&rmbg2_root)?;
-                println!(
-                    "[IMPORT] RMBG-2.0 uses ONNX directly. Model path: {}",
-                    model_path.display()
-                );
-                None
-            }
-        }
-    };
-
     if args.quantization.include_f32() {
         run_imports_with_backend::<CpuBackend>(
             false,
@@ -132,8 +84,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &dino_path,
             &vae_config,
             &dit_config,
-            rmbg.as_ref()
-                .map(|(weights, config)| (weights.as_path(), config)),
         )?;
     }
     if args.quantization.include_f16() {
@@ -145,8 +95,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &dino_path,
             &vae_config,
             &dit_config,
-            rmbg.as_ref()
-                .map(|(weights, config)| (weights.as_path(), config)),
         )?;
     }
 
@@ -161,7 +109,6 @@ fn run_imports_with_backend<B>(
     dino_path: &Path,
     vae_config: &TripoSGVaeConfig,
     dit_config: &TripoSGDiTConfig,
-    rmbg: Option<(&Path, &RmbgConfig)>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     B: burn::tensor::backend::Backend,
@@ -180,12 +127,6 @@ where
     import_if_needed("DINOv2", dino_path, use_f16, overwrite, || {
         import_triposg_dinov2_burnpack::<B>(&device, dino_path, use_f16)
     })?;
-
-    if let Some((rmbg_weights, rmbg_config)) = rmbg {
-        import_if_needed("RMBG", rmbg_weights, use_f16, overwrite, || {
-            import_rmbg_burnpack::<B>(&device, rmbg_weights, rmbg_config, use_f16)
-        })?;
-    }
 
     Ok(())
 }

@@ -5,9 +5,7 @@ use std::time::Instant;
 
 use burn::prelude::*;
 use burn_foreground::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_tensor};
-use burn_tripo::pipeline::geometry::{
-    HierarchicalExtractConfig, hierarchical_extract_geometry,
-};
+use burn_tripo::pipeline::geometry::{HierarchicalExtractConfig, hierarchical_extract_geometry};
 use burn_tripo::pipeline::mesh::grid_to_mesh;
 use burn_tripo::pipeline::triposg::TripoSGPipeline;
 

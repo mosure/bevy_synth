@@ -4,9 +4,9 @@ use std::path::Path;
 use burn::prelude::*;
 use burn::tensor::ops::InterpolateMode;
 
-use crate::model::BriaRmbg;
 use crate::preprocess::RmbgImageProcessor;
 use crate::resize::resize_chw_align_corners_false;
+use crate::rmbg14::BriaRmbg;
 
 #[derive(Debug, Clone)]
 pub struct PrepareImageConfig {
@@ -90,7 +90,7 @@ impl<B: Backend> RmbgPipeline<B> {
         weights_root: impl AsRef<Path>,
         device: &B::Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use crate::model::import::{load_rmbg, load_rmbg_config, load_rmbg_processor_config};
+        use crate::rmbg14::import::{load_rmbg, load_rmbg_config, load_rmbg_processor_config};
 
         let root = weights_root.as_ref();
         let config = load_rmbg_config(root)?;

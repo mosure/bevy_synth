@@ -39,15 +39,25 @@ impl Rmbg2Pipeline {
     pub fn from_pretrained(
         weights_root: impl AsRef<Path>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use self::import::{load_rmbg2_processor_config, resolve_rmbg2_model_path};
+        use self::import::{
+            load_rmbg2_onnx_blob_from_preferred_burnpack, load_rmbg2_processor_config,
+            resolve_rmbg2_model_path,
+        };
 
         let root = weights_root.as_ref();
-        let model_path = resolve_rmbg2_model_path(root)?;
         let processor = load_rmbg2_processor_config(root)?;
 
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Disable)?
-            .commit_from_file(&model_path)?;
+        let session = if let Some(onnx_bytes) = load_rmbg2_onnx_blob_from_preferred_burnpack(root)?
+        {
+            Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Disable)?
+                .commit_from_memory(&onnx_bytes)?
+        } else {
+            let model_path = resolve_rmbg2_model_path(root)?;
+            Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Disable)?
+                .commit_from_file(&model_path)?
+        };
 
         Ok(Self::new(session, processor))
     }
@@ -237,9 +247,54 @@ pub mod import {
         path::{Path, PathBuf},
     };
 
+    #[cfg(not(target_arch = "wasm32"))]
+    use burn::module::{Param, ParamId};
+    #[cfg(not(target_arch = "wasm32"))]
+    use burn::prelude::*;
     use burn::tensor::ops::InterpolateMode;
+    #[cfg(not(target_arch = "wasm32"))]
+    use burn_store::{BurnpackStore, ModuleSnapshot};
 
     use crate::preprocess::{RmbgImageProcessor, RmbgProcessorConfig};
+
+    const F16_SUFFIX: &str = "_f16";
+
+    const MODEL_CANDIDATES_F16: &[&str] = &[
+        "onnx/model_fp16.onnx",
+        "onnx/model.onnx",
+        "onnx/model_q4f16.onnx",
+        "onnx/model_q4.onnx",
+        "onnx/model_quantized.onnx",
+        "onnx/model_uint8.onnx",
+        "onnx/model_int8.onnx",
+        "model_fp16.onnx",
+        "model.onnx",
+    ];
+
+    const MODEL_CANDIDATES_F32: &[&str] = &[
+        "onnx/model.onnx",
+        "onnx/model_fp16.onnx",
+        "onnx/model_q4f16.onnx",
+        "onnx/model_q4.onnx",
+        "onnx/model_quantized.onnx",
+        "onnx/model_uint8.onnx",
+        "onnx/model_int8.onnx",
+        "model.onnx",
+        "model_fp16.onnx",
+    ];
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Module, Debug)]
+    struct Rmbg2OnnxBlob<B: Backend> {
+        bytes: Param<Tensor<B, 1, Int>>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Rmbg2OnnxBlobMetadata {
+        bytes_len: usize,
+        source_path: String,
+    }
 
     pub fn resolve_rmbg2_weights_root() -> PathBuf {
         if let Ok(root) = std::env::var("RMBG2_WEIGHTS_ROOT") {
@@ -256,12 +311,7 @@ pub mod import {
         }
 
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let candidates = [
-            manifest.join("../burn_tripo/assets/models/RMBG-2.0"),
-            manifest.join("assets/models/RMBG-2.0"),
-            manifest.join("../burn_tripo/assets/models/RMBG-1.4"),
-            manifest.join("assets/models/RMBG-1.4"),
-        ];
+        let candidates = [manifest.join("assets/models/RMBG-2.0")];
         for path in candidates {
             if path.exists() {
                 return path;
@@ -270,8 +320,120 @@ pub mod import {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-2.0")
     }
 
-    pub fn resolve_rmbg2_model_path(root: impl AsRef<Path>) -> Result<PathBuf, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn import_rmbg2_burnpack(
+        root: impl AsRef<Path>,
+        use_f16: bool,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let root = root.as_ref();
+        if !root.exists() {
+            return Err(format!("RMBG-2.0 root does not exist: {}", root.display()).into());
+        }
+
+        let onnx_path = resolve_rmbg2_model_path_with_precision(root, use_f16)
+            .map_err(|err| format!("failed to resolve RMBG-2.0 ONNX source: {err}"))?;
+        let bytes = fs::read(&onnx_path)
+            .map_err(|err| format!("failed to read ONNX model {}: {err}", onnx_path.display()))?;
+
+        let output_path = burnpack_path(root, use_f16);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let metadata = Rmbg2OnnxBlobMetadata {
+            bytes_len: bytes.len(),
+            source_path: onnx_path.display().to_string(),
+        };
+        save_rmbg2_onnx_blob_to_burnpack(&output_path, &bytes, &metadata)?;
+
+        Ok(output_path)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_rmbg2_onnx_blob_from_preferred_burnpack(
+        root: impl AsRef<Path>,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+        let candidates = candidate_burnpack_paths(root.as_ref());
+        let existing = candidates
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect::<Vec<_>>();
+        if existing.is_empty() {
+            return Ok(None);
+        }
+
+        for path in existing {
+            match load_rmbg2_onnx_blob_from_burnpack(&path) {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(_) => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_rmbg2_onnx_blob_from_burnpack(
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        type BlobBackend = burn::backend::NdArray<f32>;
+
+        let path = path.as_ref();
+        let metadata_path = burnpack_metadata_path(path);
+        let metadata_bytes = fs::read(&metadata_path).map_err(|err| {
+            format!(
+                "failed to read RMBG-2.0 burnpack metadata {}: {err}",
+                metadata_path.display()
+            )
+        })?;
+        let metadata: Rmbg2OnnxBlobMetadata =
+            serde_json::from_slice(&metadata_bytes).map_err(|err| {
+                format!(
+                    "failed to parse RMBG-2.0 burnpack metadata {}: {err}",
+                    metadata_path.display()
+                )
+            })?;
+
+        let device = <BlobBackend as Backend>::Device::default();
+        let zeros = Tensor::<BlobBackend, 1, Int>::zeros([metadata.bytes_len], &device);
+        let mut blob = Rmbg2OnnxBlob {
+            bytes: Param::initialized(ParamId::new(), zeros),
+        };
+
+        let mut store = BurnpackStore::from_file(path).validate(true);
+        blob.load_from(&mut store)
+            .map_err(|err| format!("failed to load RMBG-2.0 burnpack {}: {err}", path.display()))?;
+        let bytes = blob
+            .bytes
+            .val()
+            .into_data()
+            .convert::<u8>()
+            .to_vec::<u8>()
+            .map_err(|err| format!("failed to materialize RMBG-2.0 burnpack bytes: {err:?}"))?;
+
+        if bytes.len() != metadata.bytes_len {
+            return Err(format!(
+                "RMBG-2.0 burnpack byte length mismatch for {}: expected {}, got {}",
+                path.display(),
+                metadata.bytes_len,
+                bytes.len()
+            )
+            .into());
+        }
+
+        Ok(bytes)
+    }
+
+    pub fn resolve_rmbg2_model_path(root: impl AsRef<Path>) -> Result<PathBuf, String> {
+        let prefer_f16 = prefer_f16_burnpack();
+        resolve_rmbg2_model_path_with_precision(root.as_ref(), prefer_f16)
+    }
+
+    fn resolve_rmbg2_model_path_with_precision(
+        root: &Path,
+        use_f16: bool,
+    ) -> Result<PathBuf, String> {
         if root.is_file() && root.extension().and_then(|e| e.to_str()) == Some("onnx") {
             return Ok(root.to_path_buf());
         }
@@ -288,16 +450,11 @@ pub mod import {
             }
         }
 
-        let candidates = [
-            "onnx/model.onnx",
-            "onnx/model_fp16.onnx",
-            "onnx/model_int8.onnx",
-            "onnx/model_q4f16.onnx",
-            "onnx/model_q4.onnx",
-            "onnx/model_quantized.onnx",
-            "onnx/model_uint8.onnx",
-            "model.onnx",
-        ];
+        let candidates = if use_f16 {
+            MODEL_CANDIDATES_F16
+        } else {
+            MODEL_CANDIDATES_F32
+        };
         for rel in candidates {
             let path = root.join(rel);
             if path.exists() {
@@ -310,6 +467,126 @@ pub mod import {
             root.display(),
             candidates.join(", ")
         ))
+    }
+
+    fn candidate_burnpack_paths(root: &Path) -> Vec<PathBuf> {
+        let default = burnpack_path(root, false);
+        let f16 = burnpack_path(root, true);
+        if f16 == default {
+            vec![default]
+        } else if prefer_f16_burnpack() {
+            vec![f16, default]
+        } else {
+            vec![default, f16]
+        }
+    }
+
+    fn prefer_f16_burnpack() -> bool {
+        preferred_precision_from_env(
+            "RMBG2_BPK_PRECISION",
+            "RMBG_BPK_PRECISION",
+            "BURN_SYNTH_BPK_PRECISION",
+        )
+    }
+
+    fn preferred_precision_from_env(primary: &str, fallback1: &str, fallback2: &str) -> bool {
+        let value = std::env::var(primary)
+            .ok()
+            .or_else(|| std::env::var(fallback1).ok())
+            .or_else(|| std::env::var(fallback2).ok());
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("f32" | "fp32" | "float32" | "32") => false,
+            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
+            Some(_) | None => true,
+        }
+    }
+
+    fn burnpack_path(root: &Path, use_f16: bool) -> PathBuf {
+        let path = if root
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("bpk"))
+            .unwrap_or(false)
+        {
+            root.to_path_buf()
+        } else if root.is_dir() {
+            root.join("model.bpk")
+        } else {
+            root.with_extension("bpk")
+        };
+
+        if use_f16 {
+            with_file_stem_suffix(&path, F16_SUFFIX)
+        } else {
+            path
+        }
+    }
+
+    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let Some(stem) = path.file_stem() else {
+            return path.to_path_buf();
+        };
+        let stem = stem.to_string_lossy();
+        if stem.ends_with(suffix) {
+            return path.to_path_buf();
+        }
+
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let mut file_name = format!("{stem}{suffix}");
+        if !ext.is_empty() {
+            file_name.push('.');
+            file_name.push_str(ext);
+        }
+        path.with_file_name(file_name)
+    }
+
+    fn burnpack_metadata_path(path: &Path) -> PathBuf {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "model.bpk".to_string());
+        path.with_file_name(format!("{file_name}.meta.json"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_rmbg2_onnx_blob_to_burnpack(
+        output_path: &Path,
+        bytes: &[u8],
+        metadata: &Rmbg2OnnxBlobMetadata,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        type BlobBackend = burn::backend::NdArray<f32>;
+        let device = <BlobBackend as Backend>::Device::default();
+
+        let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
+            TensorData::new(bytes.to_vec(), [bytes.len()]),
+            &device,
+        );
+        let blob = Rmbg2OnnxBlob {
+            bytes: Param::initialized(ParamId::new(), tensor),
+        };
+
+        let mut store = BurnpackStore::from_file(output_path).overwrite(true);
+        blob.save_into(&mut store).map_err(|err| {
+            format!(
+                "failed to save RMBG-2.0 burnpack {}: {err}",
+                output_path.display()
+            )
+        })?;
+
+        let metadata_path = burnpack_metadata_path(output_path);
+        let metadata_json = serde_json::to_vec_pretty(metadata)?;
+        fs::write(&metadata_path, metadata_json).map_err(|err| {
+            format!(
+                "failed to write RMBG-2.0 burnpack metadata {}: {err}",
+                metadata_path.display()
+            )
+        })?;
+
+        Ok(())
     }
 
     pub fn default_rmbg2_processor() -> RmbgImageProcessor {
@@ -348,5 +625,40 @@ pub mod import {
             processor.std = [0.229, 0.224, 0.225];
         }
         Ok(processor)
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    mod tests {
+        use super::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn rmbg2_burnpack_blob_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let root = std::env::temp_dir().join(format!("burn_foreground_rmbg2_{unique}"));
+            let onnx_root = root.join("onnx");
+            fs::create_dir_all(&onnx_root)?;
+
+            let f32_bytes = b"fake_rmbg2_onnx_f32".to_vec();
+            let f16_bytes = b"fake_rmbg2_onnx_f16".to_vec();
+            fs::write(onnx_root.join("model.onnx"), &f32_bytes)?;
+            fs::write(onnx_root.join("model_fp16.onnx"), &f16_bytes)?;
+
+            let f32_bpk = import_rmbg2_burnpack(&root, false)?;
+            let f16_bpk = import_rmbg2_burnpack(&root, true)?;
+
+            assert!(f32_bpk.exists());
+            assert!(f16_bpk.exists());
+            assert!(burnpack_metadata_path(&f32_bpk).exists());
+            assert!(burnpack_metadata_path(&f16_bpk).exists());
+
+            let loaded_f32 = load_rmbg2_onnx_blob_from_burnpack(&f32_bpk)?;
+            let loaded_f16 = load_rmbg2_onnx_blob_from_burnpack(&f16_bpk)?;
+            assert_eq!(loaded_f32, f32_bytes);
+            assert_eq!(loaded_f16, f16_bytes);
+
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
     }
 }

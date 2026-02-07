@@ -40,15 +40,23 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) ->
     {
         return root;
     }
-    if let Ok(root) = std::env::var("RMBG_WEIGHTS_ROOT") {
+    if matches!(model, RmbgModel::Rmbg2)
+        && let Ok(root) = std::env::var("RMBG2_WEIGHTS_ROOT")
+    {
         let path = PathBuf::from(root);
         if let Some(root) = normalize_rmbg_root(&path) {
             return root;
         }
     }
-    if matches!(model, RmbgModel::Rmbg2)
-        && let Ok(root) = std::env::var("RMBG2_WEIGHTS_ROOT")
+    if matches!(model, RmbgModel::Rmbg14)
+        && let Ok(root) = std::env::var("RMBG14_WEIGHTS_ROOT")
     {
+        let path = PathBuf::from(root);
+        if let Some(root) = normalize_rmbg_root(&path) {
+            return root;
+        }
+    }
+    if let Ok(root) = std::env::var("RMBG_WEIGHTS_ROOT") {
         let path = PathBuf::from(root);
         if let Some(root) = normalize_rmbg_root(&path) {
             return root;
@@ -59,8 +67,12 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) ->
         RmbgModel::Rmbg14 => "RMBG-1.4",
         RmbgModel::Rmbg2 => "RMBG-2.0",
     };
-    let local = manifest_dir.join(format!("../burn_tripo/assets/models/{model_dir}"));
-    normalize_rmbg_root(&local).unwrap_or(local)
+    let foreground_local =
+        manifest_dir.join(format!("../burn_foreground/assets/models/{model_dir}"));
+    if let Some(root) = normalize_rmbg_root(&foreground_local) {
+        return root;
+    }
+    foreground_local
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -70,6 +82,11 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) ->
     }
     if matches!(model, RmbgModel::Rmbg2)
         && let Some(root) = option_env!("RMBG2_WEIGHTS_ROOT")
+    {
+        return PathBuf::from(root);
+    }
+    if matches!(model, RmbgModel::Rmbg14)
+        && let Some(root) = option_env!("RMBG14_WEIGHTS_ROOT")
     {
         return PathBuf::from(root);
     }
@@ -130,8 +147,21 @@ fn normalize_rmbg_root(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());
     }
-    if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some("model.safetensors") {
-        return path.parent().map(|p| p.to_path_buf());
+    if path.is_file() {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if file_name == "model.safetensors" || file_name.ends_with(".bpk") {
+            return path.parent().map(|p| p.to_path_buf());
+        }
+        if file_name.ends_with(".onnx") {
+            let parent = path.parent()?;
+            if parent.file_name().and_then(|n| n.to_str()) == Some("onnx") {
+                return parent.parent().map(|p| p.to_path_buf());
+            }
+            return Some(parent.to_path_buf());
+        }
     }
     None
 }
