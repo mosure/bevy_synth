@@ -14,6 +14,7 @@ use crate::pipeline::geometry::{
 };
 use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 use crate::pipeline::triposg::TripoSGPipelineOutput;
+use crate::readback::tensor_to_vec_f32;
 
 #[derive(Debug)]
 pub struct TripoSGScribblePipeline<B: Backend> {
@@ -188,11 +189,8 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
                 .reshape([count as i32, 3])
                 .unsqueeze_dim(0);
             let decoded = self.vae.decode(coords_tensor, latents.clone(), None);
-            let data = decoded
-                .into_data()
-                .convert::<f32>()
-                .to_vec::<f32>()
-                .map_err(|err| format!("failed to convert decoded grid: {err:?}"))?;
+            let data = tensor_to_vec_f32(decoded)
+                .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
             values.extend_from_slice(&data);
         }
 

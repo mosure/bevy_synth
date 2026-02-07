@@ -7,7 +7,7 @@ use safetensors::tensor::{SafeTensors, TensorView};
 
 use burn_3d_synth_tripo::pipeline::mesh::Mesh as TripoMesh;
 
-pub(crate) fn write_obj(path: &Path, mesh: &TripoMesh) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write_obj(path: &Path, mesh: &TripoMesh) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -24,7 +24,7 @@ pub(crate) fn write_obj(path: &Path, mesh: &TripoMesh) -> Result<(), Box<dyn std
     Ok(())
 }
 
-pub(crate) fn resolve_output_path(
+pub fn resolve_output_path(
     output: Option<&PathBuf>,
     image_path: &Path,
     index: u32,
@@ -56,7 +56,7 @@ pub(crate) fn resolve_output_path(
     Some(parent.join(format!("{stem}_{index}.{ext}")))
 }
 
-pub(crate) fn is_image_file(path: &Path) -> bool {
+pub fn is_image_file(path: &Path) -> bool {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     matches!(
         ext.to_ascii_lowercase().as_str(),
@@ -64,7 +64,7 @@ pub(crate) fn is_image_file(path: &Path) -> bool {
     )
 }
 
-pub(crate) fn is_mesh_file(path: &Path) -> bool {
+pub fn is_mesh_file(path: &Path) -> bool {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     matches!(
         ext.to_ascii_lowercase().as_str(),
@@ -72,7 +72,7 @@ pub(crate) fn is_mesh_file(path: &Path) -> bool {
     )
 }
 
-pub(crate) fn load_text_embeds<B: Backend>(
+pub fn load_text_embeds<B: Backend>(
     path: &Path,
     key: &str,
     device: &B::Device,

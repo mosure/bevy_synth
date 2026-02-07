@@ -55,7 +55,7 @@ impl Default for DinoImageProcessor {
 
 impl DinoImageProcessor {
     pub fn preprocess<B: Backend>(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
-        if std::env::var("DINO_STRICT_PREPROCESS").is_ok() {
+        if !cfg!(target_arch = "wasm32") && std::env::var("DINO_STRICT_PREPROCESS").is_ok() {
             return self.preprocess_cpu(image);
         }
         let mut image = image;
@@ -242,7 +242,10 @@ pub mod import {
         path::{Path, PathBuf},
     };
 
+    use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
+    use burn::tensor::Bytes;
+    use burn::tensor::FloatDType;
     use burn::tensor::ops::InterpolateMode;
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
@@ -254,6 +257,8 @@ pub mod import {
 
     use super::{DinoImageProcessor, TripoSGImageEncoder};
     use burn_dino::model::dino::DinoVisionTransformerConfig;
+
+    const F16_SUFFIX: &str = "_f16";
 
     #[derive(Debug)]
     pub struct Dinov2ImportError(pub String);
@@ -280,14 +285,22 @@ pub mod import {
                 config.positional_encoding_interpolate.output_size = Some([grid, grid]);
             }
         }
-        let burnpack_path = burnpack_path(weights_path);
-        if !burnpack_path.exists() {
+        let burnpack_candidates = candidate_burnpack_paths(weights_path);
+        let burnpack_path = burnpack_candidates
+            .iter()
+            .find(|candidate| candidate.exists())
+            .cloned();
+        let Some(burnpack_path) = burnpack_path else {
+            let checked = burnpack_candidates
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(format!(
-                "Burnpack weights missing at {}. Run `triposg_import` to generate .bpk files.",
-                burnpack_path.display()
+                "Burnpack weights missing. Checked: {checked}. Run `triposg_import` to generate .bpk files."
             )
             .into());
-        }
+        };
 
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
@@ -299,12 +312,35 @@ pub mod import {
         Ok(TripoSGImageEncoder::new(model))
     }
 
+    pub fn load_triposg_dinov2_from_burnpack_bytes<B: Backend>(
+        device: &B::Device,
+        config: DinoVisionTransformerConfig,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
+        let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
+            burn_dino::model::dino::DinoVisionTransformer::new(device, config);
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load dinov2 burnpack bytes: {err}"))?;
+        Ok(TripoSGImageEncoder::new(model))
+    }
+
     pub fn load_dinov2_processor(
         weights_root: impl AsRef<Path>,
     ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
         let root = weights_root.as_ref();
         let path = root.join("feature_extractor_dinov2/preprocessor_config.json");
         let bytes = fs::read(path)?;
+        let fallback_size = load_dinov2_image_size(root);
+        load_dinov2_processor_from_json_bytes(&bytes, fallback_size)
+    }
+
+    pub fn load_dinov2_processor_from_json_bytes(
+        bytes: &[u8],
+        fallback_size: Option<usize>,
+    ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
         let config: Dinov2ProcessorConfig = serde_json::from_slice(&bytes)?;
         let resize_mode = match config.resample.unwrap_or(3) {
             3 => InterpolateMode::Bicubic,
@@ -327,7 +363,7 @@ pub mod import {
 
         if processor.size_shortest_edge.is_none()
             && processor.crop_size.is_none()
-            && let Some(target_size) = load_dinov2_image_size(root)
+            && let Some(target_size) = fallback_size
         {
             processor.do_resize = true;
             processor.size_shortest_edge = Some(target_size);
@@ -366,15 +402,18 @@ pub mod import {
     fn load_dinov2_image_size(weights_root: &Path) -> Option<usize> {
         let config_path = weights_root.join("image_encoder_dinov2/config.json");
         let bytes = fs::read(config_path).ok()?;
-        let config: Dinov2Config = serde_json::from_slice(&bytes).ok()?;
-        config.image_size
+        load_dinov2_image_size_from_json_bytes(&bytes)
     }
 
     fn load_dinov2_preprocess_size(weights_path: &Path) -> Option<usize> {
         let weights_root = weights_path.parent()?.parent()?;
         let config_path = weights_root.join("feature_extractor_dinov2/preprocessor_config.json");
         let bytes = fs::read(config_path).ok()?;
-        let config: Dinov2ProcessorConfig = serde_json::from_slice(&bytes).ok()?;
+        load_dinov2_preprocess_size_from_json_bytes(&bytes)
+    }
+
+    pub fn load_dinov2_preprocess_size_from_json_bytes(bytes: &[u8]) -> Option<usize> {
+        let config: Dinov2ProcessorConfig = serde_json::from_slice(bytes).ok()?;
         if config.do_center_crop.unwrap_or(false)
             && let Some(crop) = config.crop_size
         {
@@ -391,7 +430,20 @@ pub mod import {
     fn load_dinov2_config(weights_path: &Path) -> Option<DinoVisionTransformerConfig> {
         let config_path = weights_path.parent()?.join("config.json");
         let bytes = fs::read(config_path).ok()?;
-        let config: Dinov2Config = serde_json::from_slice(&bytes).ok()?;
+        load_dinov2_config_from_json_bytes(&bytes)
+    }
+
+    fn load_dinov2_image_size_from_json_bytes(bytes: &[u8]) -> Option<usize> {
+        let config: Dinov2Config = serde_json::from_slice(bytes).ok()?;
+        config.image_size
+    }
+
+    pub fn default_dinov2_config() -> DinoVisionTransformerConfig {
+        DinoVisionTransformerConfig::vitl(None, None)
+    }
+
+    pub fn load_dinov2_config_from_json_bytes(bytes: &[u8]) -> Option<DinoVisionTransformerConfig> {
+        let config: Dinov2Config = serde_json::from_slice(bytes).ok()?;
         let image_size = config.image_size.unwrap_or(518);
         let patch_size = config.patch_size.unwrap_or(14);
         let mut dino = DinoVisionTransformerConfig::vitl(Some(image_size), Some(patch_size));
@@ -665,15 +717,43 @@ pub mod import {
         if let Ok(root) = std::env::var("TRIPOSG_WEIGHTS_ROOT") {
             return PathBuf::from(root);
         }
-        let root = PathBuf::from(r"E:\repos\TripoSG\pretrained_weights\TripoSG");
-        if root.exists() {
-            return root;
-        }
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/MIDI-3D")
     }
 
-    fn burnpack_path(path: &Path) -> PathBuf {
-        if path
+    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
+        let default = burnpack_path(path, false);
+        let f16 = burnpack_path(path, true);
+        if f16 == default {
+            vec![default]
+        } else if prefer_f16_burnpack() {
+            vec![f16, default]
+        } else {
+            vec![default, f16]
+        }
+    }
+
+    fn prefer_f16_burnpack() -> bool {
+        preferred_precision_from_env("TRIPOSG_BPK_PRECISION", "BURN_3D_SYNTH_BPK_PRECISION")
+    }
+
+    fn preferred_precision_from_env(primary: &str, fallback: &str) -> bool {
+        let value = std::env::var(primary)
+            .ok()
+            .or_else(|| std::env::var(fallback).ok());
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("f32" | "fp32" | "float32" | "32") => false,
+            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
+            Some(_) | None => true,
+        }
+    }
+
+    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
+        let path = if path
             .extension()
             .map(|ext| ext.eq_ignore_ascii_case("bpk"))
             .unwrap_or(false)
@@ -681,12 +761,37 @@ pub mod import {
             path.to_path_buf()
         } else {
             path.with_extension("bpk")
+        };
+
+        if use_f16 {
+            with_file_stem_suffix(&path, F16_SUFFIX)
+        } else {
+            path
         }
+    }
+
+    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let Some(stem) = path.file_stem() else {
+            return path.to_path_buf();
+        };
+        let stem = stem.to_string_lossy();
+        if stem.ends_with(suffix) {
+            return path.to_path_buf();
+        }
+
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let mut file_name = format!("{stem}{suffix}");
+        if !ext.is_empty() {
+            file_name.push('.');
+            file_name.push_str(ext);
+        }
+        path.with_file_name(file_name)
     }
 
     pub fn import_triposg_dinov2_burnpack<B: Backend>(
         device: &B::Device,
         weights_path: impl AsRef<Path>,
+        use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
         let mut config = load_dinov2_config(weights_path)
@@ -698,7 +803,7 @@ pub mod import {
                 config.positional_encoding_interpolate.output_size = Some([grid, grid]);
             }
         }
-        let burnpack_path = burnpack_path(weights_path);
+        let burnpack_path = burnpack_path(weights_path, use_f16);
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
 
@@ -707,9 +812,31 @@ pub mod import {
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 weights: {err}"))?;
+        let model = if use_f16 {
+            cast_module_float_dtype(model, FloatDType::F16)
+        } else {
+            model
+        };
         save_burnpack(&model, &burnpack_path)?;
 
         Ok(burnpack_path)
+    }
+
+    struct FloatDTypeMapper {
+        dtype: FloatDType,
+    }
+
+    impl<B: Backend> ModuleMapper<B> for FloatDTypeMapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            let tensor = tensor.cast(self.dtype);
+            Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+
+    fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
+        let mut mapper = FloatDTypeMapper { dtype };
+        module.map(&mut mapper)
     }
 
     fn save_burnpack<B: Backend>(

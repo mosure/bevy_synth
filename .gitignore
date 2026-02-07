@@ -19,6 +19,9 @@ out/
 
 .DS_Store
 
+.tmp/
+
+scripts/
 src/dino/
 screenshots/
 headless_output/

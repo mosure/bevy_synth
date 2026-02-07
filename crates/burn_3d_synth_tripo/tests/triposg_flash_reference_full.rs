@@ -60,10 +60,8 @@ fn triposg_flash_full_reference_matches() -> Result<(), Box<dyn std::error::Erro
     ];
 
     let flash_octree_depth = read_scalar_i32(&safetensors, "meta.flash_octree_depth")? as usize;
-    let flash_min_resolution =
-        read_scalar_i32(&safetensors, "meta.flash_min_resolution")? as usize;
-    let flash_mini_grid_num =
-        read_scalar_i32(&safetensors, "meta.flash_mini_grid_num")? as usize;
+    let flash_min_resolution = read_scalar_i32(&safetensors, "meta.flash_min_resolution")? as usize;
+    let flash_mini_grid_num = read_scalar_i32(&safetensors, "meta.flash_mini_grid_num")? as usize;
     let flash_num_chunks = read_scalar_i32(&safetensors, "meta.flash_num_chunks")? as usize;
     let flash_mc_level = read_scalar_f32(&safetensors, "meta.flash_mc_level")?;
     let grid_size = read_scalar_i32(&safetensors, "output.grid.size")? as usize;
@@ -72,10 +70,8 @@ fn triposg_flash_full_reference_matches() -> Result<(), Box<dyn std::error::Erro
     let sample_values = read_f32_vec(&safetensors, "output.grid.sample_values")?;
 
     let device = burn_wgpu::WgpuDevice::default();
-    let vae_config = TripoSGVaeConfig::from_config_file(
-        weights_root.join("vae/config.json"),
-    )
-    .unwrap_or_else(|_| TripoSGVaeConfig::midi_3d());
+    let vae_config = TripoSGVaeConfig::from_config_file(weights_root.join("vae/config.json"))
+        .unwrap_or_else(|_| TripoSGVaeConfig::midi_3d());
     let vae = load_triposg_vae::<GpuBackend>(
         &vae_config,
         &device,
@@ -84,11 +80,7 @@ fn triposg_flash_full_reference_matches() -> Result<(), Box<dyn std::error::Erro
 
     let latents_tensor = tensor_from_vec::<GpuBackend, 3>(
         latents.data.clone(),
-        [
-            latents_shape[0],
-            latents_shape[1],
-            latents_shape[2],
-        ],
+        [latents_shape[0], latents_shape[1], latents_shape[2]],
         &device,
     );
 
@@ -168,10 +160,8 @@ fn triposg_flash_samples_match_reference() -> Result<(), Box<dyn std::error::Err
     let sample_values = read_f32_vec(&safetensors, "output.grid.sample_values")?;
 
     let device = burn_wgpu::WgpuDevice::default();
-    let vae_config = TripoSGVaeConfig::from_config_file(
-        weights_root.join("vae/config.json"),
-    )
-    .unwrap_or_else(|_| TripoSGVaeConfig::midi_3d());
+    let vae_config = TripoSGVaeConfig::from_config_file(weights_root.join("vae/config.json"))
+        .unwrap_or_else(|_| TripoSGVaeConfig::midi_3d());
     let vae = load_triposg_vae::<GpuBackend>(
         &vae_config,
         &device,
@@ -180,11 +170,7 @@ fn triposg_flash_samples_match_reference() -> Result<(), Box<dyn std::error::Err
 
     let latents_tensor = tensor_from_vec::<GpuBackend, 3>(
         latents.data.clone(),
-        [
-            latents.shape[0],
-            latents.shape[1],
-            latents.shape[2],
-        ],
+        [latents.shape[0], latents.shape[1], latents.shape[2]],
         &device,
     );
 
@@ -213,11 +199,7 @@ fn triposg_flash_samples_match_reference() -> Result<(), Box<dyn std::error::Err
         .map_err(|_| "failed to read cached decoded flash samples")?;
     compare_sampled_logits(&decoded_values, &decoded_cached_values)?;
 
-    compare_sampled_sdf(
-        &decoded_values,
-        &sample_values,
-        flash_octree_depth,
-    )?;
+    compare_sampled_sdf(&decoded_values, &sample_values, flash_octree_depth)?;
 
     Ok(())
 }
@@ -429,11 +411,7 @@ fn compare_sampled_grid(
     Ok(())
 }
 
-fn flash_sample_coords(
-    bounds: [f32; 6],
-    grid_size: usize,
-    indices: &HookTensorI32,
-) -> Vec<f32> {
+fn flash_sample_coords(bounds: [f32; 6], grid_size: usize, indices: &HookTensorI32) -> Vec<f32> {
     let resolution = (grid_size - 1).max(1) as f32;
     let step_x = (bounds[3] - bounds[0]) / resolution;
     let step_y = (bounds[4] - bounds[1]) / resolution;
@@ -517,10 +495,9 @@ fn compare_sampled_logits(
     let max_tol = 1e-3;
     let mean_tol = 1e-4;
     if max_abs > max_tol || mean_abs > mean_tol {
-        return Err(format!(
-            "cached decode mismatch: mean_abs={mean_abs:.6} max_abs={max_abs:.6}"
-        )
-        .into());
+        return Err(
+            format!("cached decode mismatch: mean_abs={mean_abs:.6} max_abs={max_abs:.6}").into(),
+        );
     }
 
     Ok(())

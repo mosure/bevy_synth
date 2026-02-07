@@ -39,11 +39,8 @@ impl TripoSGDiTConfig {
     }
 
     #[cfg(feature = "import")]
-    pub fn from_config_file(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)?;
-        let config: TripoSGDiTConfigFile = serde_json::from_slice(&bytes)?;
+    pub fn from_config_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: TripoSGDiTConfigFile = serde_json::from_slice(bytes)?;
         Ok(Self {
             in_channels: config.in_channels.unwrap_or(64),
             width: config.width.unwrap_or(2048),
@@ -52,6 +49,14 @@ impl TripoSGDiTConfig {
             cross_attention_dim: config.cross_attention_dim.unwrap_or(768),
             cross_attention_2_dim: config.cross_attention_2_dim,
         })
+    }
+
+    #[cfg(feature = "import")]
+    pub fn from_config_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(path)?;
+        Self::from_config_bytes(&bytes)
     }
 
     pub fn init<B: Backend>(&self, device: &B::Device) -> TripoSGDiT<B> {
@@ -172,9 +177,8 @@ impl<B: Backend> TripoSGDiTBlock<B> {
         skip_norm_last: bool,
     ) -> Self {
         let norm1 = nn::LayerNormConfig::new(dim).init(device);
-        let attn1 = CrossAttention::new(
-            device, dim, dim, num_heads, false, true, false, true, false,
-        );
+        let attn1 =
+            CrossAttention::new(device, dim, dim, num_heads, false, true, false, true, false);
         let norm2 = nn::LayerNormConfig::new(dim).init(device);
         let attn2 = CrossAttention::new(
             device,
@@ -190,9 +194,8 @@ impl<B: Backend> TripoSGDiTBlock<B> {
         let (norm2_2, attn2_2) = if use_cross_attention_2 {
             let dim2 = cross_attention_2_dim.expect("cross_attention_2_dim required");
             let norm2_2 = nn::LayerNormConfig::new(dim).init(device);
-            let attn2_2 = CrossAttention::new(
-                device, dim, dim2, num_heads, false, true, false, true, true,
-            );
+            let attn2_2 =
+                CrossAttention::new(device, dim, dim2, num_heads, false, true, false, true, true);
             (Some(norm2_2), Some(attn2_2))
         } else {
             (None, None)
@@ -443,12 +446,17 @@ impl<B: Backend> TripoSGDiT<B> {
 pub mod import {
     use std::path::{Path, PathBuf};
 
+    use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
+    use burn::tensor::Bytes;
+    use burn::tensor::FloatDType;
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
 
     use super::{TripoSGDiT, TripoSGDiTConfig};
+
+    const F16_SUFFIX: &str = "_f16";
 
     pub fn load_triposg_dit<B: Backend>(
         config: &TripoSGDiTConfig,
@@ -456,14 +464,22 @@ pub mod import {
         path: impl AsRef<Path>,
     ) -> Result<TripoSGDiT<B>, Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        let burnpack_path = burnpack_path(path);
-        if !burnpack_path.exists() {
+        let burnpack_candidates = candidate_burnpack_paths(path);
+        let burnpack_path = burnpack_candidates
+            .iter()
+            .find(|candidate| candidate.exists())
+            .cloned();
+        let Some(burnpack_path) = burnpack_path else {
+            let checked = burnpack_candidates
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(format!(
-                "Burnpack weights missing at {}. Run `triposg_import` to generate .bpk files.",
-                burnpack_path.display()
+                "Burnpack weights missing. Checked: {checked}. Run `triposg_import` to generate .bpk files."
             )
             .into());
-        }
+        };
 
         let mut model = TripoSGDiT::new(device, config.clone());
         let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
@@ -473,8 +489,54 @@ pub mod import {
         Ok(model)
     }
 
-    fn burnpack_path(path: &Path) -> PathBuf {
-        if path
+    pub fn load_triposg_dit_from_burnpack_bytes<B: Backend>(
+        config: &TripoSGDiTConfig,
+        device: &B::Device,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<TripoSGDiT<B>, Box<dyn std::error::Error>> {
+        let mut model = TripoSGDiT::new(device, config.clone());
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load TripoSG DiT burnpack bytes: {err}"))?;
+        Ok(model)
+    }
+
+    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
+        let default = burnpack_path(path, false);
+        let f16 = burnpack_path(path, true);
+        if f16 == default {
+            vec![default]
+        } else if prefer_f16_burnpack() {
+            vec![f16, default]
+        } else {
+            vec![default, f16]
+        }
+    }
+
+    fn prefer_f16_burnpack() -> bool {
+        preferred_precision_from_env("TRIPOSG_BPK_PRECISION", "BURN_3D_SYNTH_BPK_PRECISION")
+    }
+
+    fn preferred_precision_from_env(primary: &str, fallback: &str) -> bool {
+        let value = std::env::var(primary)
+            .ok()
+            .or_else(|| std::env::var(fallback).ok());
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("f32" | "fp32" | "float32" | "32") => false,
+            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
+            Some(_) | None => true,
+        }
+    }
+
+    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
+        let path = if path
             .extension()
             .map(|ext| ext.eq_ignore_ascii_case("bpk"))
             .unwrap_or(false)
@@ -482,7 +544,31 @@ pub mod import {
             path.to_path_buf()
         } else {
             path.with_extension("bpk")
+        };
+
+        if use_f16 {
+            with_file_stem_suffix(&path, F16_SUFFIX)
+        } else {
+            path
         }
+    }
+
+    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let Some(stem) = path.file_stem() else {
+            return path.to_path_buf();
+        };
+        let stem = stem.to_string_lossy();
+        if stem.ends_with(suffix) {
+            return path.to_path_buf();
+        }
+
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let mut file_name = format!("{stem}{suffix}");
+        if !ext.is_empty() {
+            file_name.push('.');
+            file_name.push_str(ext);
+        }
+        path.with_file_name(file_name)
     }
 
     pub fn load_triposg_dit_from_safetensors<B: Backend>(
@@ -502,12 +588,35 @@ pub mod import {
         config: &TripoSGDiTConfig,
         device: &B::Device,
         path: impl AsRef<Path>,
+        use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        let burnpack_path = burnpack_path(path);
+        let burnpack_path = burnpack_path(path, use_f16);
         let model = load_triposg_dit_from_safetensors::<B>(config, device, path)?;
+        let model = if use_f16 {
+            cast_module_float_dtype(model, FloatDType::F16)
+        } else {
+            model
+        };
         save_burnpack(&model, &burnpack_path)?;
         Ok(burnpack_path)
+    }
+
+    struct FloatDTypeMapper {
+        dtype: FloatDType,
+    }
+
+    impl<B: Backend> ModuleMapper<B> for FloatDTypeMapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            let tensor = tensor.cast(self.dtype);
+            Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+
+    fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
+        let mut mapper = FloatDTypeMapper { dtype };
+        module.map(&mut mapper)
     }
 
     fn save_burnpack<B: Backend>(

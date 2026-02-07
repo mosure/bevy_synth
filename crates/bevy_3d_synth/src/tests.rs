@@ -6,13 +6,15 @@ use std::time::Duration;
 use bevy::prelude::*;
 use bevy_mesh::Mesh as BevyMesh;
 
-use burn_3d_synth_tripo::pipeline::mesh::Mesh as TripoMesh;
-
-use crate::app::{drive_inference, enqueue_inference};
-use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend};
-use crate::state::{
-    DraggableMesh, ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand,
-    WorkerEvent,
+use crate::app::{MeshCacheResource, drive_inference, enqueue_inference};
+use crate::ui::Burn3dSynthUiPlugin;
+use crate::ui::CatalogState;
+use bevy_transform_gizmos::GizmoTransformable;
+use bevy_3d_synth_core::TripoMesh;
+use bevy_3d_synth_core::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend};
+use bevy_3d_synth_core::cache::MeshCache;
+use bevy_3d_synth_core::state::{
+    ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
 
 fn test_args() -> AppArgs {
@@ -47,6 +49,7 @@ fn test_args() -> AppArgs {
         backend: BackendKind::Cpu,
         rmbg_backend: RmbgBackend::Auto,
         dino_backend: DinoBackend::Auto,
+        max_batch_size: 1,
     }
 }
 
@@ -63,7 +66,11 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(queue);
     app.insert_resource(worker);
     app.insert_resource(status);
+    app.insert_resource(CatalogState::default());
     app.insert_resource(ExitState::default());
+    app.insert_resource(MeshCacheResource {
+        cache: MeshCache::empty_default(),
+    });
     app.insert_resource(Assets::<BevyMesh>::default());
     app.insert_resource(Assets::<StandardMaterial>::default());
     app.add_systems(Update, drive_inference);
@@ -86,6 +93,7 @@ fn inference_queue_advances_and_tracks_completed() {
     let status = UiStatus {
         message: String::new(),
         processing: false,
+        worker_message: None,
     };
 
     let mut app = build_test_app(worker, queue, status);
@@ -96,15 +104,18 @@ fn inference_queue_advances_and_tracks_completed() {
     assert_eq!(queue.pending.len(), 1);
 
     let command = cmd_rx.try_recv().expect("expected infer command");
-    let WorkerCommand::Infer(first_request) = command else {
+    let WorkerCommand::Infer(batch) = command else {
         panic!("expected infer command");
     };
+    assert_eq!(batch.len(), 1);
+    let first_request = batch[0].clone();
 
     event_tx
         .send(WorkerEvent {
-            request: first_request.clone(),
-            result: Ok(None),
+            requests: vec![first_request.clone()],
+            results: vec![Ok(None)],
             elapsed: Duration::from_millis(1),
+            status_message: None,
         })
         .expect("send worker event");
 
@@ -128,26 +139,47 @@ fn inference_result_spawns_mesh_entity() {
     let mut queue = InferenceQueue::default();
     let args = test_args();
     enqueue_inference(PathBuf::from("mesh.png"), &args, &mut queue);
-    queue.active = queue.pending.pop_front();
+    queue.active = Some(vec![queue.pending.pop_front().expect("pending request")]);
     let status = UiStatus {
         message: String::new(),
         processing: true,
+        worker_message: None,
     };
 
-    let request = queue.active.clone().expect("active request");
+    let request = queue
+        .active
+        .as_ref()
+        .and_then(|batch| batch.first())
+        .cloned()
+        .expect("active request");
     let mut app = build_test_app(worker, queue, status);
 
     event_tx
         .send(WorkerEvent {
-            request,
-            result: Ok(Some(dummy_mesh())),
+            requests: vec![request],
+            results: vec![Ok(Some(dummy_mesh()))],
             elapsed: Duration::from_millis(1),
+            status_message: None,
         })
         .expect("send worker event");
 
     app.update();
 
     let world = app.world_mut();
-    let count = world.query::<&DraggableMesh>().iter(world).count();
+    let count = world.query::<&GizmoTransformable>().iter(world).count();
     assert_eq!(count, 1);
 }
+
+#[test]
+fn ui_plugin_update_has_no_query_conflicts() {
+    let mut app = App::new();
+    app.insert_resource(InferenceQueue::default());
+    app.insert_resource(Assets::<Image>::default());
+    app.insert_resource(Assets::<BevyMesh>::default());
+    app.insert_resource(ButtonInput::<MouseButton>::default());
+    app.insert_resource(Time::<()>::default());
+    app.add_plugins(Burn3dSynthUiPlugin);
+
+    app.update();
+}
+

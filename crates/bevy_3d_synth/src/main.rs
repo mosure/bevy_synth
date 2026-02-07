@@ -1,13 +1,7 @@
 #![recursion_limit = "256"]
 
 mod app;
-mod args;
-mod geom;
-mod io;
-mod mesh;
-mod paths;
-mod state;
-mod worker;
+mod ui;
 
 #[cfg(test)]
 mod tests;

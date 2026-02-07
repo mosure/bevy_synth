@@ -9,9 +9,9 @@ use std::{
 use burn::prelude::*;
 use safetensors::tensor::{SafeTensors, TensorView};
 
-use burn_3d_synth_bg_removal::pipeline::{prepare_image_data, PrepareImageConfig, RmbgPipeline};
+use burn_3d_synth_bg_removal::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_data};
 use burn_3d_synth_tripo::pipeline::{
-    mesh::{grid_to_mesh, DenseGrid, Mesh as TripoMesh},
+    mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh},
     triposg::TripoSGPipeline,
 };
 
@@ -51,11 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| asset_path("assets/hooks/triposg_pipeline_reference.safetensors"));
     if !reference_path.exists() {
-        return Err(format!(
-            "reference file not found at {}",
-            reference_path.display()
-        )
-        .into());
+        return Err(format!("reference file not found at {}", reference_path.display()).into());
     }
 
     let weights_root = resolve_weights_root();
@@ -85,10 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        other => Err(format!(
-            "unknown TRIPOSG_REPORT_BACKEND={other}; use cpu|wgpu"
-        )
-        .into()),
+        other => Err(format!("unknown TRIPOSG_REPORT_BACKEND={other}; use cpu|wgpu").into()),
     }
 }
 
@@ -144,7 +137,10 @@ fn run_with_backend<B: Backend>(
     println!("- chunk_size: {chunk_size}");
     println!(
         "- backend: {}",
-        std::any::type_name::<B>().split("::").last().unwrap_or("backend")
+        std::any::type_name::<B>()
+            .split("::")
+            .last()
+            .unwrap_or("backend")
     );
 
     if Path::new(RMBG_ROOT).exists() && Path::new(INPUT_IMAGE).exists() {
@@ -231,10 +227,7 @@ fn run_with_backend<B: Backend>(
                 input_latents.clone()
             };
             let model_batch = latent_model_input.shape().dims::<3>()[0];
-            let timestep = Tensor::<B, 1>::from_floats(
-                vec![t0; model_batch].as_slice(),
-                &device,
-            );
+            let timestep = Tensor::<B, 1>::from_floats(vec![t0; model_batch].as_slice(), &device);
             let mut noise_pred = pipeline.transformer.forward(
                 latent_model_input,
                 timestep,
@@ -256,7 +249,9 @@ fn run_with_backend<B: Backend>(
             let stats = compute_stats_from_tensor(&noise_pred, &step0_noise_ref)?;
             print_stats("transformer.noise_pred.step0", &stats);
 
-            let latents_step0 = pipeline.scheduler.step(noise_pred, t0, input_latents.clone());
+            let latents_step0 = pipeline
+                .scheduler
+                .step(noise_pred, t0, input_latents.clone());
             let stats = compute_stats_from_tensor(&latents_step0, &step0_latents_ref)?;
             print_stats("scheduler.latents.step0", &stats);
 
@@ -272,10 +267,8 @@ fn run_with_backend<B: Backend>(
                         latents_step0.clone()
                     };
                     let model_batch = latent_model_input.shape().dims::<3>()[0];
-                    let timestep = Tensor::<B, 1>::from_floats(
-                        vec![t1; model_batch].as_slice(),
-                        &device,
-                    );
+                    let timestep =
+                        Tensor::<B, 1>::from_floats(vec![t1; model_batch].as_slice(), &device);
                     let mut noise_pred = pipeline.transformer.forward(
                         latent_model_input,
                         timestep,
@@ -286,13 +279,14 @@ fn run_with_backend<B: Backend>(
                     if do_guidance {
                         let half = model_batch / 2;
                         let channels = pipeline.transformer.config().in_channels;
-                        let noise_uncond = noise_pred
-                            .clone()
-                            .slice([0..half, 0..num_tokens, 0..channels]);
-                        let noise_cond = noise_pred
-                            .slice([half..(half * 2), 0..num_tokens, 0..channels]);
-                        noise_pred =
-                            noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+                        let noise_uncond =
+                            noise_pred
+                                .clone()
+                                .slice([0..half, 0..num_tokens, 0..channels]);
+                        let noise_cond =
+                            noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
+                        noise_pred = noise_uncond.clone()
+                            + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
                     }
 
                     let stats = compute_stats_from_tensor(&noise_pred, &step1_noise_ref)?;
@@ -329,7 +323,9 @@ fn run_with_backend<B: Backend>(
     }
 
     if std::env::var("TRIPOSG_REPORT_CPU_DINO").is_ok()
-        && std::any::type_name::<B>().to_ascii_lowercase().contains("wgpu")
+        && std::any::type_name::<B>()
+            .to_ascii_lowercase()
+            .contains("wgpu")
     {
         let cpu_device = <CpuBackend as Backend>::Device::default();
         let cpu_pipeline =
@@ -387,7 +383,11 @@ fn run_with_backend<B: Backend>(
         size: [resolution, resolution, resolution],
         bounds,
     };
-    report_mesh("mesh", &grid_to_mesh(&grid, 0.0), &grid_to_mesh(&reference_grid, 0.0));
+    report_mesh(
+        "mesh",
+        &grid_to_mesh(&grid, 0.0),
+        &grid_to_mesh(&reference_grid, 0.0),
+    );
 
     Ok(())
 }

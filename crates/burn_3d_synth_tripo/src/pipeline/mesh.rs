@@ -1,10 +1,10 @@
+use crate::pipeline::dmc_tables::{
+    DMCEDGEOFFSET, DMCQUAD, MCCORNERS, MCEDGEINDEX, MCEDGELOCATIONS, MCFIRSTEDGEINDEX,
+    MCFIRSTPATCHINDEX, PROBLEMATICCONFIGS,
+};
 use fast_surface_nets::ndshape::RuntimeShape;
 use fast_surface_nets::{SurfaceNetsBuffer, surface_nets};
 use marching_cubes::tables::{EDGE_TABLE, TRI_TABLE};
-use crate::pipeline::dmc_tables::{
-    DMCEDGEOFFSET, DMCQUAD, MCEDGEINDEX, MCEDGELOCATIONS, MCFIRSTEDGEINDEX,
-    MCFIRSTPATCHINDEX, MCCORNERS, PROBLEMATICCONFIGS,
-};
 
 #[derive(Debug, Clone)]
 pub struct Mesh {
@@ -477,11 +477,7 @@ struct UsedCell {
     num_mc_verts: usize,
 }
 
-fn diff_dmc(
-    grid: &[f32],
-    dims: [usize; 3],
-    iso: f32,
-) -> DmcOutput {
+fn diff_dmc(grid: &[f32], dims: [usize; 3], iso: f32) -> DmcOutput {
     let [nx, ny, nz] = dims;
     if nx < 2 || ny < 2 || nz < 2 {
         return None;
@@ -512,7 +508,8 @@ fn diff_dmc(
                 if raw == 0 || raw == 255 {
                     continue;
                 }
-                let good = get_good_cell_code(&cell_codes, [cell_nx, cell_ny, cell_nz], x, y, z, raw);
+                let good =
+                    get_good_cell_code(&cell_codes, [cell_nx, cell_ny, cell_nz], x, y, z, raw);
 
                 let num_patches = (MCFIRSTPATCHINDEX[good as usize + 1]
                     - MCFIRSTPATCHINDEX[good as usize]) as usize;
@@ -714,7 +711,11 @@ fn get_good_cell_code(
     }
 
     let component = (direction >> 1) as isize;
-    let delta = if (direction & 1) == 1 { 1isize } else { -1isize };
+    let delta = if (direction & 1) == 1 {
+        1isize
+    } else {
+        -1isize
+    };
     let mut nx = x as isize;
     let mut ny = y as isize;
     let mut nz = z as isize;
@@ -733,7 +734,13 @@ fn get_good_cell_code(
     {
         return raw;
     }
-    let neighbor_idx = cell_index(nx as usize, ny as usize, nz as usize, cell_dims[0], cell_dims[1]);
+    let neighbor_idx = cell_index(
+        nx as usize,
+        ny as usize,
+        nz as usize,
+        cell_dims[0],
+        cell_dims[1],
+    );
     let neighbor_code = cell_codes[neighbor_idx];
     if PROBLEMATICCONFIGS[neighbor_code as usize] != 255 {
         raw ^ 0xff
@@ -766,11 +773,7 @@ fn compute_mc_vert(
     };
     t = t.clamp(0.0, 1.0);
     let p0 = [x as f32, y as f32, z as f32];
-    let p1 = [
-        (x + ox) as f32,
-        (y + oy) as f32,
-        (z + oz) as f32,
-    ];
+    let p1 = [(x + ox) as f32, (y + oy) as f32, (z + oz) as f32];
     [
         p0[0] + (p1[0] - p0[0]) * t,
         p0[1] + (p1[1] - p0[1]) * t,

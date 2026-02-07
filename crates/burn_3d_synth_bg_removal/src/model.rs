@@ -22,15 +22,20 @@ impl RmbgConfig {
     }
 
     #[cfg(feature = "import")]
-    pub fn from_config_file(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)?;
-        let config: RmbgConfigFile = serde_json::from_slice(&bytes)?;
+    pub fn from_config_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: RmbgConfigFile = serde_json::from_slice(bytes)?;
         Ok(Self {
             in_ch: config.in_ch.unwrap_or(3),
             out_ch: config.out_ch.unwrap_or(1),
         })
+    }
+
+    #[cfg(feature = "import")]
+    pub fn from_config_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(path)?;
+        Self::from_config_bytes(&bytes)
     }
 }
 
@@ -567,12 +572,17 @@ pub mod import {
         path::{Path, PathBuf},
     };
 
+    use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
+    use burn::tensor::Bytes;
+    use burn::tensor::FloatDType;
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
 
     use super::{BriaRmbg, RmbgConfig};
+
+    const F16_SUFFIX: &str = "_f16";
 
     pub fn load_rmbg<B: Backend>(
         device: &B::Device,
@@ -580,14 +590,22 @@ pub mod import {
         config: &RmbgConfig,
     ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
-        let burnpack_path = burnpack_path(weights_path);
-        if !burnpack_path.exists() {
+        let burnpack_candidates = candidate_burnpack_paths(weights_path);
+        let burnpack_path = burnpack_candidates
+            .iter()
+            .find(|candidate| candidate.exists())
+            .cloned();
+        let Some(burnpack_path) = burnpack_path else {
+            let checked = burnpack_candidates
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(format!(
-                "Burnpack weights missing at {}. Run `triposg_import` to generate .bpk files.",
-                burnpack_path.display()
+                "Burnpack weights missing. Checked: {checked}. Run `triposg_import` to generate .bpk files."
             )
             .into());
-        }
+        };
 
         let mut model = BriaRmbg::new(device, config.clone());
         let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
@@ -595,6 +613,26 @@ pub mod import {
             .load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG burnpack: {err}"))?;
         Ok(model)
+    }
+
+    pub fn load_rmbg_from_burnpack_bytes<B: Backend>(
+        device: &B::Device,
+        burnpack_bytes: Vec<u8>,
+        config: &RmbgConfig,
+    ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
+        let mut model = BriaRmbg::new(device, config.clone());
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load RMBG burnpack bytes: {err}"))?;
+        Ok(model)
+    }
+
+    pub fn load_rmbg_config_from_json_bytes(
+        bytes: &[u8],
+    ) -> Result<RmbgConfig, Box<dyn std::error::Error>> {
+        RmbgConfig::from_config_bytes(bytes)
     }
 
     pub fn load_rmbg_config(
@@ -614,9 +652,10 @@ pub mod import {
                 return path;
             }
         }
-        let root = PathBuf::from(r"E:\repos\TripoSG\pretrained_weights\RMBG-1.4");
-        if root.exists() {
-            return root;
+        let tripo_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../burn_3d_synth_tripo/assets/models/RMBG-1.4");
+        if tripo_assets.exists() {
+            return tripo_assets;
         }
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-1.4")
     }
@@ -629,6 +668,12 @@ pub mod import {
             return Ok(super::super::preprocess::RmbgImageProcessor::default());
         }
         let bytes = fs::read(path)?;
+        load_rmbg_processor_from_json_bytes(&bytes)
+    }
+
+    pub fn load_rmbg_processor_from_json_bytes(
+        bytes: &[u8],
+    ) -> Result<super::super::preprocess::RmbgImageProcessor, Box<dyn std::error::Error>> {
         let config: super::super::preprocess::RmbgProcessorConfig = serde_json::from_slice(&bytes)?;
         Ok(super::super::preprocess::RmbgImageProcessor::from_config(
             config,
@@ -659,8 +704,40 @@ pub mod import {
         ]
     }
 
-    fn burnpack_path(path: &Path) -> PathBuf {
-        if path
+    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
+        let default = burnpack_path(path, false);
+        let f16 = burnpack_path(path, true);
+        if f16 == default {
+            vec![default]
+        } else if prefer_f16_burnpack() {
+            vec![f16, default]
+        } else {
+            vec![default, f16]
+        }
+    }
+
+    fn prefer_f16_burnpack() -> bool {
+        preferred_precision_from_env("RMBG_BPK_PRECISION", "BURN_3D_SYNTH_BPK_PRECISION")
+    }
+
+    fn preferred_precision_from_env(primary: &str, fallback: &str) -> bool {
+        let value = std::env::var(primary)
+            .ok()
+            .or_else(|| std::env::var(fallback).ok());
+        match value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("f32" | "fp32" | "float32" | "32") => false,
+            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
+            Some(_) | None => true,
+        }
+    }
+
+    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
+        let path = if path
             .extension()
             .map(|ext| ext.eq_ignore_ascii_case("bpk"))
             .unwrap_or(false)
@@ -668,7 +745,31 @@ pub mod import {
             path.to_path_buf()
         } else {
             path.with_extension("bpk")
+        };
+
+        if use_f16 {
+            with_file_stem_suffix(&path, F16_SUFFIX)
+        } else {
+            path
         }
+    }
+
+    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let Some(stem) = path.file_stem() else {
+            return path.to_path_buf();
+        };
+        let stem = stem.to_string_lossy();
+        if stem.ends_with(suffix) {
+            return path.to_path_buf();
+        }
+
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let mut file_name = format!("{stem}{suffix}");
+        if !ext.is_empty() {
+            file_name.push('.');
+            file_name.push_str(ext);
+        }
+        path.with_file_name(file_name)
     }
 
     pub fn load_rmbg_from_safetensors<B: Backend>(
@@ -688,12 +789,35 @@ pub mod import {
         device: &B::Device,
         weights_path: impl AsRef<Path>,
         config: &RmbgConfig,
+        use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
-        let burnpack_path = burnpack_path(weights_path);
+        let burnpack_path = burnpack_path(weights_path, use_f16);
         let model = load_rmbg_from_safetensors::<B>(device, weights_path, config)?;
+        let model = if use_f16 {
+            cast_module_float_dtype(model, FloatDType::F16)
+        } else {
+            model
+        };
         save_burnpack(&model, &burnpack_path)?;
         Ok(burnpack_path)
+    }
+
+    struct FloatDTypeMapper {
+        dtype: FloatDType,
+    }
+
+    impl<B: Backend> ModuleMapper<B> for FloatDTypeMapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            let tensor = tensor.cast(self.dtype);
+            Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+
+    fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
+        let mut mapper = FloatDTypeMapper { dtype };
+        module.map(&mut mapper)
     }
 
     fn save_burnpack<B: Backend>(

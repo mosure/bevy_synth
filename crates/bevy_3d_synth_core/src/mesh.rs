@@ -1,10 +1,9 @@
-use bevy::prelude::Vec3;
 use bevy_asset::RenderAssetUsages;
 use bevy_mesh::{Indices, Mesh as BevyMesh, PrimitiveTopology};
 
 use burn_3d_synth_tripo::pipeline::mesh::Mesh as TripoMesh;
 
-pub(crate) fn to_bevy_mesh(mesh: &TripoMesh) -> BevyMesh {
+pub fn to_bevy_mesh(mesh: &TripoMesh) -> BevyMesh {
     let mut bevy_mesh = BevyMesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -59,14 +58,4 @@ fn compute_normals(mesh: &TripoMesh) -> Vec<[f32; 3]> {
     }
 
     normals
-}
-
-pub(crate) fn mesh_bounds(mesh: &TripoMesh) -> (Vec3, Vec3) {
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for v in &mesh.vertices {
-        min = min.min(Vec3::new(v[0], v[1], v[2]));
-        max = max.max(Vec3::new(v[0], v[1], v[2]));
-    }
-    (min, max)
 }

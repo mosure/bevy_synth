@@ -62,12 +62,22 @@ features = [
   "std",
 ]
 
-[dependencies.burn-wgpu]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-wgpu]
 version = "0.19"
 default-features = false
 features = [
   "fusion",
   "std",
+  "vulkan",
+]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
+version = "0.19"
+default-features = false
+features = [
+  "fusion",
+  "std",
+  "webgpu",
 ]
 
 [dependencies.cubecl]

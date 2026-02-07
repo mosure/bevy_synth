@@ -1,0 +1,24 @@
+[package]
+name = "bevy_3d_synth"
+version = "0.1.0"
+edition = "2024"
+
+description = "Bevy app for TripoSG image/text to mesh"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["wgpu"]
+wgpu = ["bevy_3d_synth_core/wgpu"]
+cuda = ["bevy_3d_synth_core/cuda"]
+
+[dependencies]
+bevy = { version = "0.17", features = ["http", "https"] }
+bevy_panorbit_camera = "0.33.0"
+bevy_infinite_grid = "0.17"
+bevy_mesh = "0.17"
+bevy_picking = { version = "0.17", features = ["bevy_mesh_picking_backend"] }
+bevy_file_dialog = { path = "../bevy_file_dialog" }
+bevy_editor_core = { path = "../bevy_editor_core" }
+bevy_transform_gizmos = { path = "../bevy_transform_gizmos" }
+clap = { version = "4.5", features = ["derive"] }
+bevy_3d_synth_core = { path = "../bevy_3d_synth_core", default-features = false }

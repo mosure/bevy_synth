@@ -152,10 +152,7 @@ fn compare_grids(
         max_diff <= tol_max,
         "grid max diff {max_diff:.4} > {tol_max:.4}"
     );
-    assert!(
-        mean <= tol_mean,
-        "grid mean diff {mean:.4} > {tol_mean:.4}"
-    );
+    assert!(mean <= tol_mean, "grid mean diff {mean:.4} > {tol_mean:.4}");
 }
 
 fn load_same_weights<M: Module<CpuBackend>>(
@@ -213,17 +210,9 @@ fn gpu_dit_matches_cpu_small() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu_model = TripoSGDiT::<GpuBackend>::new(&gpu_device, config);
     load_weights_into(&mut gpu_model, &burnpack_path)?;
 
-    let hidden = tensor_from_vec::<CpuBackend, 3>(
-        make_data(4 * 8, 0.7),
-        [1, 4, 8],
-        &cpu_device,
-    );
+    let hidden = tensor_from_vec::<CpuBackend, 3>(make_data(4 * 8, 0.7), [1, 4, 8], &cpu_device);
     let timestep = tensor_from_vec::<CpuBackend, 1>(make_data(1, 0.1), [1], &cpu_device);
-    let encoder = tensor_from_vec::<CpuBackend, 3>(
-        make_data(3 * 16, 0.5),
-        [1, 3, 16],
-        &cpu_device,
-    );
+    let encoder = tensor_from_vec::<CpuBackend, 3>(make_data(3 * 16, 0.5), [1, 3, 16], &cpu_device);
 
     let hidden_gpu = tensor_from_vec::<GpuBackend, 3>(
         tensor_to_vec(hidden.clone(), "dit.hidden")?,
@@ -286,16 +275,8 @@ fn gpu_vae_decode_matches_cpu_small() -> Result<(), Box<dyn std::error::Error>> 
     let mut gpu_model = TripoSGVae::<GpuBackend>::new(&gpu_device, config);
     load_weights_into(&mut gpu_model, &burnpack_path)?;
 
-    let latents = tensor_from_vec::<CpuBackend, 3>(
-        make_data(4 * 8, 0.9),
-        [1, 4, 8],
-        &cpu_device,
-    );
-    let coords = tensor_from_vec::<CpuBackend, 3>(
-        make_data(6 * 3, 0.2),
-        [1, 6, 3],
-        &cpu_device,
-    );
+    let latents = tensor_from_vec::<CpuBackend, 3>(make_data(4 * 8, 0.9), [1, 4, 8], &cpu_device);
+    let coords = tensor_from_vec::<CpuBackend, 3>(make_data(6 * 3, 0.2), [1, 6, 3], &cpu_device);
 
     let latents_gpu = tensor_from_vec::<GpuBackend, 3>(
         tensor_to_vec(latents.clone(), "vae.latents")?,
@@ -353,11 +334,7 @@ fn gpu_flash_extract_matches_cpu_small() -> Result<(), Box<dyn std::error::Error
     let mut gpu_model = TripoSGVae::<GpuBackend>::new(&gpu_device, config);
     load_weights_into(&mut gpu_model, &burnpack_path)?;
 
-    let latents = tensor_from_vec::<CpuBackend, 3>(
-        make_data(4 * 8, 0.75),
-        [1, 4, 8],
-        &cpu_device,
-    );
+    let latents = tensor_from_vec::<CpuBackend, 3>(make_data(4 * 8, 0.75), [1, 4, 8], &cpu_device);
     let latents_gpu = tensor_from_vec::<GpuBackend, 3>(
         tensor_to_vec(latents.clone(), "flash.latents")?,
         [1, 4, 8],

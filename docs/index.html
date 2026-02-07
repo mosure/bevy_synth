@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bevy_3d_synth</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: #0d1117;
+        color: #d6deeb;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      body {
+        overflow: hidden;
+      }
+      #boot {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 1000;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        border: 1px solid rgba(180, 200, 240, 0.22);
+        border-radius: 10px;
+        background: rgba(7, 11, 18, 0.9);
+        backdrop-filter: blur(3px);
+      }
+      #dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: #6dd3ff;
+        box-shadow: 0 0 0 0 rgba(109, 211, 255, 0.5);
+        animation: pulse 1.2s infinite;
+      }
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(109, 211, 255, 0.5);
+        }
+        70% {
+          box-shadow: 0 0 0 12px rgba(109, 211, 255, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(109, 211, 255, 0);
+        }
+      }
+      #boot-text {
+        font-size: 14px;
+        letter-spacing: 0.01em;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="boot">
+      <div id="dot"></div>
+      <div id="boot-text">loading wasm module...</div>
+    </div>
+    <script type="module">
+      import init from "./bevy_3d_synth.js";
+
+      const boot = document.getElementById("boot");
+      const text = document.getElementById("boot-text");
+      try {
+        await init();
+        text.textContent = "module ready";
+        setTimeout(() => boot.remove(), 1200);
+      } catch (err) {
+        console.error("Failed to initialize bevy_3d_synth wasm", err);
+        text.textContent = "failed to load wasm module";
+      }
+    </script>
+  </body>
+</html>

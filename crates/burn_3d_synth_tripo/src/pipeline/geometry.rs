@@ -1,12 +1,15 @@
 use burn::prelude::*;
 use burn::tensor::TensorData;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::model::triposg::vae::TripoSGVae;
 use crate::pipeline::mesh::DenseGrid;
+use crate::readback::{tensor_to_vec_f32, tensor_to_vec_i32};
 
 const FLASH_INVALID_SENTINEL: f32 = -10000.0;
 const FLASH_INVALID_THRESHOLD: f32 = -9000.0;
 const FLASH_WGPU_MAX_POINTS: usize = 4096;
+static FLASH_FORCE_CPU: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct HierarchicalExtractConfig {
@@ -109,7 +112,7 @@ pub fn flash_extract_geometry<B: Backend>(
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
-    if std::env::var("TRIPOSG_FLASH_CPU").is_ok() {
+    if !should_use_gpu_flash::<B>() {
         return flash_extract_geometry_cpu(latents, vae, config);
     }
     let latents_cpu = latents.clone();
@@ -119,6 +122,7 @@ pub fn flash_extract_geometry<B: Backend>(
                 eprintln!(
                     "flash_extract_geometry: GPU grid was all NaNs, retrying with CPU flash path."
                 );
+                FLASH_FORCE_CPU.store(true, Ordering::Relaxed);
                 return flash_extract_geometry_cpu(latents_cpu, vae, config);
             }
             Ok(grid)
@@ -128,11 +132,29 @@ pub fn flash_extract_geometry<B: Backend>(
                 eprintln!(
                     "flash_extract_geometry: GPU flash failed ({err}), retrying with CPU flash path."
                 );
+                FLASH_FORCE_CPU.store(true, Ordering::Relaxed);
                 return flash_extract_geometry_cpu(latents_cpu, vae, config);
             }
             Err(err)
         }
     }
+}
+
+fn should_use_gpu_flash<B: Backend>() -> bool {
+    if std::env::var("TRIPOSG_FLASH_CPU").is_ok() {
+        return false;
+    }
+    if FLASH_FORCE_CPU.load(Ordering::Relaxed) {
+        return false;
+    }
+    if std::env::var("TRIPOSG_FLASH_GPU").is_ok() {
+        return true;
+    }
+    let backend_name = std::any::type_name::<B>().to_ascii_lowercase();
+    if backend_name.contains("wgpu") {
+        return false;
+    }
+    true
 }
 
 fn flash_max_points<B: Backend>() -> usize {
@@ -194,8 +216,7 @@ fn flash_extract_geometry_gpu<B: Backend>(
 
         let device = grid_logits.device();
         let next_total = next_size * next_size * next_size;
-        let mut next_logits =
-            Tensor::<B, 1>::full([next_total], FLASH_INVALID_SENTINEL, &device);
+        let mut next_logits = Tensor::<B, 1>::full([next_total], FLASH_INVALID_SENTINEL, &device);
 
         let mut curr_mask = extract_near_surface_mask_gpu(&grid_logits, config.mc_level);
         let near_mask = grid_logits.clone().abs().lower_elem(0.95);
@@ -239,8 +260,7 @@ fn flash_extract_geometry_gpu<B: Backend>(
         }
 
         let flat_indices = coords_to_linear_indices_2(next_coords.clone(), next_size);
-        let world_coords =
-            coords_to_world_2(next_coords, bounds, [step_x, step_y, step_z]);
+        let world_coords = coords_to_world_2(next_coords, bounds, [step_x, step_y, step_z]);
 
         decode_flash_points_gpu(
             vae,
@@ -252,16 +272,14 @@ fn flash_extract_geometry_gpu<B: Backend>(
             &mut next_logits,
         )?;
 
-        grid_logits = next_logits.reshape([
-            next_size as i32,
-            next_size as i32,
-            next_size as i32,
-        ]);
+        grid_logits = next_logits.reshape([next_size as i32, next_size as i32, next_size as i32]);
         grid_size = next_size;
         log_flash_stats(&format!("level-{level_idx}"), &grid_logits, grid_size);
     }
 
-    let invalid = grid_logits.clone().lower_equal_elem(FLASH_INVALID_THRESHOLD);
+    let invalid = grid_logits
+        .clone()
+        .lower_equal_elem(FLASH_INVALID_THRESHOLD);
     let nan = Tensor::<B, 1>::from_floats([f32::NAN], &grid_logits.device()).reshape([1, 1, 1]);
     let grid_logits = grid_logits.mask_where(invalid, nan);
 
@@ -269,11 +287,8 @@ fn flash_extract_geometry_gpu<B: Backend>(
     let sdf = grid_logits
         .mul_scalar(-1.0 / octree_resolution as f32)
         .permute([2, 1, 0]);
-    let sdf_values = sdf
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|_| "failed to read flash grid logits")?;
+    let sdf_values =
+        tensor_to_vec_f32(sdf).map_err(|err| format!("failed to read flash grid logits: {err}"))?;
 
     Ok(DenseGrid {
         values: sdf_values,
@@ -290,7 +305,7 @@ fn log_flash_stats<B: Backend>(label: &str, grid: &Tensor<B, 3>, size: usize) {
     if std::env::var("TRIPOSG_FLASH_DEBUG").is_err() {
         return;
     }
-    let data = match grid.clone().into_data().convert::<f32>().to_vec::<f32>() {
+    let data = match tensor_to_vec_f32(grid.clone()) {
         Ok(values) => values,
         Err(_) => {
             eprintln!("flash_extract_geometry: failed to read grid logits for {label}");
@@ -318,7 +333,7 @@ fn log_flash_stats<B: Backend>(label: &str, grid: &Tensor<B, 3>, size: usize) {
 }
 
 fn grid_all_invalid<B: Backend>(grid: &Tensor<B, 3>) -> bool {
-    let Ok(values) = grid.clone().into_data().convert::<f32>().to_vec::<f32>() else {
+    let Ok(values) = tensor_to_vec_f32(grid.clone()) else {
         return false;
     };
     values
@@ -378,8 +393,7 @@ fn flash_extract_geometry_cpu<B: Backend>(
         let step_y = (bounds[4] - bounds[1]) / res as f32;
         let step_z = (bounds[5] - bounds[2]) / res as f32;
 
-        let mut next_logits =
-            vec![FLASH_INVALID_SENTINEL; next_size * next_size * next_size];
+        let mut next_logits = vec![FLASH_INVALID_SENTINEL; next_size * next_size * next_size];
 
         let mut curr_mask = extract_near_surface_mask(&grid_logits, grid_size, config.mc_level);
         for idx in 0..curr_mask.len() {
@@ -561,11 +575,8 @@ fn eval_flash_base_grid<B: Backend>(
         ]);
         let latents_batch = latents.clone().repeat_dim(0, batch);
         let decoded = vae.decode(coords_tensor, latents_batch, None);
-        let data = decoded
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|_| "failed to decode flash base grid")?;
+        let data = tensor_to_vec_f32(decoded)
+            .map_err(|err| format!("failed to decode flash base grid: {err}"))?;
         for (i, &idx) in indices.iter().enumerate() {
             grid_values[idx] = data[i];
         }
@@ -711,11 +722,8 @@ fn decode_flash_points<B: Backend>(
             3,
         ]);
         let decoded = vae.decode(coords_tensor, latents.clone(), None);
-        let data = decoded
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|_| "failed to decode flash grid values")?;
+        let data = tensor_to_vec_f32(decoded)
+            .map_err(|err| format!("failed to decode flash grid values: {err}"))?;
         for (i, &idx) in indices.iter().enumerate() {
             output[idx] = data[i];
         }
@@ -748,8 +756,7 @@ fn eval_flash_base_grid_gpu<B: Backend>(
 
     let device = latent_proj.device();
     let total = grid_size * grid_size * grid_size;
-    let mut grid_logits =
-        Tensor::<B, 1>::full([total], FLASH_INVALID_SENTINEL, &device);
+    let mut grid_logits = Tensor::<B, 1>::full([total], FLASH_INVALID_SENTINEL, &device);
 
     let local_grid: Tensor<B, 4, Int> =
         Tensor::<B, 3, Int>::cartesian_grid([mini_size, mini_size, mini_size], &device);
@@ -787,8 +794,7 @@ fn eval_flash_base_grid_gpu<B: Backend>(
             ]);
         }
         let offsets = TensorData::new(offsets, [batch, 3]);
-        let offsets =
-            Tensor::<B, 2, Int>::from_ints(offsets, &device).unsqueeze_dim::<3>(1);
+        let offsets = Tensor::<B, 2, Int>::from_ints(offsets, &device).unsqueeze_dim::<3>(1);
         let coords_idx = offsets + local_grid.clone();
         let coords_idx = coords_idx.reshape([batch * points_per_block, 3]);
         let coords_world = coords_to_world_2(coords_idx.clone(), bounds, step);
@@ -796,11 +802,7 @@ fn eval_flash_base_grid_gpu<B: Backend>(
 
         if std::env::var("TRIPOSG_FLASH_DEBUG").is_ok()
             && start == 0
-            && let Ok(coord_data) = coords_world
-                .clone()
-                .into_data()
-                .convert::<f32>()
-                .to_vec::<f32>()
+            && let Ok(coord_data) = tensor_to_vec_f32(coords_world.clone())
         {
             let mut min = [f32::INFINITY; 3];
             let mut max = [f32::NEG_INFINITY; 3];
@@ -831,7 +833,10 @@ fn eval_flash_base_grid_gpu<B: Backend>(
     Ok(grid_logits.reshape([grid_size, grid_size, grid_size]))
 }
 
-fn coords_to_linear_indices_2<B: Backend>(coords: Tensor<B, 2, Int>, size: usize) -> Tensor<B, 1, Int> {
+fn coords_to_linear_indices_2<B: Backend>(
+    coords: Tensor<B, 2, Int>,
+    size: usize,
+) -> Tensor<B, 1, Int> {
     let device = coords.device();
     let idx0 = Tensor::<B, 1, Int>::from_ints([0], &device);
     let idx1 = Tensor::<B, 1, Int>::from_ints([1], &device);
@@ -917,18 +922,10 @@ fn maybe_group_flash_coords<B: Backend>(
         .max(1);
     let device = coords.device();
 
-    let coords_data = coords
-        .clone()
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|_| "failed to read flash coords for grouping")?;
-    let indices_data = indices
-        .clone()
-        .into_data()
-        .convert::<i32>()
-        .to_vec::<i32>()
-        .map_err(|_| "failed to read flash indices for grouping")?;
+    let coords_data = tensor_to_vec_f32(coords.clone())
+        .map_err(|err| format!("failed to read flash coords for grouping: {err}"))?;
+    let indices_data = tensor_to_vec_i32(indices.clone())
+        .map_err(|err| format!("failed to read flash indices for grouping: {err}"))?;
 
     let count = indices_data.len();
     if count == 0 {
@@ -1213,11 +1210,8 @@ fn write_decoded_contiguous<B: Backend>(
     }
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device).reshape([1, count as i32, 3]);
     let decoded = vae.decode(coords_tensor, latents.clone(), None);
-    let data = decoded
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|_| "failed to decode grid values")?;
+    let data =
+        tensor_to_vec_f32(decoded).map_err(|err| format!("failed to decode grid values: {err}"))?;
     output_slice.copy_from_slice(&data[..output_slice.len()]);
     Ok(())
 }
@@ -1236,11 +1230,8 @@ fn write_decoded<B: Backend>(
     }
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device).reshape([1, count as i32, 3]);
     let decoded = vae.decode(coords_tensor, latents.clone(), None);
-    let data = decoded
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|_| "failed to decode grid values")?;
+    let data =
+        tensor_to_vec_f32(decoded).map_err(|err| format!("failed to decode grid values: {err}"))?;
     for (i, &dst) in indices.iter().enumerate() {
         output[dst] = data[i];
     }

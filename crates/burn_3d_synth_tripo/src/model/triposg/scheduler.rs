@@ -22,16 +22,21 @@ impl RectifiedFlowSchedulerConfig {
     }
 
     #[cfg(feature = "import")]
-    pub fn from_config_file(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)?;
-        let config: RectifiedFlowSchedulerConfigFile = serde_json::from_slice(&bytes)?;
+    pub fn from_config_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: RectifiedFlowSchedulerConfigFile = serde_json::from_slice(bytes)?;
         Ok(Self {
             num_train_timesteps: config.num_train_timesteps.unwrap_or(1000),
             shift: config.shift.unwrap_or(1.0),
             use_dynamic_shifting: config.use_dynamic_shifting.unwrap_or(false),
         })
+    }
+
+    #[cfg(feature = "import")]
+    pub fn from_config_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(path)?;
+        Self::from_config_bytes(&bytes)
     }
 }
 

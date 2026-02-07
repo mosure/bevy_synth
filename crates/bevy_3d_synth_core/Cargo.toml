@@ -1,0 +1,48 @@
+[package]
+name = "bevy_3d_synth_core"
+version = "0.1.0"
+edition = "2024"
+
+description = "Core Bevy utilities for burn_3d_synth"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["wgpu"]
+wgpu = ["dep:burn-wgpu"]
+cuda = ["burn-cuda"]
+
+[dependencies]
+bevy = "0.17"
+bevy_asset = "0.17"
+bevy_mesh = "0.17"
+base64 = "0.22"
+bytemuck = "1.25"
+clap = { version = "4.5", features = ["derive"] }
+burn = { version = "0.19", default-features = false, features = ["ndarray", "std"] }
+burn_3d_synth_tripo = { path = "../burn_3d_synth_tripo", features = ["import"] }
+burn_3d_synth_bg_removal = { path = "../burn_3d_synth_bg_removal", features = ["import"] }
+burn-cuda = { version = "0.19", optional = true }
+half = "2.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+safetensors = "0.6"
+meshopt = "0.6.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = [
+  "Storage",
+  "Window",
+  "Headers",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "Response",
+] }
+burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "webgpu"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }

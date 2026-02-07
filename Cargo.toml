@@ -3,8 +3,12 @@ resolver = "2"
 members = [
   "crates/burn_3d_synth",
   "crates/burn_3d_synth_tripo",
-  "crates/burn_3d_synth_bevy",
+  "crates/bevy_3d_synth",
+  "crates/bevy_3d_synth_core",
   "crates/burn_3d_synth_bg_removal",
+  "crates/bevy_file_dialog",
+  "crates/bevy_editor_core",
+  "crates/bevy_transform_gizmos",
 ]
 
 [profile.dev.package."*"]
@@ -18,7 +22,7 @@ strip = "symbols"
 lto = "thin"
 codegen-units = 1
 opt-level = 3
-panic = "abort"
+panic = "unwind"
 
 [profile.wasm-release]
 strip = "symbols"

@@ -1,5 +1,8 @@
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit
         && let Some(root) = normalize_weights_root(path)
@@ -12,15 +15,23 @@ pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
             return root;
         }
     }
-    let fallback = PathBuf::from(r"E:\repos\TripoSG\pretrained_weights\TripoSG");
-    if let Some(root) = normalize_weights_root(&fallback) {
-        return root;
-    }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let local = manifest_dir.join("../burn_3d_synth_tripo/assets/models/MIDI-3D");
     normalize_weights_root(&local).unwrap_or(local)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(root) = option_env!("TRIPOSG_WEIGHTS_ROOT") {
+        return PathBuf::from(root);
+    }
+    web_asset_root().join("models/MIDI-3D")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit
         && let Some(root) = normalize_rmbg_root(path)
@@ -33,15 +44,23 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>) -> PathBuf {
             return root;
         }
     }
-    let fallback = PathBuf::from(r"E:\repos\TripoSG\pretrained_weights\RMBG-1.4");
-    if let Some(root) = normalize_rmbg_root(&fallback) {
-        return root;
-    }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let local = manifest_dir.join("../burn_3d_synth_bg_removal/assets/models/RMBG-1.4");
+    let local = manifest_dir.join("../burn_3d_synth_tripo/assets/models/RMBG-1.4");
     normalize_rmbg_root(&local).unwrap_or(local)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(root) = option_env!("RMBG_WEIGHTS_ROOT") {
+        return PathBuf::from(root);
+    }
+    web_asset_root().join("models/RMBG-1.4")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit
         && let Some(root) = normalize_weights_root(path)
@@ -54,15 +73,23 @@ pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
             return root;
         }
     }
-    let fallback = PathBuf::from(r"E:\repos\TripoSG\pretrained_weights\TripoSG-scribble");
-    if let Some(root) = normalize_weights_root(&fallback) {
-        return root;
-    }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let local = manifest_dir.join("../burn_3d_synth_tripo/assets/models/TripoSG-scribble");
     normalize_weights_root(&local).unwrap_or(local)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(root) = option_env!("TRIPOSG_SCRIBBLE_WEIGHTS_ROOT") {
+        return PathBuf::from(root);
+    }
+    web_asset_root().join("models/TripoSG-scribble")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_weights_root(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());
@@ -75,6 +102,7 @@ fn normalize_weights_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_rmbg_root(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());
@@ -83,4 +111,15 @@ fn normalize_rmbg_root(path: &Path) -> Option<PathBuf> {
         return path.parent().map(|p| p.to_path_buf());
     }
     None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_asset_root() -> PathBuf {
+    if let Some(root) = option_env!("BURN_3D_SYNTH_WEB_ASSET_ROOT") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from("assets")
 }

@@ -1,0 +1,11 @@
+[package]
+name = "bevy_transform_gizmos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.17"
+bevy_editor_core = { path = "../bevy_editor_core" }
+
+#[lints]
+#workspace = true
