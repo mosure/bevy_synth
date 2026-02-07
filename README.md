@@ -15,36 +15,36 @@
 
 ## features
 
-- [x] foreground segmentation
-- [x] image to 3d
-- [x] text to 3d
-- [x] web demo
-- [ ] text to image
-- [ ] image to composite-3d
-- [ ] many-3d to composite-3d
-- [ ] image to 4d
-- [ ] video to 4d
+- [x] editor
+- [x] wasm demo
+
+
+### media
+
+| status | input   | output       |
+| ------ | ------- | ------------ |
+| [x]    | image   | foreground   |
+| [x]    | image   | 3d           |
+| [x]    | text    | 3d           |
+| [ ]    | text    | image        |
+| [ ]    | image   | composite-3d |
+| [ ]    | many-3d | composite-3d |
+| [ ]    | image   | 4d           |
+| [ ]    | video   | 4d           |
+| [ ]    | text    | audio        |
+| [ ]    | video   | audio        |
+
+
 
 
 ## setup
+
+<!-- note: migrate this config section to be feature dependent, e.g. it is likely all models/features will not be used so please modularize the setup instructions/weight download -->
 
 - download TripoSG + RMBG weights (or set `TRIPOSG_WEIGHTS_ROOT` / `RMBG_WEIGHTS_ROOT`)
 - run the burnpack import tool `cargo run -p burn_3d_synth_tripo --bin triposg_import --features import`
 - run the bevy app with the burnpack weights
 
-## web/wasm
-
-Build wasm artifacts into `docs/` (and clear `RUSTFLAGS` for wasm builds):
-
-```powershell
-./scripts/build_web.ps1
-```
-
-Then serve `docs/` with any static server (example):
-
-```powershell
-python -m http.server 8080 --directory docs
-```
 
 
 ## model import
