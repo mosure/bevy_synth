@@ -21,7 +21,7 @@
 
 ### media
 
-| status  | input   | output       |
+|         | input   | output       |
 | ------  | ------- | ------------ |
 | ✅      | image   | foreground   |
 | ✅      | image   | 3d           |
