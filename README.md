@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/burn_synth.svg)](https://crates.io/crates/burn_synth)
 
 
-3d synthesis implemented in bevy and burn, view the [live demo](https://mosure.github.io/burn_synth/)
+asset synthesis implemented in bevy and burn, view the [live demo](https://mosure.github.io/burn_synth/)
 
 ## example
 
