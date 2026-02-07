@@ -1,10 +1,14 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
-use bevy::pbr::MeshMaterial3d;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::light::AtmosphereEnvironmentMapLight;
+use bevy::pbr::{Atmosphere, MeshMaterial3d};
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::alpha::AlphaMode;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::render::view::Hdr;
 use bevy::window::PrimaryWindow;
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
@@ -74,13 +78,20 @@ pub struct CatalogSpawnRequest {
     pub select_spawned: bool,
 }
 
+#[derive(Message, Clone, Debug)]
+pub struct CatalogDeleteRequest {
+    pub cache_key: Option<String>,
+}
+
 pub struct BurnSynthUiPlugin;
 
 impl Plugin for BurnSynthUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CatalogState>()
             .init_resource::<DragState>()
+            .init_resource::<CatalogSelectionState>()
             .add_message::<CatalogSpawnRequest>()
+            .add_message::<CatalogDeleteRequest>()
             .add_systems(Startup, setup_ui)
             .add_systems(
                 Update,
@@ -88,6 +99,8 @@ impl Plugin for BurnSynthUiPlugin {
                     update_queue_text,
                     handle_catalog_toggle,
                     handle_page_buttons,
+                    handle_catalog_delete_button,
+                    handle_catalog_delete_shortcut,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
                     update_button_visuals,
                     (
@@ -131,6 +144,10 @@ impl Default for CatalogState {
 }
 
 impl CatalogState {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn add_pending(&mut self, request: &InferenceRequest) {
         let label = request
             .image_path
@@ -181,6 +198,14 @@ impl CatalogState {
 
     pub fn entry_mut(&mut self, id: u32) -> Option<&mut CatalogEntry> {
         self.entries.iter_mut().find(|entry| entry.id == id)
+    }
+
+    pub fn remove_entry(&mut self, id: u32) -> Option<CatalogEntry> {
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        let removed = self.entries.remove(index);
+        self.clamp_page();
+        self.bump_revision();
+        Some(removed)
     }
 
     pub fn bump_revision(&mut self) {
@@ -311,6 +336,11 @@ impl DragState {
     }
 }
 
+#[derive(Resource, Default)]
+struct CatalogSelectionState {
+    selected: Option<u32>,
+}
+
 #[derive(Component)]
 struct QueueText;
 
@@ -343,6 +373,9 @@ struct CatalogNextButton;
 #[derive(Component)]
 struct PageLabel;
 
+#[derive(Component)]
+struct CatalogDeleteButton;
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 struct OpenImageButton;
@@ -366,19 +399,27 @@ enum ControlButtonKind {
 #[derive(Component)]
 struct ButtonLabel;
 
+#[derive(Component)]
+struct UiRootNode;
+
 fn setup_ui(mut commands: Commands) {
     let mut list_entity = Entity::PLACEHOLDER;
 
     let root = commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(0.0),
-            left: Val::Px(0.0),
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            flex_direction: FlexDirection::Column,
-            ..default()
-        })
+        .spawn((
+            UiRootNode,
+            // Keep world-space picking active in empty viewport regions.
+            Pickable::IGNORE,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+        ))
         .id();
 
     commands.entity(root).with_children(|parent| {
@@ -557,6 +598,28 @@ fn setup_ui(mut commands: Commands) {
                                     .with_children(|button| {
                                         button.spawn((
                                             Text::new(">"),
+                                            TextFont::from_font_size(12.0),
+                                            TextColor(BUTTON_TEXT),
+                                            ButtonLabel,
+                                        ));
+                                    });
+                                controls
+                                    .spawn((
+                                        Button,
+                                        CatalogDeleteButton,
+                                        ControlButton(ControlButtonKind::Secondary),
+                                        Node {
+                                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                            border: UiRect::all(Val::Px(1.0)),
+                                            ..default()
+                                        },
+                                        BorderColor::all(BUTTON_BORDER),
+                                        BackgroundColor(BUTTON_BG),
+                                        BorderRadius::all(Val::Px(6.0)),
+                                    ))
+                                    .with_children(|button| {
+                                        button.spawn((
+                                            Text::new("delete"),
                                             TextFont::from_font_size(12.0),
                                             TextColor(BUTTON_TEXT),
                                             ButtonLabel,
@@ -875,13 +938,114 @@ fn despawn_children_recursive(
 fn handle_catalog_entry_interaction(
     mut interactions: Query<(&Interaction, &CatalogEntryButton), Changed<Interaction>>,
     mut drag: ResMut<DragState>,
+    mut selection: ResMut<CatalogSelectionState>,
 ) {
     for (interaction, entry) in interactions.iter_mut() {
         if *interaction == Interaction::Pressed {
+            selection.selected = Some(entry.id);
             drag.active = Some(entry.id);
             drag.ghost_entry = None;
         }
     }
+}
+
+fn delete_catalog_entry(
+    id: u32,
+    catalog: &mut CatalogState,
+    selection: &mut CatalogSelectionState,
+    drag: &mut DragState,
+    commands: &mut Commands,
+    delete_requests: &mut MessageWriter<CatalogDeleteRequest>,
+) {
+    let Some(entry) = catalog.remove_entry(id) else {
+        if selection.selected == Some(id) {
+            selection.selected = None;
+        }
+        if drag.active == Some(id) {
+            drag.active = None;
+        }
+        if drag.ghost_entry == Some(id) {
+            clear_drag_ghost(drag, commands);
+        }
+        return;
+    };
+
+    if let Some(preview) = entry.preview {
+        commands.entity(preview.mesh_entity).despawn();
+        commands.entity(preview.camera_entity).despawn();
+        catalog.release_preview_layer(preview.layer_index);
+    }
+    if selection.selected == Some(id) {
+        selection.selected = None;
+    }
+    if drag.active == Some(id) {
+        drag.active = None;
+    }
+    if drag.ghost_entry == Some(id) {
+        clear_drag_ghost(drag, commands);
+    }
+
+    delete_requests.write(CatalogDeleteRequest {
+        cache_key: entry.cache_key,
+    });
+}
+
+fn handle_catalog_delete_button(
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<CatalogDeleteButton>)>,
+    mut catalog: ResMut<CatalogState>,
+    mut selection: ResMut<CatalogSelectionState>,
+    mut drag: ResMut<DragState>,
+    mut commands: Commands,
+    mut delete_requests: MessageWriter<CatalogDeleteRequest>,
+) {
+    for interaction in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(id) = selection.selected else {
+            continue;
+        };
+        delete_catalog_entry(
+            id,
+            &mut catalog,
+            &mut selection,
+            &mut drag,
+            &mut commands,
+            &mut delete_requests,
+        );
+    }
+}
+
+fn handle_catalog_delete_shortcut(
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    ui_state: Res<CatalogUiState>,
+    mut catalog: ResMut<CatalogState>,
+    mut selection: ResMut<CatalogSelectionState>,
+    mut drag: ResMut<DragState>,
+    mut commands: Commands,
+    mut delete_requests: MessageWriter<CatalogDeleteRequest>,
+) {
+    if !keys.just_pressed(KeyCode::Delete) && !keys.just_pressed(KeyCode::Backspace) {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    if !ui_state.cursor_over_ui(window) {
+        return;
+    }
+    let Some(id) = selection.selected else {
+        return;
+    };
+    delete_catalog_entry(
+        id,
+        &mut catalog,
+        &mut selection,
+        &mut drag,
+        &mut commands,
+        &mut delete_requests,
+    );
 }
 
 fn handle_page_buttons(
@@ -916,12 +1080,14 @@ fn handle_page_buttons(
 fn update_button_visuals(
     catalog: Res<CatalogState>,
     drag: Res<DragState>,
+    mut selection: ResMut<CatalogSelectionState>,
     mut controls: Query<
         (
             &Interaction,
             &ControlButton,
             Option<&CatalogPrevButton>,
             Option<&CatalogNextButton>,
+            Option<&CatalogDeleteButton>,
             &Children,
             &mut BackgroundColor,
             &mut BorderColor,
@@ -939,11 +1105,21 @@ fn update_button_visuals(
         (With<Button>, Without<ControlButton>),
     >,
 ) {
-    for (interaction, button, prev, next, children, mut bg, mut border) in controls.iter_mut() {
+    if let Some(selected) = selection.selected
+        && catalog.entry(selected).is_none()
+    {
+        selection.selected = None;
+    }
+
+    for (interaction, button, prev, next, delete, children, mut bg, mut border) in
+        controls.iter_mut()
+    {
         let disabled = if prev.is_some() {
             catalog.page() == 0
         } else if next.is_some() {
             catalog.page() + 1 >= catalog.page_count()
+        } else if delete.is_some() {
+            selection.selected.is_none()
         } else {
             false
         };
@@ -964,8 +1140,11 @@ fn update_button_visuals(
 
     for (interaction, entry, mut bg, mut border) in entries.iter_mut() {
         let dragging_this_entry = drag.active == Some(entry.id);
+        let selected = selection.selected == Some(entry.id);
         let (entry_bg, entry_border) = if dragging_this_entry {
             (BUTTON_OPEN_BG_HOVER, BUTTON_OPEN_BORDER_HOVER)
+        } else if selected {
+            (ENTRY_BG_HOVER, ENTRY_BORDER_HOVER)
         } else {
             match *interaction {
                 Interaction::Pressed => (ENTRY_BG_PRESSED, ENTRY_BORDER_PRESSED),
@@ -1343,6 +1522,14 @@ fn spawn_preview_scene(
     let camera_entity = commands
         .spawn((
             Camera3d::default(),
+            Hdr,
+            Tonemapping::AcesFitted,
+            Bloom::NATURAL,
+            Atmosphere::EARTH,
+            AtmosphereEnvironmentMapLight {
+                intensity: 1.1,
+                ..default()
+            },
             Camera {
                 order: 2,
                 target: RenderTarget::Image(image_handle.clone().into()),
@@ -1415,4 +1602,33 @@ pub fn preview_light_layers() -> RenderLayers {
         layers = layers.with(layer);
     }
     layers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_synth_runtime::state::InferenceQueue;
+
+    #[test]
+    fn ui_root_is_pass_through_for_world_picking() {
+        let mut app = App::new();
+        app.insert_resource(InferenceQueue::default());
+        app.insert_resource(Assets::<Image>::default());
+        app.insert_resource(Assets::<BevyMesh>::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Time::<()>::default());
+        app.add_plugins(BurnSynthUiPlugin);
+
+        app.update();
+
+        let world = app.world_mut();
+        let mut query = world.query::<(&UiRootNode, &Pickable)>();
+        let pickables: Vec<Pickable> = query
+            .iter(world)
+            .map(|(_, pickable)| pickable.clone())
+            .collect();
+        assert_eq!(pickables.len(), 1, "expected exactly one UI root node");
+        assert_eq!(pickables[0], Pickable::IGNORE);
+    }
 }

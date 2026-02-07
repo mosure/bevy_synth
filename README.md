@@ -1,4 +1,4 @@
-# lattice 🕊️🔥🎛️🎹
+# bevy_synth 🕊️🔥🎛️🎹
 
 [![GitHub License](https://img.shields.io/github/license/mosure/lattice)](https://raw.githubusercontent.com/mosure/lattice/main/LICENSE-MIT)
 [![crates.io](https://img.shields.io/crates/v/lattice.svg)](https://crates.io/crates/lattice)
@@ -17,6 +17,7 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 ## features
 
 - [x] editor
+- [x] native mcp server
 - [x] wasm demo
 
 

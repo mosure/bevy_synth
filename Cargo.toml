@@ -10,6 +10,7 @@ members = [
   "crates/bevy_file_dialog",
   "crates/bevy_editor_core",
   "crates/bevy_transform_gizmos",
+  "crates/burn_synth_mcp",
 ]
 
 [profile.dev.package."*"]
@@ -32,5 +33,4 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-
 

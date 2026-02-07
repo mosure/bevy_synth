@@ -327,7 +327,8 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
                 });
         let dit = load_triposg_dit(&dit_config, device, dit_path)?;
 
-        let scheduler_config = RectifiedFlowSchedulerConfig::from_config_file(scheduler_path)?;
+        let scheduler_config = RectifiedFlowSchedulerConfig::from_config_file(scheduler_path)
+            .unwrap_or_else(|_| RectifiedFlowSchedulerConfig::midi_3d());
         let scheduler = RectifiedFlowScheduler::new(scheduler_config);
 
         let image_encoder = load_triposg_dinov2(device, dino_path)?;

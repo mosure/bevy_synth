@@ -2276,8 +2276,23 @@ dependencies = [
 name = "burn_synth"
 version = "0.1.0"
 dependencies = [
+ "burn",
+ "burn-cuda",
+ "burn-wgpu",
  "burn_foreground",
  "burn_tripo",
+ "image",
+]
+
+[[package]]
+name = "burn_synth_mcp"
+version = "0.1.0"
+dependencies = [
+ "burn_synth",
+ "clap",
+ "image",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

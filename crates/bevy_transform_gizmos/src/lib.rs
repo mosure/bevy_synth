@@ -869,7 +869,7 @@ fn update_gizmo_visibility(
                 *vis = Visibility::Hidden;
             }
             for mut vis in scale_gizmos.iter_mut() {
-                *vis = Visibility::Hidden;
+                *vis = Visibility::Inherited;
             }
         }
         GizmoMode::Rotate => {

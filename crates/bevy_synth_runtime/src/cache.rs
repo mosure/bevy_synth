@@ -229,6 +229,26 @@ impl MeshCache {
         Ok(metadata)
     }
 
+    pub fn remove_mesh_entry(&mut self, cache_key: &str) -> CacheResult<bool> {
+        let Some(position) = self
+            .index
+            .meshes
+            .iter()
+            .position(|entry| entry.cache_key == cache_key)
+        else {
+            return Ok(false);
+        };
+
+        self.index.meshes.remove(position);
+        self.remove_mesh_payload(cache_key)?;
+        self.remove_gltf_output(cache_key)?;
+        self.index
+            .world_items
+            .retain(|item| item.cache_key != cache_key);
+        self.save_index()?;
+        Ok(true)
+    }
+
     pub fn set_world_items(&mut self, mut items: Vec<CachedWorldItem>) -> CacheResult<()> {
         items.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
         self.index.world_items = items;
@@ -676,6 +696,58 @@ mod tests {
         assert_eq!(cache.world_items().len(), 1);
         assert_eq!(cache.world_items()[0].cache_key, "abcd");
         assert_eq!(cache.world_items()[0].translation, [1.0, 2.0, 3.0]);
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn remove_mesh_entry_cleans_payload_and_world_refs() {
+        let root = temp_root("remove");
+        let image = PathBuf::from("C:/data/input/delete_me.png");
+
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let entry = cache
+            .upsert_mesh_for_image(&image, &dummy_mesh(1.0))
+            .expect("insert mesh");
+        cache
+            .set_world_items(vec![
+                CachedWorldItem {
+                    cache_key: entry.cache_key.clone(),
+                    translation: [0.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                CachedWorldItem {
+                    cache_key: "keep".to_string(),
+                    translation: [1.0, 2.0, 3.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+            ])
+            .expect("write world items");
+
+        let removed = cache
+            .remove_mesh_entry(&entry.cache_key)
+            .expect("remove mesh entry");
+        assert!(removed);
+        assert!(cache.mesh_entries().is_empty());
+        assert!(
+            cache
+                .world_items()
+                .iter()
+                .all(|item| item.cache_key != entry.cache_key)
+        );
+        let maybe_mesh = cache
+            .load_mesh(&entry.cache_key)
+            .expect("load mesh after removal");
+        assert!(maybe_mesh.is_none());
+        assert!(!PathBuf::from(&entry.gltf_output_id).exists());
+
+        let removed_again = cache
+            .remove_mesh_entry(&entry.cache_key)
+            .expect("remove mesh entry second time");
+        assert!(!removed_again);
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }

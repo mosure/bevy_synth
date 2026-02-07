@@ -10,11 +10,18 @@ use bevy::asset::{AssetMetaCheck, AssetMode, AssetPlugin, UnapprovedPathMode};
 use bevy::camera::ClearColorConfig;
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
-use bevy::light::PointLight;
-use bevy::pbr::{MeshMaterial3d, StandardMaterial};
+use bevy::light::{
+    AmbientLight, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, DirectionalLight,
+    PointLight, light_consts::lux,
+};
+use bevy::math::primitives::Cuboid;
+use bevy::pbr::{Atmosphere, MeshMaterial3d, StandardMaterial};
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::view::Hdr;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{FileDragAndDrop, PrimaryWindow, WindowCloseRequested};
 use bevy_editor_core::selection::{
@@ -46,8 +53,8 @@ use bevy_synth_runtime::worker::start_worker;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
-    BurnSynthUiPlugin, CatalogSpawnRequest, CatalogState, CatalogStatus, CatalogUiState, DragState,
-    MainCamera, preview_light_layers,
+    BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnRequest, CatalogState, CatalogStatus,
+    CatalogUiState, DragState, MainCamera, preview_light_layers,
 };
 
 #[derive(Component, Clone, Debug)]
@@ -160,6 +167,7 @@ pub(crate) fn run() {
                 handle_file_drop,
                 drive_inference,
                 handle_catalog_spawn_requests,
+                handle_catalog_delete_requests,
                 delete_selected_meshes,
                 (mark_world_cache_dirty, persist_world_cache).chain(),
                 update_spinner,
@@ -172,10 +180,11 @@ pub(crate) fn run() {
             (
                 remove_entity_from_selection_if_despawned,
                 update_selection_from_primary_click.after(TransformGizmoSystems::Main),
-                sync_panorbit_bindings,
-                sync_panorbit_enabled,
-            )
-                .before(PanOrbitCameraSystemSet),
+            ),
+        )
+        .add_systems(
+            PostUpdate,
+            (sync_panorbit_bindings, sync_panorbit_enabled).before(PanOrbitCameraSystemSet),
         );
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -230,6 +239,7 @@ fn setup(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ambient_light: ResMut<AmbientLight>,
     args: Res<AppArgs>,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
@@ -241,6 +251,14 @@ fn setup(
 
     commands.spawn((
         Camera3d::default(),
+        Hdr,
+        Tonemapping::AcesFitted,
+        Bloom::NATURAL,
+        Atmosphere::EARTH,
+        AtmosphereEnvironmentMapLight {
+            intensity: 1.1,
+            ..default()
+        },
         Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)),
         PanOrbitCamera {
             allow_upside_down: true,
@@ -256,9 +274,44 @@ fn setup(
         RenderLayers::layer(0).with(12),
         MainCamera,
     ));
+    ambient_light.color = Color::srgb(0.93, 0.96, 1.0);
+    ambient_light.brightness = 95.0;
     commands.spawn((
-        PointLight::default(),
-        Transform::from_xyz(2.0, 3.0, 2.0),
+        DirectionalLight {
+            color: Color::srgb(1.0, 0.97, 0.92),
+            illuminance: lux::AMBIENT_DAYLIGHT,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(6.0, 9.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 8.0,
+            maximum_distance: 36.0,
+            ..default()
+        }
+        .build(),
+        preview_light_layers(),
+    ));
+    commands.spawn((
+        PointLight {
+            color: Color::srgb(0.62, 0.72, 1.0),
+            intensity: 2600.0,
+            range: 30.0,
+            radius: 0.35,
+            ..default()
+        },
+        Transform::from_xyz(-5.0, 3.5, -4.0),
+        preview_light_layers(),
+    ));
+    commands.spawn((
+        PointLight {
+            color: Color::srgb(1.0, 0.9, 0.82),
+            intensity: 1900.0,
+            range: 24.0,
+            radius: 0.35,
+            ..default()
+        },
+        Transform::from_xyz(3.0, 4.0, 5.0),
         preview_light_layers(),
     ));
 
@@ -289,6 +342,7 @@ fn setup(
         &mut catalog,
         &mut cache,
     );
+    seed_default_catalog_cube(&mut meshes, &mut materials, &mut queue, &mut catalog);
     world_cache.dirty = false;
     world_cache.timer.reset();
 
@@ -407,6 +461,27 @@ fn hydrate_from_cache(
             "Loaded {loaded_meshes} cached catalog mesh(es) and {loaded_world_items} cached world item(s)."
         );
     }
+}
+
+fn seed_default_catalog_cube(
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    queue: &mut ResMut<InferenceQueue>,
+    catalog: &mut ResMut<CatalogState>,
+) {
+    if !catalog.is_empty() {
+        return;
+    }
+
+    let mesh = meshes.add(BevyMesh::from(Cuboid::from_size(Vec3::ONE)));
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.8, 0.84, 0.9),
+        perceptual_roughness: 0.58,
+        ..default()
+    });
+    let id = queue.counter;
+    queue.counter = queue.counter.wrapping_add(1);
+    catalog.add_ready(id, "cube".to_string(), mesh, material, None, None);
 }
 
 fn transform_from_cached_world_item(item: &CachedWorldItem) -> Option<Transform> {
@@ -643,6 +718,37 @@ fn handle_catalog_spawn_requests(
             && let Some(selection) = selection.as_mut()
         {
             selection.set(entity);
+        }
+    }
+}
+
+fn handle_catalog_delete_requests(
+    mut requests: MessageReader<CatalogDeleteRequest>,
+    mut cache: ResMut<MeshCacheResource>,
+    cached_instances: Query<(Entity, &CachedMeshInstance)>,
+    mut commands: Commands,
+) {
+    for request in requests.read() {
+        let Some(cache_key) = request.cache_key.as_ref() else {
+            continue;
+        };
+
+        if let Err(err) = cache.cache.remove_mesh_entry(cache_key) {
+            warn!("Failed to remove cached mesh entry {cache_key}: {err}");
+        }
+
+        let to_despawn: Vec<Entity> = cached_instances
+            .iter()
+            .filter_map(|(entity, cached)| {
+                if &cached.cache_key == cache_key {
+                    Some(entity)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for entity in to_despawn {
+            commands.entity(entity).despawn();
         }
     }
 }

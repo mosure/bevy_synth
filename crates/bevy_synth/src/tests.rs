@@ -180,6 +180,7 @@ fn ui_plugin_update_has_no_query_conflicts() {
     app.insert_resource(Assets::<Image>::default());
     app.insert_resource(Assets::<BevyMesh>::default());
     app.insert_resource(ButtonInput::<MouseButton>::default());
+    app.insert_resource(ButtonInput::<KeyCode>::default());
     app.insert_resource(Time::<()>::default());
     app.add_plugins(BurnSynthUiPlugin);
 

@@ -6,20 +6,7 @@ use crate::args::RmbgModel;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
-    if let Some(path) = explicit
-        && let Some(root) = normalize_weights_root(path)
-    {
-        return root;
-    }
-    if let Ok(root) = std::env::var("TRIPOSG_WEIGHTS_ROOT") {
-        let path = PathBuf::from(root);
-        if let Some(root) = normalize_weights_root(&path) {
-            return root;
-        }
-    }
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let local = manifest_dir.join("../burn_tripo/assets/models/MIDI-3D");
-    normalize_weights_root(&local).unwrap_or(local)
+    burn_tripo::paths::resolve_triposg_weights_root(explicit.map(|path| path.as_path()))
 }
 
 #[cfg(target_arch = "wasm32")]

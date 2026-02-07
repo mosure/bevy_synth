@@ -10,6 +10,9 @@ license = "MIT OR Apache-2.0"
 default = []
 triposg = ["dep:burn_tripo"]
 bg-removal = ["dep:burn_foreground"]
+runtime = ["import", "dep:burn", "dep:image"]
+wgpu = ["runtime", "dep:burn-wgpu"]
+cuda = ["runtime", "dep:burn-cuda"]
 import = [
   "triposg",
   "bg-removal",
@@ -18,7 +21,11 @@ import = [
 ]
 
 [dependencies]
+burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 burn_tripo = { path = "../burn_tripo", optional = true, default-features = false }
 burn_foreground = { path = "../burn_foreground", optional = true, default-features = false }
+burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+burn-cuda = { version = "0.19", optional = true }
 
 

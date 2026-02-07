@@ -246,6 +246,21 @@ fn load_rmbg14_pipelines<B: Backend>(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn load_rmbg14_pipelines<B: Backend>(
+    _rmbg_root: &std::path::Path,
+    _rmbg_backend: RmbgBackend,
+    _device: &B::Device,
+) -> Result<
+    (
+        Option<RmbgPipeline<burn::backend::NdArray<f32>>>,
+        Option<RmbgPipeline<B>>,
+    ),
+    String,
+> {
+    Err("RMBG-1.4 native loader is unavailable on wasm32".to_string())
+}
+
 fn worker_loop_backend<B: Backend>(
     args: AppArgs,
     command_rx: Receiver<WorkerCommand>,

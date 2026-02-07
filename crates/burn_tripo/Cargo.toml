@@ -31,7 +31,8 @@ exclude = [
 default = []
 
 benchmark = ["burn/autotune", "burn/fusion"]
-import = ["bevy_args", "burn-store", "clap", "serde", "serde_json"]
+import = ["burn-store", "clap", "serde", "serde_json"]
+import-cli = ["import", "bevy_args"]
 foreground = ["dep:burn_foreground"]
 cuda = ["burn-cuda"]
 report = []
@@ -119,22 +120,22 @@ path = "src/lib.rs"
 [[bin]]
 name = "import"
 path = "tool/import.rs"
-required-features = ["import"]
+required-features = ["import-cli"]
 
 [[bin]]
 name = "triposg_hook"
 path = "tool/triposg_hook.rs"
-required-features = ["import"]
+required-features = ["import-cli"]
 
 [[bin]]
 name = "triposg_dit_hook"
 path = "tool/triposg_dit_hook.rs"
-required-features = ["import"]
+required-features = ["import-cli"]
 
 [[bin]]
 name = "triposg_dino_hook"
 path = "tool/triposg_dino_hook.rs"
-required-features = ["import"]
+required-features = ["import-cli"]
 
 [[bin]]
 name = "triposg_profile"
@@ -149,7 +150,7 @@ required-features = ["import"]
 [[bin]]
 name = "list_safetensors"
 path = "tool/list_safetensors.rs"
-required-features = ["import"]
+required-features = ["import-cli"]
 
 [[bin]]
 name = "triposg_report"
