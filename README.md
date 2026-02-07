@@ -21,18 +21,19 @@
 
 ### media
 
-| status | input   | output       |
-| ------ | ------- | ------------ |
-| [x]    | image   | foreground   |
-| [x]    | image   | 3d           |
-| [x]    | text    | 3d           |
-| [ ]    | text    | image        |
-| [ ]    | image   | composite-3d |
-| [ ]    | many-3d | composite-3d |
-| [ ]    | image   | 4d           |
-| [ ]    | video   | 4d           |
-| [ ]    | text    | audio        |
-| [ ]    | video   | audio        |
+| status  | input   | output       |
+| ------  | ------- | ------------ |
+| ✅      | image   | foreground   |
+| ✅      | image   | 3d           |
+| ✅      | text    | 3d           |
+| ⬜      | text    | image        |
+| ⬜      | image   | composite-3d |
+| ⬜      | many-3d | composite-3d |
+| ⬜      | image   | 4d           |
+| ⬜      | video   | 4d           |
+| ⬜      | text    | audio        |
+| ⬜      | video   | audio        |
+
 
 
 
