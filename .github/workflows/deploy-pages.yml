@@ -18,13 +18,13 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     env:
-      # Example S3 base: https://example-bucket.s3.amazonaws.com/burn_3d_synth/assets
-      BURN_3D_SYNTH_WEB_ASSET_ROOT: ${{ vars.BURN_3D_SYNTH_WEB_ASSET_ROOT || secrets.BURN_3D_SYNTH_WEB_ASSET_ROOT }}
-      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_3d_synth/assets/models/MIDI-3D
+      # Example S3 base: https://example-bucket.s3.amazonaws.com/burn_synth/assets
+      BURN_SYNTH_WEB_ASSET_ROOT: ${{ vars.BURN_SYNTH_WEB_ASSET_ROOT || secrets.BURN_SYNTH_WEB_ASSET_ROOT }}
+      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/MIDI-3D
       TRIPOSG_WEIGHTS_ROOT: ${{ vars.TRIPOSG_WEIGHTS_ROOT || secrets.TRIPOSG_WEIGHTS_ROOT }}
-      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_3d_synth/assets/models/TripoSG-scribble
+      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TripoSG-scribble
       TRIPOSG_SCRIBBLE_WEIGHTS_ROOT: ${{ vars.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT || secrets.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT }}
-      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_3d_synth/assets/models/RMBG-1.4
+      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/RMBG-1.4
       RMBG_WEIGHTS_ROOT: ${{ vars.RMBG_WEIGHTS_ROOT || secrets.RMBG_WEIGHTS_ROOT }}
 
     steps:
@@ -43,8 +43,8 @@ jobs:
         run: |
           unset RUSTFLAGS
           unset CARGO_ENCODED_RUSTFLAGS
-          cargo build -p bevy_3d_synth --target wasm32-unknown-unknown --profile wasm-release
-          wasm-bindgen target/wasm32-unknown-unknown/wasm-release/bevy_3d_synth.wasm --out-dir docs --target web --no-typescript
+          cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release
+          wasm-bindgen target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm --out-dir docs --target web --no-typescript
 
       - name: configure pages
         uses: actions/configure-pages@v5

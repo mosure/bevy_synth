@@ -1,10 +1,11 @@
-# burn_synth 🔥🎛️🎹
+# lattice 🕊️🔥🎛️🎹
 
-[![GitHub License](https://img.shields.io/github/license/mosure/burn_synth)](https://raw.githubusercontent.com/mosure/burn_synth/main/LICENSE-MIT)
-[![crates.io](https://img.shields.io/crates/v/burn_synth.svg)](https://crates.io/crates/burn_synth)
+[![GitHub License](https://img.shields.io/github/license/mosure/lattice)](https://raw.githubusercontent.com/mosure/lattice/main/LICENSE-MIT)
+[![crates.io](https://img.shields.io/crates/v/lattice.svg)](https://crates.io/crates/lattice)
 
 
-asset synthesis implemented in bevy and burn, view the [live demo](https://mosure.github.io/burn_synth/)
+asset synthesis implemented in bevy and burn, view the [live demo](https://mosure.github.io/lattice/)
+
 
 ## example
 
@@ -36,14 +37,12 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 
 
 
-
-
 ## setup
 
 <!-- note: migrate this config section to be feature dependent, e.g. it is likely all models/features will not be used so please modularize the setup instructions/weight download -->
 
 - download TripoSG + RMBG weights (or set `TRIPOSG_WEIGHTS_ROOT` / `RMBG_WEIGHTS_ROOT`)
-- run the burnpack import tool `cargo run -p burn_3d_synth_tripo --bin triposg_import --features import`
+- run the burnpack import tool `cargo run -p burn_tripo --bin triposg_import --features import`
 - run the bevy app with the burnpack weights
 
 
@@ -51,7 +50,7 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 ## model import
 
 ```
-cargo run -p burn_3d_synth_tripo --bin triposg_import --features import
+cargo run -p burn_tripo --bin triposg_import --features import
 ```
 
 
@@ -62,3 +61,4 @@ cargo run -p burn_3d_synth_tripo --bin triposg_import --features import
 - [midi](https://huanngzh.github.io/MIDI-Page/)
 - [trellis](https://github.com/microsoft/TRELLIS.2)
 - [triposg](https://yg256li.github.io/TripoSG-Page/)
+

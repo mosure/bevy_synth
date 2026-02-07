@@ -13,7 +13,7 @@
 //! transform gizmo will appear and allow you to move and rotate your selection.
 
 use bevy::camera::Projection;
-use bevy::picking::prelude::MeshPickingPlugin;
+use bevy::picking::prelude::{MeshPickingPlugin, Pickable};
 use bevy::picking::{backend::ray::RayMap, pointer::PointerId};
 use bevy::{prelude::*, transform::TransformSystems};
 use bevy_editor_core::selection::EditorSelection;
@@ -172,6 +172,8 @@ impl Plugin for TransformGizmoPlugin {
                 .run_if(|settings: Res<TransformGizmoSettings>| settings.enabled),
         );
 
+        app.add_systems(PostUpdate, ensure_pickable_handles);
+
         app.add_systems(Startup, mesh::build_gizmo)
             .add_systems(PostStartup, place_gizmo);
     }
@@ -255,6 +257,15 @@ struct InitialTransform {
 /// Marker component for the camera that display and control the transform gizmo.
 #[derive(Component, Default, Clone, Debug)]
 pub struct GizmoCamera;
+
+fn ensure_pickable_handles(
+    mut commands: Commands,
+    handles: Query<Entity, (With<InteractionKind>, Without<Pickable>)>,
+) {
+    for entity in handles.iter() {
+        commands.entity(entity).insert(Pickable::default());
+    }
+}
 
 fn on_transform_gizmo_pointer_press(
     trigger: On<Pointer<Press>>,

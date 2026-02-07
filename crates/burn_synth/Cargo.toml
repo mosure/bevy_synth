@@ -1,0 +1,24 @@
+[package]
+name = "burn_synth"
+version = "0.1.0"
+edition = "2024"
+
+description = "Shared utilities and pipeline re-exports for burn_synth"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+triposg = ["dep:burn_tripo"]
+bg-removal = ["dep:burn_foreground"]
+import = [
+  "triposg",
+  "bg-removal",
+  "burn_tripo/import",
+  "burn_foreground/import",
+]
+
+[dependencies]
+burn_tripo = { path = "../burn_tripo", optional = true, default-features = false }
+burn_foreground = { path = "../burn_foreground", optional = true, default-features = false }
+
+

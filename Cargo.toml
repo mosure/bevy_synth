@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/burn_3d_synth",
-  "crates/burn_3d_synth_tripo",
-  "crates/bevy_3d_synth",
-  "crates/bevy_3d_synth_core",
-  "crates/burn_3d_synth_bg_removal",
+  "crates/burn_synth",
+  "crates/burn_tripo",
+  "crates/bevy_synth",
+  "crates/bevy_synth_runtime",
+  "crates/bevy_synth_ui",
+  "crates/burn_foreground",
   "crates/bevy_file_dialog",
   "crates/bevy_editor_core",
   "crates/bevy_transform_gizmos",
@@ -31,3 +32,5 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+

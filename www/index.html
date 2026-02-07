@@ -68,7 +68,7 @@
       <div id="boot-text">loading wasm module...</div>
     </div>
     <script type="module">
-      import init from "./bevy_3d_synth.js";
+      import init from "./bevy_synth.js";
 
       const boot = document.getElementById("boot");
       const text = document.getElementById("boot-text");
@@ -77,9 +77,10 @@
         text.textContent = "module ready";
         setTimeout(() => boot.remove(), 1200);
       } catch (err) {
-        console.error("Failed to initialize bevy_3d_synth wasm", err);
+        console.error("Failed to initialize bevy_synth wasm", err);
         text.textContent = "failed to load wasm module";
       }
     </script>
   </body>
 </html>
+

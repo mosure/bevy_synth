@@ -1,0 +1,18 @@
+[package]
+name = "bevy_synth_ui"
+version = "0.1.0"
+edition = "2024"
+
+description = "UI plugin and catalog interactions for bevy_synth"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy = "0.17"
+bevy_editor_core = { path = "../bevy_editor_core" }
+bevy_mesh = "0.17"
+bevy_picking = "0.17"
+bevy_synth_runtime = { path = "../bevy_synth_runtime", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy_file_dialog = { path = "../bevy_file_dialog" }
+
