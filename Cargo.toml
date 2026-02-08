@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/burn_synth",
+  "crates/burn_trellis",
   "crates/burn_tripo",
   "crates/bevy_synth",
   "crates/bevy_synth_runtime",
@@ -33,4 +34,3 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-

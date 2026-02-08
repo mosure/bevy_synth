@@ -21,6 +21,10 @@ use burn_foreground::rmbg14::import::{
     load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_bytes,
     load_rmbg_processor_from_json_bytes,
 };
+use burn_trellis::config::TrellisQuality as TrellisRuntimeQuality;
+use burn_trellis::pipeline::{
+    Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
+};
 #[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::dit::TripoSGDiTConfig;
 #[cfg(target_arch = "wasm32")]
@@ -30,6 +34,7 @@ use burn_tripo::model::triposg::image_encoder::import::{
     default_dinov2_config, load_dinov2_processor_from_json_bytes,
     load_triposg_dinov2_from_burnpack_bytes,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use burn_tripo::model::triposg::image_encoder::import::{
     load_dinov2_processor, load_triposg_dinov2,
 };
@@ -50,12 +55,16 @@ use burn_tripo::pipeline::{
     triposg_scribble::TripoSGScribblePipeline,
 };
 
+use crate::args::TrellisQuality;
 use crate::args::{
     AppArgs, BackendKind, DEFAULT_CHUNK_SIZE, DinoBackend, MeshMode, RmbgBackend, RmbgModel,
     SynthesisModel,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use crate::io::load_text_embeds;
-use crate::paths::{resolve_rmbg_root, resolve_scribble_root, resolve_triposg_root};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::paths::resolve_scribble_root;
+use crate::paths::{resolve_rmbg_root, resolve_triposg_root};
 use crate::state::{InferenceRequest, InferenceWorker, WorkerCommand, WorkerEvent};
 #[cfg(target_arch = "wasm32")]
 use js_sys::Uint8Array;
@@ -68,6 +77,42 @@ use web_sys::{ReadableStreamDefaultReader, Response};
 
 const WGPU_CHUNK_SIZE_CAP: usize = 8_192;
 const CUDA_CHUNK_SIZE_CAP: usize = 32_768;
+
+fn synthesis_attempt_order(models: &[SynthesisModel]) -> Result<Vec<SynthesisModel>, String> {
+    let mut order = Vec::with_capacity(models.len());
+    for model in models.iter().copied() {
+        if !order.contains(&model) {
+            order.push(model);
+        }
+    }
+    if order.is_empty() {
+        Err("No synthesis backend selected.".to_string())
+    } else {
+        Ok(order)
+    }
+}
+
+fn synthesis_model_name(model: SynthesisModel) -> &'static str {
+    match model {
+        SynthesisModel::Triposg => "TripoSG",
+        SynthesisModel::Trellis => "Trellis",
+    }
+}
+
+fn synthesis_unavailable_message(
+    triposg_load_error: Option<&str>,
+    trellis_load_error: Option<&str>,
+) -> String {
+    let triposg = match triposg_load_error {
+        Some(err) => format!("TripoSG: {err}"),
+        None => "TripoSG: disabled".to_string(),
+    };
+    let trellis = match trellis_load_error {
+        Some(err) => format!("Trellis: {err}"),
+        None => "Trellis: disabled".to_string(),
+    };
+    format!("No synthesis backend is available. {triposg}. {trellis}.")
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn start_worker(args: &AppArgs) -> InferenceWorker {
@@ -203,6 +248,8 @@ struct PipelineState<B: Backend> {
     dino_cpu: Option<DinoCpuState>,
     triposg: Option<TripoSGPipeline<B>>,
     scribble: Option<TripoSGScribblePipeline<B>>,
+    trellis: Option<Trellis2Pipeline>,
+    trellis_load_error: Option<String>,
     synthesis_models: Vec<SynthesisModel>,
     triposg_load_error: Option<String>,
     text_embeds: Option<Tensor<B, 3>>,
@@ -246,21 +293,65 @@ fn load_rmbg14_pipelines<B: Backend>(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn load_rmbg14_pipelines<B: Backend>(
-    _rmbg_root: &std::path::Path,
-    _rmbg_backend: RmbgBackend,
-    _device: &B::Device,
-) -> Result<
-    (
-        Option<RmbgPipeline<burn::backend::NdArray<f32>>>,
-        Option<RmbgPipeline<B>>,
-    ),
-    String,
-> {
-    Err("RMBG-1.4 native loader is unavailable on wasm32".to_string())
+fn load_trellis_pipeline(args: &AppArgs) -> Result<Trellis2Pipeline, String> {
+    let mut config = Trellis2PipelineConfig::default();
+    if let Some(path) = args.trellis_weights_root.as_ref() {
+        config.weights_root = path.clone();
+    }
+    config.image_large_root = args.trellis_image_large_root.clone();
+
+    let pipeline = Trellis2Pipeline::new(config)
+        .map_err(|err| format!("failed to initialize Trellis2: {err}"))?;
+    pipeline
+        .validate_runtime()
+        .map_err(|err| format!("Trellis2 runtime unavailable: {err}"))?;
+    Ok(pipeline)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn load_triposg_pipeline<B: Backend>(
+    args: &AppArgs,
+    device: &B::Device,
+    dino_backend: DinoBackend,
+) -> Result<(Option<DinoCpuState>, TripoSGPipeline<B>), String> {
+    let weights_root = resolve_triposg_root(args.weights_root.as_ref());
+    let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
+        let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
+        let weights_path = weights_root.join("image_encoder_dinov2/model.safetensors");
+        let encoder = load_triposg_dinov2(&cpu_device, &weights_path)
+            .map_err(|err| format!("failed to load DINOv2 weights on CPU: {err}"))?;
+        let processor = load_dinov2_processor(&weights_root)
+            .map_err(|err| format!("failed to load DINOv2 processor: {err}"))?;
+        Some(DinoCpuState {
+            device: cpu_device,
+            encoder,
+            processor,
+        })
+    } else {
+        None
+    };
+    let triposg = TripoSGPipeline::from_pretrained(weights_root, device)
+        .map_err(|err| format!("failed to load TripoSG weights: {err}"))?;
+    Ok((dino_cpu, triposg))
+}
+
+fn trellis_quality_to_runtime(quality: TrellisQuality) -> TrellisRuntimeQuality {
+    match quality {
+        TrellisQuality::Low => TrellisRuntimeQuality::Low,
+        TrellisQuality::Medium => TrellisRuntimeQuality::Medium,
+        TrellisQuality::High => TrellisRuntimeQuality::High,
+    }
+}
+
+fn trellis_device_for_backend(backend: BackendKind) -> TrellisDevice {
+    match backend {
+        BackendKind::Cpu => TrellisDevice::Cpu,
+        BackendKind::Wgpu => TrellisDevice::Wgpu,
+        BackendKind::Cuda => TrellisDevice::Cuda,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn worker_loop_backend<B: Backend>(
     args: AppArgs,
     command_rx: Receiver<WorkerCommand>,
@@ -338,6 +429,7 @@ async fn worker_loop_backend_wasm<B: Backend>(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, String> {
     configure_cubecl_autotune::<B>();
     let bounds = parse_bounds(&args.bounds).map_err(|err| err.to_string())?;
@@ -363,12 +455,10 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
     }
 
     let synthesis_models = args.synthesis_models.clone();
-    let wants_triposg = synthesis_models
+    let synthesis_order = synthesis_attempt_order(&synthesis_models)?;
+    let wants_triposg = synthesis_order
         .iter()
         .any(|model| matches!(model, SynthesisModel::Triposg));
-    let wants_trellis = synthesis_models
-        .iter()
-        .any(|model| matches!(model, SynthesisModel::Trellis));
 
     let dino_backend = match args.dino_backend {
         DinoBackend::Auto => {
@@ -413,35 +503,6 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         other => other,
     };
 
-    if wants_trellis && !wants_triposg {
-        if args.text_embeds.is_some() || args.prompt.is_some() {
-            return Err(
-                "text/scribble mode currently requires TripoSG; include `triposg` in --synthesis-models"
-                    .to_string(),
-            );
-        }
-        warn!("Trellis backend selected, but Trellis inference is not implemented yet.");
-        return Ok(PipelineState {
-            device,
-            rmbg14_cpu: None,
-            rmbg14_device: None,
-            rmbg2: None,
-            rmbg_model: requested_rmbg_model,
-            rmbg_backend,
-            dino_backend,
-            dino_cpu: None,
-            triposg: None,
-            scribble: None,
-            synthesis_models,
-            triposg_load_error: None,
-            text_embeds: None,
-            bounds,
-            hierarchical,
-            chunk_size,
-            flash,
-        });
-    }
-
     let mut active_rmbg_model = requested_rmbg_model;
     let (rmbg14_cpu, rmbg14_device, rmbg2) = match requested_rmbg_model {
         RmbgModel::Rmbg14 => {
@@ -484,6 +545,13 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
 
     let wants_text = args.text_embeds.is_some() || args.prompt.is_some();
     if wants_text {
+        if !wants_triposg {
+            return Err(
+                "text/scribble mode currently requires TripoSG; include `triposg` in --synthesis-models"
+                    .to_string(),
+            );
+        }
+
         let text_path = args
             .text_embeds
             .as_ref()
@@ -510,6 +578,8 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
             dino_cpu: None,
             triposg: None,
             scribble: Some(scribble),
+            trellis: None,
+            trellis_load_error: None,
             synthesis_models: synthesis_models.clone(),
             triposg_load_error: None,
             text_embeds: Some(text_embeds),
@@ -520,25 +590,60 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         });
     }
 
-    let weights_root = resolve_triposg_root(args.weights_root.as_ref());
-    let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
-        let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-        let weights_path = weights_root.join("image_encoder_dinov2/model.safetensors");
-        let encoder = load_triposg_dinov2(&cpu_device, &weights_path)
-            .map_err(|err| format!("failed to load DINOv2 weights on CPU: {err}"))?;
-        let processor = load_dinov2_processor(&weights_root)
-            .map_err(|err| format!("failed to load DINOv2 processor: {err}"))?;
-        Some(DinoCpuState {
-            device: cpu_device,
-            encoder,
-            processor,
-        })
-    } else {
-        None
-    };
+    let mut trellis = None;
+    let mut trellis_load_error = None;
+    let mut dino_cpu = None;
+    let mut triposg = None;
+    let mut triposg_load_error = None;
+    for (index, model) in synthesis_order.iter().copied().enumerate() {
+        let fallback = synthesis_order.get(index + 1).copied();
+        match model {
+            SynthesisModel::Triposg => {
+                match load_triposg_pipeline::<B>(args, &device, dino_backend) {
+                    Ok((dino_state, triposg_pipeline)) => {
+                        dino_cpu = dino_state;
+                        triposg = Some(triposg_pipeline);
+                        break;
+                    }
+                    Err(err) => {
+                        triposg_load_error = Some(err.clone());
+                        if let Some(next_model) = fallback {
+                            warn!(
+                                "Requested {} backend unavailable ({}); trying {} fallback.",
+                                synthesis_model_name(model),
+                                err,
+                                synthesis_model_name(next_model)
+                            );
+                        }
+                    }
+                }
+            }
+            SynthesisModel::Trellis => match load_trellis_pipeline(args) {
+                Ok(pipeline) => {
+                    trellis = Some(pipeline);
+                    break;
+                }
+                Err(err) => {
+                    trellis_load_error = Some(err.clone());
+                    if let Some(next_model) = fallback {
+                        warn!(
+                            "Requested {} backend unavailable ({}); trying {} fallback.",
+                            synthesis_model_name(model),
+                            err,
+                            synthesis_model_name(next_model)
+                        );
+                    }
+                }
+            },
+        }
+    }
 
-    let triposg = TripoSGPipeline::from_pretrained(weights_root, &device)
-        .map_err(|err| format!("failed to load TripoSG weights: {err}"))?;
+    if triposg.is_none() && trellis.is_none() {
+        return Err(synthesis_unavailable_message(
+            triposg_load_error.as_deref(),
+            trellis_load_error.as_deref(),
+        ));
+    }
 
     Ok(PipelineState {
         device,
@@ -549,10 +654,12 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         rmbg_backend,
         dino_backend,
         dino_cpu,
-        triposg: Some(triposg),
+        triposg,
         scribble: None,
+        trellis,
+        trellis_load_error,
         synthesis_models,
-        triposg_load_error: None,
+        triposg_load_error,
         text_embeds: None,
         bounds,
         hierarchical,
@@ -592,12 +699,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
     }
 
     let synthesis_models = args.synthesis_models.clone();
-    let wants_triposg = synthesis_models
-        .iter()
-        .any(|model| matches!(model, SynthesisModel::Triposg));
-    let wants_trellis = synthesis_models
-        .iter()
-        .any(|model| matches!(model, SynthesisModel::Trellis));
+    let synthesis_order = synthesis_attempt_order(&synthesis_models)?;
 
     if args.text_embeds.is_some() || args.prompt.is_some() {
         return Err("text/scribble mode is not supported on wasm yet".to_string());
@@ -633,28 +735,6 @@ async fn build_pipeline_state_wasm<B: Backend>(
         RmbgBackend::Auto => RmbgBackend::Gpu,
         other => other,
     };
-    if wants_trellis && !wants_triposg {
-        send_worker_status(event_tx, "Trellis backend selected (not implemented yet).");
-        return Ok(PipelineState {
-            device,
-            rmbg14_cpu: None,
-            rmbg14_device: None,
-            rmbg2: None,
-            rmbg_model: args.rmbg_model,
-            rmbg_backend,
-            dino_backend,
-            dino_cpu: None,
-            triposg: None,
-            scribble: None,
-            synthesis_models,
-            triposg_load_error: None,
-            text_embeds: None,
-            bounds,
-            hierarchical,
-            chunk_size,
-            flash,
-        });
-    }
 
     let mut totals = DownloadTotals::default();
     send_worker_status(event_tx, "Loading model weights...");
@@ -712,6 +792,103 @@ async fn build_pipeline_state_wasm<B: Backend>(
         }
     };
 
+    let mut triposg = None;
+    let mut trellis = None;
+    let mut dino_cpu = None;
+    let mut triposg_load_error = None;
+    let mut trellis_load_error = None;
+    for (index, model) in synthesis_order.iter().copied().enumerate() {
+        let fallback = synthesis_order.get(index + 1).copied();
+        match model {
+            SynthesisModel::Triposg => {
+                match load_triposg_pipeline_wasm::<B>(
+                    args,
+                    &device,
+                    dino_backend,
+                    event_tx,
+                    &mut totals,
+                )
+                .await
+                {
+                    Ok((dino_state, pipeline)) => {
+                        dino_cpu = dino_state;
+                        triposg = Some(pipeline);
+                        break;
+                    }
+                    Err(err) => {
+                        triposg_load_error = Some(err.clone());
+                        if let Some(next_model) = fallback {
+                            let log_message = format!(
+                                "Requested {} backend unavailable ({}); trying {} fallback.",
+                                synthesis_model_name(model),
+                                err,
+                                synthesis_model_name(next_model)
+                            );
+                            warn!("{log_message}");
+                            send_worker_status(event_tx, log_message);
+                        }
+                    }
+                }
+            }
+            SynthesisModel::Trellis => match load_trellis_pipeline(args) {
+                Ok(pipeline) => {
+                    trellis = Some(pipeline);
+                    break;
+                }
+                Err(err) => {
+                    trellis_load_error = Some(err.clone());
+                    if let Some(next_model) = fallback {
+                        let log_message = format!(
+                            "Requested {} backend unavailable ({}); trying {} fallback.",
+                            synthesis_model_name(model),
+                            err,
+                            synthesis_model_name(next_model)
+                        );
+                        warn!("{log_message}");
+                        send_worker_status(event_tx, log_message);
+                    }
+                }
+            },
+        }
+    }
+    if triposg.is_none() && trellis.is_none() {
+        return Err(synthesis_unavailable_message(
+            triposg_load_error.as_deref(),
+            trellis_load_error.as_deref(),
+        ));
+    }
+
+    Ok(PipelineState {
+        device,
+        rmbg14_cpu,
+        rmbg14_device,
+        rmbg2: None,
+        rmbg_model,
+        rmbg_backend,
+        dino_backend,
+        dino_cpu,
+        triposg,
+        scribble: None,
+        trellis,
+        trellis_load_error,
+        synthesis_models,
+        triposg_load_error,
+        text_embeds: None,
+        bounds,
+        hierarchical,
+        chunk_size,
+        flash,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_triposg_pipeline_wasm<B: Backend>(
+    args: &AppArgs,
+    device: &B::Device,
+    dino_backend: DinoBackend,
+    event_tx: &Sender<WorkerEvent>,
+    totals: &mut DownloadTotals,
+) -> Result<(Option<DinoCpuState>, TripoSGPipeline<B>), String> {
     let triposg_root = resolve_triposg_root(args.weights_root.as_ref());
     let triposg_root_url = normalize_web_path(&triposg_root);
     let vae_burnpack = download_burnpack_asset(
@@ -719,7 +896,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
         "TripoSG VAE",
         "TRIPOSG_BPK_PRECISION",
         event_tx,
-        &mut totals,
+        totals,
     )
     .await?;
     let dit_burnpack = download_burnpack_asset(
@@ -730,7 +907,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
         "TripoSG DiT",
         "TRIPOSG_BPK_PRECISION",
         event_tx,
-        &mut totals,
+        totals,
     )
     .await?;
     let dino_burnpack = download_burnpack_asset(
@@ -738,7 +915,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
         "DINOv2",
         "TRIPOSG_BPK_PRECISION",
         event_tx,
-        &mut totals,
+        totals,
     )
     .await?;
 
@@ -820,13 +997,12 @@ async fn build_pipeline_state_wasm<B: Backend>(
         None
     };
 
-    let vae = load_triposg_vae_from_burnpack_bytes(&vae_config, &device, vae_burnpack)
+    let vae = load_triposg_vae_from_burnpack_bytes(&vae_config, device, vae_burnpack)
         .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
-    let dit = load_triposg_dit_from_burnpack_bytes(&dit_config, &device, dit_burnpack)
+    let dit = load_triposg_dit_from_burnpack_bytes(&dit_config, device, dit_burnpack)
         .map_err(|err| format!("failed to load TripoSG DiT burnpack: {err}"))?;
-    let image_encoder =
-        load_triposg_dinov2_from_burnpack_bytes(&device, dino_config, dino_burnpack)
-            .map_err(|err| format!("failed to load DINOv2 burnpack: {err}"))?;
+    let image_encoder = load_triposg_dinov2_from_burnpack_bytes(device, dino_config, dino_burnpack)
+        .map_err(|err| format!("failed to load DINOv2 burnpack: {err}"))?;
     let scheduler = scheduler_config.init();
     let triposg = TripoSGPipeline::new(vae, dit, scheduler, image_encoder, dino_processor.clone());
 
@@ -855,25 +1031,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
         None
     };
 
-    Ok(PipelineState {
-        device,
-        rmbg14_cpu,
-        rmbg14_device,
-        rmbg2: None,
-        rmbg_model,
-        rmbg_backend,
-        dino_backend,
-        dino_cpu,
-        triposg: Some(triposg),
-        scribble: None,
-        synthesis_models,
-        triposg_load_error: None,
-        text_embeds: None,
-        bounds,
-        hierarchical,
-        chunk_size,
-        flash,
-    })
+    Ok((dino_cpu, triposg))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1116,13 +1274,9 @@ fn run_inference_with_state<B: Backend>(
         Err(err) => return vec![Err(err); requests.len()],
     };
     if matches!(synthesis_backend, ActiveSynthesisBackend::Trellis) {
-        return vec![
-            Err(
-                "Trellis backend is selected but not implemented yet. Use --synthesis-models triposg for inference."
-                    .to_string(),
-            );
-            requests.len()
-        ];
+        return run_trellis_batch(state, args, requests).unwrap_or_else(|err| {
+            vec![Err(format!("Trellis batch execution failed: {err}")); requests.len()]
+        });
     }
 
     let device = state.device.clone();
@@ -1182,6 +1336,7 @@ fn select_synthesis_backend<B: Backend>(
     state: &PipelineState<B>,
 ) -> Result<ActiveSynthesisBackend, String> {
     let triposg_loaded = state.triposg.is_some() || state.scribble.is_some();
+    let trellis_loaded = state.trellis.is_some();
     for model in state.synthesis_models.iter() {
         match model {
             SynthesisModel::Triposg => {
@@ -1190,7 +1345,9 @@ fn select_synthesis_backend<B: Backend>(
                 }
             }
             SynthesisModel::Trellis => {
-                return Ok(ActiveSynthesisBackend::Trellis);
+                if trellis_loaded {
+                    return Ok(ActiveSynthesisBackend::Trellis);
+                }
             }
         }
     }
@@ -1203,7 +1360,52 @@ fn select_synthesis_backend<B: Backend>(
         return Err(format!("TripoSG backend is unavailable: {err}"));
     }
 
+    if let Some(err) = state.trellis_load_error.as_ref() {
+        return Err(format!("Trellis backend is unavailable: {err}"));
+    }
+
     Err("No synthesis backend is available.".to_string())
+}
+
+fn run_trellis_batch<B: Backend>(
+    state: &mut PipelineState<B>,
+    args: &AppArgs,
+    requests: &[InferenceRequest],
+) -> Result<Vec<Result<Option<TripoMesh>, String>>, String> {
+    let pipeline = state.trellis.as_ref().ok_or_else(|| {
+        if let Some(err) = state.trellis_load_error.as_ref() {
+            format!("Trellis backend is unavailable: {err}")
+        } else {
+            "Trellis backend is not loaded".to_string()
+        }
+    })?;
+    let quality = trellis_quality_to_runtime(args.trellis_quality);
+    let device = trellis_device_for_backend(args.backend.clone());
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        let options = TrellisRunOptions {
+            quality,
+            device,
+            seed: args.seed,
+            hook_output: None,
+        };
+        match pipeline.infer_mesh(&request.image_path, &options) {
+            Ok(mesh) => {
+                let mesh = TripoMesh {
+                    vertices: mesh.vertices,
+                    faces: mesh.faces,
+                };
+                results.push(Ok(apply_mesh_decimation(Some(mesh), args.target_faces)));
+            }
+            Err(err) => {
+                results.push(Err(format!(
+                    "Trellis2 inference failed for '{}': {err}",
+                    request.image_path.display()
+                )));
+            }
+        }
+    }
+    Ok(results)
 }
 
 fn prepare_request<B: Backend>(

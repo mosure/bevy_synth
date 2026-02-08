@@ -44,12 +44,13 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
   - RMBG-1.4
   - RMBG-2.0
   - TripoSG
-  - Trellis (planned, not implemented yet)
+  - Trellis2
 - canonical foreground model paths and expected files:
   - `crates/burn_foreground/assets/models/README.md`
 - import tooling split by model family:
   - TripoSG: `cargo run -p burn_tripo --features import --bin triposg_import`
   - RMBG: `cargo run -p burn_foreground --features import --bin foreground_import -- --rmbg-model rmbg2 --quantization both`
+  - Trellis2: `cargo run -p burn_trellis --features import --bin trellis2_import -- --quantization both`
 - app default foreground model:
   - `bevy_synth` defaults to `rmbg2` when available (native fallback to `rmbg14`, wasm fallback to `rmbg14`)
 

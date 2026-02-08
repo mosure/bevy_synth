@@ -21,5 +21,8 @@ pub use runtime::{
 #[cfg(feature = "triposg")]
 pub use burn_tripo as triposg;
 
+#[cfg(feature = "trellis")]
+pub use burn_trellis as trellis;
+
 #[cfg(feature = "bg-removal")]
 pub use burn_foreground as bg_removal;

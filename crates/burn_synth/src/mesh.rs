@@ -66,3 +66,24 @@ impl MeshLike for burn_tripo::pipeline::mesh::Mesh {
         &self.faces
     }
 }
+
+#[cfg(feature = "trellis")]
+impl From<burn_trellis::Mesh> for Mesh {
+    fn from(value: burn_trellis::Mesh) -> Self {
+        Self {
+            vertices: value.vertices,
+            faces: value.faces,
+        }
+    }
+}
+
+#[cfg(feature = "trellis")]
+impl MeshLike for burn_trellis::Mesh {
+    fn vertices(&self) -> &[[f32; 3]] {
+        &self.vertices
+    }
+
+    fn faces(&self) -> &[[u32; 3]] {
+        &self.faces
+    }
+}

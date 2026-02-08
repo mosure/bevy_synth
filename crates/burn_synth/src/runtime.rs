@@ -11,6 +11,10 @@ use burn_foreground::pipeline::{
 use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
+use burn_trellis::TrellisQuality;
+use burn_trellis::pipeline::{
+    Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
+};
 use burn_tripo::paths::resolve_triposg_weights_root;
 use burn_tripo::pipeline::geometry::FlashExtractConfig;
 use burn_tripo::pipeline::triposg::TripoSGPipeline;
@@ -63,7 +67,18 @@ impl InferenceBackend {
 pub struct RuntimeConfig {
     pub model_selection: ModelSelection,
     pub backend: InferenceBackend,
+    /// TripoSG weights root.
     pub weights_root: Option<PathBuf>,
+    /// Trellis2 weights root.
+    pub trellis_weights_root: Option<PathBuf>,
+    /// Optional local root for TRELLIS-image-large assets.
+    pub trellis_image_large_root: Option<PathBuf>,
+    /// Legacy field retained for CLI compatibility; ignored by Trellis2 Rust runtime.
+    pub trellis_python_bin: Option<PathBuf>,
+    /// Legacy field retained for CLI compatibility; ignored by Trellis2 Rust runtime.
+    pub trellis_bridge_script: Option<PathBuf>,
+    /// Trellis high-level quality selection.
+    pub trellis_quality: TrellisQuality,
     pub bg_weights_root: Option<PathBuf>,
     pub num_steps: usize,
     pub num_tokens: usize,
@@ -80,6 +95,11 @@ impl Default for RuntimeConfig {
             model_selection: ModelSelection::default(),
             backend: InferenceBackend::default(),
             weights_root: None,
+            trellis_weights_root: None,
+            trellis_image_large_root: None,
+            trellis_python_bin: None,
+            trellis_bridge_script: None,
+            trellis_quality: TrellisQuality::Medium,
             bg_weights_root: None,
             num_steps: DEFAULT_NUM_STEPS,
             num_tokens: DEFAULT_NUM_TOKENS,
@@ -141,6 +161,7 @@ pub struct MeshOutput {
     pub mesh: Mesh,
     pub foreground_model: ForegroundModel,
     pub synthesis_models: Vec<SynthesisModel>,
+    pub synthesis_backend: SynthesisModel,
     pub backend: InferenceBackend,
 }
 
@@ -230,9 +251,13 @@ impl SynthRuntime {
             .map(sanitize_synthesis_models)
             .unwrap_or_else(|| self.config.model_selection.synthesis_models.clone());
         let selected_backend = request.backend.unwrap_or(self.config.backend);
+        let preferred_synthesis = selected_synthesis
+            .first()
+            .copied()
+            .unwrap_or(SynthesisModel::Triposg);
 
-        let mesh = if request.dry_run {
-            canonical_cube_mesh()
+        let (mesh, synthesis_backend) = if request.dry_run {
+            (canonical_cube_mesh(), preferred_synthesis)
         } else {
             let materialized = MaterializedImageInput::from_source(&request.image)?;
             self.infer_mesh(
@@ -247,6 +272,7 @@ impl SynthRuntime {
             mesh,
             foreground_model: selected_foreground,
             synthesis_models: selected_synthesis,
+            synthesis_backend,
             backend: selected_backend,
         })
     }
@@ -257,13 +283,60 @@ impl SynthRuntime {
         foreground_model: ForegroundModel,
         backend: InferenceBackend,
         synthesis_models: &[SynthesisModel],
-    ) -> RuntimeResult<Mesh> {
-        if !synthesis_models.contains(&SynthesisModel::Triposg) {
-            return Err(RuntimeError::new(
-                "synthesis_models did not include triposg; trellis is not implemented yet",
-            ));
-        }
+    ) -> RuntimeResult<(Mesh, SynthesisModel)> {
+        let preferred = synthesis_models
+            .first()
+            .copied()
+            .unwrap_or(SynthesisModel::Triposg);
 
+        match preferred {
+            SynthesisModel::Triposg => {
+                match self.infer_mesh_triposg(input_image_path, foreground_model, backend) {
+                    Ok(mesh) => return Ok((mesh, SynthesisModel::Triposg)),
+                    Err(err) if synthesis_models.contains(&SynthesisModel::Trellis) => {
+                        eprintln!(
+                            "burn_synth runtime: TripoSG failed ({err}); falling back to Trellis2."
+                        );
+                        match self.infer_mesh_trellis(input_image_path, foreground_model, backend) {
+                            Ok(mesh) => return Ok((mesh, SynthesisModel::Trellis)),
+                            Err(trellis_err) => {
+                                return Err(RuntimeError::new(format!(
+                                    "TripoSG failed ({err}); Trellis2 fallback failed ({trellis_err})"
+                                )));
+                            }
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            SynthesisModel::Trellis => {
+                match self.infer_mesh_trellis(input_image_path, foreground_model, backend) {
+                    Ok(mesh) => return Ok((mesh, SynthesisModel::Trellis)),
+                    Err(err) if synthesis_models.contains(&SynthesisModel::Triposg) => {
+                        eprintln!(
+                            "burn_synth runtime: Trellis2 failed ({err}); falling back to TripoSG."
+                        );
+                        match self.infer_mesh_triposg(input_image_path, foreground_model, backend) {
+                            Ok(mesh) => return Ok((mesh, SynthesisModel::Triposg)),
+                            Err(triposg_err) => {
+                                return Err(RuntimeError::new(format!(
+                                    "Trellis2 failed ({err}); TripoSG fallback failed ({triposg_err})"
+                                )));
+                            }
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+
+    fn infer_mesh_triposg(
+        &mut self,
+        input_image_path: &Path,
+        foreground_model: ForegroundModel,
+        backend: InferenceBackend,
+    ) -> RuntimeResult<Mesh> {
         let prepared = self.prepare_image_for_mesh(input_image_path, foreground_model)?;
         match backend {
             InferenceBackend::Cpu => {
@@ -297,6 +370,44 @@ impl SynthRuntime {
                 }
             }
         }
+    }
+
+    fn infer_mesh_trellis(
+        &mut self,
+        input_image_path: &Path,
+        foreground_model: ForegroundModel,
+        backend: InferenceBackend,
+    ) -> RuntimeResult<Mesh> {
+        let prepared = self.extract_foreground(ForegroundRequest {
+            image: ImageSource::from_path(input_image_path.to_path_buf()),
+            model: Some(foreground_model),
+        })?;
+        let temp_input = unique_temp_png_path();
+        prepared.image.save(&temp_input).map_err(|err| {
+            RuntimeError::new(format!(
+                "failed to persist Trellis input image {}: {err}",
+                temp_input.display()
+            ))
+        })?;
+
+        let pipeline = self.synthesis.ensure_trellis(&self.config)?;
+        let trellis_device = match backend {
+            InferenceBackend::Cpu => TrellisDevice::Cpu,
+            InferenceBackend::Wgpu => TrellisDevice::Wgpu,
+            InferenceBackend::Cuda => TrellisDevice::Cuda,
+        };
+        let options = TrellisRunOptions {
+            quality: self.config.trellis_quality,
+            device: trellis_device,
+            seed: self.config.seed,
+            hook_output: None,
+        };
+
+        let mesh = pipeline
+            .infer_mesh(&temp_input, &options)
+            .map_err(|err| RuntimeError::new(format!("Trellis2 inference failed: {err}")))?;
+        let _ = std::fs::remove_file(temp_input);
+        Ok(mesh.into())
     }
 
     fn compute_alpha_mask(
@@ -430,6 +541,7 @@ struct SynthesisRuntime {
     wgpu: Option<BackendSynthesisState<WgpuBackend>>,
     #[cfg(feature = "cuda")]
     cuda: Option<BackendSynthesisState<CudaBackend>>,
+    trellis: Option<Trellis2Pipeline>,
 }
 
 impl SynthesisRuntime {
@@ -443,6 +555,26 @@ impl SynthesisRuntime {
         self.cpu
             .as_mut()
             .ok_or_else(|| RuntimeError::new("CPU synthesis backend unavailable"))
+    }
+
+    fn ensure_trellis(&mut self, config: &RuntimeConfig) -> RuntimeResult<&mut Trellis2Pipeline> {
+        if self.trellis.is_none() {
+            let mut trellis_config = Trellis2PipelineConfig::default();
+            if let Some(root) = config.trellis_weights_root.as_ref() {
+                trellis_config.weights_root = root.clone();
+            }
+            trellis_config.image_large_root = config.trellis_image_large_root.clone();
+            let pipeline = Trellis2Pipeline::new(trellis_config).map_err(|err| {
+                RuntimeError::new(format!("failed to initialize Trellis2: {err}"))
+            })?;
+            pipeline
+                .validate_runtime()
+                .map_err(|err| RuntimeError::new(format!("Trellis2 runtime unavailable: {err}")))?;
+            self.trellis = Some(pipeline);
+        }
+        self.trellis
+            .as_mut()
+            .ok_or_else(|| RuntimeError::new("Trellis2 synthesis backend unavailable"))
     }
 
     #[cfg(feature = "wgpu")]

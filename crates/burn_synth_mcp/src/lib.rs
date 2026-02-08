@@ -38,6 +38,14 @@ pub enum InferenceBackend {
     Cuda,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrellisQuality {
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "burn_synth_mcp",
@@ -54,6 +62,7 @@ pub struct ServerArgs {
         value_delimiter = ',',
         default_values_t = [SynthesisModel::Triposg]
     )]
+    /// Synthesis backends, ordered by preference (first is preferred).
     pub synthesis_models: Vec<SynthesisModel>,
 
     #[arg(long, value_enum, default_value_t = InferenceBackend::Wgpu)]
@@ -61,6 +70,21 @@ pub struct ServerArgs {
 
     #[arg(long)]
     pub weights_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_weights_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_image_large_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_python_bin: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_bridge_script: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
+    pub trellis_quality: TrellisQuality,
 
     #[arg(long)]
     pub bg_weights_root: Option<PathBuf>,
@@ -81,6 +105,11 @@ pub struct ServerConfig {
     pub default_synthesis_models: Vec<SynthesisModel>,
     pub default_backend: InferenceBackend,
     pub weights_root: Option<PathBuf>,
+    pub trellis_weights_root: Option<PathBuf>,
+    pub trellis_image_large_root: Option<PathBuf>,
+    pub trellis_python_bin: Option<PathBuf>,
+    pub trellis_bridge_script: Option<PathBuf>,
+    pub trellis_quality: TrellisQuality,
     pub bg_weights_root: Option<PathBuf>,
     pub num_steps: usize,
     pub num_tokens: usize,
@@ -94,6 +123,11 @@ impl ServerConfig {
             default_synthesis_models: sanitize_synthesis_models(args.synthesis_models),
             default_backend: args.backend,
             weights_root: args.weights_root,
+            trellis_weights_root: args.trellis_weights_root,
+            trellis_image_large_root: args.trellis_image_large_root,
+            trellis_python_bin: args.trellis_python_bin,
+            trellis_bridge_script: args.trellis_bridge_script,
+            trellis_quality: args.trellis_quality,
             bg_weights_root: args.bg_weights_root,
             num_steps: args.num_steps.unwrap_or(DEFAULT_NUM_STEPS),
             num_tokens: args.num_tokens.unwrap_or(DEFAULT_NUM_TOKENS),
@@ -112,6 +146,11 @@ impl ServerConfig {
             ),
             backend: self.default_backend.into(),
             weights_root: self.weights_root.clone(),
+            trellis_weights_root: self.trellis_weights_root.clone(),
+            trellis_image_large_root: self.trellis_image_large_root.clone(),
+            trellis_python_bin: self.trellis_python_bin.clone(),
+            trellis_bridge_script: self.trellis_bridge_script.clone(),
+            trellis_quality: self.trellis_quality.into(),
             bg_weights_root: self.bg_weights_root.clone(),
             num_steps: self.num_steps,
             num_tokens: self.num_tokens,
@@ -496,7 +535,7 @@ fn tool_defs() -> Vec<Value> {
                     "input_image_path": { "type": "string", "description": "Path to input image file." },
                     "output_mesh_path": { "type": "string", "description": "Optional output OBJ path (defaults to *_mesh.obj)." },
                     "rmbg_model": { "type": "string", "enum": ["rmbg14", "rmbg2"], "description": "Optional RMBG model override." },
-                    "synthesis_models": { "type": "array", "items": { "type": "string", "enum": ["triposg", "trellis"] }, "description": "Optional synthesis model list override." },
+                    "synthesis_models": { "type": "array", "items": { "type": "string", "enum": ["triposg", "trellis"] }, "description": "Optional synthesis model list override, ordered by preference." },
                     "backend": { "type": "string", "enum": ["cpu", "wgpu", "cuda"], "description": "Optional backend override." },
                     "dry_run": { "type": "boolean", "description": "Skip model inference and emit a canonical cube mesh." }
                 },
@@ -671,6 +710,16 @@ impl From<InferenceBackend> for burn_synth::InferenceBackend {
             InferenceBackend::Cpu => Self::Cpu,
             InferenceBackend::Wgpu => Self::Wgpu,
             InferenceBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
+impl From<TrellisQuality> for burn_synth::trellis::TrellisQuality {
+    fn from(value: TrellisQuality) -> Self {
+        match value {
+            TrellisQuality::Low => Self::Low,
+            TrellisQuality::Medium => Self::Medium,
+            TrellisQuality::High => Self::High,
         }
     }
 }

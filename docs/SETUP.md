@@ -71,11 +71,37 @@ Verify canonical RMBG-2.0 burnpacks:
 Get-ChildItem crates/burn_foreground/assets/models/RMBG-2.0/model*.bpk
 ```
 
-## Trellis (planned, not implemented yet)
+## Trellis2 (native Rust runtime in progress)
 
-- Trellis integration is not implemented yet in this repo.
-- You can still select it in the app backend list (`--synthesis-models trellis`) to reserve config, but inference will return a clear "not implemented" error.
-- No Trellis weights are currently required by the runtime.
+### Weights
+
+- Set `TRELLIS2_WEIGHTS_ROOT` to the TRELLIS.2-4B root containing `pipeline.json`.
+- Optional root for TRELLIS-image-large assets:
+  - `TRELLIS2_IMAGE_LARGE_ROOT`
+- Canonical in-repo locations:
+  - `crates/burn_trellis/assets/models/TRELLIS.2-4B`
+  - `crates/burn_trellis/assets/models/TRELLIS-image-large`
+
+### Runtime requirements
+
+- Trellis2 runs through the same Rust `burn_trellis` module on native and wasm (no Python bridge runtime path).
+- Current implementation includes asset validation, preprocessing parity hooks, and import tooling.
+- Full Trellis2 model execution stages are still being implemented.
+
+### Burnpack import (native)
+
+```powershell
+cargo run -p burn_trellis --features import --bin trellis2_import -- --quantization both
+```
+
+### App selection
+
+- Select Trellis2 only:
+  - `--synthesis-models trellis`
+- Select both with fallback:
+  - `--synthesis-models trellis,triposg`
+- Quality presets:
+  - `--trellis-quality low|medium|high`
 
 ## Combined examples
 
@@ -91,8 +117,8 @@ cargo run -p bevy_synth --release -- --synthesis-models triposg --rmbg-model rmb
 cargo run -p bevy_synth --release -- --synthesis-models triposg --rmbg-model rmbg14
 ```
 
-### Reserve both synthesis backends (TripoSG active, Trellis planned)
+### Enable both synthesis backends (Trellis preferred, TripoSG fallback)
 
 ```powershell
-cargo run -p bevy_synth --release -- --synthesis-models triposg,trellis --rmbg-model rmbg2
+cargo run -p bevy_synth --release -- --synthesis-models trellis,triposg --rmbg-model rmbg2 --trellis-quality medium
 ```

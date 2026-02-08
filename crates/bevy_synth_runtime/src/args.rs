@@ -26,6 +26,26 @@ pub struct Args {
     #[arg(long)]
     pub weights_root: Option<PathBuf>,
 
+    /// Optional weights root for Trellis2 pipeline.
+    #[arg(long)]
+    pub trellis_weights_root: Option<PathBuf>,
+
+    /// Optional weights root for TRELLIS-image-large assets.
+    #[arg(long)]
+    pub trellis_image_large_root: Option<PathBuf>,
+
+    /// Legacy option kept for backward CLI compatibility; ignored by Trellis2 Rust runtime.
+    #[arg(long)]
+    pub trellis_python_bin: Option<PathBuf>,
+
+    /// Legacy option kept for backward CLI compatibility; ignored by Trellis2 Rust runtime.
+    #[arg(long)]
+    pub trellis_bridge_script: Option<PathBuf>,
+
+    /// Trellis quality preset (low, medium, high).
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
+    pub trellis_quality: TrellisQuality,
+
     /// Optional weights root for TripoSG-scribble pipeline.
     #[arg(long)]
     pub scribble_weights_root: Option<PathBuf>,
@@ -130,7 +150,7 @@ pub struct Args {
     #[arg(long)]
     pub bg_weights_root: Option<PathBuf>,
 
-    /// Synthesis backend models to enable (comma-delimited). Trellis is currently a placeholder.
+    /// Synthesis backend models to enable (comma-delimited, ordered by preference).
     #[arg(
         long,
         value_enum,
@@ -177,6 +197,13 @@ pub enum RmbgModel {
 pub enum SynthesisModel {
     Triposg,
     Trellis,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrellisQuality {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -285,6 +312,11 @@ pub struct AppArgs {
     pub text_embeds: Option<PathBuf>,
     pub text_embeds_key: String,
     pub weights_root: Option<PathBuf>,
+    pub trellis_weights_root: Option<PathBuf>,
+    pub trellis_image_large_root: Option<PathBuf>,
+    pub trellis_python_bin: Option<PathBuf>,
+    pub trellis_bridge_script: Option<PathBuf>,
+    pub trellis_quality: TrellisQuality,
     pub scribble_weights_root: Option<PathBuf>,
     pub num_steps: usize,
     pub num_tokens: usize,
@@ -344,6 +376,11 @@ pub fn build_app_args(args: Args) -> AppArgs {
         text_embeds: args.text_embeds,
         text_embeds_key: args.text_embeds_key,
         weights_root: args.weights_root,
+        trellis_weights_root: args.trellis_weights_root,
+        trellis_image_large_root: args.trellis_image_large_root,
+        trellis_python_bin: args.trellis_python_bin,
+        trellis_bridge_script: args.trellis_bridge_script,
+        trellis_quality: args.trellis_quality,
         scribble_weights_root: args.scribble_weights_root,
         num_steps: args.num_steps.unwrap_or(defaults.num_steps),
         num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),

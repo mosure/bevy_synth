@@ -1,0 +1,59 @@
+[package]
+name = "burn_trellis"
+description = "Trellis2 integration utilities and runtime scaffolding for burn_synth"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+runtime-model = ["dep:burn", "dep:burn-store"]
+runtime-model-wgpu = ["runtime-model", "dep:burn-wgpu"]
+import = ["runtime-model", "dep:sha2", "dep:hex"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+safetensors = "0.6"
+half = "2.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
+burn-store = { version = "0.19", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-wgpu]
+version = "0.19"
+optional = true
+default-features = false
+features = ["fusion", "std", "vulkan"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
+version = "0.19"
+optional = true
+default-features = false
+features = ["fusion", "std", "webgpu"]
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+tempfile = "3.13"
+
+[[bin]]
+name = "trellis2_import"
+path = "tool/trellis2_import.rs"
+required-features = ["import"]
+
+[[bin]]
+name = "trellis2_hook_diff"
+path = "tool/trellis2_hook_diff.rs"
+
+[[bin]]
+name = "trellis2_run"
+path = "tool/trellis2_run.rs"
+
+[[bench]]
+name = "trellis2_pipeline"
+path = "benches/trellis2_pipeline.rs"
+harness = false
