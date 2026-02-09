@@ -308,6 +308,21 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 .into());
             }
         }
+        for level in 0..4usize {
+            for suffix in ["coords", "feats", "spatial_shape"] {
+                let key = format!("decode_shape_slat.subs.{level}.{suffix}");
+                if !reference.tensors.contains_key(key.as_str()) {
+                    return Err(
+                        format!("strict mode requires subdivision reference key: {key}").into(),
+                    );
+                }
+                if !actual.tensors.contains_key(key.as_str()) {
+                    return Err(
+                        format!("strict mode requires subdivision actual key: {key}").into(),
+                    );
+                }
+            }
+        }
     }
 
     // PBR hook schema must be emitted by the Rust path for downstream parity checks.
@@ -421,7 +436,6 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         let strict_limit = 1.0e-3f32;
         let strict_float_keys = [
             "sample_sparse_structure.latent",
-            "decode_shape_slat.subs.0.feats",
             "decode_tex_slat.voxels.feats",
             "pbr.uv_unwrap.uvs",
             "pbr.sample.position",
@@ -447,6 +461,38 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 return Err(format!(
                     "strict float threshold failed for '{key}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
                     stats.mean_abs, stats.max_abs, stats.rmse
+                )
+                .into());
+            }
+        }
+
+        // Subdivision logits are the hardest decoder boundary and are
+        // intentionally gated independently to make level-wise drift explicit.
+        let subdiv_limit = std::env::var("TRELLIS2_E2E_SUBDIV_MAX")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .unwrap_or(1.0e-2f32);
+        for level in 0..4usize {
+            let key = format!("decode_shape_slat.subs.{level}.feats");
+            let entry = report
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .ok_or_else(|| format!("missing strict subdivision key '{key}'"))?;
+            let stats = entry
+                .stats
+                .ok_or_else(|| format!("missing stats for strict subdivision hook '{key}'"))?;
+            let level_limit = std::env::var(format!("TRELLIS2_E2E_SUBDIV_LEVEL{level}_MAX"))
+                .ok()
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .unwrap_or(subdiv_limit);
+            if stats.mean_abs > level_limit
+                || stats.max_abs > level_limit
+                || stats.rmse > level_limit
+            {
+                return Err(format!(
+                    "strict subdivision threshold failed for '{key}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} limit={:.6e}",
+                    stats.mean_abs, stats.max_abs, stats.rmse, level_limit
                 )
                 .into());
             }

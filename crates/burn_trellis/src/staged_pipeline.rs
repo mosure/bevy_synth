@@ -2432,6 +2432,15 @@ mod tests {
             && reference
                 .tensors
                 .contains_key("decode_shape_slat.input.feats");
+        let strict_subdiv_checks = env_flag("TRELLIS2_PARITY_STRICT")
+            || env_flag("TRELLIS2_E2E_STRICT")
+            || env_flag("TRELLIS2_DECODER_SUBDIV_REQUIRE_DECODE_INPUTS");
+        if strict_subdiv_checks && !has_decode_inputs {
+            panic!(
+                "runtime_decoder_hook_alignment_report: strict subdivision checks require decode_shape_slat.input.* keys in reference hook '{}'",
+                reference_path.display()
+            );
+        }
         let (shape_coords, shape_feats) = if has_decode_inputs {
             let coords = tensor_to_coords4(
                 reference
@@ -2510,6 +2519,11 @@ mod tests {
             && cap > 0
             && rows > cap
         {
+            assert!(
+                !strict_subdiv_checks,
+                "runtime_decoder_hook_alignment_report: TRELLIS2_DECODER_TEST_MAX_ROWS={} is not allowed in strict subdivision mode because sparse conv neighborhoods depend on full coordinate context",
+                cap
+            );
             rows = cap;
         }
 
@@ -2561,55 +2575,133 @@ mod tests {
         let shape_decoded = shape_decoder
             .decode_sparse(&shape_coords[..rows], &shape_feats[..rows])
             .expect("shape decoder should run");
-        if has_decode_inputs {
-            for (level, actual_sub) in shape_decoded.subdivisions.iter().enumerate() {
-                if let Some(reference_sub) = reference_subdivisions.get(level) {
-                    let (sub_stats, sub_overlap, actual_sub_rows, reference_sub_rows) =
-                        compare_subdivision_overlap(actual_sub, reference_sub);
-                    let (actual_min, actual_max, actual_mean) =
-                        tensor_stats(actual_sub.logits.as_slice());
-                    let (reference_min, reference_max, reference_mean) =
-                        tensor_stats(reference_sub.logits.as_slice());
-                    println!(
-                        "runtime_decoder_hook_alignment_report shape_subdiv.level={} overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} actual[min,max,mean]=[{:.6e},{:.6e},{:.6e}] reference[min,max,mean]=[{:.6e},{:.6e},{:.6e}]",
+        let default_subdiv_threshold = if strict_subdiv_checks {
+            Some(1.0e-2f32)
+        } else {
+            None
+        };
+        let global_subdiv_max_mean_abs =
+            env_f32("TRELLIS2_DECODER_SUBDIV_MAX_MEAN_ABS").or(default_subdiv_threshold);
+        let global_subdiv_max_rmse =
+            env_f32("TRELLIS2_DECODER_SUBDIV_MAX_RMSE").or(default_subdiv_threshold);
+        let global_subdiv_max_abs =
+            env_f32("TRELLIS2_DECODER_SUBDIV_MAX_ABS").or(default_subdiv_threshold);
+        let mut compared_subdiv_levels = 0usize;
+        for (level, reference_sub) in reference_subdivisions.iter().enumerate() {
+            let Some(actual_sub) = shape_decoded.subdivisions.get(level) else {
+                if strict_subdiv_checks {
+                    panic!(
+                        "runtime_decoder_hook_alignment_report: missing actual subdivision level {} (actual_levels={} reference_levels={})",
                         level,
-                        sub_overlap,
-                        actual_sub_rows,
-                        reference_sub_rows,
-                        sub_stats.mean_abs,
-                        sub_stats.max_abs,
-                        sub_stats.rmse,
-                        actual_min,
-                        actual_max,
-                        actual_mean,
-                        reference_min,
-                        reference_max,
-                        reference_mean
+                        shape_decoded.subdivisions.len(),
+                        reference_subdivisions.len()
                     );
-                    if let Some(top_k) = env_usize("TRELLIS2_DECODER_SUBDIV_TOPK")
-                        && top_k > 0
-                    {
-                        for (rank, entry) in top_subdivision_diffs(actual_sub, reference_sub, top_k)
-                            .into_iter()
-                            .enumerate()
-                        {
-                            println!(
-                                "runtime_decoder_hook_alignment_report shape_subdiv.level={} top_diff.rank={} coord=[{},{},{},{}] child={} abs_diff={:.6e} actual={:.6e} reference={:.6e}",
-                                level,
-                                rank + 1,
-                                entry.coord[0],
-                                entry.coord[1],
-                                entry.coord[2],
-                                entry.coord[3],
-                                entry.child,
-                                entry.abs_diff,
-                                entry.actual,
-                                entry.reference
-                            );
-                        }
-                    }
+                }
+                continue;
+            };
+            compared_subdiv_levels += 1;
+            let (sub_stats, sub_overlap, actual_sub_rows, reference_sub_rows) =
+                compare_subdivision_overlap(actual_sub, reference_sub);
+            let (actual_min, actual_max, actual_mean) = tensor_stats(actual_sub.logits.as_slice());
+            let (reference_min, reference_max, reference_mean) =
+                tensor_stats(reference_sub.logits.as_slice());
+            println!(
+                "runtime_decoder_hook_alignment_report shape_subdiv.level={} overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} actual[min,max,mean]=[{:.6e},{:.6e},{:.6e}] reference[min,max,mean]=[{:.6e},{:.6e},{:.6e}]",
+                level,
+                sub_overlap,
+                actual_sub_rows,
+                reference_sub_rows,
+                sub_stats.mean_abs,
+                sub_stats.max_abs,
+                sub_stats.rmse,
+                actual_min,
+                actual_max,
+                actual_mean,
+                reference_min,
+                reference_max,
+                reference_mean
+            );
+            if let Some(top_k) = env_usize("TRELLIS2_DECODER_SUBDIV_TOPK")
+                && top_k > 0
+            {
+                for (rank, entry) in top_subdivision_diffs(actual_sub, reference_sub, top_k)
+                    .into_iter()
+                    .enumerate()
+                {
+                    println!(
+                        "runtime_decoder_hook_alignment_report shape_subdiv.level={} top_diff.rank={} coord=[{},{},{},{}] child={} abs_diff={:.6e} actual={:.6e} reference={:.6e}",
+                        level,
+                        rank + 1,
+                        entry.coord[0],
+                        entry.coord[1],
+                        entry.coord[2],
+                        entry.coord[3],
+                        entry.child,
+                        entry.abs_diff,
+                        entry.actual,
+                        entry.reference
+                    );
                 }
             }
+            if strict_subdiv_checks {
+                assert!(
+                    sub_overlap > 0,
+                    "runtime_decoder_hook_alignment_report: subdivision level {} has zero coord overlap (actual_rows={} reference_rows={})",
+                    level,
+                    actual_sub_rows,
+                    reference_sub_rows
+                );
+            }
+
+            let level_max_mean_abs = env_f32(&format!(
+                "TRELLIS2_DECODER_SUBDIV_LEVEL{}_MAX_MEAN_ABS",
+                level
+            ))
+            .or(global_subdiv_max_mean_abs);
+            if let Some(limit) = level_max_mean_abs {
+                assert!(
+                    sub_stats.mean_abs <= limit,
+                    "runtime_decoder_hook_alignment_report: subdivision level {} mean_abs {:.6e} exceeded limit {:.6e}",
+                    level,
+                    sub_stats.mean_abs,
+                    limit
+                );
+            }
+            let level_max_rmse =
+                env_f32(&format!("TRELLIS2_DECODER_SUBDIV_LEVEL{}_MAX_RMSE", level))
+                    .or(global_subdiv_max_rmse);
+            if let Some(limit) = level_max_rmse {
+                assert!(
+                    sub_stats.rmse <= limit,
+                    "runtime_decoder_hook_alignment_report: subdivision level {} rmse {:.6e} exceeded limit {:.6e}",
+                    level,
+                    sub_stats.rmse,
+                    limit
+                );
+            }
+            let level_max_abs = env_f32(&format!("TRELLIS2_DECODER_SUBDIV_LEVEL{}_MAX_ABS", level))
+                .or(global_subdiv_max_abs);
+            if let Some(limit) = level_max_abs {
+                assert!(
+                    sub_stats.max_abs <= limit,
+                    "runtime_decoder_hook_alignment_report: subdivision level {} max_abs {:.6e} exceeded limit {:.6e}",
+                    level,
+                    sub_stats.max_abs,
+                    limit
+                );
+            }
+        }
+        if strict_subdiv_checks {
+            assert!(
+                compared_subdiv_levels > 0,
+                "runtime_decoder_hook_alignment_report: strict subdivision checks compared zero levels"
+            );
+            assert!(
+                shape_decoded.subdivisions.len() == reference_subdivisions.len(),
+                "runtime_decoder_hook_alignment_report: strict subdivision checks require equal level count (actual={} reference={})",
+                shape_decoded.subdivisions.len(),
+                reference_subdivisions.len()
+            );
         }
         let tex_decoded = tex_decoder
             .decode_with_guidance(
@@ -2739,20 +2831,66 @@ mod tests {
         let reference =
             HookSnapshot::from_file(&reference_path).expect("reference hook should load");
 
-        let shape_coords = tensor_to_coords4(
-            reference
+        let strict_subdiv_checks = env_flag("TRELLIS2_PARITY_STRICT")
+            || env_flag("TRELLIS2_E2E_STRICT")
+            || env_flag("TRELLIS2_DECODER_SUBDIV_REQUIRE_DECODE_INPUTS");
+        let has_decode_inputs = reference
+            .tensors
+            .contains_key("decode_shape_slat.input.coords")
+            && reference
                 .tensors
-                .get("sample_shape_slat.slat.coords")
-                .expect("missing sample_shape_slat.slat.coords"),
-        )
-        .expect("shape coords should decode");
-        let shape_feats = tensor_to_rows::<32>(
-            reference
-                .tensors
-                .get("sample_shape_slat.slat.feats")
-                .expect("missing sample_shape_slat.slat.feats"),
-        )
-        .expect("shape feats should decode");
+                .contains_key("decode_shape_slat.input.feats");
+        let (shape_coords, shape_feats, input_source) = if has_decode_inputs {
+            let coords = tensor_to_coords4(
+                reference
+                    .tensors
+                    .get("decode_shape_slat.input.coords")
+                    .expect("missing decode_shape_slat.input.coords"),
+            )
+            .expect("decode input coords should decode");
+            let feats = tensor_to_rows::<32>(
+                reference
+                    .tensors
+                    .get("decode_shape_slat.input.feats")
+                    .expect("missing decode_shape_slat.input.feats"),
+            )
+            .expect("decode input feats should decode");
+            (coords, feats, "decode_shape_slat.input")
+        } else {
+            assert!(
+                !strict_subdiv_checks,
+                "runtime_decoder_stage0_subdivision_alignment_report: strict subdivision checks require decode_shape_slat.input.* keys in reference hook '{}'",
+                reference_path.display()
+            );
+            let coords = tensor_to_coords4(
+                reference
+                    .tensors
+                    .get("sample_shape_slat.slat.coords")
+                    .expect("missing sample_shape_slat.slat.coords"),
+            )
+            .expect("shape coords should decode");
+            let feats = tensor_to_rows::<32>(
+                reference
+                    .tensors
+                    .get("sample_shape_slat.slat.feats")
+                    .expect("missing sample_shape_slat.slat.feats"),
+            )
+            .expect("shape feats should decode");
+            (coords, feats, "sample_shape_slat.slat")
+        };
+        let mut rows = shape_coords.len().min(shape_feats.len());
+        assert!(rows > 0, "reference hook must contain stage0 rows");
+        if let Some(cap) = env_usize("TRELLIS2_DECODER_TEST_MAX_ROWS")
+            && cap > 0
+            && rows > cap
+        {
+            assert!(
+                !strict_subdiv_checks,
+                "runtime_decoder_stage0_subdivision_alignment_report: TRELLIS2_DECODER_TEST_MAX_ROWS={} is not allowed in strict subdivision mode because sparse conv neighborhoods depend on full coordinate context",
+                cap
+            );
+            rows = cap;
+        }
         let reference_subdivisions = load_reference_subdivisions(&reference)
             .expect("reference shape subdivisions should decode");
         let Some(reference_stage0) = reference_subdivisions.first() else {
@@ -2796,13 +2934,19 @@ mod tests {
         .expect("shape decoder should load");
 
         let stage0 = shape_decoder
-            .stage0_subdivision_logits(shape_coords.as_slice(), shape_feats.as_slice())
+            .stage0_subdivision_logits(&shape_coords[..rows], &shape_feats[..rows])
             .expect("shape stage0 subdivision should run");
         let (stats, overlap, actual_rows, reference_rows) =
             compare_subdivision_overlap(&stage0, reference_stage0);
         println!(
-            "runtime_decoder_stage0_subdivision_alignment_report overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
-            overlap, actual_rows, reference_rows, stats.mean_abs, stats.max_abs, stats.rmse
+            "runtime_decoder_stage0_subdivision_alignment_report input_source={} overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
+            input_source,
+            overlap,
+            actual_rows,
+            reference_rows,
+            stats.mean_abs,
+            stats.max_abs,
+            stats.rmse
         );
         assert!(
             overlap > 0,
@@ -2812,6 +2956,48 @@ mod tests {
             stats.mean_abs.is_finite() && stats.max_abs.is_finite() && stats.rmse.is_finite(),
             "stage0 subdivision diff stats must be finite"
         );
+        if let Some(limit) =
+            env_f32("TRELLIS2_DECODER_SUBDIV_STAGE0_MAX_MEAN_ABS").or(if strict_subdiv_checks {
+                Some(1.0e-2f32)
+            } else {
+                None
+            })
+        {
+            assert!(
+                stats.mean_abs <= limit,
+                "stage0 subdivision mean_abs {:.6e} exceeded limit {:.6e}",
+                stats.mean_abs,
+                limit
+            );
+        }
+        if let Some(limit) =
+            env_f32("TRELLIS2_DECODER_SUBDIV_STAGE0_MAX_RMSE").or(if strict_subdiv_checks {
+                Some(1.0e-2f32)
+            } else {
+                None
+            })
+        {
+            assert!(
+                stats.rmse <= limit,
+                "stage0 subdivision rmse {:.6e} exceeded limit {:.6e}",
+                stats.rmse,
+                limit
+            );
+        }
+        if let Some(limit) =
+            env_f32("TRELLIS2_DECODER_SUBDIV_STAGE0_MAX_ABS").or(if strict_subdiv_checks {
+                Some(1.0e-2f32)
+            } else {
+                None
+            })
+        {
+            assert!(
+                stats.max_abs <= limit,
+                "stage0 subdivision max_abs {:.6e} exceeded limit {:.6e}",
+                stats.max_abs,
+                limit
+            );
+        }
     }
 
     #[cfg(feature = "runtime-model")]
