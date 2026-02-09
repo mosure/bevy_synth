@@ -30,8 +30,90 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     "unknown panic payload".to_string()
 }
 
+fn sampled_or_truncated_metadata_keys(snapshot: &HookSnapshot) -> Vec<String> {
+    fn is_allowed_noncritical_sampled_key(key: &str) -> bool {
+        let base = key
+            .strip_suffix(".row_sampled")
+            .or_else(|| key.strip_suffix(".flat_sampled_from"))
+            .or_else(|| key.strip_suffix(".list_truncated"))
+            .unwrap_or(key);
+        // Face index tensors can be very large and are not part of strict float parity gates.
+        (base.starts_with("decode_latent.mesh.") || base.starts_with("decode_shape_slat.meshes."))
+            && base.ends_with(".faces")
+    }
+
+    let mut keys = snapshot
+        .metadata
+        .keys()
+        .filter(|key| {
+            (key.ends_with(".row_sampled")
+                || key.ends_with(".flat_sampled_from")
+                || key.ends_with(".list_truncated"))
+                && !is_allowed_noncritical_sampled_key(key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn scalar_count(snapshot: &HookSnapshot, key: &str) -> Result<u64, String> {
+    let tensor = snapshot
+        .tensors
+        .get(key)
+        .ok_or_else(|| format!("missing count key '{key}'"))?;
+    if tensor.data.is_empty() {
+        return Err(format!("count key '{key}' has no elements"));
+    }
+    let value = tensor.data[0];
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("count key '{key}' is invalid ({value})"));
+    }
+    Ok(value.round() as u64)
+}
+
+fn coords_set(
+    snapshot: &HookSnapshot,
+    key: &str,
+) -> Result<std::collections::HashSet<u64>, String> {
+    let tensor = snapshot
+        .tensors
+        .get(key)
+        .ok_or_else(|| format!("missing coords key '{key}'"))?;
+    if tensor.shape.len() != 2 || tensor.shape[1] != 4 {
+        return Err(format!(
+            "coords key '{key}' has invalid shape {:?}; expected [N,4]",
+            tensor.shape
+        ));
+    }
+    if tensor.data.len() != tensor.shape[0] * tensor.shape[1] {
+        return Err(format!(
+            "coords key '{key}' has invalid element count {} for shape {:?}",
+            tensor.data.len(),
+            tensor.shape
+        ));
+    }
+    let mut out = std::collections::HashSet::with_capacity(tensor.shape[0] * 2);
+    for row in 0..tensor.shape[0] {
+        let base = row * 4;
+        let x = tensor.data[base + 1].round().max(0.0) as u64;
+        let y = tensor.data[base + 2].round().max(0.0) as u64;
+        let z = tensor.data[base + 3].round().max(0.0) as u64;
+        let packed = (x << 42) | (y << 21) | z;
+        out.insert(packed);
+    }
+    Ok(out)
+}
+
 #[test]
 fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(feature = "runtime-model") {
+        eprintln!(
+            "Skipping Trellis2 e2e hook alignment: burn_trellis runtime-model feature is disabled."
+        );
+        return Ok(());
+    }
+
     let strict = env_flag("TRELLIS2_E2E_STRICT", false);
     let disable_runtime = env_flag("TRELLIS2_E2E_DISABLE_RUNTIME_MODEL", false);
     let device = std::env::var("TRELLIS2_E2E_DEVICE")
@@ -44,8 +126,14 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         })
         .unwrap_or(TrellisDevice::Auto);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input_image = root.join("assets/hooks/trellis2_preprocess_input.png");
-    let reference_hook = root.join("assets/hooks/trellis2_full_reference_alpha_512.safetensors");
+    let input_image = std::env::var("TRELLIS2_E2E_INPUT_IMAGE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("assets/hooks/trellis2_preprocess_input.png"));
+    let reference_hook = std::env::var("TRELLIS2_E2E_REFERENCE_HOOK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            root.join("assets/hooks/trellis2_full_reference_alpha_512.safetensors")
+        });
     if !input_image.exists() || !reference_hook.exists() {
         eprintln!("Skipping Trellis2 e2e hook alignment: missing input or reference hook capture.");
         return Ok(());
@@ -182,12 +270,36 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
 
     let reference = HookSnapshot::from_file(reference_hook)?;
     let actual = HookSnapshot::from_file(&actual_hook)?;
+
+    if strict {
+        let reference_sampled = sampled_or_truncated_metadata_keys(&reference);
+        if !reference_sampled.is_empty() {
+            return Err(format!(
+                "strict mode requires full-capture reference hook (found sampled/truncated metadata keys): {}",
+                reference_sampled.join(", ")
+            )
+            .into());
+        }
+        let actual_sampled = sampled_or_truncated_metadata_keys(&actual);
+        if !actual_sampled.is_empty() {
+            return Err(format!(
+                "strict mode requires full-capture actual hook (found sampled/truncated metadata keys): {}",
+                actual_sampled.join(", ")
+            )
+            .into());
+        }
+    }
+
     let report = compare_hook_snapshots(&reference, &actual, None);
 
     if strict {
         for key in [
             "sample_shape_slat.noise_dense",
             "sample_tex_slat.noise_dense",
+            "decode_shape_slat.input.coords",
+            "decode_shape_slat.input.feats",
+            "decode_tex_slat.input.coords",
+            "decode_tex_slat.input.feats",
         ] {
             if !reference.tensors.contains_key(key) {
                 return Err(format!(
@@ -199,7 +311,7 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
     }
 
     // PBR hook schema must be emitted by the Rust path for downstream parity checks.
-    for key in [
+    let required_pbr_hook_keys = [
         "sample_shape_slat.noise_dense",
         "sample_tex_slat.noise_dense",
         "pbr.uv_unwrap.vertices",
@@ -214,10 +326,29 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         "pbr.texture.alpha_float",
         "pbr.texture.base_color_rgba_u8",
         "pbr.texture.metallic_roughness_u8",
-    ] {
+    ];
+    let mut missing_pbr_in_reference = Vec::new();
+    for key in required_pbr_hook_keys {
         if !actual.tensors.contains_key(key) {
             return Err(format!("missing required pbr hook key in actual output: {key}").into());
         }
+        if !reference.tensors.contains_key(key) {
+            missing_pbr_in_reference.push(key);
+        }
+    }
+    if strict && !missing_pbr_in_reference.is_empty() {
+        return Err(format!(
+            "strict mode requires PBR reference keys, missing in reference hook: {}",
+            missing_pbr_in_reference.join(", ")
+        )
+        .into());
+    }
+    if !strict && !missing_pbr_in_reference.is_empty() {
+        eprintln!(
+            "warning: reference hook is missing {} PBR key(s), so full PBR numeric parity is not being evaluated: {}",
+            missing_pbr_in_reference.len(),
+            missing_pbr_in_reference.join(", ")
+        );
     }
 
     let missing = report
@@ -253,11 +384,47 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
     }
 
     if strict {
+        for key in [
+            "decode_latent.mesh.0.vertices_count",
+            "decode_latent.mesh.0.faces_count",
+            "decode_latent.mesh.0.voxel_count",
+        ] {
+            let actual_count = scalar_count(&actual, key)?;
+            let reference_count = scalar_count(&reference, key)?;
+            if actual_count != reference_count {
+                return Err(format!(
+                    "strict structural mismatch for '{key}': actual={} reference={}",
+                    actual_count, reference_count
+                )
+                .into());
+            }
+        }
+        for key in [
+            "sample_sparse_structure.coords",
+            "sample_shape_slat.slat.coords",
+            "sample_tex_slat.slat.coords",
+        ] {
+            let actual_coords = coords_set(&actual, key)?;
+            let reference_coords = coords_set(&reference, key)?;
+            if actual_coords != reference_coords {
+                let overlap = actual_coords.intersection(&reference_coords).count();
+                return Err(format!(
+                    "strict coordinate mismatch for '{key}': actual_rows={} reference_rows={} overlap={}",
+                    actual_coords.len(),
+                    reference_coords.len(),
+                    overlap
+                )
+                .into());
+            }
+        }
+
         let strict_limit = 1.0e-3f32;
         let strict_float_keys = [
             "sample_sparse_structure.latent",
             "decode_shape_slat.subs.0.feats",
             "decode_tex_slat.voxels.feats",
+            "pbr.uv_unwrap.uvs",
+            "pbr.sample.position",
             "pbr.sample.attrs_float",
             "pbr.texture.base_color_float",
             "pbr.texture.metallic_float",
@@ -286,6 +453,7 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         }
 
         let strict_u8_keys = [
+            "pbr.raster.mask",
             "pbr.texture.base_color_rgba_u8",
             "pbr.texture.metallic_roughness_u8",
         ];
@@ -298,7 +466,8 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
             let stats = entry
                 .stats
                 .ok_or_else(|| format!("missing stats for strict hook '{key}'"))?;
-            if stats.max_abs > 1.0 || stats.mean_abs > 1.0 || stats.rmse > 1.0 {
+            let limit = if key == "pbr.raster.mask" { 0.0 } else { 1.0 };
+            if stats.max_abs > limit || stats.mean_abs > limit || stats.rmse > limit {
                 return Err(format!(
                     "strict u8 threshold failed for '{key}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
                     stats.mean_abs, stats.max_abs, stats.rmse

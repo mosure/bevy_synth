@@ -149,6 +149,23 @@ cargo run -p bevy_synth --release -- --synthesis-models triposg --rmbg-model rmb
 cargo run -p bevy_synth --release -- --synthesis-models trellis,triposg --rmbg-model rmbg2 --trellis-quality medium
 ```
 
+## burn_synth CLI Progress Logging
+
+- `burn_synth` now emits structured sampler/stage progress through shared runtime events.
+- CLI flags:
+  - `--progress off|stages|steps` (`steps` default)
+  - `--progress-every <N>` emits every N sampler steps (first/last always emitted)
+- Example:
+
+```powershell
+cargo run -p burn_synth --features runtime,wgpu -- mesh --input docs/output_chair_bg_removed.png --progress steps --progress-every 5
+```
+
+- Log lines include:
+  - stage start/finish timing
+  - sampler step timing + ETA
+  - sampler metadata (step counts, guidance/timestep info)
+
 ## MCP Server Mesh Output
 
 Example `tools/call` arguments:

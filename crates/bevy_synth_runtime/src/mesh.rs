@@ -38,6 +38,7 @@ fn to_bevy_mesh_with_uvs(mesh: &TripoMesh, uvs_opt: Option<&[[f32; 2]]>) -> Bevy
     bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_NORMAL, normals);
     bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_UV_0, uvs);
     bevy_mesh.insert_indices(Indices::U32(indices));
+    let _ = bevy_mesh.generate_tangents();
     bevy_mesh
 }
 
@@ -75,4 +76,33 @@ fn compute_normals(mesh: &TripoMesh) -> Vec<[f32; 3]> {
     }
 
     normals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_synth_mesh() -> SynthMesh {
+        SynthMesh {
+            mesh: TripoMesh {
+                vertices: vec![
+                    [-1.0, 0.0, -1.0],
+                    [1.0, 0.0, -1.0],
+                    [1.0, 0.0, 1.0],
+                    [-1.0, 0.0, 1.0],
+                ],
+                faces: vec![[0, 1, 2], [0, 2, 3]],
+            },
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            material: None,
+            pbr_textures: None,
+        }
+    }
+
+    #[test]
+    fn bevy_mesh_generation_includes_uvs_and_tangents() {
+        let mesh = to_bevy_mesh_synth(&sample_synth_mesh());
+        assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_UV_0));
+        assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_TANGENT));
+    }
 }

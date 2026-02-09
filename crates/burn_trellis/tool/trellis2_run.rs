@@ -51,7 +51,7 @@ struct Args {
     require_runtime_model: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), String> {
     let args = Args::parse();
 
     let mut config = Trellis2PipelineConfig::default();
@@ -62,8 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.image_large_root = Some(path);
     }
 
-    let pipeline = Trellis2Pipeline::new(config)?;
-    pipeline.validate_runtime()?;
+    let pipeline = Trellis2Pipeline::new(config).map_err(|err| err.to_string())?;
+    pipeline.validate_runtime().map_err(|err| err.to_string())?;
 
     let options = TrellisRunOptions {
         quality: args.quality,
@@ -73,12 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         noise_overrides_hook: args.noise_overrides_hook.clone(),
     };
 
-    let profiled = pipeline.infer_mesh_profile(&args.input_image, &options)?;
+    let profiled = pipeline
+        .infer_mesh_profile(&args.input_image, &options)
+        .map_err(|err| err.to_string())?;
     if args.require_runtime_model && profiled.sparse_source.as_str() == "synthetic" {
-        return Err("runtime-model required but sparse stage used synthetic fallback".into());
+        return Err("runtime-model required but sparse stage used synthetic fallback".to_string());
     }
     if let Some(obj_path) = args.output_obj.as_ref() {
-        burn_trellis::write_obj_mesh(obj_path, &profiled.mesh)?;
+        burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
 
     println!(
@@ -109,4 +111,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     );
     Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let handle = std::thread::Builder::new()
+        .name("trellis2_run".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run)?;
+    match handle.join() {
+        Ok(result) => result.map_err(|err| err.into()),
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "trellis2_run worker thread panicked with non-string payload".to_string()
+            };
+            Err(message.into())
+        }
+    }
 }

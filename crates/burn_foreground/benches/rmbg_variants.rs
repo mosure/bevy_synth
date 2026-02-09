@@ -1,7 +1,7 @@
 #![cfg(feature = "import")]
 
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
 
@@ -95,13 +95,13 @@ fn bench_rmbg_variants(c: &mut Criterion) {
 }
 
 fn manual_bench_rmbg14(
-    input_image: &PathBuf,
-    root: &PathBuf,
+    input_image: &Path,
+    root: &Path,
     config: &PrepareImageConfig,
     runs: usize,
 ) -> Result<f64, String> {
-    let input_image = input_image.clone();
-    let root = root.clone();
+    let input_image = input_image.to_path_buf();
+    let root = root.to_path_buf();
     let config = config.clone();
     let runs = runs.max(1);
 

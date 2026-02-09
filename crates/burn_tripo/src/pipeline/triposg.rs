@@ -1,4 +1,5 @@
 use burn::{prelude::*, tensor::Distribution};
+use std::time::Instant;
 
 #[cfg(feature = "import")]
 use crate::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
@@ -35,6 +36,14 @@ pub struct TripoSGMeshOutput<B: Backend> {
     pub latents: Tensor<B, 3>,
     pub grid: DenseGrid,
     pub mesh: Option<Mesh>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TripoSGSamplerProgress {
+    pub step_index: usize,
+    pub total_steps: usize,
+    pub timestep: f32,
+    pub step_ms: f64,
 }
 
 impl<B: Backend> TripoSGPipeline<B> {
@@ -111,6 +120,30 @@ impl<B: Backend> TripoSGPipeline<B> {
         query_coords: Option<Tensor<B, 3>>,
         latents: Option<Tensor<B, 3>>,
     ) -> TripoSGPipelineOutput<B> {
+        self.sample_from_embeds_with_progress(
+            image_embeds,
+            batch_size,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            query_coords,
+            latents,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_from_embeds_with_progress<F: FnMut(TripoSGSamplerProgress)>(
+        &mut self,
+        image_embeds: Tensor<B, 3>,
+        batch_size: usize,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        query_coords: Option<Tensor<B, 3>>,
+        latents: Option<Tensor<B, 3>>,
+        mut on_step: F,
+    ) -> TripoSGPipelineOutput<B> {
         let device = image_embeds.device();
         let do_guidance = guidance_scale > 1.0;
         let image_embeds = if do_guidance {
@@ -129,13 +162,15 @@ impl<B: Backend> TripoSGPipeline<B> {
             self.prepare_latents(batch_size, num_tokens, num_channels, &device, latents);
 
         let timesteps = self.scheduler.timesteps().to_vec();
+        let total_steps = timesteps.len();
         let model_batch = if do_guidance {
             batch_size * 2
         } else {
             batch_size
         };
         let timestep_template = Tensor::<B, 1>::zeros([model_batch as i32], &device);
-        for &t in timesteps.iter() {
+        for (step_index, &t) in timesteps.iter().enumerate() {
+            let step_start = Instant::now();
             let latent_model_input = if do_guidance {
                 Tensor::cat(vec![latents.clone(), latents.clone()], 0)
             } else {
@@ -164,6 +199,13 @@ impl<B: Backend> TripoSGPipeline<B> {
             }
 
             latents = self.scheduler.step(noise_pred, t, latents);
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            on_step(TripoSGSamplerProgress {
+                step_index: step_index + 1,
+                total_steps,
+                timestep: t,
+                step_ms,
+            });
         }
 
         let decoded = query_coords.map(|coords| self.vae.decode(coords, latents.clone(), None));
@@ -357,13 +399,39 @@ impl<B: Backend> TripoSGPipeline<B> {
         config: &FlashExtractConfig,
         latents: Option<Tensor<B, 3>>,
     ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
-        let output = self.sample(
+        self.sample_mesh_flash_with_progress(
             image,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            config,
+            latents,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_mesh_flash_with_progress<F: FnMut(TripoSGSamplerProgress)>(
+        &mut self,
+        image: Tensor<B, 4>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        config: &FlashExtractConfig,
+        latents: Option<Tensor<B, 3>>,
+        mut on_step: F,
+    ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
+        let batch_size = image.shape().dims::<4>()[0];
+        let image_embeds = self.encode_image(image);
+        let output = self.sample_from_embeds_with_progress(
+            image_embeds,
+            batch_size,
             num_inference_steps,
             num_tokens,
             guidance_scale,
             None,
             latents,
+            &mut on_step,
         );
         let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
         let mesh = sdf_to_mesh_diff_dmc(&grid);

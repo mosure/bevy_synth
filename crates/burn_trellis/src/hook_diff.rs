@@ -14,12 +14,15 @@ pub struct HookTensor {
 #[derive(Debug, Clone, Default)]
 pub struct HookSnapshot {
     pub tensors: BTreeMap<String, HookTensor>,
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl HookSnapshot {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, HookDiffError> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(HookDiffError::Io)?;
+        let (_, header_metadata) =
+            SafeTensors::read_metadata(&bytes).map_err(HookDiffError::SafeTensors)?;
         let safetensors = SafeTensors::deserialize(&bytes).map_err(HookDiffError::SafeTensors)?;
 
         let mut tensors = BTreeMap::new();
@@ -31,7 +34,18 @@ impl HookSnapshot {
             tensors.insert(name.to_string(), tensor);
         }
 
-        Ok(Self { tensors })
+        let metadata = header_metadata
+            .metadata()
+            .as_ref()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        Ok(Self { tensors, metadata })
     }
 }
 

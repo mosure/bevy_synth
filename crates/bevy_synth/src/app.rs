@@ -208,12 +208,18 @@ pub(crate) fn run() {
     };
 
     let mut app = App::new();
+    let directional_shadow_map_size = if cfg!(feature = "solari") { 8192 } else { 4096 };
+    let point_shadow_map_size = if cfg!(feature = "solari") { 4096 } else { 2048 };
     app.insert_resource(app_args)
         .insert_resource(InferenceQueue::default())
         .insert_resource(ExitState::default())
         .insert_resource(TitlePulse::default())
-        .insert_resource(DirectionalLightShadowMap { size: 4096 })
-        .insert_resource(PointLightShadowMap { size: 2048 })
+        .insert_resource(DirectionalLightShadowMap {
+            size: directional_shadow_map_size,
+        })
+        .insert_resource(PointLightShadowMap {
+            size: point_shadow_map_size,
+        })
         .init_resource::<EditorSelection>()
         .insert_resource(MeshCacheResource::load_or_empty())
         .insert_resource(WorldCachePersistence::default())
@@ -362,7 +368,11 @@ fn setup(
         MainCamera,
     ));
     ambient_light.color = Color::srgb(0.92, 0.95, 1.0);
-    ambient_light.brightness = 135.0;
+    ambient_light.brightness = if cfg!(feature = "solari") {
+        165.0
+    } else {
+        135.0
+    };
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(1.0, 0.96, 0.9),

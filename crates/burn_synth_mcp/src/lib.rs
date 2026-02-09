@@ -1199,3 +1199,63 @@ impl From<TrellisQuality> for burn_synth::trellis::TrellisQuality {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_texture(width: u32, height: u32, rgba: [u8; 4]) -> burn_synth::MeshTexture {
+        let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
+        for _ in 0..(width as usize * height as usize) {
+            bytes.extend_from_slice(&rgba);
+        }
+        burn_synth::MeshTexture {
+            width,
+            height,
+            rgba8: bytes,
+        }
+    }
+
+    fn sample_mesh_with_pbr() -> Mesh {
+        Mesh {
+            vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.8, 0.0]],
+            faces: vec![[0, 1, 2]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            material: Some(burn_synth::MeshMaterial {
+                base_color: [1.0, 1.0, 1.0],
+                metallic: 1.0,
+                roughness: 1.0,
+                alpha: 1.0,
+            }),
+            pbr_textures: Some(burn_synth::MeshPbrTextures {
+                base_color: test_texture(2, 2, [220, 200, 180, 255]),
+                metallic_roughness: test_texture(2, 2, [0, 140, 60, 255]),
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn gltf_json_embeds_pbr_textures() {
+        let mesh = sample_mesh_with_pbr();
+        let layout = build_mesh_binary_layout(&mesh).expect("mesh layout");
+        let gltf = gltf_json(&mesh, &layout);
+        let materials = gltf["materials"].as_array().expect("materials array");
+        assert_eq!(materials.len(), 1);
+        let pbr = &materials[0]["pbrMetallicRoughness"];
+        assert!(pbr.get("baseColorTexture").is_some());
+        assert!(pbr.get("metallicRoughnessTexture").is_some());
+        assert!(
+            gltf["textures"]
+                .as_array()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            gltf["images"]
+                .as_array()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+}

@@ -107,11 +107,19 @@ pub struct TrellisPipelineTimings {
     pub total_ms: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrellisPipelineStepCounts {
+    pub sparse: usize,
+    pub shape_slat: usize,
+    pub tex_slat: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrellisInferenceProfile {
     pub mesh: Mesh,
     pub timings: TrellisPipelineTimings,
     pub sparse_source: SparseStructureStageSource,
+    pub step_counts: TrellisPipelineStepCounts,
 }
 
 impl Default for Trellis2PipelineConfig {
@@ -285,16 +293,25 @@ impl Trellis2Pipeline {
         let seed = options.seed.unwrap_or(42);
         let noise_overrides = self.load_noise_overrides(options)?;
         reset_runtime_transfer_stats();
-        let (stage_output, stage_timings) = runtime.run_profiled_with_overrides(
-            &preprocess,
-            seed,
-            noise_overrides.as_ref(),
-            options.hook_output.is_some(),
-        );
+        let (stage_output, stage_timings) = runtime
+            .run_profiled_with_overrides(
+                &preprocess,
+                seed,
+                noise_overrides.as_ref(),
+                options.hook_output.is_some(),
+            )
+            .map_err(|err| {
+                TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
+            })?;
         let (host_readback_count, host_readback_elements) = runtime_transfer_stats();
         let hook_capture_start = Instant::now();
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
         let hook_capture_ms = hook_capture_start.elapsed().as_secs_f64() * 1000.0;
+        let step_counts = TrellisPipelineStepCounts {
+            sparse: stage_output.sparse.step_count,
+            shape_slat: stage_output.shape_slat.step_count,
+            tex_slat: stage_output.tex_slat.step_count,
+        };
         let timings = TrellisPipelineTimings {
             preprocess_ms,
             runtime_setup_ms,
@@ -311,6 +328,7 @@ impl Trellis2Pipeline {
             sparse_source: stage_output.sparse.source,
             mesh: stage_output.mesh,
             timings,
+            step_counts,
         })
     }
 
@@ -343,6 +361,9 @@ impl Trellis2Pipeline {
                 noise_overrides.as_ref(),
                 options.hook_output.is_some(),
             )
+            .map_err(|err| {
+                TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
+            })?
             .0;
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
         Ok(stage_output.mesh)
@@ -405,6 +426,12 @@ impl Trellis2Pipeline {
         if let Some(tensor) = snapshot.tensors.get("sample_sparse_structure.noise") {
             overrides.sparse_noise = Some(tensor.data.clone());
         }
+        if let Some(tensor) = snapshot.tensors.get("sample_sparse_structure.coords") {
+            overrides.sparse_coords = Some(hook_tensor_to_coords4(
+                "sample_sparse_structure.coords",
+                tensor,
+            )?);
+        }
         overrides.shape_noise = extract_sparse_row_noise_override(
             &snapshot,
             "sample_shape_slat.noise",
@@ -441,9 +468,13 @@ impl Trellis2Pipeline {
             )));
         }
         eprintln!(
-            "burn_trellis: loaded noise overrides from '{}': sparse={} shape_rows={} tex_rows={} shape_dense={} tex_dense={} sparse_sampler={} shape_sampler={} tex_sampler={} cond512={} neg512={} cond1024={} neg1024={}",
+            "burn_trellis: loaded noise overrides from '{}': sparse={} sparse_coords={} shape_rows={} tex_rows={} shape_dense={} tex_dense={} sparse_sampler={} shape_sampler={} tex_sampler={} cond512={} neg512={} cond1024={} neg1024={}",
             path.display(),
             overrides.sparse_noise.as_ref().map_or(0usize, |v| v.len()),
+            overrides
+                .sparse_coords
+                .as_ref()
+                .map_or(0usize, |coords| coords.len()),
             overrides
                 .shape_noise
                 .as_ref()

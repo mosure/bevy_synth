@@ -1,0 +1,34 @@
+[package]
+name = "burn_flex_gmm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sparse submanifold convolution kernels and FlexGMM-style gather+GEMM helpers."
+
+[features]
+default = []
+wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
+
+[dependencies]
+matrixmultiply = "0.3"
+burn = { version = "0.19", default-features = false, features = ["std"], optional = true }
+burn-cubecl = { version = "0.19", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-wgpu]
+version = "0.19"
+optional = true
+default-features = false
+features = ["fusion", "std", "vulkan"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
+version = "0.19"
+optional = true
+default-features = false
+features = ["fusion", "std", "webgpu"]
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+
+[[bench]]
+name = "sparse_subm_conv"
+harness = false

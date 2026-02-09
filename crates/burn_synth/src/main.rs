@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use burn_synth::{
-    ForegroundRequest, ImageSource, MeshRequest, ModelSelection, RuntimeConfig, SynthRuntime,
-    write_glb_mesh,
+    ForegroundRequest, ImageSource, MeshRequest, ModelSelection, ProgressVerbosity, RuntimeConfig,
+    RuntimeProgressObserver, SynthRuntime, default_log_progress_callback, write_glb_mesh,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -62,6 +62,12 @@ struct Cli {
 
     #[arg(long)]
     seed: Option<u64>,
+
+    #[arg(long, value_enum, default_value_t = CliProgress::Steps, global = true)]
+    progress: CliProgress,
+
+    #[arg(long, default_value_t = 1, global = true)]
+    progress_every: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,7 +128,16 @@ enum CliTrellisQuality {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum CliProgress {
+    Off,
+    Stages,
+    Steps,
+}
+
 fn main() {
+    init_logging();
     let cli = Cli::parse();
     if let Err(err) = run(cli) {
         eprintln!("burn_synth error: {err}");
@@ -132,7 +147,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), String> {
     let synthesis_models = sanitize_synthesis_models(cli.synthesis_models);
-    let runtime_config = RuntimeConfig {
+    let mut runtime_config = RuntimeConfig {
         model_selection: ModelSelection::new(
             synthesis_models.iter().copied().map(Into::into),
             cli.rmbg_model.into(),
@@ -155,6 +170,13 @@ fn run(cli: Cli) -> Result<(), String> {
         seed: cli.seed.or(RuntimeConfig::default().seed),
         ..RuntimeConfig::default()
     };
+    if !matches!(cli.progress, CliProgress::Off) {
+        runtime_config.progress = RuntimeProgressObserver::with_callback(
+            cli.progress.into(),
+            cli.progress_every.max(1),
+            default_log_progress_callback(),
+        );
+    }
     let mut runtime = SynthRuntime::new(runtime_config);
 
     match cli.command {
@@ -213,6 +235,14 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn init_logging() {
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("burn_synth=info"),
+    );
+    builder.format_timestamp_millis();
+    let _ = builder.try_init();
 }
 
 fn ensure_exists(path: &Path) -> Result<(), String> {
@@ -324,6 +354,16 @@ impl From<CliTrellisQuality> for burn_synth::trellis::TrellisQuality {
             CliTrellisQuality::Low => Self::Low,
             CliTrellisQuality::Medium => Self::Medium,
             CliTrellisQuality::High => Self::High,
+        }
+    }
+}
+
+impl From<CliProgress> for ProgressVerbosity {
+    fn from(value: CliProgress) -> Self {
+        match value {
+            CliProgress::Off => Self::Off,
+            CliProgress::Stages => Self::Stages,
+            CliProgress::Steps => Self::Steps,
         }
     }
 }

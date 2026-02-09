@@ -19,6 +19,10 @@ use crate::runtime_model::sparse_unet_vae_decoder::SparseUnetVaeDecoderRuntime;
 use crate::sampler::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig};
 use crate::trellis_config::{TrellisNormalization, TrellisPipelineArgs, TrellisSamplerConfig};
 
+#[path = "staged_pipeline_decode.rs"]
+mod staged_pipeline_decode;
+use staged_pipeline_decode::*;
+
 #[derive(Debug, Clone)]
 pub struct SparseStructureSample {
     pub source: SparseStructureStageSource,
@@ -153,6 +157,7 @@ pub struct SparseRowNoiseOverride {
 #[derive(Debug, Clone, Default)]
 pub struct TrellisNoiseOverrides {
     pub sparse_noise: Option<Vec<f32>>,
+    pub sparse_coords: Option<Vec<[u32; 4]>>,
     pub shape_noise: Option<SparseRowNoiseOverride>,
     pub tex_noise: Option<SparseRowNoiseOverride>,
     pub shape_noise_dense: Option<Vec<f32>>,
@@ -175,6 +180,7 @@ pub struct SamplerConfigOverride {
 impl TrellisNoiseOverrides {
     pub fn is_empty(&self) -> bool {
         self.sparse_noise.is_none()
+            && self.sparse_coords.is_none()
             && self.shape_noise.is_none()
             && self.tex_noise.is_none()
             && self.shape_noise_dense.is_none()
@@ -451,7 +457,11 @@ impl TrellisStageRuntime {
         self.pipeline_type.as_str()
     }
 
-    pub fn run(&self, preprocess: &PreprocessOutput, seed: u64) -> TrellisStageOutput {
+    pub fn run(
+        &self,
+        preprocess: &PreprocessOutput,
+        seed: u64,
+    ) -> Result<TrellisStageOutput, String> {
         self.run_with_overrides(preprocess, seed, None)
     }
 
@@ -460,16 +470,16 @@ impl TrellisStageRuntime {
         preprocess: &PreprocessOutput,
         seed: u64,
         noise_overrides: Option<&TrellisNoiseOverrides>,
-    ) -> TrellisStageOutput {
+    ) -> Result<TrellisStageOutput, String> {
         self.run_profiled_with_overrides(preprocess, seed, noise_overrides, false)
-            .0
+            .map(|(output, _timings)| output)
     }
 
     pub fn run_profiled(
         &self,
         preprocess: &PreprocessOutput,
         seed: u64,
-    ) -> (TrellisStageOutput, TrellisStageTimings) {
+    ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
         self.run_profiled_with_overrides(preprocess, seed, None, false)
     }
 
@@ -479,13 +489,14 @@ impl TrellisStageRuntime {
         seed: u64,
         noise_overrides: Option<&TrellisNoiseOverrides>,
         capture_sampler_trace: bool,
-    ) -> (TrellisStageOutput, TrellisStageTimings) {
+    ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
         let total_start = Instant::now();
         let stage_debug = runtime_stage_debug_enabled();
         let parity_strict = runtime_parity_strict();
         let sparse_resolution = sparse_resolution_for_pipeline(self.pipeline_type());
         let mut rng = Lcg::new(seed);
         let sparse_noise_override = noise_overrides.and_then(|v| v.sparse_noise.as_deref());
+        let sparse_coords_override = noise_overrides.and_then(|v| v.sparse_coords.as_deref());
         let shape_noise_override = noise_overrides.and_then(|v| v.shape_noise.as_ref());
         let tex_noise_override = noise_overrides.and_then(|v| v.tex_noise.as_ref());
         let shape_noise_dense_override =
@@ -502,6 +513,7 @@ impl TrellisStageRuntime {
             sparse_resolution,
             &mut rng,
             sparse_noise_override,
+            sparse_coords_override,
             sparse_cond_override,
             sparse_neg_cond_override,
             &self.sparse_sampler,
@@ -510,7 +522,7 @@ impl TrellisStageRuntime {
             parity_strict,
             #[cfg(feature = "runtime-model")]
             self.sparse_flow.as_ref(),
-        );
+        )?;
         let sparse_ms = sparse_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
             eprintln!(
@@ -535,7 +547,7 @@ impl TrellisStageRuntime {
             parity_strict,
             #[cfg(feature = "runtime-model")]
             self.shape_flow.as_ref(),
-        );
+        )?;
         let shape_slat_ms = shape_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
             eprintln!(
@@ -561,7 +573,7 @@ impl TrellisStageRuntime {
             parity_strict,
             #[cfg(feature = "runtime-model")]
             self.tex_flow.as_ref(),
-        );
+        )?;
         let tex_slat_ms = tex_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
             eprintln!(
@@ -573,8 +585,9 @@ impl TrellisStageRuntime {
         let decode_start = Instant::now();
         let decoded = if runtime_skip_decode() {
             if parity_strict {
-                panic!(
+                return Err(
                     "burn_trellis parity strict mode: TRELLIS2_SKIP_DECODE cannot be used in parity mode"
+                        .to_string(),
                 );
             }
             DecodedLatentOutput {
@@ -597,7 +610,7 @@ impl TrellisStageRuntime {
                 self.shape_decoder.as_ref(),
                 #[cfg(feature = "runtime-model")]
                 self.tex_decoder.as_ref(),
-            )
+            )?
         };
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
@@ -623,7 +636,7 @@ impl TrellisStageRuntime {
             decode_ms,
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
         };
-        (output, timings)
+        Ok((output, timings))
     }
 }
 
@@ -635,15 +648,17 @@ fn runtime_sampler_steps_override() -> Option<usize> {
 }
 
 fn runtime_parity_strict() -> bool {
-    std::env::var("TRELLIS2_PARITY_STRICT")
-        .ok()
-        .map(|value| {
-            matches!(
+    for key in ["TRELLIS2_PARITY_STRICT", "TRELLIS2_E2E_STRICT"] {
+        if let Ok(value) = std::env::var(key)
+            && matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             )
-        })
-        .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn runtime_stage_debug_enabled() -> bool {
@@ -704,6 +719,73 @@ fn dense_noise_with_override(
 }
 
 #[cfg(feature = "runtime-model")]
+#[allow(clippy::too_many_arguments)]
+fn build_dense_runtime_noise(
+    rng: &mut Lcg,
+    channels: usize,
+    voxel_count: usize,
+    dense_override: Option<&[f32]>,
+    sparse_row_override: Option<&SparseRowNoiseOverride>,
+    active_coords: &[[u32; 4]],
+    sparse_resolution: usize,
+    dense_resolution: usize,
+    stage: &str,
+) -> Vec<f32> {
+    let mut noise = dense_noise_with_override(
+        rng,
+        channels.saturating_mul(voxel_count),
+        dense_override,
+        stage,
+    );
+    if let Some(override_rows) = sparse_row_override {
+        merge_sparse_row_noise_override(
+            noise.as_mut_slice(),
+            override_rows,
+            active_coords,
+            channels,
+            sparse_resolution,
+            dense_resolution,
+            stage,
+        );
+    }
+    noise
+}
+
+#[cfg(feature = "runtime-model")]
+fn resize_override_values(values: &[f32], expected_len: usize) -> Option<Vec<f32>> {
+    if expected_len == 0 {
+        return Some(Vec::new());
+    }
+    if values.is_empty() {
+        return None;
+    }
+    if values.len() == expected_len {
+        return Some(values.to_vec());
+    }
+    if values.len() == 1 {
+        return Some(vec![values[0]; expected_len]);
+    }
+
+    let src_last = values.len() - 1;
+    let dst_last = expected_len - 1;
+    let mut out = Vec::with_capacity(expected_len);
+    for dst_idx in 0..expected_len {
+        let src_pos = dst_idx as f64 * src_last as f64 / dst_last.max(1) as f64;
+        let src_floor = src_pos.floor() as usize;
+        let src_ceil = src_pos.ceil() as usize;
+        if src_floor == src_ceil {
+            out.push(values[src_floor]);
+            continue;
+        }
+        let t = (src_pos - src_floor as f64) as f32;
+        let a = values[src_floor];
+        let b = values[src_ceil];
+        out.push(a * (1.0 - t) + b * t);
+    }
+    Some(out)
+}
+
+#[cfg(feature = "runtime-model")]
 fn cond_override_for_tokens(
     overrides: Option<&TrellisNoiseOverrides>,
     cond_tokens: usize,
@@ -733,11 +815,26 @@ fn dense_cond_with_override(
     cond_channels: usize,
     override_values: Option<&[f32]>,
     stage: &str,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, String> {
     let expected = cond_tokens.saturating_mul(cond_channels);
     if let Some(values) = override_values {
         if values.len() == expected {
-            return values.to_vec();
+            return Ok(values.to_vec());
+        }
+        if runtime_parity_strict() {
+            return Err(format!(
+                "strict mode rejects {stage} cond override len mismatch (expected {}, got {})",
+                expected,
+                values.len()
+            ));
+        }
+        if let Some(resized) = resize_override_values(values, expected) {
+            eprintln!(
+                "burn_trellis: resized {stage} cond override from {} to {} values",
+                values.len(),
+                expected
+            );
+            return Ok(resized);
         }
         eprintln!(
             "burn_trellis: ignoring {stage} cond override due to len mismatch (expected {}, got {})",
@@ -745,7 +842,11 @@ fn dense_cond_with_override(
             values.len()
         );
     }
-    build_sparse_cond_from_preprocess(preprocess, cond_tokens, cond_channels)
+    Ok(build_sparse_cond_from_preprocess(
+        preprocess,
+        cond_tokens,
+        cond_channels,
+    ))
 }
 
 #[cfg(feature = "runtime-model")]
@@ -753,10 +854,25 @@ fn dense_neg_cond_with_override(
     expected_len: usize,
     override_values: Option<&[f32]>,
     stage: &str,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, String> {
     if let Some(values) = override_values {
         if values.len() == expected_len {
-            return values.to_vec();
+            return Ok(values.to_vec());
+        }
+        if runtime_parity_strict() {
+            return Err(format!(
+                "strict mode rejects {stage} neg-cond override len mismatch (expected {}, got {})",
+                expected_len,
+                values.len()
+            ));
+        }
+        if let Some(resized) = resize_override_values(values, expected_len) {
+            eprintln!(
+                "burn_trellis: resized {stage} neg-cond override from {} to {} values",
+                values.len(),
+                expected_len
+            );
+            return Ok(resized);
         }
         eprintln!(
             "burn_trellis: ignoring {stage} neg-cond override due to len mismatch (expected {}, got {})",
@@ -764,7 +880,7 @@ fn dense_neg_cond_with_override(
             values.len()
         );
     }
-    vec![0.0; expected_len]
+    Ok(vec![0.0; expected_len])
 }
 
 fn sparse_row_noise_map(override_rows: &SparseRowNoiseOverride) -> HashMap<u64, [f32; 32]> {
@@ -831,6 +947,7 @@ fn sample_sparse_structure(
     resolution: usize,
     rng: &mut Lcg,
     noise_override: Option<&[f32]>,
+    coords_override: Option<&[[u32; 4]]>,
     _cond_override: Option<&[f32]>,
     _neg_cond_override: Option<&[f32]>,
     sampler_config: &TrellisSamplerConfig,
@@ -838,7 +955,7 @@ fn sample_sparse_structure(
     capture_sampler_trace: bool,
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] sparse_flow: Option<&SparseStructureFlowRuntime>,
-) -> SparseStructureSample {
+) -> Result<SparseStructureSample, String> {
     #[cfg(feature = "runtime-model")]
     if let Some(sparse_flow) = sparse_flow
         && let Some(sample) = sample_sparse_structure_with_model(
@@ -846,6 +963,7 @@ fn sample_sparse_structure(
             resolution,
             rng,
             noise_override,
+            coords_override,
             _cond_override,
             _neg_cond_override,
             sampler_config,
@@ -854,29 +972,33 @@ fn sample_sparse_structure(
             sparse_flow,
         )
     {
-        return sample;
+        return Ok(sample);
     }
     if parity_strict {
-        panic!(
+        return Err(
             "burn_trellis parity strict mode: sparse_structure stage would use synthetic fallback"
+                .to_string(),
         );
     }
-    sample_sparse_structure_synthetic(
+    Ok(sample_sparse_structure_synthetic(
         preprocess,
         resolution,
         rng,
         noise_override,
+        coords_override,
         sampler_config,
         sampler_override,
         capture_sampler_trace,
-    )
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_sparse_structure_synthetic(
     preprocess: &PreprocessOutput,
     resolution: usize,
     rng: &mut Lcg,
     noise_override: Option<&[f32]>,
+    coords_override: Option<&[[u32; 4]]>,
     sampler_config: &TrellisSamplerConfig,
     sampler_override: Option<SamplerConfigOverride>,
     capture_sampler_trace: bool,
@@ -908,19 +1030,24 @@ fn sample_sparse_structure_synthetic(
     let latent = trace.samples;
     let occupancy = latent_to_occupancy(&latent, flow_channels, flow_resolution);
     let upsampled = upsample_occupancy(occupancy.as_slice(), flow_resolution, resolution);
-    let mut coords = Vec::new();
-    let threshold = 0.5f32;
-    for z in 0..resolution {
-        for y in 0..resolution {
-            for x in 0..resolution {
-                let flat = (z * resolution + y) * resolution + x;
-                if upsampled[flat] <= threshold {
-                    continue;
+    let mut coords = if let Some(override_coords) = coords_override {
+        override_coords.to_vec()
+    } else {
+        let mut sampled = Vec::new();
+        let threshold = 0.5f32;
+        for z in 0..resolution {
+            for y in 0..resolution {
+                for x in 0..resolution {
+                    let flat = (z * resolution + y) * resolution + x;
+                    if upsampled[flat] <= threshold {
+                        continue;
+                    }
+                    sampled.push([0, x as u32, y as u32, z as u32]);
                 }
-                coords.push([0, x as u32, y as u32, z as u32]);
             }
         }
-    }
+        sampled
+    };
     if coords.is_empty() {
         coords.push([
             0,
@@ -953,6 +1080,7 @@ fn sample_sparse_structure_with_model(
     resolution: usize,
     rng: &mut Lcg,
     noise_override: Option<&[f32]>,
+    coords_override: Option<&[[u32; 4]]>,
     cond_override: Option<&[f32]>,
     neg_cond_override: Option<&[f32]>,
     sampler_config: &TrellisSamplerConfig,
@@ -972,14 +1100,34 @@ fn sample_sparse_structure_with_model(
     );
 
     let cond_tokens = 32 * 32 + 5;
-    let cond = dense_cond_with_override(
+    let cond = match dense_cond_with_override(
         preprocess,
         cond_tokens,
         config.cond_channels,
         cond_override,
         "sparse_runtime",
-    );
-    let neg_cond = dense_neg_cond_with_override(cond.len(), neg_cond_override, "sparse_runtime");
+    ) {
+        Ok(cond) => cond,
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: sparse flow cond override rejected ({err}); using synthetic sparse stage fallback."
+            );
+            return None;
+        }
+    };
+    let neg_cond = match dense_neg_cond_with_override(
+        cond.len(),
+        neg_cond_override,
+        "sparse_runtime",
+    ) {
+        Ok(cond) => cond,
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: sparse flow neg-cond override rejected ({err}); using synthetic sparse stage fallback."
+            );
+            return None;
+        }
+    };
     let cond_tensor = match sparse_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
@@ -1021,7 +1169,34 @@ fn sample_sparse_structure_with_model(
     let occupancy = latent_to_occupancy(&latent, channels, flow_resolution);
     let upsampled = upsample_occupancy(occupancy.as_slice(), flow_resolution, resolution);
     let max_sparse_coords = runtime_max_sparse_coords();
-    let mut coords = occupancy_to_coords(upsampled.as_slice(), resolution, 0.5, max_sparse_coords);
+    let mut coords = if let Some(override_coords) = coords_override {
+        if runtime_stage_debug_enabled() {
+            eprintln!(
+                "burn_trellis: sparse runtime using hook coord override rows={}",
+                override_coords.len()
+            );
+        }
+        override_coords.to_vec()
+    } else {
+        let mut sampled =
+            occupancy_to_coords(upsampled.as_slice(), resolution, 0.5, max_sparse_coords);
+        if sampled.is_empty() {
+            sampled.push([
+                0,
+                (resolution / 2) as u32,
+                (resolution / 2) as u32,
+                (resolution / 2) as u32,
+            ]);
+        }
+        if let Some(limit) = max_sparse_coords {
+            eprintln!(
+                "burn_trellis: sparse coords after threshold/cap = {} (limit={})",
+                sampled.len(),
+                limit
+            );
+        }
+        sampled
+    };
     if coords.is_empty() {
         coords.push([
             0,
@@ -1029,13 +1204,6 @@ fn sample_sparse_structure_with_model(
             (resolution / 2) as u32,
             (resolution / 2) as u32,
         ]);
-    }
-    if let Some(limit) = max_sparse_coords {
-        eprintln!(
-            "burn_trellis: sparse coords after threshold/cap = {} (limit={})",
-            coords.len(),
-            limit
-        );
     }
     Some(SparseStructureSample {
         source: match sparse_flow.backend_name() {
@@ -1102,23 +1270,17 @@ fn sample_shape_slat_with_model(
         .map(|coord| map_coord_to_dense_flat(*coord, sparse_resolution, dense_resolution))
         .collect::<Vec<_>>();
 
-    let mut noise = dense_noise_with_override(
+    let noise = build_dense_runtime_noise(
         rng,
-        config.out_channels * voxel_count,
+        config.out_channels,
+        voxel_count,
         noise_dense_override,
+        noise_override,
+        coords,
+        sparse_resolution,
+        dense_resolution,
         "shape_slat_runtime",
     );
-    if let Some(override_rows) = noise_override {
-        merge_sparse_row_noise_override(
-            noise.as_mut_slice(),
-            override_rows,
-            coords,
-            config.out_channels,
-            sparse_resolution,
-            dense_resolution,
-            "shape_slat_runtime",
-        );
-    }
 
     let cond_tokens = if dense_resolution <= 32 {
         32 * 32 + 5
@@ -1126,15 +1288,34 @@ fn sample_shape_slat_with_model(
         64 * 64 + 5
     };
     let (cond_override, neg_cond_override) = cond_override_for_tokens(cond_overrides, cond_tokens);
-    let cond = dense_cond_with_override(
+    let cond = match dense_cond_with_override(
         preprocess,
         cond_tokens,
         config.cond_channels,
         cond_override,
         "shape_slat_runtime",
-    );
-    let neg_cond =
-        dense_neg_cond_with_override(cond.len(), neg_cond_override, "shape_slat_runtime");
+    ) {
+        Ok(cond) => cond,
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: shape slat cond override rejected ({err}); using synthetic shape stage fallback."
+            );
+            return None;
+        }
+    };
+    let neg_cond = match dense_neg_cond_with_override(
+        cond.len(),
+        neg_cond_override,
+        "shape_slat_runtime",
+    ) {
+        Ok(cond) => cond,
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: shape slat neg-cond override rejected ({err}); using synthetic shape stage fallback."
+            );
+            return None;
+        }
+    };
     let cond_tensor = match shape_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
@@ -1308,23 +1489,17 @@ fn sample_tex_slat_with_model(
         }
     }
 
-    let mut noise = dense_noise_with_override(
+    let noise = build_dense_runtime_noise(
         rng,
-        config.out_channels * voxel_count,
+        config.out_channels,
+        voxel_count,
         noise_dense_override,
+        noise_override,
+        shape_slat.coords.as_slice(),
+        sparse_resolution,
+        dense_resolution,
         "tex_slat_runtime",
     );
-    if let Some(override_rows) = noise_override {
-        merge_sparse_row_noise_override(
-            noise.as_mut_slice(),
-            override_rows,
-            shape_slat.coords.as_slice(),
-            config.out_channels,
-            sparse_resolution,
-            dense_resolution,
-            "tex_slat_runtime",
-        );
-    }
 
     let cond_tokens = if dense_resolution <= 32 {
         32 * 32 + 5
@@ -1332,14 +1507,34 @@ fn sample_tex_slat_with_model(
         64 * 64 + 5
     };
     let (cond_override, neg_cond_override) = cond_override_for_tokens(cond_overrides, cond_tokens);
-    let cond = dense_cond_with_override(
+    let cond = match dense_cond_with_override(
         preprocess,
         cond_tokens,
         config.cond_channels,
         cond_override,
         "tex_slat_runtime",
-    );
-    let neg_cond = dense_neg_cond_with_override(cond.len(), neg_cond_override, "tex_slat_runtime");
+    ) {
+        Ok(cond) => cond,
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: tex slat cond override rejected ({err}); using synthetic tex stage fallback."
+            );
+            return None;
+        }
+    };
+    let neg_cond = match dense_neg_cond_with_override(
+        cond.len(),
+        neg_cond_override,
+        "tex_slat_runtime",
+    ) {
+        Ok(cond) => cond,
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: tex slat neg-cond override rejected ({err}); using synthetic tex stage fallback."
+            );
+            return None;
+        }
+    };
     let cond_tensor = match tex_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
@@ -1460,7 +1655,7 @@ fn sample_shape_slat(
     capture_sampler_trace: bool,
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] shape_flow: Option<&SparseStructureFlowRuntime>,
-) -> ShapeSLatSample {
+) -> Result<ShapeSLatSample, String> {
     #[cfg(feature = "runtime-model")]
     if let Some(shape_flow) = shape_flow
         && let Some(sample) = sample_shape_slat_with_model(
@@ -1478,10 +1673,13 @@ fn sample_shape_slat(
             shape_flow,
         )
     {
-        return sample;
+        return Ok(sample);
     }
     if parity_strict {
-        panic!("burn_trellis parity strict mode: shape_slat stage would use synthetic fallback");
+        return Err(
+            "burn_trellis parity strict mode: shape_slat stage would use synthetic fallback"
+                .to_string(),
+        );
     }
 
     let mut features = Vec::with_capacity(coords.len());
@@ -1539,7 +1737,7 @@ fn sample_shape_slat(
         step_mid_rows.push(step_mid_row);
         step_last_rows.push(step_last_row);
     }
-    ShapeSLatSample {
+    Ok(ShapeSLatSample {
         sampler_config: sample_cfg,
         sigma_min,
         step_count: sample_cfg.steps,
@@ -1552,7 +1750,7 @@ fn sample_shape_slat(
         step_mid_x_t: step_mid_rows,
         step_last_x_t: step_last_rows,
         coords: coords.to_vec(),
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1571,7 +1769,7 @@ fn sample_tex_slat(
     capture_sampler_trace: bool,
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] tex_flow: Option<&SparseStructureFlowRuntime>,
-) -> TexSLatSample {
+) -> Result<TexSLatSample, String> {
     #[cfg(feature = "runtime-model")]
     if let Some(tex_flow) = tex_flow
         && let Some(sample) = sample_tex_slat_with_model(
@@ -1590,10 +1788,13 @@ fn sample_tex_slat(
             tex_flow,
         )
     {
-        return sample;
+        return Ok(sample);
     }
     if parity_strict {
-        panic!("burn_trellis parity strict mode: tex_slat stage would use synthetic fallback");
+        return Err(
+            "burn_trellis parity strict mode: tex_slat stage would use synthetic fallback"
+                .to_string(),
+        );
     }
 
     let (sampler, sample_cfg, sigma_min) =
@@ -1667,7 +1868,7 @@ fn sample_tex_slat(
         step_last_rows.push(step_last_row);
         shape_cond_rows.push(shape_cond);
     }
-    TexSLatSample {
+    Ok(TexSLatSample {
         sampler_config: sample_cfg,
         sigma_min,
         step_count: sample_cfg.steps,
@@ -1681,7 +1882,7 @@ fn sample_tex_slat(
         step_last_x_t: step_last_rows,
         shape_slat_cond: shape_cond_rows,
         coords: shape_slat.coords.clone(),
-    }
+    })
 }
 
 fn decode_latent_to_outputs(
@@ -1691,36 +1892,61 @@ fn decode_latent_to_outputs(
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] shape_decoder: Option<&FdgDecoderRuntime>,
     #[cfg(feature = "runtime-model")] tex_decoder: Option<&SparseUnetVaeDecoderRuntime>,
-) -> DecodedLatentOutput {
+) -> Result<DecodedLatentOutput, String> {
     #[cfg(feature = "runtime-model")]
     {
-        let shape_decoder = shape_decoder.unwrap_or_else(|| {
-            panic!(
-                "burn_trellis: shape runtime decoder is required (missing `shape_slat_decoder` runtime)"
-            )
-        });
-        let tex_decoder = tex_decoder.unwrap_or_else(|| {
-            panic!(
-                "burn_trellis: tex runtime decoder is required (missing `tex_slat_decoder` runtime)"
-            )
-        });
-        decode_latent_with_runtime_decoders(
-            shape,
-            tex,
-            pipeline_type,
-            parity_strict,
-            shape_decoder,
-            tex_decoder,
-        )
-        .unwrap_or_else(|err| {
-            panic!("burn_trellis: runtime decode pipeline failed: {err}");
-        })
+        let Some(shape_decoder) = shape_decoder else {
+            if parity_strict {
+                return Err(
+                    "burn_trellis: shape runtime decoder is required (missing `shape_slat_decoder` runtime)"
+                        .to_string(),
+                );
+            }
+            eprintln!(
+                "burn_trellis: shape runtime decoder missing; using canonical-cube decode fallback"
+            );
+            return Ok(decoded_fallback_output());
+        };
+        let Some(tex_decoder) = tex_decoder else {
+            if parity_strict {
+                return Err(
+                    "burn_trellis: tex runtime decoder is required (missing `tex_slat_decoder` runtime)"
+                        .to_string(),
+                );
+            }
+            eprintln!(
+                "burn_trellis: tex runtime decoder missing; using canonical-cube decode fallback"
+            );
+            return Ok(decoded_fallback_output());
+        };
+        decode_latent_with_runtime_decoders(shape, tex, pipeline_type, parity_strict, shape_decoder, tex_decoder)
+            .or_else(|err| {
+                if parity_strict {
+                    Err(format!("burn_trellis: runtime decode pipeline failed: {err}"))
+                } else {
+                    eprintln!("burn_trellis: runtime decode pipeline failed ({err}); using canonical-cube decode fallback");
+                    Ok(decoded_fallback_output())
+                }
+            })
     }
 
     #[cfg(not(feature = "runtime-model"))]
     {
         let _ = (shape, tex, pipeline_type, parity_strict);
-        panic!("burn_trellis: TRELLIS decode requires `runtime-model` feature");
+        Err("burn_trellis: TRELLIS decode requires `runtime-model` feature".to_string())
+    }
+}
+
+fn decoded_fallback_output() -> DecodedLatentOutput {
+    DecodedLatentOutput {
+        mesh: canonical_cube(),
+        shape_subs: Vec::new(),
+        tex_voxels: DecodeTexVoxelSample {
+            coords: Vec::new(),
+            feats: Vec::new(),
+            spatial_shape: [1, 1, 1],
+        },
+        pbr: None,
     }
 }
 
@@ -1746,16 +1972,7 @@ fn decode_latent_with_runtime_decoders(
                     .to_string(),
             );
         }
-        return Ok(DecodedLatentOutput {
-            mesh: canonical_cube(),
-            shape_subs: Vec::new(),
-            tex_voxels: DecodeTexVoxelSample {
-                coords: Vec::new(),
-                feats: Vec::new(),
-                spatial_shape: [512, 512, 512],
-            },
-            pbr: None,
-        });
+        return Ok(decoded_fallback_output());
     }
     if shape_decoder.out_channels() < 7 || tex_decoder.out_channels() < 6 {
         return Err(format!(
@@ -1886,1042 +2103,6 @@ fn decode_latent_with_runtime_decoders(
     })
 }
 
-#[cfg(feature = "runtime-model")]
-fn runtime_subdivision_to_sample(sub: &SparseSubdivisionLogits) -> DecodeShapeSubSample {
-    let mut feats = Vec::with_capacity(sub.coords.len());
-    for row_idx in 0..sub.coords.len() {
-        let mut row = [0.0f32; 8];
-        let base = row_idx * 8;
-        if base + 8 <= sub.logits.len() {
-            row.copy_from_slice(&sub.logits[base..base + 8]);
-        }
-        feats.push(row);
-    }
-    DecodeShapeSubSample {
-        coords: sub.coords.clone(),
-        feats,
-        spatial_shape: sub.spatial_shape,
-    }
-}
-
-#[cfg(feature = "runtime-model")]
-fn spatial_shape_from_sparse_coords(coords: &[[u32; 4]]) -> [u32; 3] {
-    if coords.is_empty() {
-        return [1, 1, 1];
-    }
-    let mut max_x = 0u32;
-    let mut max_y = 0u32;
-    let mut max_z = 0u32;
-    for coord in coords {
-        max_x = max_x.max(coord[1]);
-        max_y = max_y.max(coord[2]);
-        max_z = max_z.max(coord[3]);
-    }
-    [
-        max_x.saturating_add(1),
-        max_y.saturating_add(1),
-        max_z.saturating_add(1),
-    ]
-}
-
-fn flexible_dual_grid_to_mesh(
-    coords: &[[u32; 4]],
-    dual_vertices: &[[f32; 3]],
-    intersected_flag: &[[bool; 3]],
-    split_weight: Option<&[f32]>,
-    grid_size: [u32; 3],
-    aabb_min: [f32; 3],
-    aabb_max: [f32; 3],
-) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
-    if coords.is_empty()
-        || dual_vertices.len() != coords.len()
-        || intersected_flag.len() != coords.len()
-        || split_weight.is_some_and(|w| w.len() != coords.len())
-    {
-        return (Vec::new(), Vec::new());
-    }
-
-    // TRELLIS2 flexible-dual-grid edge neighborhoods:
-    // x-axis, y-axis, z-axis (4 voxels per quad candidate).
-    const EDGE_NEIGHBOR_VOXEL_OFFSET: [[[i32; 3]; 4]; 3] = [
-        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
-        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
-    ];
-
-    let mut coord_to_index = HashMap::with_capacity(coords.len() * 2);
-    for (idx, coord) in coords.iter().enumerate() {
-        coord_to_index.insert(pack_coord(coord[1], coord[2], coord[3]), idx as u32);
-    }
-
-    let mut quad_indices = Vec::<[u32; 4]>::new();
-    for (idx, coord) in coords.iter().enumerate() {
-        let base = [coord[1] as i32, coord[2] as i32, coord[3] as i32];
-        for axis in 0..3 {
-            if !intersected_flag[idx][axis] {
-                continue;
-            }
-            let mut quad = [0u32; 4];
-            let mut valid = true;
-            for k in 0..4 {
-                let offset = EDGE_NEIGHBOR_VOXEL_OFFSET[axis][k];
-                let nx = base[0] + offset[0];
-                let ny = base[1] + offset[1];
-                let nz = base[2] + offset[2];
-                if nx < 0 || ny < 0 || nz < 0 {
-                    valid = false;
-                    break;
-                }
-                let Some(&neighbor_idx) =
-                    coord_to_index.get(&pack_coord(nx as u32, ny as u32, nz as u32))
-                else {
-                    valid = false;
-                    break;
-                };
-                quad[k] = neighbor_idx;
-            }
-            if valid {
-                quad_indices.push(quad);
-            }
-        }
-    }
-
-    if quad_indices.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-
-    let voxel_size = [
-        (aabb_max[0] - aabb_min[0]) / grid_size[0].max(1) as f32,
-        (aabb_max[1] - aabb_min[1]) / grid_size[1].max(1) as f32,
-        (aabb_max[2] - aabb_min[2]) / grid_size[2].max(1) as f32,
-    ];
-    let mut vertices = Vec::with_capacity(coords.len());
-    for (coord, dual) in coords.iter().zip(dual_vertices.iter()) {
-        vertices.push([
-            (coord[1] as f32 + dual[0]) * voxel_size[0] + aabb_min[0],
-            (coord[2] as f32 + dual[1]) * voxel_size[1] + aabb_min[1],
-            (coord[3] as f32 + dual[2]) * voxel_size[2] + aabb_min[2],
-        ]);
-    }
-
-    let mut faces = Vec::with_capacity(quad_indices.len() * 2);
-    for quad in quad_indices {
-        let use_split_1 = if let Some(weights) = split_weight {
-            let w02 = weights[quad[0] as usize] * weights[quad[2] as usize];
-            let w13 = weights[quad[1] as usize] * weights[quad[3] as usize];
-            w02 > w13
-        } else {
-            let split1 = quad_to_triangles_split1(quad);
-            let split2 = quad_to_triangles_split2(quad);
-            triangle_alignment(vertices.as_slice(), split1).abs()
-                > triangle_alignment(vertices.as_slice(), split2).abs()
-        };
-        let tris = if use_split_1 {
-            quad_to_triangles_split1(quad)
-        } else {
-            quad_to_triangles_split2(quad)
-        };
-        faces.push(tris[0]);
-        faces.push(tris[1]);
-    }
-
-    (vertices, faces)
-}
-
-fn quad_to_triangles_split1(quad: [u32; 4]) -> [[u32; 3]; 2] {
-    [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]]
-}
-
-fn quad_to_triangles_split2(quad: [u32; 4]) -> [[u32; 3]; 2] {
-    [[quad[0], quad[1], quad[3]], [quad[3], quad[1], quad[2]]]
-}
-
-fn triangle_alignment(vertices: &[[f32; 3]], tris: [[u32; 3]; 2]) -> f32 {
-    let n0 = triangle_normal(vertices, tris[0]);
-    let n1 = triangle_normal(vertices, tris[1]);
-    dot3(n0, n1)
-}
-
-fn triangle_normal(vertices: &[[f32; 3]], tri: [u32; 3]) -> [f32; 3] {
-    let a = vertices[tri[0] as usize];
-    let b = vertices[tri[1] as usize];
-    let c = vertices[tri[2] as usize];
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    cross3(ab, ac)
-}
-
-fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn pack_coord(x: u32, y: u32, z: u32) -> u64 {
-    ((x as u64) << 42) | ((y as u64) << 21) | z as u64
-}
-
-fn summarize_material(
-    voxel_attrs: &[[f32; 6]],
-    pbr_textures: Option<&MeshPbrTextures>,
-) -> Option<MeshMaterial> {
-    if let Some(textures) = pbr_textures {
-        let base = &textures.base_color.rgba8;
-        let mr = &textures.metallic_roughness.rgba8;
-        if base.len() >= 4 && mr.len() >= 4 {
-            let texels = (base.len() / 4).max(1);
-            let mut accum = [0.0f32; 6];
-            for idx in 0..texels {
-                let off = idx * 4;
-                accum[0] += base[off] as f32 / 255.0;
-                accum[1] += base[off + 1] as f32 / 255.0;
-                accum[2] += base[off + 2] as f32 / 255.0;
-                accum[5] += base[off + 3] as f32 / 255.0;
-                accum[3] += mr[off + 2] as f32 / 255.0;
-                accum[4] += mr[off + 1] as f32 / 255.0;
-            }
-            let inv = 1.0 / texels as f32;
-            return Some(MeshMaterial {
-                base_color: [
-                    (accum[0] * inv).clamp(0.0, 1.0),
-                    (accum[1] * inv).clamp(0.0, 1.0),
-                    (accum[2] * inv).clamp(0.0, 1.0),
-                ],
-                metallic: (accum[3] * inv).clamp(0.0, 1.0),
-                roughness: (accum[4] * inv).clamp(0.0, 1.0),
-                alpha: (accum[5] * inv).clamp(0.0, 1.0),
-            });
-        }
-    }
-    if voxel_attrs.is_empty() {
-        return None;
-    }
-    let mut accum = [0.0f32; 6];
-    for attrs in voxel_attrs {
-        for idx in 0..6 {
-            accum[idx] += attrs[idx];
-        }
-    }
-    let inv = 1.0 / voxel_attrs.len() as f32;
-    Some(MeshMaterial {
-        base_color: [
-            (accum[0] * inv).clamp(0.0, 1.0),
-            (accum[1] * inv).clamp(0.0, 1.0),
-            (accum[2] * inv).clamp(0.0, 1.0),
-        ],
-        metallic: (accum[3] * inv).clamp(0.0, 1.0),
-        roughness: (accum[4] * inv).clamp(0.0, 1.0),
-        alpha: (accum[5] * inv).clamp(0.0, 1.0),
-    })
-}
-
-fn runtime_pbr_texture_size() -> usize {
-    std::env::var("TRELLIS2_PBR_TEX_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 64)
-        .unwrap_or(256)
-}
-
-#[allow(clippy::type_complexity)]
-fn bake_pbr_from_voxels(
-    vertices: &[[f32; 3]],
-    faces: &[[u32; 3]],
-    voxel_coords: &[[u32; 4]],
-    voxel_attrs: &[[f32; 6]],
-    fallback_spatial_resolution: u32,
-) -> (Vec<[f32; 2]>, Option<MeshPbrTextures>, PbrBakeDebug) {
-    if vertices.is_empty() || faces.is_empty() {
-        return (
-            Vec::new(),
-            None,
-            PbrBakeDebug {
-                texture_width: 0,
-                texture_height: 0,
-                uvs: Vec::new(),
-                raster_mask: Vec::new(),
-                sample_positions: Vec::new(),
-                sample_attrs: Vec::new(),
-                base_color_float: Vec::new(),
-                metallic_float: Vec::new(),
-                roughness_float: Vec::new(),
-                alpha_float: Vec::new(),
-                base_color_rgba_u8: Vec::new(),
-                metallic_roughness_u8: Vec::new(),
-            },
-        );
-    }
-
-    let uvs = box_uv_unwrap(vertices, faces);
-    let texture_size = runtime_pbr_texture_size();
-    let texel_count = texture_size * texture_size;
-    let mut raster_mask = vec![0u8; texel_count];
-    let mut base_color_float = vec![[0.0f32; 4]; texel_count];
-    let mut metallic_float = vec![0.0f32; texel_count];
-    let mut roughness_float = vec![1.0f32; texel_count];
-    let mut alpha_float = vec![1.0f32; texel_count];
-    let mut sample_positions = Vec::with_capacity(texel_count / 2);
-    let mut sample_attrs = Vec::with_capacity(texel_count / 2);
-
-    let mut voxel_map = HashMap::with_capacity(voxel_coords.len().saturating_mul(2));
-    let mut spatial = [
-        fallback_spatial_resolution.max(1),
-        fallback_spatial_resolution.max(1),
-        fallback_spatial_resolution.max(1),
-    ];
-    for (idx, coord) in voxel_coords.iter().enumerate() {
-        let attrs = voxel_attrs
-            .get(idx)
-            .copied()
-            .unwrap_or([0.5, 0.5, 0.5, 0.0, 1.0, 1.0]);
-        voxel_map.insert(pack_coord(coord[1], coord[2], coord[3]), attrs);
-        spatial[0] = spatial[0].max(coord[1].saturating_add(1));
-        spatial[1] = spatial[1].max(coord[2].saturating_add(1));
-        spatial[2] = spatial[2].max(coord[3].saturating_add(1));
-    }
-    let fallback_attr = summarize_voxel_attr(voxel_attrs);
-
-    for face in faces {
-        let i0 = face[0] as usize;
-        let i1 = face[1] as usize;
-        let i2 = face[2] as usize;
-        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
-            continue;
-        }
-        if i0 >= uvs.len() || i1 >= uvs.len() || i2 >= uvs.len() {
-            continue;
-        }
-        let p0 = vertices[i0];
-        let p1 = vertices[i1];
-        let p2 = vertices[i2];
-        let uv0 = uvs[i0];
-        let uv1 = uvs[i1];
-        let uv2 = uvs[i2];
-        rasterize_triangle(texture_size, [uv0, uv1, uv2], |x, y, bary| {
-            let position = [
-                p0[0] * bary[0] + p1[0] * bary[1] + p2[0] * bary[2],
-                p0[1] * bary[0] + p1[1] * bary[1] + p2[1] * bary[2],
-                p0[2] * bary[0] + p1[2] * bary[1] + p2[2] * bary[2],
-            ];
-            let attrs =
-                sample_voxel_attr(position, &voxel_map, fallback_attr, spatial, voxel_coords);
-            let idx = y * texture_size + x;
-            if raster_mask[idx] == 0 {
-                base_color_float[idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
-                metallic_float[idx] = attrs[3];
-                roughness_float[idx] = attrs[4];
-                alpha_float[idx] = attrs[5];
-                raster_mask[idx] = 255;
-            } else {
-                // Weighted blend where overdraw occurs from UV seams.
-                base_color_float[idx][0] = 0.5 * base_color_float[idx][0] + 0.5 * attrs[0];
-                base_color_float[idx][1] = 0.5 * base_color_float[idx][1] + 0.5 * attrs[1];
-                base_color_float[idx][2] = 0.5 * base_color_float[idx][2] + 0.5 * attrs[2];
-                base_color_float[idx][3] = 0.5 * base_color_float[idx][3] + 0.5 * attrs[5];
-                metallic_float[idx] = 0.5 * metallic_float[idx] + 0.5 * attrs[3];
-                roughness_float[idx] = 0.5 * roughness_float[idx] + 0.5 * attrs[4];
-                alpha_float[idx] = 0.5 * alpha_float[idx] + 0.5 * attrs[5];
-            }
-            sample_positions.push(position);
-            sample_attrs.push(attrs);
-        });
-    }
-
-    inpaint_texture_channels(
-        texture_size,
-        raster_mask.as_mut_slice(),
-        base_color_float.as_mut_slice(),
-        metallic_float.as_mut_slice(),
-        roughness_float.as_mut_slice(),
-        alpha_float.as_mut_slice(),
-        fallback_attr,
-    );
-
-    let mut base_color_rgba_u8 = vec![0u8; texel_count * 4];
-    let mut metallic_roughness_u8 = vec![0u8; texel_count * 4];
-    for idx in 0..texel_count {
-        let off = idx * 4;
-        let rgba = base_color_float[idx];
-        base_color_rgba_u8[off] = quantize_unorm8(rgba[0]);
-        base_color_rgba_u8[off + 1] = quantize_unorm8(rgba[1]);
-        base_color_rgba_u8[off + 2] = quantize_unorm8(rgba[2]);
-        base_color_rgba_u8[off + 3] = quantize_unorm8(alpha_float[idx]);
-        metallic_roughness_u8[off] = 0;
-        metallic_roughness_u8[off + 1] = quantize_unorm8(roughness_float[idx]);
-        metallic_roughness_u8[off + 2] = quantize_unorm8(metallic_float[idx]);
-        metallic_roughness_u8[off + 3] = 255;
-    }
-
-    let pbr_textures = MeshPbrTextures {
-        base_color: MeshTexture {
-            width: texture_size as u32,
-            height: texture_size as u32,
-            rgba8: base_color_rgba_u8.clone(),
-        },
-        metallic_roughness: MeshTexture {
-            width: texture_size as u32,
-            height: texture_size as u32,
-            rgba8: metallic_roughness_u8.clone(),
-        },
-        normal: None,
-        emissive: None,
-        occlusion: None,
-    };
-
-    (
-        uvs.clone(),
-        Some(pbr_textures),
-        PbrBakeDebug {
-            texture_width: texture_size,
-            texture_height: texture_size,
-            uvs,
-            raster_mask,
-            sample_positions,
-            sample_attrs,
-            base_color_float,
-            metallic_float,
-            roughness_float,
-            alpha_float,
-            base_color_rgba_u8,
-            metallic_roughness_u8,
-        },
-    )
-}
-
-fn box_uv_unwrap(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<[f32; 2]> {
-    if vertices.is_empty() {
-        return Vec::new();
-    }
-    let mut normals = vec![[0.0f32; 3]; vertices.len()];
-    for face in faces {
-        let i0 = face[0] as usize;
-        let i1 = face[1] as usize;
-        let i2 = face[2] as usize;
-        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
-            continue;
-        }
-        let p0 = vertices[i0];
-        let p1 = vertices[i1];
-        let p2 = vertices[i2];
-        let e0 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        let e1 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-        let n = [
-            e0[1] * e1[2] - e0[2] * e1[1],
-            e0[2] * e1[0] - e0[0] * e1[2],
-            e0[0] * e1[1] - e0[1] * e1[0],
-        ];
-        for &idx in &[i0, i1, i2] {
-            normals[idx][0] += n[0];
-            normals[idx][1] += n[1];
-            normals[idx][2] += n[2];
-        }
-    }
-    let mut min = vertices[0];
-    let mut max = vertices[0];
-    for vertex in vertices.iter().skip(1) {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(vertex[axis]);
-            max[axis] = max[axis].max(vertex[axis]);
-        }
-    }
-    let range_x = (max[0] - min[0]).abs().max(1.0e-6);
-    let range_y = (max[1] - min[1]).abs().max(1.0e-6);
-    let range_z = (max[2] - min[2]).abs().max(1.0e-6);
-    vertices
-        .iter()
-        .zip(normals.iter())
-        .map(|(vertex, normal)| {
-            // Dominant-axis box projection based on local normal direction.
-            let ax = normal[0].abs();
-            let ay = normal[1].abs();
-            let az = normal[2].abs();
-            if ay >= ax && ay >= az {
-                let mut u = ((vertex[0] - min[0]) / range_x).clamp(0.0, 1.0);
-                if normal[1] < 0.0 {
-                    u = 1.0 - u;
-                }
-                [u, ((vertex[2] - min[2]) / range_z).clamp(0.0, 1.0)]
-            } else if ax >= az {
-                let mut u = ((vertex[2] - min[2]) / range_z).clamp(0.0, 1.0);
-                if normal[0] < 0.0 {
-                    u = 1.0 - u;
-                }
-                [u, ((vertex[1] - min[1]) / range_y).clamp(0.0, 1.0)]
-            } else {
-                let mut u = ((vertex[0] - min[0]) / range_x).clamp(0.0, 1.0);
-                if normal[2] < 0.0 {
-                    u = 1.0 - u;
-                }
-                [u, ((vertex[1] - min[1]) / range_y).clamp(0.0, 1.0)]
-            }
-        })
-        .collect()
-}
-
-fn summarize_voxel_attr(voxel_attrs: &[[f32; 6]]) -> [f32; 6] {
-    if voxel_attrs.is_empty() {
-        return [0.7, 0.7, 0.7, 0.0, 0.8, 1.0];
-    }
-    let mut accum = [0.0f32; 6];
-    for attrs in voxel_attrs {
-        for idx in 0..6 {
-            accum[idx] += attrs[idx];
-        }
-    }
-    let inv = 1.0 / voxel_attrs.len() as f32;
-    for value in &mut accum {
-        *value *= inv;
-    }
-    accum
-}
-
-fn sample_voxel_attr(
-    position: [f32; 3],
-    voxel_map: &HashMap<u64, [f32; 6]>,
-    fallback: [f32; 6],
-    spatial: [u32; 3],
-    voxel_coords: &[[u32; 4]],
-) -> [f32; 6] {
-    if voxel_map.is_empty() {
-        return fallback;
-    }
-    let map_axis = |value: f32, dim: u32| -> f32 {
-        let dim = dim.max(1) as f32;
-        ((value + 0.5) * (dim - 1.0)).clamp(0.0, dim - 1.0)
-    };
-    let coord = [
-        map_axis(position[0], spatial[0]),
-        map_axis(position[1], spatial[1]),
-        map_axis(position[2], spatial[2]),
-    ];
-    let base = [
-        coord[0].floor() as i32,
-        coord[1].floor() as i32,
-        coord[2].floor() as i32,
-    ];
-    let frac = [
-        coord[0] - base[0] as f32,
-        coord[1] - base[1] as f32,
-        coord[2] - base[2] as f32,
-    ];
-
-    let mut accum = [0.0f32; 6];
-    let mut weight_sum = 0.0f32;
-    for dz in 0..=1 {
-        for dy in 0..=1 {
-            for dx in 0..=1 {
-                let x = base[0] + dx;
-                let y = base[1] + dy;
-                let z = base[2] + dz;
-                if x < 0 || y < 0 || z < 0 {
-                    continue;
-                }
-                let x = x.min(spatial[0] as i32 - 1) as u32;
-                let y = y.min(spatial[1] as i32 - 1) as u32;
-                let z = z.min(spatial[2] as i32 - 1) as u32;
-                let wx = if dx == 0 { 1.0 - frac[0] } else { frac[0] };
-                let wy = if dy == 0 { 1.0 - frac[1] } else { frac[1] };
-                let wz = if dz == 0 { 1.0 - frac[2] } else { frac[2] };
-                let weight = wx * wy * wz;
-                let key = pack_coord(x, y, z);
-                if let Some(attrs) = voxel_map.get(&key) {
-                    for ch in 0..6 {
-                        accum[ch] += attrs[ch] * weight;
-                    }
-                    weight_sum += weight;
-                }
-            }
-        }
-    }
-    if weight_sum > 1.0e-8 {
-        let inv = 1.0 / weight_sum;
-        for value in &mut accum {
-            *value *= inv;
-        }
-        return accum;
-    }
-
-    let nearest = [
-        coord[0].round() as i32,
-        coord[1].round() as i32,
-        coord[2].round() as i32,
-    ];
-    let key = pack_coord(
-        nearest[0].clamp(0, spatial[0] as i32 - 1) as u32,
-        nearest[1].clamp(0, spatial[1] as i32 - 1) as u32,
-        nearest[2].clamp(0, spatial[2] as i32 - 1) as u32,
-    );
-    if let Some(attrs) = voxel_map.get(&key) {
-        return *attrs;
-    }
-
-    let mut best = None;
-    let mut best_dist = f32::INFINITY;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let x = nearest[0] + dx;
-                let y = nearest[1] + dy;
-                let z = nearest[2] + dz;
-                if x < 0 || y < 0 || z < 0 {
-                    continue;
-                }
-                let key = pack_coord(x as u32, y as u32, z as u32);
-                if let Some(attrs) = voxel_map.get(&key) {
-                    let dist = (dx * dx + dy * dy + dz * dz) as f32;
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best = Some(*attrs);
-                    }
-                }
-            }
-        }
-    }
-    if let Some(attrs) = best {
-        return attrs;
-    }
-    if !voxel_coords.is_empty() {
-        // Last-resort stable fallback for sparse misses: nearest known coordinate.
-        let mut nearest_idx = 0usize;
-        let mut nearest_dist = f32::INFINITY;
-        for (idx, coord) in voxel_coords.iter().enumerate() {
-            let dx = coord[1] as f32 - base[0] as f32;
-            let dy = coord[2] as f32 - base[1] as f32;
-            let dz = coord[3] as f32 - base[2] as f32;
-            let dist = dx * dx + dy * dy + dz * dz;
-            if dist < nearest_dist {
-                nearest_dist = dist;
-                nearest_idx = idx;
-            }
-        }
-        if let Some(attrs) = voxel_map.get(&pack_coord(
-            voxel_coords[nearest_idx][1],
-            voxel_coords[nearest_idx][2],
-            voxel_coords[nearest_idx][3],
-        )) {
-            return *attrs;
-        }
-    }
-    fallback
-}
-
-fn rasterize_triangle(
-    texture_size: usize,
-    tri_uv: [[f32; 2]; 3],
-    mut draw: impl FnMut(usize, usize, [f32; 3]),
-) {
-    let to_px = |uv: [f32; 2]| -> [f32; 2] {
-        [
-            uv[0].clamp(0.0, 1.0) * (texture_size.saturating_sub(1)) as f32,
-            (1.0 - uv[1].clamp(0.0, 1.0)) * (texture_size.saturating_sub(1)) as f32,
-        ]
-    };
-    let p0 = to_px(tri_uv[0]);
-    let p1 = to_px(tri_uv[1]);
-    let p2 = to_px(tri_uv[2]);
-    let min_x = p0[0]
-        .min(p1[0])
-        .min(p2[0])
-        .floor()
-        .clamp(0.0, (texture_size.saturating_sub(1)) as f32) as usize;
-    let max_x = p0[0]
-        .max(p1[0])
-        .max(p2[0])
-        .ceil()
-        .clamp(0.0, (texture_size.saturating_sub(1)) as f32) as usize;
-    let min_y = p0[1]
-        .min(p1[1])
-        .min(p2[1])
-        .floor()
-        .clamp(0.0, (texture_size.saturating_sub(1)) as f32) as usize;
-    let max_y = p0[1]
-        .max(p1[1])
-        .max(p2[1])
-        .ceil()
-        .clamp(0.0, (texture_size.saturating_sub(1)) as f32) as usize;
-
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let bary = barycentric_2d([x as f32 + 0.5, y as f32 + 0.5], p0, p1, p2);
-            if bary[0] >= -1.0e-6 && bary[1] >= -1.0e-6 && bary[2] >= -1.0e-6 {
-                draw(x, y, bary);
-            }
-        }
-    }
-}
-
-fn barycentric_2d(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> [f32; 3] {
-    let v0 = [b[0] - a[0], b[1] - a[1]];
-    let v1 = [c[0] - a[0], c[1] - a[1]];
-    let v2 = [p[0] - a[0], p[1] - a[1]];
-    let d00 = v0[0] * v0[0] + v0[1] * v0[1];
-    let d01 = v0[0] * v1[0] + v0[1] * v1[1];
-    let d11 = v1[0] * v1[0] + v1[1] * v1[1];
-    let d20 = v2[0] * v0[0] + v2[1] * v0[1];
-    let d21 = v2[0] * v1[0] + v2[1] * v1[1];
-    let denom = d00 * d11 - d01 * d01;
-    if denom.abs() <= 1.0e-12 {
-        return [-1.0, -1.0, -1.0];
-    }
-    let v = (d11 * d20 - d01 * d21) / denom;
-    let w = (d00 * d21 - d01 * d20) / denom;
-    let u = 1.0 - v - w;
-    [u, v, w]
-}
-
-fn inpaint_texture_channels(
-    texture_size: usize,
-    mask: &mut [u8],
-    base_color_float: &mut [[f32; 4]],
-    metallic_float: &mut [f32],
-    roughness_float: &mut [f32],
-    alpha_float: &mut [f32],
-    fallback: [f32; 6],
-) {
-    let texels = texture_size * texture_size;
-    if mask.len() != texels {
-        return;
-    }
-    let neighbors = [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)];
-    for _ in 0..6 {
-        let mut changed = false;
-        let prev_mask = mask.to_vec();
-        let prev_base = base_color_float.to_vec();
-        let prev_metallic = metallic_float.to_vec();
-        let prev_roughness = roughness_float.to_vec();
-        let prev_alpha = alpha_float.to_vec();
-        for y in 0..texture_size {
-            for x in 0..texture_size {
-                let idx = y * texture_size + x;
-                if prev_mask[idx] != 0 {
-                    continue;
-                }
-                let mut count = 0usize;
-                let mut accum_base = [0.0f32; 4];
-                let mut accum_m = 0.0f32;
-                let mut accum_r = 0.0f32;
-                let mut accum_a = 0.0f32;
-                for (dx, dy) in neighbors {
-                    let nx = x as isize + dx;
-                    let ny = y as isize + dy;
-                    if nx < 0
-                        || ny < 0
-                        || nx >= texture_size as isize
-                        || ny >= texture_size as isize
-                    {
-                        continue;
-                    }
-                    let nidx = ny as usize * texture_size + nx as usize;
-                    if prev_mask[nidx] == 0 {
-                        continue;
-                    }
-                    count += 1;
-                    for ch in 0..4 {
-                        accum_base[ch] += prev_base[nidx][ch];
-                    }
-                    accum_m += prev_metallic[nidx];
-                    accum_r += prev_roughness[nidx];
-                    accum_a += prev_alpha[nidx];
-                }
-                if count == 0 {
-                    continue;
-                }
-                let inv = 1.0 / count as f32;
-                for ch in 0..4 {
-                    base_color_float[idx][ch] = accum_base[ch] * inv;
-                }
-                metallic_float[idx] = accum_m * inv;
-                roughness_float[idx] = accum_r * inv;
-                alpha_float[idx] = accum_a * inv;
-                mask[idx] = 255;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    for idx in 0..texels {
-        if mask[idx] != 0 {
-            continue;
-        }
-        base_color_float[idx] = [fallback[0], fallback[1], fallback[2], fallback[5]];
-        metallic_float[idx] = fallback[3];
-        roughness_float[idx] = fallback[4];
-        alpha_float[idx] = fallback[5];
-        mask[idx] = 255;
-    }
-}
-
-fn quantize_unorm8(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-fn occupancy_target(preprocess: &PreprocessOutput, resolution: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; resolution * resolution * resolution];
-    for z in 0..resolution {
-        let z_norm = z as f32 / (resolution.saturating_sub(1).max(1) as f32);
-        for y in 0..resolution {
-            for x in 0..resolution {
-                let idx = (z * resolution + y) * resolution + x;
-                let luma = sample_pixel_luma(preprocess, x as u32, y as u32, z as u32);
-                let depth_bias = 1.0 - (z_norm - 0.5).abs() * 1.6;
-                out[idx] = (luma * depth_bias).clamp(0.0, 1.0);
-            }
-        }
-    }
-    out
-}
-
-#[cfg(feature = "runtime-model")]
-fn build_sparse_cond_from_preprocess(
-    preprocess: &PreprocessOutput,
-    tokens: usize,
-    cond_channels: usize,
-) -> Vec<f32> {
-    let patch_side = (tokens as f32).sqrt().floor().max(1.0) as usize;
-    let patch_tokens = (patch_side * patch_side).min(tokens);
-    let extra_tokens = tokens.saturating_sub(patch_tokens);
-    let width = preprocess.width.max(1) as usize;
-    let height = preprocess.height.max(1) as usize;
-    let mut out = Vec::with_capacity(tokens * cond_channels);
-    for token_idx in 0..tokens {
-        let (x, y, extra_scale) = if token_idx < patch_tokens {
-            let x = token_idx % patch_side;
-            let y = token_idx / patch_side;
-            (x, y, 0.0f32)
-        } else {
-            let extra_idx = token_idx - patch_tokens;
-            let x = width / 2;
-            let y = height / 2;
-            let scale = if extra_tokens > 0 {
-                extra_idx as f32 / extra_tokens as f32
-            } else {
-                0.0
-            };
-            (x, y, scale)
-        };
-        let xx = if token_idx < patch_tokens {
-            (x * width / patch_side).min(width - 1)
-        } else {
-            x.min(width - 1)
-        };
-        let yy = if token_idx < patch_tokens {
-            (y * height / patch_side).min(height - 1)
-        } else {
-            y.min(height - 1)
-        };
-        let offset = (yy * width + xx) * 3;
-        let r = preprocess.rgb[offset] as f32 / 255.0;
-        let g = preprocess.rgb[offset + 1] as f32 / 255.0;
-        let b = preprocess.rgb[offset + 2] as f32 / 255.0;
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let nx = if patch_side > 1 {
-            x as f32 / (patch_side as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let ny = if patch_side > 1 {
-            y as f32 / (patch_side as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let basis = [r, g, b, luma, nx, ny, extra_scale];
-        for channel in 0..cond_channels {
-            let base = basis[channel % basis.len()];
-            let gain = 1.0 + ((channel / basis.len()) % 17) as f32 / 17.0;
-            let phase = ((token_idx + channel + 1) as f32 * 0.013).sin();
-            out.push((base * gain + 0.1 * phase).clamp(-1.0, 1.0));
-        }
-    }
-    out
-}
-
-fn latent_to_occupancy(latent: &[f32], channels: usize, resolution: usize) -> Vec<f32> {
-    let voxels = resolution * resolution * resolution;
-    let mut occupancy = vec![0.0f32; voxels];
-    for idx in 0..voxels {
-        let mut sum = 0.0f32;
-        for ch in 0..channels {
-            sum += latent[ch * voxels + idx];
-        }
-        occupancy[idx] = sum / channels.max(1) as f32;
-    }
-    // Map to [0, 1] using per-sample dynamic normalization.
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for value in &occupancy {
-        min = min.min(*value);
-        max = max.max(*value);
-    }
-    let denom = (max - min).max(1.0e-6);
-    for value in &mut occupancy {
-        *value = (*value - min) / denom;
-    }
-    occupancy
-}
-
-fn upsample_occupancy(input: &[f32], input_res: usize, output_res: usize) -> Vec<f32> {
-    if input_res == output_res {
-        return input.to_vec();
-    }
-    let mut out = vec![0.0f32; output_res * output_res * output_res];
-    for z in 0..output_res {
-        let src_z = z * input_res / output_res;
-        for y in 0..output_res {
-            let src_y = y * input_res / output_res;
-            for x in 0..output_res {
-                let src_x = x * input_res / output_res;
-                let src_idx = (src_z * input_res + src_y) * input_res + src_x;
-                let dst_idx = (z * output_res + y) * output_res + x;
-                out[dst_idx] = input[src_idx];
-            }
-        }
-    }
-    out
-}
-
-#[cfg(feature = "runtime-model")]
-fn occupancy_to_coords(
-    occupancy: &[f32],
-    resolution: usize,
-    threshold: f32,
-    max_coords: Option<usize>,
-) -> Vec<[u32; 4]> {
-    let mut candidates = Vec::new();
-    for z in 0..resolution {
-        for y in 0..resolution {
-            for x in 0..resolution {
-                let idx = (z * resolution + y) * resolution + x;
-                let value = occupancy[idx];
-                if value > threshold {
-                    candidates.push((idx, value));
-                }
-            }
-        }
-    }
-
-    if let Some(limit) = max_coords
-        && limit > 0
-        && candidates.len() > limit
-    {
-        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        candidates.truncate(limit);
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-    }
-
-    let mut coords = Vec::with_capacity(candidates.len());
-    for (idx, _) in candidates {
-        let x = idx % resolution;
-        let y = (idx / resolution) % resolution;
-        let z = idx / (resolution * resolution);
-        coords.push([0, x as u32, y as u32, z as u32]);
-    }
-    coords
-}
-
-#[cfg(feature = "runtime-model")]
-fn runtime_max_sparse_coords() -> Option<usize> {
-    std::env::var("TRELLIS2_MAX_SPARSE_COORDS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
-#[cfg(feature = "runtime-model")]
-fn map_coord_to_dense_flat(
-    coord: [u32; 4],
-    sparse_resolution: usize,
-    dense_resolution: usize,
-) -> usize {
-    let map_axis = |value: u32| -> usize {
-        if sparse_resolution <= 1 || dense_resolution <= 1 {
-            return 0;
-        }
-        let mapped = (value as usize)
-            .saturating_mul(dense_resolution)
-            .saturating_div(sparse_resolution.max(1));
-        mapped.min(dense_resolution - 1)
-    };
-    let x = map_axis(coord[1]);
-    let y = map_axis(coord[2]);
-    let z = map_axis(coord[3]);
-    (z * dense_resolution + y) * dense_resolution + x
-}
-
-fn sample_pixel_luma(preprocess: &PreprocessOutput, x: u32, y: u32, z: u32) -> f32 {
-    let width = preprocess.width.max(1);
-    let height = preprocess.height.max(1);
-    let xx = (x as usize * width as usize / 32).min(width as usize - 1);
-    let yy = (y as usize * height as usize / 32).min(height as usize - 1);
-    let offset = (yy * width as usize + xx) * 3;
-    let r = preprocess.rgb[offset] as f32 / 255.0;
-    let g = preprocess.rgb[offset + 1] as f32 / 255.0;
-    let b = preprocess.rgb[offset + 2] as f32 / 255.0;
-    let z_mod = 0.9 + 0.2 * ((z as f32 / 31.0) - 0.5);
-    (0.2126 * r + 0.7152 * g + 0.0722 * b) * z_mod
-}
-
-fn sparse_resolution_for_pipeline(pipeline_type: &str) -> usize {
-    match pipeline_type {
-        "512" | "512_base" => 32,
-        "1024" | "1024_single" => 64,
-        "1024_cascade" => 32,
-        "1536_cascade" => 32,
-        _ => 32,
-    }
-}
-
-fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
-    match pipeline_type {
-        "512" | "512_base" => 512,
-        "1024" | "1024_single" | "1024_cascade" => 1024,
-        "1536_cascade" => 1536,
-        _ => 512,
-    }
-}
-
-fn canonical_cube() -> Mesh {
-    let vertices = vec![
-        [-0.5, -0.5, -0.5],
-        [0.5, -0.5, -0.5],
-        [0.5, 0.5, -0.5],
-        [-0.5, 0.5, -0.5],
-        [-0.5, -0.5, 0.5],
-        [0.5, -0.5, 0.5],
-        [0.5, 0.5, 0.5],
-        [-0.5, 0.5, 0.5],
-    ];
-    let faces = vec![
-        [0, 1, 2],
-        [0, 2, 3],
-        [4, 6, 5],
-        [4, 7, 6],
-        [0, 4, 5],
-        [0, 5, 1],
-        [1, 5, 6],
-        [1, 6, 2],
-        [2, 6, 7],
-        [2, 7, 3],
-        [3, 7, 4],
-        [3, 4, 0],
-    ];
-    Mesh {
-        vertices,
-        faces,
-        uvs: Vec::new(),
-        material: None,
-        pbr_textures: None,
-    }
-}
-
-#[derive(Clone, Debug)]
 struct Lcg {
     state: u64,
     cached_normal: Option<f32>,
@@ -2975,7 +2156,10 @@ mod tests {
     #[cfg(feature = "runtime-model")]
     use std::path::PathBuf;
 
-    use super::{bake_pbr_from_voxels, summarize_material};
+    use super::{
+        FlowEulerSampleConfig, ShapeSLatSample, TexSLatSample, bake_pbr_from_voxels,
+        decode_latent_to_outputs, summarize_material,
+    };
     #[cfg(feature = "runtime-model")]
     use crate::hook_diff::{HookSnapshot, compute_stats};
     use crate::mesh::MeshPbrTextures;
@@ -3001,6 +2185,18 @@ mod tests {
                 )
             })
             .unwrap_or(false)
+    }
+
+    fn env_usize(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    }
+
+    fn env_f32(name: &str) -> Option<f32> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
     }
 
     fn dummy_textures() -> MeshPbrTextures {
@@ -3050,11 +2246,165 @@ mod tests {
     }
 
     #[test]
+    fn pbr_quantization_tracks_float_buffers() {
+        let vertices = vec![
+            [-0.5, 0.0, -0.5],
+            [0.5, 0.0, -0.5],
+            [0.5, 0.0, 0.5],
+            [-0.5, 0.0, 0.5],
+        ];
+        let faces = vec![[0, 1, 2], [0, 2, 3]];
+        let vox_coords = vec![[0, 8, 8, 8], [0, 16, 8, 8], [0, 16, 16, 8], [0, 8, 16, 8]];
+        let vox_attrs = vec![
+            [0.2, 0.3, 0.4, 0.2, 0.7, 1.0],
+            [0.5, 0.6, 0.7, 0.4, 0.5, 1.0],
+            [0.8, 0.6, 0.3, 0.6, 0.4, 1.0],
+            [0.4, 0.2, 0.1, 0.1, 0.8, 1.0],
+        ];
+
+        let (_, _, debug) = bake_pbr_from_voxels(&vertices, &faces, &vox_coords, &vox_attrs, 32);
+        assert!(!debug.base_color_float.is_empty());
+        assert_eq!(
+            debug.base_color_float.len(),
+            debug.texture_width * debug.texture_height
+        );
+        assert_eq!(
+            debug.metallic_float.len(),
+            debug.texture_width * debug.texture_height
+        );
+
+        for (idx, rgba) in debug.base_color_float.iter().enumerate() {
+            let off = idx * 4;
+            let expected = [
+                (rgba[0].clamp(0.0, 1.0) * 255.0).round() as i32,
+                (rgba[1].clamp(0.0, 1.0) * 255.0).round() as i32,
+                (rgba[2].clamp(0.0, 1.0) * 255.0).round() as i32,
+                (debug.alpha_float[idx].clamp(0.0, 1.0) * 255.0).round() as i32,
+            ];
+            for (channel, expected_value) in expected.iter().enumerate() {
+                let actual = debug.base_color_rgba_u8[off + channel] as i32;
+                assert!(
+                    (actual - *expected_value).abs() <= 1,
+                    "base channel mismatch idx={idx} ch={channel}: actual={actual}, expected={}",
+                    expected_value
+                );
+            }
+
+            let expected_metallic =
+                (debug.metallic_float[idx].clamp(0.0, 1.0) * 255.0).round() as i32;
+            let expected_roughness =
+                (debug.roughness_float[idx].clamp(0.0, 1.0) * 255.0).round() as i32;
+            let mr = &debug.metallic_roughness_u8[off..off + 4];
+            assert!((mr[1] as i32 - expected_roughness).abs() <= 1);
+            assert!((mr[2] as i32 - expected_metallic).abs() <= 1);
+        }
+    }
+
+    #[test]
     fn material_summary_prefers_texture_data_when_available() {
         let textures = dummy_textures();
         let material = summarize_material(&[[0.0; 6]], Some(&textures)).expect("material");
         assert!(material.base_color[0] > 0.1);
         assert!(material.alpha > 0.8);
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[test]
+    fn decode_missing_runtime_decoders_falls_back_when_not_strict() {
+        let shape = ShapeSLatSample {
+            sampler_config: FlowEulerSampleConfig {
+                steps: 1,
+                rescale_t: 1.0,
+                guidance_strength: 1.0,
+                guidance_rescale: 0.0,
+                guidance_interval: [0.0, 1.0],
+            },
+            sigma_min: 1.0e-3,
+            step_count: 1,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: None,
+            features: vec![[0.0; 32]],
+            noise: vec![[0.0; 32]],
+            step_0_x_t: vec![[0.0; 32]],
+            step_mid_x_t: vec![[0.0; 32]],
+            step_last_x_t: vec![[0.0; 32]],
+            coords: vec![[0, 0, 0, 0]],
+        };
+        let tex = TexSLatSample {
+            sampler_config: FlowEulerSampleConfig {
+                steps: 1,
+                rescale_t: 1.0,
+                guidance_strength: 1.0,
+                guidance_rescale: 0.0,
+                guidance_interval: [0.0, 1.0],
+            },
+            sigma_min: 1.0e-3,
+            step_count: 1,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: None,
+            features: vec![[0.0; 32]],
+            noise: vec![[0.0; 32]],
+            step_0_x_t: vec![[0.0; 32]],
+            step_mid_x_t: vec![[0.0; 32]],
+            step_last_x_t: vec![[0.0; 32]],
+            shape_slat_cond: vec![[0.0; 32]],
+            coords: vec![[0, 0, 0, 0]],
+        };
+        let decoded = decode_latent_to_outputs(&shape, &tex, "512", false, None, None)
+            .expect("non-strict decode should use fallback output when decoders are missing");
+        assert!(!decoded.mesh.vertices.is_empty());
+        assert!(!decoded.mesh.faces.is_empty());
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[test]
+    fn decode_missing_runtime_decoders_errors_when_strict() {
+        let shape = ShapeSLatSample {
+            sampler_config: FlowEulerSampleConfig {
+                steps: 1,
+                rescale_t: 1.0,
+                guidance_strength: 1.0,
+                guidance_rescale: 0.0,
+                guidance_interval: [0.0, 1.0],
+            },
+            sigma_min: 1.0e-3,
+            step_count: 1,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: None,
+            features: vec![[0.0; 32]],
+            noise: vec![[0.0; 32]],
+            step_0_x_t: vec![[0.0; 32]],
+            step_mid_x_t: vec![[0.0; 32]],
+            step_last_x_t: vec![[0.0; 32]],
+            coords: vec![[0, 0, 0, 0]],
+        };
+        let tex = TexSLatSample {
+            sampler_config: FlowEulerSampleConfig {
+                steps: 1,
+                rescale_t: 1.0,
+                guidance_strength: 1.0,
+                guidance_rescale: 0.0,
+                guidance_interval: [0.0, 1.0],
+            },
+            sigma_min: 1.0e-3,
+            step_count: 1,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: None,
+            features: vec![[0.0; 32]],
+            noise: vec![[0.0; 32]],
+            step_0_x_t: vec![[0.0; 32]],
+            step_mid_x_t: vec![[0.0; 32]],
+            step_last_x_t: vec![[0.0; 32]],
+            shape_slat_cond: vec![[0.0; 32]],
+            coords: vec![[0, 0, 0, 0]],
+        };
+        let err = decode_latent_to_outputs(&shape, &tex, "512", true, None, None)
+            .expect_err("strict decode should fail when runtime decoders are missing");
+        assert!(err.contains("shape runtime decoder is required"));
     }
 
     #[cfg(feature = "runtime-model")]
@@ -3236,6 +2586,28 @@ mod tests {
                         reference_max,
                         reference_mean
                     );
+                    if let Some(top_k) = env_usize("TRELLIS2_DECODER_SUBDIV_TOPK")
+                        && top_k > 0
+                    {
+                        for (rank, entry) in top_subdivision_diffs(actual_sub, reference_sub, top_k)
+                            .into_iter()
+                            .enumerate()
+                        {
+                            println!(
+                                "runtime_decoder_hook_alignment_report shape_subdiv.level={} top_diff.rank={} coord=[{},{},{},{}] child={} abs_diff={:.6e} actual={:.6e} reference={:.6e}",
+                                level,
+                                rank + 1,
+                                entry.coord[0],
+                                entry.coord[1],
+                                entry.coord[2],
+                                entry.coord[3],
+                                entry.child,
+                                entry.abs_diff,
+                                entry.actual,
+                                entry.reference
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3311,6 +2683,38 @@ mod tests {
             stats.mean_abs.is_finite() && stats.max_abs.is_finite() && stats.rmse.is_finite(),
             "decoder diff stats must be finite"
         );
+        if let Some(min_overlap) = env_usize("TRELLIS2_DECODER_MIN_OVERLAP") {
+            assert!(
+                overlap >= min_overlap,
+                "decoder overlap {} below TRELLIS2_DECODER_MIN_OVERLAP={}",
+                overlap,
+                min_overlap
+            );
+        }
+        if let Some(max_mean_abs) = env_f32("TRELLIS2_DECODER_MAX_MEAN_ABS") {
+            assert!(
+                stats.mean_abs <= max_mean_abs,
+                "decoder mean_abs {:.6e} exceeded TRELLIS2_DECODER_MAX_MEAN_ABS={:.6e}",
+                stats.mean_abs,
+                max_mean_abs
+            );
+        }
+        if let Some(max_rmse) = env_f32("TRELLIS2_DECODER_MAX_RMSE") {
+            assert!(
+                stats.rmse <= max_rmse,
+                "decoder rmse {:.6e} exceeded TRELLIS2_DECODER_MAX_RMSE={:.6e}",
+                stats.rmse,
+                max_rmse
+            );
+        }
+        if let Some(max_abs) = env_f32("TRELLIS2_DECODER_MAX_ABS") {
+            assert!(
+                stats.max_abs <= max_abs,
+                "decoder max_abs {:.6e} exceeded TRELLIS2_DECODER_MAX_ABS={:.6e}",
+                stats.max_abs,
+                max_abs
+            );
+        }
     }
 
     #[cfg(feature = "runtime-model")]
@@ -3556,6 +2960,56 @@ mod tests {
         let overlap = actual_flat.len() / 8;
         let stats = compute_stats(actual_flat.as_slice(), reference_flat.as_slice());
         (stats, overlap, actual_map.len(), reference_map.len())
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[derive(Clone, Copy, Debug)]
+    struct SubdivisionDiffEntry {
+        coord: [u32; 4],
+        child: usize,
+        abs_diff: f32,
+        actual: f32,
+        reference: f32,
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn top_subdivision_diffs(
+        actual: &SparseSubdivisionLogits,
+        reference: &SparseSubdivisionLogits,
+        k: usize,
+    ) -> Vec<SubdivisionDiffEntry> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut actual_map: HashMap<[u32; 4], [f32; 8]> =
+            HashMap::with_capacity(actual.coords.len().saturating_mul(2));
+        for (idx, coord) in actual.coords.iter().copied().enumerate() {
+            let mut row = [0.0f32; 8];
+            row.copy_from_slice(&actual.logits[idx * 8..(idx + 1) * 8]);
+            actual_map.insert(coord, row);
+        }
+
+        let mut out = Vec::new();
+        for (idx, coord) in reference.coords.iter().copied().enumerate() {
+            let Some(actual_row) = actual_map.get(&coord) else {
+                continue;
+            };
+            let reference_row = &reference.logits[idx * 8..(idx + 1) * 8];
+            for child in 0..8 {
+                let actual_value = actual_row[child];
+                let reference_value = reference_row[child];
+                out.push(SubdivisionDiffEntry {
+                    coord,
+                    child,
+                    abs_diff: (actual_value - reference_value).abs(),
+                    actual: actual_value,
+                    reference: reference_value,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.abs_diff.total_cmp(&a.abs_diff));
+        out.truncate(k);
+        out
     }
 
     #[cfg(feature = "runtime-model")]

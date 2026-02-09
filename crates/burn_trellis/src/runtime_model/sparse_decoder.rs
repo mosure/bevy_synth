@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use burn_flex_gmm::{
+    SparseSubmConvConfig as FlexConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex,
+};
 use half::{bf16, f16};
 use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors};
@@ -1030,7 +1033,82 @@ fn linear_forward(
     Ok(output)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecoderConvImpl {
+    Legacy,
+    FlexGmm,
+}
+
+fn decoder_conv_impl() -> DecoderConvImpl {
+    match std::env::var("TRELLIS2_DECODER_CONV_IMPL")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("legacy") => DecoderConvImpl::Legacy,
+        Some("flex") | Some("flex_gmm") => DecoderConvImpl::FlexGmm,
+        Some("auto") | None => {
+            if env_flag("TRELLIS2_PARITY_STRICT") || env_flag("TRELLIS2_E2E_STRICT") {
+                DecoderConvImpl::Legacy
+            } else {
+                DecoderConvImpl::FlexGmm
+            }
+        }
+        Some(_) => DecoderConvImpl::FlexGmm,
+    }
+}
+
+fn decoder_conv_debug_enabled() -> bool {
+    std::env::var("TRELLIS2_DECODER_CONV_DEBUG")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn sparse_subm_conv_forward(
+    coords: &[[u32; 4]],
+    input: &[f32],
+    layer: &SparseConvLayer,
+    context: &str,
+) -> Result<Vec<f32>, String> {
+    if decoder_conv_impl() == DecoderConvImpl::FlexGmm {
+        let config = FlexConvConfig {
+            in_channels: layer.in_channels,
+            out_channels: layer.out_channels,
+            kernel_d: layer.kernel_d,
+            kernel_h: layer.kernel_h,
+            kernel_w: layer.kernel_w,
+            in_channels_per_group: layer.in_channels_per_group,
+            out_channels_per_group: layer.out_channels_per_group,
+            groups: layer.groups,
+            axis_order: conv_kernel_axis_order(),
+            axis_sign: conv_kernel_axis_signs(),
+        };
+        let weights = SparseSubmConvWeights {
+            weight: layer.weight.as_slice(),
+            bias: layer.bias.as_slice(),
+        };
+        match sparse_subm_conv_forward_flex(&config, weights, coords, input) {
+            Ok(output) => return Ok(output),
+            Err(err) => {
+                if decoder_conv_debug_enabled() {
+                    eprintln!(
+                        "burn_trellis: flex_gmm conv fallback to legacy in '{context}': {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    sparse_subm_conv_forward_legacy(coords, input, layer, context)
+}
+
+fn sparse_subm_conv_forward_legacy(
     coords: &[[u32; 4]],
     input: &[f32],
     layer: &SparseConvLayer,
@@ -1136,17 +1214,25 @@ fn sparse_subm_conv_forward(
 }
 
 fn conv_kernel_axis_order() -> [usize; 3] {
-    match std::env::var("TRELLIS2_CONV_AXIS_ORDER")
+    if let Some(value) = std::env::var("TRELLIS2_CONV_AXIS_ORDER")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
     {
-        Some("xzy") => [0, 2, 1],
-        Some("yxz") => [1, 0, 2],
-        Some("yzx") => [1, 2, 0],
-        Some("zxy") => [2, 0, 1],
-        Some("zyx") => [2, 1, 0],
-        _ => [0, 1, 2],
+        return match value.as_str() {
+            "xzy" => [0, 2, 1],
+            "yxz" => [1, 0, 2],
+            "yzx" => [1, 2, 0],
+            "zxy" => [2, 0, 1],
+            "zyx" => [2, 1, 0],
+            _ => [0, 1, 2],
+        };
+    }
+
+    if env_flag("TRELLIS2_PARITY_STRICT") {
+        // Empirically closest to current TRELLIS2 decoder hook traces.
+        [1, 0, 2]
+    } else {
+        [0, 1, 2]
     }
 }
 
@@ -1154,7 +1240,13 @@ fn conv_kernel_axis_signs() -> [i32; 3] {
     let raw = std::env::var("TRELLIS2_CONV_AXIS_SIGN")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "+++".to_string());
+        .unwrap_or_else(|| {
+            if env_flag("TRELLIS2_PARITY_STRICT") {
+                "---".to_string()
+            } else {
+                "+++".to_string()
+            }
+        });
     let mut signs = [1i32, 1, 1];
     for (idx, ch) in raw.chars().take(3).enumerate() {
         signs[idx] = if ch == '-' { -1 } else { 1 };
@@ -1580,7 +1672,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        LinearLayer, SparseConvLayer, linear_forward, logits_to_mask, sparse_subm_conv_forward,
+        DecoderConvImpl, LinearLayer, SparseConvLayer, decoder_conv_impl, linear_forward,
+        logits_to_mask, sparse_subm_conv_forward, sparse_subm_conv_forward_legacy,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1600,8 +1693,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct Lcg {
+        state: u64,
+    }
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self { state: seed | 1 }
+        }
+
+        fn next_f32(&mut self) -> f32 {
+            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let bits = ((self.state >> 40) as u32) | 1;
+            (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }
+    }
+
     #[test]
     fn sparse_conv_uses_neighbor_voxels() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
+            std::env::set_var("TRELLIS2_CONV_AXIS_SIGN", "+++");
+        }
         let coords = vec![[0, 0, 0, 0], [0, 1, 0, 0]];
         let input = vec![1.0f32, 2.0f32];
         // kernel offsets: [-1, 0, +1]
@@ -1615,6 +1731,56 @@ mod tests {
         assert!((output[0] - 201.0).abs() < 1.0e-5);
         // x=1: left-neighbor(1*10) + center(2*1)
         assert!((output[1] - 12.0).abs() < 1.0e-5);
+        unsafe {
+            std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
+            std::env::remove_var("TRELLIS2_CONV_AXIS_SIGN");
+        }
+    }
+
+    #[test]
+    fn sparse_conv_flex_matches_legacy_path() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
+            std::env::set_var("TRELLIS2_CONV_AXIS_SIGN", "+++");
+            std::env::set_var("TRELLIS2_DECODER_CONV_IMPL", "flex_gmm");
+        }
+        let mut rng = Lcg::new(123);
+        let layer = SparseConvLayer {
+            in_channels: 4,
+            out_channels: 6,
+            kernel_d: 3,
+            kernel_h: 1,
+            kernel_w: 1,
+            in_channels_per_group: 2,
+            out_channels_per_group: 3,
+            groups: 2,
+            weight: (0..(6 * 3 * 2)).map(|_| rng.next_f32()).collect(),
+            bias: (0..6).map(|_| rng.next_f32()).collect(),
+        };
+        let coords: Vec<[u32; 4]> = (0..32u32).map(|x| [0, x, 0, 0]).collect();
+        let input: Vec<f32> = (0..coords.len() * layer.in_channels)
+            .map(|_| rng.next_f32())
+            .collect();
+        let legacy =
+            sparse_subm_conv_forward_legacy(coords.as_slice(), input.as_slice(), &layer, "legacy")
+                .expect("legacy conv");
+        let fused = sparse_subm_conv_forward(coords.as_slice(), input.as_slice(), &layer, "fused")
+            .expect("fused conv");
+        assert_eq!(legacy.len(), fused.len());
+        for (idx, (lhs, rhs)) in legacy.iter().zip(fused.iter()).enumerate() {
+            let diff = (lhs - rhs).abs();
+            assert!(
+                diff <= 1.0e-5,
+                "mismatch idx={idx}: legacy={lhs} fused={rhs} diff={diff}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
+            std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
+            std::env::remove_var("TRELLIS2_CONV_AXIS_SIGN");
+        }
     }
 
     #[test]
@@ -1662,6 +1828,30 @@ mod tests {
         assert_eq!(selected, 8);
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT");
+        }
+    }
+
+    #[test]
+    fn decoder_conv_auto_defaults_to_flex() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
+        }
+        assert_eq!(decoder_conv_impl(), DecoderConvImpl::FlexGmm);
+    }
+
+    #[test]
+    fn decoder_conv_auto_uses_legacy_in_strict_mode() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
+            std::env::set_var("TRELLIS2_E2E_STRICT", "1");
+        }
+        assert_eq!(decoder_conv_impl(), DecoderConvImpl::Legacy);
+        unsafe {
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
         }
     }
 

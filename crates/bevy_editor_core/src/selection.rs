@@ -253,8 +253,8 @@ mod tests {
         let child = world.spawn_empty().id();
         world.entity_mut(parent).add_child(child);
 
-        let mut state: SystemState<(Query<(), With<Selectable>>, Query<&ChildOf>)> =
-            SystemState::new(&mut world);
+        let mut state =
+            SystemState::<(Query<(), With<Selectable>>, Query<&ChildOf>)>::new(&mut world);
         let (selectable_query, parent_query) = state.get(&world);
 
         let resolved = resolve_selectable_target(child, &selectable_query, &parent_query);

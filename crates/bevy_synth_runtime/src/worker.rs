@@ -5,7 +5,9 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(target_arch = "wasm32")]
+use std::time::Duration;
+use std::time::Instant;
 
 use bevy::prelude::*;
 use burn::prelude::*;
@@ -75,6 +77,11 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{ReadableStreamDefaultReader, Response};
+
+#[path = "worker_unavailable.rs"]
+mod worker_unavailable;
+#[cfg(any(target_arch = "wasm32", not(feature = "wgpu"), not(feature = "cuda")))]
+use worker_unavailable::worker_loop_backend_unavailable;
 
 const WGPU_CHUNK_SIZE_CAP: usize = 8_192;
 const CUDA_CHUNK_SIZE_CAP: usize = 32_768;
@@ -213,27 +220,6 @@ async fn worker_loop_wasm(
                 event_tx,
                 "cuda backend is unavailable on wasm32",
             );
-        }
-    }
-}
-
-fn worker_loop_backend_unavailable(
-    command_rx: Receiver<WorkerCommand>,
-    event_tx: Sender<WorkerEvent>,
-    message: &'static str,
-) {
-    for command in command_rx {
-        match command {
-            WorkerCommand::Infer(requests) => {
-                let results = vec![Err(message.to_string()); requests.len()];
-                let _ = event_tx.send(WorkerEvent {
-                    requests,
-                    results,
-                    elapsed: Duration::ZERO,
-                    status_message: None,
-                });
-            }
-            WorkerCommand::Shutdown => break,
         }
     }
 }

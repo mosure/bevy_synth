@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/burn_flex_gmm",
   "crates/burn_synth",
   "crates/burn_trellis",
   "crates/burn_tripo",

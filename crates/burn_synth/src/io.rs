@@ -422,3 +422,83 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "runtime"))]
+mod tests {
+    use super::*;
+    use crate::mesh::{Mesh, MeshMaterial, MeshPbrTextures, MeshTexture};
+
+    fn test_texture(width: u32, height: u32, rgba: [u8; 4]) -> MeshTexture {
+        let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
+        for _ in 0..(width as usize * height as usize) {
+            bytes.extend_from_slice(&rgba);
+        }
+        MeshTexture {
+            width,
+            height,
+            rgba8: bytes,
+        }
+    }
+
+    fn sample_mesh_with_pbr() -> Mesh {
+        Mesh {
+            vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.8, 0.0]],
+            faces: vec![[0, 1, 2]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            material: Some(MeshMaterial {
+                base_color: [1.0, 1.0, 1.0],
+                metallic: 1.0,
+                roughness: 1.0,
+                alpha: 1.0,
+            }),
+            pbr_textures: Some(MeshPbrTextures {
+                base_color: test_texture(2, 2, [200, 180, 160, 255]),
+                metallic_roughness: test_texture(2, 2, [0, 128, 64, 255]),
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn glb_embeds_pbr_textures_when_present() {
+        let mesh = sample_mesh_with_pbr();
+        let bytes = mesh_to_glb_bytes(&mesh).expect("glb export");
+        let glb = gltf::Glb::from_slice(bytes.as_slice()).expect("parse glb");
+        let json: Value = serde_json::from_slice(glb.json.as_ref()).expect("parse glb json");
+
+        let materials = json["materials"].as_array().expect("materials array");
+        assert_eq!(materials.len(), 1);
+        let pbr = &materials[0]["pbrMetallicRoughness"];
+        assert!(pbr.get("baseColorTexture").is_some());
+        assert!(pbr.get("metallicRoughnessTexture").is_some());
+        assert!(
+            json["textures"]
+                .as_array()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            json["images"]
+                .as_array()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn glb_writes_material_when_only_textures_are_present() {
+        let mut mesh = sample_mesh_with_pbr();
+        mesh.material = None;
+
+        let bytes = mesh_to_glb_bytes(&mesh).expect("glb export");
+        let glb = gltf::Glb::from_slice(bytes.as_slice()).expect("parse glb");
+        let json: Value = serde_json::from_slice(glb.json.as_ref()).expect("parse glb json");
+
+        let materials = json["materials"].as_array().expect("materials array");
+        assert_eq!(materials.len(), 1);
+        assert_eq!(materials[0]["alphaMode"], "OPAQUE");
+        let pbr = &materials[0]["pbrMetallicRoughness"];
+        assert!(pbr.get("baseColorTexture").is_some());
+        assert!(pbr.get("metallicRoughnessTexture").is_some());
+    }
+}

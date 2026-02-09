@@ -7,9 +7,12 @@ description = "Bevy app for TripoSG image/text to mesh"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "solari"]
 wgpu = ["bevy_synth_runtime/wgpu"]
 cuda = ["bevy_synth_runtime/cuda"]
+solari = []
+dlss = []
+force_disable_dlss = []
 
 [dependencies]
 bevy = { version = "0.17", features = ["http", "https"] }

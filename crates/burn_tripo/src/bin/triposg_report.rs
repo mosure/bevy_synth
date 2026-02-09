@@ -219,19 +219,59 @@ fn run_with_backend<B: Backend>(
     if let (Some(step0_noise_ref), Some(step0_latents_ref)) = (
         reference.get_input("output.noise_pred.step0"),
         reference.get_input("output.latents.step0"),
-    ) {
-        if let Some(&t0) = timesteps.first() {
+    ) && let Some(&t0) = timesteps.first()
+    {
+        let latent_model_input = if do_guidance {
+            Tensor::cat(vec![input_latents.clone(), input_latents.clone()], 0)
+        } else {
+            input_latents.clone()
+        };
+        let model_batch = latent_model_input.shape().dims::<3>()[0];
+        let timestep = Tensor::<B, 1>::from_floats(vec![t0; model_batch].as_slice(), &device);
+        let mut noise_pred = pipeline.transformer.forward(
+            latent_model_input,
+            timestep,
+            guided_embeds.clone(),
+            None,
+            None,
+        );
+        if do_guidance {
+            let half = model_batch / 2;
+            let channels = pipeline.transformer.config().in_channels;
+            let noise_uncond = noise_pred
+                .clone()
+                .slice([0..half, 0..num_tokens, 0..channels]);
+            let noise_cond = noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
+            noise_pred =
+                noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+        }
+
+        let stats = compute_stats_from_tensor(&noise_pred, &step0_noise_ref)?;
+        print_stats("transformer.noise_pred.step0", &stats);
+
+        let latents_step0 = pipeline
+            .scheduler
+            .step(noise_pred, t0, input_latents.clone());
+        let stats = compute_stats_from_tensor(&latents_step0, &step0_latents_ref)?;
+        print_stats("scheduler.latents.step0", &stats);
+
+        if let (Some(step1_noise_ref), Some(step1_latents_ref)) = (
+            reference.get_input("output.noise_pred.step1"),
+            reference.get_input("output.latents.step1"),
+        ) && timesteps.len() > 1
+        {
+            let t1 = timesteps[1];
             let latent_model_input = if do_guidance {
-                Tensor::cat(vec![input_latents.clone(), input_latents.clone()], 0)
+                Tensor::cat(vec![latents_step0.clone(), latents_step0.clone()], 0)
             } else {
-                input_latents.clone()
+                latents_step0.clone()
             };
             let model_batch = latent_model_input.shape().dims::<3>()[0];
-            let timestep = Tensor::<B, 1>::from_floats(vec![t0; model_batch].as_slice(), &device);
+            let timestep = Tensor::<B, 1>::from_floats(vec![t1; model_batch].as_slice(), &device);
             let mut noise_pred = pipeline.transformer.forward(
                 latent_model_input,
                 timestep,
-                guided_embeds.clone(),
+                guided_embeds,
                 None,
                 None,
             );
@@ -246,80 +286,35 @@ fn run_with_backend<B: Backend>(
                     noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
             }
 
-            let stats = compute_stats_from_tensor(&noise_pred, &step0_noise_ref)?;
-            print_stats("transformer.noise_pred.step0", &stats);
+            let stats = compute_stats_from_tensor(&noise_pred, &step1_noise_ref)?;
+            print_stats("transformer.noise_pred.step1", &stats);
 
-            let latents_step0 = pipeline
-                .scheduler
-                .step(noise_pred, t0, input_latents.clone());
-            let stats = compute_stats_from_tensor(&latents_step0, &step0_latents_ref)?;
-            print_stats("scheduler.latents.step0", &stats);
-
-            if let (Some(step1_noise_ref), Some(step1_latents_ref)) = (
-                reference.get_input("output.noise_pred.step1"),
-                reference.get_input("output.latents.step1"),
-            ) {
-                if timesteps.len() > 1 {
-                    let t1 = timesteps[1];
-                    let latent_model_input = if do_guidance {
-                        Tensor::cat(vec![latents_step0.clone(), latents_step0.clone()], 0)
-                    } else {
-                        latents_step0.clone()
-                    };
-                    let model_batch = latent_model_input.shape().dims::<3>()[0];
-                    let timestep =
-                        Tensor::<B, 1>::from_floats(vec![t1; model_batch].as_slice(), &device);
-                    let mut noise_pred = pipeline.transformer.forward(
-                        latent_model_input,
-                        timestep,
-                        guided_embeds,
-                        None,
-                        None,
-                    );
-                    if do_guidance {
-                        let half = model_batch / 2;
-                        let channels = pipeline.transformer.config().in_channels;
-                        let noise_uncond =
-                            noise_pred
-                                .clone()
-                                .slice([0..half, 0..num_tokens, 0..channels]);
-                        let noise_cond =
-                            noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
-                        noise_pred = noise_uncond.clone()
-                            + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
-                    }
-
-                    let stats = compute_stats_from_tensor(&noise_pred, &step1_noise_ref)?;
-                    print_stats("transformer.noise_pred.step1", &stats);
-
-                    let latents_step1 = pipeline.scheduler.step(noise_pred, t1, latents_step0);
-                    let stats = compute_stats_from_tensor(&latents_step1, &step1_latents_ref)?;
-                    print_stats("scheduler.latents.step1", &stats);
-                }
-            }
+            let latents_step1 = pipeline.scheduler.step(noise_pred, t1, latents_step0);
+            let stats = compute_stats_from_tensor(&latents_step1, &step1_latents_ref)?;
+            print_stats("scheduler.latents.step1", &stats);
         }
     }
 
-    if std::env::var("TRIPOSG_REPORT_REF_EMBEDS").is_ok() {
-        if let Some(reference_embeds) = reference_embeds.as_ref() {
-            let embeds_tensor = tensor_from_data_3d::<B>(reference_embeds, &device)?;
-            let output_ref = pipeline.sample_from_embeds(
-                embeds_tensor,
-                1,
-                num_steps,
-                num_tokens,
-                guidance_scale,
-                None,
-                Some(input_latents.clone()),
-            );
+    if std::env::var("TRIPOSG_REPORT_REF_EMBEDS").is_ok()
+        && let Some(reference_embeds) = reference_embeds.as_ref()
+    {
+        let embeds_tensor = tensor_from_data_3d::<B>(reference_embeds, &device)?;
+        let output_ref = pipeline.sample_from_embeds(
+            embeds_tensor,
+            1,
+            num_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            Some(input_latents.clone()),
+        );
 
-            let stats = compute_stats_from_tensor(&output_ref.latents, &output_latents)?;
-            print_stats("pipeline.latents.from_reference_embeds", &stats);
+        let stats = compute_stats_from_tensor(&output_ref.latents, &output_latents)?;
+        print_stats("pipeline.latents.from_reference_embeds", &stats);
 
-            let grid = pipeline.decode_grid(output_ref.latents, bounds, resolution, chunk_size)?;
-            let stats = compute_stats(&grid.values, &output_grid.data);
-            print_stats("decoder.grid_logits.from_reference_embeds", &stats);
-        }
+        let grid = pipeline.decode_grid(output_ref.latents, bounds, resolution, chunk_size)?;
+        let stats = compute_stats(&grid.values, &output_grid.data);
+        print_stats("decoder.grid_logits.from_reference_embeds", &stats);
     }
 
     if std::env::var("TRIPOSG_REPORT_CPU_DINO").is_ok()

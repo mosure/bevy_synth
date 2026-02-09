@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use burn::backend::NdArray;
 use burn::prelude::Backend;
@@ -16,13 +16,15 @@ use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
 use burn_tripo::paths::resolve_triposg_weights_root;
-use burn_tripo::pipeline::geometry::FlashExtractConfig;
-use burn_tripo::pipeline::triposg::TripoSGPipeline;
+use burn_tripo::pipeline::geometry::{FlashExtractConfig, flash_extract_geometry};
+use burn_tripo::pipeline::mesh::sdf_to_mesh_diff_dmc;
+use burn_tripo::pipeline::triposg::{TripoSGPipeline, TripoSGSamplerProgress};
 use image::{ImageFormat, RgbaImage};
 
 use crate::io::ImageSource;
 use crate::mesh::Mesh;
 use crate::pipeline::{ForegroundModel, ModelSelection, SynthesisModel, sanitize_synthesis_models};
+use crate::progress::{RuntimeProgressEvent, RuntimeProgressObserver};
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
 const DEFAULT_NUM_STEPS: usize = 50;
@@ -38,7 +40,7 @@ const DEFAULT_SEED: u64 = 42;
 type WgpuBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
 #[cfg(feature = "cuda")]
-type CudaBackend = burn_cuda::Cuda<f32, i32, u32>;
+type CudaBackend = burn_cuda::Cuda<f32, i32>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InferenceBackend {
@@ -82,6 +84,7 @@ pub struct RuntimeConfig {
     pub flash_extract: FlashExtractConfig,
     pub mesh_prepare: PrepareImageConfig,
     pub foreground_prepare: PrepareImageConfig,
+    pub progress: RuntimeProgressObserver,
 }
 
 impl Default for RuntimeConfig {
@@ -106,6 +109,7 @@ impl Default for RuntimeConfig {
                 max_dimension: usize::MAX,
                 ..PrepareImageConfig::default()
             },
+            progress: RuntimeProgressObserver::default(),
         }
     }
 }
@@ -183,6 +187,114 @@ impl std::error::Error for RuntimeError {}
 
 type RuntimeResult<T> = Result<T, RuntimeError>;
 
+struct ProgressRun {
+    observer: RuntimeProgressObserver,
+    run: &'static str,
+    started: Instant,
+}
+
+impl ProgressRun {
+    fn new(observer: &RuntimeProgressObserver, run: &'static str, detail: Option<String>) -> Self {
+        let this = Self {
+            observer: observer.clone(),
+            run,
+            started: Instant::now(),
+        };
+        if this.observer.emits_stages() {
+            this.observer
+                .emit(RuntimeProgressEvent::RunStarted { run, detail });
+        }
+        this
+    }
+
+    fn stage_started(
+        &self,
+        stage: &'static str,
+        total_steps: Option<usize>,
+        detail: Option<String>,
+    ) {
+        if self.observer.emits_stages() {
+            self.observer.emit(RuntimeProgressEvent::StageStarted {
+                run: self.run,
+                stage,
+                total_steps,
+                detail,
+            });
+        }
+    }
+
+    fn stage_completed(
+        &self,
+        stage: &'static str,
+        total_steps: Option<usize>,
+        elapsed_ms: f64,
+        detail: Option<String>,
+    ) {
+        if self.observer.emits_stages() {
+            self.observer.emit(RuntimeProgressEvent::StageCompleted {
+                run: self.run,
+                stage,
+                total_steps,
+                elapsed_ms,
+                detail,
+            });
+        }
+    }
+
+    fn step(
+        &self,
+        stage: &'static str,
+        progress: TripoSGSamplerProgress,
+        elapsed_ms: f64,
+        detail: Option<String>,
+    ) {
+        if !self
+            .observer
+            .should_emit_step(progress.step_index, progress.total_steps)
+        {
+            return;
+        }
+        let avg_step_ms = if progress.step_index > 0 {
+            elapsed_ms / progress.step_index as f64
+        } else {
+            progress.step_ms
+        };
+        let remaining = progress.total_steps.saturating_sub(progress.step_index) as f64;
+        let eta_ms = if remaining > 0.0 {
+            Some(avg_step_ms * remaining)
+        } else {
+            Some(0.0)
+        };
+        self.observer.emit(RuntimeProgressEvent::Step {
+            run: self.run,
+            stage,
+            step: progress.step_index,
+            total_steps: progress.total_steps,
+            step_ms: progress.step_ms,
+            elapsed_ms,
+            eta_ms,
+            detail,
+        });
+    }
+
+    fn warn(&self, message: impl Into<String>) {
+        self.observer.emit(RuntimeProgressEvent::Warning {
+            run: self.run,
+            message: message.into(),
+        });
+    }
+
+    fn complete(&self, detail: Option<String>) {
+        if self.observer.emits_stages() {
+            self.observer.emit(RuntimeProgressEvent::RunCompleted {
+                run: self.run,
+                elapsed_ms: self.started.elapsed().as_secs_f64() * 1000.0,
+                detail,
+            });
+        }
+    }
+}
+
 pub struct SynthRuntime {
     config: RuntimeConfig,
     foreground: ForegroundRuntime,
@@ -209,12 +321,45 @@ impl SynthRuntime {
         let selected_model = request
             .model
             .unwrap_or(self.config.model_selection.foreground_model);
+        let progress = ProgressRun::new(
+            &self.config.progress,
+            "foreground",
+            Some(format!("model={}", foreground_model_label(selected_model))),
+        );
+        progress.stage_started("foreground.materialize_input", None, None);
+        let materialize_start = Instant::now();
         let materialized = MaterializedImageInput::from_source(&request.image)?;
+        progress.stage_completed(
+            "foreground.materialize_input",
+            None,
+            materialize_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!("path={}", materialized.path().display())),
+        );
+        progress.stage_started("foreground.load_image", None, None);
+        let load_start = Instant::now();
         let source = image::open(materialized.path())
             .map_err(|err| RuntimeError::new(format!("failed to open input image: {err}")))?
             .to_rgba8();
+        progress.stage_completed(
+            "foreground.load_image",
+            None,
+            load_start.elapsed().as_secs_f64() * 1000.0,
+            None,
+        );
         let (width, height) = source.dimensions();
+        progress.stage_started(
+            "foreground.alpha_mask",
+            None,
+            Some(format!("model={}", foreground_model_label(selected_model))),
+        );
+        let alpha_start = Instant::now();
         let alpha_mask = self.compute_alpha_mask(materialized.path(), selected_model)?;
+        progress.stage_completed(
+            "foreground.alpha_mask",
+            None,
+            alpha_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!("pixels={}", alpha_mask.len())),
+        );
         let expected = width as usize * height as usize;
         if alpha_mask.len() != expected {
             return Err(RuntimeError::new(format!(
@@ -229,12 +374,19 @@ impl SynthRuntime {
             pixel.0[3] = alpha;
         }
 
-        Ok(ForegroundOutput {
+        let output = ForegroundOutput {
             image: output,
             width,
             height,
             model: selected_model,
-        })
+        };
+        progress.complete(Some(format!(
+            "width={} height={} model={}",
+            output.width,
+            output.height,
+            foreground_model_label(output.model)
+        )));
+        Ok(output)
     }
 
     pub fn synthesize_mesh(&mut self, request: MeshRequest) -> RuntimeResult<MeshOutput> {
@@ -250,9 +402,32 @@ impl SynthRuntime {
             .first()
             .copied()
             .unwrap_or(SynthesisModel::Triposg);
+        let progress = ProgressRun::new(
+            &self.config.progress,
+            "mesh",
+            Some(format!(
+                "foreground_model={} backend={} synthesis_models={}",
+                foreground_model_label(selected_foreground),
+                selected_backend.as_str(),
+                synthesis_models_label(&selected_synthesis)
+            )),
+        );
 
         let (mesh, synthesis_backend) = if request.dry_run {
-            (canonical_cube_mesh(), preferred_synthesis)
+            progress.stage_started("mesh.dry_run", None, None);
+            let dry_start = Instant::now();
+            let mesh = canonical_cube_mesh();
+            progress.stage_completed(
+                "mesh.dry_run",
+                None,
+                dry_start.elapsed().as_secs_f64() * 1000.0,
+                Some(format!(
+                    "vertices={} faces={}",
+                    mesh.vertices.len(),
+                    mesh.faces.len()
+                )),
+            );
+            (mesh, preferred_synthesis)
         } else {
             let materialized = MaterializedImageInput::from_source(&request.image)?;
             self.infer_mesh(
@@ -260,16 +435,24 @@ impl SynthRuntime {
                 selected_foreground,
                 selected_backend,
                 &selected_synthesis,
+                &progress,
             )?
         };
 
-        Ok(MeshOutput {
+        let output = MeshOutput {
             mesh,
             foreground_model: selected_foreground,
             synthesis_models: selected_synthesis,
             synthesis_backend,
             backend: selected_backend,
-        })
+        };
+        progress.complete(Some(format!(
+            "vertices={} faces={} synthesis_backend={}",
+            output.mesh.vertices.len(),
+            output.mesh.faces.len(),
+            synthesis_model_label(output.synthesis_backend)
+        )));
+        Ok(output)
     }
 
     fn infer_mesh(
@@ -278,6 +461,7 @@ impl SynthRuntime {
         foreground_model: ForegroundModel,
         backend: InferenceBackend,
         synthesis_models: &[SynthesisModel],
+        progress: &ProgressRun,
     ) -> RuntimeResult<(Mesh, SynthesisModel)> {
         let preferred = synthesis_models
             .first()
@@ -286,13 +470,17 @@ impl SynthRuntime {
 
         match preferred {
             SynthesisModel::Triposg => {
-                match self.infer_mesh_triposg(input_image_path, foreground_model, backend) {
+                match self.infer_mesh_triposg(input_image_path, foreground_model, backend, progress)
+                {
                     Ok(mesh) => Ok((mesh, SynthesisModel::Triposg)),
                     Err(err) if synthesis_models.contains(&SynthesisModel::Trellis) => {
-                        eprintln!(
-                            "burn_synth runtime: TripoSG failed ({err}); falling back to Trellis2."
-                        );
-                        match self.infer_mesh_trellis(input_image_path, foreground_model, backend) {
+                        progress.warn(format!("TripoSG failed ({err}); falling back to Trellis2"));
+                        match self.infer_mesh_trellis(
+                            input_image_path,
+                            foreground_model,
+                            backend,
+                            progress,
+                        ) {
                             Ok(mesh) => Ok((mesh, SynthesisModel::Trellis)),
                             Err(trellis_err) => Err(RuntimeError::new(format!(
                                 "TripoSG failed ({err}); Trellis2 fallback failed ({trellis_err})"
@@ -303,13 +491,17 @@ impl SynthRuntime {
                 }
             }
             SynthesisModel::Trellis => {
-                match self.infer_mesh_trellis(input_image_path, foreground_model, backend) {
+                match self.infer_mesh_trellis(input_image_path, foreground_model, backend, progress)
+                {
                     Ok(mesh) => Ok((mesh, SynthesisModel::Trellis)),
                     Err(err) if synthesis_models.contains(&SynthesisModel::Triposg) => {
-                        eprintln!(
-                            "burn_synth runtime: Trellis2 failed ({err}); falling back to TripoSG."
-                        );
-                        match self.infer_mesh_triposg(input_image_path, foreground_model, backend) {
+                        progress.warn(format!("Trellis2 failed ({err}); falling back to TripoSG"));
+                        match self.infer_mesh_triposg(
+                            input_image_path,
+                            foreground_model,
+                            backend,
+                            progress,
+                        ) {
                             Ok(mesh) => Ok((mesh, SynthesisModel::Triposg)),
                             Err(triposg_err) => Err(RuntimeError::new(format!(
                                 "Trellis2 failed ({err}); TripoSG fallback failed ({triposg_err})"
@@ -327,18 +519,54 @@ impl SynthRuntime {
         input_image_path: &Path,
         foreground_model: ForegroundModel,
         backend: InferenceBackend,
+        progress: &ProgressRun,
     ) -> RuntimeResult<Mesh> {
+        progress.stage_started(
+            "mesh.preprocess_foreground",
+            None,
+            Some(format!(
+                "model={}",
+                foreground_model_label(foreground_model)
+            )),
+        );
+        let preprocess_start = Instant::now();
         let prepared = self.prepare_image_for_mesh(input_image_path, foreground_model)?;
+        progress.stage_completed(
+            "mesh.preprocess_foreground",
+            None,
+            preprocess_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!("size={}x{}", prepared.width, prepared.height)),
+        );
         match backend {
             InferenceBackend::Cpu => {
+                progress.stage_started("triposg.load_backend", None, Some("backend=cpu".into()));
+                let load_start = Instant::now();
                 let state = self.synthesis.ensure_cpu(&self.config)?;
-                run_backend_inference(state, &prepared, &self.config)
+                progress.stage_completed(
+                    "triposg.load_backend",
+                    None,
+                    load_start.elapsed().as_secs_f64() * 1000.0,
+                    Some("backend=cpu".into()),
+                );
+                run_backend_inference(state, &prepared, &self.config, progress)
             }
             InferenceBackend::Wgpu => {
                 #[cfg(feature = "wgpu")]
                 {
+                    progress.stage_started(
+                        "triposg.load_backend",
+                        None,
+                        Some("backend=wgpu".into()),
+                    );
+                    let load_start = Instant::now();
                     let state = self.synthesis.ensure_wgpu(&self.config)?;
-                    run_backend_inference(state, &prepared, &self.config)
+                    progress.stage_completed(
+                        "triposg.load_backend",
+                        None,
+                        load_start.elapsed().as_secs_f64() * 1000.0,
+                        Some("backend=wgpu".into()),
+                    );
+                    run_backend_inference(state, &prepared, &self.config, progress)
                 }
                 #[cfg(not(feature = "wgpu"))]
                 {
@@ -350,8 +578,20 @@ impl SynthRuntime {
             InferenceBackend::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
+                    progress.stage_started(
+                        "triposg.load_backend",
+                        None,
+                        Some("backend=cuda".into()),
+                    );
+                    let load_start = Instant::now();
                     let state = self.synthesis.ensure_cuda(&self.config)?;
-                    run_backend_inference(state, &prepared, &self.config)
+                    progress.stage_completed(
+                        "triposg.load_backend",
+                        None,
+                        load_start.elapsed().as_secs_f64() * 1000.0,
+                        Some("backend=cuda".into()),
+                    );
+                    run_backend_inference(state, &prepared, &self.config, progress)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -368,7 +608,17 @@ impl SynthRuntime {
         input_image_path: &Path,
         foreground_model: ForegroundModel,
         backend: InferenceBackend,
+        progress: &ProgressRun,
     ) -> RuntimeResult<Mesh> {
+        progress.stage_started(
+            "trellis.preprocess_foreground",
+            None,
+            Some(format!(
+                "model={}",
+                foreground_model_label(foreground_model)
+            )),
+        );
+        let preprocess_start = Instant::now();
         let prepared = self.extract_foreground(ForegroundRequest {
             image: ImageSource::from_path(input_image_path.to_path_buf()),
             model: Some(foreground_model),
@@ -380,8 +630,30 @@ impl SynthRuntime {
                 temp_input.display()
             ))
         })?;
+        progress.stage_completed(
+            "trellis.preprocess_foreground",
+            None,
+            preprocess_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!(
+                "size={}x{} temp={}",
+                prepared.width,
+                prepared.height,
+                temp_input.display()
+            )),
+        );
 
+        progress.stage_started("trellis.load_backend", None, None);
+        let load_start = Instant::now();
         let pipeline = self.synthesis.ensure_trellis(&self.config)?;
+        progress.stage_completed(
+            "trellis.load_backend",
+            None,
+            load_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!(
+                "weights_root={}",
+                pipeline.config().weights_root.display()
+            )),
+        );
         let trellis_device = match backend {
             InferenceBackend::Cpu => TrellisDevice::Cpu,
             InferenceBackend::Wgpu => TrellisDevice::Wgpu,
@@ -394,12 +666,63 @@ impl SynthRuntime {
             hook_output: None,
             noise_overrides_hook: None,
         };
-
-        let mesh = pipeline
-            .infer_mesh(&temp_input, &options)
+        progress.stage_started(
+            "trellis.infer",
+            None,
+            Some(format!(
+                "quality={:?} device={}",
+                self.config.trellis_quality,
+                trellis_device.as_str()
+            )),
+        );
+        let infer_start = Instant::now();
+        let profiled = pipeline
+            .infer_mesh_profile(&temp_input, &options)
             .map_err(|err| RuntimeError::new(format!("Trellis2 inference failed: {err}")))?;
+        progress.stage_completed(
+            "trellis.infer",
+            None,
+            infer_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!(
+                "total_ms={:.1} host_readbacks={} host_readback_elements={}",
+                profiled.timings.total_ms,
+                profiled.timings.host_readback_count,
+                profiled.timings.host_readback_elements
+            )),
+        );
+        progress.stage_completed(
+            "trellis.sparse",
+            Some(profiled.step_counts.sparse),
+            profiled.timings.sparse_ms,
+            Some(avg_step_detail(
+                profiled.timings.sparse_ms,
+                profiled.step_counts.sparse,
+                profiled.sparse_source.as_str(),
+            )),
+        );
+        progress.stage_completed(
+            "trellis.shape_slat",
+            Some(profiled.step_counts.shape_slat),
+            profiled.timings.shape_slat_ms,
+            Some(avg_step_detail(
+                profiled.timings.shape_slat_ms,
+                profiled.step_counts.shape_slat,
+                "runtime",
+            )),
+        );
+        progress.stage_completed(
+            "trellis.tex_slat",
+            Some(profiled.step_counts.tex_slat),
+            profiled.timings.tex_slat_ms,
+            Some(avg_step_detail(
+                profiled.timings.tex_slat_ms,
+                profiled.step_counts.tex_slat,
+                "runtime",
+            )),
+        );
+        progress.stage_completed("trellis.decode", None, profiled.timings.decode_ms, None);
         let _ = std::fs::remove_file(temp_input);
-        Ok(mesh.into())
+        Ok(profiled.mesh.into())
     }
 
     fn compute_alpha_mask(
@@ -614,29 +937,140 @@ fn load_backend_state<B: Backend>(
     Ok(BackendSynthesisState { device, pipeline })
 }
 
+fn foreground_model_label(model: ForegroundModel) -> &'static str {
+    match model {
+        ForegroundModel::Rmbg14 => "rmbg14",
+        ForegroundModel::Rmbg2 => "rmbg2",
+    }
+}
+
+fn synthesis_model_label(model: SynthesisModel) -> &'static str {
+    match model {
+        SynthesisModel::Triposg => "triposg",
+        SynthesisModel::Trellis => "trellis",
+    }
+}
+
+fn synthesis_models_label(models: &[SynthesisModel]) -> String {
+    models
+        .iter()
+        .map(|model| synthesis_model_label(*model))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn avg_step_detail(elapsed_ms: f64, total_steps: usize, source: &str) -> String {
+    if total_steps == 0 {
+        return format!("source={source} avg_step_ms={elapsed_ms:.1}");
+    }
+    let avg_step_ms = elapsed_ms / total_steps as f64;
+    format!("source={source} avg_step_ms={avg_step_ms:.1}")
+}
+
 fn run_backend_inference<B: Backend>(
     state: &mut BackendSynthesisState<B>,
     prepared: &PreparedImageData,
     config: &RuntimeConfig,
+    progress: &ProgressRun,
 ) -> RuntimeResult<Mesh> {
     if let Some(seed) = config.seed {
         B::seed(&state.device, seed);
     }
+    progress.stage_started(
+        "triposg.prepare_tensor",
+        None,
+        Some(format!("image={}x{}", prepared.width, prepared.height)),
+    );
+    let prepare_start = Instant::now();
     let image = prepared.to_tensor::<B>(&state.device);
-    let output = state
-        .pipeline
-        .sample_mesh_flash(
-            image,
-            config.num_steps,
-            config.num_tokens,
-            config.guidance_scale,
-            &config.flash_extract,
-            None,
-        )
-        .map_err(|err| RuntimeError::new(format!("TripoSG inference failed: {err}")))?;
-    let mesh = output
-        .mesh
-        .ok_or_else(|| RuntimeError::new("inference returned an empty mesh"))?;
+    progress.stage_completed(
+        "triposg.prepare_tensor",
+        None,
+        prepare_start.elapsed().as_secs_f64() * 1000.0,
+        None,
+    );
+
+    progress.stage_started(
+        "triposg.sample",
+        Some(config.num_steps),
+        Some(format!(
+            "num_tokens={} guidance_scale={:.3}",
+            config.num_tokens, config.guidance_scale
+        )),
+    );
+    let sample_start = Instant::now();
+    let batch_size = image.shape().dims::<4>()[0];
+    let image_embeds = state.pipeline.encode_image(image);
+    let output = state.pipeline.sample_from_embeds_with_progress(
+        image_embeds,
+        batch_size,
+        config.num_steps,
+        config.num_tokens,
+        config.guidance_scale,
+        None,
+        None,
+        |step| {
+            let elapsed_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+            progress.step(
+                "triposg.sample",
+                step,
+                elapsed_ms,
+                Some(format!("timestep={:.6}", step.timestep)),
+            );
+        },
+    );
+    let sample_elapsed_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_step_ms = if config.num_steps > 0 {
+        sample_elapsed_ms / config.num_steps as f64
+    } else {
+        sample_elapsed_ms
+    };
+    progress.stage_completed(
+        "triposg.sample",
+        Some(config.num_steps),
+        sample_elapsed_ms,
+        Some(format!("avg_step_ms={avg_step_ms:.1}")),
+    );
+
+    progress.stage_started(
+        "triposg.flash_extract",
+        None,
+        Some(format!(
+            "octree_depth={} min_resolution={} mini_grid_num={} num_chunks={}",
+            config.flash_extract.octree_depth,
+            config.flash_extract.min_resolution,
+            config.flash_extract.mini_grid_num,
+            config.flash_extract.num_chunks
+        )),
+    );
+    let extract_start = Instant::now();
+    let grid = flash_extract_geometry(
+        output.latents.clone(),
+        &state.pipeline.vae,
+        &config.flash_extract,
+    )
+    .map_err(|err| RuntimeError::new(format!("TripoSG geometry extraction failed: {err}")))?;
+    progress.stage_completed(
+        "triposg.flash_extract",
+        None,
+        extract_start.elapsed().as_secs_f64() * 1000.0,
+        None,
+    );
+
+    progress.stage_started("triposg.mesh_extract", None, None);
+    let mesh_start = Instant::now();
+    let mesh = sdf_to_mesh_diff_dmc(&grid)
+        .ok_or_else(|| RuntimeError::new("TripoSG mesh extraction returned an empty mesh"))?;
+    progress.stage_completed(
+        "triposg.mesh_extract",
+        None,
+        mesh_start.elapsed().as_secs_f64() * 1000.0,
+        Some(format!(
+            "vertices={} faces={}",
+            mesh.vertices.len(),
+            mesh.faces.len()
+        )),
+    );
     Ok(mesh.into())
 }
 
