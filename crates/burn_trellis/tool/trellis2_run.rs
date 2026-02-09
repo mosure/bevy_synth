@@ -99,6 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "tex_slat": profiled.timings.tex_slat_ms,
                 "decode": profiled.timings.decode_ms,
                 "hook_capture": profiled.timings.hook_capture_ms,
+                "host_readback_count": profiled.timings.host_readback_count,
+                "host_readback_elements": profiled.timings.host_readback_elements,
                 "total": profiled.timings.total_ms
             },
             "hook_output": args.hook_output,

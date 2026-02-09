@@ -48,13 +48,27 @@ impl FlowEulerGuidanceIntervalSampler {
     where
         F: FnMut(&[f32], f32, bool) -> Vec<f32>,
     {
-        self.sample_with_trace(noise, config, predict_v).samples
+        self.sample_with_trace_mode(noise, config, false, predict_v)
+            .samples
     }
 
     pub fn sample_with_trace<F>(
         &self,
         noise: &[f32],
         config: FlowEulerSampleConfig,
+        mut predict_v: F,
+    ) -> FlowEulerSampleTrace
+    where
+        F: FnMut(&[f32], f32, bool) -> Vec<f32>,
+    {
+        self.sample_with_trace_mode(noise, config, true, &mut predict_v)
+    }
+
+    pub fn sample_with_trace_mode<F>(
+        &self,
+        noise: &[f32],
+        config: FlowEulerSampleConfig,
+        capture_snapshots: bool,
         mut predict_v: F,
     ) -> FlowEulerSampleTrace
     where
@@ -72,13 +86,13 @@ impl FlowEulerGuidanceIntervalSampler {
             for (idx, value) in sample.iter_mut().enumerate() {
                 *value -= dt * pred_v[idx];
             }
-            if step_idx == 0 {
+            if capture_snapshots && step_idx == 0 {
                 step_0_x_t = Some(sample.clone());
             }
-            if step_idx == mid_step {
+            if capture_snapshots && step_idx == mid_step {
                 step_mid_x_t = Some(sample.clone());
             }
-            if step_idx + 1 == config.steps {
+            if capture_snapshots && step_idx + 1 == config.steps {
                 step_last_x_t = Some(sample.clone());
             }
         }

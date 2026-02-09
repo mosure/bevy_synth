@@ -55,6 +55,15 @@ impl FdgDecoderRuntime {
         let decoded = self.inner.decode(coords, rows, None)?;
         decode_fdg_outputs(&decoded, self.voxel_margin())
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stage0_subdivision_logits(
+        &self,
+        coords: &[[u32; 4]],
+        rows: &[[f32; 32]],
+    ) -> Result<SparseSubdivisionLogits, String> {
+        self.inner.stage0_subdivision_logits(coords, rows)
+    }
 }
 
 fn decode_fdg_outputs(

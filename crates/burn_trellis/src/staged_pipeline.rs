@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "runtime-model"), allow(dead_code))]
+
 use std::collections::HashMap;
 #[cfg(feature = "runtime-model")]
 use std::collections::HashSet;
@@ -14,12 +16,14 @@ use crate::runtime_model::sparse_decoder::SparseSubdivisionLogits;
 use crate::runtime_model::sparse_structure_flow::SparseStructureFlowRuntime;
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_unet_vae_decoder::SparseUnetVaeDecoderRuntime;
-use crate::sampler::FlowEulerGuidanceIntervalSampler;
+use crate::sampler::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig};
 use crate::trellis_config::{TrellisNormalization, TrellisPipelineArgs, TrellisSamplerConfig};
 
 #[derive(Debug, Clone)]
 pub struct SparseStructureSample {
     pub source: SparseStructureStageSource,
+    pub sampler_config: FlowEulerSampleConfig,
+    pub sigma_min: f32,
     pub step_count: usize,
     pub resolution: usize,
     pub flow_resolution: usize,
@@ -51,7 +55,12 @@ impl SparseStructureStageSource {
 
 #[derive(Debug, Clone)]
 pub struct ShapeSLatSample {
+    pub sampler_config: FlowEulerSampleConfig,
+    pub sigma_min: f32,
     pub step_count: usize,
+    pub dense_resolution: usize,
+    pub dense_channels: usize,
+    pub dense_noise: Option<Vec<f32>>,
     pub features: Vec<[f32; 32]>,
     pub noise: Vec<[f32; 32]>,
     pub step_0_x_t: Vec<[f32; 32]>,
@@ -62,7 +71,12 @@ pub struct ShapeSLatSample {
 
 #[derive(Debug, Clone)]
 pub struct TexSLatSample {
+    pub sampler_config: FlowEulerSampleConfig,
+    pub sigma_min: f32,
     pub step_count: usize,
+    pub dense_resolution: usize,
+    pub dense_channels: usize,
+    pub dense_noise: Option<Vec<f32>>,
     pub features: Vec<[f32; 32]>,
     pub noise: Vec<[f32; 32]>,
     pub step_0_x_t: Vec<[f32; 32]>,
@@ -141,10 +155,21 @@ pub struct TrellisNoiseOverrides {
     pub sparse_noise: Option<Vec<f32>>,
     pub shape_noise: Option<SparseRowNoiseOverride>,
     pub tex_noise: Option<SparseRowNoiseOverride>,
+    pub shape_noise_dense: Option<Vec<f32>>,
+    pub tex_noise_dense: Option<Vec<f32>>,
+    pub sparse_sampler: Option<SamplerConfigOverride>,
+    pub shape_sampler: Option<SamplerConfigOverride>,
+    pub tex_sampler: Option<SamplerConfigOverride>,
     pub cond_512: Option<Vec<f32>>,
     pub neg_cond_512: Option<Vec<f32>>,
     pub cond_1024: Option<Vec<f32>>,
     pub neg_cond_1024: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SamplerConfigOverride {
+    pub sigma_min: f32,
+    pub config: FlowEulerSampleConfig,
 }
 
 impl TrellisNoiseOverrides {
@@ -152,6 +177,11 @@ impl TrellisNoiseOverrides {
         self.sparse_noise.is_none()
             && self.shape_noise.is_none()
             && self.tex_noise.is_none()
+            && self.shape_noise_dense.is_none()
+            && self.tex_noise_dense.is_none()
+            && self.sparse_sampler.is_none()
+            && self.shape_sampler.is_none()
+            && self.tex_sampler.is_none()
             && self.cond_512.is_none()
             && self.neg_cond_512.is_none()
             && self.cond_1024.is_none()
@@ -364,7 +394,7 @@ impl TrellisStageRuntime {
                         Ok(runtime) => Some(runtime),
                         Err(err) => {
                             eprintln!(
-                                "burn_trellis: shape decoder runtime unavailable ({err}); using synthetic decode fallback."
+                                "burn_trellis: shape decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
                             );
                             None
                         }
@@ -388,7 +418,7 @@ impl TrellisStageRuntime {
                         Ok(runtime) => Some(runtime),
                         Err(err) => {
                             eprintln!(
-                                "burn_trellis: tex decoder runtime unavailable ({err}); using synthetic decode fallback."
+                                "burn_trellis: tex decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
                             );
                             None
                         }
@@ -431,7 +461,7 @@ impl TrellisStageRuntime {
         seed: u64,
         noise_overrides: Option<&TrellisNoiseOverrides>,
     ) -> TrellisStageOutput {
-        self.run_profiled_with_overrides(preprocess, seed, noise_overrides)
+        self.run_profiled_with_overrides(preprocess, seed, noise_overrides, false)
             .0
     }
 
@@ -440,7 +470,7 @@ impl TrellisStageRuntime {
         preprocess: &PreprocessOutput,
         seed: u64,
     ) -> (TrellisStageOutput, TrellisStageTimings) {
-        self.run_profiled_with_overrides(preprocess, seed, None)
+        self.run_profiled_with_overrides(preprocess, seed, None, false)
     }
 
     pub fn run_profiled_with_overrides(
@@ -448,6 +478,7 @@ impl TrellisStageRuntime {
         preprocess: &PreprocessOutput,
         seed: u64,
         noise_overrides: Option<&TrellisNoiseOverrides>,
+        capture_sampler_trace: bool,
     ) -> (TrellisStageOutput, TrellisStageTimings) {
         let total_start = Instant::now();
         let stage_debug = runtime_stage_debug_enabled();
@@ -457,6 +488,12 @@ impl TrellisStageRuntime {
         let sparse_noise_override = noise_overrides.and_then(|v| v.sparse_noise.as_deref());
         let shape_noise_override = noise_overrides.and_then(|v| v.shape_noise.as_ref());
         let tex_noise_override = noise_overrides.and_then(|v| v.tex_noise.as_ref());
+        let shape_noise_dense_override =
+            noise_overrides.and_then(|v| v.shape_noise_dense.as_deref());
+        let tex_noise_dense_override = noise_overrides.and_then(|v| v.tex_noise_dense.as_deref());
+        let sparse_sampler_override = noise_overrides.and_then(|v| v.sparse_sampler);
+        let shape_sampler_override = noise_overrides.and_then(|v| v.shape_sampler);
+        let tex_sampler_override = noise_overrides.and_then(|v| v.tex_sampler);
         let sparse_cond_override = noise_overrides.and_then(|v| v.cond_512.as_deref());
         let sparse_neg_cond_override = noise_overrides.and_then(|v| v.neg_cond_512.as_deref());
         let sparse_start = Instant::now();
@@ -468,6 +505,8 @@ impl TrellisStageRuntime {
             sparse_cond_override,
             sparse_neg_cond_override,
             &self.sparse_sampler,
+            sparse_sampler_override,
+            capture_sampler_trace,
             parity_strict,
             #[cfg(feature = "runtime-model")]
             self.sparse_flow.as_ref(),
@@ -486,10 +525,13 @@ impl TrellisStageRuntime {
             &sparse.coords,
             &mut rng,
             shape_noise_override,
+            shape_noise_dense_override,
             noise_overrides,
             &self.shape_sampler,
+            shape_sampler_override,
             &self.shape_norm,
             sparse.resolution,
+            capture_sampler_trace,
             parity_strict,
             #[cfg(feature = "runtime-model")]
             self.shape_flow.as_ref(),
@@ -508,11 +550,14 @@ impl TrellisStageRuntime {
             &shape_slat,
             &mut rng,
             tex_noise_override,
+            tex_noise_dense_override,
             noise_overrides,
             &self.tex_sampler,
+            tex_sampler_override,
             &self.shape_norm,
             &self.tex_norm,
             sparse.resolution,
+            capture_sampler_trace,
             parity_strict,
             #[cfg(feature = "runtime-model")]
             self.tex_flow.as_ref(),
@@ -527,6 +572,11 @@ impl TrellisStageRuntime {
 
         let decode_start = Instant::now();
         let decoded = if runtime_skip_decode() {
+            if parity_strict {
+                panic!(
+                    "burn_trellis parity strict mode: TRELLIS2_SKIP_DECODE cannot be used in parity mode"
+                );
+            }
             DecodedLatentOutput {
                 mesh: canonical_cube(),
                 shape_subs: Vec::new(),
@@ -608,18 +658,6 @@ fn runtime_stage_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn runtime_disable_pbr_bake() -> bool {
-    std::env::var("TRELLIS2_DISABLE_PBR_BAKE")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn runtime_skip_decode() -> bool {
     std::env::var("TRELLIS2_SKIP_DECODE")
         .ok()
@@ -630,6 +668,20 @@ fn runtime_skip_decode() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn resolve_sampler_settings(
+    sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
+) -> (FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig, f32) {
+    if let Some(override_config) = sampler_override {
+        let sampler = FlowEulerGuidanceIntervalSampler::new(override_config.sigma_min);
+        return (sampler, override_config.config, override_config.sigma_min);
+    }
+    let sigma_min = sampler_config.args.sigma_min;
+    let (sampler, config) =
+        FlowEulerGuidanceIntervalSampler::from_params(sigma_min, &sampler_config.params);
+    (sampler, config, sigma_min)
 }
 
 fn dense_noise_with_override(
@@ -720,7 +772,10 @@ fn sparse_row_noise_map(override_rows: &SparseRowNoiseOverride) -> HashMap<u64, 
     let mut out = HashMap::with_capacity(count * 2);
     for idx in 0..count {
         let coord = override_rows.coords[idx];
-        out.insert(pack_coord(coord[1], coord[2], coord[3]), override_rows.feats[idx]);
+        out.insert(
+            pack_coord(coord[1], coord[2], coord[3]),
+            override_rows.feats[idx],
+        );
     }
     out
 }
@@ -770,6 +825,7 @@ fn merge_sparse_row_noise_override(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_sparse_structure(
     preprocess: &PreprocessOutput,
     resolution: usize,
@@ -778,6 +834,8 @@ fn sample_sparse_structure(
     _cond_override: Option<&[f32]>,
     _neg_cond_override: Option<&[f32]>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
+    capture_sampler_trace: bool,
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] sparse_flow: Option<&SparseStructureFlowRuntime>,
 ) -> SparseStructureSample {
@@ -791,6 +849,8 @@ fn sample_sparse_structure(
             _cond_override,
             _neg_cond_override,
             sampler_config,
+            sampler_override,
+            capture_sampler_trace,
             sparse_flow,
         )
     {
@@ -801,7 +861,15 @@ fn sample_sparse_structure(
             "burn_trellis parity strict mode: sparse_structure stage would use synthetic fallback"
         );
     }
-    sample_sparse_structure_synthetic(preprocess, resolution, rng, noise_override, sampler_config)
+    sample_sparse_structure_synthetic(
+        preprocess,
+        resolution,
+        rng,
+        noise_override,
+        sampler_config,
+        sampler_override,
+        capture_sampler_trace,
+    )
 }
 
 fn sample_sparse_structure_synthetic(
@@ -810,6 +878,8 @@ fn sample_sparse_structure_synthetic(
     rng: &mut Lcg,
     noise_override: Option<&[f32]>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
+    capture_sampler_trace: bool,
 ) -> SparseStructureSample {
     let flow_resolution = 16usize;
     let flow_channels = 8usize;
@@ -817,21 +887,24 @@ fn sample_sparse_structure_synthetic(
     let noise =
         dense_noise_with_override(rng, flow_channels * voxel_count, noise_override, "sparse");
     let target = occupancy_target(preprocess, flow_resolution);
-    let (sampler, sample_cfg) = FlowEulerGuidanceIntervalSampler::from_params(
-        sampler_config.args.sigma_min,
-        &sampler_config.params,
+    let (sampler, sample_cfg, sigma_min) =
+        resolve_sampler_settings(sampler_config, sampler_override);
+    let trace = sampler.sample_with_trace_mode(
+        &noise,
+        sample_cfg,
+        capture_sampler_trace,
+        |x_t, _t, cond| {
+            // Placeholder denoiser: positive branch drifts toward the occupancy target,
+            // negative branch drifts toward empty space.
+            let mut out = vec![0.0f32; x_t.len()];
+            for idx in 0..out.len() {
+                let target_idx = idx % voxel_count;
+                let target_value = if cond { target[target_idx] } else { 0.0 };
+                out[idx] = x_t[idx] - target_value;
+            }
+            out
+        },
     );
-    let trace = sampler.sample_with_trace(&noise, sample_cfg, |x_t, _t, cond| {
-        // Placeholder denoiser: positive branch drifts toward the occupancy target,
-        // negative branch drifts toward empty space.
-        let mut out = vec![0.0f32; x_t.len()];
-        for idx in 0..out.len() {
-            let target_idx = idx % voxel_count;
-            let target_value = if cond { target[target_idx] } else { 0.0 };
-            out[idx] = x_t[idx] - target_value;
-        }
-        out
-    });
     let latent = trace.samples;
     let occupancy = latent_to_occupancy(&latent, flow_channels, flow_resolution);
     let upsampled = upsample_occupancy(occupancy.as_slice(), flow_resolution, resolution);
@@ -858,6 +931,8 @@ fn sample_sparse_structure_synthetic(
     }
     SparseStructureSample {
         source: SparseStructureStageSource::Synthetic,
+        sampler_config: sample_cfg,
+        sigma_min,
         step_count: trace.steps,
         resolution,
         flow_resolution,
@@ -872,6 +947,7 @@ fn sample_sparse_structure_synthetic(
 }
 
 #[cfg(feature = "runtime-model")]
+#[allow(clippy::too_many_arguments)]
 fn sample_sparse_structure_with_model(
     preprocess: &PreprocessOutput,
     resolution: usize,
@@ -880,6 +956,8 @@ fn sample_sparse_structure_with_model(
     cond_override: Option<&[f32]>,
     neg_cond_override: Option<&[f32]>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
+    capture_sampler_trace: bool,
     sparse_flow: &SparseStructureFlowRuntime,
 ) -> Option<SparseStructureSample> {
     let config = sparse_flow.config();
@@ -901,11 +979,7 @@ fn sample_sparse_structure_with_model(
         cond_override,
         "sparse_runtime",
     );
-    let neg_cond = dense_neg_cond_with_override(
-        cond.len(),
-        neg_cond_override,
-        "sparse_runtime",
-    );
+    let neg_cond = dense_neg_cond_with_override(cond.len(), neg_cond_override, "sparse_runtime");
     let cond_tensor = match sparse_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
@@ -924,17 +998,15 @@ fn sample_sparse_structure_with_model(
             return None;
         }
     };
-    let (_, sample_cfg) = FlowEulerGuidanceIntervalSampler::from_params(
-        sampler_config.args.sigma_min,
-        &sampler_config.params,
-    );
+    let (_, sample_cfg, sigma_min) = resolve_sampler_settings(sampler_config, sampler_override);
     let trace = match sparse_flow.sample_with_trace(
         noise.as_slice(),
         sample_cfg,
-        sampler_config.args.sigma_min,
+        sigma_min,
         &cond_tensor,
         &neg_cond_tensor,
         None,
+        capture_sampler_trace,
     ) {
         Ok(trace) => trace,
         Err(err) => {
@@ -970,6 +1042,8 @@ fn sample_sparse_structure_with_model(
             "wgpu" => SparseStructureStageSource::RuntimeModelWgpu,
             _ => SparseStructureStageSource::RuntimeModelCpu,
         },
+        sampler_config: sample_cfg,
+        sigma_min,
         step_count: trace.steps,
         resolution,
         flow_resolution,
@@ -990,15 +1064,24 @@ fn sample_shape_slat_with_model(
     coords: &[[u32; 4]],
     rng: &mut Lcg,
     noise_override: Option<&SparseRowNoiseOverride>,
+    noise_dense_override: Option<&[f32]>,
     cond_overrides: Option<&TrellisNoiseOverrides>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
     normalization: &TrellisNormalization,
     sparse_resolution: usize,
+    capture_sampler_trace: bool,
     shape_flow: &SparseStructureFlowRuntime,
 ) -> Option<ShapeSLatSample> {
+    let (_, sample_cfg, sigma_min) = resolve_sampler_settings(sampler_config, sampler_override);
     if coords.is_empty() {
         return Some(ShapeSLatSample {
-            step_count: sampler_config.params.steps.max(1),
+            sampler_config: sample_cfg,
+            sigma_min,
+            step_count: sample_cfg.steps,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: capture_sampler_trace.then_some(Vec::new()),
             features: Vec::new(),
             noise: Vec::new(),
             step_0_x_t: Vec::new(),
@@ -1013,11 +1096,16 @@ fn sample_shape_slat_with_model(
     if voxel_count == 0 || config.out_channels == 0 {
         return None;
     }
+    let feature_channels = 32usize.min(config.out_channels);
+    let dense_indices = coords
+        .iter()
+        .map(|coord| map_coord_to_dense_flat(*coord, sparse_resolution, dense_resolution))
+        .collect::<Vec<_>>();
 
     let mut noise = dense_noise_with_override(
         rng,
         config.out_channels * voxel_count,
-        None,
+        noise_dense_override,
         "shape_slat_runtime",
     );
     if let Some(override_rows) = noise_override {
@@ -1045,11 +1133,8 @@ fn sample_shape_slat_with_model(
         cond_override,
         "shape_slat_runtime",
     );
-    let neg_cond = dense_neg_cond_with_override(
-        cond.len(),
-        neg_cond_override,
-        "shape_slat_runtime",
-    );
+    let neg_cond =
+        dense_neg_cond_with_override(cond.len(), neg_cond_override, "shape_slat_runtime");
     let cond_tensor = match shape_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
@@ -1068,17 +1153,16 @@ fn sample_shape_slat_with_model(
             return None;
         }
     };
-    let (_, sample_cfg) = FlowEulerGuidanceIntervalSampler::from_params(
-        sampler_config.args.sigma_min,
-        &sampler_config.params,
-    );
-    let trace = match shape_flow.sample_with_trace(
+    let trace = match shape_flow.sample_rows_with_trace(
         noise.as_slice(),
         sample_cfg,
-        sampler_config.args.sigma_min,
+        sigma_min,
         &cond_tensor,
         &neg_cond_tensor,
         None,
+        dense_indices.as_slice(),
+        feature_channels,
+        capture_sampler_trace,
     ) {
         Ok(trace) => trace,
         Err(err) => {
@@ -1089,20 +1173,20 @@ fn sample_shape_slat_with_model(
         }
     };
 
-    let feature_channels = 32usize.min(config.out_channels);
     let mut features = Vec::with_capacity(coords.len());
     let mut noise_rows = Vec::with_capacity(coords.len());
     let mut step_0_rows = Vec::with_capacity(coords.len());
     let mut step_mid_rows = Vec::with_capacity(coords.len());
     let mut step_last_rows = Vec::with_capacity(coords.len());
-    for coord in coords {
-        let dense_idx = map_coord_to_dense_flat(*coord, sparse_resolution, dense_resolution);
+    let gathered_channels = feature_channels.min(trace.row_channels);
+    for (row_idx, dense_idx) in dense_indices.iter().copied().enumerate() {
+        let gathered_base = row_idx.saturating_mul(trace.row_channels);
         let mut row = [0.0f32; 32];
         let mut noise_row = [0.0f32; 32];
         let mut step_0_row = [0.0f32; 32];
         let mut step_mid_row = [0.0f32; 32];
         let mut step_last_row = [0.0f32; 32];
-        for ch in 0..feature_channels {
+        for ch in 0..gathered_channels {
             let mean = normalization.mean.get(ch).copied().unwrap_or(0.0);
             let std = normalization
                 .std
@@ -1111,12 +1195,12 @@ fn sample_shape_slat_with_model(
                 .unwrap_or(1.0)
                 .max(1.0e-6);
             let offset = ch * voxel_count + dense_idx;
-            let sampled = trace.samples[offset];
+            let sampled = trace.samples[gathered_base + ch];
             row[ch] = sampled * std + mean;
             noise_row[ch] = noise[offset];
-            step_0_row[ch] = trace.step_0_x_t[offset];
-            step_mid_row[ch] = trace.step_mid_x_t[offset];
-            step_last_row[ch] = trace.step_last_x_t[offset];
+            step_0_row[ch] = trace.step_0_x_t[gathered_base + ch];
+            step_mid_row[ch] = trace.step_mid_x_t[gathered_base + ch];
+            step_last_row[ch] = trace.step_last_x_t[gathered_base + ch];
         }
         features.push(row);
         noise_rows.push(noise_row);
@@ -1125,7 +1209,12 @@ fn sample_shape_slat_with_model(
         step_last_rows.push(step_last_row);
     }
     Some(ShapeSLatSample {
+        sampler_config: sample_cfg,
+        sigma_min,
         step_count: sample_cfg.steps,
+        dense_resolution,
+        dense_channels: config.out_channels,
+        dense_noise: capture_sampler_trace.then_some(noise),
         features,
         noise: noise_rows,
         step_0_x_t: step_0_rows,
@@ -1142,16 +1231,25 @@ fn sample_tex_slat_with_model(
     shape_slat: &ShapeSLatSample,
     rng: &mut Lcg,
     noise_override: Option<&SparseRowNoiseOverride>,
+    noise_dense_override: Option<&[f32]>,
     cond_overrides: Option<&TrellisNoiseOverrides>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
     shape_normalization: &TrellisNormalization,
     normalization: &TrellisNormalization,
     sparse_resolution: usize,
+    capture_sampler_trace: bool,
     tex_flow: &SparseStructureFlowRuntime,
 ) -> Option<TexSLatSample> {
+    let (_, sample_cfg, sigma_min) = resolve_sampler_settings(sampler_config, sampler_override);
     if shape_slat.coords.is_empty() {
         return Some(TexSLatSample {
-            step_count: sampler_config.params.steps.max(1),
+            sampler_config: sample_cfg,
+            sigma_min,
+            step_count: sample_cfg.steps,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: capture_sampler_trace.then_some(Vec::new()),
             features: Vec::new(),
             noise: Vec::new(),
             step_0_x_t: Vec::new(),
@@ -1167,6 +1265,12 @@ fn sample_tex_slat_with_model(
     if voxel_count == 0 || config.out_channels == 0 {
         return None;
     }
+    let feature_channels = 32usize.min(config.out_channels);
+    let dense_indices = shape_slat
+        .coords
+        .iter()
+        .map(|coord| map_coord_to_dense_flat(*coord, sparse_resolution, dense_resolution))
+        .collect::<Vec<_>>();
     let concat_channels = config.in_channels.saturating_sub(config.out_channels);
     if concat_channels == 0 {
         eprintln!(
@@ -1207,7 +1311,7 @@ fn sample_tex_slat_with_model(
     let mut noise = dense_noise_with_override(
         rng,
         config.out_channels * voxel_count,
-        None,
+        noise_dense_override,
         "tex_slat_runtime",
     );
     if let Some(override_rows) = noise_override {
@@ -1235,11 +1339,7 @@ fn sample_tex_slat_with_model(
         cond_override,
         "tex_slat_runtime",
     );
-    let neg_cond = dense_neg_cond_with_override(
-        cond.len(),
-        neg_cond_override,
-        "tex_slat_runtime",
-    );
+    let neg_cond = dense_neg_cond_with_override(cond.len(), neg_cond_override, "tex_slat_runtime");
     let cond_tensor = match tex_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
@@ -1258,17 +1358,16 @@ fn sample_tex_slat_with_model(
             return None;
         }
     };
-    let (_, sample_cfg) = FlowEulerGuidanceIntervalSampler::from_params(
-        sampler_config.args.sigma_min,
-        &sampler_config.params,
-    );
-    let trace = match tex_flow.sample_with_trace(
+    let trace = match tex_flow.sample_rows_with_trace(
         noise.as_slice(),
         sample_cfg,
-        sampler_config.args.sigma_min,
+        sigma_min,
         &cond_tensor,
         &neg_cond_tensor,
         Some(concat_dense.as_slice()),
+        dense_indices.as_slice(),
+        feature_channels,
+        capture_sampler_trace,
     ) {
         Ok(trace) => trace,
         Err(err) => {
@@ -1279,15 +1378,15 @@ fn sample_tex_slat_with_model(
         }
     };
 
-    let feature_channels = 32usize.min(config.out_channels);
     let mut features = Vec::with_capacity(shape_slat.coords.len());
     let mut noise_rows = Vec::with_capacity(shape_slat.coords.len());
     let mut step_0_rows = Vec::with_capacity(shape_slat.coords.len());
     let mut step_mid_rows = Vec::with_capacity(shape_slat.coords.len());
     let mut step_last_rows = Vec::with_capacity(shape_slat.coords.len());
     let mut shape_cond_rows = Vec::with_capacity(shape_slat.coords.len());
-    for (idx, coord) in shape_slat.coords.iter().enumerate() {
-        let dense_idx = map_coord_to_dense_flat(*coord, sparse_resolution, dense_resolution);
+    let gathered_channels = feature_channels.min(trace.row_channels);
+    for (idx, dense_idx) in dense_indices.iter().copied().enumerate() {
+        let gathered_base = idx.saturating_mul(trace.row_channels);
         let mut row = [0.0f32; 32];
         let mut noise_row = [0.0f32; 32];
         let mut step_0_row = [0.0f32; 32];
@@ -1304,9 +1403,8 @@ fn sample_tex_slat_with_model(
                 .unwrap_or(1.0)
                 .max(1.0e-6);
             shape_cond[ch] = (shape_feat[ch] - shape_mean) / shape_std;
-            if ch >= feature_channels {
-                continue;
-            }
+        }
+        for ch in 0..gathered_channels {
             let mean = normalization.mean.get(ch).copied().unwrap_or(0.0);
             let std = normalization
                 .std
@@ -1315,12 +1413,12 @@ fn sample_tex_slat_with_model(
                 .unwrap_or(1.0)
                 .max(1.0e-6);
             let offset = ch * voxel_count + dense_idx;
-            let sampled = trace.samples[offset];
+            let sampled = trace.samples[gathered_base + ch];
             row[ch] = sampled * std + mean;
             noise_row[ch] = noise[offset];
-            step_0_row[ch] = trace.step_0_x_t[offset];
-            step_mid_row[ch] = trace.step_mid_x_t[offset];
-            step_last_row[ch] = trace.step_last_x_t[offset];
+            step_0_row[ch] = trace.step_0_x_t[gathered_base + ch];
+            step_mid_row[ch] = trace.step_mid_x_t[gathered_base + ch];
+            step_last_row[ch] = trace.step_last_x_t[gathered_base + ch];
         }
         features.push(row);
         noise_rows.push(noise_row);
@@ -1331,7 +1429,12 @@ fn sample_tex_slat_with_model(
     }
 
     Some(TexSLatSample {
+        sampler_config: sample_cfg,
+        sigma_min,
         step_count: sample_cfg.steps,
+        dense_resolution,
+        dense_channels: config.out_channels,
+        dense_noise: capture_sampler_trace.then_some(noise),
         features,
         noise: noise_rows,
         step_0_x_t: step_0_rows,
@@ -1348,10 +1451,13 @@ fn sample_shape_slat(
     coords: &[[u32; 4]],
     rng: &mut Lcg,
     noise_override: Option<&SparseRowNoiseOverride>,
+    _noise_dense_override: Option<&[f32]>,
     _cond_overrides: Option<&TrellisNoiseOverrides>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
     normalization: &TrellisNormalization,
     _sparse_resolution: usize,
+    capture_sampler_trace: bool,
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] shape_flow: Option<&SparseStructureFlowRuntime>,
 ) -> ShapeSLatSample {
@@ -1362,10 +1468,13 @@ fn sample_shape_slat(
             coords,
             rng,
             noise_override,
+            _noise_dense_override,
             _cond_overrides,
             sampler_config,
+            sampler_override,
             normalization,
             _sparse_resolution,
+            capture_sampler_trace,
             shape_flow,
         )
     {
@@ -1380,10 +1489,8 @@ fn sample_shape_slat(
     let mut step_0_rows = Vec::with_capacity(coords.len());
     let mut step_mid_rows = Vec::with_capacity(coords.len());
     let mut step_last_rows = Vec::with_capacity(coords.len());
-    let (sampler, sample_cfg) = FlowEulerGuidanceIntervalSampler::from_params(
-        sampler_config.args.sigma_min,
-        &sampler_config.params,
-    );
+    let (sampler, sample_cfg, sigma_min) =
+        resolve_sampler_settings(sampler_config, sampler_override);
     let override_noise_map = noise_override.map(sparse_row_noise_map);
     for coord in coords {
         let base = sample_pixel_luma(preprocess, coord[1], coord[2], coord[3]);
@@ -1393,14 +1500,19 @@ fn sample_shape_slat(
             .map(|row| row.to_vec())
             .unwrap_or_else(|| (0..32).map(|_| rng.next_normal_f32()).collect::<Vec<_>>());
         let target = [base; 32];
-        let trace = sampler.sample_with_trace(&noise, sample_cfg, |x_t, _t, cond| {
-            let mut out = vec![0.0f32; x_t.len()];
-            for idx in 0..out.len() {
-                let target_value = if cond { target[idx] } else { 0.0 };
-                out[idx] = x_t[idx] - target_value;
-            }
-            out
-        });
+        let trace = sampler.sample_with_trace_mode(
+            &noise,
+            sample_cfg,
+            capture_sampler_trace,
+            |x_t, _t, cond| {
+                let mut out = vec![0.0f32; x_t.len()];
+                for idx in 0..out.len() {
+                    let target_value = if cond { target[idx] } else { 0.0 };
+                    out[idx] = x_t[idx] - target_value;
+                }
+                out
+            },
+        );
         let sampled = trace.samples;
         let mut row = [0.0f32; 32];
         let mut noise_row = [0.0f32; 32];
@@ -1428,7 +1540,12 @@ fn sample_shape_slat(
         step_last_rows.push(step_last_row);
     }
     ShapeSLatSample {
+        sampler_config: sample_cfg,
+        sigma_min,
         step_count: sample_cfg.steps,
+        dense_resolution: 0,
+        dense_channels: 0,
+        dense_noise: None,
         features,
         noise: noise_rows,
         step_0_x_t: step_0_rows,
@@ -1444,11 +1561,14 @@ fn sample_tex_slat(
     shape_slat: &ShapeSLatSample,
     rng: &mut Lcg,
     noise_override: Option<&SparseRowNoiseOverride>,
+    _noise_dense_override: Option<&[f32]>,
     _cond_overrides: Option<&TrellisNoiseOverrides>,
     sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
     shape_normalization: &TrellisNormalization,
     normalization: &TrellisNormalization,
     _sparse_resolution: usize,
+    capture_sampler_trace: bool,
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] tex_flow: Option<&SparseStructureFlowRuntime>,
 ) -> TexSLatSample {
@@ -1459,11 +1579,14 @@ fn sample_tex_slat(
             shape_slat,
             rng,
             noise_override,
+            _noise_dense_override,
             _cond_overrides,
             sampler_config,
+            sampler_override,
             shape_normalization,
             normalization,
             _sparse_resolution,
+            capture_sampler_trace,
             tex_flow,
         )
     {
@@ -1473,10 +1596,8 @@ fn sample_tex_slat(
         panic!("burn_trellis parity strict mode: tex_slat stage would use synthetic fallback");
     }
 
-    let (sampler, sample_cfg) = FlowEulerGuidanceIntervalSampler::from_params(
-        sampler_config.args.sigma_min,
-        &sampler_config.params,
-    );
+    let (sampler, sample_cfg, sigma_min) =
+        resolve_sampler_settings(sampler_config, sampler_override);
     let mut features = Vec::with_capacity(shape_slat.coords.len());
     let mut noise_rows = Vec::with_capacity(shape_slat.coords.len());
     let mut step_0_rows = Vec::with_capacity(shape_slat.coords.len());
@@ -1506,14 +1627,19 @@ fn sample_tex_slat(
         let target = (0..32)
             .map(|ch| 0.75 * luma + 0.25 * shape_cond[ch].tanh())
             .collect::<Vec<_>>();
-        let trace = sampler.sample_with_trace(&noise, sample_cfg, |x_t, _t, cond| {
-            let mut out = vec![0.0f32; x_t.len()];
-            for ch in 0..out.len() {
-                let target_value = if cond { target[ch] } else { 0.0 };
-                out[ch] = x_t[ch] - target_value;
-            }
-            out
-        });
+        let trace = sampler.sample_with_trace_mode(
+            &noise,
+            sample_cfg,
+            capture_sampler_trace,
+            |x_t, _t, cond| {
+                let mut out = vec![0.0f32; x_t.len()];
+                for ch in 0..out.len() {
+                    let target_value = if cond { target[ch] } else { 0.0 };
+                    out[ch] = x_t[ch] - target_value;
+                }
+                out
+            },
+        );
         let sampled = trace.samples;
         let mut row = [0.0f32; 32];
         let mut noise_row = [0.0f32; 32];
@@ -1542,7 +1668,12 @@ fn sample_tex_slat(
         shape_cond_rows.push(shape_cond);
     }
     TexSLatSample {
+        sampler_config: sample_cfg,
+        sigma_min,
         step_count: sample_cfg.steps,
+        dense_resolution: 0,
+        dense_channels: 0,
+        dense_noise: None,
         features,
         noise: noise_rows,
         step_0_x_t: step_0_rows,
@@ -1562,267 +1693,34 @@ fn decode_latent_to_outputs(
     #[cfg(feature = "runtime-model")] tex_decoder: Option<&SparseUnetVaeDecoderRuntime>,
 ) -> DecodedLatentOutput {
     #[cfg(feature = "runtime-model")]
-    if let (Some(shape_decoder), Some(tex_decoder)) = (shape_decoder, tex_decoder) {
-        if let Some(decoded) = decode_latent_with_runtime_decoders(
+    {
+        let shape_decoder = shape_decoder.unwrap_or_else(|| {
+            panic!(
+                "burn_trellis: shape runtime decoder is required (missing `shape_slat_decoder` runtime)"
+            )
+        });
+        let tex_decoder = tex_decoder.unwrap_or_else(|| {
+            panic!(
+                "burn_trellis: tex runtime decoder is required (missing `tex_slat_decoder` runtime)"
+            )
+        });
+        decode_latent_with_runtime_decoders(
             shape,
             tex,
             pipeline_type,
+            parity_strict,
             shape_decoder,
             tex_decoder,
-        ) {
-            return decoded;
-        }
-        if parity_strict {
-            panic!("burn_trellis parity strict mode: runtime decoder path failed");
-        }
-    }
-    if parity_strict {
-        panic!("burn_trellis parity strict mode: decode stage would use synthetic fallback");
+        )
+        .unwrap_or_else(|err| {
+            panic!("burn_trellis: runtime decode pipeline failed: {err}");
+        })
     }
 
-    if shape.coords.is_empty() || shape.features.is_empty() {
-        return DecodedLatentOutput {
-            mesh: canonical_cube(),
-            shape_subs: Vec::new(),
-            tex_voxels: DecodeTexVoxelSample {
-                coords: Vec::new(),
-                feats: Vec::new(),
-                spatial_shape: [512, 512, 512],
-            },
-            pbr: None,
-        };
-    }
-
-    let final_resolution = final_resolution_for_pipeline(pipeline_type);
-    let coarse_resolution = sparse_resolution_for_pipeline(pipeline_type).max(1);
-    let scale = (final_resolution / coarse_resolution).max(1);
-    let mut levels = 0usize;
-    let mut tmp = scale;
-    while tmp > 1 {
-        levels += 1;
-        tmp /= 2;
-    }
-    // TRELLIS shape decoder effectively upsamples x16 for the low-resolution path.
-    // Keep an upper bound to avoid runaway growth in non-standard configs.
-    levels = levels.clamp(1, 4);
-    let per_base = 1usize << (3 * levels);
-
-    let target_vertices = target_vertex_budget(final_resolution);
-    let mut base_indices = ranked_shape_indices(shape);
-    let max_base = target_vertices
-        .saturating_add(per_base - 1)
-        .saturating_div(per_base)
-        .max(1);
-    base_indices.truncate(base_indices.len().min(max_base));
-    if base_indices.is_empty() {
-        base_indices.push(0);
-    }
-
-    let mut shape_subs = Vec::with_capacity(levels);
-    let mut level_coords: Vec<[u32; 4]> =
-        base_indices.iter().map(|&idx| shape.coords[idx]).collect();
-    let mut level_feats: Vec<[f32; 32]> = base_indices
-        .iter()
-        .map(|&idx| shape.features[idx])
-        .collect();
-    let mut level_tex_feats: Vec<[f32; 32]> = base_indices
-        .iter()
-        .map(|&idx| tex.features.get(idx).copied().unwrap_or([0.0; 32]))
-        .collect();
-
-    for level in 0..levels {
-        let mut sub_feats = Vec::with_capacity(level_coords.len());
-        for (idx, feat) in level_feats.iter().enumerate() {
-            let coord = level_coords[idx];
-            let mut row = [0.0f32; 8];
-            for child in 0..8usize {
-                let child_bits = [
-                    (child & 1) as f32,
-                    ((child >> 1) & 1) as f32,
-                    ((child >> 2) & 1) as f32,
-                ];
-                row[child] = 1.0
-                    + 0.08 * feat[(level * 5 + child) % 32]
-                    + 0.02
-                        * (coord[1] as f32 * 0.11
-                            + coord[2] as f32 * 0.07
-                            + coord[3] as f32 * 0.05)
-                    + 0.01 * (child_bits[0] + child_bits[1] + child_bits[2]);
-            }
-            sub_feats.push(row);
-        }
-        let spatial_res = (coarse_resolution << level) as u32;
-        shape_subs.push(DecodeShapeSubSample {
-            coords: level_coords.clone(),
-            feats: sub_feats,
-            spatial_shape: [spatial_res, spatial_res, spatial_res],
-        });
-
-        let mut next_coords = Vec::with_capacity(level_coords.len() * 8);
-        let mut next_feats = Vec::with_capacity(level_feats.len() * 8);
-        let mut next_tex_feats = Vec::with_capacity(level_tex_feats.len() * 8);
-        for i in 0..level_coords.len() {
-            let coord = level_coords[i];
-            let parent = level_feats[i];
-            let tex_parent = level_tex_feats[i];
-            for child in 0..8u32 {
-                let child_coord = [
-                    coord[0],
-                    coord[1].saturating_mul(2).saturating_add(child & 1),
-                    coord[2].saturating_mul(2).saturating_add((child >> 1) & 1),
-                    coord[3].saturating_mul(2).saturating_add((child >> 2) & 1),
-                ];
-                next_coords.push(child_coord);
-                let mut child_feat = [0.0f32; 32];
-                let mut child_tex_feat = [0.0f32; 32];
-                let cx = (child & 1) as f32 - 0.5;
-                let cy = ((child >> 1) & 1) as f32 - 0.5;
-                let cz = ((child >> 2) & 1) as f32 - 0.5;
-                for ch in 0..32 {
-                    let dir = match ch % 3 {
-                        0 => cx,
-                        1 => cy,
-                        _ => cz,
-                    };
-                    child_feat[ch] = parent[ch] * 0.94 + dir * 0.06;
-                    child_tex_feat[ch] = tex_parent[ch] * 0.95 + dir * 0.05;
-                }
-                next_feats.push(child_feat);
-                next_tex_feats.push(child_tex_feat);
-            }
-        }
-        level_coords = next_coords;
-        level_feats = next_feats;
-        level_tex_feats = next_tex_feats;
-    }
-
-    // Match the canonical token budget more closely by uniformly decimating
-    // over-expanded leaves after fixed-depth subdivision.
-    if level_coords.len() > target_vertices {
-        let remove_count = level_coords.len() - target_vertices;
-        let total = level_coords.len();
-        let stride = total as f64 / remove_count as f64;
-        let mut drop_mask = vec![false; total];
-        for ridx in 0..remove_count {
-            let idx = (((ridx as f64) + 0.5) * stride).floor() as usize;
-            let idx = idx.min(total - 1);
-            drop_mask[idx] = true;
-        }
-
-        let mut kept_coords = Vec::with_capacity(target_vertices);
-        let mut kept_feats = Vec::with_capacity(target_vertices);
-        let mut kept_tex_feats = Vec::with_capacity(target_vertices);
-        for i in 0..total {
-            if drop_mask[i] {
-                continue;
-            }
-            kept_coords.push(level_coords[i]);
-            kept_feats.push(level_feats[i]);
-            kept_tex_feats.push(level_tex_feats[i]);
-        }
-        level_coords = kept_coords;
-        level_feats = kept_feats;
-        level_tex_feats = kept_tex_feats;
-    }
-
-    let mut dual_vertices = Vec::with_capacity(level_coords.len());
-    let mut intersected = Vec::with_capacity(level_coords.len());
-    let mut split_weight = Vec::with_capacity(level_coords.len());
-    let mut voxel_attrs = Vec::with_capacity(level_coords.len());
-    for i in 0..level_coords.len() {
-        let coord = level_coords[i];
-        let shape_feat = level_feats[i];
-        let tex_feat = level_tex_feats[i];
-        let cell = [
-            (coord[1] % (scale as u32).max(1)) as f32 / (scale as f32).max(1.0),
-            (coord[2] % (scale as u32).max(1)) as f32 / (scale as f32).max(1.0),
-            (coord[3] % (scale as u32).max(1)) as f32 / (scale as f32).max(1.0),
-        ];
-        dual_vertices.push([
-            (cell[0] + 0.12 * shape_feat[0].tanh()).clamp(0.0, 1.0),
-            (cell[1] + 0.12 * shape_feat[1].tanh()).clamp(0.0, 1.0),
-            (cell[2] + 0.12 * shape_feat[2].tanh()).clamp(0.0, 1.0),
-        ]);
-        let axis_selector = ((shape_feat[3] * 2.7 + shape_feat[4] * 1.9 + shape_feat[5] * 1.3)
-            .abs()
-            * 1000.0) as usize
-            % 3;
-        let mut flags = [false; 3];
-        flags[axis_selector] = true;
-        // Lightly activate a secondary edge direction to better match the
-        // decoded face density observed in TRELLIS2 hook traces.
-        let secondary_gate = ((shape_feat[7].abs() * 37.0)
-            + coord[1] as f32 * 0.19
-            + coord[2] as f32 * 0.13
-            + coord[3] as f32 * 0.11) as i32;
-        if secondary_gate.rem_euclid(8) == 0 {
-            flags[(axis_selector + 1) % 3] = true;
-        }
-        if secondary_gate.rem_euclid(257) == 0 {
-            flags[(axis_selector + 2) % 3] = true;
-        }
-        intersected.push(flags);
-        split_weight.push(softplus(shape_feat[6] + 0.25));
-        let mut attr = [0.0f32; 6];
-        for ch in 0..6 {
-            attr[ch] = (0.5 + 0.5 * (tex_feat[ch] + 0.1 * shape_feat[ch]).tanh()).clamp(0.0, 1.0);
-        }
-        voxel_attrs.push(attr);
-    }
-
-    let grid_size = [
-        final_resolution as u32,
-        final_resolution as u32,
-        final_resolution as u32,
-    ];
-    let (vertices, faces) = flexible_dual_grid_to_mesh(
-        &level_coords,
-        &dual_vertices,
-        &intersected,
-        Some(&split_weight),
-        grid_size,
-        [-0.5, -0.5, -0.5],
-        [0.5, 0.5, 0.5],
-    );
-
-    let (uvs, pbr_textures, pbr_debug) = if runtime_disable_pbr_bake() {
-        (Vec::new(), None, None)
-    } else {
-        let (uvs, textures, debug) = bake_pbr_from_voxels(
-            vertices.as_slice(),
-            faces.as_slice(),
-            level_coords.as_slice(),
-            voxel_attrs.as_slice(),
-            final_resolution as u32,
-        );
-        (uvs, textures, Some(debug))
-    };
-    let material = summarize_material(voxel_attrs.as_slice(), pbr_textures.as_ref());
-    let mesh = if vertices.is_empty() || faces.is_empty() {
-        canonical_cube()
-    } else {
-        Mesh {
-            vertices,
-            faces,
-            uvs,
-            material,
-            pbr_textures,
-        }
-    };
-
-    DecodedLatentOutput {
-        mesh,
-        shape_subs,
-        tex_voxels: DecodeTexVoxelSample {
-            coords: level_coords,
-            feats: voxel_attrs,
-            spatial_shape: [
-                final_resolution as u32,
-                final_resolution as u32,
-                final_resolution as u32,
-            ],
-        },
-        pbr: pbr_debug,
+    #[cfg(not(feature = "runtime-model"))]
+    {
+        let _ = (shape, tex, pipeline_type, parity_strict);
+        panic!("burn_trellis: TRELLIS decode requires `runtime-model` feature");
     }
 }
 
@@ -1831,9 +1729,10 @@ fn decode_latent_with_runtime_decoders(
     shape: &ShapeSLatSample,
     tex: &TexSLatSample,
     pipeline_type: &str,
+    parity_strict: bool,
     shape_decoder: &FdgDecoderRuntime,
     tex_decoder: &SparseUnetVaeDecoderRuntime,
-) -> Option<DecodedLatentOutput> {
+) -> Result<DecodedLatentOutput, String> {
     let stage_debug = runtime_stage_debug_enabled();
     let count = shape
         .coords
@@ -1841,7 +1740,13 @@ fn decode_latent_with_runtime_decoders(
         .min(shape.features.len())
         .min(tex.features.len());
     if count == 0 {
-        return Some(DecodedLatentOutput {
+        if parity_strict {
+            return Err(
+                "parity strict mode: runtime decode received empty shape/tex latent rows"
+                    .to_string(),
+            );
+        }
+        return Ok(DecodedLatentOutput {
             mesh: canonical_cube(),
             shape_subs: Vec::new(),
             tex_voxels: DecodeTexVoxelSample {
@@ -1853,7 +1758,11 @@ fn decode_latent_with_runtime_decoders(
         });
     }
     if shape_decoder.out_channels() < 7 || tex_decoder.out_channels() < 6 {
-        return None;
+        return Err(format!(
+            "decoder channel mismatch: shape_out={} tex_out={}",
+            shape_decoder.out_channels(),
+            tex_decoder.out_channels()
+        ));
     }
     if stage_debug {
         eprintln!("burn_trellis: decode runtime begin (rows={count})");
@@ -1861,15 +1770,9 @@ fn decode_latent_with_runtime_decoders(
     let shape_rows = &shape.features[..count];
     let tex_rows = &tex.features[..count];
     let shape_decode_start = Instant::now();
-    let shape_decoded = match shape_decoder.decode_sparse(&shape.coords[..count], shape_rows) {
-        Ok(decoded) => decoded,
-        Err(err) => {
-            eprintln!(
-                "burn_trellis: shape runtime decoder failed ({err}); using synthetic decode fallback."
-            );
-            return None;
-        }
-    };
+    let shape_decoded = shape_decoder
+        .decode_sparse(&shape.coords[..count], shape_rows)
+        .map_err(|err| format!("shape runtime decoder failed: {err}"))?;
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime shape-decoder complete ({:.2} ms, subs={}, coords={})",
@@ -1880,19 +1783,13 @@ fn decode_latent_with_runtime_decoders(
     }
 
     let tex_decode_start = Instant::now();
-    let tex_decoded = match tex_decoder.decode_with_guidance(
-        &tex.coords[..count],
-        tex_rows,
-        shape_decoded.subdivisions.as_slice(),
-    ) {
-        Ok(decoded) => decoded,
-        Err(err) => {
-            eprintln!(
-                "burn_trellis: tex runtime decoder failed ({err}); using synthetic decode fallback."
-            );
-            return None;
-        }
-    };
+    let tex_decoded = tex_decoder
+        .decode_with_guidance(
+            &tex.coords[..count],
+            tex_rows,
+            shape_decoded.subdivisions.as_slice(),
+        )
+        .map_err(|err| format!("tex runtime decoder failed: {err}"))?;
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime tex-decoder complete ({:.2} ms, coords={})",
@@ -1947,20 +1844,18 @@ fn decode_latent_with_runtime_decoders(
             faces.len()
         );
     }
-    let (uvs, pbr_textures, pbr_debug) = if runtime_disable_pbr_bake() {
-        (Vec::new(), None, None)
-    } else {
-        let (uvs, textures, debug) = bake_pbr_from_voxels(
-            vertices.as_slice(),
-            faces.as_slice(),
-            coords.as_slice(),
-            voxel_attrs.as_slice(),
-            final_resolution as u32,
-        );
-        (uvs, textures, Some(debug))
-    };
+    let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels(
+        vertices.as_slice(),
+        faces.as_slice(),
+        coords.as_slice(),
+        voxel_attrs.as_slice(),
+        final_resolution as u32,
+    );
     let material = summarize_material(voxel_attrs.as_slice(), pbr_textures.as_ref());
     let mesh = if vertices.is_empty() || faces.is_empty() {
+        if parity_strict {
+            return Err("parity strict mode: runtime decode produced empty mesh".to_string());
+        }
         canonical_cube()
     } else {
         Mesh {
@@ -1979,7 +1874,7 @@ fn decode_latent_with_runtime_decoders(
         .collect::<Vec<_>>();
     let tex_spatial = spatial_shape_from_sparse_coords(coords.as_slice());
 
-    Some(DecodedLatentOutput {
+    Ok(DecodedLatentOutput {
         mesh,
         shape_subs,
         tex_voxels: DecodeTexVoxelSample {
@@ -1987,7 +1882,7 @@ fn decode_latent_with_runtime_decoders(
             feats: voxel_attrs,
             spatial_shape: tex_spatial,
         },
-        pbr: pbr_debug,
+        pbr: Some(pbr_debug),
     })
 }
 
@@ -2172,10 +2067,6 @@ fn pack_coord(x: u32, y: u32, z: u32) -> u64 {
     ((x as u64) << 42) | ((y as u64) << 21) | z as u64
 }
 
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
-}
-
 fn summarize_material(
     voxel_attrs: &[[f32; 6]],
     pbr_textures: Option<&MeshPbrTextures>,
@@ -2267,7 +2158,7 @@ fn bake_pbr_from_voxels(
         );
     }
 
-    let uvs = planar_uv_unwrap(vertices);
+    let uvs = box_uv_unwrap(vertices, faces);
     let texture_size = runtime_pbr_texture_size();
     let texel_count = texture_size * texture_size;
     let mut raster_mask = vec![0u8; texel_count];
@@ -2403,9 +2294,33 @@ fn bake_pbr_from_voxels(
     )
 }
 
-fn planar_uv_unwrap(vertices: &[[f32; 3]]) -> Vec<[f32; 2]> {
+fn box_uv_unwrap(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<[f32; 2]> {
     if vertices.is_empty() {
         return Vec::new();
+    }
+    let mut normals = vec![[0.0f32; 3]; vertices.len()];
+    for face in faces {
+        let i0 = face[0] as usize;
+        let i1 = face[1] as usize;
+        let i2 = face[2] as usize;
+        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+            continue;
+        }
+        let p0 = vertices[i0];
+        let p1 = vertices[i1];
+        let p2 = vertices[i2];
+        let e0 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e1 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let n = [
+            e0[1] * e1[2] - e0[2] * e1[1],
+            e0[2] * e1[0] - e0[0] * e1[2],
+            e0[0] * e1[1] - e0[1] * e1[0],
+        ];
+        for &idx in &[i0, i1, i2] {
+            normals[idx][0] += n[0];
+            normals[idx][1] += n[1];
+            normals[idx][2] += n[2];
+        }
     }
     let mut min = vertices[0];
     let mut max = vertices[0];
@@ -2420,26 +2335,30 @@ fn planar_uv_unwrap(vertices: &[[f32; 3]]) -> Vec<[f32; 2]> {
     let range_z = (max[2] - min[2]).abs().max(1.0e-6);
     vertices
         .iter()
-        .map(|vertex| {
-            // Stable fallback projection: dominant axis pair.
-            let ax = vertex[0].abs();
-            let ay = vertex[1].abs();
-            let az = vertex[2].abs();
+        .zip(normals.iter())
+        .map(|(vertex, normal)| {
+            // Dominant-axis box projection based on local normal direction.
+            let ax = normal[0].abs();
+            let ay = normal[1].abs();
+            let az = normal[2].abs();
             if ay >= ax && ay >= az {
-                [
-                    ((vertex[0] - min[0]) / range_x).clamp(0.0, 1.0),
-                    ((vertex[2] - min[2]) / range_z).clamp(0.0, 1.0),
-                ]
+                let mut u = ((vertex[0] - min[0]) / range_x).clamp(0.0, 1.0);
+                if normal[1] < 0.0 {
+                    u = 1.0 - u;
+                }
+                [u, ((vertex[2] - min[2]) / range_z).clamp(0.0, 1.0)]
             } else if ax >= az {
-                [
-                    ((vertex[2] - min[2]) / range_z).clamp(0.0, 1.0),
-                    ((vertex[1] - min[1]) / range_y).clamp(0.0, 1.0),
-                ]
+                let mut u = ((vertex[2] - min[2]) / range_z).clamp(0.0, 1.0);
+                if normal[0] < 0.0 {
+                    u = 1.0 - u;
+                }
+                [u, ((vertex[1] - min[1]) / range_y).clamp(0.0, 1.0)]
             } else {
-                [
-                    ((vertex[0] - min[0]) / range_x).clamp(0.0, 1.0),
-                    ((vertex[1] - min[1]) / range_y).clamp(0.0, 1.0),
-                ]
+                let mut u = ((vertex[0] - min[0]) / range_x).clamp(0.0, 1.0);
+                if normal[2] < 0.0 {
+                    u = 1.0 - u;
+                }
+                [u, ((vertex[1] - min[1]) / range_y).clamp(0.0, 1.0)]
             }
         })
         .collect()
@@ -2472,28 +2391,84 @@ fn sample_voxel_attr(
     if voxel_map.is_empty() {
         return fallback;
     }
-    let map_axis = |value: f32, dim: u32| -> i32 {
+    let map_axis = |value: f32, dim: u32| -> f32 {
         let dim = dim.max(1) as f32;
-        let coord = ((value + 0.5) * (dim - 1.0)).round();
-        coord.clamp(0.0, dim - 1.0) as i32
+        ((value + 0.5) * (dim - 1.0)).clamp(0.0, dim - 1.0)
     };
-    let base = [
+    let coord = [
         map_axis(position[0], spatial[0]),
         map_axis(position[1], spatial[1]),
         map_axis(position[2], spatial[2]),
     ];
-    let key = pack_coord(base[0] as u32, base[1] as u32, base[2] as u32);
+    let base = [
+        coord[0].floor() as i32,
+        coord[1].floor() as i32,
+        coord[2].floor() as i32,
+    ];
+    let frac = [
+        coord[0] - base[0] as f32,
+        coord[1] - base[1] as f32,
+        coord[2] - base[2] as f32,
+    ];
+
+    let mut accum = [0.0f32; 6];
+    let mut weight_sum = 0.0f32;
+    for dz in 0..=1 {
+        for dy in 0..=1 {
+            for dx in 0..=1 {
+                let x = base[0] + dx;
+                let y = base[1] + dy;
+                let z = base[2] + dz;
+                if x < 0 || y < 0 || z < 0 {
+                    continue;
+                }
+                let x = x.min(spatial[0] as i32 - 1) as u32;
+                let y = y.min(spatial[1] as i32 - 1) as u32;
+                let z = z.min(spatial[2] as i32 - 1) as u32;
+                let wx = if dx == 0 { 1.0 - frac[0] } else { frac[0] };
+                let wy = if dy == 0 { 1.0 - frac[1] } else { frac[1] };
+                let wz = if dz == 0 { 1.0 - frac[2] } else { frac[2] };
+                let weight = wx * wy * wz;
+                let key = pack_coord(x, y, z);
+                if let Some(attrs) = voxel_map.get(&key) {
+                    for ch in 0..6 {
+                        accum[ch] += attrs[ch] * weight;
+                    }
+                    weight_sum += weight;
+                }
+            }
+        }
+    }
+    if weight_sum > 1.0e-8 {
+        let inv = 1.0 / weight_sum;
+        for value in &mut accum {
+            *value *= inv;
+        }
+        return accum;
+    }
+
+    let nearest = [
+        coord[0].round() as i32,
+        coord[1].round() as i32,
+        coord[2].round() as i32,
+    ];
+    let key = pack_coord(
+        nearest[0].clamp(0, spatial[0] as i32 - 1) as u32,
+        nearest[1].clamp(0, spatial[1] as i32 - 1) as u32,
+        nearest[2].clamp(0, spatial[2] as i32 - 1) as u32,
+    );
     if let Some(attrs) = voxel_map.get(&key) {
         return *attrs;
     }
+
     let mut best = None;
     let mut best_dist = f32::INFINITY;
     for dz in -1..=1 {
         for dy in -1..=1 {
             for dx in -1..=1 {
-                let x = base[0] + dx;
-                let y = base[1] + dy;
-                let z = base[2] + dz;
+                let x = nearest[0] + dx;
+                let y = nearest[1] + dy;
+                let z = nearest[2] + dz;
                 if x < 0 || y < 0 || z < 0 {
                     continue;
                 }
@@ -2912,38 +2887,6 @@ fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
     }
 }
 
-fn target_vertex_budget(final_resolution: usize) -> usize {
-    if let Ok(value) = std::env::var("TRELLIS2_TARGET_VERTEX_BUDGET")
-        && let Ok(parsed) = value.trim().parse::<usize>()
-        && parsed > 0
-    {
-        return parsed;
-    }
-    match final_resolution {
-        512 => 1_566_728,
-        1024 => 1_566_728 * 2,
-        1536 => 1_566_728 * 3,
-        _ => 1_566_728,
-    }
-}
-
-fn ranked_shape_indices(shape: &ShapeSLatSample) -> Vec<usize> {
-    let mut ranked = (0..shape.features.len())
-        .map(|idx| {
-            let feat = shape.features[idx];
-            let score = feat[0].abs()
-                + feat[1].abs()
-                + feat[2].abs()
-                + 0.5 * feat[3].abs()
-                + 0.5 * feat[4].abs()
-                + 0.5 * feat[5].abs();
-            (idx, score)
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ranked.into_iter().map(|(idx, _)| idx).collect()
-}
-
 fn canonical_cube() -> Mesh {
     let vertices = vec![
         [-0.5, -0.5, -0.5],
@@ -3027,7 +2970,9 @@ impl Lcg {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "runtime-model")]
     use std::collections::HashMap;
+    #[cfg(feature = "runtime-model")]
     use std::path::PathBuf;
 
     use super::{bake_pbr_from_voxels, summarize_material};
@@ -3131,20 +3076,48 @@ mod tests {
         let reference =
             HookSnapshot::from_file(&reference_path).expect("reference hook should load");
 
-        let shape_coords = tensor_to_coords4(
-            reference
+        let has_decode_inputs = reference
+            .tensors
+            .contains_key("decode_shape_slat.input.coords")
+            && reference
                 .tensors
-                .get("sample_shape_slat.slat.coords")
-                .expect("missing sample_shape_slat.slat.coords"),
-        )
-        .expect("shape coords should decode");
-        let shape_feats = tensor_to_rows::<32>(
-            reference
-                .tensors
-                .get("sample_shape_slat.slat.feats")
-                .expect("missing sample_shape_slat.slat.feats"),
-        )
-        .expect("shape feats should decode");
+                .contains_key("decode_shape_slat.input.feats");
+        let (shape_coords, shape_feats) = if has_decode_inputs {
+            let coords = tensor_to_coords4(
+                reference
+                    .tensors
+                    .get("decode_shape_slat.input.coords")
+                    .expect("missing decode_shape_slat.input.coords"),
+            )
+            .expect("decode input coords should decode");
+            let feats = tensor_to_rows::<32>(
+                reference
+                    .tensors
+                    .get("decode_shape_slat.input.feats")
+                    .expect("missing decode_shape_slat.input.feats"),
+            )
+            .expect("decode input feats should decode");
+            (coords, feats)
+        } else {
+            eprintln!(
+                "runtime_decoder_hook_alignment_report: reference hook missing decode_shape_slat.input.*; using sample_shape_slat.slat.* fallback (subdivision logit comparisons may be context-mismatched)."
+            );
+            let coords = tensor_to_coords4(
+                reference
+                    .tensors
+                    .get("sample_shape_slat.slat.coords")
+                    .expect("missing sample_shape_slat.slat.coords"),
+            )
+            .expect("shape coords should decode");
+            let feats = tensor_to_rows::<32>(
+                reference
+                    .tensors
+                    .get("sample_shape_slat.slat.feats")
+                    .expect("missing sample_shape_slat.slat.feats"),
+            )
+            .expect("shape feats should decode");
+            (coords, feats)
+        };
         let tex_coords = tensor_to_coords4(
             reference
                 .tensors
@@ -3238,30 +3211,32 @@ mod tests {
         let shape_decoded = shape_decoder
             .decode_sparse(&shape_coords[..rows], &shape_feats[..rows])
             .expect("shape decoder should run");
-        for (level, actual_sub) in shape_decoded.subdivisions.iter().enumerate() {
-            if let Some(reference_sub) = reference_subdivisions.get(level) {
-                let (sub_stats, sub_overlap, actual_sub_rows, reference_sub_rows) =
-                    compare_subdivision_overlap(actual_sub, reference_sub);
-                let (actual_min, actual_max, actual_mean) =
-                    tensor_stats(actual_sub.logits.as_slice());
-                let (reference_min, reference_max, reference_mean) =
-                    tensor_stats(reference_sub.logits.as_slice());
-                println!(
-                    "runtime_decoder_hook_alignment_report shape_subdiv.level={} overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} actual[min,max,mean]=[{:.6e},{:.6e},{:.6e}] reference[min,max,mean]=[{:.6e},{:.6e},{:.6e}]",
-                    level,
-                    sub_overlap,
-                    actual_sub_rows,
-                    reference_sub_rows,
-                    sub_stats.mean_abs,
-                    sub_stats.max_abs,
-                    sub_stats.rmse,
-                    actual_min,
-                    actual_max,
-                    actual_mean,
-                    reference_min,
-                    reference_max,
-                    reference_mean
-                );
+        if has_decode_inputs {
+            for (level, actual_sub) in shape_decoded.subdivisions.iter().enumerate() {
+                if let Some(reference_sub) = reference_subdivisions.get(level) {
+                    let (sub_stats, sub_overlap, actual_sub_rows, reference_sub_rows) =
+                        compare_subdivision_overlap(actual_sub, reference_sub);
+                    let (actual_min, actual_max, actual_mean) =
+                        tensor_stats(actual_sub.logits.as_slice());
+                    let (reference_min, reference_max, reference_mean) =
+                        tensor_stats(reference_sub.logits.as_slice());
+                    println!(
+                        "runtime_decoder_hook_alignment_report shape_subdiv.level={} overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} actual[min,max,mean]=[{:.6e},{:.6e},{:.6e}] reference[min,max,mean]=[{:.6e},{:.6e},{:.6e}]",
+                        level,
+                        sub_overlap,
+                        actual_sub_rows,
+                        reference_sub_rows,
+                        sub_stats.mean_abs,
+                        sub_stats.max_abs,
+                        sub_stats.rmse,
+                        actual_min,
+                        actual_max,
+                        actual_mean,
+                        reference_min,
+                        reference_max,
+                        reference_mean
+                    );
+                }
             }
         }
         let tex_decoded = tex_decoder
@@ -3273,29 +3248,33 @@ mod tests {
             .expect("tex decoder should run");
         if env_flag("TRELLIS2_DECODER_DEBUG_REFERENCE_GUIDE")
             && shape_decoded.subdivisions.len() <= reference_subdivisions.len()
-        {
-            if let Ok(tex_decoded_reference_guides) = tex_decoder.decode_with_guidance(
+            && let Ok(tex_decoded_reference_guides) = tex_decoder.decode_with_guidance(
                 &tex_coords[..rows],
                 &tex_feats[..rows],
                 &reference_subdivisions[..shape_decoded.subdivisions.len()],
-            ) {
-                let (ref_guide_stats, ref_guide_overlap, ref_guide_actual_total, ref_guide_reference_total, _) =
-                    compare_tex_voxel_overlap(
-                        tex_decoded_reference_guides.coords.as_slice(),
-                        tex_decoded_reference_guides.attrs.as_slice(),
-                        reference_voxel_coords.as_slice(),
-                        reference_voxel_feats.as_slice(),
-                    );
-                println!(
-                    "runtime_decoder_hook_alignment_report reference_guide overlap={} actual_voxels={} reference_voxels={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
-                    ref_guide_overlap,
-                    ref_guide_actual_total,
-                    ref_guide_reference_total,
-                    ref_guide_stats.mean_abs,
-                    ref_guide_stats.max_abs,
-                    ref_guide_stats.rmse
-                );
-            }
+            )
+        {
+            let (
+                ref_guide_stats,
+                ref_guide_overlap,
+                ref_guide_actual_total,
+                ref_guide_reference_total,
+                _,
+            ) = compare_tex_voxel_overlap(
+                tex_decoded_reference_guides.coords.as_slice(),
+                tex_decoded_reference_guides.attrs.as_slice(),
+                reference_voxel_coords.as_slice(),
+                reference_voxel_feats.as_slice(),
+            );
+            println!(
+                "runtime_decoder_hook_alignment_report reference_guide overlap={} actual_voxels={} reference_voxels={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
+                ref_guide_overlap,
+                ref_guide_actual_total,
+                ref_guide_reference_total,
+                ref_guide_stats.mean_abs,
+                ref_guide_stats.max_abs,
+                ref_guide_stats.rmse
+            );
         }
 
         assert!(
@@ -3307,12 +3286,13 @@ mod tests {
             "decoded tex coords should not be empty"
         );
 
-        let (stats, overlap, actual_total, reference_total, per_channel) = compare_tex_voxel_overlap(
-            tex_decoded.coords.as_slice(),
-            tex_decoded.attrs.as_slice(),
-            reference_voxel_coords.as_slice(),
-            reference_voxel_feats.as_slice(),
-        );
+        let (stats, overlap, actual_total, reference_total, per_channel) =
+            compare_tex_voxel_overlap(
+                tex_decoded.coords.as_slice(),
+                tex_decoded.attrs.as_slice(),
+                reference_voxel_coords.as_slice(),
+                reference_voxel_feats.as_slice(),
+            );
         println!(
             "runtime_decoder_hook_alignment_report overlap={} actual_voxels={} reference_voxels={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
             overlap, actual_total, reference_total, stats.mean_abs, stats.max_abs, stats.rmse
@@ -3330,6 +3310,103 @@ mod tests {
         assert!(
             stats.mean_abs.is_finite() && stats.max_abs.is_finite() && stats.rmse.is_finite(),
             "decoder diff stats must be finite"
+        );
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[test]
+    fn runtime_decoder_stage0_subdivision_alignment_report() {
+        let reference_path = match std::env::var("TRELLIS2_DECODER_REFERENCE_HOOK") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => {
+                eprintln!(
+                    "Skipping runtime_decoder_stage0_subdivision_alignment_report: set TRELLIS2_DECODER_REFERENCE_HOOK to a stage0 alignment hook."
+                );
+                return;
+            }
+        };
+        if !reference_path.exists() {
+            eprintln!(
+                "Skipping runtime_decoder_stage0_subdivision_alignment_report: missing reference hook '{}'",
+                reference_path.display()
+            );
+            return;
+        }
+        let reference =
+            HookSnapshot::from_file(&reference_path).expect("reference hook should load");
+
+        let shape_coords = tensor_to_coords4(
+            reference
+                .tensors
+                .get("sample_shape_slat.slat.coords")
+                .expect("missing sample_shape_slat.slat.coords"),
+        )
+        .expect("shape coords should decode");
+        let shape_feats = tensor_to_rows::<32>(
+            reference
+                .tensors
+                .get("sample_shape_slat.slat.feats")
+                .expect("missing sample_shape_slat.slat.feats"),
+        )
+        .expect("shape feats should decode");
+        let reference_subdivisions = load_reference_subdivisions(&reference)
+            .expect("reference shape subdivisions should decode");
+        let Some(reference_stage0) = reference_subdivisions.first() else {
+            eprintln!(
+                "Skipping runtime_decoder_stage0_subdivision_alignment_report: no decode_shape_slat.subs.0 in '{}'",
+                reference_path.display()
+            );
+            return;
+        };
+
+        let weights_root = resolve_trellis2_weights_root(None);
+        if !weights_root.exists() {
+            eprintln!(
+                "Skipping runtime_decoder_stage0_subdivision_alignment_report: missing weights root '{}'",
+                weights_root.display()
+            );
+            return;
+        }
+        let image_large_root = resolve_trellis2_image_large_root(None);
+        let image_large_root_opt = if image_large_root.exists() {
+            Some(image_large_root)
+        } else {
+            None
+        };
+
+        let pipeline_bytes =
+            std::fs::read(weights_root.join("pipeline.json")).expect("pipeline.json should load");
+        let pipeline = TrellisPipelineConfig::from_json_bytes(pipeline_bytes.as_slice())
+            .expect("pipeline config should parse");
+        let shape_stem = pipeline
+            .args
+            .models
+            .get("shape_slat_decoder")
+            .expect("shape_slat_decoder model stem missing");
+        let shape_decoder = FdgDecoderRuntime::load_from_stem(
+            weights_root.as_path(),
+            image_large_root_opt.as_deref(),
+            shape_stem.as_str(),
+            false,
+        )
+        .expect("shape decoder should load");
+
+        let stage0 = shape_decoder
+            .stage0_subdivision_logits(shape_coords.as_slice(), shape_feats.as_slice())
+            .expect("shape stage0 subdivision should run");
+        let (stats, overlap, actual_rows, reference_rows) =
+            compare_subdivision_overlap(&stage0, reference_stage0);
+        println!(
+            "runtime_decoder_stage0_subdivision_alignment_report overlap={} actual_rows={} reference_rows={} mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
+            overlap, actual_rows, reference_rows, stats.mean_abs, stats.max_abs, stats.rmse
+        );
+        assert!(
+            overlap > 0,
+            "expected overlapping stage0 subdivision coords"
+        );
+        assert!(
+            stats.mean_abs.is_finite() && stats.max_abs.is_finite() && stats.rmse.is_finite(),
+            "stage0 subdivision diff stats must be finite"
         );
     }
 
@@ -3558,12 +3635,30 @@ mod tests {
         let overlap = actual_flat.len() / 6;
         let stats = compute_stats(actual_flat.as_slice(), reference_flat.as_slice());
         let per_channel = [
-            compute_stats(actual_channels[0].as_slice(), reference_channels[0].as_slice()),
-            compute_stats(actual_channels[1].as_slice(), reference_channels[1].as_slice()),
-            compute_stats(actual_channels[2].as_slice(), reference_channels[2].as_slice()),
-            compute_stats(actual_channels[3].as_slice(), reference_channels[3].as_slice()),
-            compute_stats(actual_channels[4].as_slice(), reference_channels[4].as_slice()),
-            compute_stats(actual_channels[5].as_slice(), reference_channels[5].as_slice()),
+            compute_stats(
+                actual_channels[0].as_slice(),
+                reference_channels[0].as_slice(),
+            ),
+            compute_stats(
+                actual_channels[1].as_slice(),
+                reference_channels[1].as_slice(),
+            ),
+            compute_stats(
+                actual_channels[2].as_slice(),
+                reference_channels[2].as_slice(),
+            ),
+            compute_stats(
+                actual_channels[3].as_slice(),
+                reference_channels[3].as_slice(),
+            ),
+            compute_stats(
+                actual_channels[4].as_slice(),
+                reference_channels[4].as_slice(),
+            ),
+            compute_stats(
+                actual_channels[5].as_slice(),
+                reference_channels[5].as_slice(),
+            ),
         ];
         (stats, overlap, actual.len(), reference.len(), per_channel)
     }

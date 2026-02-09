@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use burn::module::{Ignored, Module, Param};
 use burn::nn;
 use burn::prelude::Backend;
 use burn::tensor::activation::{sigmoid, softmax};
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Int, Tensor, TensorData};
 use burn_store::{
     BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
@@ -18,10 +19,45 @@ const F16_SUFFIX: &str = "_f16";
 const MAX_PERIOD: f32 = 10_000.0;
 const LAYER_NORM_EPS: f32 = 1.0e-6;
 const RMS_NORM_EPS: f32 = 1.0e-12;
+static HOST_READBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOST_READBACK_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 
 type CpuRuntimeBackend = burn::backend::NdArray<f32>;
 #[cfg(feature = "runtime-model-wgpu")]
 type WgpuRuntimeBackend = burn_wgpu::Wgpu<f32, i32, u32>;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostTransferStats {
+    pub readback_count: u64,
+    pub readback_elements: u64,
+}
+
+pub fn reset_host_transfer_stats() {
+    HOST_READBACK_COUNT.store(0, Ordering::Relaxed);
+    HOST_READBACK_ELEMENTS.store(0, Ordering::Relaxed);
+}
+
+pub fn host_transfer_stats() -> HostTransferStats {
+    HostTransferStats {
+        readback_count: HOST_READBACK_COUNT.load(Ordering::Relaxed),
+        readback_elements: HOST_READBACK_ELEMENTS.load(Ordering::Relaxed),
+    }
+}
+
+fn record_host_readback(elements: usize) {
+    HOST_READBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    HOST_READBACK_ELEMENTS.fetch_add(elements as u64, Ordering::Relaxed);
+}
+
+#[derive(Clone, Debug)]
+pub struct SparseFlowRowTrace {
+    pub steps: usize,
+    pub row_channels: usize,
+    pub samples: Vec<f32>,
+    pub step_0_x_t: Vec<f32>,
+    pub step_mid_x_t: Vec<f32>,
+    pub step_last_x_t: Vec<f32>,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SparseStructureFlowConfig {
@@ -813,6 +849,7 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             .map_err(|err| format!("failed to read sparse flow output: {err:?}"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sample_with_trace(
         &self,
         noise: &[f32],
@@ -821,6 +858,7 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
         cond: Tensor<B, 3>,
         neg_cond: Tensor<B, 3>,
         concat_cond: Option<&[f32]>,
+        capture_snapshots: bool,
     ) -> Result<FlowEulerSampleTrace, String> {
         let voxel = self.config.resolution * self.config.resolution * self.config.resolution;
         if voxel == 0 {
@@ -891,13 +929,13 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             )?;
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
-            if step_idx == 0 {
+            if capture_snapshots && step_idx == 0 {
                 step_0_x_t = Some(tensor_to_vec(x_t.clone())?);
             }
-            if step_idx == mid_step {
+            if capture_snapshots && step_idx == mid_step {
                 step_mid_x_t = Some(tensor_to_vec(x_t.clone())?);
             }
-            if step_idx + 1 == sample_cfg.steps {
+            if capture_snapshots && step_idx + 1 == sample_cfg.steps {
                 step_last_x_t = Some(tensor_to_vec(x_t.clone())?);
             }
         }
@@ -909,6 +947,174 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             step_mid_x_t: step_mid_x_t.unwrap_or_else(|| samples.clone()),
             step_last_x_t: step_last_x_t.unwrap_or_else(|| samples.clone()),
             samples,
+        })
+    }
+
+    fn gather_rows_from_state(
+        &self,
+        state: Tensor<B, 5>,
+        dense_indices: &[usize],
+        row_channels: usize,
+    ) -> Result<Vec<f32>, String> {
+        let [_, state_channels, rx, ry, rz] = state.dims();
+        let voxel = rx.saturating_mul(ry).saturating_mul(rz).max(1);
+        let channels = row_channels.min(state_channels);
+        if channels == 0 || dense_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let gather_len = channels.saturating_mul(dense_indices.len());
+        let mut gather_indices = Vec::with_capacity(gather_len);
+        for &dense_idx in dense_indices {
+            if dense_idx >= voxel {
+                return Err(format!(
+                    "dense row index out of bounds: idx={} voxel_count={}",
+                    dense_idx, voxel
+                ));
+            }
+            for ch in 0..channels {
+                let flat_idx = ch.saturating_mul(voxel).saturating_add(dense_idx);
+                if flat_idx > i32::MAX as usize {
+                    return Err(format!(
+                        "dense row gather index overflow: idx={} > i32::MAX",
+                        flat_idx
+                    ));
+                }
+                gather_indices.push(flat_idx as i32);
+            }
+        }
+        let gather_shape = [gather_indices.len()];
+        let index_tensor = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(gather_indices, gather_shape).convert::<i32>(),
+            &self.device,
+        );
+        let flat = state.reshape([state_channels.saturating_mul(voxel)]);
+        let selected = flat.select(0, index_tensor);
+        let values = selected
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|err| format!("failed to read sparse-row gather tensor: {err:?}"))?;
+        record_host_readback(values.len());
+        Ok(values)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_rows_with_trace(
+        &self,
+        noise: &[f32],
+        sample_cfg: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<&[f32]>,
+        dense_indices: &[usize],
+        row_channels: usize,
+        capture_snapshots: bool,
+    ) -> Result<SparseFlowRowTrace, String> {
+        let voxel = self.config.resolution * self.config.resolution * self.config.resolution;
+        if voxel == 0 {
+            return Err("sparse flow resolution produced zero voxels".to_string());
+        }
+        if !noise.len().is_multiple_of(voxel) {
+            return Err(format!(
+                "sparse flow sample length mismatch: sample len {} is not divisible by voxel count {}",
+                noise.len(),
+                voxel
+            ));
+        }
+        let state_channels = noise.len() / voxel;
+        if state_channels != self.config.out_channels {
+            return Err(format!(
+                "sparse flow state/output mismatch: state={} expected_out={}",
+                state_channels, self.config.out_channels
+            ));
+        }
+        let concat_channels = concat_cond.map_or(0usize, |values| values.len() / voxel);
+        if state_channels + concat_channels != self.config.in_channels {
+            return Err(format!(
+                "sparse flow channel mismatch: state={} concat={} expected_in={}",
+                state_channels, concat_channels, self.config.in_channels
+            ));
+        }
+        if let Some(values) = concat_cond
+            && !values.len().is_multiple_of(voxel)
+        {
+            return Err(format!(
+                "sparse flow concat cond length mismatch: len {} is not divisible by voxel count {}",
+                values.len(),
+                voxel
+            ));
+        }
+
+        let mut x_t = Tensor::<B, 1>::from_floats(noise, &self.device).reshape([
+            1,
+            state_channels,
+            self.config.resolution,
+            self.config.resolution,
+            self.config.resolution,
+        ]);
+        let concat_tensor = concat_cond.map(|values| {
+            Tensor::<B, 1>::from_floats(values, &self.device).reshape([
+                1,
+                concat_channels,
+                self.config.resolution,
+                self.config.resolution,
+                self.config.resolution,
+            ])
+        });
+
+        let mut step_0_state: Option<Tensor<B, 5>> = None;
+        let mut step_mid_state: Option<Tensor<B, 5>> = None;
+        let mut step_last_state: Option<Tensor<B, 5>> = None;
+        let mid_step = mid_snapshot_step(sample_cfg.steps);
+        let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
+        for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
+            let pred = self.predict_with_cfg_tensor(
+                x_t.clone(),
+                t,
+                sample_cfg,
+                sigma_min,
+                cond.clone(),
+                neg_cond.clone(),
+                concat_tensor.clone(),
+            )?;
+            let dt = t - t_prev;
+            x_t = x_t.sub(pred.mul_scalar(dt));
+            if capture_snapshots && step_idx == 0 {
+                step_0_state = Some(x_t.clone());
+            }
+            if capture_snapshots && step_idx == mid_step {
+                step_mid_state = Some(x_t.clone());
+            }
+            if capture_snapshots && step_idx + 1 == sample_cfg.steps {
+                step_last_state = Some(x_t.clone());
+            }
+        }
+
+        let samples = self.gather_rows_from_state(x_t.clone(), dense_indices, row_channels)?;
+        let step_0_x_t = if let Some(state) = step_0_state {
+            self.gather_rows_from_state(state, dense_indices, row_channels)?
+        } else {
+            samples.clone()
+        };
+        let step_mid_x_t = if let Some(state) = step_mid_state {
+            self.gather_rows_from_state(state, dense_indices, row_channels)?
+        } else {
+            samples.clone()
+        };
+        let step_last_x_t = if let Some(state) = step_last_state {
+            self.gather_rows_from_state(state, dense_indices, row_channels)?
+        } else {
+            samples.clone()
+        };
+
+        Ok(SparseFlowRowTrace {
+            steps: sample_cfg.steps,
+            row_channels: row_channels.min(state_channels),
+            samples,
+            step_0_x_t,
+            step_mid_x_t,
+            step_last_x_t,
         })
     }
 
@@ -947,12 +1153,12 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
 
         let x0_pos = pred_to_xstart_tensor(x_t.clone(), timestep, pos, sigma_min);
         let x0_cfg = pred_to_xstart_tensor(x_t.clone(), timestep, pred.clone(), sigma_min);
-        let std_pos = tensor_std_scalar(x0_pos.clone())?;
-        let std_cfg = tensor_std_scalar(x0_cfg.clone())?.max(1.0e-12);
-        let scale = std_pos / std_cfg;
+        let std_pos = tensor_std_tensor(x0_pos.clone());
+        let std_cfg = tensor_std_tensor(x0_cfg.clone()).add_scalar(1.0e-12);
+        let scale = std_pos.div(std_cfg).reshape([1, 1, 1, 1, 1]);
         let x0 = x0_cfg
             .clone()
-            .mul_scalar(scale)
+            .mul(scale)
             .mul_scalar(config.guidance_rescale)
             .add(x0_cfg.mul_scalar(1.0 - config.guidance_rescale));
         pred = xstart_to_pred_tensor(x_t, timestep, x0, sigma_min);
@@ -1112,6 +1318,7 @@ impl SparseStructureFlowRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sample_with_trace(
         &self,
         noise: &[f32],
@@ -1120,6 +1327,7 @@ impl SparseStructureFlowRuntime {
         condition: &SparseFlowCondition,
         negative_condition: &SparseFlowCondition,
         concat_cond: Option<&[f32]>,
+        capture_snapshots: bool,
     ) -> Result<FlowEulerSampleTrace, String> {
         #[cfg(feature = "runtime-model-wgpu")]
         {
@@ -1135,6 +1343,7 @@ impl SparseStructureFlowRuntime {
                     cond.clone(),
                     neg_cond.clone(),
                     concat_cond,
+                    capture_snapshots,
                 ),
                 (
                     Self::Wgpu(runtime),
@@ -1147,6 +1356,7 @@ impl SparseStructureFlowRuntime {
                     cond.clone(),
                     neg_cond.clone(),
                     concat_cond,
+                    capture_snapshots,
                 ),
                 _ => {
                     Err("sparse flow condition backend does not match runtime backend".to_string())
@@ -1165,6 +1375,77 @@ impl SparseStructureFlowRuntime {
                 cond.clone(),
                 neg_cond.clone(),
                 concat_cond,
+                capture_snapshots,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_with_trace(
+        &self,
+        noise: &[f32],
+        sample_cfg: FlowEulerSampleConfig,
+        sigma_min: f32,
+        condition: &SparseFlowCondition,
+        negative_condition: &SparseFlowCondition,
+        concat_cond: Option<&[f32]>,
+        dense_indices: &[usize],
+        row_channels: usize,
+        capture_snapshots: bool,
+    ) -> Result<SparseFlowRowTrace, String> {
+        #[cfg(feature = "runtime-model-wgpu")]
+        {
+            match (self, condition, negative_condition) {
+                (
+                    Self::Cpu(runtime),
+                    SparseFlowCondition::Cpu(cond),
+                    SparseFlowCondition::Cpu(neg_cond),
+                ) => runtime.sample_rows_with_trace(
+                    noise,
+                    sample_cfg,
+                    sigma_min,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    concat_cond,
+                    dense_indices,
+                    row_channels,
+                    capture_snapshots,
+                ),
+                (
+                    Self::Wgpu(runtime),
+                    SparseFlowCondition::Wgpu(cond),
+                    SparseFlowCondition::Wgpu(neg_cond),
+                ) => runtime.sample_rows_with_trace(
+                    noise,
+                    sample_cfg,
+                    sigma_min,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    concat_cond,
+                    dense_indices,
+                    row_channels,
+                    capture_snapshots,
+                ),
+                _ => {
+                    Err("sparse flow condition backend does not match runtime backend".to_string())
+                }
+            }
+        }
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        {
+            let Self::Cpu(runtime) = self;
+            let SparseFlowCondition::Cpu(cond) = condition;
+            let SparseFlowCondition::Cpu(neg_cond) = negative_condition;
+            runtime.sample_rows_with_trace(
+                noise,
+                sample_cfg,
+                sigma_min,
+                cond.clone(),
+                neg_cond.clone(),
+                concat_cond,
+                dense_indices,
+                row_channels,
+                capture_snapshots,
             )
         }
     }
@@ -1192,7 +1473,7 @@ fn xstart_to_pred_tensor<B: Backend>(
     x_t.mul_scalar(keep).sub(x0).div_scalar(factor)
 }
 
-fn tensor_std_scalar<B: Backend>(tensor: Tensor<B, 5>) -> Result<f32, String> {
+fn tensor_std_tensor<B: Backend>(tensor: Tensor<B, 5>) -> Tensor<B, 1> {
     let [b, c, x, y, z] = tensor.dims();
     let numel = b
         .saturating_mul(c)
@@ -1202,24 +1483,23 @@ fn tensor_std_scalar<B: Backend>(tensor: Tensor<B, 5>) -> Result<f32, String> {
         .max(1);
     let flat = tensor.reshape([numel]);
     let mean = flat.clone().mean_dim(0);
-    let var = flat
-        .sub(mean)
-        .powf_scalar(2.0)
-        .mean_dim(0)
-        .sqrt()
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|err| format!("failed to read sparse flow std tensor: {err:?}"))?;
-    Ok(var.first().copied().unwrap_or(0.0))
+    flat.sub(mean).powf_scalar(2.0).mean_dim(0).sqrt()
 }
 
 fn tensor_to_vec<B: Backend>(tensor: Tensor<B, 5>) -> Result<Vec<f32>, String> {
-    tensor
+    let [b, c, x, y, z] = tensor.dims();
+    let elements = b
+        .saturating_mul(c)
+        .saturating_mul(x)
+        .saturating_mul(y)
+        .saturating_mul(z);
+    let values = tensor
         .into_data()
         .convert::<f32>()
         .to_vec::<f32>()
-        .map_err(|err| format!("failed to read sparse flow tensor: {err:?}"))
+        .map_err(|err| format!("failed to read sparse flow tensor: {err:?}"))?;
+    record_host_readback(elements.max(values.len()));
+    Ok(values)
 }
 
 fn gelu<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {

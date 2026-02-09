@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  TRELLIS2_E2E_STRICT: ${{ vars.TRELLIS2_E2E_STRICT || '' }}
+  TRELLIS2_E2E_DEVICE: ${{ vars.TRELLIS2_E2E_DEVICE || '' }}
+  TRELLIS2_E2E_MAX_HOST_READBACKS: ${{ vars.TRELLIS2_E2E_MAX_HOST_READBACKS || '' }}
+  TRELLIS2_E2E_MAX_HOST_READBACK_ELEMENTS: ${{ vars.TRELLIS2_E2E_MAX_HOST_READBACK_ELEMENTS || '' }}
+  TRELLIS2_WEIGHTS_ROOT: ${{ vars.TRELLIS2_WEIGHTS_ROOT || '' }}
+  TRELLIS2_IMAGE_LARGE_ROOT: ${{ vars.TRELLIS2_IMAGE_LARGE_ROOT || '' }}
 
 jobs:
   test:
@@ -35,3 +41,10 @@ jobs:
 
     - name: test (default)
       run: cargo test
+
+    - name: clippy (trellis)
+      run: cargo clippy -p burn_trellis --features runtime-model-wgpu -- -D warnings
+
+    - name: test (trellis strict optional)
+      if: ${{ env.TRELLIS2_E2E_STRICT == '1' && env.TRELLIS2_WEIGHTS_ROOT != '' }}
+      run: cargo test -p burn_trellis --features runtime-model-wgpu --test e2e_hook_alignment -- --nocapture

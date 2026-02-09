@@ -2292,7 +2292,10 @@ dependencies = [
  "burn_foreground",
  "burn_trellis",
  "burn_tripo",
+ "clap",
+ "gltf",
  "image",
+ "serde_json",
 ]
 
 [[package]]

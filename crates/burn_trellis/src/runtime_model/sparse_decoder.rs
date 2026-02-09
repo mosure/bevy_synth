@@ -314,7 +314,7 @@ impl SparseUnetDecoderRuntime {
             out_channels,
             pred_subdiv: parsed.args.pred_subdiv.unwrap_or(true),
             voxel_margin: parsed.args.voxel_margin.unwrap_or(0.5),
-            compute_fp16: parsed.args.use_fp16.unwrap_or(false),
+            compute_fp16: parsed.args.use_fp16.unwrap_or(false) && !decoder_force_fp32(),
             model_channels: parsed.args.model_channels,
             from_latent,
             output_layer,
@@ -581,6 +581,122 @@ impl SparseUnetDecoderRuntime {
             feats: state_feats,
             out_channels: self.out_channels,
             subdivisions,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stage0_subdivision_logits(
+        &self,
+        coords: &[[u32; 4]],
+        rows: &[[f32; 32]],
+    ) -> Result<SparseSubdivisionLogits, String> {
+        if self.stages.is_empty() {
+            return Err("decoder has no stages".to_string());
+        }
+        let stage = &self.stages[0];
+        let up = stage
+            .upsample_block
+            .as_ref()
+            .ok_or_else(|| "decoder stage0 has no upsample block".to_string())?;
+        let to_subdiv = up
+            .to_subdiv
+            .as_ref()
+            .ok_or_else(|| "decoder stage0 has no to_subdiv head".to_string())?;
+
+        let count = coords.len().min(rows.len());
+        if count == 0 {
+            return Ok(SparseSubdivisionLogits {
+                coords: Vec::new(),
+                logits: Vec::new(),
+                spatial_shape: [1, 1, 1],
+            });
+        }
+
+        let state_coords = coords[..count].to_vec();
+        let mut state_feats = flatten_rows_32(&rows[..count]);
+        state_feats = linear_forward(
+            state_feats.as_slice(),
+            count,
+            &self.from_latent,
+            "from_latent(stage0)",
+        )?;
+        if self.compute_fp16 {
+            quantize_f16_inplace(state_feats.as_mut_slice());
+        }
+
+        let stage_channels = self.model_channels[0];
+        for (block_idx, block) in stage.convnext_blocks.iter().enumerate() {
+            let row_count = state_coords.len();
+            if row_count == 0 {
+                break;
+            }
+            let residual = state_feats.clone();
+            let mut h = sparse_subm_conv_forward(
+                state_coords.as_slice(),
+                state_feats.as_slice(),
+                &block.conv,
+                format!("stage0 block {block_idx} conv(stage0)").as_str(),
+            )?;
+            if self.compute_fp16 {
+                quantize_f16_inplace(h.as_mut_slice());
+            }
+            layer_norm_inplace(
+                h.as_mut_slice(),
+                row_count,
+                stage_channels,
+                Some(block.norm_weight.as_slice()),
+                Some(block.norm_bias.as_slice()),
+                LAYER_NORM32_EPS,
+            )?;
+            if self.compute_fp16 {
+                quantize_f16_inplace(h.as_mut_slice());
+            }
+            h = linear_forward(
+                h.as_slice(),
+                row_count,
+                &block.mlp_0,
+                format!("stage0 block {block_idx} mlp_0(stage0)").as_str(),
+            )?;
+            if self.compute_fp16 {
+                quantize_f16_inplace(h.as_mut_slice());
+            }
+            silu_inplace(h.as_mut_slice());
+            if self.compute_fp16 {
+                quantize_f16_inplace(h.as_mut_slice());
+            }
+            h = linear_forward(
+                h.as_slice(),
+                row_count,
+                &block.mlp_2,
+                format!("stage0 block {block_idx} mlp_2(stage0)").as_str(),
+            )?;
+            if self.compute_fp16 {
+                quantize_f16_inplace(h.as_mut_slice());
+            }
+            add_inplace(h.as_mut_slice(), residual.as_slice());
+            if self.compute_fp16 {
+                quantize_f16_inplace(h.as_mut_slice());
+            }
+            state_feats = h;
+        }
+
+        let mut subdiv_logits = linear_forward(
+            state_feats.as_slice(),
+            state_coords.len(),
+            to_subdiv,
+            "stage0 to_subdiv",
+        )?;
+        if self.compute_fp16 {
+            quantize_f16_inplace(subdiv_logits.as_mut_slice());
+        }
+        if should_center_subdivision_logits() {
+            row_center_logits(subdiv_logits.as_mut_slice(), state_coords.len());
+        }
+
+        Ok(SparseSubdivisionLogits {
+            spatial_shape: spatial_shape_from_coords(state_coords.as_slice()),
+            coords: state_coords,
+            logits: subdiv_logits,
         })
     }
 }
@@ -982,7 +1098,12 @@ fn sparse_subm_conv_forward(
                     if spatial[0] < 0 || spatial[1] < 0 || spatial[2] < 0 {
                         continue;
                     }
-                    let neighbor = [batch, spatial[0] as u32, spatial[1] as u32, spatial[2] as u32];
+                    let neighbor = [
+                        batch,
+                        spatial[0] as u32,
+                        spatial[1] as u32,
+                        spatial[2] as u32,
+                    ];
                     let Some(in_row_idx) = coord_to_row.get(&neighbor).copied() else {
                         continue;
                     };
@@ -1135,6 +1256,18 @@ fn row_center_logits(data: &mut [f32], rows: usize) {
 
 fn should_center_subdivision_logits() -> bool {
     std::env::var("TRELLIS2_DECODER_CENTER_SUBDIV_LOGITS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn decoder_force_fp32() -> bool {
+    std::env::var("TRELLIS2_DECODER_FORCE_FP32")
         .ok()
         .map(|value| {
             matches!(
@@ -1446,7 +1579,9 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use std::sync::Mutex;
 
-    use super::{LinearLayer, SparseConvLayer, linear_forward, logits_to_mask, sparse_subm_conv_forward};
+    use super::{
+        LinearLayer, SparseConvLayer, linear_forward, logits_to_mask, sparse_subm_conv_forward,
+    };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1556,7 +1691,7 @@ mod tests {
             // out0
             expected.push(layer.bias[0] + x[0] * 1.0 + x[1] * 2.0 + x[2] * 3.0);
             // out1
-            expected.push(layer.bias[1] + x[0] * -1.0 + x[1] * 0.5 + x[2] * 4.0);
+            expected.push(layer.bias[1] - x[0] + x[1] * 0.5 + x[2] * 4.0);
         }
         for (got, want) in output.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 1.0e-5, "got={got} want={want}");

@@ -11,7 +11,15 @@ default = []
 triposg = ["dep:burn_tripo"]
 trellis = ["dep:burn_trellis", "burn_trellis/runtime-model"]
 bg-removal = ["dep:burn_foreground"]
-runtime = ["import", "trellis", "dep:burn", "dep:image"]
+runtime = [
+  "import",
+  "trellis",
+  "dep:burn",
+  "dep:clap",
+  "dep:gltf",
+  "dep:image",
+  "dep:serde_json",
+]
 wgpu = ["runtime", "dep:burn-wgpu", "burn_trellis/runtime-model-wgpu"]
 cuda = ["runtime", "dep:burn-cuda"]
 import = [
@@ -23,11 +31,19 @@ import = [
 
 [dependencies]
 burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+gltf = { version = "1.4", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 burn_tripo = { path = "../burn_tripo", optional = true, default-features = false }
 burn_trellis = { path = "../burn_trellis", optional = true }
 burn_foreground = { path = "../burn_foreground", optional = true, default-features = false }
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
 burn-cuda = { version = "0.19", optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[[bin]]
+name = "burn_synth"
+path = "src/main.rs"
+required-features = ["runtime"]
 
 

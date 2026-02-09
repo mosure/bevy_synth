@@ -7,6 +7,8 @@ pub mod pipeline;
 pub mod runtime;
 
 pub use io::{ImageSource, TextPrompt};
+#[cfg(feature = "runtime")]
+pub use io::{mesh_to_glb_bytes, write_glb_mesh};
 pub use mesh::{
     Mesh, MeshLike, MeshMaterial, MeshPbrTextures, MeshStats, MeshTexture, mesh_bounds, mesh_stats,
 };
