@@ -4,7 +4,7 @@ use bevy::prelude::Resource;
 use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
-#[command(about = "burn_synth Bevy viewer", version)]
+#[command(about = "bevy_synth", version)]
 pub struct Args {
     /// Path to an input image for mesh inference.
     #[arg(long)]

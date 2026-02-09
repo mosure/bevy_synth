@@ -444,7 +444,7 @@ fn setup_ui(mut commands: Commands) {
                 })
                 .with_children(|left| {
                     left.spawn((
-                        Text::new("burn_synth"),
+                        Text::new("bevy_synth"),
                         TextFont::from_font_size(16.0),
                         TextColor(Color::srgb(0.92, 0.94, 0.98)),
                     ));

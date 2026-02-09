@@ -816,9 +816,11 @@ fn poll_mcp_scene_control(
     mut selection: ResMut<EditorSelection>,
     transformables: Query<(), With<GizmoTransformable>>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
-    mut main_camera: Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+    mut query_set: ParamSet<(
+        Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+        Query<(&CachedMeshInstance, &Transform)>,
+    )>,
     mut world_cache: ResMut<WorldCachePersistence>,
-    query_cached: Query<(&CachedMeshInstance, &Transform)>,
 ) {
     let Some(path) = control.path.clone() else {
         return;
@@ -941,7 +943,7 @@ fn poll_mcp_scene_control(
                 pitch,
                 radius,
             } => {
-                if let Ok((mut transform, mut orbit)) = main_camera.single_mut() {
+                if let Ok((mut transform, mut orbit)) = query_set.p0().single_mut() {
                     let target_translation = Vec3::from_array(translation);
                     let target_rotation =
                         Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
@@ -989,11 +991,15 @@ fn poll_mcp_scene_control(
     }
 
     if force_cache_flush {
-        let camera_state = main_camera
-            .single()
-            .ok()
-            .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
-        if let Err(err) = flush_world_cache_now(&mut cache, &query_cached, camera_state) {
+        let camera_state = {
+            let main_camera = query_set.p0();
+            main_camera
+                .single()
+                .ok()
+                .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit))
+        };
+        let cached_query = query_set.p1();
+        if let Err(err) = flush_world_cache_now(&mut cache, &cached_query, camera_state) {
             warn!("MCP save_cache failed: {err}");
         } else {
             world_cache.dirty = false;
@@ -1274,11 +1280,11 @@ fn update_window_title(
             format!("{} images", active.len())
         };
         format!(
-            "burn_synth — processing: {name} (queued: {}){dots}",
+            "bevy_synth — processing: {name} (queued: {}){dots}",
             queue.pending.len()
         )
     } else {
-        format!("burn_synth — {}", status.message)
+        format!("bevy_synth — {}", status.message)
     };
 
     if let Ok(mut window) = windows.single_mut() {
