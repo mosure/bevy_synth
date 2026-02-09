@@ -16,8 +16,10 @@ pub struct FlowEulerSampleConfig {
 
 #[derive(Debug, Clone)]
 pub struct FlowEulerSampleTrace {
+    pub steps: usize,
     pub samples: Vec<f32>,
     pub step_0_x_t: Vec<f32>,
+    pub step_mid_x_t: Vec<f32>,
     pub step_last_x_t: Vec<f32>,
 }
 
@@ -60,8 +62,10 @@ impl FlowEulerGuidanceIntervalSampler {
     {
         let mut sample = noise.to_vec();
         let mut step_0_x_t: Option<Vec<f32>> = None;
+        let mut step_mid_x_t: Option<Vec<f32>> = None;
         let mut step_last_x_t: Option<Vec<f32>> = None;
         let t_pairs = timestep_pairs(config.steps, config.rescale_t);
+        let mid_step = mid_snapshot_step(config.steps);
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
             let pred_v = self.predict_with_cfg(&sample, t, &config, &mut predict_v);
             let dt = t - t_prev;
@@ -71,15 +75,21 @@ impl FlowEulerGuidanceIntervalSampler {
             if step_idx == 0 {
                 step_0_x_t = Some(sample.clone());
             }
+            if step_idx == mid_step {
+                step_mid_x_t = Some(sample.clone());
+            }
             if step_idx + 1 == config.steps {
                 step_last_x_t = Some(sample.clone());
             }
         }
         let step_0_x_t = step_0_x_t.unwrap_or_else(|| sample.clone());
+        let step_mid_x_t = step_mid_x_t.unwrap_or_else(|| sample.clone());
         let step_last_x_t = step_last_x_t.unwrap_or_else(|| sample.clone());
         FlowEulerSampleTrace {
+            steps: config.steps,
             samples: sample,
             step_0_x_t,
+            step_mid_x_t,
             step_last_x_t,
         }
     }
@@ -134,7 +144,14 @@ impl FlowEulerGuidanceIntervalSampler {
     }
 }
 
-fn timestep_pairs(steps: usize, rescale_t: f32) -> Vec<(f32, f32)> {
+pub(crate) fn mid_snapshot_step(steps: usize) -> usize {
+    if steps <= 1 {
+        return 0;
+    }
+    ((steps - 1) as f32 * 0.5).round() as usize
+}
+
+pub(crate) fn timestep_pairs(steps: usize, rescale_t: f32) -> Vec<(f32, f32)> {
     let mut out = Vec::with_capacity(steps);
     for i in 0..steps {
         let a = 1.0 - (i as f32 / steps as f32);

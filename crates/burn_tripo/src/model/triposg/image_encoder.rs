@@ -341,7 +341,7 @@ pub mod import {
         bytes: &[u8],
         fallback_size: Option<usize>,
     ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
-        let config: Dinov2ProcessorConfig = serde_json::from_slice(&bytes)?;
+        let config: Dinov2ProcessorConfig = serde_json::from_slice(bytes)?;
         let resize_mode = match config.resample.unwrap_or(3) {
             3 => InterpolateMode::Bicubic,
             2 => InterpolateMode::Bilinear,

@@ -71,7 +71,7 @@ Verify canonical RMBG-2.0 burnpacks:
 Get-ChildItem crates/burn_foreground/assets/models/RMBG-2.0/model*.bpk
 ```
 
-## Trellis2 (native Rust runtime in progress)
+## Trellis2 (native/wasm Rust runtime)
 
 ### Weights
 
@@ -85,14 +85,40 @@ Get-ChildItem crates/burn_foreground/assets/models/RMBG-2.0/model*.bpk
 ### Runtime requirements
 
 - Trellis2 runs through the same Rust `burn_trellis` module on native and wasm (no Python bridge runtime path).
-- Current implementation includes asset validation, preprocessing parity hooks, and import tooling.
-- Full Trellis2 model execution stages are still being implemented.
+- Runtime prefers burnpack weights and loads `*_f16.bpk` first by default.
+- Canonical runtime files under `crates/burn_trellis/assets/models/TRELLIS.2-4B/ckpts`:
+  - `*.bpk` (f32)
+  - `*_f16.bpk` (f16)
+  - `*.json` model configs used by runtime loading
 
 ### Burnpack import (native)
 
 ```powershell
 cargo run -p burn_trellis --features import --bin trellis2_import -- --quantization both
 ```
+
+### Verify imported files
+
+```powershell
+Get-ChildItem crates/burn_trellis/assets/models/TRELLIS.2-4B/ckpts -Filter *.bpk
+Get-ChildItem crates/burn_trellis/assets/models/TRELLIS.2-4B/ckpts -Filter *_f16.bpk
+```
+
+### Hook parity checks
+
+- Baseline sampled hook alignment (runtime model disabled, schema + finite stats checks):
+  - `cargo test -p burn_trellis --test e2e_hook_alignment`
+- Strict gate (non-synthetic sparse stage + `1e-3` threshold on matched hooks):
+  - `$env:TRELLIS2_E2E_STRICT='1'`
+  - `$env:TRELLIS2_E2E_DISABLE_RUNTIME_MODEL='0'`
+  - `cargo test -p burn_trellis --features runtime-model --test e2e_hook_alignment -- --nocapture`
+- Optional runtime sparse-coordinate cap for large runs:
+  - `$env:TRELLIS2_MAX_SPARSE_COORDS='1024'`
+
+### Web asset bundle
+
+- Use `scripts/bundle_web_assets.ps1` to collect runtime web assets into `www/assets/models`.
+- The bundle now includes Trellis runtime assets (`TRELLIS.2-4B` and `TRELLIS-image-large`) in addition to TripoSG and RMBG.
 
 ### App selection
 
@@ -122,3 +148,52 @@ cargo run -p bevy_synth --release -- --synthesis-models triposg --rmbg-model rmb
 ```powershell
 cargo run -p bevy_synth --release -- --synthesis-models trellis,triposg --rmbg-model rmbg2 --trellis-quality medium
 ```
+
+## MCP Server Mesh Output
+
+Example `tools/call` arguments:
+
+```json
+{
+  "name": "image_to_mesh",
+  "arguments": {
+    "input_image_path": "C:/data/input.png",
+    "output_mesh_path": "C:/data/output.glb"
+  }
+}
+```
+
+Notes:
+- `burn_synth_mcp` writes `.glb` only.
+- If `output_mesh_path` has a non-`.glb` extension, the server rewrites it to `.glb`.
+
+## Bevy Scene Control Bridge (Optional)
+
+- `bevy_synth` can optionally ingest external scene commands from a JSON file:
+  - `--mcp-scene-control-path <path-to-json>`
+- This enables an external agent/process to update the live scene and persisted world cache.
+
+Accepted command formats:
+
+- Root array:
+  - `[ { "type": "spawn_cached", ... }, ... ]`
+- Envelope object:
+  - `{ "commands": [ { "type": "spawn_cached", ... }, ... ] }`
+
+Supported command types:
+
+- `spawn_cached`
+  - fields: `cache_key`, optional `translation`, `rotation`, `scale`, `select`
+- `delete_by_cache_key`
+  - fields: `cache_key`
+- `delete_selected`
+- `clear_selection`
+- `set_camera`
+  - fields: `translation`, `rotation`, optional `focus`, `yaw`, `pitch`, `radius`
+- `save_cache`
+
+## Runtime Cache Notes
+
+- `bevy_synth` cache stores mesh payload + `.glb` artifact and persisted camera pose/orbit state.
+- Native default cache root:
+  - `%LOCALAPPDATA%/burn_synth/mesh_cache`

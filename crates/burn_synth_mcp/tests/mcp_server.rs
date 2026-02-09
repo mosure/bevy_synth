@@ -192,7 +192,7 @@ fn mesh_tool_uses_cli_model_defaults_in_dry_run() {
     ]);
     let dir = make_temp_dir("mesh_dry_run");
     let input = dir.join("input.png");
-    let output = dir.join("output_mesh.obj");
+    let output = dir.join("output_mesh.glb");
     write_test_image(&input);
 
     let response = client.send_request(
@@ -211,16 +211,110 @@ fn mesh_tool_uses_cli_model_defaults_in_dry_run() {
         "unexpected tool error: {response:#}"
     );
     assert!(output.exists(), "expected output mesh {}", output.display());
-    let mesh_text = fs::read_to_string(&output).expect("failed to read output mesh");
-    assert!(
-        mesh_text.contains("\nv ") || mesh_text.starts_with("v "),
-        "expected OBJ vertex lines"
-    );
+    let mesh_bytes = fs::read(&output).expect("failed to read output mesh");
+    assert!(mesh_bytes.starts_with(&[0x67, 0x6C, 0x54, 0x46]));
     let structured = response["result"]["structuredContent"].clone();
     assert_eq!(structured["rmbg_model"], json!("rmbg14"));
     assert_eq!(structured["backend"], json!("cpu"));
     assert_eq!(structured["synthesis_models"], json!(["trellis"]));
+    assert_eq!(structured["output_format"], json!("glb"));
     assert_eq!(structured["dry_run"], json!(true));
+
+    client.shutdown();
+}
+
+#[test]
+fn mesh_tool_supports_target_faces_and_material_metadata_fields() {
+    let mut client = McpTestClient::spawn(&[]);
+    let dir = make_temp_dir("mesh_target_faces");
+    let input = dir.join("input.png");
+    let output = dir.join("output_mesh.glb");
+    write_test_image(&input);
+
+    let response = client.send_request(
+        "tools/call",
+        json!({
+            "name": "image_to_mesh",
+            "arguments": {
+                "input_image_path": input.display().to_string(),
+                "output_mesh_path": output.display().to_string(),
+                "target_faces": 4,
+                "dry_run": true
+            }
+        }),
+    );
+    assert!(
+        response["result"]["isError"].is_null(),
+        "unexpected tool error: {response:#}"
+    );
+    assert!(output.exists(), "expected output mesh {}", output.display());
+    let structured = response["result"]["structuredContent"].clone();
+    assert_eq!(structured["target_faces"], json!(4));
+    assert_eq!(structured["output_format"], json!("glb"));
+    assert!(structured["material"].is_null());
+    let face_count = structured["faces"]
+        .as_u64()
+        .expect("faces should be present in structured response");
+    assert!(
+        face_count <= 4_u64,
+        "expected face count <= 4, got {face_count}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn mesh_tool_rejects_non_glb_output_format() {
+    let mut client = McpTestClient::spawn(&[]);
+    let dir = make_temp_dir("mesh_glb_only");
+    let input = dir.join("input.png");
+    write_test_image(&input);
+
+    let rejected_response = client.send_request(
+        "tools/call",
+        json!({
+            "name": "image_to_mesh",
+            "arguments": {
+                "input_image_path": input.display().to_string(),
+                "output_mesh_path": dir.join("output_mesh.obj").display().to_string(),
+                "output_format": "gltf",
+                "dry_run": true
+            }
+        }),
+    );
+    assert!(
+        rejected_response["result"]["isError"] == json!(true),
+        "expected non-glb output format to be rejected: {rejected_response:#}"
+    );
+
+    let glb_output = dir.join("output_mesh.glb");
+    let glb_response = client.send_request(
+        "tools/call",
+        json!({
+            "name": "image_to_mesh",
+            "arguments": {
+                "input_image_path": input.display().to_string(),
+                "output_mesh_path": glb_output.display().to_string(),
+                "output_format": "glb",
+                "dry_run": true
+            }
+        }),
+    );
+    assert!(
+        glb_response["result"]["isError"].is_null(),
+        "unexpected glb tool error: {glb_response:#}"
+    );
+    assert!(glb_output.exists(), "expected GLB output");
+    let glb = fs::read(&glb_output).expect("read glb");
+    assert!(glb.starts_with(&[0x67, 0x6C, 0x54, 0x46]));
+    assert_eq!(
+        glb_response["result"]["structuredContent"]["output_mesh_path"],
+        json!(glb_output.display().to_string())
+    );
+    assert_eq!(
+        glb_response["result"]["structuredContent"]["output_format"],
+        json!("glb")
+    );
 
     client.shutdown();
 }

@@ -652,9 +652,7 @@ pub mod import {
                 return path;
             }
         }
-        let foreground_assets =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-1.4");
-        foreground_assets
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-1.4")
     }
 
     pub fn load_rmbg_processor_config(
@@ -671,7 +669,7 @@ pub mod import {
     pub fn load_rmbg_processor_from_json_bytes(
         bytes: &[u8],
     ) -> Result<super::super::preprocess::RmbgImageProcessor, Box<dyn std::error::Error>> {
-        let config: super::super::preprocess::RmbgProcessorConfig = serde_json::from_slice(&bytes)?;
+        let config: super::super::preprocess::RmbgProcessorConfig = serde_json::from_slice(bytes)?;
         Ok(super::super::preprocess::RmbgImageProcessor::from_config(
             config,
         ))

@@ -7,16 +7,58 @@ use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::hook_diff::{HookSnapshot, HookTensor};
 use crate::config::TrellisQuality;
+use crate::hook_trace::HookTrace;
 use crate::mesh::{Mesh, write_obj_mesh};
-use crate::native::hook_trace::HookTrace;
-use crate::native::preprocess::{PreprocessConfig, preprocess_image, preprocess_image_path};
 use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
-use crate::staged_pipeline::{SparseStructureStageSource, TrellisStageOutput, TrellisStageRuntime};
+use crate::preprocess::{
+    PreprocessConfig, PreprocessOutput, preprocess_image, preprocess_image_path,
+};
+use crate::staged_pipeline::{
+    SparseRowNoiseOverride, SparseStructureStageSource, TrellisNoiseOverrides, TrellisStageOutput,
+    TrellisStageRuntime,
+};
 use crate::trellis_config::TrellisPipelineConfig;
 
 const HOOK_MAX_ROWS: usize = 1024;
 const HOOK_MAX_DENSE_ELEMENTS: usize = 200_000;
+const HOOK_SAMPLER_SNAPSHOTS: usize = 3;
+
+fn hook_full_capture_enabled() -> bool {
+    std::env::var("TRELLIS2_HOOK_FULL")
+        .ok()
+        .or_else(|| std::env::var("TRELLIS2_PARITY_STRICT").ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn hook_max_rows() -> usize {
+    if hook_full_capture_enabled() {
+        return usize::MAX;
+    }
+    std::env::var("TRELLIS2_HOOK_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(HOOK_MAX_ROWS)
+}
+
+fn hook_max_dense_elements() -> usize {
+    if hook_full_capture_enabled() {
+        return usize::MAX;
+    }
+    std::env::var("TRELLIS2_HOOK_MAX_DENSE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(HOOK_MAX_DENSE_ELEMENTS)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,23 +81,13 @@ impl TrellisDevice {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TrellisRunOptions {
     pub quality: TrellisQuality,
     pub device: TrellisDevice,
     pub seed: Option<u64>,
     pub hook_output: Option<PathBuf>,
-}
-
-impl Default for TrellisRunOptions {
-    fn default() -> Self {
-        Self {
-            quality: TrellisQuality::default(),
-            device: TrellisDevice::default(),
-            seed: None,
-            hook_output: None,
-        }
-    }
+    pub noise_overrides_hook: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,9 +117,14 @@ pub struct TrellisInferenceProfile {
 
 impl Default for Trellis2PipelineConfig {
     fn default() -> Self {
+        let image_large_root = resolve_trellis2_image_large_root(None);
         Self {
             weights_root: resolve_trellis2_weights_root(None),
-            image_large_root: Some(resolve_trellis2_image_large_root(None)),
+            image_large_root: if image_large_root.exists() {
+                Some(image_large_root)
+            } else {
+                None
+            },
         }
     }
 }
@@ -120,12 +157,15 @@ pub struct Trellis2Pipeline {
 impl Trellis2Pipeline {
     pub fn from_pretrained(weights_root: impl AsRef<Path>) -> Result<Self, TrellisRuntimeError> {
         let weights_root = resolve_trellis2_weights_root(Some(weights_root.as_ref()));
-        let mut config = Trellis2PipelineConfig::default();
-        config.weights_root = weights_root;
+        let config = Trellis2PipelineConfig {
+            weights_root,
+            ..Default::default()
+        };
         Self::new(config)
     }
 
     pub fn new(config: Trellis2PipelineConfig) -> Result<Self, TrellisRuntimeError> {
+        #[cfg(not(target_arch = "wasm32"))]
         if !config.weights_root.exists() {
             return Err(TrellisRuntimeError::new(format!(
                 "Trellis2 weights root does not exist: {}",
@@ -244,7 +284,9 @@ impl Trellis2Pipeline {
         let runtime = self.load_stage_runtime(options)?;
         let runtime_setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
         let seed = options.seed.unwrap_or(42);
-        let (stage_output, stage_timings) = runtime.run_profiled(&preprocess, seed);
+        let noise_overrides = self.load_noise_overrides(options)?;
+        let (stage_output, stage_timings) =
+            runtime.run_profiled_with_overrides(&preprocess, seed, noise_overrides.as_ref());
         let hook_capture_start = Instant::now();
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
         let hook_capture_ms = hook_capture_start.elapsed().as_secs_f64() * 1000.0;
@@ -285,7 +327,8 @@ impl Trellis2Pipeline {
             .map_err(|err| TrellisRuntimeError::new(format!("preprocess failed: {err}")))?;
         let runtime = self.load_stage_runtime(options)?;
         let seed = options.seed.unwrap_or(42);
-        let stage_output = runtime.run(&preprocess, seed);
+        let noise_overrides = self.load_noise_overrides(options)?;
+        let stage_output = runtime.run_with_overrides(&preprocess, seed, noise_overrides.as_ref());
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
         Ok(stage_output.mesh)
     }
@@ -329,9 +372,64 @@ impl Trellis2Pipeline {
         ))
     }
 
+    fn load_noise_overrides(
+        &self,
+        options: &TrellisRunOptions,
+    ) -> Result<Option<TrellisNoiseOverrides>, TrellisRuntimeError> {
+        let Some(path) = options.noise_overrides_hook.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = HookSnapshot::from_file(path).map_err(|err| {
+            TrellisRuntimeError::new(format!(
+                "failed to load noise override hook '{}': {err}",
+                path.display()
+            ))
+        })?;
+
+        let mut overrides = TrellisNoiseOverrides::default();
+        if let Some(tensor) = snapshot.tensors.get("sample_sparse_structure.noise") {
+            overrides.sparse_noise = Some(tensor.data.clone());
+        }
+        overrides.shape_noise = extract_sparse_row_noise_override(
+            &snapshot,
+            "sample_shape_slat.noise",
+            path.as_path(),
+        )?;
+        overrides.tex_noise = extract_sparse_row_noise_override(
+            &snapshot,
+            "sample_tex_slat.noise",
+            path.as_path(),
+        )?;
+        overrides.cond_512 = extract_dense_f32_override(&snapshot, "get_cond_512.out.cond");
+        overrides.neg_cond_512 =
+            extract_dense_f32_override(&snapshot, "get_cond_512.out.neg_cond");
+        overrides.cond_1024 = extract_dense_f32_override(&snapshot, "get_cond_1024.out.cond");
+        overrides.neg_cond_1024 =
+            extract_dense_f32_override(&snapshot, "get_cond_1024.out.neg_cond");
+
+        if overrides.is_empty() {
+            return Err(TrellisRuntimeError::new(format!(
+                "noise override hook '{}' does not contain any supported noise tensors",
+                path.display()
+            )));
+        }
+        eprintln!(
+            "burn_trellis: loaded noise overrides from '{}': sparse={} shape_rows={} tex_rows={} cond512={} neg512={} cond1024={} neg1024={}",
+            path.display(),
+            overrides.sparse_noise.as_ref().map_or(0usize, |v| v.len()),
+            overrides.shape_noise.as_ref().map_or(0usize, |v| v.coords.len()),
+            overrides.tex_noise.as_ref().map_or(0usize, |v| v.coords.len()),
+            overrides.cond_512.as_ref().map_or(0usize, |v| v.len()),
+            overrides.neg_cond_512.as_ref().map_or(0usize, |v| v.len()),
+            overrides.cond_1024.as_ref().map_or(0usize, |v| v.len()),
+            overrides.neg_cond_1024.as_ref().map_or(0usize, |v| v.len()),
+        );
+        Ok(Some(overrides))
+    }
+
     fn capture_pipeline_hook(
         &self,
-        preprocess: &crate::native::preprocess::PreprocessOutput,
+        preprocess: &PreprocessOutput,
         stage_output: &TrellisStageOutput,
         pipeline_type: &str,
         options: &TrellisRunOptions,
@@ -343,15 +441,17 @@ impl Trellis2Pipeline {
                 preprocess.width as usize,
                 3usize,
             ];
+            let (preprocess_hook_shape, preprocess_hook_rgb) =
+                sample_dense_u8_for_hook(preprocess_shape.as_slice(), preprocess.rgb.as_slice());
             trace
                 .insert_u8(
                     "preprocess_image.output",
-                    preprocess_shape.clone(),
-                    preprocess.rgb.clone(),
+                    preprocess_hook_shape.clone(),
+                    preprocess_hook_rgb.clone(),
                 )
                 .map_err(TrellisRuntimeError::new)?;
             trace
-                .insert_u8("run.image", preprocess_shape, preprocess.rgb.clone())
+                .insert_u8("run.image", preprocess_hook_shape, preprocess_hook_rgb)
                 .map_err(TrellisRuntimeError::new)?;
             trace
                 .insert_f32(
@@ -368,17 +468,52 @@ impl Trellis2Pipeline {
                 )
                 .map_err(TrellisRuntimeError::new)?;
 
-            let cond = build_synthetic_cond_trace(preprocess, HOOK_MAX_DENSE_ELEMENTS);
+            let cond_channels = 1024usize;
+            let cond_512_tokens = 32usize * 32usize + 5usize;
+            let cond = build_synthetic_cond_trace(preprocess, cond_512_tokens, cond_channels);
+            let (cond_shape, cond_values) = sample_dense_f32_for_hook(
+                &[1usize, cond_512_tokens, cond_channels],
+                cond.as_slice(),
+            );
             trace
-                .insert_f32("get_cond_512.out.cond", vec![cond.len()], cond)
+                .insert_f32("get_cond_512.out.cond", cond_shape.clone(), cond_values)
                 .map_err(TrellisRuntimeError::new)?;
+            let neg_cond = vec![0.0f32; cond_512_tokens * cond_channels];
+            let (neg_cond_shape, neg_cond_values) = sample_dense_f32_for_hook(
+                &[1usize, cond_512_tokens, cond_channels],
+                neg_cond.as_slice(),
+            );
             trace
-                .insert_f32(
-                    "get_cond_512.out.neg_cond",
-                    vec![HOOK_MAX_DENSE_ELEMENTS],
-                    vec![0.0f32; HOOK_MAX_DENSE_ELEMENTS],
-                )
+                .insert_f32("get_cond_512.out.neg_cond", neg_cond_shape, neg_cond_values)
                 .map_err(TrellisRuntimeError::new)?;
+            if pipeline_type != "512" && pipeline_type != "512_base" {
+                let cond_1024_tokens = 64usize * 64usize + 5usize;
+                let cond_1024 =
+                    build_synthetic_cond_trace(preprocess, cond_1024_tokens, cond_channels);
+                let (cond_1024_shape, cond_1024_values) = sample_dense_f32_for_hook(
+                    &[1usize, cond_1024_tokens, cond_channels],
+                    cond_1024.as_slice(),
+                );
+                trace
+                    .insert_f32(
+                        "get_cond_1024.out.cond",
+                        cond_1024_shape.clone(),
+                        cond_1024_values,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                let neg_cond_1024 = vec![0.0f32; cond_1024_tokens * cond_channels];
+                let (neg_cond_1024_shape, neg_cond_1024_values) = sample_dense_f32_for_hook(
+                    &[1usize, cond_1024_tokens, cond_channels],
+                    neg_cond_1024.as_slice(),
+                );
+                trace
+                    .insert_f32(
+                        "get_cond_1024.out.neg_cond",
+                        neg_cond_1024_shape,
+                        neg_cond_1024_values,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+            }
 
             let sparse_shape = vec![
                 1usize,
@@ -394,20 +529,21 @@ impl Trellis2Pipeline {
                     stage_output.sparse.noise.clone(),
                 )
                 .map_err(TrellisRuntimeError::new)?;
-            trace
-                .insert_f32(
-                    "sample_sparse_structure.sampler.step_000_of_012.x_t",
-                    sparse_shape.clone(),
-                    stage_output.sparse.step_0_x_t.clone(),
-                )
-                .map_err(TrellisRuntimeError::new)?;
-            trace
-                .insert_f32(
-                    "sample_sparse_structure.sampler.step_011_of_012.x_t",
-                    sparse_shape.clone(),
-                    stage_output.sparse.step_last_x_t.clone(),
-                )
-                .map_err(TrellisRuntimeError::new)?;
+            for step_idx in
+                sampler_snapshot_steps(stage_output.sparse.step_count, HOOK_SAMPLER_SNAPSHOTS)
+            {
+                let key = format!(
+                    "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.x_t",
+                    stage_output.sparse.step_count.max(1)
+                );
+                trace
+                    .insert_f32(
+                        key,
+                        sparse_shape.clone(),
+                        sparse_step_values(&stage_output.sparse, step_idx),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+            }
             trace
                 .insert_f32(
                     "sample_sparse_structure.latent",
@@ -433,24 +569,23 @@ impl Trellis2Pipeline {
                 stage_output.sparse.resolution,
             )
             .map_err(TrellisRuntimeError::new)?;
-            insert_sparse_trace_rows(
-                &mut trace,
-                "sample_shape_slat.sampler.step_000_of_012.x_t",
-                &stage_output.shape_slat.coords,
-                &stage_output.shape_slat.step_0_x_t,
-                32,
-                stage_output.sparse.resolution,
-            )
-            .map_err(TrellisRuntimeError::new)?;
-            insert_sparse_trace_rows(
-                &mut trace,
-                "sample_shape_slat.sampler.step_011_of_012.x_t",
-                &stage_output.shape_slat.coords,
-                &stage_output.shape_slat.step_last_x_t,
-                32,
-                stage_output.sparse.resolution,
-            )
-            .map_err(TrellisRuntimeError::new)?;
+            for step_idx in
+                sampler_snapshot_steps(stage_output.shape_slat.step_count, HOOK_SAMPLER_SNAPSHOTS)
+            {
+                let prefix = format!(
+                    "sample_shape_slat.sampler.step_{step_idx:03}_of_{:03}.x_t",
+                    stage_output.shape_slat.step_count.max(1)
+                );
+                insert_sparse_trace_rows(
+                    &mut trace,
+                    prefix.as_str(),
+                    &stage_output.shape_slat.coords,
+                    shape_slat_step_values(&stage_output.shape_slat, step_idx),
+                    32,
+                    stage_output.sparse.resolution,
+                )
+                .map_err(TrellisRuntimeError::new)?;
+            }
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_shape_slat.slat",
@@ -470,24 +605,23 @@ impl Trellis2Pipeline {
                 stage_output.sparse.resolution,
             )
             .map_err(TrellisRuntimeError::new)?;
-            insert_sparse_trace_rows(
-                &mut trace,
-                "sample_tex_slat.sampler.step_000_of_012.x_t",
-                &stage_output.tex_slat.coords,
-                &stage_output.tex_slat.step_0_x_t,
-                32,
-                stage_output.sparse.resolution,
-            )
-            .map_err(TrellisRuntimeError::new)?;
-            insert_sparse_trace_rows(
-                &mut trace,
-                "sample_tex_slat.sampler.step_011_of_012.x_t",
-                &stage_output.tex_slat.coords,
-                &stage_output.tex_slat.step_last_x_t,
-                32,
-                stage_output.sparse.resolution,
-            )
-            .map_err(TrellisRuntimeError::new)?;
+            for step_idx in
+                sampler_snapshot_steps(stage_output.tex_slat.step_count, HOOK_SAMPLER_SNAPSHOTS)
+            {
+                let prefix = format!(
+                    "sample_tex_slat.sampler.step_{step_idx:03}_of_{:03}.x_t",
+                    stage_output.tex_slat.step_count.max(1)
+                );
+                insert_sparse_trace_rows(
+                    &mut trace,
+                    prefix.as_str(),
+                    &stage_output.tex_slat.coords,
+                    tex_slat_step_values(&stage_output.tex_slat, step_idx),
+                    32,
+                    stage_output.sparse.resolution,
+                )
+                .map_err(TrellisRuntimeError::new)?;
+            }
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.shape_slat_cond",
@@ -558,7 +692,7 @@ impl Trellis2Pipeline {
                 let prefix = format!("decode_shape_slat.subs.{level}");
                 if let Some(sub) = stage_output.decode_shape_subs.get(level) {
                     let mut sub_indices = sampled_row_indices(sub.coords.len(), 4);
-                    pad_indices_to(&mut sub_indices, HOOK_MAX_ROWS);
+                    pad_indices_to(&mut sub_indices, hook_max_rows());
                     let sub_rows = sub_indices.len();
                     trace
                         .insert_f32(
@@ -720,10 +854,223 @@ impl Trellis2Pipeline {
                     vec![voxel_source_coords.len() as f32],
                 )
                 .map_err(TrellisRuntimeError::new)?;
+
+            if let Some(pbr) = stage_output.pbr.as_ref() {
+                let uv_vertices = stage_output
+                    .mesh
+                    .vertices
+                    .iter()
+                    .flat_map(|value| value.iter().copied())
+                    .collect::<Vec<_>>();
+                let uv_faces = stage_output
+                    .mesh
+                    .faces
+                    .iter()
+                    .flat_map(|value| value.iter().map(|index| *index as f32))
+                    .collect::<Vec<_>>();
+                let uv_coords = pbr
+                    .uvs
+                    .iter()
+                    .flat_map(|value| value.iter().copied())
+                    .collect::<Vec<_>>();
+                let sample_positions = pbr
+                    .sample_positions
+                    .iter()
+                    .flat_map(|value| value.iter().copied())
+                    .collect::<Vec<_>>();
+                let sample_attrs = pbr
+                    .sample_attrs
+                    .iter()
+                    .flat_map(|value| value.iter().copied())
+                    .collect::<Vec<_>>();
+                let base_color_float = pbr
+                    .base_color_float
+                    .iter()
+                    .flat_map(|value| value.iter().copied())
+                    .collect::<Vec<_>>();
+
+                trace
+                    .insert_f32(
+                        "pbr.uv_unwrap.vertices",
+                        vec![stage_output.mesh.vertices.len(), 3],
+                        uv_vertices,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.uv_unwrap.faces",
+                        vec![stage_output.mesh.faces.len(), 3],
+                        uv_faces,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32("pbr.uv_unwrap.uvs", vec![pbr.uvs.len(), 2], uv_coords)
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_u8(
+                        "pbr.raster.mask",
+                        vec![pbr.texture_height, pbr.texture_width],
+                        pbr.raster_mask.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.sample.position",
+                        vec![pbr.sample_positions.len(), 3],
+                        sample_positions,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.sample.attrs_float",
+                        vec![pbr.sample_attrs.len(), 6],
+                        sample_attrs,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.texture.base_color_float",
+                        vec![pbr.texture_height, pbr.texture_width, 4],
+                        base_color_float,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.texture.metallic_float",
+                        vec![pbr.texture_height, pbr.texture_width],
+                        pbr.metallic_float.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.texture.roughness_float",
+                        vec![pbr.texture_height, pbr.texture_width],
+                        pbr.roughness_float.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_f32(
+                        "pbr.texture.alpha_float",
+                        vec![pbr.texture_height, pbr.texture_width],
+                        pbr.alpha_float.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_u8(
+                        "pbr.texture.base_color_rgba_u8",
+                        vec![pbr.texture_height, pbr.texture_width, 4],
+                        pbr.base_color_rgba_u8.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                trace
+                    .insert_u8(
+                        "pbr.texture.metallic_roughness_u8",
+                        vec![pbr.texture_height, pbr.texture_width, 4],
+                        pbr.metallic_roughness_u8.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+            }
             trace.save(hook_output).map_err(TrellisRuntimeError::new)?;
         }
         Ok(())
     }
+}
+
+fn extract_sparse_row_noise_override(
+    snapshot: &HookSnapshot,
+    prefix: &str,
+    source_path: &Path,
+) -> Result<Option<SparseRowNoiseOverride>, TrellisRuntimeError> {
+    let coords_key = format!("{prefix}.coords");
+    let feats_key = format!("{prefix}.feats");
+    let coords = snapshot.tensors.get(&coords_key);
+    let feats = snapshot.tensors.get(&feats_key);
+    match (coords, feats) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(TrellisRuntimeError::new(format!(
+            "noise override hook '{}' has incomplete sparse override for '{}': expected both '{}' and '{}'",
+            source_path.display(),
+            prefix,
+            coords_key,
+            feats_key
+        ))),
+        (Some(coords), Some(feats)) => {
+            let mut coords_rows = hook_tensor_to_coords4(coords_key.as_str(), coords)?;
+            let mut feat_rows = hook_tensor_to_rows32(feats_key.as_str(), feats)?;
+            if coords_rows.len() != feat_rows.len() {
+                let keep = coords_rows.len().min(feat_rows.len());
+                coords_rows.truncate(keep);
+                feat_rows.truncate(keep);
+            }
+            Ok(Some(SparseRowNoiseOverride {
+                coords: coords_rows,
+                feats: feat_rows,
+            }))
+        }
+    }
+}
+
+fn extract_dense_f32_override(snapshot: &HookSnapshot, key: &str) -> Option<Vec<f32>> {
+    snapshot.tensors.get(key).map(|tensor| tensor.data.clone())
+}
+
+fn hook_tensor_to_coords4(
+    key: &str,
+    tensor: &HookTensor,
+) -> Result<Vec<[u32; 4]>, TrellisRuntimeError> {
+    if tensor.shape.len() != 2 || tensor.shape[1] != 4 {
+        return Err(TrellisRuntimeError::new(format!(
+            "hook tensor '{key}' has invalid shape {:?}; expected [N, 4]",
+            tensor.shape
+        )));
+    }
+    let rows = tensor.shape[0];
+    if tensor.data.len() != rows * 4 {
+        return Err(TrellisRuntimeError::new(format!(
+            "hook tensor '{key}' has {} elements, expected {}",
+            tensor.data.len(),
+            rows * 4
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row * 4;
+        out.push([
+            tensor.data[base].round().max(0.0) as u32,
+            tensor.data[base + 1].round().max(0.0) as u32,
+            tensor.data[base + 2].round().max(0.0) as u32,
+            tensor.data[base + 3].round().max(0.0) as u32,
+        ]);
+    }
+    Ok(out)
+}
+
+fn hook_tensor_to_rows32(
+    key: &str,
+    tensor: &HookTensor,
+) -> Result<Vec<[f32; 32]>, TrellisRuntimeError> {
+    if tensor.shape.len() != 2 || tensor.shape[1] != 32 {
+        return Err(TrellisRuntimeError::new(format!(
+            "hook tensor '{key}' has invalid shape {:?}; expected [N, 32]",
+            tensor.shape
+        )));
+    }
+    let rows = tensor.shape[0];
+    if tensor.data.len() != rows * 32 {
+        return Err(TrellisRuntimeError::new(format!(
+            "hook tensor '{key}' has {} elements, expected {}",
+            tensor.data.len(),
+            rows * 32
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row * 32;
+        let mut values = [0.0f32; 32];
+        values.copy_from_slice(&tensor.data[base..base + 32]);
+        out.push(values);
+    }
+    Ok(out)
 }
 
 fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
@@ -736,17 +1083,67 @@ fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
 }
 
 fn build_synthetic_cond_trace(
-    preprocess: &crate::native::preprocess::PreprocessOutput,
-    max_elements: usize,
+    preprocess: &PreprocessOutput,
+    tokens: usize,
+    cond_channels: usize,
 ) -> Vec<f32> {
     if preprocess.rgb.is_empty() {
-        return vec![0.0; max_elements];
+        return vec![0.0; tokens * cond_channels];
     }
-    let mut out = Vec::with_capacity(max_elements);
-    for idx in 0..max_elements {
-        let value = preprocess.rgb[idx % preprocess.rgb.len()] as f32 / 255.0;
-        let scale = 0.25 + ((idx % 257) as f32 / 257.0);
-        out.push((value * scale).clamp(0.0, 1.0));
+    let patch_side = (tokens as f32).sqrt().floor().max(1.0) as usize;
+    let patch_tokens = (patch_side * patch_side).min(tokens);
+    let extra_tokens = tokens.saturating_sub(patch_tokens);
+    let width = preprocess.width.max(1) as usize;
+    let height = preprocess.height.max(1) as usize;
+    let mut out = Vec::with_capacity(tokens * cond_channels);
+    for token_idx in 0..tokens {
+        let (x, y, extra_scale) = if token_idx < patch_tokens {
+            let x = token_idx % patch_side;
+            let y = token_idx / patch_side;
+            (x, y, 0.0f32)
+        } else {
+            let extra_idx = token_idx - patch_tokens;
+            let x = width / 2;
+            let y = height / 2;
+            let scale = if extra_tokens > 0 {
+                extra_idx as f32 / extra_tokens as f32
+            } else {
+                0.0
+            };
+            (x, y, scale)
+        };
+        let xx = if token_idx < patch_tokens {
+            (x * width / patch_side).min(width - 1)
+        } else {
+            x.min(width - 1)
+        };
+        let yy = if token_idx < patch_tokens {
+            (y * height / patch_side).min(height - 1)
+        } else {
+            y.min(height - 1)
+        };
+        let offset = (yy * width + xx) * 3;
+        let r = preprocess.rgb[offset] as f32 / 255.0;
+        let g = preprocess.rgb[offset + 1] as f32 / 255.0;
+        let b = preprocess.rgb[offset + 2] as f32 / 255.0;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let nx = if patch_side > 1 {
+            x as f32 / (patch_side as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let ny = if patch_side > 1 {
+            y as f32 / (patch_side as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let basis = [r, g, b, luma, nx, ny, extra_scale];
+        for channel in 0..cond_channels {
+            let base = basis[channel % basis.len()];
+            let gain = 1.0 + ((channel / basis.len()) % 17) as f32 / 17.0;
+            let phase = ((token_idx + channel + 1) as f32 * 0.013).sin();
+            out.push((base * gain + 0.1 * phase).clamp(-1.0, 1.0));
+        }
     }
     out
 }
@@ -789,12 +1186,208 @@ fn insert_sparse_trace_rows(
     Ok(())
 }
 
+fn sparse_step_values(
+    sparse: &crate::staged_pipeline::SparseStructureSample,
+    step_idx: usize,
+) -> Vec<f32> {
+    let num_steps = sparse.step_count.max(1);
+    let last_step = num_steps.saturating_sub(1);
+    let mid_step = sampler_mid_step(num_steps);
+    if step_idx == 0 {
+        return sparse.step_0_x_t.clone();
+    }
+    if step_idx == mid_step {
+        return sparse.step_mid_x_t.clone();
+    }
+    if step_idx == last_step {
+        return sparse.step_last_x_t.clone();
+    }
+    sparse.step_last_x_t.clone()
+}
+
+fn shape_slat_step_values(
+    shape: &crate::staged_pipeline::ShapeSLatSample,
+    step_idx: usize,
+) -> &[[f32; 32]] {
+    let num_steps = shape.step_count.max(1);
+    let last_step = num_steps.saturating_sub(1);
+    let mid_step = sampler_mid_step(num_steps);
+    if step_idx == 0 {
+        return shape.step_0_x_t.as_slice();
+    }
+    if step_idx == mid_step {
+        return shape.step_mid_x_t.as_slice();
+    }
+    if step_idx == last_step {
+        return shape.step_last_x_t.as_slice();
+    }
+    shape.step_last_x_t.as_slice()
+}
+
+fn tex_slat_step_values(
+    tex: &crate::staged_pipeline::TexSLatSample,
+    step_idx: usize,
+) -> &[[f32; 32]] {
+    let num_steps = tex.step_count.max(1);
+    let last_step = num_steps.saturating_sub(1);
+    let mid_step = sampler_mid_step(num_steps);
+    if step_idx == 0 {
+        return tex.step_0_x_t.as_slice();
+    }
+    if step_idx == mid_step {
+        return tex.step_mid_x_t.as_slice();
+    }
+    if step_idx == last_step {
+        return tex.step_last_x_t.as_slice();
+    }
+    tex.step_last_x_t.as_slice()
+}
+
+fn sampler_snapshot_steps(num_steps: usize, snapshots: usize) -> Vec<usize> {
+    let steps = num_steps.max(1);
+    let snaps = snapshots.max(1);
+    if steps <= snaps {
+        return (0..steps).collect();
+    }
+    if snaps <= 1 {
+        return vec![steps - 1];
+    }
+
+    let mut out = Vec::with_capacity(snaps);
+    for i in 0..snaps {
+        let pos = i as f64 * (steps - 1) as f64 / (snaps - 1) as f64;
+        let idx = pos.round() as usize;
+        if out.last().copied() != Some(idx) {
+            out.push(idx);
+        }
+    }
+    out
+}
+
+fn sampler_mid_step(num_steps: usize) -> usize {
+    if num_steps <= 1 {
+        return 0;
+    }
+    ((num_steps - 1) as f32 * 0.5).round() as usize
+}
+
+fn sample_dense_u8_for_hook(shape: &[usize], data: &[u8]) -> (Vec<usize>, Vec<u8>) {
+    if hook_full_capture_enabled() {
+        return (shape.to_vec(), data.to_vec());
+    }
+
+    let max_dense = hook_max_dense_elements();
+    if shape.is_empty() {
+        return (vec![data.len()], data.to_vec());
+    }
+    let mut sampled_shape = shape.to_vec();
+    let mut sampled_data = data.to_vec();
+
+    if sampled_shape.len() >= 2 && sampled_shape[0] > 0 {
+        let per_row = sampled_shape[1..]
+            .iter()
+            .copied()
+            .fold(1usize, |acc, dim| acc.saturating_mul(dim.max(1)));
+        let row_cap = sampled_row_cap(per_row);
+        let row_indices = uniform_sample_indices(sampled_shape[0], row_cap);
+        if row_indices.len() != sampled_shape[0] {
+            let mut row_sampled = Vec::with_capacity(row_indices.len().saturating_mul(per_row));
+            for idx in row_indices {
+                let start = idx.saturating_mul(per_row);
+                let end = start.saturating_add(per_row).min(sampled_data.len());
+                if end > start {
+                    row_sampled.extend_from_slice(&sampled_data[start..end]);
+                }
+            }
+            sampled_shape[0] = row_sampled.len() / per_row.max(1);
+            sampled_data = row_sampled;
+        }
+    }
+
+    let numel = sampled_shape
+        .iter()
+        .copied()
+        .fold(1usize, |acc, dim| acc.saturating_mul(dim.max(1)));
+    if numel > max_dense && !sampled_data.is_empty() {
+        let flat_indices = uniform_sample_indices(numel, max_dense);
+        let mut flat = Vec::with_capacity(flat_indices.len());
+        for idx in flat_indices {
+            if let Some(value) = sampled_data.get(idx) {
+                flat.push(*value);
+            }
+        }
+        sampled_shape = vec![flat.len()];
+        sampled_data = flat;
+    }
+
+    (sampled_shape, sampled_data)
+}
+
+fn sample_dense_f32_for_hook(shape: &[usize], data: &[f32]) -> (Vec<usize>, Vec<f32>) {
+    if hook_full_capture_enabled() {
+        return (shape.to_vec(), data.to_vec());
+    }
+
+    let max_dense = hook_max_dense_elements();
+    if shape.is_empty() {
+        return (vec![data.len()], data.to_vec());
+    }
+    let mut sampled_shape = shape.to_vec();
+    let mut sampled_data = data.to_vec();
+
+    if sampled_shape.len() >= 2 && sampled_shape[0] > 0 {
+        let per_row = sampled_shape[1..]
+            .iter()
+            .copied()
+            .fold(1usize, |acc, dim| acc.saturating_mul(dim.max(1)));
+        let row_cap = sampled_row_cap(per_row);
+        let row_indices = uniform_sample_indices(sampled_shape[0], row_cap);
+        if row_indices.len() != sampled_shape[0] {
+            let mut row_sampled = Vec::with_capacity(row_indices.len().saturating_mul(per_row));
+            for idx in row_indices {
+                let start = idx.saturating_mul(per_row);
+                let end = start.saturating_add(per_row).min(sampled_data.len());
+                if end > start {
+                    row_sampled.extend_from_slice(&sampled_data[start..end]);
+                }
+            }
+            sampled_shape[0] = row_sampled.len() / per_row.max(1);
+            sampled_data = row_sampled;
+        }
+    }
+
+    let numel = sampled_shape
+        .iter()
+        .copied()
+        .fold(1usize, |acc, dim| acc.saturating_mul(dim.max(1)));
+    if numel > max_dense && !sampled_data.is_empty() {
+        let flat_indices = uniform_sample_indices(numel, max_dense);
+        let mut flat = Vec::with_capacity(flat_indices.len());
+        for idx in flat_indices {
+            if let Some(value) = sampled_data.get(idx) {
+                flat.push(*value);
+            }
+        }
+        sampled_shape = vec![flat.len()];
+        sampled_data = flat;
+    }
+
+    (sampled_shape, sampled_data)
+}
+
+fn sampled_row_cap(per_row_elements: usize) -> usize {
+    if hook_full_capture_enabled() {
+        return usize::MAX;
+    }
+    let dense_cap = (hook_max_dense_elements() / per_row_elements.max(1)).max(1);
+    hook_max_rows().min(dense_cap).max(1)
+}
+
 fn sampled_row_indices(total_rows: usize, per_row_elements: usize) -> Vec<usize> {
     if total_rows == 0 {
         return Vec::new();
     }
-    let dense_cap = (HOOK_MAX_DENSE_ELEMENTS / per_row_elements.max(1)).max(1);
-    let cap = HOOK_MAX_ROWS.min(dense_cap).max(1);
+    let cap = sampled_row_cap(per_row_elements);
     uniform_sample_indices(total_rows, cap)
 }
 
@@ -822,7 +1415,7 @@ fn uniform_sample_indices(total: usize, cap: usize) -> Vec<usize> {
 }
 
 fn pad_indices_to(indices: &mut Vec<usize>, target: usize) {
-    if indices.is_empty() || indices.len() >= target {
+    if target == usize::MAX || indices.is_empty() || indices.len() >= target {
         return;
     }
     let seed = indices.clone();

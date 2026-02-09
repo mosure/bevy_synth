@@ -1,18 +1,13 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, ValueEnum, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrellisQuality {
     Low,
+    #[default]
     Medium,
     High,
-}
-
-impl Default for TrellisQuality {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

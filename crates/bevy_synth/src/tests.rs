@@ -8,14 +8,15 @@ use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState};
 
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference};
-use bevy_synth_runtime::TripoMesh;
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend, RmbgModel, SynthesisModel,
+    TrellisQuality,
 };
 use bevy_synth_runtime::cache::MeshCache;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
+use bevy_synth_runtime::{SynthMesh, TripoMesh};
 use bevy_transform_gizmos::GizmoTransformable;
 
 fn test_args() -> AppArgs {
@@ -25,6 +26,11 @@ fn test_args() -> AppArgs {
         text_embeds: None,
         text_embeds_key: "input.text_embeds".to_string(),
         weights_root: None,
+        trellis_weights_root: None,
+        trellis_image_large_root: None,
+        trellis_python_bin: None,
+        trellis_bridge_script: None,
+        trellis_quality: TrellisQuality::Medium,
         scribble_weights_root: None,
         num_steps: 1,
         num_tokens: 4,
@@ -53,14 +59,15 @@ fn test_args() -> AppArgs {
         rmbg_backend: RmbgBackend::Auto,
         dino_backend: DinoBackend::Auto,
         max_batch_size: 1,
+        mcp_scene_control_path: None,
     }
 }
 
-fn dummy_mesh() -> TripoMesh {
-    TripoMesh {
+fn dummy_mesh() -> SynthMesh {
+    SynthMesh::from(TripoMesh {
         vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         faces: vec![[0, 1, 2]],
-    }
+    })
 }
 
 fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStatus) -> App {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use burn_trellis::hook_diff::{HookSnapshot, compute_stats};
-use burn_trellis::native::preprocess::{PreprocessConfig, preprocess_image_path};
+use burn_trellis::preprocess::{PreprocessConfig, preprocess_image_path};
 
 const MEAN_ABS_TOLERANCE: f32 = 0.0;
 const MAX_ABS_TOLERANCE: f32 = 0.0;

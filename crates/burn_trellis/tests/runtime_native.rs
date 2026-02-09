@@ -33,7 +33,7 @@ fn native_pipeline_writes_mesh_and_preprocess_hook() {
 
     let input = root.join("input.png");
     let image = ImageBuffer::from_fn(8, 8, |x, y| {
-        if x >= 2 && x <= 5 && y >= 1 && y <= 6 {
+        if (2..=5).contains(&x) && (1..=6).contains(&y) {
             Rgba([200u8, 120u8, 40u8, 255u8])
         } else {
             Rgba([0u8, 0u8, 0u8, 0u8])

@@ -55,6 +55,7 @@ use burn_tripo::pipeline::{
     triposg_scribble::TripoSGScribblePipeline,
 };
 
+use crate::SynthMesh;
 use crate::args::TrellisQuality;
 use crate::args::{
     AppArgs, BackendKind, DEFAULT_CHUNK_SIZE, DinoBackend, MeshMode, RmbgBackend, RmbgModel,
@@ -266,17 +267,17 @@ struct DinoCpuState {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+type Rmbg14Pipelines<B> = (
+    Option<RmbgPipeline<burn::backend::NdArray<f32>>>,
+    Option<RmbgPipeline<B>>,
+);
+
+#[cfg(not(target_arch = "wasm32"))]
 fn load_rmbg14_pipelines<B: Backend>(
     rmbg_root: &std::path::Path,
     rmbg_backend: RmbgBackend,
     device: &B::Device,
-) -> Result<
-    (
-        Option<RmbgPipeline<burn::backend::NdArray<f32>>>,
-        Option<RmbgPipeline<B>>,
-    ),
-    String,
-> {
+) -> Result<Rmbg14Pipelines<B>, String> {
     match rmbg_backend {
         RmbgBackend::Cpu => {
             let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
@@ -1264,7 +1265,7 @@ fn run_inference_with_state<B: Backend>(
     state: &mut PipelineState<B>,
     args: &AppArgs,
     requests: &[InferenceRequest],
-) -> Vec<Result<Option<TripoMesh>, String>> {
+) -> Vec<Result<Option<SynthMesh>, String>> {
     if requests.is_empty() {
         return Vec::new();
     }
@@ -1282,7 +1283,7 @@ fn run_inference_with_state<B: Backend>(
     let device = state.device.clone();
     let prepare_config =
         prepare_image_config_for_backend::<B>(state.rmbg_model, state.rmbg_backend);
-    let mut results: Vec<Option<Result<Option<TripoMesh>, String>>> = vec![None; requests.len()];
+    let mut results: Vec<Option<Result<Option<SynthMesh>, String>>> = vec![None; requests.len()];
     let mut batch_indices = Vec::new();
     let mut batch_images = Vec::new();
     let mut batch_prepared = Vec::new();
@@ -1371,7 +1372,7 @@ fn run_trellis_batch<B: Backend>(
     state: &mut PipelineState<B>,
     args: &AppArgs,
     requests: &[InferenceRequest],
-) -> Result<Vec<Result<Option<TripoMesh>, String>>, String> {
+) -> Result<Vec<Result<Option<SynthMesh>, String>>, String> {
     let pipeline = state.trellis.as_ref().ok_or_else(|| {
         if let Some(err) = state.trellis_load_error.as_ref() {
             format!("Trellis backend is unavailable: {err}")
@@ -1388,13 +1389,11 @@ fn run_trellis_batch<B: Backend>(
             device,
             seed: args.seed,
             hook_output: None,
+            noise_overrides_hook: None,
         };
         match pipeline.infer_mesh(&request.image_path, &options) {
             Ok(mesh) => {
-                let mesh = TripoMesh {
-                    vertices: mesh.vertices,
-                    faces: mesh.faces,
-                };
+                let mesh = SynthMesh::from(mesh);
                 results.push(Ok(apply_mesh_decimation(Some(mesh), args.target_faces)));
             }
             Err(err) => {
@@ -1457,7 +1456,7 @@ fn run_triposg_batch<B: Backend>(
     args: &AppArgs,
     images: &[Tensor<B, 4>],
     prepared_cpu: &[Option<PreparedImageData>],
-) -> Result<Vec<Result<Option<TripoMesh>, String>>, String> {
+) -> Result<Vec<Result<Option<SynthMesh>, String>>, String> {
     if images.len() != prepared_cpu.len() {
         return Err("prepared image mismatch".to_string());
     }
@@ -1529,7 +1528,10 @@ fn run_triposg_batch<B: Backend>(
         if mesh.is_none() {
             log_empty_mesh_stats(label, &grid);
         }
-        results.push(Ok(apply_mesh_decimation(mesh, args.target_faces)));
+        results.push(Ok(apply_mesh_decimation(
+            mesh.map(SynthMesh::from),
+            args.target_faces,
+        )));
     }
 
     Ok(results)
@@ -1539,7 +1541,7 @@ fn run_scribble_batch<B: Backend>(
     state: &mut PipelineState<B>,
     args: &AppArgs,
     images: &[Tensor<B, 4>],
-) -> Result<Vec<Result<Option<TripoMesh>, String>>, String> {
+) -> Result<Vec<Result<Option<SynthMesh>, String>>, String> {
     let bounds = state.bounds;
     let chunk_size = state.chunk_size;
     let hierarchical = state.hierarchical.clone();
@@ -1588,7 +1590,10 @@ fn run_scribble_batch<B: Backend>(
         if mesh.is_none() {
             log_empty_mesh_stats("TripoSG-scribble", &grid);
         }
-        results.push(Ok(apply_mesh_decimation(mesh, args.target_faces)));
+        results.push(Ok(apply_mesh_decimation(
+            mesh.map(SynthMesh::from),
+            args.target_faces,
+        )));
     }
 
     Ok(results)
@@ -1923,16 +1928,16 @@ fn log_empty_mesh_stats(label: &str, grid: &burn_tripo::pipeline::mesh::DenseGri
 }
 
 fn apply_mesh_decimation(
-    mesh: Option<TripoMesh>,
+    mesh: Option<SynthMesh>,
     target_faces: Option<usize>,
-) -> Option<TripoMesh> {
+) -> Option<SynthMesh> {
     let target_faces = target_faces.filter(|value| *value > 0);
     let mut mesh = mesh?;
     if let Some(target) = target_faces
-        && mesh.faces.len() > target
+        && mesh.mesh.faces.len() > target
     {
-        match decimate_mesh(&mesh, target) {
-            Ok(decimated) => mesh = decimated,
+        match decimate_mesh(&mesh.mesh, target) {
+            Ok(decimated) => mesh.mesh = decimated,
             Err(err) => warn!("mesh decimation failed ({err}); using full mesh."),
         }
     }

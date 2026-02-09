@@ -138,7 +138,7 @@ pub struct Args {
     #[arg(long)]
     pub faces: Option<usize>,
 
-    /// Path to write an OBJ file for the inferred mesh.
+    /// Path to write a GLB file for the inferred mesh.
     #[arg(long)]
     pub output: Option<PathBuf>,
 
@@ -178,6 +178,10 @@ pub struct Args {
     /// Maximum number of queued images to batch per inference dispatch.
     #[arg(long, default_value_t = 1)]
     pub max_batch_size: usize,
+
+    /// Optional JSON command file path for external MCP/agent scene control.
+    #[arg(long)]
+    pub mcp_scene_control_path: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -345,6 +349,7 @@ pub struct AppArgs {
     pub rmbg_backend: RmbgBackend,
     pub dino_backend: DinoBackend,
     pub max_batch_size: usize,
+    pub mcp_scene_control_path: Option<PathBuf>,
 }
 
 pub fn build_app_args(args: Args) -> AppArgs {
@@ -419,6 +424,7 @@ pub fn build_app_args(args: Args) -> AppArgs {
         rmbg_backend: args.rmbg_backend,
         dino_backend: args.dino_backend,
         max_batch_size: args.max_batch_size.max(1),
+        mcp_scene_control_path: args.mcp_scene_control_path,
     }
 }
 

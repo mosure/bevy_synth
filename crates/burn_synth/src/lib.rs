@@ -7,7 +7,9 @@ pub mod pipeline;
 pub mod runtime;
 
 pub use io::{ImageSource, TextPrompt};
-pub use mesh::{Mesh, MeshLike, MeshStats, mesh_bounds, mesh_stats};
+pub use mesh::{
+    Mesh, MeshLike, MeshMaterial, MeshPbrTextures, MeshStats, MeshTexture, mesh_bounds, mesh_stats,
+};
 pub use pipeline::{
     ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisModel,
     sanitize_synthesis_models,

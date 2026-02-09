@@ -10,6 +10,10 @@ use burn_store::{
 };
 use serde::Deserialize;
 
+use crate::sampler::{
+    FlowEulerSampleConfig, FlowEulerSampleTrace, mid_snapshot_step, timestep_pairs,
+};
+
 const F16_SUFFIX: &str = "_f16";
 const MAX_PERIOD: f32 = 10_000.0;
 const LAYER_NORM_EPS: f32 = 1.0e-6;
@@ -276,6 +280,7 @@ pub(crate) struct SparseStructureFlowRuntimeImpl<B: Backend> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SparseStructureFlowRuntime {
     Cpu(SparseStructureFlowRuntimeImpl<CpuRuntimeBackend>),
     #[cfg(feature = "runtime-model-wgpu")]
@@ -474,6 +479,7 @@ impl<B: Backend> CrossAttention<B> {
 }
 
 impl<B: Backend> ModulatedTransformerCrossBlock<B> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &B::Device,
         channels: usize,
@@ -664,6 +670,7 @@ where
         weights_root: &Path,
         image_large_root: Option<&Path>,
         model_stem: &str,
+        resolution_override: Option<usize>,
     ) -> Result<Self, String> {
         let config_path =
             resolve_model_source_path(model_stem, "json", weights_root, image_large_root);
@@ -673,7 +680,13 @@ where
                 config_path.display()
             )
         })?;
-        let config = SparseStructureFlowConfig::from_json_bytes(&config_bytes)?;
+        let mut config = SparseStructureFlowConfig::from_json_bytes(&config_bytes)?;
+        if let Some(override_resolution) = resolution_override {
+            if override_resolution == 0 {
+                return Err("sparse flow resolution override must be > 0".to_string());
+            }
+            config.resolution = override_resolution;
+        }
         if !config.share_mod {
             return Err(format!(
                 "unsupported sparse structure flow config '{}': share_mod=false is not yet supported",
@@ -681,20 +694,35 @@ where
             ));
         }
 
-        let weights_path = resolve_model_weights_path(model_stem, weights_root, image_large_root)
-            .ok_or_else(|| {
-            format!("unable to resolve sparse structure flow weights for stem '{model_stem}'")
-        })?;
-
+        let weight_candidates =
+            resolve_model_weight_candidates(model_stem, weights_root, image_large_root);
+        if weight_candidates.is_empty() {
+            return Err(format!(
+                "unable to resolve sparse structure flow weights for stem '{model_stem}'"
+            ));
+        }
         let device = B::Device::default();
-        let mut model = SparseStructureFlowModel::<B>::new(&device, config.clone());
-        load_sparse_model_weights(&mut model, &weights_path)?;
+        let mut last_error = None;
+        for weights_path in weight_candidates {
+            let mut model = SparseStructureFlowModel::<B>::new(&device, config.clone());
+            match load_sparse_model_weights(&mut model, &weights_path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        config,
+                        model,
+                        device,
+                    });
+                }
+                Err(err) => {
+                    last_error = Some(format!("{} ({err})", weights_path.display()));
+                }
+            }
+        }
 
-        Ok(Self {
-            config,
-            model,
-            device,
-        })
+        Err(format!(
+            "failed to load sparse structure flow weights for stem '{model_stem}': {}",
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 }
 
@@ -719,23 +747,58 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
         ]))
     }
 
+    #[allow(dead_code)]
     fn predict_velocity_with_condition(
         &self,
         x_t: &[f32],
         timestep: f32,
         cond: Tensor<B, 3>,
+        concat_cond: Option<&[f32]>,
     ) -> Result<Vec<f32>, String> {
         let voxel = self.config.resolution * self.config.resolution * self.config.resolution;
-        let sample_elements = self.config.in_channels * voxel;
-        if x_t.len() != sample_elements {
+        if !x_t.len().is_multiple_of(voxel) {
             return Err(format!(
-                "sparse flow sample length mismatch: expected {}, got {}",
-                sample_elements,
-                x_t.len()
+                "sparse flow sample length mismatch: sample len {} is not divisible by voxel count {}",
+                x_t.len(),
+                voxel
+            ));
+        }
+        let state_channels = x_t.len() / voxel;
+        let concat_channels = if let Some(cond) = concat_cond {
+            if cond.len() % voxel != 0 {
+                return Err(format!(
+                    "sparse flow concat cond length mismatch: len {} is not divisible by voxel count {}",
+                    cond.len(),
+                    voxel
+                ));
+            }
+            cond.len() / voxel
+        } else {
+            0usize
+        };
+        if state_channels + concat_channels != self.config.in_channels {
+            return Err(format!(
+                "sparse flow channel mismatch: state={} concat={} expected_in={}",
+                state_channels, concat_channels, self.config.in_channels
+            ));
+        }
+        if state_channels != self.config.out_channels {
+            return Err(format!(
+                "sparse flow state/output mismatch: state={} expected_out={}",
+                state_channels, self.config.out_channels
             ));
         }
 
-        let sample = Tensor::<B, 1>::from_floats(x_t, &self.device).reshape([
+        let input = if let Some(concat) = concat_cond {
+            let mut merged = Vec::with_capacity((state_channels + concat_channels) * voxel);
+            merged.extend_from_slice(x_t);
+            merged.extend_from_slice(concat);
+            merged
+        } else {
+            x_t.to_vec()
+        };
+
+        let sample = Tensor::<B, 1>::from_floats(input.as_slice(), &self.device).reshape([
             1,
             self.config.in_channels,
             self.config.resolution,
@@ -749,6 +812,211 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             .to_vec::<f32>()
             .map_err(|err| format!("failed to read sparse flow output: {err:?}"))
     }
+
+    fn sample_with_trace(
+        &self,
+        noise: &[f32],
+        sample_cfg: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<&[f32]>,
+    ) -> Result<FlowEulerSampleTrace, String> {
+        let voxel = self.config.resolution * self.config.resolution * self.config.resolution;
+        if voxel == 0 {
+            return Err("sparse flow resolution produced zero voxels".to_string());
+        }
+        if !noise.len().is_multiple_of(voxel) {
+            return Err(format!(
+                "sparse flow sample length mismatch: sample len {} is not divisible by voxel count {}",
+                noise.len(),
+                voxel
+            ));
+        }
+        let state_channels = noise.len() / voxel;
+        if state_channels != self.config.out_channels {
+            return Err(format!(
+                "sparse flow state/output mismatch: state={} expected_out={}",
+                state_channels, self.config.out_channels
+            ));
+        }
+        let concat_channels = concat_cond.map_or(0usize, |values| values.len() / voxel);
+        if state_channels + concat_channels != self.config.in_channels {
+            return Err(format!(
+                "sparse flow channel mismatch: state={} concat={} expected_in={}",
+                state_channels, concat_channels, self.config.in_channels
+            ));
+        }
+        if let Some(values) = concat_cond
+            && !values.len().is_multiple_of(voxel)
+        {
+            return Err(format!(
+                "sparse flow concat cond length mismatch: len {} is not divisible by voxel count {}",
+                values.len(),
+                voxel
+            ));
+        }
+
+        let mut x_t = Tensor::<B, 1>::from_floats(noise, &self.device).reshape([
+            1,
+            state_channels,
+            self.config.resolution,
+            self.config.resolution,
+            self.config.resolution,
+        ]);
+        let concat_tensor = concat_cond.map(|values| {
+            Tensor::<B, 1>::from_floats(values, &self.device).reshape([
+                1,
+                concat_channels,
+                self.config.resolution,
+                self.config.resolution,
+                self.config.resolution,
+            ])
+        });
+
+        let mut step_0_x_t: Option<Vec<f32>> = None;
+        let mut step_mid_x_t: Option<Vec<f32>> = None;
+        let mut step_last_x_t: Option<Vec<f32>> = None;
+        let mid_step = mid_snapshot_step(sample_cfg.steps);
+        let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
+        for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
+            let pred = self.predict_with_cfg_tensor(
+                x_t.clone(),
+                t,
+                sample_cfg,
+                sigma_min,
+                cond.clone(),
+                neg_cond.clone(),
+                concat_tensor.clone(),
+            )?;
+            let dt = t - t_prev;
+            x_t = x_t.sub(pred.mul_scalar(dt));
+            if step_idx == 0 {
+                step_0_x_t = Some(tensor_to_vec(x_t.clone())?);
+            }
+            if step_idx == mid_step {
+                step_mid_x_t = Some(tensor_to_vec(x_t.clone())?);
+            }
+            if step_idx + 1 == sample_cfg.steps {
+                step_last_x_t = Some(tensor_to_vec(x_t.clone())?);
+            }
+        }
+
+        let samples = tensor_to_vec(x_t.clone())?;
+        Ok(FlowEulerSampleTrace {
+            steps: sample_cfg.steps,
+            step_0_x_t: step_0_x_t.unwrap_or_else(|| samples.clone()),
+            step_mid_x_t: step_mid_x_t.unwrap_or_else(|| samples.clone()),
+            step_last_x_t: step_last_x_t.unwrap_or_else(|| samples.clone()),
+            samples,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_with_cfg_tensor(
+        &self,
+        x_t: Tensor<B, 5>,
+        timestep: f32,
+        config: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 5>>,
+    ) -> Result<Tensor<B, 5>, String> {
+        let in_guidance_interval =
+            config.guidance_interval[0] <= timestep && timestep <= config.guidance_interval[1];
+        if !in_guidance_interval {
+            return self.predict_velocity_tensor(x_t, timestep, cond, concat_cond);
+        }
+
+        let w = config.guidance_strength;
+        if (w - 1.0).abs() < f32::EPSILON {
+            return self.predict_velocity_tensor(x_t, timestep, cond, concat_cond);
+        }
+        if w.abs() < f32::EPSILON {
+            return self.predict_velocity_tensor(x_t, timestep, neg_cond, concat_cond);
+        }
+
+        let pos =
+            self.predict_velocity_tensor(x_t.clone(), timestep, cond.clone(), concat_cond.clone())?;
+        let neg = self.predict_velocity_tensor(x_t.clone(), timestep, neg_cond, concat_cond)?;
+        let mut pred = pos.clone().mul_scalar(w).add(neg.mul_scalar(1.0 - w));
+        if config.guidance_rescale <= 0.0 {
+            return Ok(pred);
+        }
+
+        let x0_pos = pred_to_xstart_tensor(x_t.clone(), timestep, pos, sigma_min);
+        let x0_cfg = pred_to_xstart_tensor(x_t.clone(), timestep, pred.clone(), sigma_min);
+        let std_pos = tensor_std_scalar(x0_pos.clone())?;
+        let std_cfg = tensor_std_scalar(x0_cfg.clone())?.max(1.0e-12);
+        let scale = std_pos / std_cfg;
+        let x0 = x0_cfg
+            .clone()
+            .mul_scalar(scale)
+            .mul_scalar(config.guidance_rescale)
+            .add(x0_cfg.mul_scalar(1.0 - config.guidance_rescale));
+        pred = xstart_to_pred_tensor(x_t, timestep, x0, sigma_min);
+        Ok(pred)
+    }
+
+    fn predict_velocity_tensor(
+        &self,
+        x_t: Tensor<B, 5>,
+        timestep: f32,
+        cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 5>>,
+    ) -> Result<Tensor<B, 5>, String> {
+        let [_, state_channels, rx, ry, rz] = x_t.dims();
+        let voxel = rx * ry * rz;
+        if rx != self.config.resolution
+            || ry != self.config.resolution
+            || rz != self.config.resolution
+        {
+            return Err(format!(
+                "sparse flow tensor resolution mismatch: got=({rx},{ry},{rz}) expected={}",
+                self.config.resolution
+            ));
+        }
+        let concat_channels = concat_cond
+            .as_ref()
+            .map(|tensor| {
+                let [_, channels, cx, cy, cz] = tensor.dims();
+                if channels == 0 {
+                    return Err("concat cond tensor has zero channels".to_string());
+                }
+                if cx != rx || cy != ry || cz != rz {
+                    return Err(format!(
+                        "concat cond tensor resolution mismatch: got=({cx},{cy},{cz}) expected=({rx},{ry},{rz})"
+                    ));
+                }
+                Ok(channels)
+            })
+            .transpose()?
+            .unwrap_or(0usize);
+        if state_channels + concat_channels != self.config.in_channels {
+            return Err(format!(
+                "sparse flow channel mismatch: state={} concat={} expected_in={}",
+                state_channels, concat_channels, self.config.in_channels
+            ));
+        }
+        if state_channels != self.config.out_channels {
+            return Err(format!(
+                "sparse flow state/output mismatch: state={} expected_out={}",
+                state_channels, self.config.out_channels
+            ));
+        }
+        if voxel == 0 {
+            return Err("sparse flow tensor voxel count is zero".to_string());
+        }
+
+        let sample = if let Some(concat) = concat_cond {
+            Tensor::cat(vec![x_t, concat], 1)
+        } else {
+            x_t
+        };
+        let t = Tensor::<B, 1>::from_floats([timestep * 1000.0], &self.device);
+        Ok(self.model.forward(sample, t, cond))
+    }
 }
 
 impl SparseStructureFlowRuntime {
@@ -757,6 +1025,7 @@ impl SparseStructureFlowRuntime {
         image_large_root: Option<&Path>,
         model_stem: &str,
         _prefer_wgpu: bool,
+        resolution_override: Option<usize>,
     ) -> Result<Self, String> {
         #[cfg(feature = "runtime-model-wgpu")]
         if _prefer_wgpu {
@@ -764,6 +1033,7 @@ impl SparseStructureFlowRuntime {
                 weights_root,
                 image_large_root,
                 model_stem,
+                resolution_override,
             ) {
                 Ok(runtime) => return Ok(Self::Wgpu(runtime)),
                 Err(err) => {
@@ -777,6 +1047,7 @@ impl SparseStructureFlowRuntime {
             weights_root,
             image_large_root,
             model_stem,
+            resolution_override,
         )?;
         Ok(Self::Cpu(runtime))
     }
@@ -813,21 +1084,21 @@ impl SparseStructureFlowRuntime {
         }
     }
 
+    #[allow(dead_code)]
     pub fn predict_velocity_with_condition(
         &self,
         x_t: &[f32],
         timestep: f32,
         condition: &SparseFlowCondition,
+        concat_cond: Option<&[f32]>,
     ) -> Result<Vec<f32>, String> {
         #[cfg(feature = "runtime-model-wgpu")]
         {
             match (self, condition) {
-                (Self::Cpu(runtime), SparseFlowCondition::Cpu(cond)) => {
-                    runtime.predict_velocity_with_condition(x_t, timestep, cond.clone())
-                }
-                (Self::Wgpu(runtime), SparseFlowCondition::Wgpu(cond)) => {
-                    runtime.predict_velocity_with_condition(x_t, timestep, cond.clone())
-                }
+                (Self::Cpu(runtime), SparseFlowCondition::Cpu(cond)) => runtime
+                    .predict_velocity_with_condition(x_t, timestep, cond.clone(), concat_cond),
+                (Self::Wgpu(runtime), SparseFlowCondition::Wgpu(cond)) => runtime
+                    .predict_velocity_with_condition(x_t, timestep, cond.clone(), concat_cond),
                 _ => {
                     Err("sparse flow condition backend does not match runtime backend".to_string())
                 }
@@ -837,9 +1108,118 @@ impl SparseStructureFlowRuntime {
         {
             let Self::Cpu(runtime) = self;
             let SparseFlowCondition::Cpu(cond) = condition;
-            runtime.predict_velocity_with_condition(x_t, timestep, cond.clone())
+            runtime.predict_velocity_with_condition(x_t, timestep, cond.clone(), concat_cond)
         }
     }
+
+    pub fn sample_with_trace(
+        &self,
+        noise: &[f32],
+        sample_cfg: FlowEulerSampleConfig,
+        sigma_min: f32,
+        condition: &SparseFlowCondition,
+        negative_condition: &SparseFlowCondition,
+        concat_cond: Option<&[f32]>,
+    ) -> Result<FlowEulerSampleTrace, String> {
+        #[cfg(feature = "runtime-model-wgpu")]
+        {
+            match (self, condition, negative_condition) {
+                (
+                    Self::Cpu(runtime),
+                    SparseFlowCondition::Cpu(cond),
+                    SparseFlowCondition::Cpu(neg_cond),
+                ) => runtime.sample_with_trace(
+                    noise,
+                    sample_cfg,
+                    sigma_min,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    concat_cond,
+                ),
+                (
+                    Self::Wgpu(runtime),
+                    SparseFlowCondition::Wgpu(cond),
+                    SparseFlowCondition::Wgpu(neg_cond),
+                ) => runtime.sample_with_trace(
+                    noise,
+                    sample_cfg,
+                    sigma_min,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    concat_cond,
+                ),
+                _ => {
+                    Err("sparse flow condition backend does not match runtime backend".to_string())
+                }
+            }
+        }
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        {
+            let Self::Cpu(runtime) = self;
+            let SparseFlowCondition::Cpu(cond) = condition;
+            let SparseFlowCondition::Cpu(neg_cond) = negative_condition;
+            runtime.sample_with_trace(
+                noise,
+                sample_cfg,
+                sigma_min,
+                cond.clone(),
+                neg_cond.clone(),
+                concat_cond,
+            )
+        }
+    }
+}
+
+fn pred_to_xstart_tensor<B: Backend>(
+    x_t: Tensor<B, 5>,
+    timestep: f32,
+    pred: Tensor<B, 5>,
+    sigma_min: f32,
+) -> Tensor<B, 5> {
+    let factor = sigma_min + (1.0 - sigma_min) * timestep;
+    let keep = 1.0 - sigma_min;
+    x_t.mul_scalar(keep).sub(pred.mul_scalar(factor))
+}
+
+fn xstart_to_pred_tensor<B: Backend>(
+    x_t: Tensor<B, 5>,
+    timestep: f32,
+    x0: Tensor<B, 5>,
+    sigma_min: f32,
+) -> Tensor<B, 5> {
+    let factor = sigma_min + (1.0 - sigma_min) * timestep;
+    let keep = 1.0 - sigma_min;
+    x_t.mul_scalar(keep).sub(x0).div_scalar(factor)
+}
+
+fn tensor_std_scalar<B: Backend>(tensor: Tensor<B, 5>) -> Result<f32, String> {
+    let [b, c, x, y, z] = tensor.dims();
+    let numel = b
+        .saturating_mul(c)
+        .saturating_mul(x)
+        .saturating_mul(y)
+        .saturating_mul(z)
+        .max(1);
+    let flat = tensor.reshape([numel]);
+    let mean = flat.clone().mean_dim(0);
+    let var = flat
+        .sub(mean)
+        .powf_scalar(2.0)
+        .mean_dim(0)
+        .sqrt()
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to read sparse flow std tensor: {err:?}"))?;
+    Ok(var.first().copied().unwrap_or(0.0))
+}
+
+fn tensor_to_vec<B: Backend>(tensor: Tensor<B, 5>) -> Result<Vec<f32>, String> {
+    tensor
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to read sparse flow tensor: {err:?}"))
 }
 
 fn gelu<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -889,12 +1269,40 @@ fn scaled_dot_product_attention<B: Backend>(
     let q = q.permute([0, 2, 1, 3]);
     let k = k.permute([0, 2, 1, 3]);
     let v = v.permute([0, 2, 1, 3]);
-    let attn = softmax(
-        q.matmul(k.swap_dims(2, 3))
-            .mul_scalar(1.0 / (head_dim as f32).sqrt()),
-        3,
-    );
-    attn.matmul(v).permute([0, 2, 1, 3])
+    let [batch, heads, tokens, _] = q.dims();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let chunk = attention_query_chunk(tokens);
+
+    // Chunk attention over the query axis to avoid allocating a full [T, T] matrix
+    // for large dense SLAT resolutions.
+    if chunk >= tokens {
+        let attn = softmax(q.matmul(k.swap_dims(2, 3)).mul_scalar(scale), 3);
+        return attn.matmul(v).permute([0, 2, 1, 3]);
+    }
+
+    let k_t = k.clone().swap_dims(2, 3);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < tokens {
+        let end = (start + chunk).min(tokens);
+        let q_chunk = q
+            .clone()
+            .slice([0..batch, 0..heads, start..end, 0..head_dim]);
+        let attn = softmax(q_chunk.matmul(k_t.clone()).mul_scalar(scale), 3);
+        chunks.push(attn.matmul(v.clone()));
+        start = end;
+    }
+
+    Tensor::cat(chunks, 2).permute([0, 2, 1, 3])
+}
+
+fn attention_query_chunk(tokens: usize) -> usize {
+    let env_chunk = std::env::var("TRELLIS2_ATTN_QUERY_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+    env_chunk.min(tokens.max(1))
 }
 
 fn apply_rope<B: Backend>(
@@ -969,13 +1377,13 @@ fn rope_cos_sin(
                     break;
                 }
                 let coords = [x as f32, y as f32, z as f32];
-                for dim in 0..3 {
+                for (dim, coord) in coords.iter().enumerate() {
                     for (freq_idx, freq) in freqs.iter().enumerate() {
                         let pair = dim * freq_dim + freq_idx;
                         if pair >= pairs {
                             continue;
                         }
-                        let phase = coords[dim] * *freq;
+                        let phase = *coord * *freq;
                         let idx = token * pairs + pair;
                         cos[idx] = phase.cos();
                         sin[idx] = phase.sin();
@@ -1051,11 +1459,11 @@ fn key_remap_rules() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn resolve_model_weights_path(
+fn resolve_model_weight_candidates(
     model_stem: &str,
     weights_root: &Path,
     image_large_root: Option<&Path>,
-) -> Option<PathBuf> {
+) -> Vec<PathBuf> {
     let source =
         resolve_model_source_path(model_stem, "safetensors", weights_root, image_large_root);
     let burnpack = source.with_extension("bpk");
@@ -1066,7 +1474,10 @@ fn resolve_model_weights_path(
     } else {
         vec![burnpack, burnpack_f16, source]
     };
-    candidates.into_iter().find(|path| path.exists())
+    candidates
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>()
 }
 
 fn prefer_f16_burnpack() -> bool {
@@ -1185,6 +1596,7 @@ mod tests {
             None,
             "ckpts/ss_flow_img_dit_1_3B_64_bf16",
             false,
+            None,
         )
         .expect("sparse flow runtime should load from model stem");
         let cfg = runtime.config();
@@ -1196,7 +1608,7 @@ mod tests {
             .prepare_condition(cond.as_slice(), cond_tokens)
             .expect("sparse flow cond should prepare");
         let out = runtime
-            .predict_velocity_with_condition(sample.as_slice(), 1.0, &prepared)
+            .predict_velocity_with_condition(sample.as_slice(), 1.0, &prepared, None)
             .expect("sparse flow runtime forward should succeed");
         assert_eq!(out.len(), sample.len());
     }

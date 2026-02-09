@@ -676,6 +676,7 @@ fn setup_ui(mut commands: Commands) {
     });
 }
 
+#[allow(clippy::type_complexity)]
 fn update_queue_text(
     queue: Res<InferenceQueue>,
     mut query: Query<(&mut Text, &mut TextColor), With<QueueText>>,
@@ -1016,6 +1017,7 @@ fn handle_catalog_delete_button(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_catalog_delete_shortcut(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -1077,6 +1079,7 @@ fn handle_page_buttons(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn update_button_visuals(
     catalog: Res<CatalogState>,
     drag: Res<DragState>,
@@ -1190,6 +1193,7 @@ fn control_button_palette(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_drag_release(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -1231,6 +1235,7 @@ fn handle_drag_release(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_drag_ghost(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,

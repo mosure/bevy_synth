@@ -3,14 +3,31 @@ use bevy_mesh::{Indices, Mesh as BevyMesh, PrimitiveTopology};
 
 use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
 
+use crate::SynthMesh;
+
 pub fn to_bevy_mesh(mesh: &TripoMesh) -> BevyMesh {
+    to_bevy_mesh_with_uvs(mesh, None)
+}
+
+pub fn to_bevy_mesh_synth(mesh: &SynthMesh) -> BevyMesh {
+    let uvs = if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
+        Some(mesh.uvs.as_slice())
+    } else {
+        None
+    };
+    to_bevy_mesh_with_uvs(&mesh.mesh, uvs)
+}
+
+fn to_bevy_mesh_with_uvs(mesh: &TripoMesh, uvs_opt: Option<&[[f32; 2]]>) -> BevyMesh {
     let mut bevy_mesh = BevyMesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     );
 
     let normals = compute_normals(mesh);
-    let uvs = vec![[0.0, 0.0]; mesh.vertices.len()];
+    let uvs = uvs_opt
+        .map(|uvs| uvs.to_vec())
+        .unwrap_or_else(|| vec![[0.0, 0.0]; mesh.vertices.len()]);
     let indices: Vec<u32> = mesh
         .faces
         .iter()

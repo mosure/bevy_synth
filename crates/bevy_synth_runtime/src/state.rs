@@ -5,7 +5,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use bevy::prelude::*;
-use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
+
+use crate::SynthMesh;
 
 #[derive(Resource, Default)]
 pub struct UiStatus {
@@ -62,7 +63,7 @@ pub enum WorkerCommand {
 
 pub struct WorkerEvent {
     pub requests: Vec<InferenceRequest>,
-    pub results: Vec<Result<Option<TripoMesh>, String>>,
+    pub results: Vec<Result<Option<SynthMesh>, String>>,
     pub elapsed: Duration,
     pub status_message: Option<String>,
 }

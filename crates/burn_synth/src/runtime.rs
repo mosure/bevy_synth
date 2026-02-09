@@ -40,17 +40,12 @@ type WgpuBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 #[cfg(feature = "cuda")]
 type CudaBackend = burn_cuda::Cuda<f32, i32, u32>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InferenceBackend {
     Cpu,
+    #[default]
     Wgpu,
     Cuda,
-}
-
-impl Default for InferenceBackend {
-    fn default() -> Self {
-        Self::Wgpu
-    }
 }
 
 impl InferenceBackend {
@@ -292,40 +287,36 @@ impl SynthRuntime {
         match preferred {
             SynthesisModel::Triposg => {
                 match self.infer_mesh_triposg(input_image_path, foreground_model, backend) {
-                    Ok(mesh) => return Ok((mesh, SynthesisModel::Triposg)),
+                    Ok(mesh) => Ok((mesh, SynthesisModel::Triposg)),
                     Err(err) if synthesis_models.contains(&SynthesisModel::Trellis) => {
                         eprintln!(
                             "burn_synth runtime: TripoSG failed ({err}); falling back to Trellis2."
                         );
                         match self.infer_mesh_trellis(input_image_path, foreground_model, backend) {
-                            Ok(mesh) => return Ok((mesh, SynthesisModel::Trellis)),
-                            Err(trellis_err) => {
-                                return Err(RuntimeError::new(format!(
-                                    "TripoSG failed ({err}); Trellis2 fallback failed ({trellis_err})"
-                                )));
-                            }
+                            Ok(mesh) => Ok((mesh, SynthesisModel::Trellis)),
+                            Err(trellis_err) => Err(RuntimeError::new(format!(
+                                "TripoSG failed ({err}); Trellis2 fallback failed ({trellis_err})"
+                            ))),
                         }
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => Err(err),
                 }
             }
             SynthesisModel::Trellis => {
                 match self.infer_mesh_trellis(input_image_path, foreground_model, backend) {
-                    Ok(mesh) => return Ok((mesh, SynthesisModel::Trellis)),
+                    Ok(mesh) => Ok((mesh, SynthesisModel::Trellis)),
                     Err(err) if synthesis_models.contains(&SynthesisModel::Triposg) => {
                         eprintln!(
                             "burn_synth runtime: Trellis2 failed ({err}); falling back to TripoSG."
                         );
                         match self.infer_mesh_triposg(input_image_path, foreground_model, backend) {
-                            Ok(mesh) => return Ok((mesh, SynthesisModel::Triposg)),
-                            Err(triposg_err) => {
-                                return Err(RuntimeError::new(format!(
-                                    "Trellis2 failed ({err}); TripoSG fallback failed ({triposg_err})"
-                                )));
-                            }
+                            Ok(mesh) => Ok((mesh, SynthesisModel::Triposg)),
+                            Err(triposg_err) => Err(RuntimeError::new(format!(
+                                "Trellis2 failed ({err}); TripoSG fallback failed ({triposg_err})"
+                            ))),
                         }
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => Err(err),
                 }
             }
         }
@@ -401,6 +392,7 @@ impl SynthRuntime {
             device: trellis_device,
             seed: self.config.seed,
             hook_output: None,
+            noise_overrides_hook: None,
         };
 
         let mesh = pipeline
@@ -717,7 +709,13 @@ fn canonical_cube_mesh() -> Mesh {
         [3, 7, 4],
         [3, 4, 0],
     ];
-    Mesh { vertices, faces }
+    Mesh {
+        vertices,
+        faces,
+        uvs: Vec::new(),
+        material: None,
+        pbr_textures: None,
+    }
 }
 
 fn default_flash_config() -> FlashExtractConfig {

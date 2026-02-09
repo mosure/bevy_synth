@@ -6,8 +6,22 @@ use burn_trellis::hook_diff::{
 };
 use burn_trellis::pipeline::{Trellis2Pipeline, Trellis2PipelineConfig, TrellisRunOptions};
 
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
 #[test]
 fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::error::Error>> {
+    let strict = env_flag("TRELLIS2_E2E_STRICT", false);
+    let disable_runtime = env_flag("TRELLIS2_E2E_DISABLE_RUNTIME_MODEL", !strict);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let input_image = root.join("assets/hooks/trellis2_preprocess_input.png");
     let reference_hook = root.join("assets/hooks/trellis2_full_reference_alpha_512.safetensors");
@@ -16,16 +30,18 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         return Ok(());
     }
 
-    let mut config = Trellis2PipelineConfig::default();
-    config.image_large_root = Some(
-        std::env::var("TRELLIS2_IMAGE_LARGE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(
-                    "E:/models/huggingface/hub/models--microsoft--TRELLIS-image-large/snapshots/25e0d31ffbebe4b5a97464dd851910efc3002d96",
-                )
-            }),
-    );
+    let mut config = Trellis2PipelineConfig {
+        image_large_root: Some(
+            std::env::var("TRELLIS2_IMAGE_LARGE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(
+                        "E:/models/huggingface/hub/models--microsoft--TRELLIS-image-large/snapshots/25e0d31ffbebe4b5a97464dd851910efc3002d96",
+                    )
+                }),
+        ),
+        ..Trellis2PipelineConfig::default()
+    };
     if let Ok(weights_root) = std::env::var("TRELLIS2_WEIGHTS_ROOT") {
         config.weights_root = PathBuf::from(weights_root);
     }
@@ -49,27 +65,55 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
     std::fs::create_dir_all(&out_dir)?;
     let actual_hook = out_dir.join("actual_alpha_512.safetensors");
 
-    unsafe {
-        std::env::set_var("TRELLIS2_DISABLE_RUNTIME_MODEL", "1");
+    if disable_runtime {
+        unsafe {
+            std::env::set_var("TRELLIS2_DISABLE_RUNTIME_MODEL", "1");
+        }
     }
     let pipeline = Trellis2Pipeline::new(config)?;
     pipeline.validate_runtime()?;
-    let _mesh = pipeline.infer_mesh(
+    let profile = pipeline.infer_mesh_profile(
         &input_image,
         &TrellisRunOptions {
             quality: TrellisQuality::Low,
             seed: Some(42),
             hook_output: Some(actual_hook.clone()),
+            noise_overrides_hook: Some(reference_hook.clone()),
             ..TrellisRunOptions::default()
         },
     )?;
-    unsafe {
-        std::env::remove_var("TRELLIS2_DISABLE_RUNTIME_MODEL");
+    if disable_runtime {
+        unsafe {
+            std::env::remove_var("TRELLIS2_DISABLE_RUNTIME_MODEL");
+        }
+    }
+    if strict && profile.sparse_source.as_str() == "synthetic" {
+        return Err("strict mode requires non-synthetic sparse stage source".into());
     }
 
     let reference = HookSnapshot::from_file(reference_hook)?;
     let actual = HookSnapshot::from_file(&actual_hook)?;
     let report = compare_hook_snapshots(&reference, &actual, None);
+
+    // PBR hook schema must be emitted by the Rust path for downstream parity checks.
+    for key in [
+        "pbr.uv_unwrap.vertices",
+        "pbr.uv_unwrap.faces",
+        "pbr.uv_unwrap.uvs",
+        "pbr.raster.mask",
+        "pbr.sample.position",
+        "pbr.sample.attrs_float",
+        "pbr.texture.base_color_float",
+        "pbr.texture.metallic_float",
+        "pbr.texture.roughness_float",
+        "pbr.texture.alpha_float",
+        "pbr.texture.base_color_rgba_u8",
+        "pbr.texture.metallic_roughness_u8",
+    ] {
+        if !actual.tensors.contains_key(key) {
+            return Err(format!("missing required pbr hook key in actual output: {key}").into());
+        }
+    }
 
     let missing = report
         .entries
@@ -81,7 +125,7 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         .iter()
         .filter(|entry| entry.status == HookDiffStatus::ShapeMismatch)
         .count();
-    if missing > 0 || shape_mismatch > 0 || !report.extra_in_actual.is_empty() {
+    if missing > 0 || shape_mismatch > 0 {
         return Err(format!(
             "hook schema mismatch: missing={missing}, shape_mismatch={shape_mismatch}, extra={}",
             report.extra_in_actual.len()
@@ -100,6 +144,25 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 entry.key, stats.mean_abs, stats.max_abs, stats.rmse
             )
             .into());
+        }
+    }
+
+    if strict {
+        let strict_limit = 1.0e-3f32;
+        for entry in &report.entries {
+            let stats = entry
+                .stats
+                .ok_or_else(|| format!("missing stats for strict hook '{}'", entry.key))?;
+            if stats.mean_abs > strict_limit
+                || stats.max_abs > strict_limit
+                || stats.rmse > strict_limit
+            {
+                return Err(format!(
+                    "strict threshold failed for '{}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
+                    entry.key, stats.mean_abs, stats.max_abs, stats.rmse
+                )
+                .into());
+            }
         }
     }
 

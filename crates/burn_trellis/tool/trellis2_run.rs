@@ -22,6 +22,10 @@ struct Args {
     #[arg(long)]
     hook_output: Option<PathBuf>,
 
+    /// Optional safetensors hook input path used as deterministic stage-noise overrides.
+    #[arg(long)]
+    noise_overrides_hook: Option<PathBuf>,
+
     /// Optional Trellis2 weights root (defaults to env/probed root).
     #[arg(long)]
     weights_root: Option<PathBuf>,
@@ -66,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device: args.device,
         seed: args.seed,
         hook_output: args.hook_output.clone(),
+        noise_overrides_hook: args.noise_overrides_hook.clone(),
     };
 
     let profiled = pipeline.infer_mesh_profile(&args.input_image, &options)?;
@@ -97,6 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "total": profiled.timings.total_ms
             },
             "hook_output": args.hook_output,
+            "noise_overrides_hook": args.noise_overrides_hook,
             "output_obj": args.output_obj,
         })
     );

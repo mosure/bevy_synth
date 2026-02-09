@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use burn_trellis::native::preprocess::{PreprocessConfig, preprocess_image_path};
+use burn_trellis::preprocess::{PreprocessConfig, preprocess_image_path};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_trellis_preprocess(c: &mut Criterion) {

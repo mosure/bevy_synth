@@ -6,13 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 
+#[cfg(target_arch = "wasm32")]
 use base64::Engine;
+#[cfg(target_arch = "wasm32")]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 
-use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
+use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture};
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 3;
 const INDEX_FILE_NAME: &str = "index.json";
 #[cfg(not(target_arch = "wasm32"))]
 const MESH_DIR_NAME: &str = "meshes";
@@ -46,7 +48,9 @@ pub struct CachedMeshMetadata {
     pub source_image_path: String,
     pub label: String,
     pub mesh_payload_id: String,
-    pub gltf_output_id: String,
+    #[serde(default)]
+    pub gltf_output_id: Option<String>,
+    pub glb_output_id: String,
     pub updated_at_unix_ms: u64,
 }
 
@@ -58,6 +62,16 @@ pub struct CachedWorldItem {
     pub scale: [f32; 3],
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CachedCameraState {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    pub focus: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub radius: f32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CacheIndex {
     version: u32,
@@ -65,6 +79,8 @@ struct CacheIndex {
     meshes: Vec<CachedMeshMetadata>,
     #[serde(default)]
     world_items: Vec<CachedWorldItem>,
+    #[serde(default)]
+    camera: Option<CachedCameraState>,
 }
 
 impl Default for CacheIndex {
@@ -73,6 +89,100 @@ impl Default for CacheIndex {
             version: CACHE_VERSION,
             meshes: Vec::new(),
             world_items: Vec::new(),
+            camera: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MeshPayloadMaterial {
+    base_color: [f32; 3],
+    metallic: f32,
+    roughness: f32,
+    alpha: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MeshPayloadTexture {
+    width: u32,
+    height: u32,
+    rgba8: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MeshPayloadPbrTextures {
+    base_color: MeshPayloadTexture,
+    metallic_roughness: MeshPayloadTexture,
+    #[serde(default)]
+    normal: Option<MeshPayloadTexture>,
+    #[serde(default)]
+    emissive: Option<MeshPayloadTexture>,
+    #[serde(default)]
+    occlusion: Option<MeshPayloadTexture>,
+}
+
+impl From<SynthMeshMaterial> for MeshPayloadMaterial {
+    fn from(material: SynthMeshMaterial) -> Self {
+        Self {
+            base_color: material.base_color,
+            metallic: material.metallic,
+            roughness: material.roughness,
+            alpha: material.alpha,
+        }
+    }
+}
+
+impl From<MeshPayloadMaterial> for SynthMeshMaterial {
+    fn from(material: MeshPayloadMaterial) -> Self {
+        Self {
+            base_color: material.base_color,
+            metallic: material.metallic,
+            roughness: material.roughness,
+            alpha: material.alpha,
+        }
+    }
+}
+
+impl From<SynthMeshTexture> for MeshPayloadTexture {
+    fn from(texture: SynthMeshTexture) -> Self {
+        Self {
+            width: texture.width,
+            height: texture.height,
+            rgba8: texture.rgba8,
+        }
+    }
+}
+
+impl From<MeshPayloadTexture> for SynthMeshTexture {
+    fn from(texture: MeshPayloadTexture) -> Self {
+        Self {
+            width: texture.width,
+            height: texture.height,
+            rgba8: texture.rgba8,
+        }
+    }
+}
+
+impl From<SynthMeshPbrTextures> for MeshPayloadPbrTextures {
+    fn from(textures: SynthMeshPbrTextures) -> Self {
+        Self {
+            base_color: textures.base_color.into(),
+            metallic_roughness: textures.metallic_roughness.into(),
+            normal: textures.normal.map(Into::into),
+            emissive: textures.emissive.map(Into::into),
+            occlusion: textures.occlusion.map(Into::into),
+        }
+    }
+}
+
+impl From<MeshPayloadPbrTextures> for SynthMeshPbrTextures {
+    fn from(textures: MeshPayloadPbrTextures) -> Self {
+        Self {
+            base_color: textures.base_color.into(),
+            metallic_roughness: textures.metallic_roughness.into(),
+            normal: textures.normal.map(Into::into),
+            emissive: textures.emissive.map(Into::into),
+            occlusion: textures.occlusion.map(Into::into),
         }
     }
 }
@@ -81,22 +191,36 @@ impl Default for CacheIndex {
 struct MeshPayload {
     vertices: Vec<[f32; 3]>,
     faces: Vec<[u32; 3]>,
+    #[serde(default)]
+    uvs: Vec<[f32; 2]>,
+    #[serde(default)]
+    material: Option<MeshPayloadMaterial>,
+    #[serde(default)]
+    pbr_textures: Option<MeshPayloadPbrTextures>,
 }
 
-impl From<&TripoMesh> for MeshPayload {
-    fn from(mesh: &TripoMesh) -> Self {
+impl From<&SynthMesh> for MeshPayload {
+    fn from(mesh: &SynthMesh) -> Self {
         Self {
-            vertices: mesh.vertices.clone(),
-            faces: mesh.faces.clone(),
+            vertices: mesh.mesh.vertices.clone(),
+            faces: mesh.mesh.faces.clone(),
+            uvs: mesh.uvs.clone(),
+            material: mesh.material.map(Into::into),
+            pbr_textures: mesh.pbr_textures.clone().map(Into::into),
         }
     }
 }
 
-impl From<MeshPayload> for TripoMesh {
+impl From<MeshPayload> for SynthMesh {
     fn from(payload: MeshPayload) -> Self {
         Self {
-            vertices: payload.vertices,
-            faces: payload.faces,
+            mesh: crate::TripoMesh {
+                vertices: payload.vertices,
+                faces: payload.faces,
+            },
+            uvs: payload.uvs,
+            material: payload.material.map(Into::into),
+            pbr_textures: payload.pbr_textures.map(Into::into),
         }
     }
 }
@@ -169,7 +293,11 @@ impl MeshCache {
         &self.index.world_items
     }
 
-    pub fn load_mesh(&self, cache_key: &str) -> CacheResult<Option<TripoMesh>> {
+    pub fn camera_state(&self) -> Option<&CachedCameraState> {
+        self.index.camera.as_ref()
+    }
+
+    pub fn load_mesh(&self, cache_key: &str) -> CacheResult<Option<SynthMesh>> {
         let mesh_payload = self.read_mesh_payload(cache_key)?;
         let Some(mesh_payload) = mesh_payload else {
             return Ok(None);
@@ -182,7 +310,7 @@ impl MeshCache {
     pub fn upsert_mesh_for_image(
         &mut self,
         source_image_path: &Path,
-        mesh: &TripoMesh,
+        mesh: &SynthMesh,
     ) -> CacheResult<CachedMeshMetadata> {
         let source_image_path = normalize_source_image_path(source_image_path);
         let cache_key = cache_key_from_source(&source_image_path);
@@ -197,15 +325,16 @@ impl MeshCache {
             .map_err(|err| CacheError::Serialization(err.to_string()))?;
         self.write_mesh_payload(&cache_key, &payload_json)?;
 
-        let gltf_text = mesh_to_embedded_gltf(mesh)?;
-        self.write_gltf_output(&cache_key, &gltf_text)?;
+        let glb = mesh_to_glb(mesh)?;
+        self.write_glb_output(&cache_key, &glb)?;
 
         let metadata = CachedMeshMetadata {
             cache_key: cache_key.clone(),
             source_image_path: source_image_path.clone(),
             label,
             mesh_payload_id: self.mesh_payload_id(&cache_key),
-            gltf_output_id: self.gltf_output_id(&cache_key),
+            gltf_output_id: None,
+            glb_output_id: self.glb_output_id(&cache_key),
             updated_at_unix_ms: now_unix_ms(),
         };
 
@@ -219,6 +348,7 @@ impl MeshCache {
             if old_cache_key != cache_key {
                 self.remove_mesh_payload(&old_cache_key)?;
                 self.remove_gltf_output(&old_cache_key)?;
+                self.remove_glb_output(&old_cache_key)?;
             }
             self.index.meshes[position] = metadata.clone();
         } else {
@@ -242,6 +372,7 @@ impl MeshCache {
         self.index.meshes.remove(position);
         self.remove_mesh_payload(cache_key)?;
         self.remove_gltf_output(cache_key)?;
+        self.remove_glb_output(cache_key)?;
         self.index
             .world_items
             .retain(|item| item.cache_key != cache_key);
@@ -252,6 +383,11 @@ impl MeshCache {
     pub fn set_world_items(&mut self, mut items: Vec<CachedWorldItem>) -> CacheResult<()> {
         items.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
         self.index.world_items = items;
+        self.save_index()
+    }
+
+    pub fn set_camera_state(&mut self, camera: Option<CachedCameraState>) -> CacheResult<()> {
+        self.index.camera = camera;
         self.save_index()
     }
 
@@ -311,17 +447,6 @@ impl MeshCache {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn write_gltf_output(&self, cache_key: &str, gltf_text: &str) -> CacheResult<()> {
-        fs::write(self.gltf_output_path(cache_key), gltf_text)
-            .map_err(|err| CacheError::Io(err.to_string()))
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn write_gltf_output(&self, cache_key: &str, gltf_text: &str) -> CacheResult<()> {
-        web_storage_set(&self.gltf_output_storage_key(cache_key), gltf_text)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
     fn remove_gltf_output(&self, cache_key: &str) -> CacheResult<()> {
         let path = self.gltf_output_path(cache_key);
         if path.exists() {
@@ -333,6 +458,32 @@ impl MeshCache {
     #[cfg(target_arch = "wasm32")]
     fn remove_gltf_output(&self, cache_key: &str) -> CacheResult<()> {
         web_storage_remove(&self.gltf_output_storage_key(cache_key))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_glb_output(&self, cache_key: &str, glb: &[u8]) -> CacheResult<()> {
+        fs::write(self.glb_output_path(cache_key), glb)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_glb_output(&self, cache_key: &str, glb: &[u8]) -> CacheResult<()> {
+        let encoded = BASE64_STANDARD.encode(glb);
+        web_storage_set(&self.glb_output_storage_key(cache_key), &encoded)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remove_glb_output(&self, cache_key: &str) -> CacheResult<()> {
+        let path = self.glb_output_path(cache_key);
+        if path.exists() {
+            fs::remove_file(path).map_err(|err| CacheError::Io(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn remove_glb_output(&self, cache_key: &str) -> CacheResult<()> {
+        web_storage_remove(&self.glb_output_storage_key(cache_key))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -382,16 +533,28 @@ impl MeshCache {
         format!("{}/gltf/{cache_key}", self.prefix)
     }
 
-    fn gltf_output_id(&self, cache_key: &str) -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn glb_output_path(&self, cache_key: &str) -> PathBuf {
+        self.root
+            .join(MESH_DIR_NAME)
+            .join(format!("{cache_key}.glb"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn glb_output_storage_key(&self, cache_key: &str) -> String {
+        format!("{}/glb/{cache_key}", self.prefix)
+    }
+
+    fn glb_output_id(&self, cache_key: &str) -> String {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.gltf_output_path(cache_key)
+            self.glb_output_path(cache_key)
                 .to_string_lossy()
                 .to_string()
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.gltf_output_storage_key(cache_key)
+            self.glb_output_storage_key(cache_key)
         }
     }
 }
@@ -409,7 +572,7 @@ fn normalize_source_image_path(path: &Path) -> String {
     let source = path.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     {
-        return source.to_ascii_lowercase();
+        source.to_ascii_lowercase()
     }
     #[cfg(not(windows))]
     {
@@ -433,105 +596,8 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn mesh_to_embedded_gltf(mesh: &TripoMesh) -> CacheResult<String> {
-    if mesh.vertices.is_empty() {
-        return Err(CacheError::InvalidData(
-            "cannot write glTF for mesh with no vertices".to_string(),
-        ));
-    }
-
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for vertex in &mesh.vertices {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(vertex[axis]);
-            max[axis] = max[axis].max(vertex[axis]);
-        }
-    }
-
-    let mut buffer = Vec::with_capacity(mesh.vertices.len() * 12 + mesh.faces.len() * 12);
-    for vertex in &mesh.vertices {
-        for component in vertex {
-            buffer.extend_from_slice(&component.to_le_bytes());
-        }
-    }
-    let positions_byte_length = buffer.len();
-    for face in &mesh.faces {
-        for index in face {
-            buffer.extend_from_slice(&index.to_le_bytes());
-        }
-    }
-    let indices_byte_length = buffer.len() - positions_byte_length;
-
-    let uri = format!(
-        "data:application/octet-stream;base64,{}",
-        BASE64_STANDARD.encode(buffer)
-    );
-
-    let gltf = serde_json::json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "burn_synth"
-        },
-        "scene": 0,
-        "scenes": [
-            { "nodes": [0] }
-        ],
-        "nodes": [
-            { "mesh": 0 }
-        ],
-        "meshes": [
-            {
-                "primitives": [
-                    {
-                        "attributes": {
-                            "POSITION": 0
-                        },
-                        "indices": 1,
-                        "mode": 4
-                    }
-                ]
-            }
-        ],
-        "buffers": [
-            {
-                "byteLength": positions_byte_length + indices_byte_length,
-                "uri": uri
-            }
-        ],
-        "bufferViews": [
-            {
-                "buffer": 0,
-                "byteOffset": 0,
-                "byteLength": positions_byte_length,
-                "target": 34962
-            },
-            {
-                "buffer": 0,
-                "byteOffset": positions_byte_length,
-                "byteLength": indices_byte_length,
-                "target": 34963
-            }
-        ],
-        "accessors": [
-            {
-                "bufferView": 0,
-                "componentType": 5126,
-                "count": mesh.vertices.len(),
-                "type": "VEC3",
-                "min": min,
-                "max": max
-            },
-            {
-                "bufferView": 1,
-                "componentType": 5125,
-                "count": mesh.faces.len() * 3,
-                "type": "SCALAR"
-            }
-        ]
-    });
-
-    serde_json::to_string_pretty(&gltf).map_err(|err| CacheError::Serialization(err.to_string()))
+fn mesh_to_glb(mesh: &SynthMesh) -> CacheResult<Vec<u8>> {
+    crate::io::mesh_to_glb_bytes(mesh).map_err(|err| CacheError::Serialization(err.to_string()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -564,7 +630,7 @@ fn default_web_cache_prefix() -> String {
             return trimmed.to_string();
         }
     }
-    "burn_synth/cache/v1".to_string()
+    "burn_synth/cache/v3".to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -630,14 +696,42 @@ mod tests {
     use super::*;
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn dummy_mesh(scale: f32) -> TripoMesh {
-        TripoMesh {
-            vertices: vec![
-                [0.0 * scale, 0.0 * scale, 0.0 * scale],
-                [1.0 * scale, 0.0 * scale, 0.0 * scale],
-                [0.0 * scale, 1.0 * scale, 0.0 * scale],
-            ],
-            faces: vec![[0, 1, 2]],
+    fn dummy_mesh(scale: f32) -> SynthMesh {
+        SynthMesh {
+            mesh: crate::TripoMesh {
+                vertices: vec![
+                    [0.0 * scale, 0.0 * scale, 0.0 * scale],
+                    [1.0 * scale, 0.0 * scale, 0.0 * scale],
+                    [0.0 * scale, 1.0 * scale, 0.0 * scale],
+                ],
+                faces: vec![[0, 1, 2]],
+            },
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            material: Some(SynthMeshMaterial {
+                base_color: [0.5, 0.7, 0.9],
+                metallic: 0.15,
+                roughness: 0.6,
+                alpha: 0.92,
+            }),
+            pbr_textures: Some(crate::SynthMeshPbrTextures {
+                base_color: crate::SynthMeshTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![
+                        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                    ],
+                },
+                metallic_roughness: crate::SynthMeshTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![
+                        0, 220, 20, 255, 0, 220, 20, 255, 0, 220, 20, 255, 0, 220, 20, 255,
+                    ],
+                },
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
         }
     }
 
@@ -672,7 +766,8 @@ mod tests {
             .load_mesh(&second.cache_key)
             .expect("read mesh")
             .expect("mesh exists");
-        assert_eq!(loaded.vertices[1], [2.0, 0.0, 0.0]);
+        assert_eq!(loaded.mesh.vertices[1], [2.0, 0.0, 0.0]);
+        assert!(loaded.material.is_some());
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }
@@ -696,6 +791,29 @@ mod tests {
         assert_eq!(cache.world_items().len(), 1);
         assert_eq!(cache.world_items()[0].cache_key, "abcd");
         assert_eq!(cache.world_items()[0].translation, [1.0, 2.0, 3.0]);
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn camera_state_round_trip_in_index() {
+        let root = temp_root("camera");
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let state = CachedCameraState {
+            translation: [3.0, 4.0, 5.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            focus: [0.5, 0.25, -0.75],
+            yaw: 1.0,
+            pitch: -0.25,
+            radius: 6.5,
+        };
+        cache
+            .set_camera_state(Some(state.clone()))
+            .expect("write camera state");
+
+        let cache = MeshCache::load_from_root(root.clone()).expect("reload cache");
+        assert_eq!(cache.camera_state(), Some(&state));
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }
@@ -742,7 +860,7 @@ mod tests {
             .load_mesh(&entry.cache_key)
             .expect("load mesh after removal");
         assert!(maybe_mesh.is_none());
-        assert!(!PathBuf::from(&entry.gltf_output_id).exists());
+        assert!(!PathBuf::from(&entry.glb_output_id).exists());
 
         let removed_again = cache
             .remove_mesh_entry(&entry.cache_key)
@@ -754,8 +872,8 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn gltf_output_is_written_with_metadata_reference() {
-        let root = temp_root("gltf");
+    fn glb_output_is_written_with_metadata_reference() {
+        let root = temp_root("glb");
         let image = PathBuf::from("C:/data/input/tree.png");
 
         let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
@@ -763,11 +881,14 @@ mod tests {
             .upsert_mesh_for_image(&image, &dummy_mesh(1.0))
             .expect("insert mesh");
 
-        let gltf_path = PathBuf::from(&entry.gltf_output_id);
-        assert!(gltf_path.exists());
-        let gltf = fs::read_to_string(gltf_path).expect("read gltf");
-        assert!(gltf.contains("\"asset\""));
-        assert!(gltf.contains("\"meshes\""));
+        assert!(entry.gltf_output_id.is_none());
+        let glb_path = PathBuf::from(&entry.glb_output_id);
+        assert!(glb_path.exists());
+        let bytes = fs::read(glb_path).expect("read glb");
+        assert!(bytes.starts_with(&[0x67, 0x6C, 0x54, 0x46]));
+        let parsed = gltf::Glb::from_slice(&bytes).expect("parse glb");
+        assert!(!parsed.json.is_empty());
+        assert!(parsed.bin.is_some());
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }

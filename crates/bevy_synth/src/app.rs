@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::SystemTime;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{fs, io};
 
 use bevy::app::AppExit;
+use bevy::asset::RenderAssetUsages;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::io::web::WebAssetPlugin;
 #[cfg(target_arch = "wasm32")]
@@ -15,12 +20,13 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
 use bevy::light::{
     AmbientLight, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, DirectionalLight,
-    PointLight, light_consts::lux,
+    DirectionalLightShadowMap, PointLight, PointLightShadowMap, light_consts::lux,
 };
 use bevy::math::primitives::Cuboid;
 use bevy::pbr::{Atmosphere, MeshMaterial3d, StandardMaterial};
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::Hdr;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{FileDragAndDrop, PrimaryWindow, WindowCloseRequested};
@@ -39,17 +45,19 @@ use bevy_picking::prelude::{MeshPickingCamera, MeshPickingSettings, Pickable};
 use bevy_transform_gizmos::prelude::{GizmoCamera, TransformGizmoPlugin};
 use bevy_transform_gizmos::{GizmoTransformable, TransformGizmo, TransformGizmoSystems};
 use clap::Parser;
+#[cfg(not(target_arch = "wasm32"))]
+use serde::Deserialize;
 
-use bevy_synth_runtime::TripoMesh;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
-use bevy_synth_runtime::cache::{CachedWorldItem, MeshCache};
-use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_obj};
-use bevy_synth_runtime::mesh::to_bevy_mesh;
+use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
+use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
+use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceRequest, InferenceWorker, Spinner, TitlePulse, UiStatus,
     WorkerCommand,
 };
 use bevy_synth_runtime::worker::start_worker;
+use bevy_synth_runtime::{SynthMesh, SynthMeshTexture};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
@@ -96,6 +104,64 @@ impl Default for WorldCachePersistence {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct McpSceneControl {
+    path: Option<PathBuf>,
+    last_modified: Option<SystemTime>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl McpSceneControl {
+    fn from_args(args: &AppArgs) -> Self {
+        Self {
+            path: args.mcp_scene_control_path.clone(),
+            last_modified: None,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Deserialize)]
+struct McpSceneCommandEnvelope {
+    commands: Vec<McpSceneCommand>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum McpSceneCommand {
+    SpawnCached {
+        cache_key: String,
+        #[serde(default)]
+        translation: Option<[f32; 3]>,
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+        #[serde(default)]
+        scale: Option<[f32; 3]>,
+        #[serde(default)]
+        select: bool,
+    },
+    DeleteByCacheKey {
+        cache_key: String,
+    },
+    DeleteSelected,
+    ClearSelection,
+    SetCamera {
+        translation: [f32; 3],
+        rotation: [f32; 4],
+        #[serde(default)]
+        focus: Option<[f32; 3]>,
+        #[serde(default)]
+        yaw: Option<f32>,
+        #[serde(default)]
+        pitch: Option<f32>,
+        #[serde(default)]
+        radius: Option<f32>,
+    },
+    SaveCache,
+}
+
 #[derive(SystemParam)]
 struct FileDropContext<'w, 's> {
     events: MessageReader<'w, 's, FileDragAndDrop>,
@@ -116,6 +182,7 @@ pub(crate) struct InferenceContext<'w, 's> {
     worker: Res<'w, InferenceWorker>,
     args: Res<'w, AppArgs>,
     meshes: ResMut<'w, Assets<BevyMesh>>,
+    images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     cache: ResMut<'w, MeshCacheResource>,
     status: ResMut<'w, UiStatus>,
@@ -131,6 +198,8 @@ pub(crate) fn run() {
     }
     let args = Args::parse();
     let app_args = build_app_args(args);
+    #[cfg(not(target_arch = "wasm32"))]
+    let mcp_scene_control = McpSceneControl::from_args(&app_args);
 
     let status_message = if app_args.image.is_none() && app_args.mesh.is_none() {
         "Drag & drop an image (.png/.jpg) or mesh (.glb/.gltf/.obj) to begin.".to_string()
@@ -143,6 +212,8 @@ pub(crate) fn run() {
         .insert_resource(InferenceQueue::default())
         .insert_resource(ExitState::default())
         .insert_resource(TitlePulse::default())
+        .insert_resource(DirectionalLightShadowMap { size: 4096 })
+        .insert_resource(PointLightShadowMap { size: 2048 })
         .init_resource::<EditorSelection>()
         .insert_resource(MeshCacheResource::load_or_empty())
         .insert_resource(WorldCachePersistence::default())
@@ -151,6 +222,8 @@ pub(crate) fn run() {
             processing: false,
             worker_message: None,
         });
+    #[cfg(not(target_arch = "wasm32"))]
+    app.insert_resource(mcp_scene_control);
     add_default_plugins(&mut app);
     if !app.is_plugin_added::<PointerInputPlugin>() {
         app.add_plugins(DefaultPickingPlugins);
@@ -190,7 +263,11 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         app.add_plugins(FileDialogPlugin::new().with_pick_file::<ImagePickDialog>())
-            .add_systems(Update, (handle_open_file_dialog, handle_file_dialog_picks));
+            .add_systems(Update, (handle_open_file_dialog, handle_file_dialog_picks))
+            .add_systems(
+                Update,
+                poll_mcp_scene_control.before(mark_world_cache_dirty),
+            );
     }
 
     app.run();
@@ -234,10 +311,12 @@ fn web_asset_root() -> String {
     "assets".to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut ambient_light: ResMut<AmbientLight>,
     args: Res<AppArgs>,
@@ -249,6 +328,22 @@ fn setup(
 ) {
     info!("bevy_synth args: {:?}", *args);
 
+    let mut camera_transform = Transform::from_translation(Vec3::new(0.0, 1.5, 5.0));
+    let mut camera_orbit = PanOrbitCamera {
+        allow_upside_down: true,
+        orbit_smoothness: 0.1,
+        pan_smoothness: 0.1,
+        zoom_smoothness: 0.1,
+        button_orbit: MouseButton::Right,
+        button_pan: MouseButton::Middle,
+        ..default()
+    };
+    if let Some(cached_camera) = cache.cache.camera_state()
+        && !apply_cached_camera_state(cached_camera, &mut camera_transform, &mut camera_orbit)
+    {
+        warn!("Ignoring cached camera state due to invalid values.");
+    }
+
     commands.spawn((
         Camera3d::default(),
         Hdr,
@@ -256,62 +351,77 @@ fn setup(
         Bloom::NATURAL,
         Atmosphere::EARTH,
         AtmosphereEnvironmentMapLight {
-            intensity: 1.1,
+            intensity: 1.35,
             ..default()
         },
-        Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)),
-        PanOrbitCamera {
-            allow_upside_down: true,
-            orbit_smoothness: 0.1,
-            pan_smoothness: 0.1,
-            zoom_smoothness: 0.1,
-            button_orbit: MouseButton::Right,
-            button_pan: MouseButton::Middle,
-            ..default()
-        },
+        camera_transform,
+        camera_orbit,
         GizmoCamera,
         MeshPickingCamera,
         RenderLayers::layer(0).with(12),
         MainCamera,
     ));
-    ambient_light.color = Color::srgb(0.93, 0.96, 1.0);
-    ambient_light.brightness = 95.0;
+    ambient_light.color = Color::srgb(0.92, 0.95, 1.0);
+    ambient_light.brightness = 135.0;
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.97, 0.92),
-            illuminance: lux::AMBIENT_DAYLIGHT,
+            color: Color::srgb(1.0, 0.96, 0.9),
+            illuminance: lux::FULL_DAYLIGHT,
             shadows_enabled: true,
+            shadow_depth_bias: 0.15,
+            shadow_normal_bias: 1.0,
             ..default()
         },
-        Transform::from_xyz(6.0, 9.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(8.0, 12.0, 6.5).looking_at(Vec3::new(0.0, 0.2, 0.0), Vec3::Y),
         CascadeShadowConfigBuilder {
-            first_cascade_far_bound: 8.0,
-            maximum_distance: 36.0,
+            first_cascade_far_bound: 10.0,
+            maximum_distance: 64.0,
             ..default()
         }
         .build(),
         preview_light_layers(),
     ));
     commands.spawn((
-        PointLight {
-            color: Color::srgb(0.62, 0.72, 1.0),
-            intensity: 2600.0,
-            range: 30.0,
-            radius: 0.35,
+        DirectionalLight {
+            color: Color::srgb(0.65, 0.74, 1.0),
+            illuminance: 7_500.0,
+            shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(-5.0, 3.5, -4.0),
+        Transform::from_xyz(-6.0, 7.0, -8.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
+        preview_light_layers(),
+    ));
+    commands.spawn((
+        PointLight {
+            color: Color::srgb(0.56, 0.7, 1.0),
+            intensity: 4200.0,
+            range: 34.0,
+            radius: 0.42,
+            ..default()
+        },
+        Transform::from_xyz(-5.5, 4.0, -4.5),
         preview_light_layers(),
     ));
     commands.spawn((
         PointLight {
             color: Color::srgb(1.0, 0.9, 0.82),
-            intensity: 1900.0,
-            range: 24.0,
-            radius: 0.35,
+            intensity: 3200.0,
+            range: 28.0,
+            radius: 0.42,
             ..default()
         },
-        Transform::from_xyz(3.0, 4.0, 5.0),
+        Transform::from_xyz(4.5, 4.8, 6.0),
+        preview_light_layers(),
+    ));
+    commands.spawn((
+        PointLight {
+            color: Color::srgb(0.98, 0.82, 0.72),
+            intensity: 1500.0,
+            range: 18.0,
+            radius: 0.25,
+            ..default()
+        },
+        Transform::from_xyz(0.0, 1.6, -6.5),
         preview_light_layers(),
     ));
 
@@ -337,6 +447,7 @@ fn setup(
     hydrate_from_cache(
         &mut commands,
         &mut meshes,
+        &mut images,
         &mut materials,
         &mut queue,
         &mut catalog,
@@ -370,6 +481,7 @@ fn setup(
 fn hydrate_from_cache(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
     queue: &mut ResMut<InferenceQueue>,
     catalog: &mut ResMut<CatalogState>,
@@ -405,11 +517,8 @@ fn hydrate_from_cache(
             }
         };
 
-        let mesh_handle = meshes.add(to_bevy_mesh(&mesh));
-        let material = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.78, 0.84, 0.92),
-            ..default()
-        });
+        let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
+        let material = materials.add(standard_material_for_inference(&mesh, images.as_mut()));
         handles_by_key.insert(
             metadata.cache_key.clone(),
             (mesh_handle.clone(), material.clone()),
@@ -517,6 +626,82 @@ fn transform_from_cached_world_item(item: &CachedWorldItem) -> Option<Transform>
     })
 }
 
+fn camera_state_from_components(
+    transform: &Transform,
+    orbit: &PanOrbitCamera,
+) -> Option<CachedCameraState> {
+    let translation = transform.translation;
+    let rotation = if transform.rotation.length_squared() > 0.0 {
+        transform.rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let focus = orbit.focus;
+    let yaw = orbit.yaw.unwrap_or(orbit.target_yaw);
+    let pitch = orbit.pitch.unwrap_or(orbit.target_pitch);
+    let radius = orbit.radius.unwrap_or(orbit.target_radius);
+    if !translation.is_finite()
+        || !rotation.is_finite()
+        || !focus.is_finite()
+        || !yaw.is_finite()
+        || !pitch.is_finite()
+        || !radius.is_finite()
+        || radius <= 0.0
+    {
+        return None;
+    }
+
+    Some(CachedCameraState {
+        translation: translation.to_array(),
+        rotation: rotation.to_array(),
+        focus: focus.to_array(),
+        yaw,
+        pitch,
+        radius,
+    })
+}
+
+fn apply_cached_camera_state(
+    state: &CachedCameraState,
+    transform: &mut Transform,
+    orbit: &mut PanOrbitCamera,
+) -> bool {
+    let translation = Vec3::from_array(state.translation);
+    let raw_rotation = Quat::from_xyzw(
+        state.rotation[0],
+        state.rotation[1],
+        state.rotation[2],
+        state.rotation[3],
+    );
+    let focus = Vec3::from_array(state.focus);
+    if !translation.is_finite()
+        || !raw_rotation.is_finite()
+        || !focus.is_finite()
+        || !state.yaw.is_finite()
+        || !state.pitch.is_finite()
+        || !state.radius.is_finite()
+        || state.radius <= 0.0
+    {
+        return false;
+    }
+
+    transform.translation = translation;
+    transform.rotation = if raw_rotation.length_squared() > 0.0 {
+        raw_rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    orbit.focus = focus;
+    orbit.target_focus = focus;
+    orbit.yaw = Some(state.yaw);
+    orbit.target_yaw = state.yaw;
+    orbit.pitch = Some(state.pitch);
+    orbit.target_pitch = state.pitch;
+    orbit.radius = Some(state.radius);
+    orbit.target_radius = state.radius;
+    true
+}
+
 fn handle_file_drop(mut ctx: FileDropContext) {
     if ctx.exit_state.requested {
         return;
@@ -609,6 +794,207 @@ fn handle_file_dialog_picks(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn poll_mcp_scene_control(
+    mut control: ResMut<McpSceneControl>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut cache: ResMut<MeshCacheResource>,
+    mut selection: ResMut<EditorSelection>,
+    transformables: Query<(), With<GizmoTransformable>>,
+    cached_instances: Query<(Entity, &CachedMeshInstance)>,
+    mut main_camera: Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+    query_cached: Query<(&CachedMeshInstance, &Transform)>,
+) {
+    let Some(path) = control.path.clone() else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            warn!(
+                "Failed to inspect MCP scene control file {}: {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    if control
+        .last_modified
+        .map(|last| modified <= last)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    control.last_modified = Some(modified);
+
+    let commands_to_apply = match read_mcp_scene_commands(&path) {
+        Ok(commands_to_apply) => commands_to_apply,
+        Err(err) => {
+            warn!(
+                "Failed to parse MCP scene control file {}: {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if commands_to_apply.is_empty() {
+        return;
+    }
+
+    let mut scene_changed = false;
+    let mut force_cache_flush = false;
+    for command in commands_to_apply {
+        match command {
+            McpSceneCommand::SpawnCached {
+                cache_key,
+                translation,
+                rotation,
+                scale,
+                select,
+            } => {
+                let mesh = match cache.cache.load_mesh(&cache_key) {
+                    Ok(Some(mesh)) => mesh,
+                    Ok(None) => {
+                        warn!("MCP spawn_cached skipped: cache key {cache_key} not found");
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!("MCP spawn_cached failed for {cache_key}: {err}");
+                        continue;
+                    }
+                };
+                let Some(transform) = transform_from_optional_parts(translation, rotation, scale)
+                else {
+                    warn!("MCP spawn_cached skipped due to invalid transform values");
+                    continue;
+                };
+                let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
+                let material =
+                    materials.add(standard_material_for_inference(&mesh, images.as_mut()));
+                let entity = spawn_mesh_instance(
+                    &mut commands,
+                    mesh_handle,
+                    material,
+                    transform,
+                    Some(cache_key),
+                );
+                if select {
+                    selection.set(entity);
+                }
+                scene_changed = true;
+            }
+            McpSceneCommand::DeleteByCacheKey { cache_key } => {
+                let to_despawn: Vec<Entity> = cached_instances
+                    .iter()
+                    .filter_map(|(entity, cached)| {
+                        if cached.cache_key == cache_key {
+                            Some(entity)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for entity in to_despawn {
+                    commands.entity(entity).despawn();
+                    scene_changed = true;
+                }
+            }
+            McpSceneCommand::DeleteSelected => {
+                let to_despawn: Vec<Entity> = selection
+                    .iter()
+                    .filter(|entity| transformables.contains(*entity))
+                    .collect();
+                for entity in to_despawn {
+                    commands.entity(entity).despawn();
+                    scene_changed = true;
+                }
+                selection.clear();
+            }
+            McpSceneCommand::ClearSelection => {
+                selection.clear();
+            }
+            McpSceneCommand::SetCamera {
+                translation,
+                rotation,
+                focus,
+                yaw,
+                pitch,
+                radius,
+            } => {
+                if let Ok((mut transform, mut orbit)) = main_camera.single_mut() {
+                    let target_translation = Vec3::from_array(translation);
+                    let target_rotation =
+                        Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
+                    if target_translation.is_finite() && target_rotation.is_finite() {
+                        transform.translation = target_translation;
+                        transform.rotation = if target_rotation.length_squared() > 0.0 {
+                            target_rotation.normalize()
+                        } else {
+                            Quat::IDENTITY
+                        };
+                        if let Some(focus) = focus {
+                            let focus = Vec3::from_array(focus);
+                            if focus.is_finite() {
+                                orbit.focus = focus;
+                                orbit.target_focus = focus;
+                            }
+                        }
+                        if let Some(yaw) = yaw
+                            && yaw.is_finite()
+                        {
+                            orbit.yaw = Some(yaw);
+                            orbit.target_yaw = yaw;
+                        }
+                        if let Some(pitch) = pitch
+                            && pitch.is_finite()
+                        {
+                            orbit.pitch = Some(pitch);
+                            orbit.target_pitch = pitch;
+                        }
+                        if let Some(radius) = radius
+                            && radius.is_finite()
+                            && radius > 0.0
+                        {
+                            orbit.radius = Some(radius);
+                            orbit.target_radius = radius;
+                        }
+                        scene_changed = true;
+                    }
+                }
+            }
+            McpSceneCommand::SaveCache => {
+                force_cache_flush = true;
+            }
+        }
+    }
+
+    if force_cache_flush {
+        let camera_state = main_camera
+            .single()
+            .ok()
+            .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
+        if let Err(err) = flush_world_cache_now(&mut cache, &query_cached, camera_state) {
+            warn!("MCP save_cache failed: {err}");
+        } else {
+            world_cache.dirty = false;
+            world_cache.timer.reset();
+        }
+    } else if scene_changed {
+        world_cache.dirty = true;
+        world_cache.timer.reset();
+    }
+}
+
 pub(crate) fn drive_inference(mut ctx: InferenceContext) {
     if ctx.exit_state.requested {
         return;
@@ -656,6 +1042,7 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
                     handle_inference_result(
                         &mut ctx.commands,
                         &mut ctx.meshes,
+                        &mut ctx.images,
                         &mut ctx.materials,
                         &mut ctx.cache,
                         &mut ctx.catalog,
@@ -889,6 +1276,7 @@ fn update_window_title(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_exit_requests(
     keys: Res<ButtonInput<KeyCode>>,
     mut close_events: MessageReader<WindowCloseRequested>,
@@ -899,6 +1287,7 @@ fn handle_exit_requests(
     worker: Res<InferenceWorker>,
     mut cache: ResMut<MeshCacheResource>,
     cached_instances: Query<(&CachedMeshInstance, &Transform)>,
+    main_camera: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
 ) {
     if exit_state.requested {
         return;
@@ -912,10 +1301,11 @@ fn handle_exit_requests(
     }
 
     exit_state.requested = true;
-    if let Err(err) = cache
-        .cache
-        .set_world_items(collect_cached_world_items(&cached_instances))
-    {
+    let camera_state = main_camera
+        .single()
+        .ok()
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
+    if let Err(err) = flush_world_cache_now(&mut cache, &cached_instances, camera_state) {
         warn!("Failed to flush world cache during shutdown: {err}");
     }
     queue.active = None;
@@ -928,19 +1318,21 @@ fn handle_exit_requests(
     exit.write(AppExit::Success);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_inference_result(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
     cache: &mut ResMut<MeshCacheResource>,
     catalog: &mut ResMut<CatalogState>,
     request: InferenceRequest,
-    result: Result<Option<TripoMesh>, String>,
+    result: Result<Option<SynthMesh>, String>,
 ) {
     match result {
         Ok(Some(mesh)) => {
             if let Some(output) = request.output_path.as_ref()
-                && let Err(err) = write_obj(output, &mesh)
+                && let Err(err) = write_glb(output, &mesh)
             {
                 warn!("failed to write mesh to {}: {err}", output.display());
             }
@@ -962,12 +1354,9 @@ fn handle_inference_result(
                 .as_ref()
                 .map(|metadata| metadata.cache_key.clone());
 
-            let bevy_mesh = to_bevy_mesh(&mesh);
+            let bevy_mesh = to_bevy_mesh_synth(&mesh);
             let mesh_handle = meshes.add(bevy_mesh);
-            let material = materials.add(StandardMaterial {
-                base_color: Color::srgb(0.78, 0.84, 0.92),
-                ..default()
-            });
+            let material = materials.add(standard_material_for_inference(&mesh, images.as_mut()));
             spawn_mesh_instance(
                 commands,
                 mesh_handle.clone(),
@@ -1010,6 +1399,83 @@ fn handle_inference_result(
             }
         }
     }
+}
+
+fn standard_material_for_inference(
+    mesh: &SynthMesh,
+    images: &mut Assets<Image>,
+) -> StandardMaterial {
+    let mut out = if let Some(material) = mesh.material {
+        let base = material.base_color;
+        let alpha = material.alpha.clamp(0.0, 1.0);
+        StandardMaterial {
+            base_color: Color::srgba(base[0], base[1], base[2], alpha),
+            metallic: material.metallic.clamp(0.0, 1.0),
+            perceptual_roughness: material.roughness.clamp(0.045, 1.0),
+            alpha_mode: if alpha < 0.995 {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Opaque
+            },
+            ..default()
+        }
+    } else {
+        StandardMaterial {
+            base_color: Color::srgb(0.78, 0.84, 0.92),
+            ..default()
+        }
+    };
+
+    if let Some(pbr) = mesh.pbr_textures.as_ref() {
+        out.base_color_texture = Some(images.add(synth_texture_to_image(
+            &pbr.base_color,
+            TextureFormat::Rgba8UnormSrgb,
+        )));
+        out.metallic_roughness_texture = Some(images.add(synth_texture_to_image(
+            &pbr.metallic_roughness,
+            TextureFormat::Rgba8Unorm,
+        )));
+        out.metallic = 1.0;
+        out.perceptual_roughness = 1.0;
+
+        if let Some(texture) = pbr.normal.as_ref() {
+            out.normal_map_texture =
+                Some(images.add(synth_texture_to_image(texture, TextureFormat::Rgba8Unorm)));
+        }
+        if let Some(texture) = pbr.emissive.as_ref() {
+            out.emissive_texture = Some(images.add(synth_texture_to_image(
+                texture,
+                TextureFormat::Rgba8UnormSrgb,
+            )));
+            out.emissive = LinearRgba::WHITE;
+        }
+        if let Some(texture) = pbr.occlusion.as_ref() {
+            out.occlusion_texture =
+                Some(images.add(synth_texture_to_image(texture, TextureFormat::Rgba8Unorm)));
+        }
+    }
+
+    out
+}
+
+fn synth_texture_to_image(texture: &SynthMeshTexture, format: TextureFormat) -> Image {
+    let expected = texture.width as usize * texture.height as usize * 4;
+    let bytes = if texture.rgba8.len() == expected {
+        texture.rgba8.clone()
+    } else {
+        vec![255u8; expected]
+    };
+    Image::new(
+        Extent3d {
+            width: texture.width.max(1),
+            height: texture.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        bytes,
+        format,
+        RenderAssetUsages::default(),
+    )
 }
 
 pub(crate) fn enqueue_inference(
@@ -1103,6 +1569,7 @@ pub(crate) fn spawn_mesh_instance(
     entity_commands.id()
 }
 
+#[allow(clippy::type_complexity)]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
     changed: Query<
@@ -1112,9 +1579,16 @@ fn mark_world_cache_dirty(
             Or<(Added<CachedMeshInstance>, Changed<Transform>)>,
         ),
     >,
+    changed_camera: Query<
+        (),
+        (
+            With<MainCamera>,
+            Or<(Changed<Transform>, Changed<PanOrbitCamera>)>,
+        ),
+    >,
     mut removed: RemovedComponents<CachedMeshInstance>,
 ) {
-    if changed.is_empty() && removed.read().next().is_none() {
+    if changed.is_empty() && changed_camera.is_empty() && removed.read().next().is_none() {
         return;
     }
     persistence.dirty = true;
@@ -1126,6 +1600,7 @@ fn persist_world_cache(
     mut persistence: ResMut<WorldCachePersistence>,
     mut cache: ResMut<MeshCacheResource>,
     query: Query<(&CachedMeshInstance, &Transform)>,
+    main_camera: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
 ) {
     if !persistence.dirty {
         return;
@@ -1135,15 +1610,16 @@ fn persist_world_cache(
         return;
     }
 
-    match cache
-        .cache
-        .set_world_items(collect_cached_world_items(&query))
-    {
+    let camera_state = main_camera
+        .single()
+        .ok()
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
+    match flush_world_cache_now(&mut cache, &query, camera_state) {
         Ok(()) => {
             persistence.dirty = false;
         }
         Err(err) => {
-            warn!("Failed to persist world cache items: {err}");
+            warn!("Failed to persist world cache state: {err}");
             persistence.timer.reset();
         }
     }
@@ -1167,6 +1643,78 @@ fn collect_cached_world_items(
         });
     }
     world_items
+}
+
+fn flush_world_cache_now(
+    cache: &mut ResMut<MeshCacheResource>,
+    query: &Query<(&CachedMeshInstance, &Transform)>,
+    camera_state: Option<CachedCameraState>,
+) -> Result<(), String> {
+    cache
+        .cache
+        .set_world_items(collect_cached_world_items(query))
+        .map_err(|err| err.to_string())?;
+    cache
+        .cache
+        .set_camera_state(camera_state)
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_mcp_scene_commands(path: &std::path::Path) -> Result<Vec<McpSceneCommand>, io::Error> {
+    let content = fs::read_to_string(path)?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<McpSceneCommand>>(trimmed).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid command array JSON: {err}"),
+            )
+        });
+    }
+
+    serde_json::from_str::<McpSceneCommandEnvelope>(trimmed)
+        .map(|envelope| envelope.commands)
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid command envelope JSON: {err}"),
+            )
+        })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn transform_from_optional_parts(
+    translation: Option<[f32; 3]>,
+    rotation: Option<[f32; 4]>,
+    scale: Option<[f32; 3]>,
+) -> Option<Transform> {
+    let translation = translation.map(Vec3::from_array).unwrap_or(Vec3::ZERO);
+    let rotation = rotation
+        .map(|q| Quat::from_xyzw(q[0], q[1], q[2], q[3]))
+        .unwrap_or(Quat::IDENTITY);
+    let scale = scale.map(Vec3::from_array).unwrap_or(Vec3::ONE);
+    if !translation.is_finite() || !rotation.is_finite() || !scale.is_finite() {
+        return None;
+    }
+    let rotation = if rotation.length_squared() > 0.0 {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    Some(Transform {
+        translation,
+        rotation,
+        scale: if scale.length_squared() > 0.0 {
+            scale
+        } else {
+            Vec3::ONE
+        },
+    })
 }
 
 fn delete_selected_meshes(
@@ -1193,6 +1741,7 @@ fn delete_selected_meshes(
     selection.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_selection_from_primary_click(
     buttons: Res<ButtonInput<MouseButton>>,
     keyboard_input: Res<ButtonInput<KeyCode>>,

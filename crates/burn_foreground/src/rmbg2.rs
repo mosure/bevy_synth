@@ -364,9 +364,8 @@ pub mod import {
         }
 
         for path in existing {
-            match load_rmbg2_onnx_blob_from_burnpack(&path) {
-                Ok(bytes) => return Ok(Some(bytes)),
-                Err(_) => {}
+            if let Ok(bytes) = load_rmbg2_onnx_blob_from_burnpack(&path) {
+                return Ok(Some(bytes));
             }
         }
 
