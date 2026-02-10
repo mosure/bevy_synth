@@ -18,13 +18,13 @@ burn-cubecl = { version = "0.19", optional = true }
 version = "0.19"
 optional = true
 default-features = false
-features = ["fusion", "std", "vulkan"]
+features = ["std", "vulkan"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
 version = "0.19"
 optional = true
 default-features = false
-features = ["fusion", "std", "webgpu"]
+features = ["std", "webgpu"]
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }

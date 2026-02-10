@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use burn::tensor::{DType, Int, Shape, Tensor as BurnTensor, TensorData, TensorPrimitive};
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::{calculate_cube_count_elemwise, prelude::*};
-use burn_cubecl::{tensor::CubeTensor, CubeRuntime};
+use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
 
-use crate::{build_neighbor_rows, kernel_rows, SparseSubmConvConfig};
+use crate::{SparseSubmConvConfig, build_neighbor_rows, kernel_rows};
 
 /// Default WGPU backend type used by the tensor convenience wrappers.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
@@ -483,30 +483,58 @@ fn resolve_cube_dim() -> CubeDim {
 
 fn resolve_split_k(config: &SparseSubmConvConfig, rows: usize, kernel_rows: usize) -> usize {
     let max_split = 8usize;
-    if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K") {
+    let mut split = if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K") {
         let value = raw.trim().to_ascii_lowercase();
         if value == "off" || value == "0" || value == "1" {
-            return 1;
-        }
-        if value != "auto" {
-            if let Ok(parsed) = value.parse::<usize>() {
-                return parsed.clamp(1, max_split);
+            1
+        } else if value != "auto" {
+            value
+                .parse::<usize>()
+                .ok()
+                .map(|parsed| parsed.clamp(1, max_split))
+                .unwrap_or(1)
+        } else {
+            let k_in = kernel_rows.saturating_mul(config.in_channels_per_group);
+            let work = rows
+                .saturating_mul(config.out_channels_per_group)
+                .saturating_mul(k_in);
+            if work >= 64 * 1024 * 1024 {
+                4
+            } else if work >= 24 * 1024 * 1024 {
+                2
+            } else {
+                1
             }
-            return 1;
         }
-    }
-
-    let k_in = kernel_rows.saturating_mul(config.in_channels_per_group);
-    let work = rows
-        .saturating_mul(config.out_channels_per_group)
-        .saturating_mul(k_in);
-    if work >= 64 * 1024 * 1024 {
-        4
-    } else if work >= 24 * 1024 * 1024 {
-        2
     } else {
-        1
+        let k_in = kernel_rows.saturating_mul(config.in_channels_per_group);
+        let work = rows
+            .saturating_mul(config.out_channels_per_group)
+            .saturating_mul(k_in);
+        if work >= 64 * 1024 * 1024 {
+            4
+        } else if work >= 24 * 1024 * 1024 {
+            2
+        } else {
+            1
+        }
+    };
+
+    let output_elements = rows.saturating_mul(config.out_channels);
+    let output_bytes = output_elements.saturating_mul(core::mem::size_of::<f32>());
+    let max_partial_bytes = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K_MAX_PARTIAL_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(256 * 1024 * 1024);
+    while split > 1 {
+        let partial_bytes = output_bytes.saturating_mul(split);
+        if partial_bytes <= max_partial_bytes {
+            break;
+        }
+        split -= 1;
     }
+    split.max(1)
 }
 
 fn resolve_sparse_conv_kernel_variant(
@@ -971,9 +999,9 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
 ) -> Result<CubeTensor<R>, String> {
     validate_tensor_shapes(config, &input, &neighbor_rows, &weight, &bias)?;
 
-    let rows = input.shape.dims[0];
+    let query_rows = neighbor_rows.shape.dims[0];
     let out_channels = config.out_channels;
-    let output_elements = rows
+    let output_elements = query_rows
         .checked_mul(out_channels)
         .ok_or_else(|| "sparse conv output size overflow".to_string())?;
     let output_bytes = output_elements
@@ -983,16 +1011,16 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
     let output = CubeTensor::new_contiguous(
         input.client.clone(),
         input.device.clone(),
-        Shape::new([rows, out_channels]),
+        Shape::new([query_rows, out_channels]),
         input.client.empty(output_bytes),
         DType::F32,
     );
 
     let kernel_rows = kernel_rows(config)?;
-    let split_k = resolve_split_k(config, rows, kernel_rows);
+    let split_k = resolve_split_k(config, query_rows, kernel_rows);
     let cube_dim = resolve_cube_dim();
     if split_k <= 1 {
-        match resolve_sparse_conv_kernel_variant(config, rows, kernel_rows) {
+        match resolve_sparse_conv_kernel_variant(config, query_rows, kernel_rows) {
             SparseConvKernelVariant::Baseline => {
                 let cube_count = calculate_cube_count_elemwise(output_elements, cube_dim);
                 unsafe {
@@ -1015,7 +1043,7 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
             }
             SparseConvKernelVariant::FusedOc4 => {
                 let blocks_per_row = config.out_channels.div_ceil(FUSED_OC_TILE as usize) as u32;
-                let output_blocks = rows
+                let output_blocks = query_rows
                     .checked_mul(blocks_per_row as usize)
                     .ok_or_else(|| "sparse conv fused output tile count overflow".to_string())?;
                 let cube_count = calculate_cube_count_elemwise(output_blocks, cube_dim);
@@ -1048,7 +1076,7 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
         let partial = CubeTensor::new_contiguous(
             input.client.clone(),
             input.device.clone(),
-            Shape::new([split_k, rows, out_channels]),
+            Shape::new([split_k, query_rows, out_channels]),
             input.client.empty(partial_bytes),
             DType::F32,
         );
@@ -1206,17 +1234,18 @@ fn validate_tensor_shapes<R: CubeRuntime>(
         ));
     }
 
-    let rows = input.shape.dims[0];
+    let input_rows = input.shape.dims[0];
+    let query_rows = neighbor_rows.shape.dims[0];
     if input.shape.dims[1] != config.in_channels {
         return Err(format!(
             "sparse conv input channel mismatch: got {} expected {}",
             input.shape.dims[1], config.in_channels
         ));
     }
-    if neighbor_rows.shape.dims[0] != rows {
+    if query_rows > input_rows {
         return Err(format!(
-            "sparse conv neighbor row count mismatch: got {} expected {}",
-            neighbor_rows.shape.dims[0], rows
+            "sparse conv neighbor row count exceeds input rows: got {} input rows {}",
+            query_rows, input_rows
         ));
     }
     let expected_kernel_rows = kernel_rows(config)?;
@@ -1255,12 +1284,12 @@ mod tests {
 
     use burn::tensor::Tensor;
 
-    use crate::{sparse_subm_conv_forward_flex, SparseSubmConvConfig, SparseSubmConvWeights};
+    use crate::{SparseSubmConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex};
 
     use super::{
-        clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
+        DefaultWgpuBackend, clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
         neighbor_rows_tensor_from_coords, reset_neighbor_rows_build_stats,
-        sparse_subm_conv_forward_wgpu, DefaultWgpuBackend,
+        sparse_subm_conv_forward_wgpu,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());

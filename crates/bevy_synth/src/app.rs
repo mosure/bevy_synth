@@ -291,10 +291,13 @@ fn add_default_plugins(app: &mut App) {
         unapproved_path_mode: UnapprovedPathMode::Allow,
         ..default()
     };
-    app.add_plugins(WebAssetPlugin {
-        silence_startup_warning: true,
-    });
-    app.add_plugins(DefaultPlugins.set(asset_plugin));
+    app.add_plugins(
+        DefaultPlugins
+            .set(WebAssetPlugin {
+                silence_startup_warning: true,
+            })
+            .set(asset_plugin),
+    );
 }
 
 #[cfg(target_arch = "wasm32")]

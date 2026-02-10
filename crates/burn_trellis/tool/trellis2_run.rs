@@ -49,6 +49,10 @@ struct Args {
     /// Fail if sparse-structure stage falls back to synthetic mode.
     #[arg(long, default_value_t = false)]
     require_runtime_model: bool,
+
+    /// Fail if any pipeline stage uses fallback behavior (benchmark strict mode).
+    #[arg(long, default_value_t = false)]
+    strict_benchmark: bool,
 }
 
 fn run() -> Result<(), String> {
@@ -79,6 +83,19 @@ fn run() -> Result<(), String> {
     if args.require_runtime_model && profiled.sparse_source.as_str() == "synthetic" {
         return Err("runtime-model required but sparse stage used synthetic fallback".to_string());
     }
+    if args.strict_benchmark {
+        if profiled.sparse_source.as_str() == "synthetic" {
+            return Err(
+                "strict benchmark failed: sparse stage used synthetic fallback".to_string(),
+            );
+        }
+        if profiled.decode_source.is_fallback() {
+            return Err(format!(
+                "strict benchmark failed: decode stage used fallback source '{}'",
+                profiled.decode_source.as_str()
+            ));
+        }
+    }
     if let Some(obj_path) = args.output_obj.as_ref() {
         burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
@@ -92,7 +109,13 @@ fn run() -> Result<(), String> {
             "elapsed_ms": profiled.timings.total_ms,
             "device": options.device.as_str(),
             "quality": options.quality.as_str(),
+            "strict_benchmark": args.strict_benchmark,
             "sparse_source": profiled.sparse_source.as_str(),
+            "decode_source": profiled.decode_source.as_str(),
+            "fallbacks": {
+                "sparse": profiled.sparse_source.as_str() == "synthetic",
+                "decode": profiled.decode_source.is_fallback(),
+            },
             "timings_ms": {
                 "preprocess": profiled.timings.preprocess_ms,
                 "runtime_setup": profiled.timings.runtime_setup_ms,

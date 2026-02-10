@@ -1222,8 +1222,7 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             return self.predict_velocity_tensor(x_t, timestep, neg_cond, concat_cond);
         }
 
-        let pos =
-            self.predict_velocity_tensor(x_t.clone(), timestep, cond.clone(), concat_cond.clone())?;
+        let pos = self.predict_velocity_tensor(x_t.clone(), timestep, cond, concat_cond.clone())?;
         let neg = self.predict_velocity_tensor(x_t.clone(), timestep, neg_cond, concat_cond)?;
         let mut pred = pos.clone().mul_scalar(w).add(neg.mul_scalar(1.0 - w));
         if config.guidance_rescale <= 0.0 {
@@ -1231,8 +1230,8 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
         }
 
         let x0_pos = pred_to_xstart_tensor(x_t.clone(), timestep, pos, sigma_min);
-        let x0_cfg = pred_to_xstart_tensor(x_t.clone(), timestep, pred.clone(), sigma_min);
-        let std_pos = tensor_std_tensor(x0_pos.clone());
+        let x0_cfg = pred_to_xstart_tensor(x_t.clone(), timestep, pred, sigma_min);
+        let std_pos = tensor_std_tensor(x0_pos);
         let std_cfg = tensor_std_tensor(x0_cfg.clone()).add_scalar(1.0e-12);
         let scale = std_pos.div(std_cfg).reshape([1, 1, 1, 1, 1]);
         let x0 = x0_cfg
@@ -1776,10 +1775,7 @@ fn scaled_dot_product_attention_dense<B: Backend>(
             .clone()
             .slice([0..batch, 0..heads, start..end, 0..head_dim])
             .clone();
-        let attn = softmax(
-            matmul_4d_via_3d(q_chunk, k_t.clone()).mul_scalar(scale),
-            3,
-        );
+        let attn = softmax(matmul_4d_via_3d(q_chunk, k_t.clone()).mul_scalar(scale), 3);
         chunks.push(matmul_4d_via_3d(attn, v.clone()));
         start = end;
     }
@@ -1883,7 +1879,12 @@ fn scaled_dot_product_attention_stream<B: Backend>(
     Tensor::cat(outputs, 2)
 }
 
-fn attention_logits_bytes(batch: usize, heads: usize, query_tokens: usize, key_tokens: usize) -> usize {
+fn attention_logits_bytes(
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+) -> usize {
     batch
         .saturating_mul(heads)
         .saturating_mul(query_tokens)

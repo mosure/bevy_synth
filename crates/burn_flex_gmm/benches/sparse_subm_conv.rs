@@ -1,16 +1,16 @@
 use burn_flex_gmm::{
-    build_neighbor_rows, pack_flex_weight, sparse_subm_conv_forward_flex,
-    sparse_subm_conv_forward_flex_precomputed, sparse_subm_conv_forward_legacy,
-    SparseSubmConvConfig, SparseSubmConvWeights,
+    SparseSubmConvConfig, SparseSubmConvWeights, build_neighbor_rows, pack_flex_weight,
+    sparse_subm_conv_forward_flex, sparse_subm_conv_forward_flex_precomputed,
+    sparse_subm_conv_forward_legacy,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "wgpu-kernel")]
 use burn::tensor::Tensor;
 #[cfg(feature = "wgpu-kernel")]
 use burn_flex_gmm::wgpu::{
-    clear_neighbor_rows_tensor_cache, neighbor_rows_tensor_from_coords,
-    sparse_subm_conv_forward_wgpu, DefaultWgpuBackend,
+    DefaultWgpuBackend, clear_neighbor_rows_tensor_cache, neighbor_rows_tensor_from_coords,
+    sparse_subm_conv_forward_wgpu,
 };
 
 #[derive(Clone)]

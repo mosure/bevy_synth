@@ -17,7 +17,7 @@ use crate::preprocess::{
 };
 use crate::sampler::{FlowEulerSampleConfig, timestep_pairs};
 use crate::staged_pipeline::{
-    SamplerConfigOverride, SparseRowNoiseOverride, SparseStructureStageSource,
+    DecodeStageSource, SamplerConfigOverride, SparseRowNoiseOverride, SparseStructureStageSource,
     TrellisNoiseOverrides, TrellisStageOutput, TrellisStageRuntime,
 };
 use crate::trellis_config::TrellisPipelineConfig;
@@ -124,6 +124,7 @@ pub struct TrellisInferenceProfile {
     pub mesh: Mesh,
     pub timings: TrellisPipelineTimings,
     pub sparse_source: SparseStructureStageSource,
+    pub decode_source: DecodeStageSource,
     pub step_counts: TrellisPipelineStepCounts,
 }
 
@@ -336,6 +337,7 @@ impl Trellis2Pipeline {
         };
         Ok(TrellisInferenceProfile {
             sparse_source: stage_output.sparse.source,
+            decode_source: stage_output.decode_source,
             mesh: stage_output.mesh,
             timings,
             step_counts,

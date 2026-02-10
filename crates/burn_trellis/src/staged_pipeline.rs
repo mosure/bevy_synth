@@ -57,6 +57,35 @@ impl SparseStructureStageSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DecodeStageSource {
+    Runtime,
+    FallbackSkipDecode,
+    FallbackMissingShapeDecoder,
+    FallbackMissingTexDecoder,
+    FallbackRuntimeError,
+    FallbackEmptyLatent,
+    FallbackEmptyMesh,
+}
+
+impl DecodeStageSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::FallbackSkipDecode => "fallback_skip_decode",
+            Self::FallbackMissingShapeDecoder => "fallback_missing_shape_decoder",
+            Self::FallbackMissingTexDecoder => "fallback_missing_tex_decoder",
+            Self::FallbackRuntimeError => "fallback_runtime_error",
+            Self::FallbackEmptyLatent => "fallback_empty_latent",
+            Self::FallbackEmptyMesh => "fallback_empty_mesh",
+        }
+    }
+
+    pub fn is_fallback(self) -> bool {
+        !matches!(self, Self::Runtime)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShapeSLatSample {
     pub sampler_config: FlowEulerSampleConfig,
@@ -95,6 +124,7 @@ pub struct TrellisStageOutput {
     pub sparse: SparseStructureSample,
     pub shape_slat: ShapeSLatSample,
     pub tex_slat: TexSLatSample,
+    pub decode_source: DecodeStageSource,
     pub decode_shape_subs: Vec<DecodeShapeSubSample>,
     pub decode_tex_voxels: DecodeTexVoxelSample,
     pub mesh: Mesh,
@@ -117,6 +147,7 @@ pub struct DecodeTexVoxelSample {
 
 #[derive(Debug, Clone)]
 struct DecodedLatentOutput {
+    source: DecodeStageSource,
     mesh: Mesh,
     shape_subs: Vec<DecodeShapeSubSample>,
     tex_voxels: DecodeTexVoxelSample,
@@ -605,17 +636,7 @@ impl TrellisStageRuntime {
                         .to_string(),
                 );
             }
-            DecodedLatentOutput {
-                mesh: canonical_cube(),
-                shape_subs: Vec::new(),
-                tex_voxels: DecodeTexVoxelSample {
-                    coords: Vec::new(),
-                    feats: Vec::new(),
-                    spatial_shape: [1, 1, 1],
-                },
-                pbr: None,
-                timings: DecodeRuntimeTimings::default(),
-            }
+            decoded_fallback_output(DecodeStageSource::FallbackSkipDecode)
         } else {
             decode_latent_to_outputs(
                 &shape_slat,
@@ -640,6 +661,7 @@ impl TrellisStageRuntime {
             sparse,
             shape_slat,
             tex_slat,
+            decode_source: decoded.source,
             decode_shape_subs: decoded.shape_subs,
             decode_tex_voxels: decoded.tex_voxels,
             mesh: decoded.mesh,
@@ -1955,7 +1977,9 @@ fn decode_latent_to_outputs(
             eprintln!(
                 "burn_trellis: shape runtime decoder missing; using canonical-cube decode fallback"
             );
-            return Ok(decoded_fallback_output());
+            return Ok(decoded_fallback_output(
+                DecodeStageSource::FallbackMissingShapeDecoder,
+            ));
         };
         let Some(tex_decoder) = tex_decoder else {
             if parity_strict {
@@ -1967,7 +1991,9 @@ fn decode_latent_to_outputs(
             eprintln!(
                 "burn_trellis: tex runtime decoder missing; using canonical-cube decode fallback"
             );
-            return Ok(decoded_fallback_output());
+            return Ok(decoded_fallback_output(
+                DecodeStageSource::FallbackMissingTexDecoder,
+            ));
         };
         decode_latent_with_runtime_decoders(shape, tex, pipeline_type, parity_strict, shape_decoder, tex_decoder)
             .or_else(|err| {
@@ -1975,7 +2001,9 @@ fn decode_latent_to_outputs(
                     Err(format!("burn_trellis: runtime decode pipeline failed: {err}"))
                 } else {
                     eprintln!("burn_trellis: runtime decode pipeline failed ({err}); using canonical-cube decode fallback");
-                    Ok(decoded_fallback_output())
+                    Ok(decoded_fallback_output(
+                        DecodeStageSource::FallbackRuntimeError,
+                    ))
                 }
             })
     }
@@ -1987,8 +2015,9 @@ fn decode_latent_to_outputs(
     }
 }
 
-fn decoded_fallback_output() -> DecodedLatentOutput {
+fn decoded_fallback_output(source: DecodeStageSource) -> DecodedLatentOutput {
     DecodedLatentOutput {
+        source,
         mesh: canonical_cube(),
         shape_subs: Vec::new(),
         tex_voxels: DecodeTexVoxelSample {
@@ -2023,7 +2052,9 @@ fn decode_latent_with_runtime_decoders(
                     .to_string(),
             );
         }
-        return Ok(decoded_fallback_output());
+        return Ok(decoded_fallback_output(
+            DecodeStageSource::FallbackEmptyLatent,
+        ));
     }
     if shape_decoder.out_channels() < 7 || tex_decoder.out_channels() < 6 {
         return Err(format!(
@@ -2142,7 +2173,9 @@ fn decode_latent_with_runtime_decoders(
         if parity_strict {
             return Err("parity strict mode: runtime decode produced empty mesh".to_string());
         }
-        canonical_cube()
+        return Ok(decoded_fallback_output(
+            DecodeStageSource::FallbackEmptyMesh,
+        ));
     } else {
         Mesh {
             vertices,
@@ -2161,6 +2194,7 @@ fn decode_latent_with_runtime_decoders(
     let tex_spatial = spatial_shape_from_sparse_coords(coords.as_slice());
 
     Ok(DecodedLatentOutput {
+        source: DecodeStageSource::Runtime,
         mesh,
         shape_subs,
         tex_voxels: DecodeTexVoxelSample {
