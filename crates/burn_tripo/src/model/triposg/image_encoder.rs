@@ -331,10 +331,23 @@ pub mod import {
         weights_root: impl AsRef<Path>,
     ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
         let root = weights_root.as_ref();
-        let path = root.join("feature_extractor_dinov2/preprocessor_config.json");
-        let bytes = fs::read(path)?;
         let fallback_size = load_dinov2_image_size(root);
-        load_dinov2_processor_from_json_bytes(&bytes, fallback_size)
+        for path in dinov2_preprocessor_config_paths(root) {
+            if let Ok(bytes) = fs::read(path)
+                && let Ok(processor) = load_dinov2_processor_from_json_bytes(&bytes, fallback_size)
+            {
+                return Ok(processor);
+            }
+        }
+
+        let mut processor = DinoImageProcessor::default();
+        if let Some(target_size) = fallback_size {
+            processor.do_resize = true;
+            processor.size_shortest_edge = Some(target_size);
+            processor.do_center_crop = true;
+            processor.crop_size = Some([target_size, target_size]);
+        }
+        Ok(processor)
     }
 
     pub fn load_dinov2_processor_from_json_bytes(
@@ -407,9 +420,22 @@ pub mod import {
 
     fn load_dinov2_preprocess_size(weights_path: &Path) -> Option<usize> {
         let weights_root = weights_path.parent()?.parent()?;
-        let config_path = weights_root.join("feature_extractor_dinov2/preprocessor_config.json");
-        let bytes = fs::read(config_path).ok()?;
-        load_dinov2_preprocess_size_from_json_bytes(&bytes)
+        for path in dinov2_preprocessor_config_paths(weights_root) {
+            if let Ok(bytes) = fs::read(path)
+                && let Some(size) = load_dinov2_preprocess_size_from_json_bytes(&bytes)
+            {
+                return Some(size);
+            }
+        }
+        None
+    }
+
+    fn dinov2_preprocessor_config_paths(weights_root: &Path) -> [PathBuf; 3] {
+        [
+            weights_root.join("feature_extractor_dinov2/preprocessor_config.json"),
+            weights_root.join("feature_extractor_2/preprocessor_config.json"),
+            weights_root.join("feature_extractor_1/preprocessor_config.json"),
+        ]
     }
 
     pub fn load_dinov2_preprocess_size_from_json_bytes(bytes: &[u8]) -> Option<usize> {
@@ -425,6 +451,90 @@ pub mod import {
             return Some(size);
         }
         None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use super::load_dinov2_processor;
+
+        static TEST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+        fn make_temp_root(label: &str) -> PathBuf {
+            let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "burn_tripo_dino_processor_test_{}_{}_{}_{}",
+                label,
+                std::process::id(),
+                nanos,
+                nonce
+            ))
+        }
+
+        #[test]
+        fn loads_preprocessor_from_legacy_feature_extractor_directory() {
+            let root = make_temp_root("legacy");
+            let legacy = root.join("feature_extractor_2");
+            fs::create_dir_all(&legacy).expect("create legacy preprocessor dir");
+            fs::write(
+                legacy.join("preprocessor_config.json"),
+                r#"{
+                    "crop_size": { "height": 512, "width": 512 },
+                    "do_center_crop": true,
+                    "do_normalize": true,
+                    "do_rescale": true,
+                    "do_resize": true,
+                    "image_mean": [0.485, 0.456, 0.406],
+                    "image_std": [0.229, 0.224, 0.225],
+                    "resample": 3,
+                    "rescale_factor": 0.00392156862745098,
+                    "size": { "shortest_edge": 512 }
+                }"#,
+            )
+            .expect("write legacy preprocessor config");
+
+            let processor = load_dinov2_processor(&root).expect("load processor");
+            assert!(processor.do_resize);
+            assert_eq!(processor.size_shortest_edge, Some(512));
+            assert!(processor.do_center_crop);
+            assert_eq!(processor.crop_size, Some([512, 512]));
+
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn falls_back_to_default_processor_when_no_preprocessor_json_exists() {
+            let root = make_temp_root("default");
+            let dino_config_dir = root.join("image_encoder_dinov2");
+            fs::create_dir_all(&dino_config_dir).expect("create dino config dir");
+            fs::write(
+                dino_config_dir.join("config.json"),
+                r#"{
+                    "image_size": 518,
+                    "patch_size": 14,
+                    "num_channels": 3
+                }"#,
+            )
+            .expect("write dino config");
+
+            let processor = load_dinov2_processor(&root).expect("load default processor");
+            assert!(processor.do_resize);
+            assert_eq!(processor.size_shortest_edge, Some(518));
+            assert!(processor.do_center_crop);
+            assert_eq!(processor.crop_size, Some([518, 518]));
+            assert_eq!(processor.mean, [0.485, 0.456, 0.406]);
+            assert_eq!(processor.std, [0.229, 0.224, 0.225]);
+
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     fn load_dinov2_config(weights_path: &Path) -> Option<DinoVisionTransformerConfig> {

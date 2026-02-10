@@ -1,14 +1,10 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
-use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::AtmosphereEnvironmentMapLight;
-use bevy::pbr::{Atmosphere, MeshMaterial3d};
-use bevy::post_process::bloom::Bloom;
+use bevy::pbr::MeshMaterial3d;
 use bevy::prelude::*;
 use bevy::render::alpha::AlphaMode;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::view::Hdr;
 use bevy::window::PrimaryWindow;
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
@@ -258,6 +254,14 @@ impl CatalogState {
         let start = total.saturating_sub(CATALOG_PAGE_SIZE * (self.page + 1));
         let end = total.saturating_sub(CATALOG_PAGE_SIZE * self.page);
         (start..end).rev().collect()
+    }
+
+    pub fn has_ready_cube_entry(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry.status, CatalogStatus::Ready)
+                && entry.cache_key.is_none()
+                && entry.label.eq_ignore_ascii_case("cube")
+        })
     }
 }
 
@@ -1527,14 +1531,6 @@ fn spawn_preview_scene(
     let camera_entity = commands
         .spawn((
             Camera3d::default(),
-            Hdr,
-            Tonemapping::AcesFitted,
-            Bloom::NATURAL,
-            Atmosphere::EARTH,
-            AtmosphereEnvironmentMapLight {
-                intensity: 1.1,
-                ..default()
-            },
             Camera {
                 order: 2,
                 target: RenderTarget::Image(image_handle.clone().into()),

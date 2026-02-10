@@ -121,6 +121,16 @@ struct DecodedLatentOutput {
     shape_subs: Vec<DecodeShapeSubSample>,
     tex_voxels: DecodeTexVoxelSample,
     pbr: Option<PbrBakeDebug>,
+    timings: DecodeRuntimeTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeRuntimeTimings {
+    shape_decoder_ms: f64,
+    tex_decoder_ms: f64,
+    attr_merge_ms: f64,
+    mesh_ms: f64,
+    pbr_ms: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +155,11 @@ pub struct TrellisStageTimings {
     pub shape_slat_ms: f64,
     pub tex_slat_ms: f64,
     pub decode_ms: f64,
+    pub decode_shape_decoder_ms: f64,
+    pub decode_tex_decoder_ms: f64,
+    pub decode_attr_merge_ms: f64,
+    pub decode_mesh_ms: f64,
+    pub decode_pbr_ms: f64,
     pub total_ms: f64,
 }
 
@@ -599,6 +614,7 @@ impl TrellisStageRuntime {
                     spatial_shape: [1, 1, 1],
                 },
                 pbr: None,
+                timings: DecodeRuntimeTimings::default(),
             }
         } else {
             decode_latent_to_outputs(
@@ -634,6 +650,11 @@ impl TrellisStageRuntime {
             shape_slat_ms,
             tex_slat_ms,
             decode_ms,
+            decode_shape_decoder_ms: decoded.timings.shape_decoder_ms,
+            decode_tex_decoder_ms: decoded.timings.tex_decoder_ms,
+            decode_attr_merge_ms: decoded.timings.attr_merge_ms,
+            decode_mesh_ms: decoded.timings.mesh_ms,
+            decode_pbr_ms: decoded.timings.pbr_ms,
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
         };
         Ok((output, timings))
@@ -683,6 +704,35 @@ fn runtime_skip_decode() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn runtime_skip_pbr() -> bool {
+    std::env::var("TRELLIS2_SKIP_PBR")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
+    if let Some(explicit_limit) = runtime_max_sparse_coords() {
+        return Some(explicit_limit);
+    }
+    if runtime_parity_strict() {
+        return None;
+    }
+    if backend_name == "wgpu" {
+        return std::env::var("TRELLIS2_MAX_SPARSE_COORDS_WGPU_DEFAULT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .or(Some(32_768));
+    }
+    None
 }
 
 fn resolve_sampler_settings(
@@ -1168,7 +1218,7 @@ fn sample_sparse_structure_with_model(
 
     let occupancy = latent_to_occupancy(&latent, channels, flow_resolution);
     let upsampled = upsample_occupancy(occupancy.as_slice(), flow_resolution, resolution);
-    let max_sparse_coords = runtime_max_sparse_coords();
+    let max_sparse_coords = runtime_max_sparse_coords_for_backend(sparse_flow.backend_name());
     let mut coords = if let Some(override_coords) = coords_override {
         if runtime_stage_debug_enabled() {
             eprintln!(
@@ -1947,6 +1997,7 @@ fn decoded_fallback_output() -> DecodedLatentOutput {
             spatial_shape: [1, 1, 1],
         },
         pbr: None,
+        timings: DecodeRuntimeTimings::default(),
     }
 }
 
@@ -1990,10 +2041,11 @@ fn decode_latent_with_runtime_decoders(
     let shape_decoded = shape_decoder
         .decode_sparse(&shape.coords[..count], shape_rows)
         .map_err(|err| format!("shape runtime decoder failed: {err}"))?;
+    let shape_decoder_ms = shape_decode_start.elapsed().as_secs_f64() * 1000.0;
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime shape-decoder complete ({:.2} ms, subs={}, coords={})",
-            shape_decode_start.elapsed().as_secs_f64() * 1000.0,
+            shape_decoder_ms,
             shape_decoded.subdivisions.len(),
             shape_decoded.coords.len()
         );
@@ -2007,10 +2059,11 @@ fn decode_latent_with_runtime_decoders(
             shape_decoded.subdivisions.as_slice(),
         )
         .map_err(|err| format!("tex runtime decoder failed: {err}"))?;
+    let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime tex-decoder complete ({:.2} ms, coords={})",
-            tex_decode_start.elapsed().as_secs_f64() * 1000.0,
+            tex_decoder_ms,
             tex_decoded.coords.len()
         );
     }
@@ -2031,10 +2084,11 @@ fn decode_latent_with_runtime_decoders(
         .iter()
         .map(|coord| tex_by_coord.get(coord).copied().unwrap_or([0.5; 6]))
         .collect::<Vec<_>>();
+    let attr_merge_ms = attr_merge_start.elapsed().as_secs_f64() * 1000.0;
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime attr merge complete ({:.2} ms)",
-            attr_merge_start.elapsed().as_secs_f64() * 1000.0
+            attr_merge_ms
         );
     }
 
@@ -2053,21 +2107,36 @@ fn decode_latent_with_runtime_decoders(
         [-0.5, -0.5, -0.5],
         [0.5, 0.5, 0.5],
     );
+    let mesh_ms = mesh_start.elapsed().as_secs_f64() * 1000.0;
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime mesh complete ({:.2} ms, vertices={}, faces={})",
-            mesh_start.elapsed().as_secs_f64() * 1000.0,
+            mesh_ms,
             vertices.len(),
             faces.len()
         );
     }
-    let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels(
-        vertices.as_slice(),
-        faces.as_slice(),
-        coords.as_slice(),
-        voxel_attrs.as_slice(),
-        final_resolution as u32,
-    );
+    let skip_pbr = runtime_skip_pbr();
+    let (uvs, pbr_textures, pbr_debug, pbr_ms) = if skip_pbr {
+        if stage_debug {
+            eprintln!("burn_trellis: decode runtime pbr skipped (TRELLIS2_SKIP_PBR=1)");
+        }
+        (Vec::new(), None, None, 0.0)
+    } else {
+        let pbr_start = Instant::now();
+        let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels(
+            vertices.as_slice(),
+            faces.as_slice(),
+            coords.as_slice(),
+            voxel_attrs.as_slice(),
+            final_resolution as u32,
+        );
+        let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
+        if stage_debug {
+            eprintln!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
+        }
+        (uvs, pbr_textures, Some(pbr_debug), pbr_ms)
+    };
     let material = summarize_material(voxel_attrs.as_slice(), pbr_textures.as_ref());
     let mesh = if vertices.is_empty() || faces.is_empty() {
         if parity_strict {
@@ -2099,7 +2168,14 @@ fn decode_latent_with_runtime_decoders(
             feats: voxel_attrs,
             spatial_shape: tex_spatial,
         },
-        pbr: Some(pbr_debug),
+        pbr: pbr_debug,
+        timings: DecodeRuntimeTimings {
+            shape_decoder_ms,
+            tex_decoder_ms,
+            attr_merge_ms,
+            mesh_ms,
+            pbr_ms,
+        },
     })
 }
 

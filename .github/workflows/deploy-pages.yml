@@ -17,15 +17,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    env:
-      # Example S3 base: https://example-bucket.s3.amazonaws.com/burn_synth/assets
-      BURN_SYNTH_WEB_ASSET_ROOT: ${{ vars.BURN_SYNTH_WEB_ASSET_ROOT || secrets.BURN_SYNTH_WEB_ASSET_ROOT }}
-      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/MIDI-3D
-      TRIPOSG_WEIGHTS_ROOT: ${{ vars.TRIPOSG_WEIGHTS_ROOT || secrets.TRIPOSG_WEIGHTS_ROOT }}
-      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TripoSG-scribble
-      TRIPOSG_SCRIBBLE_WEIGHTS_ROOT: ${{ vars.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT || secrets.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT }}
-      # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/RMBG-1.4
-      RMBG_WEIGHTS_ROOT: ${{ vars.RMBG_WEIGHTS_ROOT || secrets.RMBG_WEIGHTS_ROOT }}
 
     steps:
       - name: checkout repository
@@ -40,6 +31,24 @@ jobs:
         run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
 
       - name: build web app
+        env:
+          # Build-time-only vars embedded into wasm via option_env!.
+          # Example S3 base: https://example-bucket.s3.amazonaws.com/burn_synth/assets
+          BURN_SYNTH_WEB_ASSET_ROOT: ${{ vars.BURN_SYNTH_WEB_ASSET_ROOT || secrets.BURN_SYNTH_WEB_ASSET_ROOT }}
+          # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/MIDI-3D
+          TRIPOSG_WEIGHTS_ROOT: ${{ vars.TRIPOSG_WEIGHTS_ROOT || secrets.TRIPOSG_WEIGHTS_ROOT }}
+          # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TripoSG-scribble
+          TRIPOSG_SCRIBBLE_WEIGHTS_ROOT: ${{ vars.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT || secrets.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT }}
+          # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/RMBG-1.4
+          RMBG14_WEIGHTS_ROOT: ${{ vars.RMBG14_WEIGHTS_ROOT || secrets.RMBG14_WEIGHTS_ROOT || vars.RMBG_WEIGHTS_ROOT || secrets.RMBG_WEIGHTS_ROOT }}
+          # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/RMBG-2.0
+          RMBG2_WEIGHTS_ROOT: ${{ vars.RMBG2_WEIGHTS_ROOT || secrets.RMBG2_WEIGHTS_ROOT }}
+          # Shared fallback used by older paths; keep pointed at RMBG-1.4 unless intentionally shared.
+          RMBG_WEIGHTS_ROOT: ${{ vars.RMBG_WEIGHTS_ROOT || secrets.RMBG_WEIGHTS_ROOT }}
+          # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TRELLIS.2-4B
+          TRELLIS2_WEIGHTS_ROOT: ${{ vars.TRELLIS2_WEIGHTS_ROOT || secrets.TRELLIS2_WEIGHTS_ROOT }}
+          # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TRELLIS-image-large
+          TRELLIS2_IMAGE_LARGE_ROOT: ${{ vars.TRELLIS2_IMAGE_LARGE_ROOT || secrets.TRELLIS2_IMAGE_LARGE_ROOT }}
         run: |
           unset RUSTFLAGS
           unset CARGO_ENCODED_RUSTFLAGS

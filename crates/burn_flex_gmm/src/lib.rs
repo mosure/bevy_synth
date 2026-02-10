@@ -95,14 +95,66 @@ pub fn sparse_subm_conv_forward_flex(
         return Ok(Vec::new());
     }
 
-    let kernel = kernel_layout(config);
-    let mut output = vec![0.0f32; rows * config.out_channels];
-    for row_idx in 0..rows {
-        let base = row_idx * config.out_channels;
-        output[base..base + config.out_channels].copy_from_slice(weights.bias);
+    let neighbor_rows = build_neighbor_rows(config, coords)?;
+    sparse_subm_conv_forward_flex_precomputed(
+        config,
+        weights,
+        input,
+        neighbor_rows.as_slice(),
+        None,
+    )
+}
+
+pub fn sparse_subm_conv_forward_flex_precomputed(
+    config: &SparseSubmConvConfig,
+    weights: SparseSubmConvWeights<'_>,
+    input: &[f32],
+    neighbor_rows: &[i32],
+    packed_weight: Option<&[f32]>,
+) -> Result<Vec<f32>, String> {
+    validate_config(config)?;
+    if weights.bias.len() != config.out_channels {
+        return Err(format!(
+            "sparse conv bias len mismatch: got {} expected {}",
+            weights.bias.len(),
+            config.out_channels
+        ));
+    }
+    let expected_weight = expected_weight_len(config)?;
+    if weights.weight.len() != expected_weight {
+        return Err(format!(
+            "sparse conv weight len mismatch: got {} expected {}",
+            weights.weight.len(),
+            expected_weight
+        ));
     }
 
-    let neighbor_rows = build_neighbor_rows(config, coords)?;
+    let kernel = kernel_layout(config);
+    if !neighbor_rows.len().is_multiple_of(kernel.rows.max(1)) {
+        return Err(format!(
+            "sparse conv neighbor row len mismatch: got {} expected a multiple of {}",
+            neighbor_rows.len(),
+            kernel.rows
+        ));
+    }
+    let rows = if kernel.rows == 0 {
+        0
+    } else {
+        neighbor_rows.len() / kernel.rows
+    };
+    let expected_input = rows
+        .checked_mul(config.in_channels)
+        .ok_or_else(|| "sparse conv input size overflow".to_string())?;
+    if input.len() != expected_input {
+        return Err(format!(
+            "sparse conv input len mismatch: got {} expected {}",
+            input.len(),
+            expected_input
+        ));
+    }
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
 
     let k_in = kernel
         .rows
@@ -110,8 +162,36 @@ pub fn sparse_subm_conv_forward_flex(
         .ok_or_else(|| "k dimension overflow in sparse_subm_conv_forward_flex".to_string())?;
     let m = rows;
     let n = config.out_channels_per_group;
+    let expected_packed = config
+        .groups
+        .checked_mul(k_in)
+        .and_then(|value| value.checked_mul(n))
+        .ok_or_else(|| "sparse conv packed weight size overflow".to_string())?;
+    let trust_neighbor_rows = packed_weight.is_some();
+    let owned_packed;
+    let packed = if let Some(packed_weight) = packed_weight {
+        if packed_weight.len() != expected_packed {
+            return Err(format!(
+                "sparse conv packed weight len mismatch: got {} expected {}",
+                packed_weight.len(),
+                expected_packed
+            ));
+        }
+        packed_weight
+    } else {
+        owned_packed = pack_flex_weight(config, weights.weight)?;
+        owned_packed.as_slice()
+    };
+
+    let mut output = vec![0.0f32; rows * config.out_channels];
+    for row_idx in 0..rows {
+        let base = row_idx * config.out_channels;
+        output[base..base + config.out_channels].copy_from_slice(weights.bias);
+    }
+
+    let mut gathered = vec![0.0f32; m * k_in];
     for group in 0..config.groups {
-        let mut gathered = vec![0.0f32; m * k_in];
+        gathered.fill(0.0);
         let in_group_base = group * config.in_channels_per_group;
         for out_row in 0..m {
             for kernel_idx in 0..kernel.rows {
@@ -119,7 +199,19 @@ pub fn sparse_subm_conv_forward_flex(
                 if in_row == INVALID_NEIGHBOR_ROW {
                     continue;
                 }
-                let in_row = in_row as usize;
+                let in_row = if trust_neighbor_rows {
+                    in_row as usize
+                } else {
+                    let in_row = usize::try_from(in_row).map_err(|_| {
+                        format!("sparse conv neighbor row index is negative: {in_row}")
+                    })?;
+                    if in_row >= rows {
+                        return Err(format!(
+                            "sparse conv neighbor row index out of bounds: {in_row} >= {rows}"
+                        ));
+                    }
+                    in_row
+                };
                 let src_base = in_row * config.in_channels + in_group_base;
                 let dst_base = out_row * k_in + kernel_idx * config.in_channels_per_group;
                 gathered[dst_base..dst_base + config.in_channels_per_group]
@@ -127,7 +219,60 @@ pub fn sparse_subm_conv_forward_flex(
             }
         }
 
-        let mut packed_weight = vec![0.0f32; k_in * n];
+        let out_group_base = group * config.out_channels_per_group;
+        let packed_group_base = group * k_in * n;
+        let packed_group = &packed[packed_group_base..packed_group_base + k_in * n];
+
+        // output[m, n] += gathered[m, k] @ packed_group[k, n]
+        unsafe {
+            matrixmultiply::sgemm(
+                m,
+                k_in,
+                n,
+                1.0,
+                gathered.as_ptr(),
+                k_in as isize,
+                1,
+                packed_group.as_ptr(),
+                n as isize,
+                1,
+                1.0,
+                output.as_mut_ptr().add(out_group_base),
+                config.out_channels as isize,
+                1,
+            );
+        }
+    }
+
+    Ok(output)
+}
+
+pub fn pack_flex_weight(config: &SparseSubmConvConfig, weight: &[f32]) -> Result<Vec<f32>, String> {
+    validate_config(config)?;
+    let expected_weight = expected_weight_len(config)?;
+    if weight.len() != expected_weight {
+        return Err(format!(
+            "sparse conv weight len mismatch: got {} expected {}",
+            weight.len(),
+            expected_weight
+        ));
+    }
+
+    let kernel = kernel_layout(config);
+    let k_in = kernel
+        .rows
+        .checked_mul(config.in_channels_per_group)
+        .ok_or_else(|| "k dimension overflow in pack_flex_weight".to_string())?;
+    let n = config.out_channels_per_group;
+    let packed_len = config
+        .groups
+        .checked_mul(k_in)
+        .and_then(|value| value.checked_mul(n))
+        .ok_or_else(|| "sparse conv packed weight size overflow".to_string())?;
+    let mut packed_weight = vec![0.0f32; packed_len];
+
+    for group in 0..config.groups {
+        let group_base = group * k_in * n;
         for out_local in 0..n {
             let out_idx = group * config.out_channels_per_group + out_local;
             for kd in 0..config.kernel_d {
@@ -142,49 +287,15 @@ pub fn sparse_subm_conv_forward_flex(
                                 + kw)
                                 * config.in_channels_per_group
                                 + in_local;
-                            packed_weight[k_col * n + out_local] = weights.weight[src_idx];
+                            packed_weight[group_base + k_col * n + out_local] = weight[src_idx];
                         }
                     }
                 }
             }
         }
-
-        let out_group_base = group * config.out_channels_per_group;
-        let mut out_group = vec![0.0f32; m * n];
-        for row in 0..m {
-            let src_base = row * config.out_channels + out_group_base;
-            let dst_base = row * n;
-            out_group[dst_base..dst_base + n].copy_from_slice(&output[src_base..src_base + n]);
-        }
-
-        // out_group[m, n] += gathered[m, k] @ packed_weight[k, n]
-        unsafe {
-            matrixmultiply::sgemm(
-                m,
-                k_in,
-                n,
-                1.0,
-                gathered.as_ptr(),
-                k_in as isize,
-                1,
-                packed_weight.as_ptr(),
-                n as isize,
-                1,
-                1.0,
-                out_group.as_mut_ptr(),
-                n as isize,
-                1,
-            );
-        }
-
-        for row in 0..m {
-            let src_base = row * n;
-            let dst_base = row * config.out_channels + out_group_base;
-            output[dst_base..dst_base + n].copy_from_slice(&out_group[src_base..src_base + n]);
-        }
     }
 
-    Ok(output)
+    Ok(packed_weight)
 }
 
 pub fn sparse_subm_conv_forward_legacy(
@@ -296,13 +407,7 @@ fn validate_shapes(
             expected_input
         ));
     }
-    let expected_weight = config
-        .out_channels
-        .checked_mul(config.kernel_d)
-        .and_then(|v| v.checked_mul(config.kernel_h))
-        .and_then(|v| v.checked_mul(config.kernel_w))
-        .and_then(|v| v.checked_mul(config.in_channels_per_group))
-        .ok_or_else(|| "sparse conv weight size overflow".to_string())?;
+    let expected_weight = expected_weight_len(config)?;
     if weights.weight.len() != expected_weight {
         return Err(format!(
             "sparse conv weight len mismatch: got {} expected {}",
@@ -311,6 +416,16 @@ fn validate_shapes(
         ));
     }
     Ok(())
+}
+
+fn expected_weight_len(config: &SparseSubmConvConfig) -> Result<usize, String> {
+    config
+        .out_channels
+        .checked_mul(config.kernel_d)
+        .and_then(|v| v.checked_mul(config.kernel_h))
+        .and_then(|v| v.checked_mul(config.kernel_w))
+        .and_then(|v| v.checked_mul(config.in_channels_per_group))
+        .ok_or_else(|| "sparse conv weight size overflow".to_string())
 }
 
 fn validate_config(config: &SparseSubmConvConfig) -> Result<(), String> {
@@ -372,7 +487,8 @@ fn kernel_layout(config: &SparseSubmConvConfig) -> KernelLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        SparseSubmConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex,
+        SparseSubmConvConfig, SparseSubmConvWeights, build_neighbor_rows, pack_flex_weight,
+        sparse_subm_conv_forward_flex, sparse_subm_conv_forward_flex_precomputed,
         sparse_subm_conv_forward_legacy,
     };
 
@@ -458,5 +574,58 @@ mod tests {
         };
         let out = sparse_subm_conv_forward_flex(&cfg, weights, &[], &[]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn flex_precomputed_path_matches_default() {
+        let cfg = SparseSubmConvConfig {
+            in_channels: 8,
+            out_channels: 12,
+            kernel_d: 3,
+            kernel_h: 1,
+            kernel_w: 1,
+            in_channels_per_group: 4,
+            out_channels_per_group: 6,
+            groups: 2,
+            axis_order: [0, 1, 2],
+            axis_sign: [1, 1, 1],
+        };
+        let coords = make_sparse_line_coords(32);
+        let mut rng = Lcg::new(73);
+        let input: Vec<f32> = (0..coords.len() * cfg.in_channels)
+            .map(|_| rng.next_f32())
+            .collect();
+        let weight_len = cfg.out_channels
+            * cfg.kernel_d
+            * cfg.kernel_h
+            * cfg.kernel_w
+            * cfg.in_channels_per_group;
+        let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
+        let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
+        let weights = SparseSubmConvWeights {
+            weight: &weight,
+            bias: &bias,
+        };
+
+        let expected = sparse_subm_conv_forward_flex(&cfg, weights, &coords, &input).unwrap();
+        let neighbors = build_neighbor_rows(&cfg, &coords).unwrap();
+        let packed = pack_flex_weight(&cfg, weight.as_slice()).unwrap();
+        let actual = sparse_subm_conv_forward_flex_precomputed(
+            &cfg,
+            weights,
+            input.as_slice(),
+            neighbors.as_slice(),
+            Some(packed.as_slice()),
+        )
+        .unwrap();
+
+        assert_eq!(expected.len(), actual.len());
+        for (idx, (lhs, rhs)) in expected.iter().zip(actual.iter()).enumerate() {
+            let diff = (lhs - rhs).abs();
+            assert!(
+                diff <= 1.0e-5,
+                "mismatch at idx={idx}: expected={lhs} actual={rhs} diff={diff}"
+            );
+        }
     }
 }

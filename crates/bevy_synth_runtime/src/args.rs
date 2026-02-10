@@ -160,7 +160,7 @@ pub struct Args {
     pub synthesis_models: Vec<SynthesisModel>,
 
     /// Foreground model variant.
-    #[arg(long, value_enum, default_value_t = RmbgModel::Rmbg2)]
+    #[arg(long, value_enum, default_value_t = RmbgModel::Rmbg14)]
     pub rmbg_model: RmbgModel,
 
     /// Background removal backend (auto, cpu, gpu).
@@ -448,10 +448,10 @@ mod tests {
     use super::{Args, RmbgModel, SynthesisModel, build_app_args};
 
     #[test]
-    fn defaults_use_rmbg2_and_batch_one() {
+    fn defaults_use_rmbg14_and_batch_one() {
         let args = Args::parse_from(["bevy_synth"]);
         let app_args = build_app_args(args);
-        assert!(matches!(app_args.rmbg_model, RmbgModel::Rmbg2));
+        assert!(matches!(app_args.rmbg_model, RmbgModel::Rmbg14));
         assert_eq!(app_args.synthesis_models, vec![SynthesisModel::Triposg]);
         assert_eq!(app_args.max_batch_size, 1);
     }

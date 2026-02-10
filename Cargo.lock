@@ -1495,6 +1495,7 @@ dependencies = [
  "bevy_synth_ui",
  "bevy_transform_gizmos",
  "clap",
+ "console_error_panic_hook",
  "serde",
  "serde_json",
 ]

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 use bevy_mesh::Mesh as BevyMesh;
@@ -18,6 +20,8 @@ use bevy_synth_runtime::state::{
 };
 use bevy_synth_runtime::{SynthMesh, TripoMesh};
 use bevy_transform_gizmos::GizmoTransformable;
+
+static TEST_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn test_args() -> AppArgs {
     AppArgs {
@@ -70,6 +74,20 @@ fn dummy_mesh() -> SynthMesh {
     })
 }
 
+fn isolated_cache_root() -> PathBuf {
+    let nonce = TEST_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "bevy_synth_test_cache_{}_{}_{}",
+        std::process::id(),
+        now,
+        nonce
+    ))
+}
+
 fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStatus) -> App {
     let mut app = App::new();
     app.insert_resource(test_args());
@@ -78,9 +96,9 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(status);
     app.insert_resource(CatalogState::default());
     app.insert_resource(ExitState::default());
-    app.insert_resource(MeshCacheResource {
-        cache: MeshCache::empty_default(),
-    });
+    let cache = MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache");
+    app.insert_resource(MeshCacheResource { cache });
+    app.insert_resource(Assets::<Image>::default());
     app.insert_resource(Assets::<BevyMesh>::default());
     app.insert_resource(Assets::<StandardMaterial>::default());
     app.add_systems(Update, drive_inference);

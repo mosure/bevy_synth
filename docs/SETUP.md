@@ -56,7 +56,7 @@ cargo run -p burn_tripo --bin triposg_import --features import
 
 - Select RMBG-2.0:
   - `--rmbg-model rmbg2`
-- `bevy_synth` defaults to `rmbg2`; you only need the flag to force a model.
+- `bevy_synth` defaults to `rmbg14`; use `--rmbg-model rmbg2` to opt into RMBG-2.0.
 
 Notes:
 - On native, if `rmbg2` is selected but unavailable, the runtime falls back to RMBG-1.4 automatically.

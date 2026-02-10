@@ -1,18 +1,58 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use burn::module::{Module, Param, ParamId};
+use burn::prelude::*;
+#[cfg(feature = "runtime-model-wgpu")]
+use burn::tensor::TensorData;
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_flex_gmm::kernel_rows;
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_flex_gmm::wgpu::{DefaultWgpuBackend, sparse_subm_conv_forward_wgpu};
 use burn_flex_gmm::{
-    SparseSubmConvConfig as FlexConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex,
+    SparseSubmConvConfig as FlexConvConfig, SparseSubmConvWeights, build_neighbor_rows,
+    pack_flex_weight, sparse_subm_conv_forward_flex_precomputed,
 };
+use burn_store::{BurnpackStore, ModuleSnapshot};
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_wgpu::WgpuDevice;
 use half::{bf16, f16};
-use memmap2::MmapOptions;
+use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
 const F16_SUFFIX: &str = "_f16";
 const LAYER_NORM32_EPS: f32 = 1.0e-6;
 const F_LAYER_NORM_EPS: f32 = 1.0e-5;
+const DECODER_NEIGHBOR_CACHE_MAX: usize = 128;
+#[cfg(feature = "runtime-model-wgpu")]
+const DECODER_WGPU_TENSOR_CACHE_MAX: usize = 64;
+
+#[derive(Module, Debug)]
+struct BinaryBlob<B: Backend> {
+    bytes: Param<Tensor<B, 1, Int>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BlobMetadata {
+    bytes_len: usize,
+}
+
+enum WeightsBacking {
+    Mmap(Mmap),
+    Bytes(Vec<u8>),
+}
+
+impl WeightsBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => mmap.as_ref(),
+            Self::Bytes(bytes) => bytes.as_slice(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DecoderConfigFile {
@@ -70,6 +110,9 @@ pub(crate) struct SparseUnetDecoderRuntime {
     from_latent: LinearLayer,
     output_layer: LinearLayer,
     stages: Vec<DecoderStage>,
+    conv_cache: Arc<Mutex<DecoderConvCache>>,
+    #[cfg(feature = "runtime-model-wgpu")]
+    wgpu_context: Option<Arc<Mutex<DecoderWgpuConvContext>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +163,216 @@ struct SparseConvLayer {
     // Row-major [out, kd, kh, kw, in_per_group]
     weight: Vec<f32>,
     bias: Vec<f32>,
+    flex_packed_weight: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct NeighborRowsCacheKey {
+    coords_hash: u64,
+    rows: usize,
+    kernel_d: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    axis_order: [usize; 3],
+    axis_sign: [i32; 3],
+}
+
+impl NeighborRowsCacheKey {
+    fn new(config: &FlexConvConfig, coords: &[[u32; 4]]) -> Self {
+        Self {
+            coords_hash: hash_coords(coords),
+            rows: coords.len(),
+            kernel_d: config.kernel_d,
+            kernel_h: config.kernel_h,
+            kernel_w: config.kernel_w,
+            axis_order: config.axis_order,
+            axis_sign: config.axis_sign,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DecoderConvCache {
+    neighbor_rows: HashMap<NeighborRowsCacheKey, Vec<i32>>,
+}
+
+impl DecoderConvCache {
+    fn neighbor_rows_with_key<'a>(
+        &'a mut self,
+        config: &FlexConvConfig,
+        coords: &[[u32; 4]],
+    ) -> Result<(NeighborRowsCacheKey, &'a [i32]), String> {
+        let key = NeighborRowsCacheKey::new(config, coords);
+        if !self.neighbor_rows.contains_key(&key) {
+            trim_hashmap(&mut self.neighbor_rows, DECODER_NEIGHBOR_CACHE_MAX);
+            let neighbor_rows = build_neighbor_rows(config, coords)?;
+            self.neighbor_rows.insert(key, neighbor_rows);
+        }
+        let rows = self
+            .neighbor_rows
+            .get(&key)
+            .map(|rows| rows.as_slice())
+            .ok_or_else(|| "decoder neighbor-row cache lookup failed".to_string())?;
+        Ok((key, rows))
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct LayerTensorCacheKey {
+    weight_ptr: usize,
+    bias_ptr: usize,
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+#[derive(Debug)]
+struct DecoderWgpuConvContext {
+    device: WgpuDevice,
+    weight_tensors: HashMap<LayerTensorCacheKey, Tensor<DefaultWgpuBackend, 5>>,
+    bias_tensors: HashMap<LayerTensorCacheKey, Tensor<DefaultWgpuBackend, 1>>,
+    neighbor_tensors: HashMap<NeighborRowsCacheKey, Tensor<DefaultWgpuBackend, 2, Int>>,
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl DecoderWgpuConvContext {
+    fn new() -> Result<Self, String> {
+        let device = WgpuDevice::default();
+        let _ = Tensor::<DefaultWgpuBackend, 1>::zeros([1], &device);
+        Ok(Self {
+            device,
+            weight_tensors: HashMap::new(),
+            bias_tensors: HashMap::new(),
+            neighbor_tensors: HashMap::new(),
+        })
+    }
+
+    fn layer_key(layer: &SparseConvLayer) -> LayerTensorCacheKey {
+        LayerTensorCacheKey {
+            weight_ptr: layer.weight.as_ptr() as usize,
+            bias_ptr: layer.bias.as_ptr() as usize,
+        }
+    }
+
+    fn weight_tensor(&mut self, layer: &SparseConvLayer) -> Tensor<DefaultWgpuBackend, 5> {
+        let key = Self::layer_key(layer);
+        if let Some(tensor) = self.weight_tensors.get(&key) {
+            return tensor.clone();
+        }
+        trim_hashmap(&mut self.weight_tensors, DECODER_WGPU_TENSOR_CACHE_MAX);
+        let tensor =
+            Tensor::<DefaultWgpuBackend, 1>::from_floats(layer.weight.as_slice(), &self.device)
+                .reshape([
+                    layer.out_channels,
+                    layer.kernel_d,
+                    layer.kernel_h,
+                    layer.kernel_w,
+                    layer.in_channels_per_group,
+                ]);
+        self.weight_tensors.insert(key, tensor.clone());
+        tensor
+    }
+
+    fn bias_tensor(&mut self, layer: &SparseConvLayer) -> Tensor<DefaultWgpuBackend, 1> {
+        let key = Self::layer_key(layer);
+        if let Some(tensor) = self.bias_tensors.get(&key) {
+            return tensor.clone();
+        }
+        trim_hashmap(&mut self.bias_tensors, DECODER_WGPU_TENSOR_CACHE_MAX);
+        let tensor =
+            Tensor::<DefaultWgpuBackend, 1>::from_floats(layer.bias.as_slice(), &self.device);
+        self.bias_tensors.insert(key, tensor.clone());
+        tensor
+    }
+
+    fn neighbor_tensor(
+        &mut self,
+        key: NeighborRowsCacheKey,
+        config: &FlexConvConfig,
+        rows: usize,
+        neighbor_rows: &[i32],
+    ) -> Result<Tensor<DefaultWgpuBackend, 2, Int>, String> {
+        if let Some(tensor) = self.neighbor_tensors.get(&key) {
+            return Ok(tensor.clone());
+        }
+        let kernel_rows = kernel_rows(config)?;
+        trim_hashmap(&mut self.neighbor_tensors, DECODER_WGPU_TENSOR_CACHE_MAX);
+        let tensor = Tensor::<DefaultWgpuBackend, 1, Int>::from_data(
+            TensorData::new(neighbor_rows.to_vec(), [rows.saturating_mul(kernel_rows)]),
+            &self.device,
+        )
+        .reshape([rows, kernel_rows]);
+        self.neighbor_tensors.insert(key, tensor.clone());
+        Ok(tensor)
+    }
+
+    fn forward(
+        &mut self,
+        config: &FlexConvConfig,
+        layer: &SparseConvLayer,
+        input: &[f32],
+        cache_key: NeighborRowsCacheKey,
+        neighbor_rows: &[i32],
+    ) -> Result<Vec<f32>, String> {
+        if config.in_channels == 0 {
+            return Ok(Vec::new());
+        }
+        if !input.len().is_multiple_of(config.in_channels) {
+            return Err(format!(
+                "wgpu sparse conv input len mismatch: len={} in_channels={}",
+                input.len(),
+                config.in_channels
+            ));
+        }
+        let rows = input.len() / config.in_channels;
+        let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input, &self.device)
+            .reshape([rows, config.in_channels]);
+        let weight_t = self.weight_tensor(layer);
+        let bias_t = self.bias_tensor(layer);
+        let neighbor_t = self.neighbor_tensor(cache_key, config, rows, neighbor_rows)?;
+        let output = sparse_subm_conv_forward_wgpu(config, input_t, neighbor_t, weight_t, bias_t)?;
+        output
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|err| format!("failed to read wgpu sparse conv output: {err:?}"))
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn create_wgpu_decoder_context() -> Option<Arc<Mutex<DecoderWgpuConvContext>>> {
+    if env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
+        return None;
+    }
+    let context = std::panic::catch_unwind(DecoderWgpuConvContext::new)
+        .ok()?
+        .ok()?;
+    Some(Arc::new(Mutex::new(context)))
+}
+
+fn hash_coords(coords: &[[u32; 4]]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut hash = OFFSET;
+    for coord in coords {
+        for value in coord {
+            hash ^= *value as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash ^= coords.len() as u64;
+    hash
+}
+
+fn trim_hashmap<K, V>(map: &mut HashMap<K, V>, max_entries: usize)
+where
+    K: Eq + std::hash::Hash + Copy,
+{
+    if map.len() < max_entries.max(1) {
+        return;
+    }
+    if let Some(key) = map.keys().next().copied() {
+        map.remove(&key);
+    }
 }
 
 impl SparseUnetDecoderRuntime {
@@ -155,36 +408,18 @@ impl SparseUnetDecoderRuntime {
             ));
         }
 
-        let weight_path = resolve_model_weight_candidates(
-            model_stem,
-            weights_root,
-            image_large_root,
-        )
-        .into_iter()
-        .find(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
-        })
-        .ok_or_else(|| {
-            format!("unable to resolve safetensors weights for sparse decoder stem '{model_stem}'")
-        })?;
+        let weight_path =
+            resolve_model_weight_candidates(model_stem, weights_root, image_large_root)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    format!("unable to resolve decoder weights for stem '{model_stem}'")
+                })?;
 
-        let file = File::open(&weight_path).map_err(|err| {
+        let weight_backing = load_weight_backing(&weight_path)?;
+        let safetensors = SafeTensors::deserialize(weight_backing.as_slice()).map_err(|err| {
             format!(
-                "failed to open sparse decoder safetensors '{}': {err}",
-                weight_path.display()
-            )
-        })?;
-        let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
-            format!(
-                "failed to mmap sparse decoder safetensors '{}': {err}",
-                weight_path.display()
-            )
-        })?;
-        let safetensors = SafeTensors::deserialize(&mmap).map_err(|err| {
-            format!(
-                "failed to deserialize sparse decoder safetensors '{}': {err}",
+                "failed to deserialize sparse decoder weights '{}' as safetensors: {err}",
                 weight_path.display()
             )
         })?;
@@ -322,6 +557,9 @@ impl SparseUnetDecoderRuntime {
             from_latent,
             output_layer,
             stages,
+            conv_cache: Arc::new(Mutex::new(DecoderConvCache::default())),
+            #[cfg(feature = "runtime-model-wgpu")]
+            wgpu_context: create_wgpu_decoder_context(),
         })
     }
 
@@ -355,6 +593,20 @@ impl SparseUnetDecoderRuntime {
 
         let mut state_coords = coords[..count].to_vec();
         let mut state_feats = flatten_rows_32(&rows[..count]);
+        let mut conv_cache = self
+            .conv_cache
+            .lock()
+            .map_err(|_| "decoder conv cache lock poisoned".to_string())?;
+        #[cfg(feature = "runtime-model-wgpu")]
+        let mut wgpu_context = if let Some(context) = self.wgpu_context.as_ref() {
+            Some(
+                context
+                    .lock()
+                    .map_err(|_| "decoder wgpu context lock poisoned".to_string())?,
+            )
+        } else {
+            None
+        };
         state_feats = linear_forward(
             state_feats.as_slice(),
             count,
@@ -379,6 +631,9 @@ impl SparseUnetDecoderRuntime {
                     state_feats.as_slice(),
                     &block.conv,
                     format!("stage {stage_idx} block {block_idx} conv").as_str(),
+                    &mut conv_cache,
+                    #[cfg(feature = "runtime-model-wgpu")]
+                    wgpu_context.as_deref_mut(),
                 )?;
                 if self.compute_fp16 {
                     quantize_f16_inplace(h.as_mut_slice());
@@ -487,6 +742,9 @@ impl SparseUnetDecoderRuntime {
                     h_norm.as_slice(),
                     &up.conv1,
                     format!("stage {stage_idx} up conv1").as_str(),
+                    &mut conv_cache,
+                    #[cfg(feature = "runtime-model-wgpu")]
+                    wgpu_context.as_deref_mut(),
                 )?;
                 let mut h_conv1 = h_conv1;
                 if self.compute_fp16 {
@@ -547,6 +805,9 @@ impl SparseUnetDecoderRuntime {
                     h_up.as_slice(),
                     &up.conv2,
                     format!("stage {stage_idx} up conv2").as_str(),
+                    &mut conv_cache,
+                    #[cfg(feature = "runtime-model-wgpu")]
+                    wgpu_context.as_deref_mut(),
                 )?;
                 if self.compute_fp16 {
                     quantize_f16_inplace(h.as_mut_slice());
@@ -617,6 +878,20 @@ impl SparseUnetDecoderRuntime {
 
         let state_coords = coords[..count].to_vec();
         let mut state_feats = flatten_rows_32(&rows[..count]);
+        let mut conv_cache = self
+            .conv_cache
+            .lock()
+            .map_err(|_| "decoder conv cache lock poisoned".to_string())?;
+        #[cfg(feature = "runtime-model-wgpu")]
+        let mut wgpu_context = if let Some(context) = self.wgpu_context.as_ref() {
+            Some(
+                context
+                    .lock()
+                    .map_err(|_| "decoder wgpu context lock poisoned".to_string())?,
+            )
+        } else {
+            None
+        };
         state_feats = linear_forward(
             state_feats.as_slice(),
             count,
@@ -639,6 +914,9 @@ impl SparseUnetDecoderRuntime {
                 state_feats.as_slice(),
                 &block.conv,
                 format!("stage0 block {block_idx} conv(stage0)").as_str(),
+                &mut conv_cache,
+                #[cfg(feature = "runtime-model-wgpu")]
+                wgpu_context.as_deref_mut(),
             )?;
             if self.compute_fp16 {
                 quantize_f16_inplace(h.as_mut_slice());
@@ -861,6 +1139,20 @@ fn load_sparse_conv(
         ));
     }
 
+    let flex_pack_config = FlexConvConfig {
+        in_channels,
+        out_channels,
+        kernel_d: kd,
+        kernel_h: kh,
+        kernel_w: kw,
+        in_channels_per_group,
+        out_channels_per_group,
+        groups,
+        axis_order: [0, 1, 2],
+        axis_sign: [1, 1, 1],
+    };
+    let flex_packed_weight = Some(pack_flex_weight(&flex_pack_config, weight.as_slice())?);
+
     Ok(SparseConvLayer {
         in_channels,
         out_channels,
@@ -872,6 +1164,7 @@ fn load_sparse_conv(
         groups,
         weight,
         bias,
+        flex_packed_weight,
     })
 }
 
@@ -1037,6 +1330,8 @@ fn linear_forward(
 enum DecoderConvImpl {
     Legacy,
     FlexGmm,
+    #[cfg(feature = "runtime-model-wgpu")]
+    Wgpu,
 }
 
 fn decoder_conv_impl() -> DecoderConvImpl {
@@ -1047,14 +1342,38 @@ fn decoder_conv_impl() -> DecoderConvImpl {
     {
         Some("legacy") => DecoderConvImpl::Legacy,
         Some("flex") | Some("flex_gmm") => DecoderConvImpl::FlexGmm,
+        #[cfg(feature = "runtime-model-wgpu")]
+        Some("wgpu") => DecoderConvImpl::Wgpu,
         Some("auto") | None => {
             if env_flag("TRELLIS2_PARITY_STRICT") || env_flag("TRELLIS2_E2E_STRICT") {
                 DecoderConvImpl::Legacy
+            } else if !env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
+                #[cfg(feature = "runtime-model-wgpu")]
+                {
+                    DecoderConvImpl::Wgpu
+                }
+                #[cfg(not(feature = "runtime-model-wgpu"))]
+                {
+                    DecoderConvImpl::FlexGmm
+                }
             } else {
                 DecoderConvImpl::FlexGmm
             }
         }
-        Some(_) => DecoderConvImpl::FlexGmm,
+        Some(_) => {
+            #[cfg(feature = "runtime-model-wgpu")]
+            {
+                if !env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
+                    DecoderConvImpl::Wgpu
+                } else {
+                    DecoderConvImpl::FlexGmm
+                }
+            }
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            {
+                DecoderConvImpl::FlexGmm
+            }
+        }
     }
 }
 
@@ -1070,36 +1389,64 @@ fn decoder_conv_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn flex_config_for_layer(layer: &SparseConvLayer) -> FlexConvConfig {
+    FlexConvConfig {
+        in_channels: layer.in_channels,
+        out_channels: layer.out_channels,
+        kernel_d: layer.kernel_d,
+        kernel_h: layer.kernel_h,
+        kernel_w: layer.kernel_w,
+        in_channels_per_group: layer.in_channels_per_group,
+        out_channels_per_group: layer.out_channels_per_group,
+        groups: layer.groups,
+        axis_order: conv_kernel_axis_order(),
+        axis_sign: conv_kernel_axis_signs(),
+    }
+}
+
 fn sparse_subm_conv_forward(
     coords: &[[u32; 4]],
     input: &[f32],
     layer: &SparseConvLayer,
     context: &str,
+    conv_cache: &mut DecoderConvCache,
+    #[cfg(feature = "runtime-model-wgpu")] wgpu_context: Option<&mut DecoderWgpuConvContext>,
 ) -> Result<Vec<f32>, String> {
-    if decoder_conv_impl() == DecoderConvImpl::FlexGmm {
-        let config = FlexConvConfig {
-            in_channels: layer.in_channels,
-            out_channels: layer.out_channels,
-            kernel_d: layer.kernel_d,
-            kernel_h: layer.kernel_h,
-            kernel_w: layer.kernel_w,
-            in_channels_per_group: layer.in_channels_per_group,
-            out_channels_per_group: layer.out_channels_per_group,
-            groups: layer.groups,
-            axis_order: conv_kernel_axis_order(),
-            axis_sign: conv_kernel_axis_signs(),
-        };
-        let weights = SparseSubmConvWeights {
-            weight: layer.weight.as_slice(),
-            bias: layer.bias.as_slice(),
-        };
-        match sparse_subm_conv_forward_flex(&config, weights, coords, input) {
+    let config = flex_config_for_layer(layer);
+    let weights = SparseSubmConvWeights {
+        weight: layer.weight.as_slice(),
+        bias: layer.bias.as_slice(),
+    };
+    let (_neighbor_key, neighbor_rows) = conv_cache.neighbor_rows_with_key(&config, coords)?;
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    if decoder_conv_impl() == DecoderConvImpl::Wgpu {
+        if let Some(context_gpu) = wgpu_context {
+            match context_gpu.forward(&config, layer, input, _neighbor_key, neighbor_rows) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    if decoder_conv_debug_enabled() {
+                        eprintln!(
+                            "burn_trellis: wgpu conv fallback to flex/legacy in '{context}': {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if decoder_conv_impl() != DecoderConvImpl::Legacy {
+        match sparse_subm_conv_forward_flex_precomputed(
+            &config,
+            weights,
+            input,
+            neighbor_rows,
+            layer.flex_packed_weight.as_deref(),
+        ) {
             Ok(output) => return Ok(output),
             Err(err) => {
                 if decoder_conv_debug_enabled() {
-                    eprintln!(
-                        "burn_trellis: flex_gmm conv fallback to legacy in '{context}': {err}"
-                    );
+                    eprintln!("burn_trellis: flex conv fallback to legacy in '{context}': {err}");
                 }
             }
         }
@@ -1593,6 +1940,107 @@ fn spatial_shape_from_coords(coords: &[[u32; 4]]) -> [u32; 3] {
     ]
 }
 
+fn load_weight_backing(path: &Path) -> Result<WeightsBacking, String> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bpk"))
+    {
+        let bytes = load_burnpack_blob_bytes(path)?;
+        return Ok(WeightsBacking::Bytes(bytes));
+    }
+
+    let file = File::open(path).map_err(|err| {
+        format!(
+            "failed to open sparse decoder weights '{}': {err}",
+            path.display()
+        )
+    })?;
+    let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
+        format!(
+            "failed to mmap sparse decoder weights '{}': {err}",
+            path.display()
+        )
+    })?;
+    Ok(WeightsBacking::Mmap(mmap))
+}
+
+fn load_burnpack_blob_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata_path = metadata_path(path);
+    let metadata: BlobMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path).map_err(|err| {
+            format!(
+                "failed to read burnpack metadata '{}': {err}",
+                metadata_path.display()
+            )
+        })?)
+        .map_err(|err| {
+            format!(
+                "failed to parse burnpack metadata '{}': {err}",
+                metadata_path.display()
+            )
+        })?;
+
+    match load_blob_bytes_with_backend::<burn::backend::NdArray<f32, u8>>(path, metadata.bytes_len)
+    {
+        Ok(bytes) => Ok(bytes),
+        Err(u8_err) => load_blob_bytes_with_backend::<burn::backend::NdArray<f32, i64>>(
+            path,
+            metadata.bytes_len,
+        )
+        .map_err(|i64_err| {
+            format!(
+                "failed to load blob burnpack '{}' (u8 backend: {u8_err}; i64 fallback: {i64_err})",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn load_blob_bytes_with_backend<B: Backend>(
+    path: &Path,
+    bytes_len: usize,
+) -> Result<Vec<u8>, String>
+where
+    B::Device: Default,
+{
+    let device = <B as Backend>::Device::default();
+    let zeros = Tensor::<B, 1, Int>::zeros([bytes_len], &device);
+    let mut blob = BinaryBlob {
+        bytes: Param::initialized(ParamId::new(), zeros),
+    };
+
+    let mut store = BurnpackStore::from_file(path).validate(true);
+    blob.load_from(&mut store)
+        .map_err(|err| format!("failed to load burnpack '{}': {err}", path.display()))?;
+
+    let bytes = blob
+        .bytes
+        .val()
+        .into_data()
+        .convert::<u8>()
+        .to_vec::<u8>()
+        .map_err(|err| format!("failed to materialize burnpack bytes: {err:?}"))?;
+
+    if bytes.len() != bytes_len {
+        return Err(format!(
+            "burnpack byte length mismatch for '{}': expected {}, got {}",
+            path.display(),
+            bytes_len,
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn metadata_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model.bpk");
+    path.with_file_name(format!("{file_name}.meta.json"))
+}
+
 fn resolve_model_weight_candidates(
     model_stem: &str,
     weights_root: &Path,
@@ -1605,9 +2053,9 @@ fn resolve_model_weight_candidates(
     let source_f16 = with_file_stem_suffix(&source, F16_SUFFIX);
     let prefer_f16 = prefer_f16_burnpack();
     let candidates = if prefer_f16 {
-        vec![source_f16, source, burnpack_f16, burnpack]
+        vec![burnpack_f16, burnpack, source_f16, source]
     } else {
-        vec![source, source_f16, burnpack, burnpack_f16]
+        vec![burnpack, burnpack_f16, source, source_f16]
     };
     candidates
         .into_iter()
@@ -1669,11 +2117,15 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex;
+    use std::time::Instant;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DecoderConvImpl, LinearLayer, SparseConvLayer, decoder_conv_impl, linear_forward,
-        logits_to_mask, sparse_subm_conv_forward, sparse_subm_conv_forward_legacy,
+        DecoderConvCache, DecoderConvImpl, LinearLayer, SparseConvLayer, decoder_conv_impl,
+        linear_forward, logits_to_mask, resolve_model_weight_candidates, sparse_subm_conv_forward,
+        sparse_subm_conv_forward_legacy,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1690,6 +2142,7 @@ mod tests {
             groups: 1,
             weight: weight.to_vec(),
             bias: vec![0.0],
+            flex_packed_weight: None,
         }
     }
 
@@ -1723,9 +2176,16 @@ mod tests {
         // kernel offsets: [-1, 0, +1]
         let layer = make_unit_conv_3x1x1([10.0, 1.0, 100.0]);
 
-        let output =
-            sparse_subm_conv_forward(coords.as_slice(), input.as_slice(), &layer, "test conv")
-                .expect("sparse conv should succeed");
+        let output = sparse_subm_conv_forward(
+            coords.as_slice(),
+            input.as_slice(),
+            &layer,
+            "test conv",
+            &mut DecoderConvCache::default(),
+            #[cfg(feature = "runtime-model-wgpu")]
+            None,
+        )
+        .expect("sparse conv should succeed");
         assert_eq!(output.len(), 2);
         // x=0: center(1*1) + right-neighbor(2*100)
         assert!((output[0] - 201.0).abs() < 1.0e-5);
@@ -1758,6 +2218,7 @@ mod tests {
             groups: 2,
             weight: (0..(6 * 3 * 2)).map(|_| rng.next_f32()).collect(),
             bias: (0..6).map(|_| rng.next_f32()).collect(),
+            flex_packed_weight: None,
         };
         let coords: Vec<[u32; 4]> = (0..32u32).map(|x| [0, x, 0, 0]).collect();
         let input: Vec<f32> = (0..coords.len() * layer.in_channels)
@@ -1766,8 +2227,16 @@ mod tests {
         let legacy =
             sparse_subm_conv_forward_legacy(coords.as_slice(), input.as_slice(), &layer, "legacy")
                 .expect("legacy conv");
-        let fused = sparse_subm_conv_forward(coords.as_slice(), input.as_slice(), &layer, "fused")
-            .expect("fused conv");
+        let fused = sparse_subm_conv_forward(
+            coords.as_slice(),
+            input.as_slice(),
+            &layer,
+            "fused",
+            &mut DecoderConvCache::default(),
+            #[cfg(feature = "runtime-model-wgpu")]
+            None,
+        )
+        .expect("fused conv");
         assert_eq!(legacy.len(), fused.len());
         for (idx, (lhs, rhs)) in legacy.iter().zip(fused.iter()).enumerate() {
             let diff = (lhs - rhs).abs();
@@ -1776,6 +2245,117 @@ mod tests {
                 "mismatch idx={idx}: legacy={lhs} fused={rhs} diff={diff}"
             );
         }
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
+            std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
+            std::env::remove_var("TRELLIS2_CONV_AXIS_SIGN");
+        }
+    }
+
+    #[test]
+    fn decoder_neighbor_cache_reuses_across_coord_allocations() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
+            std::env::remove_var("TRELLIS2_CONV_AXIS_SIGN");
+        }
+        let layer = make_unit_conv_3x1x1([0.1, 0.2, 0.3]);
+        let config = super::flex_config_for_layer(&layer);
+        let coords_a: Vec<[u32; 4]> = (0..16u32).map(|x| [0, x, 0, 0]).collect();
+        let coords_b = coords_a.clone();
+        let mut cache = DecoderConvCache::default();
+
+        let key_a = {
+            let (key, rows) = cache
+                .neighbor_rows_with_key(&config, coords_a.as_slice())
+                .expect("cache build");
+            assert_eq!(rows.len(), coords_a.len() * 3);
+            key
+        };
+        let len_after_a = cache.neighbor_rows.len();
+        let key_b = {
+            let (key, rows) = cache
+                .neighbor_rows_with_key(&config, coords_b.as_slice())
+                .expect("cache hit");
+            assert_eq!(rows.len(), coords_b.len() * 3);
+            key
+        };
+
+        assert_eq!(key_a, key_b);
+        assert_eq!(cache.neighbor_rows.len(), len_after_a);
+    }
+
+    #[test]
+    fn decoder_neighbor_cache_reuse_reduces_repeated_conv_time() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::set_var("TRELLIS2_DECODER_CONV_IMPL", "flex_gmm");
+            std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
+            std::env::set_var("TRELLIS2_CONV_AXIS_SIGN", "+++");
+        }
+        let mut rng = Lcg::new(991);
+        let layer = SparseConvLayer {
+            in_channels: 64,
+            out_channels: 128,
+            kernel_d: 3,
+            kernel_h: 3,
+            kernel_w: 3,
+            in_channels_per_group: 64,
+            out_channels_per_group: 128,
+            groups: 1,
+            weight: (0..(128 * 3 * 3 * 3 * 64))
+                .map(|_| rng.next_f32())
+                .collect(),
+            bias: (0..128).map(|_| rng.next_f32()).collect(),
+            flex_packed_weight: None,
+        };
+        let coords: Vec<[u32; 4]> = (0..4096u32).map(|x| [0, x, 0, 0]).collect();
+        let input: Vec<f32> = (0..coords.len() * layer.in_channels)
+            .map(|_| rng.next_f32())
+            .collect();
+        let iterations = 12usize;
+
+        let cold_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = sparse_subm_conv_forward(
+                coords.as_slice(),
+                input.as_slice(),
+                &layer,
+                "cold",
+                &mut DecoderConvCache::default(),
+                #[cfg(feature = "runtime-model-wgpu")]
+                None,
+            )
+            .expect("cold conv");
+        }
+        let cold = cold_start.elapsed();
+
+        let mut warm_cache = DecoderConvCache::default();
+        let warm_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = sparse_subm_conv_forward(
+                coords.as_slice(),
+                input.as_slice(),
+                &layer,
+                "warm",
+                &mut warm_cache,
+                #[cfg(feature = "runtime-model-wgpu")]
+                None,
+            )
+            .expect("warm conv");
+        }
+        let warm = warm_start.elapsed();
+        eprintln!(
+            "decoder cache perf: cold={:?} warm={:?} ratio={:.3}",
+            cold,
+            warm,
+            warm.as_secs_f64() / cold.as_secs_f64().max(1.0e-12)
+        );
+        assert!(
+            warm <= cold,
+            "expected persistent neighbor cache to be no slower than rebuilding; cold={cold:?} warm={warm:?}"
+        );
+
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
             std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
@@ -1838,7 +2418,11 @@ mod tests {
             std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
             std::env::remove_var("TRELLIS2_E2E_STRICT");
+            std::env::remove_var("TRELLIS2_DECODER_DISABLE_WGPU");
         }
+        #[cfg(feature = "runtime-model-wgpu")]
+        assert_eq!(decoder_conv_impl(), DecoderConvImpl::Wgpu);
+        #[cfg(not(feature = "runtime-model-wgpu"))]
         assert_eq!(decoder_conv_impl(), DecoderConvImpl::FlexGmm);
     }
 
@@ -1886,5 +2470,60 @@ mod tests {
         for (got, want) in output.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 1.0e-5, "got={got} want={want}");
         }
+    }
+
+    #[test]
+    fn model_weight_candidates_prefer_bpk_variants() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("TRELLIS2_BPK_PRECISION");
+            std::env::remove_var("BURN_SYNTH_BPK_PRECISION");
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_decoder_candidates_{unique}"));
+        let ckpts = root.join("ckpts");
+        fs::create_dir_all(&ckpts).expect("create ckpts");
+        fs::write(ckpts.join("shape.safetensors"), b"safe").expect("write safetensors");
+        fs::write(ckpts.join("shape.bpk"), b"bpk").expect("write bpk");
+        fs::write(ckpts.join("shape_f16.bpk"), b"bpk_f16").expect("write f16 bpk");
+
+        let candidates = resolve_model_weight_candidates("ckpts/shape", root.as_path(), None);
+        assert!(!candidates.is_empty(), "expected weight candidates");
+        assert_eq!(candidates[0], ckpts.join("shape_f16.bpk"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_weight_candidates_honor_f32_preference() {
+        let _guard = ENV_LOCK.lock().expect("lock env");
+        unsafe {
+            std::env::set_var("TRELLIS2_BPK_PRECISION", "f32");
+            std::env::remove_var("BURN_SYNTH_BPK_PRECISION");
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_decoder_candidates_{unique}"));
+        let ckpts = root.join("ckpts");
+        fs::create_dir_all(&ckpts).expect("create ckpts");
+        fs::write(ckpts.join("shape.safetensors"), b"safe").expect("write safetensors");
+        fs::write(ckpts.join("shape.bpk"), b"bpk").expect("write bpk");
+        fs::write(ckpts.join("shape_f16.bpk"), b"bpk_f16").expect("write f16 bpk");
+
+        let candidates = resolve_model_weight_candidates("ckpts/shape", root.as_path(), None);
+        assert!(!candidates.is_empty(), "expected weight candidates");
+        assert_eq!(candidates[0], ckpts.join("shape.bpk"));
+
+        unsafe {
+            std::env::remove_var("TRELLIS2_BPK_PRECISION");
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }

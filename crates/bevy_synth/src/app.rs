@@ -15,19 +15,16 @@ use bevy::asset::{AssetMetaCheck, AssetMode, AssetPlugin, UnapprovedPathMode};
 use bevy::camera::ClearColorConfig;
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
-use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
 use bevy::light::{
-    AmbientLight, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, DirectionalLight,
-    DirectionalLightShadowMap, PointLight, PointLightShadowMap, light_consts::lux,
+    AmbientLight, CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap,
+    light_consts::lux,
 };
 use bevy::math::primitives::Cuboid;
-use bevy::pbr::{Atmosphere, MeshMaterial3d, StandardMaterial};
-use bevy::post_process::bloom::Bloom;
+use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::render::view::Hdr;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{FileDragAndDrop, PrimaryWindow, WindowCloseRequested};
 use bevy_editor_core::selection::{
@@ -35,7 +32,7 @@ use bevy_editor_core::selection::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_file_dialog::prelude::{DialogFilePicked, FileDialogExt, FileDialogPlugin};
-use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin};
+use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
 use bevy_picking::DefaultPickingPlugins;
@@ -191,6 +188,7 @@ pub(crate) struct InferenceContext<'w, 's> {
 }
 
 pub(crate) fn run() {
+    #[cfg(not(target_arch = "wasm32"))]
     if std::env::var("RUST_MIN_STACK").is_err() {
         unsafe {
             std::env::set_var("RUST_MIN_STACK", "67108864");
@@ -208,18 +206,11 @@ pub(crate) fn run() {
     };
 
     let mut app = App::new();
-    let directional_shadow_map_size = if cfg!(feature = "solari") { 8192 } else { 4096 };
-    let point_shadow_map_size = if cfg!(feature = "solari") { 4096 } else { 2048 };
     app.insert_resource(app_args)
         .insert_resource(InferenceQueue::default())
         .insert_resource(ExitState::default())
         .insert_resource(TitlePulse::default())
-        .insert_resource(DirectionalLightShadowMap {
-            size: directional_shadow_map_size,
-        })
-        .insert_resource(PointLightShadowMap {
-            size: point_shadow_map_size,
-        })
+        .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .init_resource::<EditorSelection>()
         .insert_resource(MeshCacheResource::load_or_empty())
         .insert_resource(WorldCachePersistence::default())
@@ -334,7 +325,8 @@ fn setup(
 ) {
     info!("bevy_synth args: {:?}", *args);
 
-    let mut camera_transform = Transform::from_translation(Vec3::new(0.0, 1.5, 5.0));
+    let mut camera_transform =
+        Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)).looking_at(Vec3::ZERO, Vec3::Y);
     let mut camera_orbit = PanOrbitCamera {
         allow_upside_down: true,
         orbit_smoothness: 0.1,
@@ -352,14 +344,6 @@ fn setup(
 
     commands.spawn((
         Camera3d::default(),
-        Hdr,
-        Tonemapping::AcesFitted,
-        Bloom::NATURAL,
-        Atmosphere::EARTH,
-        AtmosphereEnvironmentMapLight {
-            intensity: 1.35,
-            ..default()
-        },
         camera_transform,
         camera_orbit,
         GizmoCamera,
@@ -367,76 +351,35 @@ fn setup(
         RenderLayers::layer(0).with(12),
         MainCamera,
     ));
-    ambient_light.color = Color::srgb(0.92, 0.95, 1.0);
-    ambient_light.brightness = if cfg!(feature = "solari") {
-        165.0
-    } else {
-        135.0
-    };
+    ambient_light.color = Color::srgb(0.95, 0.95, 0.95);
+    ambient_light.brightness = 80.0;
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.96, 0.9),
-            illuminance: lux::FULL_DAYLIGHT,
+            color: Color::WHITE,
+            illuminance: lux::AMBIENT_DAYLIGHT,
             shadows_enabled: true,
             shadow_depth_bias: 0.15,
             shadow_normal_bias: 1.0,
             ..default()
         },
-        Transform::from_xyz(8.0, 12.0, 6.5).looking_at(Vec3::new(0.0, 0.2, 0.0), Vec3::Y),
+        Transform::from_xyz(7.0, 10.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
         CascadeShadowConfigBuilder {
             first_cascade_far_bound: 10.0,
-            maximum_distance: 64.0,
+            maximum_distance: 48.0,
             ..default()
         }
         .build(),
         preview_light_layers(),
     ));
-    commands.spawn((
-        DirectionalLight {
-            color: Color::srgb(0.65, 0.74, 1.0),
-            illuminance: 7_500.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::from_xyz(-6.0, 7.0, -8.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
-        preview_light_layers(),
-    ));
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(0.56, 0.7, 1.0),
-            intensity: 4200.0,
-            range: 34.0,
-            radius: 0.42,
-            ..default()
-        },
-        Transform::from_xyz(-5.5, 4.0, -4.5),
-        preview_light_layers(),
-    ));
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(1.0, 0.9, 0.82),
-            intensity: 3200.0,
-            range: 28.0,
-            radius: 0.42,
-            ..default()
-        },
-        Transform::from_xyz(4.5, 4.8, 6.0),
-        preview_light_layers(),
-    ));
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(0.98, 0.82, 0.72),
-            intensity: 1500.0,
-            range: 18.0,
-            radius: 0.25,
-            ..default()
-        },
-        Transform::from_xyz(0.0, 1.6, -6.5),
-        preview_light_layers(),
-    ));
 
     commands.spawn((
-        InfiniteGridBundle::default(),
+        InfiniteGridBundle {
+            settings: InfiniteGridSettings {
+                fadeout_distance: 200.0,
+                ..default()
+            },
+            ..default()
+        },
         Pickable::IGNORE,
         RenderLayers::layer(0),
     ));
@@ -588,7 +531,7 @@ fn seed_default_catalog_cube(
     queue: &mut ResMut<InferenceQueue>,
     catalog: &mut ResMut<CatalogState>,
 ) {
-    if !catalog.is_empty() {
+    if catalog.has_ready_cube_entry() {
         return;
     }
 
@@ -596,6 +539,7 @@ fn seed_default_catalog_cube(
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.8, 0.84, 0.9),
         perceptual_roughness: 0.58,
+        cull_mode: None,
         ..default()
     });
     let id = queue.counter;
@@ -696,11 +640,16 @@ fn apply_cached_camera_state(
     }
 
     transform.translation = translation;
-    transform.rotation = if raw_rotation.length_squared() > 0.0 {
-        raw_rotation.normalize()
+    let to_focus = focus - translation;
+    if to_focus.length_squared() > 0.000_001 {
+        transform.look_at(focus, Vec3::Y);
     } else {
-        Quat::IDENTITY
-    };
+        transform.rotation = if raw_rotation.length_squared() > 0.0 {
+            raw_rotation.normalize()
+        } else {
+            Quat::IDENTITY
+        };
+    }
     orbit.focus = focus;
     orbit.target_focus = focus;
     orbit.yaw = Some(state.yaw);
@@ -805,7 +754,7 @@ fn handle_file_dialog_picks(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn poll_mcp_scene_control(
     mut control: ResMut<McpSceneControl>,
     mut commands: Commands,
@@ -1428,6 +1377,7 @@ fn standard_material_for_inference(
             base_color: Color::srgba(base[0], base[1], base[2], alpha),
             metallic: material.metallic.clamp(0.0, 1.0),
             perceptual_roughness: material.roughness.clamp(0.045, 1.0),
+            cull_mode: None,
             alpha_mode: if alpha < 0.995 {
                 AlphaMode::Blend
             } else {
@@ -1438,6 +1388,7 @@ fn standard_material_for_inference(
     } else {
         StandardMaterial {
             base_color: Color::srgb(0.78, 0.84, 0.92),
+            cull_mode: None,
             ..default()
         }
     };
@@ -1555,6 +1506,7 @@ fn spawn_mesh_asset(
     let mesh_handle: Handle<BevyMesh> = asset_server.load(mesh_path);
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.82, 0.82, 0.9),
+        cull_mode: None,
         ..default()
     });
     spawn_mesh_instance(commands, mesh_handle, material, Transform::default(), None);
@@ -1764,11 +1716,10 @@ fn update_selection_from_primary_click(
     mut selection: ResMut<EditorSelection>,
     windows: Query<&Window, With<PrimaryWindow>>,
     ui_state: Res<CatalogUiState>,
-    gizmo_handles_hover: Query<&PickingInteraction, With<bevy_transform_gizmos::InteractionKind>>,
-    gizmos: Query<&TransformGizmo>,
+    gizmos: Query<(&TransformGizmo, &InheritedVisibility)>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     gizmo_handles_meshes: Query<
-        (&Mesh3d, &GlobalTransform),
+        (&Mesh3d, &GlobalTransform, Option<&InheritedVisibility>),
         With<bevy_transform_gizmos::InteractionKind>,
     >,
     transformables: Query<(Entity, &Mesh3d, &GlobalTransform), With<GizmoTransformable>>,
@@ -1783,13 +1734,13 @@ fn update_selection_from_primary_click(
     if ui_state.cursor_over_ui(window) {
         return;
     }
-    if gizmos.iter().any(|gizmo| gizmo.interaction().is_some()) {
-        return;
-    }
-    if gizmo_handles_hover
-        .iter()
-        .any(|interaction| *interaction != PickingInteraction::None)
-    {
+    let (gizmo_interacting, gizmo_visible) = gizmos
+        .single()
+        .map(|(gizmo, inherited_visibility)| {
+            (gizmo.interaction().is_some(), inherited_visibility.get())
+        })
+        .unwrap_or((false, false));
+    if gizmo_interacting {
         return;
     }
 
@@ -1803,17 +1754,26 @@ fn update_selection_from_primary_click(
         return;
     };
     // Never alter world selection when clicking gizmo handles.
-    let on_gizmo_handle = gizmo_handles_meshes.iter().any(|(mesh3d, transform)| {
-        let Some(mesh) = meshes.get(&mesh3d.0) else {
-            return false;
-        };
-        let Some(aabb) = mesh.compute_aabb() else {
-            return false;
-        };
-        let (world_min, world_max) =
-            world_aabb(aabb.center.into(), aabb.half_extents.into(), transform);
-        ray_aabb_intersection(ray.origin, ray.direction.as_vec3(), world_min, world_max).is_some()
-    });
+    let on_gizmo_handle = gizmo_visible
+        && gizmo_handles_meshes
+            .iter()
+            .any(|(mesh3d, transform, inherited_visibility)| {
+                if let Some(inherited_visibility) = inherited_visibility
+                    && !inherited_visibility.get()
+                {
+                    return false;
+                }
+                let Some(mesh) = meshes.get(&mesh3d.0) else {
+                    return false;
+                };
+                let Some(aabb) = mesh.compute_aabb() else {
+                    return false;
+                };
+                let (world_min, world_max) =
+                    world_aabb(aabb.center.into(), aabb.half_extents.into(), transform);
+                ray_aabb_intersection(ray.origin, ray.direction.as_vec3(), world_min, world_max)
+                    .is_some()
+            });
     if on_gizmo_handle {
         return;
     }

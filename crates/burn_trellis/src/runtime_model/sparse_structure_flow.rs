@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use burn::module::{Ignored, Module, Param};
+use burn::module::{Ignored, Module, Param, ParamId};
 use burn::nn;
 use burn::prelude::Backend;
 use burn::tensor::activation::{sigmoid, softmax};
@@ -9,7 +9,7 @@ use burn::tensor::{Int, Tensor, TensorData};
 use burn_store::{
     BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::sampler::{
     FlowEulerSampleConfig, FlowEulerSampleTrace, mid_snapshot_step, timestep_pairs,
@@ -30,6 +30,23 @@ type WgpuRuntimeBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 pub struct HostTransferStats {
     pub readback_count: u64,
     pub readback_elements: u64,
+}
+
+#[derive(Module, Debug)]
+struct BinaryBlob<B: Backend> {
+    bytes: Param<Tensor<B, 1, Int>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BlobMetadata {
+    bytes_len: usize,
+}
+
+#[derive(Clone)]
+struct RowGatherPlan<B: Backend> {
+    channels: usize,
+    segment_len: usize,
+    index_tensor: Tensor<B, 1, Int>,
 }
 
 pub fn reset_host_transfer_stats() {
@@ -912,9 +929,9 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             ])
         });
 
-        let mut step_0_x_t: Option<Vec<f32>> = None;
-        let mut step_mid_x_t: Option<Vec<f32>> = None;
-        let mut step_last_x_t: Option<Vec<f32>> = None;
+        let mut step_0_x_t: Option<Tensor<B, 5>> = None;
+        let mut step_mid_x_t: Option<Tensor<B, 5>> = None;
+        let mut step_last_x_t: Option<Tensor<B, 5>> = None;
         let mid_step = mid_snapshot_step(sample_cfg.steps);
         let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
@@ -930,37 +947,68 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
             if capture_snapshots && step_idx == 0 {
-                step_0_x_t = Some(tensor_to_vec(x_t.clone())?);
+                step_0_x_t = Some(x_t.clone());
             }
             if capture_snapshots && step_idx == mid_step {
-                step_mid_x_t = Some(tensor_to_vec(x_t.clone())?);
+                step_mid_x_t = Some(x_t.clone());
             }
             if capture_snapshots && step_idx + 1 == sample_cfg.steps {
-                step_last_x_t = Some(tensor_to_vec(x_t.clone())?);
+                step_last_x_t = Some(x_t.clone());
             }
         }
 
-        let samples = tensor_to_vec(x_t.clone())?;
+        let state_len = state_channels.saturating_mul(voxel);
+        let (samples, step_0_x_t, step_mid_x_t, step_last_x_t) = if capture_snapshots {
+            let samples_t = x_t;
+            let step_0_t = step_0_x_t
+                .unwrap_or_else(|| samples_t.clone())
+                .reshape([state_len]);
+            let step_mid_t = step_mid_x_t
+                .unwrap_or_else(|| samples_t.clone())
+                .reshape([state_len]);
+            let step_last_t = step_last_x_t
+                .unwrap_or_else(|| samples_t.clone())
+                .reshape([state_len]);
+            let merged = Tensor::cat(
+                vec![
+                    samples_t.reshape([state_len]),
+                    step_0_t,
+                    step_mid_t,
+                    step_last_t,
+                ],
+                0,
+            );
+            let merged = tensor_to_vec_1d(merged, "failed to read sparse trace tensor")?;
+            let segment = state_len;
+            let samples = merged[..segment].to_vec();
+            let step_0_x_t = merged[segment..segment * 2].to_vec();
+            let step_mid_x_t = merged[segment * 2..segment * 3].to_vec();
+            let step_last_x_t = merged[segment * 3..segment * 4].to_vec();
+            (samples, step_0_x_t, step_mid_x_t, step_last_x_t)
+        } else {
+            let samples = tensor_to_vec(x_t)?;
+            (samples.clone(), samples.clone(), samples.clone(), samples)
+        };
+
         Ok(FlowEulerSampleTrace {
             steps: sample_cfg.steps,
-            step_0_x_t: step_0_x_t.unwrap_or_else(|| samples.clone()),
-            step_mid_x_t: step_mid_x_t.unwrap_or_else(|| samples.clone()),
-            step_last_x_t: step_last_x_t.unwrap_or_else(|| samples.clone()),
+            step_0_x_t,
+            step_mid_x_t,
+            step_last_x_t,
             samples,
         })
     }
 
-    fn gather_rows_from_state(
+    fn build_row_gather_plan(
         &self,
-        state: Tensor<B, 5>,
+        state_channels: usize,
+        voxel: usize,
         dense_indices: &[usize],
         row_channels: usize,
-    ) -> Result<Vec<f32>, String> {
-        let [_, state_channels, rx, ry, rz] = state.dims();
-        let voxel = rx.saturating_mul(ry).saturating_mul(rz).max(1);
+    ) -> Result<Option<RowGatherPlan<B>>, String> {
         let channels = row_channels.min(state_channels);
         if channels == 0 || dense_indices.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let gather_len = channels.saturating_mul(dense_indices.len());
         let mut gather_indices = Vec::with_capacity(gather_len);
@@ -987,15 +1035,28 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             TensorData::new(gather_indices, gather_shape).convert::<i32>(),
             &self.device,
         );
+        Ok(Some(RowGatherPlan {
+            channels,
+            segment_len: gather_len,
+            index_tensor,
+        }))
+    }
+
+    fn gather_rows_tensor(
+        &self,
+        state: Tensor<B, 5>,
+        plan: &RowGatherPlan<B>,
+    ) -> Result<Tensor<B, 1>, String> {
+        let [_, state_channels, rx, ry, rz] = state.dims();
+        let voxel = rx.saturating_mul(ry).saturating_mul(rz).max(1);
+        if plan.channels > state_channels {
+            return Err(format!(
+                "dense row gather channel mismatch: requested={} available={}",
+                plan.channels, state_channels
+            ));
+        }
         let flat = state.reshape([state_channels.saturating_mul(voxel)]);
-        let selected = flat.select(0, index_tensor);
-        let values = selected
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|err| format!("failed to read sparse-row gather tensor: {err:?}"))?;
-        record_host_readback(values.len());
-        Ok(values)
+        Ok(flat.select(0, plan.index_tensor.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1063,9 +1124,11 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             ])
         });
 
-        let mut step_0_state: Option<Tensor<B, 5>> = None;
-        let mut step_mid_state: Option<Tensor<B, 5>> = None;
-        let mut step_last_state: Option<Tensor<B, 5>> = None;
+        let gather_plan =
+            self.build_row_gather_plan(state_channels, voxel, dense_indices, row_channels)?;
+        let mut step_0_rows: Option<Tensor<B, 1>> = None;
+        let mut step_mid_rows: Option<Tensor<B, 1>> = None;
+        let mut step_last_rows: Option<Tensor<B, 1>> = None;
         let mid_step = mid_snapshot_step(sample_cfg.steps);
         let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
@@ -1080,32 +1143,48 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             )?;
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
-            if capture_snapshots && step_idx == 0 {
-                step_0_state = Some(x_t.clone());
+            if capture_snapshots
+                && step_idx == 0
+                && let Some(plan) = gather_plan.as_ref()
+            {
+                step_0_rows = Some(self.gather_rows_tensor(x_t.clone(), plan)?);
             }
-            if capture_snapshots && step_idx == mid_step {
-                step_mid_state = Some(x_t.clone());
+            if capture_snapshots
+                && step_idx == mid_step
+                && let Some(plan) = gather_plan.as_ref()
+            {
+                step_mid_rows = Some(self.gather_rows_tensor(x_t.clone(), plan)?);
             }
-            if capture_snapshots && step_idx + 1 == sample_cfg.steps {
-                step_last_state = Some(x_t.clone());
+            if capture_snapshots
+                && step_idx + 1 == sample_cfg.steps
+                && let Some(plan) = gather_plan.as_ref()
+            {
+                step_last_rows = Some(self.gather_rows_tensor(x_t.clone(), plan)?);
             }
         }
 
-        let samples = self.gather_rows_from_state(x_t.clone(), dense_indices, row_channels)?;
-        let step_0_x_t = if let Some(state) = step_0_state {
-            self.gather_rows_from_state(state, dense_indices, row_channels)?
+        let (samples, step_0_x_t, step_mid_x_t, step_last_x_t) = if let Some(plan) =
+            gather_plan.as_ref()
+        {
+            let samples_t = self.gather_rows_tensor(x_t, plan)?;
+            if capture_snapshots {
+                let step_0_t = step_0_rows.unwrap_or_else(|| samples_t.clone());
+                let step_mid_t = step_mid_rows.unwrap_or_else(|| samples_t.clone());
+                let step_last_t = step_last_rows.unwrap_or_else(|| samples_t.clone());
+                let merged = Tensor::cat(vec![samples_t, step_0_t, step_mid_t, step_last_t], 0);
+                let merged = tensor_to_vec_1d(merged, "failed to read sparse-row trace tensor")?;
+                let segment = plan.segment_len;
+                let samples = merged[..segment].to_vec();
+                let step_0_x_t = merged[segment..segment * 2].to_vec();
+                let step_mid_x_t = merged[segment * 2..segment * 3].to_vec();
+                let step_last_x_t = merged[segment * 3..segment * 4].to_vec();
+                (samples, step_0_x_t, step_mid_x_t, step_last_x_t)
+            } else {
+                let samples = tensor_to_vec_1d(samples_t, "failed to read sparse-row tensor")?;
+                (samples.clone(), samples.clone(), samples.clone(), samples)
+            }
         } else {
-            samples.clone()
-        };
-        let step_mid_x_t = if let Some(state) = step_mid_state {
-            self.gather_rows_from_state(state, dense_indices, row_channels)?
-        } else {
-            samples.clone()
-        };
-        let step_last_x_t = if let Some(state) = step_last_state {
-            self.gather_rows_from_state(state, dense_indices, row_channels)?
-        } else {
-            samples.clone()
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
         Ok(SparseFlowRowTrace {
@@ -1502,6 +1581,17 @@ fn tensor_to_vec<B: Backend>(tensor: Tensor<B, 5>) -> Result<Vec<f32>, String> {
     Ok(values)
 }
 
+fn tensor_to_vec_1d<B: Backend>(tensor: Tensor<B, 1>, context: &str) -> Result<Vec<f32>, String> {
+    let [elements] = tensor.dims();
+    let values = tensor
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("{context}: {err:?}"))?;
+    record_host_readback(elements.max(values.len()));
+    Ok(values)
+}
+
 fn gelu<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
     // tanh-approx GELU parity with TRELLIS modules:
     // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
@@ -1540,6 +1630,86 @@ fn layer_norm_no_affine<B: Backend>(x: Tensor<B, 3>, eps: f32) -> Tensor<B, 3> {
     centered.mul(var.add_scalar(eps).sqrt().recip())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttentionImpl {
+    Dense,
+    Stream,
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn attention_debug_enabled() -> bool {
+    env_flag_enabled("TRELLIS2_ATTN_DEBUG")
+}
+
+fn attention_prefers_stream<B: Backend>() -> bool {
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        std::any::type_name::<B>()
+            .to_ascii_lowercase()
+            .contains("wgpu")
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        false
+    }
+}
+
+// Avoid 4D matmul layout expansion on fusion/cubecl backends by flattening batch*heads.
+fn matmul_4d_via_3d<B: Backend>(lhs: Tensor<B, 4>, rhs: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [batch, heads, m, k] = lhs.dims();
+    let [rhs_batch, rhs_heads, rhs_k, n] = rhs.dims();
+    if batch != rhs_batch || heads != rhs_heads || k != rhs_k {
+        panic!(
+            "4d matmul shape mismatch: lhs=[{batch},{heads},{m},{k}] rhs=[{rhs_batch},{rhs_heads},{rhs_k},{n}]"
+        );
+    }
+    let bh = batch.saturating_mul(heads).max(1);
+    lhs.clone()
+        .reshape([bh, m, k])
+        .matmul(rhs.clone().reshape([bh, rhs_k, n]))
+        .reshape([batch, heads, m, n])
+}
+
+fn attention_impl<B: Backend>(query_tokens: usize, key_tokens: usize) -> AttentionImpl {
+    let auto =
+        if env_flag_enabled("TRELLIS2_PARITY_STRICT") || env_flag_enabled("TRELLIS2_E2E_STRICT") {
+            AttentionImpl::Dense
+        } else {
+            let work = query_tokens.saturating_mul(key_tokens);
+            if (attention_prefers_stream::<B>() && work >= 64usize.saturating_mul(64))
+                || work >= 512usize.saturating_mul(512)
+            {
+                AttentionImpl::Stream
+            } else {
+                AttentionImpl::Dense
+            }
+        };
+
+    match std::env::var("TRELLIS2_ATTN_BACKEND")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("dense") | Some("chunked") | Some("naive") | Some("sdpa") => AttentionImpl::Dense,
+        Some("stream") | Some("flash") | Some("flash_like") | Some("varlen") => {
+            AttentionImpl::Stream
+        }
+        Some("auto") | None => auto,
+        Some(_) => auto,
+    }
+}
+
 fn scaled_dot_product_attention<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
@@ -1549,40 +1719,230 @@ fn scaled_dot_product_attention<B: Backend>(
     let q = q.permute([0, 2, 1, 3]);
     let k = k.permute([0, 2, 1, 3]);
     let v = v.permute([0, 2, 1, 3]);
-    let [batch, heads, tokens, _] = q.dims();
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let chunk = attention_query_chunk(tokens);
+    let [_, _, query_tokens, _] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
 
-    // Chunk attention over the query axis to avoid allocating a full [T, T] matrix
-    // for large dense SLAT resolutions.
-    if chunk >= tokens {
-        let attn = softmax(q.matmul(k.swap_dims(2, 3)).mul_scalar(scale), 3);
-        return attn.matmul(v).permute([0, 2, 1, 3]);
+    let attention_impl = attention_impl::<B>(query_tokens, key_tokens);
+    if attention_debug_enabled() && query_tokens >= 4096 {
+        let backend_name = std::any::type_name::<B>();
+        let impl_name = match attention_impl {
+            AttentionImpl::Dense => "dense",
+            AttentionImpl::Stream => "stream",
+        };
+        eprintln!(
+            "burn_trellis: attn dispatch backend={backend_name} impl={impl_name} q={query_tokens} k={key_tokens} head_dim={head_dim}"
+        );
+    }
+
+    let out = match attention_impl {
+        AttentionImpl::Dense => scaled_dot_product_attention_dense(q, k, v, head_dim),
+        AttentionImpl::Stream => scaled_dot_product_attention_stream(q, k, v, head_dim),
+    };
+    out.permute([0, 2, 1, 3])
+}
+
+fn scaled_dot_product_attention_dense<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+) -> Tensor<B, 4> {
+    let [batch, heads, tokens, _] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let query_chunk = attention_query_chunk::<B>(tokens, 8);
+    let logits_budget = attention_logits_budget_bytes::<B>();
+    let dense_logits_bytes = attention_logits_bytes(batch, heads, tokens, key_tokens);
+    if attention_debug_enabled() && tokens >= 4096 {
+        eprintln!(
+            "burn_trellis: attn dense q={tokens} k={key_tokens} query_chunk={query_chunk} logits_bytes={dense_logits_bytes} budget_bytes={logits_budget}"
+        );
+    }
+
+    if query_chunk >= tokens && dense_logits_bytes <= logits_budget {
+        let attn = softmax(
+            matmul_4d_via_3d(q.clone(), k.clone().swap_dims(2, 3)).mul_scalar(scale),
+            3,
+        );
+        return matmul_4d_via_3d(attn, v);
     }
 
     let k_t = k.clone().swap_dims(2, 3);
     let mut chunks = Vec::new();
     let mut start = 0usize;
     while start < tokens {
-        let end = (start + chunk).min(tokens);
+        let end = (start + query_chunk).min(tokens);
         let q_chunk = q
             .clone()
-            .slice([0..batch, 0..heads, start..end, 0..head_dim]);
-        let attn = softmax(q_chunk.matmul(k_t.clone()).mul_scalar(scale), 3);
-        chunks.push(attn.matmul(v.clone()));
+            .slice([0..batch, 0..heads, start..end, 0..head_dim])
+            .clone();
+        let attn = softmax(
+            matmul_4d_via_3d(q_chunk, k_t.clone()).mul_scalar(scale),
+            3,
+        );
+        chunks.push(matmul_4d_via_3d(attn, v.clone()));
         start = end;
     }
-
-    Tensor::cat(chunks, 2).permute([0, 2, 1, 3])
+    Tensor::cat(chunks, 2)
 }
 
-fn attention_query_chunk(tokens: usize) -> usize {
+fn scaled_dot_product_attention_stream<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+) -> Tensor<B, 4> {
+    let [batch, heads, query_tokens, _] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
+    let [_, _, _, value_dim] = v.dims();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let query_chunk = attention_query_chunk::<B>(query_tokens, 64);
+    let key_chunk = attention_key_chunk::<B>(key_tokens);
+    let logits_budget = attention_logits_budget_bytes::<B>();
+    let dense_logits_bytes = attention_logits_bytes(batch, heads, query_tokens, key_tokens);
+    if attention_debug_enabled() && query_tokens >= 4096 {
+        eprintln!(
+            "burn_trellis: attn stream q={query_tokens} k={key_tokens} query_chunk={query_chunk} key_chunk={key_chunk} logits_bytes={dense_logits_bytes} budget_bytes={logits_budget}"
+        );
+    }
+
+    if query_chunk >= query_tokens && key_chunk >= key_tokens && dense_logits_bytes <= logits_budget
+    {
+        let attn = softmax(
+            matmul_4d_via_3d(q.clone(), k.clone().swap_dims(2, 3)).mul_scalar(scale),
+            3,
+        );
+        return matmul_4d_via_3d(attn, v);
+    }
+
+    let mut outputs = Vec::new();
+    let mut q_start = 0usize;
+    while q_start < query_tokens {
+        let q_end = (q_start + query_chunk).min(query_tokens);
+        let q_chunk = q
+            .clone()
+            .slice([0..batch, 0..heads, q_start..q_end, 0..head_dim])
+            .clone();
+
+        let first_k_end = key_chunk.min(key_tokens);
+        let first_k = k
+            .clone()
+            .slice([0..batch, 0..heads, 0..first_k_end, 0..head_dim])
+            .clone();
+        let first_v = v
+            .clone()
+            .slice([0..batch, 0..heads, 0..first_k_end, 0..value_dim])
+            .clone();
+
+        let first_logits =
+            matmul_4d_via_3d(q_chunk.clone(), first_k.swap_dims(2, 3)).mul_scalar(scale);
+        let mut max_scores = first_logits.clone().max_dim(3);
+        let first_probs = first_logits.sub(max_scores.clone()).exp();
+        let mut denom = first_probs.clone().sum_dim(3);
+        let mut acc = matmul_4d_via_3d(first_probs, first_v);
+
+        let mut k_start = first_k_end;
+        while k_start < key_tokens {
+            let k_end = (k_start + key_chunk).min(key_tokens);
+            let k_chunk = k
+                .clone()
+                .slice([0..batch, 0..heads, k_start..k_end, 0..head_dim])
+                .clone();
+            let v_chunk = v
+                .clone()
+                .slice([0..batch, 0..heads, k_start..k_end, 0..value_dim])
+                .clone();
+            let logits =
+                matmul_4d_via_3d(q_chunk.clone(), k_chunk.swap_dims(2, 3)).mul_scalar(scale);
+            let chunk_max = logits.clone().max_dim(3);
+            let probs = logits.sub(chunk_max.clone()).exp();
+            let chunk_denom = probs.clone().sum_dim(3);
+            let chunk_acc = matmul_4d_via_3d(probs, v_chunk);
+
+            let max_new = max_scores.clone().max_pair(chunk_max.clone());
+            let alpha = max_scores.clone().sub(max_new.clone()).exp();
+            let beta = chunk_max.sub(max_new.clone()).exp();
+            let denom_new = alpha
+                .clone()
+                .mul(denom.clone())
+                .add(beta.clone().mul(chunk_denom.clone()))
+                .add_scalar(1.0e-12);
+            let prev_scale = alpha.mul(denom).div(denom_new.clone());
+            let chunk_scale = beta.mul(chunk_denom).div(denom_new.clone());
+            acc = acc.mul(prev_scale).add(chunk_acc.mul(chunk_scale));
+
+            max_scores = max_new;
+            denom = denom_new;
+            k_start = k_end;
+        }
+
+        outputs.push(acc);
+        q_start = q_end;
+    }
+
+    Tensor::cat(outputs, 2)
+}
+
+fn attention_logits_bytes(batch: usize, heads: usize, query_tokens: usize, key_tokens: usize) -> usize {
+    batch
+        .saturating_mul(heads)
+        .saturating_mul(query_tokens)
+        .saturating_mul(key_tokens)
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+fn attention_logits_budget_bytes<B: Backend>() -> usize {
+    std::env::var("TRELLIS2_ATTN_MAX_LOGITS_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            if attention_prefers_stream::<B>() {
+                512 * 1024 * 1024
+            } else {
+                usize::MAX
+            }
+        })
+}
+
+fn attention_query_chunk<B: Backend>(tokens: usize, default_chunk: usize) -> usize {
     let env_chunk = std::env::var("TRELLIS2_ATTN_QUERY_CHUNK")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(8);
-    env_chunk.min(tokens.max(1))
+        .unwrap_or(default_chunk);
+    let max_chunk = std::env::var("TRELLIS2_ATTN_QUERY_CHUNK_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            if attention_prefers_stream::<B>() {
+                256
+            } else {
+                usize::MAX
+            }
+        });
+    env_chunk.min(max_chunk).min(tokens.max(1))
+}
+
+fn attention_key_chunk<B: Backend>(tokens: usize) -> usize {
+    let env_chunk = std::env::var("TRELLIS2_ATTN_KEY_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128);
+    let max_chunk = std::env::var("TRELLIS2_ATTN_KEY_CHUNK_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            if attention_prefers_stream::<B>() {
+                512
+            } else {
+                usize::MAX
+            }
+        });
+    env_chunk.min(max_chunk).min(tokens.max(1))
 }
 
 fn apply_rope<B: Backend>(
@@ -1686,12 +2046,27 @@ fn load_sparse_model_weights<B: Backend>(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("bpk"))
     {
         let mut store = BurnpackStore::from_file(path).validate(true);
-        model.load_from(&mut store).map(|_| ()).map_err(|err| {
-            format!(
-                "failed to load sparse flow burnpack '{}': {err}",
-                path.display()
-            )
-        })
+        match model.load_from(&mut store) {
+            Ok(_) => Ok(()),
+            Err(module_err) => {
+                let blob_bytes = load_burnpack_blob_bytes(path).map_err(|blob_err| {
+                    format!(
+                        "failed to load sparse flow burnpack '{}' as module ({module_err}) or blob ({blob_err})",
+                        path.display()
+                    )
+                })?;
+                let mut safetensor_store = build_safetensor_store_from_bytes(blob_bytes)?;
+                model
+                    .load_from(&mut safetensor_store)
+                    .map(|_| ())
+                    .map_err(|safetensor_err| {
+                        format!(
+                            "failed to load sparse flow burnpack '{}' as safetensors blob after module load error ({module_err}): {safetensor_err}",
+                            path.display()
+                        )
+                    })
+            }
+        }
     } else {
         let mut store = build_safetensor_store(path)?;
         model.load_from(&mut store).map(|_| ()).map_err(|err| {
@@ -1716,6 +2091,97 @@ fn build_safetensor_store(path: &Path) -> Result<SafetensorsStore, String> {
         .allow_partial(false)
         .remap(remapper)
         .validate(true))
+}
+
+fn build_safetensor_store_from_bytes(bytes: Vec<u8>) -> Result<SafetensorsStore, String> {
+    let mut remapper = KeyRemapper::new();
+    for &(from, to) in key_remap_rules() {
+        remapper = remapper
+            .add_pattern(from, to)
+            .map_err(|err| format!("invalid sparse flow remap rule {from}->{to}: {err}"))?;
+    }
+
+    Ok(SafetensorsStore::from_bytes(Some(bytes))
+        .with_from_adapter(PyTorchToBurnAdapter)
+        .allow_partial(false)
+        .remap(remapper)
+        .validate(true))
+}
+
+fn load_burnpack_blob_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata_path = metadata_path(path);
+    let metadata: BlobMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path).map_err(|err| {
+            format!(
+                "failed to read burnpack metadata '{}': {err}",
+                metadata_path.display()
+            )
+        })?)
+        .map_err(|err| {
+            format!(
+                "failed to parse burnpack metadata '{}': {err}",
+                metadata_path.display()
+            )
+        })?;
+
+    match load_blob_bytes_with_backend::<burn::backend::NdArray<f32, u8>>(path, metadata.bytes_len)
+    {
+        Ok(bytes) => Ok(bytes),
+        Err(u8_err) => load_blob_bytes_with_backend::<burn::backend::NdArray<f32, i64>>(
+            path,
+            metadata.bytes_len,
+        )
+        .map_err(|i64_err| {
+            format!(
+                "failed to load blob burnpack '{}' (u8 backend: {u8_err}; i64 fallback: {i64_err})",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn load_blob_bytes_with_backend<B: Backend>(
+    path: &Path,
+    bytes_len: usize,
+) -> Result<Vec<u8>, String>
+where
+    B::Device: Default,
+{
+    let device = <B as Backend>::Device::default();
+    let zeros = Tensor::<B, 1, Int>::zeros([bytes_len], &device);
+    let mut blob = BinaryBlob {
+        bytes: Param::initialized(ParamId::new(), zeros),
+    };
+
+    let mut store = BurnpackStore::from_file(path).validate(true);
+    blob.load_from(&mut store)
+        .map_err(|err| format!("failed to load burnpack '{}': {err}", path.display()))?;
+
+    let bytes = blob
+        .bytes
+        .val()
+        .into_data()
+        .convert::<u8>()
+        .to_vec::<u8>()
+        .map_err(|err| format!("failed to materialize burnpack bytes: {err:?}"))?;
+
+    if bytes.len() != bytes_len {
+        return Err(format!(
+            "burnpack byte length mismatch for '{}': expected {}, got {}",
+            path.display(),
+            bytes_len,
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn metadata_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model.bpk");
+    path.with_file_name(format!("{file_name}.meta.json"))
 }
 
 fn key_remap_rules() -> &'static [(&'static str, &'static str)] {
@@ -1815,11 +2281,24 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+    use burn::module::{Param, ParamId};
     use burn::prelude::Backend;
-    use burn::tensor::Tensor;
+    use burn::tensor::{Int, Tensor, TensorData};
+    use burn_store::{BurnToPyTorchAdapter, BurnpackStore, ModuleSnapshot, SafetensorsStore};
 
-    use super::{SparseStructureFlowConfig, SparseStructureFlowModel, SparseStructureFlowRuntime};
+    use crate::sampler::FlowEulerSampleConfig;
+
+    use super::{
+        BinaryBlob, BlobMetadata, CpuRuntimeBackend, SparseStructureFlowConfig,
+        SparseStructureFlowModel, SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl,
+        host_transfer_stats, metadata_path, reset_host_transfer_stats,
+        scaled_dot_product_attention_dense, scaled_dot_product_attention_stream,
+    };
+
+    static HOST_STATS_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_sparse_structure_flow_config_json() {
@@ -1893,6 +2372,120 @@ mod tests {
         assert_eq!(out.len(), sample.len());
     }
 
+    #[test]
+    fn runtime_loads_blob_burnpack_when_module_layout_is_absent() {
+        type BlobBackend = burn::backend::NdArray<f32, u8>;
+        type TestBackend = burn::backend::NdArray<f32>;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_sparse_flow_blob_{unique}"));
+        let ckpts = root.join("ckpts");
+        std::fs::create_dir_all(&ckpts).expect("create ckpt dir");
+
+        let config = SparseStructureFlowConfig {
+            resolution: 2,
+            in_channels: 2,
+            out_channels: 2,
+            model_channels: 8,
+            cond_channels: 4,
+            num_blocks: 1,
+            num_heads: Some(2),
+            num_head_channels: 4,
+            mlp_ratio: 2.0,
+            pe_mode: "rope".to_string(),
+            rope_freq: [1.0, 10_000.0],
+            share_mod: true,
+            qk_rms_norm: true,
+            qk_rms_norm_cross: true,
+            frequency_embedding_size: 8,
+        };
+
+        let config_json = serde_json::json!({
+            "name": "SparseStructureFlowModel",
+            "args": {
+                "resolution": config.resolution,
+                "in_channels": config.in_channels,
+                "out_channels": config.out_channels,
+                "model_channels": config.model_channels,
+                "cond_channels": config.cond_channels,
+                "num_blocks": config.num_blocks,
+                "num_heads": config.num_heads,
+                "num_head_channels": config.num_head_channels,
+                "mlp_ratio": config.mlp_ratio,
+                "pe_mode": config.pe_mode,
+                "rope_freq": config.rope_freq,
+                "share_mod": config.share_mod,
+                "qk_rms_norm": config.qk_rms_norm,
+                "qk_rms_norm_cross": config.qk_rms_norm_cross,
+                "frequency_embedding_size": config.frequency_embedding_size
+            }
+        });
+        std::fs::write(
+            ckpts.join("flow_model.json"),
+            serde_json::to_vec_pretty(&config_json).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let source_path = ckpts.join("flow_model.safetensors");
+        let device = <TestBackend as Backend>::Device::default();
+        let model = SparseStructureFlowModel::<TestBackend>::new(&device, config.clone());
+        let mut source_store =
+            SafetensorsStore::from_file(&source_path).with_to_adapter(BurnToPyTorchAdapter);
+        model
+            .save_into(&mut source_store)
+            .expect("save source safetensors");
+        let source_bytes = std::fs::read(&source_path).expect("read source safetensors");
+
+        let burnpack_path = ckpts.join("flow_model.bpk");
+        let blob_device = <BlobBackend as Backend>::Device::default();
+        let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
+            TensorData::new(source_bytes.clone(), [source_bytes.len()]),
+            &blob_device,
+        );
+        let blob = BinaryBlob {
+            bytes: Param::initialized(ParamId::new(), tensor),
+        };
+        let mut burnpack_store = BurnpackStore::from_file(&burnpack_path).overwrite(true);
+        blob.save_into(&mut burnpack_store)
+            .expect("save blob burnpack");
+        let metadata = BlobMetadata {
+            bytes_len: source_bytes.len(),
+        };
+        std::fs::write(
+            metadata_path(&burnpack_path),
+            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        std::fs::remove_file(&source_path).expect("remove source safetensors");
+
+        let runtime = SparseStructureFlowRuntime::load_from_stem(
+            root.as_path(),
+            None,
+            "ckpts/flow_model",
+            false,
+            None,
+        )
+        .expect("runtime should load from blob burnpack");
+        let cfg = runtime.config();
+        let voxels = cfg.resolution * cfg.resolution * cfg.resolution;
+        let sample = vec![0.0f32; cfg.in_channels * voxels];
+        let cond_tokens = 4;
+        let cond = vec![0.0f32; cond_tokens * cfg.cond_channels];
+        let prepared = runtime
+            .prepare_condition(cond.as_slice(), cond_tokens)
+            .expect("prepare cond");
+        let out = runtime
+            .predict_velocity_with_condition(sample.as_slice(), 1.0, &prepared, None)
+            .expect("forward");
+        assert_eq!(out.len(), sample.len());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn run_tiny_forward<B: Backend>(device: &B::Device) {
         let config = SparseStructureFlowConfig {
             resolution: 2,
@@ -1935,6 +2528,240 @@ mod tests {
                 config.resolution
             ]
         );
+    }
+
+    fn make_tiny_runtime_cpu() -> SparseStructureFlowRuntimeImpl<CpuRuntimeBackend> {
+        let config = SparseStructureFlowConfig {
+            resolution: 2,
+            in_channels: 2,
+            out_channels: 2,
+            model_channels: 8,
+            cond_channels: 4,
+            num_blocks: 1,
+            num_heads: Some(2),
+            num_head_channels: 4,
+            mlp_ratio: 2.0,
+            pe_mode: "rope".to_string(),
+            rope_freq: [1.0, 10_000.0],
+            share_mod: true,
+            qk_rms_norm: true,
+            qk_rms_norm_cross: true,
+            frequency_embedding_size: 8,
+        };
+        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let model = SparseStructureFlowModel::<CpuRuntimeBackend>::new(&device, config.clone());
+        SparseStructureFlowRuntimeImpl {
+            config,
+            model,
+            device,
+        }
+    }
+
+    fn make_attention_tensor(
+        device: &<CpuRuntimeBackend as Backend>::Device,
+        tokens: usize,
+        heads: usize,
+        channels: usize,
+        seed: f32,
+    ) -> Tensor<CpuRuntimeBackend, 4> {
+        let mut values = Vec::with_capacity(tokens.saturating_mul(heads).saturating_mul(channels));
+        for idx in 0..values.capacity() {
+            let x = idx as f32 * 0.013 + seed;
+            values.push(x.sin() * 0.7 + x.cos() * 0.3);
+        }
+        Tensor::<CpuRuntimeBackend, 1>::from_floats(values.as_slice(), device)
+            .reshape([1, tokens, heads, channels])
+    }
+
+    fn tensor_to_vec4<B: Backend>(tensor: Tensor<B, 4>) -> Vec<f32> {
+        tensor
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("tensor should be readable")
+    }
+
+    #[test]
+    fn attention_stream_matches_dense_reference() {
+        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let heads = 4usize;
+        let head_dim = 8usize;
+        let query_tokens = 32usize;
+        let key_tokens = 24usize;
+
+        let q = make_attention_tensor(&device, query_tokens, heads, head_dim, 0.2);
+        let k = make_attention_tensor(&device, key_tokens, heads, head_dim, 0.7);
+        let v = make_attention_tensor(&device, key_tokens, heads, head_dim, 1.3);
+
+        let q = q.permute([0, 2, 1, 3]);
+        let k = k.permute([0, 2, 1, 3]);
+        let v = v.permute([0, 2, 1, 3]);
+
+        let dense = scaled_dot_product_attention_dense(q.clone(), k.clone(), v.clone(), head_dim);
+        let stream = scaled_dot_product_attention_stream(q, k, v, head_dim);
+
+        let dense = tensor_to_vec4(dense);
+        let stream = tensor_to_vec4(stream);
+        assert_eq!(dense.len(), stream.len());
+
+        let max_abs = dense
+            .iter()
+            .zip(stream.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 1.0e-3,
+            "stream attention drift too high: max_abs={max_abs:.6e}"
+        );
+    }
+
+    #[test]
+    fn attention_stream_benchmark_report() {
+        if std::env::var("TRELLIS2_ATTN_BENCH").is_err() {
+            eprintln!("skipping: set TRELLIS2_ATTN_BENCH=1 to run attention benchmark report");
+            return;
+        }
+
+        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let heads = 8usize;
+        let head_dim = 16usize;
+        let query_tokens = 160usize;
+        let key_tokens = 160usize;
+        let iterations = 6usize;
+
+        let q = make_attention_tensor(&device, query_tokens, heads, head_dim, 0.2)
+            .permute([0, 2, 1, 3]);
+        let k =
+            make_attention_tensor(&device, key_tokens, heads, head_dim, 0.7).permute([0, 2, 1, 3]);
+        let v =
+            make_attention_tensor(&device, key_tokens, heads, head_dim, 1.3).permute([0, 2, 1, 3]);
+
+        let _ = scaled_dot_product_attention_dense(q.clone(), k.clone(), v.clone(), head_dim)
+            .into_data();
+        let _ = scaled_dot_product_attention_stream(q.clone(), k.clone(), v.clone(), head_dim)
+            .into_data();
+
+        let dense_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = scaled_dot_product_attention_dense(q.clone(), k.clone(), v.clone(), head_dim)
+                .into_data();
+        }
+        let dense_ms = dense_start.elapsed().as_secs_f64() * 1_000.0 / iterations as f64;
+
+        let stream_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = scaled_dot_product_attention_stream(q.clone(), k.clone(), v.clone(), head_dim)
+                .into_data();
+        }
+        let stream_ms = stream_start.elapsed().as_secs_f64() * 1_000.0 / iterations as f64;
+        eprintln!(
+            "attention bench: dense={dense_ms:.3}ms stream={stream_ms:.3}ms ratio={:.3}",
+            stream_ms / dense_ms
+        );
+    }
+
+    #[test]
+    fn sample_trace_uses_single_host_readback_when_capturing_snapshots() {
+        let _guard = HOST_STATS_LOCK
+            .lock()
+            .expect("host transfer stats lock should not be poisoned");
+        let runtime = make_tiny_runtime_cpu();
+        let config = runtime.config().clone();
+        let voxel = config.resolution * config.resolution * config.resolution;
+        let noise = vec![0.0f32; config.out_channels * voxel];
+        let cond_tokens = 4usize;
+        let cond_values = vec![0.0f32; cond_tokens * config.cond_channels];
+        let cond = runtime
+            .prepare_condition(cond_values.as_slice(), cond_tokens)
+            .expect("prepare cond");
+        let neg_cond = runtime
+            .prepare_condition(cond_values.as_slice(), cond_tokens)
+            .expect("prepare neg cond");
+        let sample_cfg = FlowEulerSampleConfig {
+            steps: 4,
+            rescale_t: 1.0,
+            guidance_strength: 1.0,
+            guidance_rescale: 0.0,
+            guidance_interval: [0.0, 1.0],
+        };
+
+        reset_host_transfer_stats();
+        let trace = runtime
+            .sample_with_trace(
+                noise.as_slice(),
+                sample_cfg,
+                0.1,
+                cond,
+                neg_cond,
+                None,
+                true,
+            )
+            .expect("sample trace");
+        let stats = host_transfer_stats();
+
+        assert_eq!(
+            stats.readback_count, 1,
+            "dense trace snapshot capture should use a single merged host readback"
+        );
+        let expected_len = noise.len();
+        assert_eq!(trace.samples.len(), expected_len);
+        assert_eq!(trace.step_0_x_t.len(), expected_len);
+        assert_eq!(trace.step_mid_x_t.len(), expected_len);
+        assert_eq!(trace.step_last_x_t.len(), expected_len);
+    }
+
+    #[test]
+    fn sample_rows_trace_uses_single_host_readback_when_capturing_snapshots() {
+        let _guard = HOST_STATS_LOCK
+            .lock()
+            .expect("host transfer stats lock should not be poisoned");
+        let runtime = make_tiny_runtime_cpu();
+        let config = runtime.config().clone();
+        let voxel = config.resolution * config.resolution * config.resolution;
+        let noise = vec![0.0f32; config.out_channels * voxel];
+        let cond_tokens = 4usize;
+        let cond_values = vec![0.0f32; cond_tokens * config.cond_channels];
+        let cond = runtime
+            .prepare_condition(cond_values.as_slice(), cond_tokens)
+            .expect("prepare cond");
+        let neg_cond = runtime
+            .prepare_condition(cond_values.as_slice(), cond_tokens)
+            .expect("prepare neg cond");
+        let dense_indices = vec![0usize, 1usize, 3usize];
+        let row_channels = 2usize;
+        let sample_cfg = FlowEulerSampleConfig {
+            steps: 4,
+            rescale_t: 1.0,
+            guidance_strength: 1.0,
+            guidance_rescale: 0.0,
+            guidance_interval: [0.0, 1.0],
+        };
+
+        reset_host_transfer_stats();
+        let trace = runtime
+            .sample_rows_with_trace(
+                noise.as_slice(),
+                sample_cfg,
+                0.1,
+                cond,
+                neg_cond,
+                None,
+                dense_indices.as_slice(),
+                row_channels,
+                true,
+            )
+            .expect("sample rows with trace");
+        let stats = host_transfer_stats();
+
+        assert_eq!(
+            stats.readback_count, 1,
+            "row-trace snapshot capture should use a single merged host readback"
+        );
+        let expected_len = dense_indices.len() * row_channels;
+        assert_eq!(trace.samples.len(), expected_len);
+        assert_eq!(trace.step_0_x_t.len(), expected_len);
+        assert_eq!(trace.step_mid_x_t.len(), expected_len);
+        assert_eq!(trace.step_last_x_t.len(), expected_len);
     }
 
     #[test]

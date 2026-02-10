@@ -674,16 +674,6 @@ async fn build_pipeline_state_wasm<B: Backend>(
     if let Some(seed) = args.seed {
         B::seed(&device, seed);
     }
-    if std::env::var("RMBG_STRICT_INTERP").is_err() {
-        unsafe {
-            std::env::set_var("RMBG_STRICT_INTERP", "1");
-        }
-    }
-    if args.match_python && std::env::var("TRIPOSG_MAX_IMAGE_DIM").is_err() {
-        unsafe {
-            std::env::set_var("TRIPOSG_MAX_IMAGE_DIM", "2000");
-        }
-    }
 
     let synthesis_models = args.synthesis_models.clone();
     let synthesis_order = synthesis_attempt_order(&synthesis_models)?;
@@ -1827,6 +1817,7 @@ fn is_cuda_backend<B: Backend>() -> bool {
 }
 
 fn configure_cubecl_autotune<B: Backend>() {
+    #[cfg(not(target_arch = "wasm32"))]
     if is_wgpu_backend::<B>() && std::env::var("CUBECL_AUTOTUNE_LEVEL").is_err() {
         unsafe {
             std::env::set_var("CUBECL_AUTOTUNE_LEVEL", "minimal");
