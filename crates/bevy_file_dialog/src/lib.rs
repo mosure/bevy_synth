@@ -56,8 +56,10 @@
 //! [`FileDialog::pick_multiple_file_paths`] and
 //! [`EventReader<DialogFilePicked<T>>`]
 //!
-//! If you want to be compatible with wasm, do not use any of the `pick_` apis,
-//! they are only for native platforms.
+//! If you want to be compatible with wasm, do not use any of the `pick_` APIs,
+//! they are only for native platforms. Use [`FileDialog::load_file`],
+//! [`FileDialog::load_multiple_files`] and [`FileDialogPlugin::with_drop_file`]
+//! instead.
 
 use std::io;
 use std::marker::PhantomData;
@@ -76,12 +78,14 @@ mod pick;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use pick::*;
+mod drop;
+pub use drop::*;
 
 pub mod prelude {
     //! Prelude containing all types you need for saving/loading files with dialogs.
     pub use crate::{
-        DialogFileLoadCanceled, DialogFileLoaded, DialogFileSaveCanceled, DialogFileSaved,
-        FileDialogExt, FileDialogPlugin,
+        DialogFileDropCanceled, DialogFileDropped, DialogFileLoadCanceled, DialogFileLoaded,
+        DialogFileSaveCanceled, DialogFileSaved, FileDialogExt, FileDialogPlugin,
     };
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -205,6 +209,20 @@ pub struct DialogFileSaved<T: SaveContents> {
     marker: PhantomData<T>,
 }
 
+impl<T: SaveContents> DialogFileSaved<T> {
+    /// Returns the native path when available.
+    pub fn path(&self) -> Option<&Path> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Some(self.path.as_path())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+}
+
 /// Event that gets sent when file contents get loaded from file system.
 #[derive(Message)]
 pub struct DialogFileLoaded<T: LoadContents> {
@@ -221,6 +239,20 @@ pub struct DialogFileLoaded<T: LoadContents> {
     pub path: std::path::PathBuf,
 
     marker: PhantomData<T>,
+}
+
+impl<T: LoadContents> DialogFileLoaded<T> {
+    /// Returns the native path when available.
+    pub fn path(&self) -> Option<&Path> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Some(self.path.as_path())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
 }
 
 /// Event that gets sent when user closes file load dialog without picking any file.

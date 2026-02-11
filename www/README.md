@@ -9,5 +9,6 @@
 - exclude RMBG-2.0 from the bundle (optional):
   - `pwsh ./scripts/bundle_web_assets.ps1 -ExcludeRmbg2`
 - the bundler only copies deployment-needed model files:
-  - only `*.bpk`
-  - all JSON and `*.safetensors` are excluded
+  - `*.bpk` burnpacks for all selected models
+  - runtime JSON configs used by wasm loaders (RMBG + TripoSG + Trellis)
+  - excludes raw `*.safetensors` and `*.bpk.meta.json`

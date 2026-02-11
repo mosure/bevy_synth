@@ -1319,7 +1319,18 @@ impl SparseStructureFlowRuntime {
                 model_stem,
                 resolution_override,
             ) {
-                Ok(runtime) => return Ok(Self::Wgpu(runtime)),
+                Ok(runtime) => {
+                    if sparse_flow_wgpu_may_overflow(runtime.config()) {
+                        eprintln!(
+                            "burn_trellis: sparse flow wgpu disabled for model '{}' due estimated peak tensor bytes (resolution={}, model_channels={}); falling back to cpu.",
+                            model_stem,
+                            runtime.config().resolution,
+                            runtime.config().model_channels
+                        );
+                    } else {
+                        return Ok(Self::Wgpu(runtime));
+                    }
+                }
                 Err(err) => {
                     eprintln!(
                         "burn_trellis: failed to load sparse flow runtime on wgpu ({err}); falling back to cpu."
@@ -1647,16 +1658,47 @@ fn env_flag_enabled(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_max_peak_bytes() -> usize {
+    std::env::var("TRELLIS2_SPARSE_FLOW_WGPU_MAX_PEAK_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3 * 1024 * 1024 * 1024)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_estimated_peak_bytes(config: &SparseStructureFlowConfig) -> usize {
+    let tokens = config
+        .resolution
+        .checked_mul(config.resolution)
+        .and_then(|value| value.checked_mul(config.resolution))
+        .unwrap_or(usize::MAX);
+    let qkv_channels = config.model_channels.saturating_mul(3);
+    let mlp_channels = ((config.model_channels as f32) * config.mlp_ratio.max(1.0))
+        .ceil()
+        .max(config.model_channels as f32) as usize;
+    let peak_channels = qkv_channels.max(mlp_channels);
+    tokens
+        .checked_mul(peak_channels)
+        .and_then(|value| value.checked_mul(core::mem::size_of::<f32>()))
+        .unwrap_or(usize::MAX)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_may_overflow(config: &SparseStructureFlowConfig) -> bool {
+    let estimated = sparse_flow_wgpu_estimated_peak_bytes(config);
+    estimated > sparse_flow_wgpu_max_peak_bytes()
+}
+
 fn attention_debug_enabled() -> bool {
     env_flag_enabled("TRELLIS2_ATTN_DEBUG")
 }
 
-fn attention_prefers_stream<B: Backend>() -> bool {
+fn attention_prefers_stream() -> bool {
     #[cfg(feature = "runtime-model-wgpu")]
     {
-        std::any::type_name::<B>()
-            .to_ascii_lowercase()
-            .contains("wgpu")
+        true
     }
     #[cfg(not(feature = "runtime-model-wgpu"))]
     {
@@ -1680,13 +1722,13 @@ fn matmul_4d_via_3d<B: Backend>(lhs: Tensor<B, 4>, rhs: Tensor<B, 4>) -> Tensor<
         .reshape([batch, heads, m, n])
 }
 
-fn attention_impl<B: Backend>(query_tokens: usize, key_tokens: usize) -> AttentionImpl {
+fn attention_impl(query_tokens: usize, key_tokens: usize) -> AttentionImpl {
     let auto =
         if env_flag_enabled("TRELLIS2_PARITY_STRICT") || env_flag_enabled("TRELLIS2_E2E_STRICT") {
             AttentionImpl::Dense
         } else {
             let work = query_tokens.saturating_mul(key_tokens);
-            if (attention_prefers_stream::<B>() && work >= 64usize.saturating_mul(64))
+            if (attention_prefers_stream() && work >= 64usize.saturating_mul(64))
                 || work >= 512usize.saturating_mul(512)
             {
                 AttentionImpl::Stream
@@ -1721,7 +1763,7 @@ fn scaled_dot_product_attention<B: Backend>(
     let [_, _, query_tokens, _] = q.dims();
     let [_, _, key_tokens, _] = k.dims();
 
-    let attention_impl = attention_impl::<B>(query_tokens, key_tokens);
+    let attention_impl = attention_impl(query_tokens, key_tokens);
     if attention_debug_enabled() && query_tokens >= 4096 {
         let backend_name = std::any::type_name::<B>();
         let impl_name = match attention_impl {
@@ -1749,8 +1791,8 @@ fn scaled_dot_product_attention_dense<B: Backend>(
     let [batch, heads, tokens, _] = q.dims();
     let [_, _, key_tokens, _] = k.dims();
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let query_chunk = attention_query_chunk::<B>(tokens, 8);
-    let logits_budget = attention_logits_budget_bytes::<B>();
+    let query_chunk = attention_query_chunk(tokens, 8);
+    let logits_budget = attention_logits_budget_bytes();
     let dense_logits_bytes = attention_logits_bytes(batch, heads, tokens, key_tokens);
     if attention_debug_enabled() && tokens >= 4096 {
         eprintln!(
@@ -1792,9 +1834,9 @@ fn scaled_dot_product_attention_stream<B: Backend>(
     let [_, _, key_tokens, _] = k.dims();
     let [_, _, _, value_dim] = v.dims();
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let query_chunk = attention_query_chunk::<B>(query_tokens, 64);
-    let key_chunk = attention_key_chunk::<B>(key_tokens);
-    let logits_budget = attention_logits_budget_bytes::<B>();
+    let query_chunk = attention_query_chunk(query_tokens, 64);
+    let key_chunk = attention_key_chunk(key_tokens);
+    let logits_budget = attention_logits_budget_bytes();
     let dense_logits_bytes = attention_logits_bytes(batch, heads, query_tokens, key_tokens);
     if attention_debug_enabled() && query_tokens >= 4096 {
         eprintln!(
@@ -1892,13 +1934,13 @@ fn attention_logits_bytes(
         .saturating_mul(std::mem::size_of::<f32>())
 }
 
-fn attention_logits_budget_bytes<B: Backend>() -> usize {
+fn attention_logits_budget_bytes() -> usize {
     std::env::var("TRELLIS2_ATTN_MAX_LOGITS_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or_else(|| {
-            if attention_prefers_stream::<B>() {
+            if attention_prefers_stream() {
                 512 * 1024 * 1024
             } else {
                 usize::MAX
@@ -1906,7 +1948,7 @@ fn attention_logits_budget_bytes<B: Backend>() -> usize {
         })
 }
 
-fn attention_query_chunk<B: Backend>(tokens: usize, default_chunk: usize) -> usize {
+fn attention_query_chunk(tokens: usize, default_chunk: usize) -> usize {
     let env_chunk = std::env::var("TRELLIS2_ATTN_QUERY_CHUNK")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -1917,7 +1959,7 @@ fn attention_query_chunk<B: Backend>(tokens: usize, default_chunk: usize) -> usi
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or_else(|| {
-            if attention_prefers_stream::<B>() {
+            if attention_prefers_stream() {
                 256
             } else {
                 usize::MAX
@@ -1926,7 +1968,7 @@ fn attention_query_chunk<B: Backend>(tokens: usize, default_chunk: usize) -> usi
     env_chunk.min(max_chunk).min(tokens.max(1))
 }
 
-fn attention_key_chunk<B: Backend>(tokens: usize) -> usize {
+fn attention_key_chunk(tokens: usize) -> usize {
     let env_chunk = std::env::var("TRELLIS2_ATTN_KEY_CHUNK")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -1937,7 +1979,7 @@ fn attention_key_chunk<B: Backend>(tokens: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or_else(|| {
-            if attention_prefers_stream::<B>() {
+            if attention_prefers_stream() {
                 512
             } else {
                 usize::MAX

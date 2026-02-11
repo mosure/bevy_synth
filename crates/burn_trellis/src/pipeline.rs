@@ -1,5 +1,8 @@
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::ValueEnum;
@@ -20,11 +23,12 @@ use crate::staged_pipeline::{
     DecodeStageSource, SamplerConfigOverride, SparseRowNoiseOverride, SparseStructureStageSource,
     TrellisNoiseOverrides, TrellisStageOutput, TrellisStageRuntime,
 };
-use crate::trellis_config::TrellisPipelineConfig;
+use crate::trellis_config::{TrellisPipelineArgs, TrellisPipelineConfig};
 
 const HOOK_MAX_ROWS: usize = usize::MAX;
 const HOOK_MAX_DENSE_ELEMENTS: usize = usize::MAX;
 const HOOK_SAMPLER_SNAPSHOTS: usize = 3;
+const STAGE_RUNTIME_CACHE_MAX: usize = 2;
 
 #[cfg(feature = "runtime-model")]
 fn reset_runtime_transfer_stats() {
@@ -55,6 +59,41 @@ fn hook_max_rows() -> usize {
 
 fn hook_max_dense_elements() -> usize {
     HOOK_MAX_DENSE_ELEMENTS
+}
+
+fn stage_runtime_cache_disabled() -> bool {
+    env_bool("TRELLIS2_DISABLE_STAGE_RUNTIME_CACHE")
+}
+
+fn env_bool(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_bool_default_true(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -106,6 +145,18 @@ pub struct TrellisPipelineTimings {
     pub decode_attr_merge_ms: f64,
     pub decode_mesh_ms: f64,
     pub decode_pbr_ms: f64,
+    pub decode_shape_conv_calls: u64,
+    pub decode_tex_conv_calls: u64,
+    pub decode_shape_wgpu_dispatches: u64,
+    pub decode_tex_wgpu_dispatches: u64,
+    pub decode_shape_wgpu_chunked_calls: u64,
+    pub decode_tex_wgpu_chunked_calls: u64,
+    pub decode_shape_wgpu_input_bytes: u64,
+    pub decode_tex_wgpu_input_bytes: u64,
+    pub decode_shape_wgpu_output_bytes: u64,
+    pub decode_tex_wgpu_output_bytes: u64,
+    pub decode_shape_wgpu_max_chunk_rows: usize,
+    pub decode_tex_wgpu_max_chunk_rows: usize,
     pub hook_capture_ms: f64,
     pub host_readback_count: u64,
     pub host_readback_elements: u64,
@@ -165,6 +216,19 @@ impl std::error::Error for TrellisRuntimeError {}
 
 pub struct Trellis2Pipeline {
     config: Trellis2PipelineConfig,
+    pipeline_args_cache: OnceCell<TrellisPipelineArgs>,
+    stage_runtime_cache: RefCell<HashMap<StageRuntimeCacheKey, Arc<TrellisStageRuntime>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct StageRuntimeCacheKey {
+    preferred_pipeline_type: String,
+    prefer_wgpu: bool,
+    sampler_steps_override: Option<usize>,
+    runtime_model_disabled: bool,
+    runtime_decoders_disabled: bool,
+    runtime_lazy_model_load: bool,
+    slat_dense_resolution: Option<usize>,
 }
 
 impl Trellis2Pipeline {
@@ -185,7 +249,11 @@ impl Trellis2Pipeline {
                 config.weights_root.display()
             )));
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            pipeline_args_cache: OnceCell::new(),
+            stage_runtime_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     pub fn config(&self) -> &Trellis2PipelineConfig {
@@ -330,6 +398,18 @@ impl Trellis2Pipeline {
             decode_attr_merge_ms: stage_timings.decode_attr_merge_ms,
             decode_mesh_ms: stage_timings.decode_mesh_ms,
             decode_pbr_ms: stage_timings.decode_pbr_ms,
+            decode_shape_conv_calls: stage_timings.decode_shape_conv_calls,
+            decode_tex_conv_calls: stage_timings.decode_tex_conv_calls,
+            decode_shape_wgpu_dispatches: stage_timings.decode_shape_wgpu_dispatches,
+            decode_tex_wgpu_dispatches: stage_timings.decode_tex_wgpu_dispatches,
+            decode_shape_wgpu_chunked_calls: stage_timings.decode_shape_wgpu_chunked_calls,
+            decode_tex_wgpu_chunked_calls: stage_timings.decode_tex_wgpu_chunked_calls,
+            decode_shape_wgpu_input_bytes: stage_timings.decode_shape_wgpu_input_bytes,
+            decode_tex_wgpu_input_bytes: stage_timings.decode_tex_wgpu_input_bytes,
+            decode_shape_wgpu_output_bytes: stage_timings.decode_shape_wgpu_output_bytes,
+            decode_tex_wgpu_output_bytes: stage_timings.decode_tex_wgpu_output_bytes,
+            decode_shape_wgpu_max_chunk_rows: stage_timings.decode_shape_wgpu_max_chunk_rows,
+            decode_tex_wgpu_max_chunk_rows: stage_timings.decode_tex_wgpu_max_chunk_rows,
             hook_capture_ms,
             host_readback_count,
             host_readback_elements,
@@ -395,7 +475,41 @@ impl Trellis2Pipeline {
     fn load_stage_runtime(
         &self,
         options: &TrellisRunOptions,
-    ) -> Result<TrellisStageRuntime, TrellisRuntimeError> {
+    ) -> Result<Arc<TrellisStageRuntime>, TrellisRuntimeError> {
+        let cache_key = self.stage_runtime_cache_key(options);
+        if !stage_runtime_cache_disabled()
+            && let Some(hit) = self.stage_runtime_cache.borrow().get(&cache_key)
+        {
+            return Ok(hit.clone());
+        }
+
+        let preferred_pipeline_type = options.quality.settings().pipeline_type;
+        let prefer_wgpu = cache_key.prefer_wgpu;
+        #[allow(clippy::arc_with_non_send_sync)]
+        let runtime = Arc::new(TrellisStageRuntime::from_args_with_assets(
+            self.pipeline_args()?,
+            Some(preferred_pipeline_type),
+            Some(self.config.weights_root.as_path()),
+            self.config.image_large_root.as_deref(),
+            prefer_wgpu,
+        ));
+
+        if !stage_runtime_cache_disabled() {
+            let mut cache = self.stage_runtime_cache.borrow_mut();
+            if cache.len() >= STAGE_RUNTIME_CACHE_MAX
+                && let Some(key) = cache.keys().next().cloned()
+            {
+                cache.remove(&key);
+            }
+            cache.insert(cache_key, runtime.clone());
+        }
+        Ok(runtime)
+    }
+
+    fn pipeline_args(&self) -> Result<&TrellisPipelineArgs, TrellisRuntimeError> {
+        if let Some(args) = self.pipeline_args_cache.get() {
+            return Ok(args);
+        }
         let pipeline_path = self.config.weights_root.join("pipeline.json");
         let pipeline_bytes = std::fs::read(&pipeline_path).map_err(|err| {
             TrellisRuntimeError::new(format!(
@@ -409,15 +523,22 @@ impl Trellis2Pipeline {
                 pipeline_path.display()
             ))
         })?;
-        let preferred_pipeline_type = options.quality.settings().pipeline_type;
-        let prefer_wgpu = !matches!(options.device, TrellisDevice::Cpu);
-        Ok(TrellisStageRuntime::from_args_with_assets(
-            &pipeline.args,
-            Some(preferred_pipeline_type),
-            Some(self.config.weights_root.as_path()),
-            self.config.image_large_root.as_deref(),
-            prefer_wgpu,
-        ))
+        let _ = self.pipeline_args_cache.set(pipeline.args);
+        self.pipeline_args_cache
+            .get()
+            .ok_or_else(|| TrellisRuntimeError::new("failed to cache Trellis2 pipeline args"))
+    }
+
+    fn stage_runtime_cache_key(&self, options: &TrellisRunOptions) -> StageRuntimeCacheKey {
+        StageRuntimeCacheKey {
+            preferred_pipeline_type: options.quality.settings().pipeline_type.to_string(),
+            prefer_wgpu: !matches!(options.device, TrellisDevice::Cpu),
+            sampler_steps_override: env_usize("TRELLIS2_SAMPLER_STEPS_OVERRIDE"),
+            runtime_model_disabled: env_bool("TRELLIS2_DISABLE_RUNTIME_MODEL"),
+            runtime_decoders_disabled: env_bool("TRELLIS2_DISABLE_RUNTIME_DECODERS"),
+            runtime_lazy_model_load: env_bool_default_true("TRELLIS2_RUNTIME_LAZY_MODEL_LOAD"),
+            slat_dense_resolution: env_usize("TRELLIS2_SLAT_DENSE_RESOLUTION"),
+        }
     }
 
     fn load_noise_overrides(

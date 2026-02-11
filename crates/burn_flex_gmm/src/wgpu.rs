@@ -44,6 +44,13 @@ enum NeighborDeviceAlgo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NeighborHashBuildMode {
+    Auto,
+    Host,
+    Wgsl,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SparseConvKernelVariant {
     Baseline,
     FusedOc4,
@@ -51,14 +58,9 @@ enum SparseConvKernelVariant {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct NeighborConfigCacheKey {
-    in_channels: usize,
-    out_channels: usize,
     kernel_d: usize,
     kernel_h: usize,
     kernel_w: usize,
-    in_channels_per_group: usize,
-    out_channels_per_group: usize,
-    groups: usize,
     axis_order: [usize; 3],
     axis_sign: [i32; 3],
 }
@@ -66,14 +68,9 @@ struct NeighborConfigCacheKey {
 impl From<&SparseSubmConvConfig> for NeighborConfigCacheKey {
     fn from(config: &SparseSubmConvConfig) -> Self {
         Self {
-            in_channels: config.in_channels,
-            out_channels: config.out_channels,
             kernel_d: config.kernel_d,
             kernel_h: config.kernel_h,
             kernel_w: config.kernel_w,
-            in_channels_per_group: config.in_channels_per_group,
-            out_channels_per_group: config.out_channels_per_group,
-            groups: config.groups,
             axis_order: config.axis_order,
             axis_sign: config.axis_sign,
         }
@@ -411,6 +408,71 @@ fn spatial_hash_u32(batch: i32, x: i32, y: i32, z: i32) -> u32 {
 }
 
 #[cube(launch_unchecked)]
+fn neighbor_hash_reset_kernel(table_rows: &mut Array<i32>, fill: &i32) {
+    if ABSOLUTE_POS >= table_rows.len() {
+        terminate!();
+    }
+    table_rows[ABSOLUTE_POS] = *fill;
+}
+
+#[cube(launch_unchecked)]
+fn neighbor_hash_build_serial_kernel(
+    coords: &Array<i32>,
+    table_rows: &mut Array<i32>,
+    table_coords: &mut Array<i32>,
+    overflow_flag: &mut Array<i32>,
+    rows: &u32,
+    table_mask: &u32,
+    max_probe: &u32,
+) {
+    if ABSOLUTE_POS != 0 {
+        terminate!();
+    }
+
+    for row in 0..*rows {
+        let coord_base = row * 4;
+        let batch = coords[coord_base];
+        let x = coords[coord_base + 1];
+        let y = coords[coord_base + 2];
+        let z = coords[coord_base + 3];
+        let hash = spatial_hash_u32(batch, x, y, z);
+        let row_i32 = i32::cast_from(row);
+        let inserted = RuntimeCell::<i32>::new(0);
+
+        for probe in 0..*max_probe {
+            if inserted.read() == 0 {
+                let slot = (hash + probe) & *table_mask;
+                let slot_row = table_rows[slot];
+                if slot_row == HASH_SLOT_EMPTY {
+                    table_rows[slot] = row_i32;
+                    let dst = slot * 4;
+                    table_coords[dst] = batch;
+                    table_coords[dst + 1] = x;
+                    table_coords[dst + 2] = y;
+                    table_coords[dst + 3] = z;
+                    inserted.store(1);
+                } else {
+                    let dst = slot * 4;
+                    let same = table_coords[dst] == batch
+                        && table_coords[dst + 1] == x
+                        && table_coords[dst + 2] == y
+                        && table_coords[dst + 3] == z;
+                    if same {
+                        if row_i32 < slot_row {
+                            table_rows[slot] = row_i32;
+                        }
+                        inserted.store(1);
+                    }
+                }
+            }
+        }
+        if inserted.read() == 0 {
+            overflow_flag[0] = 1;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
 fn neighbor_hash_query_kernel(
     coords: &Array<i32>,
     offsets: &Array<i32>,
@@ -574,10 +636,24 @@ fn resolve_neighbor_backend(rows: usize, kernel_rows: usize) -> NeighborBuildBac
     }
 
     let work = rows.saturating_mul(kernel_rows);
-    if work <= 65_536 {
-        NeighborBuildBackend::Device
-    } else {
-        NeighborBuildBackend::Host
+    match resolve_neighbor_hash_build_mode() {
+        NeighborHashBuildMode::Host => {
+            if work > 131_072 {
+                NeighborBuildBackend::Host
+            } else {
+                NeighborBuildBackend::Device
+            }
+        }
+        NeighborHashBuildMode::Wgsl => NeighborBuildBackend::Device,
+        NeighborHashBuildMode::Auto => {
+            // For large workloads, keep the robust host build path by default.
+            // WGSL hash build remains available via explicit env override.
+            if work > 131_072 {
+                NeighborBuildBackend::Host
+            } else {
+                NeighborBuildBackend::Device
+            }
+        }
     }
 }
 
@@ -599,6 +675,18 @@ fn resolve_neighbor_device_algo(rows: usize, kernel_rows: usize) -> NeighborDevi
     }
 }
 
+fn resolve_neighbor_hash_build_mode() -> NeighborHashBuildMode {
+    if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "host" | "cpu" => return NeighborHashBuildMode::Host,
+            "wgsl" | "device" | "gpu" => return NeighborHashBuildMode::Wgsl,
+            "auto" => return NeighborHashBuildMode::Auto,
+            _ => {}
+        }
+    }
+    NeighborHashBuildMode::Auto
+}
+
 fn resolve_neighbor_hash_load_factor() -> usize {
     std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_LOAD_FACTOR")
         .ok()
@@ -615,6 +703,17 @@ fn resolve_neighbor_hash_table_size(rows: usize) -> usize {
     let min_capacity = rows.saturating_mul(load_factor);
     let capacity = min_capacity.next_power_of_two();
     capacity.max(64)
+}
+
+fn resolve_neighbor_hash_max_probe(table_size: usize) -> usize {
+    // Large default probe windows can cause pathological WGSL loop cost and buffer invalidation.
+    // Keep a conservative cap by default; callers can raise/lower with env override.
+    let limit = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_MAX_PROBE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128);
+    limit.min(table_size).max(1)
 }
 
 fn neighbor_cache_max_entries() -> usize {
@@ -852,7 +951,7 @@ fn build_neighbor_rows_tensor_device_scan(
     Ok(BurnTensor::from_primitive(output))
 }
 
-fn build_neighbor_rows_tensor_device_hash(
+fn build_neighbor_rows_tensor_device_hash_host_table(
     config: &SparseSubmConvConfig,
     coords: &[[u32; 4]],
     device: &burn_wgpu::WgpuDevice,
@@ -873,9 +972,6 @@ fn build_neighbor_rows_tensor_device_hash(
     let table_coords_elements = table_size
         .checked_mul(4)
         .ok_or_else(|| "neighbor hash coordinate table size overflow".to_string())?;
-    // TODO(#2 wgsl-hash-build): replace this host-side hash-table build with a direct WGSL
-    // compute pass that writes `table_rows/table_coords` on-device behind an experimental flag
-    // (e.g. `BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD=wgsl`), then keep this as fallback.
     let (table_rows_host, table_coords_host) =
         build_coord_hash_table_host(coords_flat.as_slice(), rows, table_size)?;
     let coords_t = BurnTensor::<DefaultWgpuBackend, 1, Int>::from_data(
@@ -915,13 +1011,11 @@ fn build_neighbor_rows_tensor_device_hash(
 
     let table_mask = u32::try_from(table_size - 1)
         .map_err(|_| "neighbor hash table mask exceeds u32::MAX".to_string())?;
-    let max_probe = u32::try_from(table_size)
+    let max_probe = u32::try_from(resolve_neighbor_hash_max_probe(table_size))
         .map_err(|_| "neighbor hash max probe exceeds u32::MAX".to_string())?;
     let cube_dim = resolve_cube_dim();
     let query_count = calculate_cube_count_elemwise(output_elements, cube_dim);
     unsafe {
-        // TODO(#2 wgsl-hash-build): once a direct WGSL hash-build pass exists, keep this query
-        // kernel launch but feed it the device-produced hash buffers to avoid host staging.
         neighbor_hash_query_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
             &coords_p.client,
             query_count,
@@ -940,6 +1034,186 @@ fn build_neighbor_rows_tensor_device_hash(
     let neighbor_rows_1d: BurnTensor<DefaultWgpuBackend, 1, Int> =
         BurnTensor::from_primitive(output);
     Ok(neighbor_rows_1d.reshape([rows, kernel_rows]))
+}
+
+fn build_neighbor_rows_tensor_device_hash_wgsl_table(
+    config: &SparseSubmConvConfig,
+    coords: &[[u32; 4]],
+    device: &burn_wgpu::WgpuDevice,
+) -> Result<BurnTensor<DefaultWgpuBackend, 2, Int>, String> {
+    let rows = coords.len();
+    let kernel_rows = kernel_rows(config)?;
+    let coords_flat = flatten_coords_i32(coords)?;
+    let offsets = kernel_offsets(config);
+    let mut offsets_flat = Vec::with_capacity(offsets.len() * 3);
+    for offset in offsets {
+        offsets_flat.extend_from_slice(offset.as_slice());
+    }
+
+    let table_size = resolve_neighbor_hash_table_size(rows);
+    if table_size > i32::MAX as usize {
+        return Err("neighbor hash table size exceeds i32::MAX entries".to_string());
+    }
+    let table_coords_elements = table_size
+        .checked_mul(4)
+        .ok_or_else(|| "neighbor hash coordinate table size overflow".to_string())?;
+    let output_elements = rows
+        .checked_mul(kernel_rows)
+        .ok_or_else(|| "neighbor row output size overflow".to_string())?;
+    let output_row_bytes = output_elements
+        .checked_mul(core::mem::size_of::<i32>())
+        .ok_or_else(|| "neighbor row output byte size overflow".to_string())?;
+    let table_rows_bytes = table_size
+        .checked_mul(core::mem::size_of::<i32>())
+        .ok_or_else(|| "neighbor hash row table byte size overflow".to_string())?;
+    let table_coords_bytes = table_coords_elements
+        .checked_mul(core::mem::size_of::<i32>())
+        .ok_or_else(|| "neighbor hash coord table byte size overflow".to_string())?;
+
+    let coords_t = BurnTensor::<DefaultWgpuBackend, 1, Int>::from_data(
+        TensorData::new(coords_flat, [rows * 4]),
+        device,
+    );
+    let offsets_t = BurnTensor::<DefaultWgpuBackend, 1, Int>::from_data(
+        TensorData::new(offsets_flat, [kernel_rows * 3]),
+        device,
+    );
+    let coords_p = coords_t.into_primitive();
+    let offsets_p = offsets_t.into_primitive();
+    let table_rows = CubeTensor::new_contiguous(
+        coords_p.client.clone(),
+        coords_p.device.clone(),
+        Shape::new([table_size]),
+        coords_p.client.empty(table_rows_bytes),
+        DType::I32,
+    );
+    let table_coords = CubeTensor::new_contiguous(
+        coords_p.client.clone(),
+        coords_p.device.clone(),
+        Shape::new([table_coords_elements]),
+        coords_p.client.empty(table_coords_bytes),
+        DType::I32,
+    );
+    let output = CubeTensor::new_contiguous(
+        coords_p.client.clone(),
+        coords_p.device.clone(),
+        Shape::new([output_elements]),
+        coords_p.client.empty(output_row_bytes),
+        DType::I32,
+    );
+    let overflow_flag = BurnTensor::<DefaultWgpuBackend, 1, Int>::from_data(
+        TensorData::new(vec![0i32], [1]),
+        device,
+    );
+    let overflow_p = overflow_flag.into_primitive();
+
+    let table_mask = u32::try_from(table_size - 1)
+        .map_err(|_| "neighbor hash table mask exceeds u32::MAX".to_string())?;
+    let max_probe = u32::try_from(resolve_neighbor_hash_max_probe(table_size))
+        .map_err(|_| "neighbor hash max probe exceeds u32::MAX".to_string())?;
+    let rows_u32 =
+        u32::try_from(rows).map_err(|_| "neighbor row count exceeds u32::MAX".to_string())?;
+
+    let cube_dim = resolve_cube_dim();
+    let reset_count = calculate_cube_count_elemwise(table_size, cube_dim);
+    unsafe {
+        neighbor_hash_reset_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
+            &coords_p.client,
+            reset_count,
+            cube_dim,
+            table_rows.as_array_arg::<i32>(1),
+            ScalarArg::new(HASH_SLOT_EMPTY),
+        );
+    }
+
+    let build_count = calculate_cube_count_elemwise(1, cube_dim);
+    unsafe {
+        // TODO(#2 wgsl-hash-build): replace serial device hash insertion with a
+        // parallel subgroup-friendly hash build once adapter-safe atomics are available.
+        neighbor_hash_build_serial_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
+            &coords_p.client,
+            build_count,
+            cube_dim,
+            coords_p.as_array_arg::<i32>(1),
+            table_rows.as_array_arg::<i32>(1),
+            table_coords.as_array_arg::<i32>(1),
+            overflow_p.as_array_arg::<i32>(1),
+            ScalarArg::new(rows_u32),
+            ScalarArg::new(table_mask),
+            ScalarArg::new(max_probe),
+        );
+    }
+    let overflow_value = BurnTensor::<DefaultWgpuBackend, 1, Int>::from_primitive(overflow_p)
+        .into_data()
+        .convert::<i32>()
+        .to_vec::<i32>()
+        .map_err(|err| format!("failed to read neighbor hash overflow flag: {err:?}"))?
+        .into_iter()
+        .next()
+        .unwrap_or(1);
+    if overflow_value != 0 {
+        return Err(format!(
+            "neighbor hash serial build exceeded max_probe={max_probe} for rows={rows} table_size={table_size}"
+        ));
+    }
+
+    let query_count = calculate_cube_count_elemwise(output_elements, cube_dim);
+    unsafe {
+        neighbor_hash_query_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
+            &coords_p.client,
+            query_count,
+            cube_dim,
+            coords_p.as_array_arg::<i32>(1),
+            offsets_p.as_array_arg::<i32>(1),
+            table_rows.as_array_arg::<i32>(1),
+            table_coords.as_array_arg::<i32>(1),
+            output.as_array_arg::<i32>(1),
+            ScalarArg::new(kernel_rows as u32),
+            ScalarArg::new(table_mask),
+            ScalarArg::new(max_probe),
+        );
+    }
+
+    let neighbor_rows_1d: BurnTensor<DefaultWgpuBackend, 1, Int> =
+        BurnTensor::from_primitive(output);
+    Ok(neighbor_rows_1d.reshape([rows, kernel_rows]))
+}
+
+fn build_neighbor_rows_tensor_device_hash(
+    config: &SparseSubmConvConfig,
+    coords: &[[u32; 4]],
+    device: &burn_wgpu::WgpuDevice,
+) -> Result<BurnTensor<DefaultWgpuBackend, 2, Int>, String> {
+    let rows = coords.len();
+    let table_size = resolve_neighbor_hash_table_size(rows);
+    match resolve_neighbor_hash_build_mode() {
+        NeighborHashBuildMode::Host => {
+            build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
+        }
+        NeighborHashBuildMode::Wgsl => {
+            build_neighbor_rows_tensor_device_hash_wgsl_table(config, coords, device)
+        }
+        NeighborHashBuildMode::Auto => {
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_neighbor_rows_tensor_device_hash_wgsl_table(config, coords, device)
+            }));
+            match attempt {
+                Ok(Ok(tensor)) => Ok(tensor),
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "burn_flex_gmm: device hash-table build failed for rows={rows}, table_size={table_size}; falling back to host table build: {err}"
+                    );
+                    build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
+                }
+                Err(_) => {
+                    eprintln!(
+                        "burn_flex_gmm: device hash-table build panicked for rows={rows}, table_size={table_size}; falling back to host table build"
+                    );
+                    build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
+                }
+            }
+        }
+    }
 }
 
 fn build_neighbor_rows_tensor_device(
@@ -1439,6 +1713,65 @@ mod tests {
             .expect("second neighbor tensor")
             .to_data();
 
+        let first = first.as_slice::<i32>().expect("i32").to_vec();
+        let second = second.as_slice::<i32>().expect("i32").to_vec();
+        assert_eq!(first, second);
+
+        let stats = neighbor_rows_build_stats();
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.host_builds, 1);
+        assert_eq!(stats.device_builds, 0);
+
+        clear_neighbor_rows_tensor_cache();
+        reset_neighbor_rows_build_stats();
+        unsafe {
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND");
+        }
+    }
+
+    #[test]
+    fn neighbor_rows_cache_reuses_across_channel_variants_with_same_topology() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "host");
+        }
+        clear_neighbor_rows_tensor_cache();
+        reset_neighbor_rows_build_stats();
+
+        let cfg_a = SparseSubmConvConfig {
+            in_channels: 4,
+            out_channels: 8,
+            kernel_d: 3,
+            kernel_h: 3,
+            kernel_w: 1,
+            in_channels_per_group: 4,
+            out_channels_per_group: 8,
+            groups: 1,
+            axis_order: [0, 1, 2],
+            axis_sign: [1, 1, 1],
+        };
+        let cfg_b = SparseSubmConvConfig {
+            in_channels: 16,
+            out_channels: 16,
+            kernel_d: 3,
+            kernel_h: 3,
+            kernel_w: 1,
+            in_channels_per_group: 8,
+            out_channels_per_group: 8,
+            groups: 2,
+            axis_order: [0, 1, 2],
+            axis_sign: [1, 1, 1],
+        };
+        let coords = line_coords(96);
+        let device = burn_wgpu::WgpuDevice::default();
+
+        let first = neighbor_rows_tensor_from_coords(&cfg_a, coords.as_slice(), &device)
+            .expect("first neighbor tensor")
+            .to_data();
+        let second = neighbor_rows_tensor_from_coords(&cfg_b, coords.as_slice(), &device)
+            .expect("second neighbor tensor")
+            .to_data();
         let first = first.as_slice::<i32>().expect("i32").to_vec();
         let second = second.as_slice::<i32>().expect("i32").to_vec();
         assert_eq!(first, second);

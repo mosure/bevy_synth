@@ -381,7 +381,7 @@ fn convert_safetensors_blob_to_f16(source_bytes: &[u8]) -> Result<Vec<u8>, Strin
 }
 
 fn f32_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(format!(
             "invalid f32 tensor payload byte length {}; must be divisible by 4",
             bytes.len()
@@ -396,7 +396,7 @@ fn f32_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn f64_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(format!(
             "invalid f64 tensor payload byte length {}; must be divisible by 8",
             bytes.len()
@@ -413,7 +413,7 @@ fn f64_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn bf16_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(format!(
             "invalid bf16 tensor payload byte length {}; must be divisible by 2",
             bytes.len()

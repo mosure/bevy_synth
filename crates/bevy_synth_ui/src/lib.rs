@@ -6,13 +6,11 @@ use bevy::prelude::*;
 use bevy::render::alpha::AlphaMode;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::window::PrimaryWindow;
+use bevy_file_dialog::prelude::FileDialogExt;
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
 
 use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest};
-
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_file_dialog::prelude::FileDialogExt;
 
 const PANEL_WIDTH: f32 = 336.0;
 const MENU_HEIGHT: f32 = 44.0;
@@ -61,7 +59,6 @@ const STATUS_PROCESSING: Color = Color::srgb(0.93, 0.66, 0.2);
 #[derive(Component)]
 pub struct MainCamera;
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 pub struct ImagePickDialog;
 
@@ -110,7 +107,6 @@ impl Plugin for BurnSynthUiPlugin {
                 ),
             );
 
-        #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, handle_open_button);
     }
 }
@@ -380,7 +376,6 @@ struct PageLabel;
 #[derive(Component)]
 struct CatalogDeleteButton;
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 struct OpenImageButton;
 
@@ -453,7 +448,6 @@ fn setup_ui(mut commands: Commands) {
                         TextColor(Color::srgb(0.92, 0.94, 0.98)),
                     ));
 
-                    #[cfg(not(target_arch = "wasm32"))]
                     left.spawn((
                         Button,
                         OpenImageButton,
@@ -1464,7 +1458,6 @@ fn spin_thumbnails(time: Res<Time>, mut query: Query<&mut Transform, With<Thumbn
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn handle_open_button(
     mut interactions: Query<&Interaction, (Changed<Interaction>, With<OpenImageButton>)>,
     mut commands: Commands,
@@ -1480,7 +1473,7 @@ fn handle_open_button(
                         "png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "tif", "tiff",
                     ],
                 )
-                .pick_multiple_file_paths::<ImagePickDialog>();
+                .load_multiple_files::<ImagePickDialog>();
         }
     }
 }

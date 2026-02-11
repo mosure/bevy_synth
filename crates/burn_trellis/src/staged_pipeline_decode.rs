@@ -259,6 +259,7 @@ pub(super) fn runtime_pbr_texture_size() -> usize {
 }
 
 #[allow(clippy::type_complexity)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn bake_pbr_from_voxels(
     vertices: &[[f32; 3]],
     faces: &[[u32; 3]],
@@ -266,23 +267,51 @@ pub(super) fn bake_pbr_from_voxels(
     voxel_attrs: &[[f32; 6]],
     fallback_spatial_resolution: u32,
 ) -> (Vec<[f32; 2]>, Option<MeshPbrTextures>, PbrBakeDebug) {
+    let (uvs, textures, debug) = bake_pbr_from_voxels_with_options(
+        vertices,
+        faces,
+        voxel_coords,
+        voxel_attrs,
+        fallback_spatial_resolution,
+        true,
+    );
+    (uvs, textures, debug.unwrap_or_else(empty_pbr_bake_debug))
+}
+
+fn empty_pbr_bake_debug() -> PbrBakeDebug {
+    PbrBakeDebug {
+        texture_width: 0,
+        texture_height: 0,
+        uvs: Vec::new(),
+        raster_mask: Vec::new(),
+        sample_positions: Vec::new(),
+        sample_attrs: Vec::new(),
+        base_color_float: Vec::new(),
+        metallic_float: Vec::new(),
+        roughness_float: Vec::new(),
+        alpha_float: Vec::new(),
+        base_color_rgba_u8: Vec::new(),
+        metallic_roughness_u8: Vec::new(),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub(super) fn bake_pbr_from_voxels_with_options(
+    vertices: &[[f32; 3]],
+    faces: &[[u32; 3]],
+    voxel_coords: &[[u32; 4]],
+    voxel_attrs: &[[f32; 6]],
+    fallback_spatial_resolution: u32,
+    capture_debug: bool,
+) -> (Vec<[f32; 2]>, Option<MeshPbrTextures>, Option<PbrBakeDebug>) {
     if vertices.is_empty() || faces.is_empty() {
         return (
             Vec::new(),
             None,
-            PbrBakeDebug {
-                texture_width: 0,
-                texture_height: 0,
-                uvs: Vec::new(),
-                raster_mask: Vec::new(),
-                sample_positions: Vec::new(),
-                sample_attrs: Vec::new(),
-                base_color_float: Vec::new(),
-                metallic_float: Vec::new(),
-                roughness_float: Vec::new(),
-                alpha_float: Vec::new(),
-                base_color_rgba_u8: Vec::new(),
-                metallic_roughness_u8: Vec::new(),
+            if capture_debug {
+                Some(empty_pbr_bake_debug())
+            } else {
+                None
             },
         );
     }
@@ -295,8 +324,16 @@ pub(super) fn bake_pbr_from_voxels(
     let mut metallic_float = vec![0.0f32; texel_count];
     let mut roughness_float = vec![1.0f32; texel_count];
     let mut alpha_float = vec![1.0f32; texel_count];
-    let mut sample_positions = Vec::with_capacity(texel_count / 2);
-    let mut sample_attrs = Vec::with_capacity(texel_count / 2);
+    let mut sample_positions = if capture_debug {
+        Vec::with_capacity(texel_count / 2)
+    } else {
+        Vec::new()
+    };
+    let mut sample_attrs = if capture_debug {
+        Vec::with_capacity(texel_count / 2)
+    } else {
+        Vec::new()
+    };
 
     let mut voxel_map = HashMap::with_capacity(voxel_coords.len().saturating_mul(2));
     let mut spatial = [
@@ -339,6 +376,11 @@ pub(super) fn bake_pbr_from_voxels(
         let uv1 = uv_domain.raster_uvs[i1];
         let uv2 = uv_domain.raster_uvs[i2];
         rasterize_triangle(texture_size, [uv0, uv1, uv2], |x, y, bary| {
+            let idx = y * texture_size + x;
+            if !capture_debug && raster_mask[idx] != 0 {
+                return;
+            }
+
             let position = [
                 p0[0] * bary[0] + p1[0] * bary[1] + p2[0] * bary[2],
                 p0[1] * bary[0] + p1[1] * bary[1] + p2[1] * bary[2],
@@ -346,7 +388,6 @@ pub(super) fn bake_pbr_from_voxels(
             ];
             let attrs =
                 sample_voxel_attr(position, &voxel_map, fallback_attr, spatial, voxel_coords);
-            let idx = y * texture_size + x;
             if raster_mask[idx] == 0 {
                 base_color_float[idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
                 metallic_float[idx] = attrs[3];
@@ -354,8 +395,10 @@ pub(super) fn bake_pbr_from_voxels(
                 alpha_float[idx] = attrs[5];
                 raster_mask[idx] = 255;
             }
-            sample_positions.push(position);
-            sample_attrs.push(attrs);
+            if capture_debug {
+                sample_positions.push(position);
+                sample_attrs.push(attrs);
+            }
         });
     }
 
@@ -384,29 +427,42 @@ pub(super) fn bake_pbr_from_voxels(
         metallic_roughness_u8[off + 3] = 255;
     }
 
+    let debug_base_color_rgba = if capture_debug {
+        base_color_rgba_u8.clone()
+    } else {
+        Vec::new()
+    };
+    let debug_metallic_roughness = if capture_debug {
+        metallic_roughness_u8.clone()
+    } else {
+        Vec::new()
+    };
+    let debug_uvs = if capture_debug {
+        uv_domain.output_uvs.clone()
+    } else {
+        Vec::new()
+    };
     let pbr_textures = MeshPbrTextures {
         base_color: MeshTexture {
             width: texture_size as u32,
             height: texture_size as u32,
-            rgba8: base_color_rgba_u8.clone(),
+            rgba8: base_color_rgba_u8,
         },
         metallic_roughness: MeshTexture {
             width: texture_size as u32,
             height: texture_size as u32,
-            rgba8: metallic_roughness_u8.clone(),
+            rgba8: metallic_roughness_u8,
         },
         normal: None,
         emissive: None,
         occlusion: None,
     };
 
-    (
-        uv_domain.output_uvs.clone(),
-        Some(pbr_textures),
-        PbrBakeDebug {
+    let debug = if capture_debug {
+        Some(PbrBakeDebug {
             texture_width: texture_size,
             texture_height: texture_size,
-            uvs: uv_domain.output_uvs,
+            uvs: debug_uvs,
             raster_mask,
             sample_positions,
             sample_attrs,
@@ -414,10 +470,14 @@ pub(super) fn bake_pbr_from_voxels(
             metallic_float,
             roughness_float,
             alpha_float,
-            base_color_rgba_u8,
-            metallic_roughness_u8,
-        },
-    )
+            base_color_rgba_u8: debug_base_color_rgba,
+            metallic_roughness_u8: debug_metallic_roughness,
+        })
+    } else {
+        None
+    };
+
+    (uv_domain.output_uvs, Some(pbr_textures), debug)
 }
 
 fn build_uv_raster_domain(

@@ -47,6 +47,7 @@ pub struct InferenceQueue {
 pub struct InferenceRequest {
     pub id: u32,
     pub image_path: PathBuf,
+    pub image_contents: Option<Vec<u8>>,
     pub output_path: Option<PathBuf>,
 }
 

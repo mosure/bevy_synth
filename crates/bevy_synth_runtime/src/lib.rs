@@ -4,6 +4,7 @@ pub mod args;
 pub mod cache;
 pub mod io;
 pub mod mesh;
+pub mod model_loader;
 pub mod paths;
 pub mod state;
 pub mod worker;

@@ -35,17 +35,23 @@ jobs:
           # Build-time-only vars embedded into wasm via option_env!.
           # Example S3 base: https://example-bucket.s3.amazonaws.com/burn_synth/assets
           BURN_SYNTH_WEB_ASSET_ROOT: ${{ vars.BURN_SYNTH_WEB_ASSET_ROOT || secrets.BURN_SYNTH_WEB_ASSET_ROOT }}
+          # Optional burnpack safety cap (bytes) for browser downloads; leave empty to use default (1 GiB).
+          BURN_SYNTH_WEB_MAX_BPK_BYTES: ${{ vars.BURN_SYNTH_WEB_MAX_BPK_BYTES || secrets.BURN_SYNTH_WEB_MAX_BPK_BYTES }}
           # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/MIDI-3D
+          # Supports plain .bpk and shard manifests (*.bpk.shards.json + *.bpk.shard-*).
           TRIPOSG_WEIGHTS_ROOT: ${{ vars.TRIPOSG_WEIGHTS_ROOT || secrets.TRIPOSG_WEIGHTS_ROOT }}
           # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TripoSG-scribble
           TRIPOSG_SCRIBBLE_WEIGHTS_ROOT: ${{ vars.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT || secrets.TRIPOSG_SCRIBBLE_WEIGHTS_ROOT }}
           # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/RMBG-1.4
+          # Supports plain .bpk and shard manifests (*.bpk.shards.json + *.bpk.shard-*).
           RMBG14_WEIGHTS_ROOT: ${{ vars.RMBG14_WEIGHTS_ROOT || secrets.RMBG14_WEIGHTS_ROOT || vars.RMBG_WEIGHTS_ROOT || secrets.RMBG_WEIGHTS_ROOT }}
           # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/RMBG-2.0
+          # Supports plain .bpk and shard manifests (*.bpk.shards.json + *.bpk.shard-*).
           RMBG2_WEIGHTS_ROOT: ${{ vars.RMBG2_WEIGHTS_ROOT || secrets.RMBG2_WEIGHTS_ROOT }}
           # Shared fallback used by older paths; keep pointed at RMBG-1.4 unless intentionally shared.
           RMBG_WEIGHTS_ROOT: ${{ vars.RMBG_WEIGHTS_ROOT || secrets.RMBG_WEIGHTS_ROOT }}
           # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TRELLIS.2-4B
+          # Supports plain .bpk and shard manifests (*.bpk.shards.json + *.bpk.shard-*).
           TRELLIS2_WEIGHTS_ROOT: ${{ vars.TRELLIS2_WEIGHTS_ROOT || secrets.TRELLIS2_WEIGHTS_ROOT }}
           # Example S3 path: https://example-bucket.s3.amazonaws.com/burn_synth/assets/models/TRELLIS-image-large
           TRELLIS2_IMAGE_LARGE_ROOT: ${{ vars.TRELLIS2_IMAGE_LARGE_ROOT || secrets.TRELLIS2_IMAGE_LARGE_ROOT }}

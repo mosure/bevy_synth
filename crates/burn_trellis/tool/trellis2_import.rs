@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use burn_synth_import::plan::ArtifactPolicy;
+use burn_synth_import::shard::apply_artifact_policy;
 use burn_trellis::import::{QuantizationMode, TrellisImportOptions, import_trellis2_assets};
 use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use clap::{Parser, ValueEnum};
@@ -19,6 +21,24 @@ impl From<Quantization> for QuantizationMode {
             Quantization::F32 => Self::F32,
             Quantization::F16 => Self::F16,
             Quantization::Both => Self::Both,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ArtifactPolicyArg {
+    SingleFile,
+    Sharded,
+    Both,
+}
+
+impl ArtifactPolicyArg {
+    fn into_policy(self, shard_size_mib: u64) -> ArtifactPolicy {
+        let shard_size_mib = shard_size_mib.max(1);
+        match self {
+            Self::SingleFile => ArtifactPolicy::SingleFile,
+            Self::Sharded => ArtifactPolicy::Sharded { shard_size_mib },
+            Self::Both => ArtifactPolicy::Both { shard_size_mib },
         }
     }
 }
@@ -43,6 +63,12 @@ struct Args {
 
     #[arg(long)]
     overwrite: bool,
+
+    #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::SingleFile)]
+    artifact_policy: ArtifactPolicyArg,
+
+    #[arg(long, default_value_t = 64)]
+    shard_size_mib: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,6 +89,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         quantization: args.quantization.into(),
         overwrite: args.overwrite,
     })?;
+    let artifact_policy = args.artifact_policy.into_policy(args.shard_size_mib);
+    let mut shard_manifest_count = 0usize;
+    let mut shard_count = 0usize;
+    if artifact_policy.wants_shards() {
+        for imported in &report.manifest.imported_blobs {
+            let output_path = PathBuf::from(&imported.output);
+            if let Some(shard_report) =
+                apply_artifact_policy(&output_path, artifact_policy, args.overwrite)?
+            {
+                shard_manifest_count += 1;
+                shard_count += shard_report.shard_paths.len();
+                println!(
+                    "[IMPORT] sharded {} -> {} ({} shards, {:.1} MiB)",
+                    output_path.display(),
+                    shard_report.manifest_path.display(),
+                    shard_report.shard_paths.len(),
+                    shard_report.total_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+        }
+    }
 
     println!(
         "[IMPORT] Trellis2 roots: weights='{}', output='{}'",
@@ -75,6 +122,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.manifest.imported_blobs.len(),
         report.manifest.missing_sources.len()
     );
+    if artifact_policy.wants_shards() {
+        println!(
+            "[IMPORT] generated shard manifests: {}, total shards: {}",
+            shard_manifest_count, shard_count
+        );
+    }
     if !report.manifest.missing_sources.is_empty() {
         println!("[IMPORT] Missing sources:");
         for source in &report.manifest.missing_sources {

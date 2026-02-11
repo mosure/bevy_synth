@@ -1,11 +1,12 @@
 #![recursion_limit = "256"]
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use burn::backend::NdArray;
+use burn_synth_import::io::ensure_parent_dir;
+use burn_synth_import::layout::{burnpack_path, precision_label};
+use burn_synth_import::plan::ArtifactPolicy;
+use burn_synth_import::shard::apply_artifact_policy;
 use clap::{Parser, ValueEnum};
 
 use burn_tripo::model::triposg::{
@@ -16,7 +17,6 @@ use burn_tripo::model::triposg::{
 
 type CpuBackend = NdArray<f32>;
 type GpuBackend = burn_wgpu::Wgpu;
-const F16_SUFFIX: &str = "_f16";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum Quantization {
@@ -35,6 +35,24 @@ impl Quantization {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ArtifactPolicyArg {
+    SingleFile,
+    Sharded,
+    Both,
+}
+
+impl ArtifactPolicyArg {
+    fn into_policy(self, shard_size_mib: u64) -> ArtifactPolicy {
+        let shard_size_mib = shard_size_mib.max(1);
+        match self {
+            Self::SingleFile => ArtifactPolicy::SingleFile,
+            Self::Sharded => ArtifactPolicy::Sharded { shard_size_mib },
+            Self::Both => ArtifactPolicy::Both { shard_size_mib },
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     about = "Import TripoSG safetensors into Burnpack (.bpk) files",
@@ -49,6 +67,18 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = Quantization::F32)]
     quantization: Quantization,
+
+    #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::SingleFile)]
+    artifact_policy: ArtifactPolicyArg,
+
+    #[arg(long, default_value_t = 64)]
+    shard_size_mib: u64,
+}
+
+struct TripoSources<'a> {
+    vae: &'a Path,
+    dit: &'a Path,
+    dino: &'a Path,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,22 +109,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_imports_with_backend::<CpuBackend>(
             false,
             args.overwrite,
-            &vae_path,
-            &dit_path,
-            &dino_path,
+            TripoSources {
+                vae: &vae_path,
+                dit: &dit_path,
+                dino: &dino_path,
+            },
             &vae_config,
             &dit_config,
+            args.artifact_policy.into_policy(args.shard_size_mib),
         )?;
     }
     if args.quantization.include_f16() {
         run_imports_with_backend::<GpuBackend>(
             true,
             args.overwrite,
-            &vae_path,
-            &dit_path,
-            &dino_path,
+            TripoSources {
+                vae: &vae_path,
+                dit: &dit_path,
+                dino: &dino_path,
+            },
             &vae_config,
             &dit_config,
+            args.artifact_policy.into_policy(args.shard_size_mib),
         )?;
     }
 
@@ -104,11 +140,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_imports_with_backend<B>(
     use_f16: bool,
     overwrite: bool,
-    vae_path: &Path,
-    dit_path: &Path,
-    dino_path: &Path,
+    sources: TripoSources<'_>,
     vae_config: &TripoSGVaeConfig,
     dit_config: &TripoSGDiTConfig,
+    artifact_policy: ArtifactPolicy,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     B: burn::tensor::backend::Backend,
@@ -116,55 +151,34 @@ where
 {
     let device = <B as burn::tensor::backend::Backend>::Device::default();
 
-    import_if_needed("VAE", vae_path, use_f16, overwrite, || {
-        import_triposg_vae_burnpack::<B>(vae_config, &device, vae_path, use_f16)
-    })?;
+    import_if_needed(
+        "VAE",
+        sources.vae,
+        use_f16,
+        overwrite,
+        artifact_policy,
+        || import_triposg_vae_burnpack::<B>(vae_config, &device, sources.vae, use_f16),
+    )?;
 
-    import_if_needed("DiT", dit_path, use_f16, overwrite, || {
-        import_triposg_dit_burnpack::<B>(dit_config, &device, dit_path, use_f16)
-    })?;
+    import_if_needed(
+        "DiT",
+        sources.dit,
+        use_f16,
+        overwrite,
+        artifact_policy,
+        || import_triposg_dit_burnpack::<B>(dit_config, &device, sources.dit, use_f16),
+    )?;
 
-    import_if_needed("DINOv2", dino_path, use_f16, overwrite, || {
-        import_triposg_dinov2_burnpack::<B>(&device, dino_path, use_f16)
-    })?;
+    import_if_needed(
+        "DINOv2",
+        sources.dino,
+        use_f16,
+        overwrite,
+        artifact_policy,
+        || import_triposg_dinov2_burnpack::<B>(&device, sources.dino, use_f16),
+    )?;
 
     Ok(())
-}
-
-fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
-    let path = if path
-        .extension()
-        .map(|ext| ext.eq_ignore_ascii_case("bpk"))
-        .unwrap_or(false)
-    {
-        path.to_path_buf()
-    } else {
-        path.with_extension("bpk")
-    };
-
-    if use_f16 {
-        with_file_stem_suffix(&path, F16_SUFFIX)
-    } else {
-        path
-    }
-}
-
-fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let Some(stem) = path.file_stem() else {
-        return path.to_path_buf();
-    };
-    let stem = stem.to_string_lossy();
-    if stem.ends_with(suffix) {
-        return path.to_path_buf();
-    }
-
-    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let mut file_name = format!("{stem}{suffix}");
-    if !ext.is_empty() {
-        file_name.push('.');
-        file_name.push_str(ext);
-    }
-    path.with_file_name(file_name)
 }
 
 fn import_if_needed<F>(
@@ -172,6 +186,7 @@ fn import_if_needed<F>(
     weights_path: &Path,
     use_f16: bool,
     overwrite: bool,
+    artifact_policy: ArtifactPolicy,
     import_fn: F,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -182,23 +197,30 @@ where
     }
 
     let burnpack = burnpack_path(weights_path, use_f16);
-    let precision = if use_f16 { "f16" } else { "f32" };
-    if burnpack.exists() && !overwrite {
+    let precision = precision_label(use_f16);
+    let output = if burnpack.exists() && !overwrite {
         println!(
             "[IMPORT] {label} ({precision}) burnpack already exists at {}, skipping.",
             burnpack.display()
         );
-        return Ok(());
-    }
+        burnpack.clone()
+    } else {
+        ensure_parent_dir(&burnpack)?;
+        let output = import_fn()?;
+        println!(
+            "[IMPORT] {label} ({precision}) burnpack saved to {}",
+            output.display()
+        );
+        output
+    };
 
-    if let Some(parent) = burnpack.parent() {
-        fs::create_dir_all(parent)?;
+    if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
+        println!(
+            "[IMPORT] {label} ({precision}) shard manifest: {} ({} shards, {:.1} MiB)",
+            report.manifest_path.display(),
+            report.shard_paths.len(),
+            report.total_bytes as f64 / (1024.0 * 1024.0),
+        );
     }
-
-    let output = import_fn()?;
-    println!(
-        "[IMPORT] {label} ({precision}) burnpack saved to {}",
-        output.display()
-    );
     Ok(())
 }

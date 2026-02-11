@@ -53,6 +53,10 @@ struct Args {
     /// Fail if any pipeline stage uses fallback behavior (benchmark strict mode).
     #[arg(long, default_value_t = false)]
     strict_benchmark: bool,
+
+    /// Number of repeated in-process runs (reuses the loaded runtime cache).
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
 }
 
 fn run() -> Result<(), String> {
@@ -69,75 +73,157 @@ fn run() -> Result<(), String> {
     let pipeline = Trellis2Pipeline::new(config).map_err(|err| err.to_string())?;
     pipeline.validate_runtime().map_err(|err| err.to_string())?;
 
-    let options = TrellisRunOptions {
-        quality: args.quality,
-        device: args.device,
-        seed: args.seed,
-        hook_output: args.hook_output.clone(),
-        noise_overrides_hook: args.noise_overrides_hook.clone(),
-    };
-
-    let profiled = pipeline
-        .infer_mesh_profile(&args.input_image, &options)
-        .map_err(|err| err.to_string())?;
-    if args.require_runtime_model && profiled.sparse_source.as_str() == "synthetic" {
-        return Err("runtime-model required but sparse stage used synthetic fallback".to_string());
-    }
-    if args.strict_benchmark {
-        if profiled.sparse_source.as_str() == "synthetic" {
+    let repeat = args.repeat.max(1);
+    let mut runs = Vec::with_capacity(repeat);
+    for run_idx in 0..repeat {
+        let options = TrellisRunOptions {
+            quality: args.quality,
+            device: args.device,
+            seed: args.seed,
+            hook_output: if run_idx + 1 == repeat {
+                args.hook_output.clone()
+            } else {
+                None
+            },
+            noise_overrides_hook: args.noise_overrides_hook.clone(),
+        };
+        let profiled = pipeline
+            .infer_mesh_profile(&args.input_image, &options)
+            .map_err(|err| err.to_string())?;
+        if args.require_runtime_model && profiled.sparse_source.as_str() == "synthetic" {
             return Err(
-                "strict benchmark failed: sparse stage used synthetic fallback".to_string(),
+                "runtime-model required but sparse stage used synthetic fallback".to_string(),
             );
         }
-        if profiled.decode_source.is_fallback() {
-            return Err(format!(
-                "strict benchmark failed: decode stage used fallback source '{}'",
-                profiled.decode_source.as_str()
-            ));
+        if args.strict_benchmark {
+            if profiled.sparse_source.as_str() == "synthetic" {
+                return Err(
+                    "strict benchmark failed: sparse stage used synthetic fallback".to_string(),
+                );
+            }
+            if profiled.decode_source.is_fallback() {
+                return Err(format!(
+                    "strict benchmark failed: decode stage used fallback source '{}'",
+                    profiled.decode_source.as_str()
+                ));
+            }
         }
+        runs.push(profiled);
     }
+    let profiled = runs
+        .last()
+        .ok_or_else(|| "no inference runs were produced".to_string())?;
     if let Some(obj_path) = args.output_obj.as_ref() {
         burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
 
-    println!(
-        "{}",
+    let timings_json = |profiled: &burn_trellis::pipeline::TrellisInferenceProfile| {
         json!({
-            "status": "ok",
-            "vertices": profiled.mesh.vertices.len(),
-            "faces": profiled.mesh.faces.len(),
-            "elapsed_ms": profiled.timings.total_ms,
-            "device": options.device.as_str(),
-            "quality": options.quality.as_str(),
-            "strict_benchmark": args.strict_benchmark,
-            "sparse_source": profiled.sparse_source.as_str(),
-            "decode_source": profiled.decode_source.as_str(),
-            "fallbacks": {
-                "sparse": profiled.sparse_source.as_str() == "synthetic",
-                "decode": profiled.decode_source.is_fallback(),
-            },
-            "timings_ms": {
-                "preprocess": profiled.timings.preprocess_ms,
-                "runtime_setup": profiled.timings.runtime_setup_ms,
-                "sparse": profiled.timings.sparse_ms,
-                "shape_slat": profiled.timings.shape_slat_ms,
-                "tex_slat": profiled.timings.tex_slat_ms,
-                "decode": profiled.timings.decode_ms,
-                "decode_shape_decoder": profiled.timings.decode_shape_decoder_ms,
-                "decode_tex_decoder": profiled.timings.decode_tex_decoder_ms,
-                "decode_attr_merge": profiled.timings.decode_attr_merge_ms,
-                "decode_mesh": profiled.timings.decode_mesh_ms,
-                "decode_pbr": profiled.timings.decode_pbr_ms,
-                "hook_capture": profiled.timings.hook_capture_ms,
-                "host_readback_count": profiled.timings.host_readback_count,
-                "host_readback_elements": profiled.timings.host_readback_elements,
-                "total": profiled.timings.total_ms
-            },
-            "hook_output": args.hook_output,
-            "noise_overrides_hook": args.noise_overrides_hook,
-            "output_obj": args.output_obj,
+            "preprocess": profiled.timings.preprocess_ms,
+            "runtime_setup": profiled.timings.runtime_setup_ms,
+            "sparse": profiled.timings.sparse_ms,
+            "shape_slat": profiled.timings.shape_slat_ms,
+            "tex_slat": profiled.timings.tex_slat_ms,
+            "decode": profiled.timings.decode_ms,
+            "decode_shape_decoder": profiled.timings.decode_shape_decoder_ms,
+            "decode_tex_decoder": profiled.timings.decode_tex_decoder_ms,
+            "decode_attr_merge": profiled.timings.decode_attr_merge_ms,
+            "decode_mesh": profiled.timings.decode_mesh_ms,
+            "decode_pbr": profiled.timings.decode_pbr_ms,
+            "decode_shape_conv_calls": profiled.timings.decode_shape_conv_calls,
+            "decode_tex_conv_calls": profiled.timings.decode_tex_conv_calls,
+            "decode_shape_wgpu_dispatches": profiled.timings.decode_shape_wgpu_dispatches,
+            "decode_tex_wgpu_dispatches": profiled.timings.decode_tex_wgpu_dispatches,
+            "decode_shape_wgpu_chunked_calls": profiled.timings.decode_shape_wgpu_chunked_calls,
+            "decode_tex_wgpu_chunked_calls": profiled.timings.decode_tex_wgpu_chunked_calls,
+            "decode_shape_wgpu_input_bytes": profiled.timings.decode_shape_wgpu_input_bytes,
+            "decode_tex_wgpu_input_bytes": profiled.timings.decode_tex_wgpu_input_bytes,
+            "decode_shape_wgpu_output_bytes": profiled.timings.decode_shape_wgpu_output_bytes,
+            "decode_tex_wgpu_output_bytes": profiled.timings.decode_tex_wgpu_output_bytes,
+            "decode_shape_wgpu_max_chunk_rows": profiled.timings.decode_shape_wgpu_max_chunk_rows,
+            "decode_tex_wgpu_max_chunk_rows": profiled.timings.decode_tex_wgpu_max_chunk_rows,
+            "hook_capture": profiled.timings.hook_capture_ms,
+            "host_readback_count": profiled.timings.host_readback_count,
+            "host_readback_elements": profiled.timings.host_readback_elements,
+            "total": profiled.timings.total_ms
         })
-    );
+    };
+
+    if repeat == 1 {
+        println!(
+            "{}",
+            json!({
+                "status": "ok",
+                "vertices": profiled.mesh.vertices.len(),
+                "faces": profiled.mesh.faces.len(),
+                "elapsed_ms": profiled.timings.total_ms,
+                "device": args.device.as_str(),
+                "quality": args.quality.as_str(),
+                "strict_benchmark": args.strict_benchmark,
+                "repeat": repeat,
+                "sparse_source": profiled.sparse_source.as_str(),
+                "decode_source": profiled.decode_source.as_str(),
+                "fallbacks": {
+                    "sparse": profiled.sparse_source.as_str() == "synthetic",
+                    "decode": profiled.decode_source.is_fallback(),
+                },
+                "timings_ms": timings_json(profiled),
+                "hook_output": args.hook_output,
+                "noise_overrides_hook": args.noise_overrides_hook,
+                "output_obj": args.output_obj,
+            })
+        );
+    } else {
+        let runs_json = runs
+            .iter()
+            .enumerate()
+            .map(|(idx, run)| {
+                json!({
+                    "run": idx + 1,
+                    "elapsed_ms": run.timings.total_ms,
+                    "runtime_setup_ms": run.timings.runtime_setup_ms,
+                    "vertices": run.mesh.vertices.len(),
+                    "faces": run.mesh.faces.len(),
+                    "sparse_source": run.sparse_source.as_str(),
+                    "decode_source": run.decode_source.as_str(),
+                    "timings_ms": timings_json(run),
+                })
+            })
+            .collect::<Vec<_>>();
+        let setup_mean = runs
+            .iter()
+            .map(|run| run.timings.runtime_setup_ms)
+            .sum::<f64>()
+            / runs.len() as f64;
+        let total_mean =
+            runs.iter().map(|run| run.timings.total_ms).sum::<f64>() / runs.len() as f64;
+        println!(
+            "{}",
+            json!({
+                "status": "ok",
+                "device": args.device.as_str(),
+                "quality": args.quality.as_str(),
+                "strict_benchmark": args.strict_benchmark,
+                "repeat": repeat,
+                "summary": {
+                    "runtime_setup_mean_ms": setup_mean,
+                    "total_mean_ms": total_mean,
+                },
+                "last": {
+                    "vertices": profiled.mesh.vertices.len(),
+                    "faces": profiled.mesh.faces.len(),
+                    "elapsed_ms": profiled.timings.total_ms,
+                    "sparse_source": profiled.sparse_source.as_str(),
+                    "decode_source": profiled.decode_source.as_str(),
+                    "timings_ms": timings_json(profiled),
+                },
+                "runs": runs_json,
+                "hook_output": args.hook_output,
+                "noise_overrides_hook": args.noise_overrides_hook,
+                "output_obj": args.output_obj,
+            })
+        );
+    }
     Ok(())
 }
 

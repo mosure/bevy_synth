@@ -7,12 +7,13 @@ fn main() {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
+    use std::path::{Path, PathBuf};
 
     use burn::backend::NdArray;
+    use burn_synth_import::io::ensure_parent_dir;
+    use burn_synth_import::layout::{burnpack_path, precision_label};
+    use burn_synth_import::plan::ArtifactPolicy;
+    use burn_synth_import::shard::apply_artifact_policy;
     use clap::{Parser, ValueEnum};
 
     use burn_foreground::rmbg2::import::{import_rmbg2_burnpack, resolve_rmbg2_weights_root};
@@ -23,7 +24,6 @@ mod native {
 
     type CpuBackend = NdArray<f32>;
     type GpuBackend = burn_wgpu::Wgpu;
-    const F16_SUFFIX: &str = "_f16";
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
     enum Quantization {
@@ -46,6 +46,24 @@ mod native {
 
         fn include_f16(self) -> bool {
             matches!(self, Self::F16 | Self::Both)
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+    enum ArtifactPolicyArg {
+        SingleFile,
+        Sharded,
+        Both,
+    }
+
+    impl ArtifactPolicyArg {
+        fn into_policy(self, shard_size_mib: u64) -> ArtifactPolicy {
+            let shard_size_mib = shard_size_mib.max(1);
+            match self {
+                Self::SingleFile => ArtifactPolicy::SingleFile,
+                Self::Sharded => ArtifactPolicy::Sharded { shard_size_mib },
+                Self::Both => ArtifactPolicy::Both { shard_size_mib },
+            }
         }
     }
 
@@ -72,6 +90,12 @@ mod native {
 
         #[arg(long, value_enum, default_value_t = Quantization::F32)]
         quantization: Quantization,
+
+        #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::SingleFile)]
+        artifact_policy: ArtifactPolicyArg,
+
+        #[arg(long, default_value_t = 64)]
+        shard_size_mib: u64,
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,6 +118,7 @@ mod native {
                     .as_ref()
                     .map(|(weights, config)| (weights.as_path(), config)),
                 rmbg2_root.as_deref(),
+                args.artifact_policy.into_policy(args.shard_size_mib),
             )?;
         }
         if args.quantization.include_f16() {
@@ -104,6 +129,7 @@ mod native {
                     .as_ref()
                     .map(|(weights, config)| (weights.as_path(), config)),
                 rmbg2_root.as_deref(),
+                args.artifact_policy.into_policy(args.shard_size_mib),
             )?;
         }
 
@@ -162,6 +188,7 @@ mod native {
         overwrite: bool,
         rmbg14: Option<(&Path, &RmbgConfig)>,
         rmbg2_root: Option<&Path>,
+        artifact_policy: ArtifactPolicy,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         B: burn::tensor::backend::Backend,
@@ -170,9 +197,14 @@ mod native {
         let device = <B as burn::tensor::backend::Backend>::Device::default();
 
         if let Some((weights, config)) = rmbg14 {
-            import_if_needed("RMBG-1.4", weights, use_f16, overwrite, || {
-                import_rmbg_burnpack::<B>(&device, weights, config, use_f16)
-            })?;
+            import_if_needed(
+                "RMBG-1.4",
+                weights,
+                use_f16,
+                overwrite,
+                artifact_policy,
+                || import_rmbg_burnpack::<B>(&device, weights, config, use_f16),
+            )?;
         }
 
         if let Some(root) = rmbg2_root {
@@ -184,20 +216,28 @@ mod native {
             } else {
                 "model.bpk"
             });
-            let precision = if use_f16 { "f16" } else { "f32" };
-            if output.exists() && !overwrite {
+            let precision = precision_label(use_f16);
+            let output = if output.exists() && !overwrite {
                 println!(
                     "[IMPORT] RMBG-2.0 ({precision}) burnpack already exists at {}, skipping.",
                     output.display()
                 );
+                output
             } else {
-                if let Some(parent) = output.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                ensure_parent_dir(&output)?;
                 let saved = import_rmbg2_burnpack(root, use_f16)?;
                 println!(
                     "[IMPORT] RMBG-2.0 ({precision}) burnpack saved to {}",
                     saved.display()
+                );
+                saved
+            };
+            if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
+                println!(
+                    "[IMPORT] RMBG-2.0 ({precision}) shard manifest: {} ({} shards, {:.1} MiB)",
+                    report.manifest_path.display(),
+                    report.shard_paths.len(),
+                    report.total_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
         }
@@ -205,47 +245,12 @@ mod native {
         Ok(())
     }
 
-    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
-        let path = if path
-            .extension()
-            .map(|ext| ext.eq_ignore_ascii_case("bpk"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            path.with_extension("bpk")
-        };
-
-        if use_f16 {
-            with_file_stem_suffix(&path, F16_SUFFIX)
-        } else {
-            path
-        }
-    }
-
-    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
-        let Some(stem) = path.file_stem() else {
-            return path.to_path_buf();
-        };
-        let stem = stem.to_string_lossy();
-        if stem.ends_with(suffix) {
-            return path.to_path_buf();
-        }
-
-        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        let mut file_name = format!("{stem}{suffix}");
-        if !ext.is_empty() {
-            file_name.push('.');
-            file_name.push_str(ext);
-        }
-        path.with_file_name(file_name)
-    }
-
     fn import_if_needed<F>(
         label: &str,
         weights_path: &Path,
         use_f16: bool,
         overwrite: bool,
+        artifact_policy: ArtifactPolicy,
         import_fn: F,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
@@ -256,24 +261,32 @@ mod native {
         }
 
         let burnpack = burnpack_path(weights_path, use_f16);
-        let precision = if use_f16 { "f16" } else { "f32" };
-        if burnpack.exists() && !overwrite {
+        let precision = precision_label(use_f16);
+        let output = if burnpack.exists() && !overwrite {
             println!(
                 "[IMPORT] {label} ({precision}) burnpack already exists at {}, skipping.",
                 burnpack.display()
             );
-            return Ok(());
+            burnpack
+        } else {
+            ensure_parent_dir(&burnpack)?;
+            let output = import_fn()?;
+            println!(
+                "[IMPORT] {label} ({precision}) burnpack saved to {}",
+                output.display()
+            );
+            output
+        };
+
+        if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
+            println!(
+                "[IMPORT] {label} ({precision}) shard manifest: {} ({} shards, {:.1} MiB)",
+                report.manifest_path.display(),
+                report.shard_paths.len(),
+                report.total_bytes as f64 / (1024.0 * 1024.0),
+            );
         }
 
-        if let Some(parent) = burnpack.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let output = import_fn()?;
-        println!(
-            "[IMPORT] {label} ({precision}) burnpack saved to {}",
-            output.display()
-        );
         Ok(())
     }
 }

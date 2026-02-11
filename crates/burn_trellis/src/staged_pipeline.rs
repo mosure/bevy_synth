@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 #[cfg(feature = "runtime-model")]
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "runtime-model")]
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::mesh::{Mesh, MeshMaterial, MeshPbrTextures, MeshTexture};
@@ -11,7 +13,10 @@ use crate::preprocess::PreprocessOutput;
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::fdg_decoder::FdgDecoderRuntime;
 #[cfg(feature = "runtime-model")]
-use crate::runtime_model::sparse_decoder::SparseSubdivisionLogits;
+use crate::runtime_model::sparse_decoder::{
+    DecoderConvTelemetry, SparseSubdivisionLogits, decoder_conv_telemetry,
+    reset_decoder_conv_telemetry,
+};
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_structure_flow::SparseStructureFlowRuntime;
 #[cfg(feature = "runtime-model")]
@@ -155,13 +160,25 @@ struct DecodedLatentOutput {
     timings: DecodeRuntimeTimings,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct DecodeRuntimeTimings {
     shape_decoder_ms: f64,
     tex_decoder_ms: f64,
     attr_merge_ms: f64,
     mesh_ms: f64,
     pbr_ms: f64,
+    shape_conv_calls: u64,
+    tex_conv_calls: u64,
+    shape_wgpu_dispatches: u64,
+    tex_wgpu_dispatches: u64,
+    shape_wgpu_chunked_calls: u64,
+    tex_wgpu_chunked_calls: u64,
+    shape_wgpu_input_bytes: u64,
+    tex_wgpu_input_bytes: u64,
+    shape_wgpu_output_bytes: u64,
+    tex_wgpu_output_bytes: u64,
+    shape_wgpu_max_chunk_rows: usize,
+    tex_wgpu_max_chunk_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +208,18 @@ pub struct TrellisStageTimings {
     pub decode_attr_merge_ms: f64,
     pub decode_mesh_ms: f64,
     pub decode_pbr_ms: f64,
+    pub decode_shape_conv_calls: u64,
+    pub decode_tex_conv_calls: u64,
+    pub decode_shape_wgpu_dispatches: u64,
+    pub decode_tex_wgpu_dispatches: u64,
+    pub decode_shape_wgpu_chunked_calls: u64,
+    pub decode_tex_wgpu_chunked_calls: u64,
+    pub decode_shape_wgpu_input_bytes: u64,
+    pub decode_tex_wgpu_input_bytes: u64,
+    pub decode_shape_wgpu_output_bytes: u64,
+    pub decode_tex_wgpu_output_bytes: u64,
+    pub decode_shape_wgpu_max_chunk_rows: usize,
+    pub decode_tex_wgpu_max_chunk_rows: usize,
     pub total_ms: f64,
 }
 
@@ -250,15 +279,54 @@ pub struct TrellisStageRuntime {
     shape_norm: TrellisNormalization,
     tex_norm: TrellisNormalization,
     #[cfg(feature = "runtime-model")]
-    sparse_flow: Option<SparseStructureFlowRuntime>,
+    sparse_flow: OnceLock<Option<SparseStructureFlowRuntime>>,
     #[cfg(feature = "runtime-model")]
-    shape_flow: Option<SparseStructureFlowRuntime>,
+    shape_flow: OnceLock<Option<SparseStructureFlowRuntime>>,
     #[cfg(feature = "runtime-model")]
-    tex_flow: Option<SparseStructureFlowRuntime>,
+    tex_flow: OnceLock<Option<SparseStructureFlowRuntime>>,
     #[cfg(feature = "runtime-model")]
-    shape_decoder: Option<FdgDecoderRuntime>,
+    shape_decoder: OnceLock<Option<FdgDecoderRuntime>>,
     #[cfg(feature = "runtime-model")]
-    tex_decoder: Option<SparseUnetVaeDecoderRuntime>,
+    tex_decoder: OnceLock<Option<SparseUnetVaeDecoderRuntime>>,
+    #[cfg(feature = "runtime-model")]
+    sparse_flow_spec: Option<FlowRuntimeLoadSpec>,
+    #[cfg(feature = "runtime-model")]
+    shape_flow_spec: Option<FlowRuntimeLoadSpec>,
+    #[cfg(feature = "runtime-model")]
+    tex_flow_spec: Option<FlowRuntimeLoadSpec>,
+    #[cfg(feature = "runtime-model")]
+    shape_decoder_spec: Option<DecoderRuntimeLoadSpec>,
+    #[cfg(feature = "runtime-model")]
+    tex_decoder_spec: Option<DecoderRuntimeLoadSpec>,
+}
+
+#[cfg(feature = "runtime-model")]
+#[derive(Debug, Clone)]
+struct FlowRuntimeLoadSpec {
+    weights_root: PathBuf,
+    image_large_root: Option<PathBuf>,
+    model_stem: String,
+    prefer_wgpu: bool,
+    slat_dense_resolution: Option<usize>,
+    stage_label: &'static str,
+    flow_key: Option<String>,
+}
+
+#[cfg(feature = "runtime-model")]
+#[derive(Debug, Clone, Copy)]
+enum DecoderRuntimeKind {
+    Shape,
+    Tex,
+}
+
+#[cfg(feature = "runtime-model")]
+#[derive(Debug, Clone)]
+struct DecoderRuntimeLoadSpec {
+    kind: DecoderRuntimeKind,
+    weights_root: PathBuf,
+    image_large_root: Option<PathBuf>,
+    model_stem: String,
+    prefer_wgpu: bool,
 }
 
 impl TrellisStageRuntime {
@@ -325,109 +393,63 @@ impl TrellisStageRuntime {
             "tex_slat_flow_model_1024"
         };
         #[cfg(feature = "runtime-model")]
-        let sparse_flow = if runtime_model_disabled {
+        let runtime_lazy_model_load = runtime_lazy_model_load_enabled();
+        #[cfg(feature = "runtime-model")]
+        let sparse_flow_spec = if runtime_model_disabled {
             None
         } else {
             match (
                 _weights_root,
                 args.models.get("sparse_structure_flow_model"),
             ) {
-                (Some(weights_root), Some(model_stem)) => {
-                    match SparseStructureFlowRuntime::load_from_stem(
-                        weights_root,
-                        _image_large_root,
-                        model_stem,
-                        _prefer_wgpu,
-                        None,
-                    ) {
-                        Ok(runtime) => {
-                            eprintln!(
-                                "burn_trellis: sparse flow runtime backend = {}",
-                                runtime.backend_name()
-                            );
-                            Some(runtime)
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "burn_trellis: sparse flow runtime model unavailable ({err}); using synthetic sparse stage fallback."
-                            );
-                            None
-                        }
-                    }
-                }
+                (Some(weights_root), Some(model_stem)) => Some(FlowRuntimeLoadSpec {
+                    weights_root: weights_root.to_path_buf(),
+                    image_large_root: _image_large_root.map(Path::to_path_buf),
+                    model_stem: model_stem.clone(),
+                    prefer_wgpu: _prefer_wgpu,
+                    slat_dense_resolution: None,
+                    stage_label: "sparse flow",
+                    flow_key: None,
+                }),
                 _ => None,
             }
         };
         #[cfg(feature = "runtime-model")]
-        let shape_flow = if runtime_model_disabled {
+        let shape_flow_spec = if runtime_model_disabled {
             None
         } else {
             match (_weights_root, args.models.get(shape_flow_key)) {
-                (Some(weights_root), Some(model_stem)) => {
-                    match SparseStructureFlowRuntime::load_from_stem(
-                        weights_root,
-                        _image_large_root,
-                        model_stem,
-                        _prefer_wgpu,
-                        slat_dense_resolution,
-                    ) {
-                        Ok(runtime) => {
-                            eprintln!(
-                                "burn_trellis: shape slat runtime backend = {} (flow={}, dense_res={})",
-                                runtime.backend_name(),
-                                shape_flow_key,
-                                runtime.config().resolution
-                            );
-                            Some(runtime)
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "burn_trellis: shape slat runtime model unavailable for key '{}' ({err}); using synthetic shape stage fallback.",
-                                shape_flow_key
-                            );
-                            None
-                        }
-                    }
-                }
+                (Some(weights_root), Some(model_stem)) => Some(FlowRuntimeLoadSpec {
+                    weights_root: weights_root.to_path_buf(),
+                    image_large_root: _image_large_root.map(Path::to_path_buf),
+                    model_stem: model_stem.clone(),
+                    prefer_wgpu: _prefer_wgpu,
+                    slat_dense_resolution,
+                    stage_label: "shape slat",
+                    flow_key: Some(shape_flow_key.to_string()),
+                }),
                 _ => None,
             }
         };
         #[cfg(feature = "runtime-model")]
-        let tex_flow = if runtime_model_disabled {
+        let tex_flow_spec = if runtime_model_disabled {
             None
         } else {
             match (_weights_root, args.models.get(tex_flow_key)) {
-                (Some(weights_root), Some(model_stem)) => {
-                    match SparseStructureFlowRuntime::load_from_stem(
-                        weights_root,
-                        _image_large_root,
-                        model_stem,
-                        _prefer_wgpu,
-                        slat_dense_resolution,
-                    ) {
-                        Ok(runtime) => {
-                            eprintln!(
-                                "burn_trellis: tex slat runtime backend = {} (flow={}, dense_res={})",
-                                runtime.backend_name(),
-                                tex_flow_key,
-                                runtime.config().resolution
-                            );
-                            Some(runtime)
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "burn_trellis: tex slat runtime model unavailable for key '{}' ({err}); using synthetic tex stage fallback.",
-                                tex_flow_key
-                            );
-                            None
-                        }
-                    }
-                }
+                (Some(weights_root), Some(model_stem)) => Some(FlowRuntimeLoadSpec {
+                    weights_root: weights_root.to_path_buf(),
+                    image_large_root: _image_large_root.map(Path::to_path_buf),
+                    model_stem: model_stem.clone(),
+                    prefer_wgpu: _prefer_wgpu,
+                    slat_dense_resolution,
+                    stage_label: "tex slat",
+                    flow_key: Some(tex_flow_key.to_string()),
+                }),
                 _ => None,
             }
         };
         #[cfg(feature = "runtime-model")]
-        let shape_decoder = if runtime_model_disabled || runtime_decoders_disabled {
+        let shape_decoder_spec = if runtime_model_disabled || runtime_decoders_disabled {
             if runtime_decoders_disabled {
                 eprintln!(
                     "burn_trellis: runtime decoders disabled by TRELLIS2_DISABLE_RUNTIME_DECODERS."
@@ -436,49 +458,49 @@ impl TrellisStageRuntime {
             None
         } else {
             match (_weights_root, args.models.get("shape_slat_decoder")) {
-                (Some(weights_root), Some(model_stem)) => {
-                    match FdgDecoderRuntime::load_from_stem(
-                        weights_root,
-                        _image_large_root,
-                        model_stem,
-                        _prefer_wgpu,
-                    ) {
-                        Ok(runtime) => Some(runtime),
-                        Err(err) => {
-                            eprintln!(
-                                "burn_trellis: shape decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
-                            );
-                            None
-                        }
-                    }
-                }
+                (Some(weights_root), Some(model_stem)) => Some(DecoderRuntimeLoadSpec {
+                    kind: DecoderRuntimeKind::Shape,
+                    weights_root: weights_root.to_path_buf(),
+                    image_large_root: _image_large_root.map(Path::to_path_buf),
+                    model_stem: model_stem.clone(),
+                    prefer_wgpu: _prefer_wgpu,
+                }),
                 _ => None,
             }
         };
         #[cfg(feature = "runtime-model")]
-        let tex_decoder = if runtime_model_disabled || runtime_decoders_disabled {
+        let tex_decoder_spec = if runtime_model_disabled || runtime_decoders_disabled {
             None
         } else {
             match (_weights_root, args.models.get("tex_slat_decoder")) {
-                (Some(weights_root), Some(model_stem)) => {
-                    match SparseUnetVaeDecoderRuntime::load_from_stem(
-                        weights_root,
-                        _image_large_root,
-                        model_stem,
-                        _prefer_wgpu,
-                    ) {
-                        Ok(runtime) => Some(runtime),
-                        Err(err) => {
-                            eprintln!(
-                                "burn_trellis: tex decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
-                            );
-                            None
-                        }
-                    }
-                }
+                (Some(weights_root), Some(model_stem)) => Some(DecoderRuntimeLoadSpec {
+                    kind: DecoderRuntimeKind::Tex,
+                    weights_root: weights_root.to_path_buf(),
+                    image_large_root: _image_large_root.map(Path::to_path_buf),
+                    model_stem: model_stem.clone(),
+                    prefer_wgpu: _prefer_wgpu,
+                }),
                 _ => None,
             }
         };
+        #[cfg(feature = "runtime-model")]
+        let sparse_flow = OnceLock::new();
+        #[cfg(feature = "runtime-model")]
+        let shape_flow = OnceLock::new();
+        #[cfg(feature = "runtime-model")]
+        let tex_flow = OnceLock::new();
+        #[cfg(feature = "runtime-model")]
+        let shape_decoder = OnceLock::new();
+        #[cfg(feature = "runtime-model")]
+        let tex_decoder = OnceLock::new();
+        #[cfg(feature = "runtime-model")]
+        if !runtime_lazy_model_load {
+            let _ = sparse_flow.set(load_flow_runtime_from_spec(sparse_flow_spec.as_ref()));
+            let _ = shape_flow.set(load_flow_runtime_from_spec(shape_flow_spec.as_ref()));
+            let _ = tex_flow.set(load_flow_runtime_from_spec(tex_flow_spec.as_ref()));
+            let _ = shape_decoder.set(load_shape_decoder_from_spec(shape_decoder_spec.as_ref()));
+            let _ = tex_decoder.set(load_tex_decoder_from_spec(tex_decoder_spec.as_ref()));
+        }
         Self {
             pipeline_type,
             sparse_sampler,
@@ -496,7 +518,52 @@ impl TrellisStageRuntime {
             shape_decoder,
             #[cfg(feature = "runtime-model")]
             tex_decoder,
+            #[cfg(feature = "runtime-model")]
+            sparse_flow_spec,
+            #[cfg(feature = "runtime-model")]
+            shape_flow_spec,
+            #[cfg(feature = "runtime-model")]
+            tex_flow_spec,
+            #[cfg(feature = "runtime-model")]
+            shape_decoder_spec,
+            #[cfg(feature = "runtime-model")]
+            tex_decoder_spec,
         }
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn sparse_flow_runtime(&self) -> Option<&SparseStructureFlowRuntime> {
+        self.sparse_flow
+            .get_or_init(|| load_flow_runtime_from_spec(self.sparse_flow_spec.as_ref()))
+            .as_ref()
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn shape_flow_runtime(&self) -> Option<&SparseStructureFlowRuntime> {
+        self.shape_flow
+            .get_or_init(|| load_flow_runtime_from_spec(self.shape_flow_spec.as_ref()))
+            .as_ref()
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn tex_flow_runtime(&self) -> Option<&SparseStructureFlowRuntime> {
+        self.tex_flow
+            .get_or_init(|| load_flow_runtime_from_spec(self.tex_flow_spec.as_ref()))
+            .as_ref()
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn shape_decoder_runtime(&self) -> Option<&FdgDecoderRuntime> {
+        self.shape_decoder
+            .get_or_init(|| load_shape_decoder_from_spec(self.shape_decoder_spec.as_ref()))
+            .as_ref()
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn tex_decoder_runtime(&self) -> Option<&SparseUnetVaeDecoderRuntime> {
+        self.tex_decoder
+            .get_or_init(|| load_tex_decoder_from_spec(self.tex_decoder_spec.as_ref()))
+            .as_ref()
     }
 
     pub fn pipeline_type(&self) -> &str {
@@ -553,6 +620,8 @@ impl TrellisStageRuntime {
         let tex_sampler_override = noise_overrides.and_then(|v| v.tex_sampler);
         let sparse_cond_override = noise_overrides.and_then(|v| v.cond_512.as_deref());
         let sparse_neg_cond_override = noise_overrides.and_then(|v| v.neg_cond_512.as_deref());
+        #[cfg(feature = "runtime-model")]
+        let sparse_flow_runtime = self.sparse_flow_runtime();
         let sparse_start = Instant::now();
         let sparse = sample_sparse_structure(
             preprocess,
@@ -567,7 +636,7 @@ impl TrellisStageRuntime {
             capture_sampler_trace,
             parity_strict,
             #[cfg(feature = "runtime-model")]
-            self.sparse_flow.as_ref(),
+            sparse_flow_runtime,
         )?;
         let sparse_ms = sparse_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
@@ -577,6 +646,8 @@ impl TrellisStageRuntime {
             );
         }
 
+        #[cfg(feature = "runtime-model")]
+        let shape_flow_runtime = self.shape_flow_runtime();
         let shape_start = Instant::now();
         let shape_slat = sample_shape_slat(
             preprocess,
@@ -592,7 +663,7 @@ impl TrellisStageRuntime {
             capture_sampler_trace,
             parity_strict,
             #[cfg(feature = "runtime-model")]
-            self.shape_flow.as_ref(),
+            shape_flow_runtime,
         )?;
         let shape_slat_ms = shape_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
@@ -602,6 +673,8 @@ impl TrellisStageRuntime {
             );
         }
 
+        #[cfg(feature = "runtime-model")]
+        let tex_flow_runtime = self.tex_flow_runtime();
         let tex_start = Instant::now();
         let tex_slat = sample_tex_slat(
             preprocess,
@@ -618,7 +691,7 @@ impl TrellisStageRuntime {
             capture_sampler_trace,
             parity_strict,
             #[cfg(feature = "runtime-model")]
-            self.tex_flow.as_ref(),
+            tex_flow_runtime,
         )?;
         let tex_slat_ms = tex_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
@@ -638,15 +711,20 @@ impl TrellisStageRuntime {
             }
             decoded_fallback_output(DecodeStageSource::FallbackSkipDecode)
         } else {
+            #[cfg(feature = "runtime-model")]
+            let shape_decoder_runtime = self.shape_decoder_runtime();
+            #[cfg(feature = "runtime-model")]
+            let tex_decoder_runtime = self.tex_decoder_runtime();
             decode_latent_to_outputs(
                 &shape_slat,
                 &tex_slat,
                 self.pipeline_type(),
                 parity_strict,
+                capture_sampler_trace,
                 #[cfg(feature = "runtime-model")]
-                self.shape_decoder.as_ref(),
+                shape_decoder_runtime,
                 #[cfg(feature = "runtime-model")]
-                self.tex_decoder.as_ref(),
+                tex_decoder_runtime,
             )?
         };
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
@@ -677,6 +755,18 @@ impl TrellisStageRuntime {
             decode_attr_merge_ms: decoded.timings.attr_merge_ms,
             decode_mesh_ms: decoded.timings.mesh_ms,
             decode_pbr_ms: decoded.timings.pbr_ms,
+            decode_shape_conv_calls: decoded.timings.shape_conv_calls,
+            decode_tex_conv_calls: decoded.timings.tex_conv_calls,
+            decode_shape_wgpu_dispatches: decoded.timings.shape_wgpu_dispatches,
+            decode_tex_wgpu_dispatches: decoded.timings.tex_wgpu_dispatches,
+            decode_shape_wgpu_chunked_calls: decoded.timings.shape_wgpu_chunked_calls,
+            decode_tex_wgpu_chunked_calls: decoded.timings.tex_wgpu_chunked_calls,
+            decode_shape_wgpu_input_bytes: decoded.timings.shape_wgpu_input_bytes,
+            decode_tex_wgpu_input_bytes: decoded.timings.tex_wgpu_input_bytes,
+            decode_shape_wgpu_output_bytes: decoded.timings.shape_wgpu_output_bytes,
+            decode_tex_wgpu_output_bytes: decoded.timings.tex_wgpu_output_bytes,
+            decode_shape_wgpu_max_chunk_rows: decoded.timings.shape_wgpu_max_chunk_rows,
+            decode_tex_wgpu_max_chunk_rows: decoded.timings.tex_wgpu_max_chunk_rows,
             total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
         };
         Ok((output, timings))
@@ -714,6 +804,181 @@ fn runtime_stage_debug_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+#[cfg(feature = "runtime-model")]
+fn runtime_lazy_model_load_enabled() -> bool {
+    match std::env::var("TRELLIS2_RUNTIME_LAZY_MODEL_LOAD") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn load_flow_runtime_from_spec(
+    spec: Option<&FlowRuntimeLoadSpec>,
+) -> Option<SparseStructureFlowRuntime> {
+    let spec = spec?;
+    match SparseStructureFlowRuntime::load_from_stem(
+        spec.weights_root.as_path(),
+        spec.image_large_root.as_deref(),
+        spec.model_stem.as_str(),
+        spec.prefer_wgpu,
+        spec.slat_dense_resolution,
+    ) {
+        Ok(runtime) => {
+            match spec.stage_label {
+                "sparse flow" => {
+                    eprintln!(
+                        "burn_trellis: sparse flow runtime backend = {}",
+                        runtime.backend_name()
+                    );
+                }
+                "shape slat" => {
+                    let key = spec.flow_key.as_deref().unwrap_or("shape_slat_flow_model");
+                    eprintln!(
+                        "burn_trellis: shape slat runtime backend = {} (flow={}, dense_res={})",
+                        runtime.backend_name(),
+                        key,
+                        runtime.config().resolution
+                    );
+                }
+                "tex slat" => {
+                    let key = spec.flow_key.as_deref().unwrap_or("tex_slat_flow_model");
+                    eprintln!(
+                        "burn_trellis: tex slat runtime backend = {} (flow={}, dense_res={})",
+                        runtime.backend_name(),
+                        key,
+                        runtime.config().resolution
+                    );
+                }
+                _ => {}
+            }
+            Some(runtime)
+        }
+        Err(err) => {
+            match spec.stage_label {
+                "sparse flow" => {
+                    eprintln!(
+                        "burn_trellis: sparse flow runtime model unavailable ({err}); using synthetic sparse stage fallback."
+                    );
+                }
+                "shape slat" => {
+                    let key = spec.flow_key.as_deref().unwrap_or("shape_slat_flow_model");
+                    eprintln!(
+                        "burn_trellis: shape slat runtime model unavailable for key '{}' ({err}); using synthetic shape stage fallback.",
+                        key
+                    );
+                }
+                "tex slat" => {
+                    let key = spec.flow_key.as_deref().unwrap_or("tex_slat_flow_model");
+                    eprintln!(
+                        "burn_trellis: tex slat runtime model unavailable for key '{}' ({err}); using synthetic tex stage fallback.",
+                        key
+                    );
+                }
+                _ => {}
+            }
+            None
+        }
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn load_shape_decoder_from_spec(
+    spec: Option<&DecoderRuntimeLoadSpec>,
+) -> Option<FdgDecoderRuntime> {
+    let spec = spec?;
+    if !matches!(spec.kind, DecoderRuntimeKind::Shape) {
+        return None;
+    }
+    match FdgDecoderRuntime::load_from_stem(
+        spec.weights_root.as_path(),
+        spec.image_large_root.as_deref(),
+        spec.model_stem.as_str(),
+        spec.prefer_wgpu,
+    ) {
+        Ok(runtime) => Some(runtime),
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: shape decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn load_tex_decoder_from_spec(
+    spec: Option<&DecoderRuntimeLoadSpec>,
+) -> Option<SparseUnetVaeDecoderRuntime> {
+    let spec = spec?;
+    if !matches!(spec.kind, DecoderRuntimeKind::Tex) {
+        return None;
+    }
+    match SparseUnetVaeDecoderRuntime::load_from_stem(
+        spec.weights_root.as_path(),
+        spec.image_large_root.as_deref(),
+        spec.model_stem.as_str(),
+        spec.prefer_wgpu,
+    ) {
+        Ok(runtime) => Some(runtime),
+        Err(err) => {
+            eprintln!(
+                "burn_trellis: tex decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn runtime_decoder_conv_telemetry_enabled() -> bool {
+    std::env::var("TRELLIS2_DECODER_CONV_TELEMETRY")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "runtime-model")]
+fn log_decoder_conv_telemetry(stage: &str, telemetry: &DecoderConvTelemetry) {
+    eprintln!(
+        "burn_trellis: decoder conv telemetry [{stage}] conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
+        telemetry.conv_calls,
+        telemetry.wgpu_calls,
+        telemetry.wgpu_successes,
+        telemetry.wgpu_failures,
+        telemetry.dispatches,
+        telemetry.chunked_calls,
+        telemetry.max_chunk_rows,
+        telemetry.input_bytes,
+        telemetry.output_bytes,
+        telemetry.neighbor_elements
+    );
+    for block in telemetry.blocks.iter() {
+        eprintln!(
+            "burn_trellis: decoder conv telemetry [{stage}] block='{}' conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
+            block.context,
+            block.conv_calls,
+            block.wgpu_calls,
+            block.wgpu_successes,
+            block.wgpu_failures,
+            block.dispatches,
+            block.chunked_calls,
+            block.max_chunk_rows,
+            block.input_bytes,
+            block.output_bytes,
+            block.neighbor_elements
+        );
+    }
 }
 
 fn runtime_skip_decode() -> bool {
@@ -1962,6 +2227,7 @@ fn decode_latent_to_outputs(
     tex: &TexSLatSample,
     pipeline_type: &str,
     parity_strict: bool,
+    capture_debug_artifacts: bool,
     #[cfg(feature = "runtime-model")] shape_decoder: Option<&FdgDecoderRuntime>,
     #[cfg(feature = "runtime-model")] tex_decoder: Option<&SparseUnetVaeDecoderRuntime>,
 ) -> Result<DecodedLatentOutput, String> {
@@ -1995,8 +2261,16 @@ fn decode_latent_to_outputs(
                 DecodeStageSource::FallbackMissingTexDecoder,
             ));
         };
-        decode_latent_with_runtime_decoders(shape, tex, pipeline_type, parity_strict, shape_decoder, tex_decoder)
-            .or_else(|err| {
+        decode_latent_with_runtime_decoders(
+            shape,
+            tex,
+            pipeline_type,
+            parity_strict,
+            capture_debug_artifacts,
+            shape_decoder,
+            tex_decoder,
+        )
+        .or_else(|err| {
                 if parity_strict {
                     Err(format!("burn_trellis: runtime decode pipeline failed: {err}"))
                 } else {
@@ -2010,7 +2284,13 @@ fn decode_latent_to_outputs(
 
     #[cfg(not(feature = "runtime-model"))]
     {
-        let _ = (shape, tex, pipeline_type, parity_strict);
+        let _ = (
+            shape,
+            tex,
+            pipeline_type,
+            parity_strict,
+            capture_debug_artifacts,
+        );
         Err("burn_trellis: TRELLIS decode requires `runtime-model` feature".to_string())
     }
 }
@@ -2036,6 +2316,7 @@ fn decode_latent_with_runtime_decoders(
     tex: &TexSLatSample,
     pipeline_type: &str,
     parity_strict: bool,
+    capture_debug_artifacts: bool,
     shape_decoder: &FdgDecoderRuntime,
     tex_decoder: &SparseUnetVaeDecoderRuntime,
 ) -> Result<DecodedLatentOutput, String> {
@@ -2066,13 +2347,16 @@ fn decode_latent_with_runtime_decoders(
     if stage_debug {
         eprintln!("burn_trellis: decode runtime begin (rows={count})");
     }
+    let conv_telemetry_debug = runtime_decoder_conv_telemetry_enabled();
     let shape_rows = &shape.features[..count];
     let tex_rows = &tex.features[..count];
+    reset_decoder_conv_telemetry();
     let shape_decode_start = Instant::now();
     let shape_decoded = shape_decoder
         .decode_sparse(&shape.coords[..count], shape_rows)
         .map_err(|err| format!("shape runtime decoder failed: {err}"))?;
     let shape_decoder_ms = shape_decode_start.elapsed().as_secs_f64() * 1000.0;
+    let shape_conv_telemetry = decoder_conv_telemetry();
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime shape-decoder complete ({:.2} ms, subs={}, coords={})",
@@ -2081,7 +2365,11 @@ fn decode_latent_with_runtime_decoders(
             shape_decoded.coords.len()
         );
     }
+    if stage_debug || conv_telemetry_debug {
+        log_decoder_conv_telemetry("shape_decoder", &shape_conv_telemetry);
+    }
 
+    reset_decoder_conv_telemetry();
     let tex_decode_start = Instant::now();
     let tex_decoded = tex_decoder
         .decode_with_guidance(
@@ -2091,12 +2379,16 @@ fn decode_latent_with_runtime_decoders(
         )
         .map_err(|err| format!("tex runtime decoder failed: {err}"))?;
     let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
+    let tex_conv_telemetry = decoder_conv_telemetry();
     if stage_debug {
         eprintln!(
             "burn_trellis: decode runtime tex-decoder complete ({:.2} ms, coords={})",
             tex_decoder_ms,
             tex_decoded.coords.len()
         );
+    }
+    if stage_debug || conv_telemetry_debug {
+        log_decoder_conv_telemetry("tex_decoder", &tex_conv_telemetry);
     }
 
     let final_resolution = final_resolution_for_pipeline(pipeline_type);
@@ -2155,18 +2447,19 @@ fn decode_latent_with_runtime_decoders(
         (Vec::new(), None, None, 0.0)
     } else {
         let pbr_start = Instant::now();
-        let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels(
+        let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels_with_options(
             vertices.as_slice(),
             faces.as_slice(),
             coords.as_slice(),
             voxel_attrs.as_slice(),
             final_resolution as u32,
+            capture_debug_artifacts,
         );
         let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
             eprintln!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
         }
-        (uvs, pbr_textures, Some(pbr_debug), pbr_ms)
+        (uvs, pbr_textures, pbr_debug, pbr_ms)
     };
     let material = summarize_material(voxel_attrs.as_slice(), pbr_textures.as_ref());
     let mesh = if vertices.is_empty() || faces.is_empty() {
@@ -2209,6 +2502,18 @@ fn decode_latent_with_runtime_decoders(
             attr_merge_ms,
             mesh_ms,
             pbr_ms,
+            shape_conv_calls: shape_conv_telemetry.conv_calls,
+            tex_conv_calls: tex_conv_telemetry.conv_calls,
+            shape_wgpu_dispatches: shape_conv_telemetry.dispatches,
+            tex_wgpu_dispatches: tex_conv_telemetry.dispatches,
+            shape_wgpu_chunked_calls: shape_conv_telemetry.chunked_calls,
+            tex_wgpu_chunked_calls: tex_conv_telemetry.chunked_calls,
+            shape_wgpu_input_bytes: shape_conv_telemetry.input_bytes,
+            tex_wgpu_input_bytes: tex_conv_telemetry.input_bytes,
+            shape_wgpu_output_bytes: shape_conv_telemetry.output_bytes,
+            tex_wgpu_output_bytes: tex_conv_telemetry.output_bytes,
+            shape_wgpu_max_chunk_rows: shape_conv_telemetry.max_chunk_rows,
+            tex_wgpu_max_chunk_rows: tex_conv_telemetry.max_chunk_rows,
         },
     })
 }
@@ -2462,7 +2767,7 @@ mod tests {
             shape_slat_cond: vec![[0.0; 32]],
             coords: vec![[0, 0, 0, 0]],
         };
-        let decoded = decode_latent_to_outputs(&shape, &tex, "512", false, None, None)
+        let decoded = decode_latent_to_outputs(&shape, &tex, "512", false, false, None, None)
             .expect("non-strict decode should use fallback output when decoders are missing");
         assert!(!decoded.mesh.vertices.is_empty());
         assert!(!decoded.mesh.faces.is_empty());
@@ -2512,7 +2817,7 @@ mod tests {
             shape_slat_cond: vec![[0.0; 32]],
             coords: vec![[0, 0, 0, 0]],
         };
-        let err = decode_latent_to_outputs(&shape, &tex, "512", true, None, None)
+        let err = decode_latent_to_outputs(&shape, &tex, "512", true, false, None, None)
             .expect_err("strict decode should fail when runtime decoders are missing");
         assert!(err.contains("shape runtime decoder is required"));
     }

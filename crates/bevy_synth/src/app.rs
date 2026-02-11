@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
@@ -26,12 +26,13 @@ use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::ui::IsDefaultUiCamera;
-use bevy::window::{FileDragAndDrop, PrimaryWindow, WindowCloseRequested};
+use bevy::window::{PrimaryWindow, WindowCloseRequested};
 use bevy_editor_core::selection::{
     EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_file_dialog::prelude::{DialogFilePicked, FileDialogExt, FileDialogPlugin};
+use bevy_file_dialog::prelude::{
+    DialogFileDropped, DialogFileLoaded, FileDialogExt, FileDialogPlugin,
+};
 use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
@@ -55,7 +56,6 @@ use bevy_synth_runtime::state::{
 };
 use bevy_synth_runtime::worker::start_worker;
 use bevy_synth_runtime::{SynthMesh, SynthMeshTexture};
-#[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnRequest, CatalogState, CatalogStatus,
@@ -160,19 +160,6 @@ enum McpSceneCommand {
 }
 
 #[derive(SystemParam)]
-struct FileDropContext<'w, 's> {
-    events: MessageReader<'w, 's, FileDragAndDrop>,
-    queue: ResMut<'w, InferenceQueue>,
-    args: Res<'w, AppArgs>,
-    asset_server: Res<'w, AssetServer>,
-    commands: Commands<'w, 's>,
-    materials: ResMut<'w, Assets<StandardMaterial>>,
-    status: ResMut<'w, UiStatus>,
-    catalog: ResMut<'w, CatalogState>,
-    exit_state: Res<'w, ExitState>,
-}
-
-#[derive(SystemParam)]
 pub(crate) struct InferenceContext<'w, 's> {
     commands: Commands<'w, 's>,
     queue: ResMut<'w, InferenceQueue>,
@@ -200,9 +187,9 @@ pub(crate) fn run() {
     let mcp_scene_control = McpSceneControl::from_args(&app_args);
 
     let status_message = if app_args.image.is_none() && app_args.mesh.is_none() {
-        "Drag & drop an image (.png/.jpg) or mesh (.glb/.gltf/.obj) to begin.".to_string()
+        "upload an image (.png/.jpg) to begin.".to_string()
     } else {
-        "Initializing synth viewer…".to_string()
+        "initializing viewer…".to_string()
     };
 
     let mut app = App::new();
@@ -234,7 +221,9 @@ pub(crate) fn run() {
             Update,
             (
                 handle_exit_requests,
-                handle_file_drop,
+                handle_open_file_dialog,
+                handle_file_dialog_loads,
+                handle_dropped_files,
                 drive_inference,
                 handle_catalog_spawn_requests,
                 handle_catalog_delete_requests,
@@ -255,17 +244,18 @@ pub(crate) fn run() {
         .add_systems(
             PostUpdate,
             (sync_panorbit_bindings, sync_panorbit_enabled).before(PanOrbitCameraSystemSet),
+        )
+        .add_plugins(
+            FileDialogPlugin::new()
+                .with_load_file::<ImagePickDialog>()
+                .with_drop_file::<ImagePickDialog>(),
         );
 
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        app.add_plugins(FileDialogPlugin::new().with_pick_file::<ImagePickDialog>())
-            .add_systems(Update, (handle_open_file_dialog, handle_file_dialog_picks))
-            .add_systems(
-                Update,
-                poll_mcp_scene_control.before(mark_world_cache_dirty),
-            );
-    }
+    app.add_systems(
+        Update,
+        poll_mcp_scene_control.before(mark_world_cache_dirty),
+    );
 
     app.run();
 }
@@ -664,43 +654,6 @@ fn apply_cached_camera_state(
     true
 }
 
-fn handle_file_drop(mut ctx: FileDropContext) {
-    if ctx.exit_state.requested {
-        return;
-    }
-    for event in ctx.events.read() {
-        let FileDragAndDrop::DroppedFile { path_buf, .. } = event else {
-            continue;
-        };
-
-        if is_image_file(path_buf) {
-            let request = enqueue_inference(path_buf.clone(), &ctx.args, &mut ctx.queue);
-            ctx.catalog.add_pending(&request);
-            info!("Queued inference for {}", path_buf.display());
-            continue;
-        }
-
-        if is_mesh_file(path_buf) {
-            spawn_mesh_asset(
-                &mut ctx.commands,
-                &ctx.asset_server,
-                &mut ctx.materials,
-                path_buf.clone(),
-            );
-            info!("Loaded mesh asset {}", path_buf.display());
-            continue;
-        }
-
-        warn!(
-            "Dropped file {} is not a supported image or mesh",
-            path_buf.display()
-        );
-    }
-
-    update_status_message(&ctx.args, &ctx.queue, &mut ctx.status);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn handle_open_file_dialog(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
@@ -721,13 +674,16 @@ fn handle_open_file_dialog(
                     "png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "tif", "tiff",
                 ],
             )
-            .pick_multiple_file_paths::<ImagePickDialog>();
+            .load_multiple_files::<ImagePickDialog>();
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn handle_file_dialog_picks(
-    mut events: MessageReader<DialogFilePicked<ImagePickDialog>>,
+#[allow(clippy::too_many_arguments)]
+fn handle_file_dialog_loads(
+    mut events: MessageReader<DialogFileLoaded<ImagePickDialog>>,
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut queue: ResMut<InferenceQueue>,
     args: Res<AppArgs>,
     mut status: ResMut<UiStatus>,
@@ -739,21 +695,124 @@ fn handle_file_dialog_picks(
     }
     let mut queued = 0usize;
     for event in events.read() {
-        if is_image_file(&event.path) {
-            let request = enqueue_inference(event.path.clone(), &args, &mut queue);
-            catalog.add_pending(&request);
-            queued += 1;
-        } else {
-            warn!(
-                "Selected file {} is not a supported image",
-                event.path.display()
-            );
-        }
+        queued += ingest_candidate_file(
+            event.path(),
+            &event.file_name,
+            event.contents.as_slice(),
+            &args,
+            &mut queue,
+            &mut catalog,
+            &mut commands,
+            &asset_server,
+            &mut materials,
+            "Selected file",
+        );
     }
 
     if queued > 0 {
         update_status_message(&args, &queue, &mut status);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_dropped_files(
+    mut events: MessageReader<DialogFileDropped<ImagePickDialog>>,
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut queue: ResMut<InferenceQueue>,
+    args: Res<AppArgs>,
+    mut status: ResMut<UiStatus>,
+    mut catalog: ResMut<CatalogState>,
+    exit_state: Res<ExitState>,
+) {
+    if exit_state.requested {
+        return;
+    }
+    let mut queued = 0usize;
+    for event in events.read() {
+        queued += ingest_candidate_file(
+            event.path(),
+            &event.file_name,
+            event.contents.as_slice(),
+            &args,
+            &mut queue,
+            &mut catalog,
+            &mut commands,
+            &asset_server,
+            &mut materials,
+            "Dropped file",
+        );
+    }
+    if queued > 0 {
+        update_status_message(&args, &queue, &mut status);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_candidate_file(
+    path: Option<&Path>,
+    file_name: &str,
+    contents: &[u8],
+    args: &AppArgs,
+    queue: &mut InferenceQueue,
+    catalog: &mut CatalogState,
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    materials: &mut Assets<StandardMaterial>,
+    source_label: &str,
+) -> usize {
+    if let Some(path) = path {
+        if is_image_file(path) {
+            let request = enqueue_inference(path.to_path_buf(), args, queue);
+            catalog.add_pending(&request);
+            info!("Queued inference for {}", path.display());
+            return 1;
+        }
+        if is_mesh_file(path) {
+            spawn_mesh_asset(commands, asset_server, materials, path.to_path_buf());
+            info!("Loaded mesh asset {}", path.display());
+            return 0;
+        }
+        warn!(
+            "{source_label} {} is not a supported image or mesh",
+            path.display()
+        );
+        return 0;
+    }
+
+    let inferred_path = Path::new(file_name);
+    if is_image_file(inferred_path) {
+        let request = enqueue_inference_with_contents(
+            virtual_upload_path(file_name, queue.counter),
+            Some(contents.to_vec()),
+            args,
+            queue,
+        );
+        catalog.add_pending(&request);
+        info!("Queued uploaded inference for {file_name}");
+        return 1;
+    }
+    if is_mesh_file(inferred_path) {
+        warn!(
+            "{source_label} {file_name} is a mesh, but web uploads for mesh assets require URL-backed asset loading."
+        );
+        return 0;
+    }
+    warn!("{source_label} {file_name} is not a supported image or mesh");
+    0
+}
+
+fn virtual_upload_path(file_name: &str, request_id: u32) -> PathBuf {
+    let mut sanitized = String::with_capacity(file_name.len());
+    for ch in file_name.chars() {
+        let allowed = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_');
+        sanitized.push(if allowed { ch } else { '_' });
+    }
+    if sanitized.is_empty() {
+        sanitized.push_str("upload_image");
+    }
+    PathBuf::from(format!("uploaded/{request_id:08}_{sanitized}"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1453,10 +1512,20 @@ pub(crate) fn enqueue_inference(
     args: &AppArgs,
     queue: &mut InferenceQueue,
 ) -> InferenceRequest {
+    enqueue_inference_with_contents(image_path, None, args, queue)
+}
+
+pub(crate) fn enqueue_inference_with_contents(
+    image_path: PathBuf,
+    image_contents: Option<Vec<u8>>,
+    args: &AppArgs,
+    queue: &mut InferenceQueue,
+) -> InferenceRequest {
     let output_path = resolve_output_path(args.output.as_ref(), &image_path, queue.counter);
     let request = InferenceRequest {
         id: queue.counter,
         image_path,
+        image_contents,
         output_path,
     };
     queue.counter = queue.counter.wrapping_add(1);
@@ -1484,9 +1553,9 @@ fn update_status_message(args: &AppArgs, queue: &InferenceQueue, status: &mut Ui
     } else if !queue.pending.is_empty() {
         format!("Queued {} inference job(s)…", queue.pending.len())
     } else if args.image.is_none() && args.mesh.is_none() && queue.completed == 0 {
-        "Drag & drop an image (.png/.jpg) or mesh (.glb/.gltf/.obj) to begin.".to_string()
+        "upload an image (.png/.jpg) to begin.".to_string()
     } else {
-        "Ready. Drag & drop another image or mesh to add more.".to_string()
+        "ready. upload another image.".to_string()
     };
 
     status.processing = queue
@@ -1502,8 +1571,8 @@ fn update_status_message(args: &AppArgs, queue: &InferenceQueue, status: &mut Ui
 
 fn spawn_mesh_asset(
     commands: &mut Commands,
-    asset_server: &Res<AssetServer>,
-    materials: &mut ResMut<Assets<StandardMaterial>>,
+    asset_server: &AssetServer,
+    materials: &mut Assets<StandardMaterial>,
     mesh_path: PathBuf,
 ) {
     let mesh_handle: Handle<BevyMesh> = asset_server.load(mesh_path);

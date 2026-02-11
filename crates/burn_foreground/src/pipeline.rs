@@ -108,6 +108,23 @@ pub fn prepare_image_data<B: Backend>(
     config: &PrepareImageConfig,
 ) -> Result<PreparedImageData, PrepareImageError> {
     let loaded = load_image_rgb(path, config.max_dimension)?;
+    prepare_loaded_image(loaded, pipeline, config)
+}
+
+pub fn prepare_image_data_from_bytes<B: Backend>(
+    bytes: &[u8],
+    pipeline: Option<&RmbgPipeline<B>>,
+    config: &PrepareImageConfig,
+) -> Result<PreparedImageData, PrepareImageError> {
+    let loaded = load_image_rgb_from_bytes(bytes, config.max_dimension)?;
+    prepare_loaded_image(loaded, pipeline, config)
+}
+
+fn prepare_loaded_image<B: Backend>(
+    loaded: LoadedImage,
+    pipeline: Option<&RmbgPipeline<B>>,
+    config: &PrepareImageConfig,
+) -> Result<PreparedImageData, PrepareImageError> {
     let rgb = loaded.rgb;
     let alpha = loaded.alpha;
     let width = loaded.width;
@@ -191,12 +208,39 @@ pub fn prepare_image_tensor<B: Backend>(
     Ok(flat.reshape([1, 3, prepared.height as i32, prepared.width as i32]))
 }
 
+pub fn prepare_image_tensor_from_bytes<B: Backend>(
+    bytes: &[u8],
+    pipeline: Option<&RmbgPipeline<B>>,
+    device: &B::Device,
+    config: &PrepareImageConfig,
+) -> Result<Tensor<B, 4>, PrepareImageError> {
+    let prepared = prepare_image_data_from_bytes(bytes, pipeline, config)?;
+    let flat = Tensor::<B, 1>::from_floats(prepared.data.as_slice(), device);
+    Ok(flat.reshape([1, 3, prepared.height as i32, prepared.width as i32]))
+}
+
 pub(crate) fn load_image_rgb(
     path: &Path,
     max_dimension: usize,
 ) -> Result<LoadedImage, PrepareImageError> {
     let image = image::open(path)
         .map_err(|err| PrepareImageError(format!("invalid image path {path:?}: {err}")))?;
+    load_image_rgb_from_dynamic(image, max_dimension)
+}
+
+pub(crate) fn load_image_rgb_from_bytes(
+    bytes: &[u8],
+    max_dimension: usize,
+) -> Result<LoadedImage, PrepareImageError> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|err| PrepareImageError(format!("invalid image bytes: {err}")))?;
+    load_image_rgb_from_dynamic(image, max_dimension)
+}
+
+fn load_image_rgb_from_dynamic(
+    image: image::DynamicImage,
+    max_dimension: usize,
+) -> Result<LoadedImage, PrepareImageError> {
     let has_alpha = image.color().has_alpha();
 
     let rgba = image.to_rgba8();

@@ -15,7 +15,7 @@ runtime-model = [
     "dep:matrixmultiply",
 ]
 runtime-model-wgpu = ["runtime-model", "dep:burn-wgpu", "burn_flex_gmm/wgpu-kernel"]
-import = ["runtime-model", "dep:sha2", "dep:hex"]
+import = ["runtime-model", "dep:sha2", "dep:hex", "dep:burn_synth_import"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -30,6 +30,7 @@ matrixmultiply = { version = "0.3", optional = true }
 burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
 burn_flex_gmm = { path = "../burn_flex_gmm", optional = true }
 burn-store = { version = "0.19", optional = true }
+burn_synth_import = { path = "../burn_synth_import", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
 

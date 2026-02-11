@@ -15,10 +15,10 @@ use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 
 use burn_foreground::pipeline::{
-    PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data, prepare_image_tensor,
+    PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data,
+    prepare_image_data_from_bytes, prepare_image_tensor, prepare_image_tensor_from_bytes,
 };
 use burn_foreground::rmbg2::Rmbg2Pipeline;
-#[cfg(target_arch = "wasm32")]
 use burn_foreground::rmbg14::import::{
     load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_bytes,
     load_rmbg_processor_from_json_bytes,
@@ -27,25 +27,15 @@ use burn_trellis::config::TrellisQuality as TrellisRuntimeQuality;
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
-#[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::dit::TripoSGDiTConfig;
-#[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::dit::import::load_triposg_dit_from_burnpack_bytes;
-#[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::image_encoder::import::{
     default_dinov2_config, load_dinov2_processor_from_json_bytes,
     load_triposg_dinov2_from_burnpack_bytes,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use burn_tripo::model::triposg::image_encoder::import::{
-    load_dinov2_processor, load_triposg_dinov2,
-};
 use burn_tripo::model::triposg::image_encoder::{DinoImageProcessor, TripoSGImageEncoder};
-#[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
-#[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::vae::TripoSGVaeConfig;
-#[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::vae::import::load_triposg_vae_from_burnpack_bytes;
 use burn_tripo::pipeline::{
     geometry::{
@@ -65,6 +55,16 @@ use crate::args::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::load_text_embeds;
+#[cfg(target_arch = "wasm32")]
+use crate::model_loader::{
+    burnpack_manifest_candidates, candidate_burnpack_names, parse_shard_manifest_bytes,
+    prefer_f16_burnpack, resolve_manifest_entry_uri,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::model_loader::{
+    load_burnpack_asset_from_root, load_optional_text_candidates_from_root,
+    load_optional_text_from_root,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::paths::resolve_scribble_root;
 use crate::paths::{resolve_rmbg_root, resolve_triposg_root};
@@ -85,6 +85,33 @@ use worker_unavailable::worker_loop_backend_unavailable;
 
 const WGPU_CHUNK_SIZE_CAP: usize = 8_192;
 const CUDA_CHUNK_SIZE_CAP: usize = 32_768;
+const DINO_CONFIG_RELPATHS: [&str; 3] = [
+    "image_encoder_dinov2/config.json",
+    "image_encoder_2/config.json",
+    "image_encoder_1/config.json",
+];
+const DINO_PREPROCESSOR_RELPATHS: [&str; 3] = [
+    "feature_extractor_dinov2/preprocessor_config.json",
+    "feature_extractor_2/preprocessor_config.json",
+    "feature_extractor_1/preprocessor_config.json",
+];
+
+struct Rmbg14Artifacts {
+    burnpack: Vec<u8>,
+    config_json: Option<String>,
+    processor_json: Option<String>,
+}
+
+struct TriposgArtifacts {
+    vae_burnpack: Vec<u8>,
+    dit_burnpack: Vec<u8>,
+    dino_burnpack: Vec<u8>,
+    vae_config_json: Option<String>,
+    dit_config_json: Option<String>,
+    scheduler_config_json: Option<String>,
+    dino_config_json: Option<String>,
+    dino_preproc_json: Option<String>,
+}
 
 fn synthesis_attempt_order(models: &[SynthesisModel]) -> Result<Vec<SynthesisModel>, String> {
     let mut order = Vec::with_capacity(models.len());
@@ -264,16 +291,33 @@ fn load_rmbg14_pipelines<B: Backend>(
     rmbg_backend: RmbgBackend,
     device: &B::Device,
 ) -> Result<Rmbg14Pipelines<B>, String> {
+    let artifacts = load_rmbg14_artifacts_from_root(rmbg_root)?;
+    let rmbg_config = if let Some(json) = artifacts.config_json.as_ref() {
+        load_rmbg_config_from_json_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse RMBG config: {err}"))?
+    } else {
+        burn_foreground::rmbg14::RmbgConfig::rmbg_1_4()
+    };
+    let rmbg_processor = if let Some(json) = artifacts.processor_json.as_ref() {
+        load_rmbg_processor_from_json_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse RMBG preprocessor config: {err}"))?
+    } else {
+        burn_foreground::preprocess::RmbgImageProcessor::default()
+    };
+    let rmbg_burnpack = artifacts.burnpack;
+
     match rmbg_backend {
         RmbgBackend::Cpu => {
             let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-            let rmbg = RmbgPipeline::from_pretrained(rmbg_root, &cpu_device)
-                .map_err(|err| format!("failed to load RMBG-1.4 weights on CPU: {err}"))?;
+            let model = load_rmbg_from_burnpack_bytes(&cpu_device, rmbg_burnpack, &rmbg_config)
+                .map_err(|err| format!("failed to load RMBG burnpack on CPU: {err}"))?;
+            let rmbg = RmbgPipeline::new(model, rmbg_processor);
             Ok((Some(rmbg), None))
         }
         RmbgBackend::Gpu | RmbgBackend::Auto => {
-            let mut rmbg = RmbgPipeline::from_pretrained(rmbg_root, device)
-                .map_err(|err| format!("failed to load RMBG-1.4 weights: {err}"))?;
+            let model = load_rmbg_from_burnpack_bytes(device, rmbg_burnpack, &rmbg_config)
+                .map_err(|err| format!("failed to load RMBG burnpack: {err}"))?;
+            let mut rmbg = RmbgPipeline::new(model, rmbg_processor);
             cap_rmbg14_processor_for_backend::<B>(&mut rmbg, rmbg_backend);
             Ok((None, Some(rmbg)))
         }
@@ -302,23 +346,144 @@ fn load_triposg_pipeline<B: Backend>(
     dino_backend: DinoBackend,
 ) -> Result<(Option<DinoCpuState>, TripoSGPipeline<B>), String> {
     let weights_root = resolve_triposg_root(args.weights_root.as_ref());
+    let artifacts = load_triposg_artifacts_from_root(&weights_root)?;
+    build_triposg_pipeline_from_artifacts::<B>(device, dino_backend, artifacts)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_rmbg14_artifacts_from_root(root: &std::path::Path) -> Result<Rmbg14Artifacts, String> {
+    let burnpack = load_burnpack_asset_from_root(root, "model.safetensors", "RMBG_BPK_PRECISION")?;
+    let config_json = load_optional_text_from_root(root, "config.json")?;
+    let processor_json = load_optional_text_from_root(root, "preprocessor_config.json")?;
+    Ok(Rmbg14Artifacts {
+        burnpack,
+        config_json,
+        processor_json,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_triposg_artifacts_from_root(root: &std::path::Path) -> Result<TriposgArtifacts, String> {
+    let vae_burnpack = load_burnpack_asset_from_root(
+        root,
+        "vae/diffusion_pytorch_model.safetensors",
+        "TRIPOSG_BPK_PRECISION",
+    )?;
+    let dit_burnpack = load_burnpack_asset_from_root(
+        root,
+        "transformer/diffusion_pytorch_model.safetensors",
+        "TRIPOSG_BPK_PRECISION",
+    )?;
+    let dino_burnpack = load_burnpack_asset_from_root(
+        root,
+        "image_encoder_dinov2/model.safetensors",
+        "TRIPOSG_BPK_PRECISION",
+    )?;
+    let vae_config_json = load_optional_text_from_root(root, "vae/config.json")?;
+    let dit_config_json = load_optional_text_from_root(root, "transformer/config.json")?;
+    let scheduler_config_json =
+        load_optional_text_from_root(root, "scheduler/scheduler_config.json")?;
+    let dino_config_json = load_optional_text_candidates_from_root(root, &DINO_CONFIG_RELPATHS)?;
+    let dino_preproc_json =
+        load_optional_text_candidates_from_root(root, &DINO_PREPROCESSOR_RELPATHS)?;
+
+    Ok(TriposgArtifacts {
+        vae_burnpack,
+        dit_burnpack,
+        dino_burnpack,
+        vae_config_json,
+        dit_config_json,
+        scheduler_config_json,
+        dino_config_json,
+        dino_preproc_json,
+    })
+}
+
+fn build_triposg_pipeline_from_artifacts<B: Backend>(
+    device: &B::Device,
+    dino_backend: DinoBackend,
+    artifacts: TriposgArtifacts,
+) -> Result<(Option<DinoCpuState>, TripoSGPipeline<B>), String> {
+    let vae_config = if let Some(json) = artifacts.vae_config_json.as_ref() {
+        TripoSGVaeConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG VAE config: {err}"))?
+    } else {
+        TripoSGVaeConfig::midi_3d()
+    };
+    let dit_config = if let Some(json) = artifacts.dit_config_json.as_ref() {
+        TripoSGDiTConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG DiT config: {err}"))?
+    } else {
+        TripoSGDiTConfig::triposg_pretrained()
+    };
+    let scheduler_config = if let Some(json) = artifacts.scheduler_config_json.as_ref() {
+        RectifiedFlowSchedulerConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse scheduler config: {err}"))?
+    } else {
+        RectifiedFlowSchedulerConfig::midi_3d()
+    };
+
+    let parsed_dino_config = artifacts.dino_config_json.as_ref().and_then(|json| {
+        burn_tripo::model::triposg::image_encoder::import::load_dinov2_config_from_json_bytes(
+            json.as_bytes(),
+        )
+    });
+    let dino_fallback_size = parsed_dino_config.as_ref().map(|cfg| cfg.image_size);
+    let mut dino_config = parsed_dino_config
+        .clone()
+        .unwrap_or_else(default_dinov2_config);
+    if let Some(size) = artifacts.dino_preproc_json.as_ref().and_then(|json| {
+        burn_tripo::model::triposg::image_encoder::import::load_dinov2_preprocess_size_from_json_bytes(
+            json.as_bytes(),
+        )
+    }) {
+        let patch = dino_config.patch_size.max(1);
+        let grid = size / patch;
+        if grid > 0 {
+            dino_config.positional_encoding_interpolate.output_size = Some([grid, grid]);
+        }
+    }
+    let dino_processor = if let Some(json) = artifacts.dino_preproc_json.as_ref() {
+        load_dinov2_processor_from_json_bytes(json.as_bytes(), dino_fallback_size)
+            .map_err(|err| format!("failed to parse DINO preprocessor config: {err}"))?
+    } else {
+        DinoImageProcessor::default()
+    };
+
+    let dino_burnpack_for_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
+        Some(artifacts.dino_burnpack.clone())
+    } else {
+        None
+    };
+
+    let vae = load_triposg_vae_from_burnpack_bytes(&vae_config, device, artifacts.vae_burnpack)
+        .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
+    let dit = load_triposg_dit_from_burnpack_bytes(&dit_config, device, artifacts.dit_burnpack)
+        .map_err(|err| format!("failed to load TripoSG DiT burnpack: {err}"))?;
+    let image_encoder =
+        load_triposg_dinov2_from_burnpack_bytes(device, dino_config, artifacts.dino_burnpack)
+            .map_err(|err| format!("failed to load DINOv2 burnpack: {err}"))?;
+    let scheduler = scheduler_config.init();
+    let triposg = TripoSGPipeline::new(vae, dit, scheduler, image_encoder, dino_processor.clone());
+
     let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
         let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-        let weights_path = weights_root.join("image_encoder_dinov2/model.safetensors");
-        let encoder = load_triposg_dinov2(&cpu_device, &weights_path)
-            .map_err(|err| format!("failed to load DINOv2 weights on CPU: {err}"))?;
-        let processor = load_dinov2_processor(&weights_root)
-            .map_err(|err| format!("failed to load DINOv2 processor: {err}"))?;
+        let cpu_config = parsed_dino_config.unwrap_or_else(default_dinov2_config);
+        let encoder = load_triposg_dinov2_from_burnpack_bytes(
+            &cpu_device,
+            cpu_config,
+            dino_burnpack_for_cpu.expect("cpu dino burnpack must exist"),
+        )
+        .map_err(|err| format!("failed to load DINOv2 burnpack on CPU: {err}"))?;
         Some(DinoCpuState {
             device: cpu_device,
             encoder,
-            processor,
+            processor: dino_processor,
         })
     } else {
         None
     };
-    let triposg = TripoSGPipeline::from_pretrained(weights_root, device)
-        .map_err(|err| format!("failed to load TripoSG weights: {err}"))?;
+
     Ok((dino_cpu, triposg))
 }
 
@@ -728,30 +893,20 @@ async fn build_pipeline_state_wasm<B: Backend>(
     let rmbg_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), rmbg_model);
     let rmbg_root_url = normalize_web_path(&rmbg_root);
 
-    let rmbg_burnpack = download_burnpack_asset(
-        &join_web_path(&rmbg_root_url, "model.safetensors"),
-        "RMBG",
-        "RMBG_BPK_PRECISION",
-        event_tx,
-        &mut totals,
-    )
-    .await?;
-    let rmbg_config_json =
-        fetch_optional_text(&join_web_path(&rmbg_root_url, "config.json")).await?;
-    let rmbg_processor_json =
-        fetch_optional_text(&join_web_path(&rmbg_root_url, "preprocessor_config.json")).await?;
-    let rmbg_config = if let Some(json) = rmbg_config_json {
+    let rmbg_artifacts = load_rmbg14_artifacts_wasm(&rmbg_root_url, event_tx, &mut totals).await?;
+    let rmbg_config = if let Some(json) = rmbg_artifacts.config_json.as_ref() {
         load_rmbg_config_from_json_bytes(json.as_bytes())
             .map_err(|err| format!("failed to parse RMBG config: {err}"))?
     } else {
         burn_foreground::rmbg14::RmbgConfig::rmbg_1_4()
     };
-    let rmbg_processor = if let Some(json) = rmbg_processor_json {
+    let rmbg_processor = if let Some(json) = rmbg_artifacts.processor_json.as_ref() {
         load_rmbg_processor_from_json_bytes(json.as_bytes())
             .map_err(|err| format!("failed to parse RMBG preprocessor config: {err}"))?
     } else {
         burn_foreground::preprocess::RmbgImageProcessor::default()
     };
+    let rmbg_burnpack = rmbg_artifacts.burnpack;
 
     let (rmbg14_cpu, rmbg14_device) = match rmbg_backend {
         RmbgBackend::Cpu => {
@@ -868,8 +1023,42 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
 ) -> Result<(Option<DinoCpuState>, TripoSGPipeline<B>), String> {
     let triposg_root = resolve_triposg_root(args.weights_root.as_ref());
     let triposg_root_url = normalize_web_path(&triposg_root);
+    let artifacts = load_triposg_artifacts_wasm(&triposg_root_url, event_tx, totals).await?;
+    build_triposg_pipeline_from_artifacts::<B>(device, dino_backend, artifacts)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_rmbg14_artifacts_wasm(
+    rmbg_root_url: &str,
+    event_tx: &Sender<WorkerEvent>,
+    totals: &mut DownloadTotals,
+) -> Result<Rmbg14Artifacts, String> {
+    let burnpack = download_burnpack_asset(
+        &join_web_path(rmbg_root_url, "model.safetensors"),
+        "RMBG",
+        "RMBG_BPK_PRECISION",
+        event_tx,
+        totals,
+    )
+    .await?;
+    let config_json = fetch_optional_text(&join_web_path(rmbg_root_url, "config.json")).await?;
+    let processor_json =
+        fetch_optional_text(&join_web_path(rmbg_root_url, "preprocessor_config.json")).await?;
+    Ok(Rmbg14Artifacts {
+        burnpack,
+        config_json,
+        processor_json,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_triposg_artifacts_wasm(
+    triposg_root_url: &str,
+    event_tx: &Sender<WorkerEvent>,
+    totals: &mut DownloadTotals,
+) -> Result<TriposgArtifacts, String> {
     let vae_burnpack = download_burnpack_asset(
-        &join_web_path(&triposg_root_url, "vae/diffusion_pytorch_model.safetensors"),
+        &join_web_path(triposg_root_url, "vae/diffusion_pytorch_model.safetensors"),
         "TripoSG VAE",
         "TRIPOSG_BPK_PRECISION",
         event_tx,
@@ -878,7 +1067,7 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
     .await?;
     let dit_burnpack = download_burnpack_asset(
         &join_web_path(
-            &triposg_root_url,
+            triposg_root_url,
             "transformer/diffusion_pytorch_model.safetensors",
         ),
         "TripoSG DiT",
@@ -888,127 +1077,43 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
     )
     .await?;
     let dino_burnpack = download_burnpack_asset(
-        &join_web_path(&triposg_root_url, "image_encoder_dinov2/model.safetensors"),
+        &join_web_path(triposg_root_url, "image_encoder_dinov2/model.safetensors"),
         "DINOv2",
         "TRIPOSG_BPK_PRECISION",
         event_tx,
         totals,
     )
     .await?;
-
     let vae_config_json =
-        fetch_optional_text(&join_web_path(&triposg_root_url, "vae/config.json")).await?;
+        fetch_optional_text(&join_web_path(triposg_root_url, "vae/config.json")).await?;
     let dit_config_json =
-        fetch_optional_text(&join_web_path(&triposg_root_url, "transformer/config.json")).await?;
+        fetch_optional_text(&join_web_path(triposg_root_url, "transformer/config.json")).await?;
     let scheduler_config_json = fetch_optional_text(&join_web_path(
-        &triposg_root_url,
+        triposg_root_url,
         "scheduler/scheduler_config.json",
     ))
     .await?;
-    let dino_config_json = fetch_optional_text(&join_web_path(
-        &triposg_root_url,
-        "image_encoder_dinov2/config.json",
-    ))
-    .await?;
-    let dino_preproc_json = fetch_optional_text(&join_web_path(
-        &triposg_root_url,
-        "feature_extractor_dinov2/preprocessor_config.json",
-    ))
-    .await?;
+    let dino_config_candidates = DINO_CONFIG_RELPATHS
+        .iter()
+        .map(|rel| join_web_path(triposg_root_url, rel))
+        .collect::<Vec<_>>();
+    let dino_config_json = fetch_optional_text_candidates(&dino_config_candidates).await?;
+    let dino_preproc_candidates = DINO_PREPROCESSOR_RELPATHS
+        .iter()
+        .map(|rel| join_web_path(triposg_root_url, rel))
+        .collect::<Vec<_>>();
+    let dino_preproc_json = fetch_optional_text_candidates(&dino_preproc_candidates).await?;
 
-    let vae_config = if let Some(json) = vae_config_json {
-        TripoSGVaeConfig::from_config_bytes(json.as_bytes())
-            .map_err(|err| format!("failed to parse TripoSG VAE config: {err}"))?
-    } else {
-        TripoSGVaeConfig::midi_3d()
-    };
-    let dit_config = if let Some(json) = dit_config_json {
-        TripoSGDiTConfig::from_config_bytes(json.as_bytes())
-            .map_err(|err| format!("failed to parse TripoSG DiT config: {err}"))?
-    } else {
-        TripoSGDiTConfig::triposg_pretrained()
-    };
-    let scheduler_config = if let Some(json) = scheduler_config_json {
-        RectifiedFlowSchedulerConfig::from_config_bytes(json.as_bytes())
-            .map_err(|err| format!("failed to parse scheduler config: {err}"))?
-    } else {
-        RectifiedFlowSchedulerConfig::midi_3d()
-    };
-
-    let dino_fallback_size = dino_config_json
-        .as_ref()
-        .and_then(|json| {
-            burn_tripo::model::triposg::image_encoder::import::load_dinov2_config_from_json_bytes(
-                json.as_bytes(),
-            )
-        })
-        .map(|cfg| cfg.image_size);
-    let mut dino_config = dino_config_json
-        .as_ref()
-        .and_then(|json| {
-            burn_tripo::model::triposg::image_encoder::import::load_dinov2_config_from_json_bytes(
-                json.as_bytes(),
-            )
-        })
-        .unwrap_or_else(default_dinov2_config);
-    if let Some(size) = dino_preproc_json.as_ref().and_then(|json| {
-        burn_tripo::model::triposg::image_encoder::import::load_dinov2_preprocess_size_from_json_bytes(
-            json.as_bytes(),
-        )
-    }) {
-        let patch = dino_config.patch_size.max(1);
-        let grid = size / patch;
-        if grid > 0 {
-            dino_config.positional_encoding_interpolate.output_size = Some([grid, grid]);
-        }
-    }
-    let dino_processor = if let Some(json) = dino_preproc_json {
-        load_dinov2_processor_from_json_bytes(json.as_bytes(), dino_fallback_size)
-            .map_err(|err| format!("failed to parse DINO preprocessor config: {err}"))?
-    } else {
-        DinoImageProcessor::default()
-    };
-    let dino_burnpack_for_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
-        Some(dino_burnpack.clone())
-    } else {
-        None
-    };
-
-    let vae = load_triposg_vae_from_burnpack_bytes(&vae_config, device, vae_burnpack)
-        .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
-    let dit = load_triposg_dit_from_burnpack_bytes(&dit_config, device, dit_burnpack)
-        .map_err(|err| format!("failed to load TripoSG DiT burnpack: {err}"))?;
-    let image_encoder = load_triposg_dinov2_from_burnpack_bytes(device, dino_config, dino_burnpack)
-        .map_err(|err| format!("failed to load DINOv2 burnpack: {err}"))?;
-    let scheduler = scheduler_config.init();
-    let triposg = TripoSGPipeline::new(vae, dit, scheduler, image_encoder, dino_processor.clone());
-
-    let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
-        let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-        let cpu_config = dino_config_json
-            .as_ref()
-            .and_then(|json| {
-                burn_tripo::model::triposg::image_encoder::import::load_dinov2_config_from_json_bytes(
-                    json.as_bytes(),
-                )
-            })
-            .unwrap_or_else(default_dinov2_config);
-        let encoder = load_triposg_dinov2_from_burnpack_bytes(
-            &cpu_device,
-            cpu_config,
-            dino_burnpack_for_cpu.expect("cpu dino burnpack must exist"),
-        )
-        .map_err(|err| format!("failed to load DINOv2 burnpack on CPU: {err}"))?;
-        Some(DinoCpuState {
-            device: cpu_device,
-            encoder,
-            processor: dino_processor,
-        })
-    } else {
-        None
-    };
-
-    Ok((dino_cpu, triposg))
+    Ok(TriposgArtifacts {
+        vae_burnpack,
+        dit_burnpack,
+        dino_burnpack,
+        vae_config_json,
+        dit_config_json,
+        scheduler_config_json,
+        dino_config_json,
+        dino_preproc_json,
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1040,41 +1145,21 @@ fn format_mebibytes(bytes: u64) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn prefer_f16_burnpack(primary: &str) -> bool {
-    let value = std::env::var(primary)
-        .ok()
-        .or_else(|| std::env::var("BURN_SYNTH_BPK_PRECISION").ok());
-    match value
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("f32" | "fp32" | "float32" | "32") => false,
-        Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-        Some(_) | None => true,
-    }
+fn web_max_burnpack_bytes() -> u64 {
+    const DEFAULT_MAX_BPK_BYTES: u64 = 1_073_741_824; // 1 GiB
+    option_env!("BURN_SYNTH_WEB_MAX_BPK_BYTES")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_BPK_BYTES)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn candidate_burnpack_urls(base_safetensors_url: &str, prefer_f16: bool) -> Vec<String> {
-    let base = if base_safetensors_url
-        .to_ascii_lowercase()
-        .ends_with(".safetensors")
-    {
-        &base_safetensors_url[..base_safetensors_url.len() - ".safetensors".len()]
-    } else if base_safetensors_url.to_ascii_lowercase().ends_with(".bpk") {
-        return vec![base_safetensors_url.to_string()];
-    } else {
-        base_safetensors_url
-    };
-    let f16 = format!("{base}_f16.bpk");
-    let f32 = format!("{base}.bpk");
-    if prefer_f16 {
-        vec![f16, f32]
-    } else {
-        vec![f32, f16]
-    }
+fn burnpack_too_large_error(url: &str, bytes: u64, limit_bytes: u64) -> String {
+    format!(
+        "burnpack at {url} is {} which exceeds browser limit {} (set build-time BURN_SYNTH_WEB_MAX_BPK_BYTES to raise)",
+        format_mebibytes(bytes),
+        format_mebibytes(limit_bytes),
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1086,56 +1171,122 @@ async fn download_burnpack_asset(
     totals: &mut DownloadTotals,
 ) -> Result<Vec<u8>, String> {
     let candidates =
-        candidate_burnpack_urls(base_safetensors_url, prefer_f16_burnpack(precision_env));
-    let mut last_error = String::new();
+        candidate_burnpack_names(base_safetensors_url, prefer_f16_burnpack(precision_env));
+    let max_bytes = web_max_burnpack_bytes();
+    let mut last_error = "no matching burnpack candidate".to_string();
     for candidate in candidates {
-        let mut registered_total = false;
-        let mut prev = 0u64;
-        let result = fetch_binary_with_progress(&candidate, |loaded, total| {
-            if let Some(total) = total
-                && !registered_total
-            {
-                totals.known_total = totals.known_total.saturating_add(total);
-                registered_total = true;
-            }
-            if registered_total {
-                let delta = loaded.saturating_sub(prev);
-                totals.known_downloaded = totals.known_downloaded.saturating_add(delta);
-            } else {
-                let delta = loaded.saturating_sub(prev);
-                totals.unknown_downloaded = totals.unknown_downloaded.saturating_add(delta);
-            }
-            prev = loaded;
-
-            let message = if totals.known_total > 0 {
-                let percent = (totals.known_downloaded as f64 / totals.known_total as f64) * 100.0;
-                format!(
-                    "Loading {label}... {percent:.1}% ({}/{})",
-                    format_mebibytes(totals.known_downloaded),
-                    format_mebibytes(totals.known_total)
-                )
-            } else {
-                format!(
-                    "Loading {label}... {} downloaded",
-                    format_mebibytes(totals.unknown_downloaded)
-                )
-            };
-            send_worker_status(event_tx, message);
-        })
-        .await;
-        match result {
+        match download_binary_with_status(&candidate, label, max_bytes, event_tx, totals).await {
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
-                last_error = err.clone();
-                if !err.contains("HTTP 404") {
+                last_error = err;
+                if !last_error.contains("HTTP 404") {
                     break;
                 }
             }
+        }
+
+        for manifest_url in burnpack_manifest_candidates(&candidate) {
+            match download_burnpack_from_manifest(&manifest_url, label, max_bytes, event_tx, totals)
+                .await
+            {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => {
+                    last_error = err;
+                    if !last_error.contains("HTTP 404") {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !last_error.contains("HTTP 404") {
+            break;
         }
     }
     Err(format!(
         "failed to download burnpack for {label} from {base_safetensors_url}: {last_error}"
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn download_burnpack_from_manifest(
+    manifest_url: &str,
+    label: &str,
+    max_bytes: u64,
+    event_tx: &Sender<WorkerEvent>,
+    totals: &mut DownloadTotals,
+) -> Result<Vec<u8>, String> {
+    let manifest_text = fetch_text(manifest_url).await?;
+    let manifest = parse_shard_manifest_bytes(manifest_text.as_bytes(), manifest_url)?;
+    let entries = manifest.shard_entries();
+    if entries.is_empty() {
+        return Err(format!(
+            "shard manifest {manifest_url} contains no shard entries"
+        ));
+    }
+
+    let mut output = Vec::with_capacity(manifest.total_bytes as usize);
+    for (index, entry) in entries.iter().enumerate() {
+        let shard_url = resolve_manifest_entry_uri(manifest_url, entry.path());
+        let shard_label = format!("{label} shard {}/{}", index + 1, entries.len());
+        let bytes =
+            download_binary_with_status(&shard_url, &shard_label, max_bytes, event_tx, totals)
+                .await?;
+        output.extend_from_slice(&bytes);
+    }
+
+    if manifest.total_bytes > 0 && output.len() as u64 != manifest.total_bytes {
+        return Err(format!(
+            "manifest {manifest_url} expected {} bytes but reconstructed {} bytes",
+            manifest.total_bytes,
+            output.len()
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn download_binary_with_status(
+    url: &str,
+    label: &str,
+    max_bytes: u64,
+    event_tx: &Sender<WorkerEvent>,
+    totals: &mut DownloadTotals,
+) -> Result<Vec<u8>, String> {
+    let mut registered_total = false;
+    let mut prev = 0u64;
+    fetch_binary_with_progress(url, max_bytes, |loaded, total| {
+        if let Some(total_bytes) = total
+            && !registered_total
+        {
+            totals.known_total = totals.known_total.saturating_add(total_bytes);
+            registered_total = true;
+        }
+        if registered_total {
+            let delta = loaded.saturating_sub(prev);
+            totals.known_downloaded = totals.known_downloaded.saturating_add(delta);
+        } else {
+            let delta = loaded.saturating_sub(prev);
+            totals.unknown_downloaded = totals.unknown_downloaded.saturating_add(delta);
+        }
+        prev = loaded;
+
+        let message = if totals.known_total > 0 {
+            let percent = (totals.known_downloaded as f64 / totals.known_total as f64) * 100.0;
+            format!(
+                "Loading {label}... {percent:.1}% ({}/{})",
+                format_mebibytes(totals.known_downloaded),
+                format_mebibytes(totals.known_total)
+            )
+        } else {
+            format!(
+                "Loading {label}... {} downloaded",
+                format_mebibytes(totals.unknown_downloaded)
+            )
+        };
+        send_worker_status(event_tx, message);
+    })
+    .await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1145,6 +1296,18 @@ async fn fetch_optional_text(url: &str) -> Result<Option<String>, String> {
         Err(err) if err.contains("HTTP 404") => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_optional_text_candidates(urls: &[String]) -> Result<Option<String>, String> {
+    for url in urls {
+        match fetch_text(url).await {
+            Ok(text) => return Ok(Some(text)),
+            Err(err) if err.contains("HTTP 404") => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1169,7 +1332,11 @@ async fn fetch_text(url: &str) -> Result<String, String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn fetch_binary_with_progress<F>(url: &str, mut on_progress: F) -> Result<Vec<u8>, String>
+async fn fetch_binary_with_progress<F>(
+    url: &str,
+    max_bytes: u64,
+    mut on_progress: F,
+) -> Result<Vec<u8>, String>
 where
     F: FnMut(u64, Option<u64>),
 {
@@ -1190,6 +1357,11 @@ where
         .ok()
         .flatten()
         .and_then(|value| value.parse::<u64>().ok());
+    if let Some(total_bytes) = total
+        && total_bytes > max_bytes
+    {
+        return Err(burnpack_too_large_error(url, total_bytes, max_bytes));
+    }
 
     if let Some(body) = response.body() {
         let reader: ReadableStreamDefaultReader = body
@@ -1214,6 +1386,13 @@ where
                 .map_err(|_| format!("missing stream chunk value for {url}"))?;
             let chunk_bytes = Uint8Array::new(&value);
             let len = chunk_bytes.length() as usize;
+            if loaded.saturating_add(len as u64) > max_bytes {
+                return Err(burnpack_too_large_error(
+                    url,
+                    loaded.saturating_add(len as u64),
+                    max_bytes,
+                ));
+            }
             let old_len = output.len();
             output.resize(old_len + len, 0);
             chunk_bytes.copy_to(&mut output[old_len..]);
@@ -1231,6 +1410,13 @@ where
         .await
         .map_err(|err| format!("failed to await array_buffer for {url}: {err:?}"))?;
     let bytes = Uint8Array::new(&buffer);
+    if (bytes.length() as u64) > max_bytes {
+        return Err(burnpack_too_large_error(
+            url,
+            bytes.length() as u64,
+            max_bytes,
+        ));
+    }
     let mut output = vec![0u8; bytes.length() as usize];
     bytes.copy_to(&mut output);
     on_progress(output.len() as u64, total);
@@ -1360,6 +1546,13 @@ fn run_trellis_batch<B: Backend>(
     let device = trellis_device_for_backend(args.backend.clone());
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
+        if request.image_contents.is_some() {
+            results.push(Err(format!(
+                "Trellis2 inference from uploaded bytes is unsupported for '{}'.",
+                request.image_path.display()
+            )));
+            continue;
+        }
         let options = TrellisRunOptions {
             quality,
             device,
@@ -1389,6 +1582,38 @@ fn prepare_request<B: Backend>(
     request: &InferenceRequest,
     config: &PrepareImageConfig,
 ) -> Result<(Tensor<B, 4>, Option<PreparedImageData>), String> {
+    if let Some(bytes) = request.image_contents.as_deref() {
+        return match state.rmbg_model {
+            RmbgModel::Rmbg2 => Err(format!(
+                "RMBG-2.0 preprocessing from uploaded bytes is unsupported for '{}'.",
+                request.image_path.display()
+            )),
+            RmbgModel::Rmbg14 => match state.rmbg_backend {
+                RmbgBackend::Cpu => {
+                    let rmbg = state
+                        .rmbg14_cpu
+                        .as_ref()
+                        .ok_or_else(|| "RMBG-1.4 CPU pipeline not loaded".to_string())?;
+                    let prepared: PreparedImageData =
+                        prepare_image_data_from_bytes(bytes, Some(rmbg), config)
+                            .map_err(|err| format!("failed to prepare image bytes: {err}"))?;
+                    let image = prepared.to_tensor::<B>(device);
+                    Ok((image, Some(prepared)))
+                }
+                RmbgBackend::Gpu | RmbgBackend::Auto => {
+                    let image = prepare_image_tensor_from_bytes::<B>(
+                        bytes,
+                        state.rmbg14_device.as_ref(),
+                        device,
+                        config,
+                    )
+                    .map_err(|err| format!("failed to prepare image bytes: {err}"))?;
+                    Ok((image, None))
+                }
+            },
+        };
+    }
+
     match state.rmbg_model {
         RmbgModel::Rmbg2 => {
             let rmbg2 = state

@@ -58,6 +58,21 @@
         font-size: 14px;
         letter-spacing: 0.01em;
       }
+      #boot-start {
+        appearance: none;
+        border: 1px solid rgba(180, 200, 240, 0.28);
+        background: rgba(32, 64, 104, 0.4);
+        color: #d6deeb;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #boot-start:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
       canvas {
         display: block;
       }
@@ -66,21 +81,35 @@
   <body>
     <div id="boot">
       <div id="dot"></div>
-      <div id="boot-text">loading wasm module...</div>
+      <div id="boot-text">click start to initialize wasm</div>
+      <button id="boot-start" type="button">Start</button>
     </div>
     <script type="module">
       import init from "./out/bevy_synth.js";
 
       const boot = document.getElementById("boot");
       const text = document.getElementById("boot-text");
-      try {
-        await init();
-        text.textContent = "module ready";
-        setTimeout(() => boot.remove(), 1200);
-      } catch (err) {
-        console.error("Failed to initialize bevy_synth wasm", err);
-        text.textContent = "failed to load wasm module";
-      }
+      const startButton = document.getElementById("boot-start");
+      let started = false;
+
+      const start = async () => {
+        if (started) return;
+        started = true;
+        startButton.disabled = true;
+        text.textContent = "loading wasm module...";
+        try {
+          await init();
+          text.textContent = "module ready";
+          setTimeout(() => boot.remove(), 1200);
+        } catch (err) {
+          console.error("failed to initialize bevy_synth wasm", err);
+          text.textContent = "failed to load wasm module";
+          startButton.disabled = false;
+          started = false;
+        }
+      };
+
+      startButton.addEventListener("click", start);
     </script>
   </body>
 </html>
