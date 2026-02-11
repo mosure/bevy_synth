@@ -15,7 +15,8 @@ use burn::tensor::activation::sigmoid;
 use burn_flex_gmm::kernel_rows;
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::wgpu::{
-    DefaultWgpuBackend, neighbor_rows_tensor_from_coords, sparse_subm_conv_forward_wgpu,
+    DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
+    neighbor_rows_tensor_from_coords, sparse_subm_conv_forward_wgpu_with_config,
 };
 use burn_flex_gmm::{
     SparseSubmConvConfig as FlexConvConfig, SparseSubmConvWeights, build_neighbor_rows,
@@ -693,9 +694,19 @@ impl DecoderWgpuConvContext {
         let output_bytes = rows
             .checked_mul(bytes_per_row)
             .ok_or_else(|| "wgpu sparse conv output-byte-size overflow".to_string())?;
+        // TODO(perf-kernel-2): Replace heuristic hotspot overrides with dedicated fused
+        // sparse decoder kernels (fused gather+GEMM plus subgroup-tiling schedule).
+        let forward_cfg =
+            decoder_wgpu_forward_config_for_call(config, rows, output_bytes, max_output_bytes);
         if output_bytes <= max_output_bytes {
-            let output =
-                sparse_subm_conv_forward_wgpu(config, input_t, neighbor_t, weight_t, bias_t)?;
+            let output = sparse_subm_conv_forward_wgpu_with_config(
+                config,
+                input_t,
+                neighbor_t,
+                weight_t,
+                bias_t,
+                forward_cfg,
+            )?;
             telemetry_record_wgpu_success(
                 context,
                 1,
@@ -721,12 +732,13 @@ impl DecoderWgpuConvContext {
         while start < rows {
             let end = (start + chunk_rows).min(rows);
             let chunk_neighbor_t = neighbor_t.clone().slice([start..end, 0..kernel_rows]);
-            let chunk_out = sparse_subm_conv_forward_wgpu(
+            let chunk_out = sparse_subm_conv_forward_wgpu_with_config(
                 config,
                 input_t.clone(),
                 chunk_neighbor_t,
                 weight_t.clone(),
                 bias_t.clone(),
+                forward_cfg,
             )?;
             chunk_tensors.push(chunk_out);
             start = end;
@@ -2967,6 +2979,52 @@ fn decoder_wgpu_chunk_rows(rows: usize, bytes_per_row: usize, max_output_bytes: 
     let by_bytes = (max_output_bytes / bytes_per_row).max(1).min(rows);
     let aligned = by_bytes - (by_bytes % 64);
     if aligned > 0 { aligned } else { by_bytes }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_hotspot_min_output_bytes() -> usize {
+    std::env::var("TRELLIS2_DECODER_WGPU_HOTSPOT_MIN_OUTPUT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(384 * 1024 * 1024)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_hotspot_fused_enabled() -> bool {
+    std::env::var("TRELLIS2_DECODER_WGPU_HOTSPOT_FUSED")
+        .ok()
+        .map(|raw| {
+            !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_forward_config_for_call(
+    config: &FlexConvConfig,
+    rows: usize,
+    output_bytes: usize,
+    max_output_bytes: usize,
+) -> SparseWgpuForwardConfig {
+    if !decoder_wgpu_hotspot_fused_enabled() {
+        return SparseWgpuForwardConfig::default();
+    }
+
+    let hotspot = output_bytes >= decoder_wgpu_hotspot_min_output_bytes()
+        || output_bytes > max_output_bytes
+        || rows >= 131_072;
+    if hotspot && config.out_channels_per_group >= 4 && config.out_channels >= 4 {
+        SparseWgpuForwardConfig {
+            kernel_variant: SparseWgpuKernelVariant::FusedOc4,
+            split_k: Some(1),
+        }
+    } else {
+        SparseWgpuForwardConfig::default()
+    }
 }
 
 fn env_flag(key: &str) -> bool {

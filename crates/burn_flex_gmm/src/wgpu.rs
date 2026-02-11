@@ -56,6 +56,28 @@ enum SparseConvKernelVariant {
     FusedOc4,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SparseWgpuKernelVariant {
+    Auto,
+    Baseline,
+    FusedOc4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparseWgpuForwardConfig {
+    pub kernel_variant: SparseWgpuKernelVariant,
+    pub split_k: Option<usize>,
+}
+
+impl Default for SparseWgpuForwardConfig {
+    fn default() -> Self {
+        Self {
+            kernel_variant: SparseWgpuKernelVariant::Auto,
+            split_k: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct NeighborConfigCacheKey {
     kernel_d: usize,
@@ -146,7 +168,7 @@ fn sparse_subm_conv_fused_oc4_kernel(
     in_channels_per_group: &u32,
     out_channels_per_group: &u32,
 ) {
-    let blocks_per_row = (*out_channels + FUSED_OC_TILE - 1) / FUSED_OC_TILE;
+    let blocks_per_row = (*out_channels).div_ceil(FUSED_OC_TILE);
     let rows = neighbor_rows.len() / *kernel_rows;
     let output_blocks = rows * blocks_per_row;
     if ABSOLUTE_POS >= output_blocks {
@@ -286,7 +308,7 @@ fn sparse_subm_conv_splitk_partial_kernel(
     let out_channel = out_idx % *out_channels;
     let group = out_channel / *out_channels_per_group;
     let in_group_base = group * *in_channels_per_group;
-    let chunk = (*kernel_rows + *split_k - 1) / *split_k;
+    let chunk = (*kernel_rows).div_ceil(*split_k);
     let kernel_start = split_idx * chunk;
     let kernel_end = Min::min(kernel_start + chunk, *kernel_rows);
 
@@ -307,6 +329,132 @@ fn sparse_subm_conv_splitk_partial_kernel(
     }
 
     partial[partial_idx] = acc;
+}
+
+#[cube(launch_unchecked)]
+fn sparse_subm_conv_splitk_partial_fused_oc4_kernel(
+    input: &Tensor<Line<f32>>,
+    neighbor_rows: &Tensor<Line<i32>>,
+    weight: &Tensor<Line<f32>>,
+    partial: &mut Tensor<Line<f32>>,
+    out_channels: &u32,
+    kernel_rows: &u32,
+    in_channels: &u32,
+    in_channels_per_group: &u32,
+    out_channels_per_group: &u32,
+    output_elements: &u32,
+    split_k: &u32,
+) {
+    let blocks_per_row = (*out_channels).div_ceil(FUSED_OC_TILE);
+    let rows = neighbor_rows.len() / *kernel_rows;
+    let split_tiles = rows * blocks_per_row;
+    if split_tiles == 0 {
+        terminate!();
+    }
+    if ABSOLUTE_POS >= split_tiles * *split_k {
+        terminate!();
+    }
+
+    let tile_idx = ABSOLUTE_POS;
+    let split_idx = tile_idx / split_tiles;
+    if split_idx >= *split_k {
+        terminate!();
+    }
+    let split_tile = tile_idx % split_tiles;
+    let row = split_tile / blocks_per_row;
+    let block = split_tile % blocks_per_row;
+    let out_channel_0 = block * FUSED_OC_TILE;
+    let out_channel_1 = out_channel_0 + 1;
+    let out_channel_2 = out_channel_0 + 2;
+    let out_channel_3 = out_channel_0 + 3;
+    let valid_0 = out_channel_0 < *out_channels;
+    let valid_1 = out_channel_1 < *out_channels;
+    let valid_2 = out_channel_2 < *out_channels;
+    let valid_3 = out_channel_3 < *out_channels;
+
+    let chunk = (*kernel_rows).div_ceil(*split_k);
+    let kernel_start = split_idx * chunk;
+    let kernel_end = Min::min(kernel_start + chunk, *kernel_rows);
+
+    let mut acc_0 = Line::new(0.0);
+    let mut acc_1 = Line::new(0.0);
+    let mut acc_2 = Line::new(0.0);
+    let mut acc_3 = Line::new(0.0);
+
+    for kernel_idx in kernel_start..kernel_end {
+        let neighbor = neighbor_rows[row * *kernel_rows + kernel_idx];
+        let safe_neighbor = Max::max(neighbor, Line::new(0));
+        let in_row = u32::cast_from(safe_neighbor);
+        let invalid = neighbor.equal(Line::new(-1));
+
+        if valid_0 {
+            let group_0 = out_channel_0 / *out_channels_per_group;
+            let in_group_base_0 = group_0 * *in_channels_per_group;
+            let input_base_0 = in_row * *in_channels + in_group_base_0;
+            let weight_base_0 =
+                (out_channel_0 * *kernel_rows + kernel_idx) * *in_channels_per_group;
+            for in_local in 0..*in_channels_per_group {
+                let input_value_0 = input[input_base_0 + in_local];
+                let weight_value_0 = weight[weight_base_0 + in_local];
+                let term_0 = input_value_0 * weight_value_0;
+                acc_0 += select_many(invalid, Line::new(0.0), term_0);
+            }
+        }
+        if valid_1 {
+            let group_1 = out_channel_1 / *out_channels_per_group;
+            let in_group_base_1 = group_1 * *in_channels_per_group;
+            let input_base_1 = in_row * *in_channels + in_group_base_1;
+            let weight_base_1 =
+                (out_channel_1 * *kernel_rows + kernel_idx) * *in_channels_per_group;
+            for in_local in 0..*in_channels_per_group {
+                let input_value_1 = input[input_base_1 + in_local];
+                let weight_value_1 = weight[weight_base_1 + in_local];
+                let term_1 = input_value_1 * weight_value_1;
+                acc_1 += select_many(invalid, Line::new(0.0), term_1);
+            }
+        }
+        if valid_2 {
+            let group_2 = out_channel_2 / *out_channels_per_group;
+            let in_group_base_2 = group_2 * *in_channels_per_group;
+            let input_base_2 = in_row * *in_channels + in_group_base_2;
+            let weight_base_2 =
+                (out_channel_2 * *kernel_rows + kernel_idx) * *in_channels_per_group;
+            for in_local in 0..*in_channels_per_group {
+                let input_value_2 = input[input_base_2 + in_local];
+                let weight_value_2 = weight[weight_base_2 + in_local];
+                let term_2 = input_value_2 * weight_value_2;
+                acc_2 += select_many(invalid, Line::new(0.0), term_2);
+            }
+        }
+        if valid_3 {
+            let group_3 = out_channel_3 / *out_channels_per_group;
+            let in_group_base_3 = group_3 * *in_channels_per_group;
+            let input_base_3 = in_row * *in_channels + in_group_base_3;
+            let weight_base_3 =
+                (out_channel_3 * *kernel_rows + kernel_idx) * *in_channels_per_group;
+            for in_local in 0..*in_channels_per_group {
+                let input_value_3 = input[input_base_3 + in_local];
+                let weight_value_3 = weight[weight_base_3 + in_local];
+                let term_3 = input_value_3 * weight_value_3;
+                acc_3 += select_many(invalid, Line::new(0.0), term_3);
+            }
+        }
+    }
+
+    let split_base = split_idx * *output_elements;
+    let row_base = row * *out_channels;
+    if valid_0 {
+        partial[split_base + row_base + out_channel_0] = acc_0;
+    }
+    if valid_1 {
+        partial[split_base + row_base + out_channel_1] = acc_1;
+    }
+    if valid_2 {
+        partial[split_base + row_base + out_channel_2] = acc_2;
+    }
+    if valid_3 {
+        partial[split_base + row_base + out_channel_3] = acc_3;
+    }
 }
 
 #[cube(launch_unchecked)]
@@ -516,15 +664,13 @@ fn neighbor_hash_query_kernel(
                 active.store(0);
             } else {
                 let table_base = slot * 4;
-                if table_coords[table_base] == batch {
-                    if table_coords[table_base + 1] == nx {
-                        if table_coords[table_base + 2] == ny {
-                            if table_coords[table_base + 3] == nz {
-                                found.store(state);
-                                active.store(0);
-                            }
-                        }
-                    }
+                if table_coords[table_base] == batch
+                    && table_coords[table_base + 1] == nx
+                    && table_coords[table_base + 2] == ny
+                    && table_coords[table_base + 3] == nz
+                {
+                    found.store(state);
+                    active.store(0);
                 }
             }
         }
@@ -543,9 +689,16 @@ fn resolve_cube_dim() -> CubeDim {
     CubeDim::new_1d(requested)
 }
 
-fn resolve_split_k(config: &SparseSubmConvConfig, rows: usize, kernel_rows: usize) -> usize {
+fn resolve_split_k(
+    config: &SparseSubmConvConfig,
+    rows: usize,
+    kernel_rows: usize,
+    split_k_override: Option<usize>,
+) -> usize {
     let max_split = 8usize;
-    let mut split = if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K") {
+    let mut split = if let Some(override_split) = split_k_override {
+        override_split.clamp(1, max_split)
+    } else if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K") {
         let value = raw.trim().to_ascii_lowercase();
         if value == "off" || value == "0" || value == "1" {
             1
@@ -603,7 +756,14 @@ fn resolve_sparse_conv_kernel_variant(
     config: &SparseSubmConvConfig,
     rows: usize,
     kernel_rows: usize,
+    kernel_override: SparseWgpuKernelVariant,
 ) -> SparseConvKernelVariant {
+    match kernel_override {
+        SparseWgpuKernelVariant::Baseline => return SparseConvKernelVariant::Baseline,
+        SparseWgpuKernelVariant::FusedOc4 => return SparseConvKernelVariant::FusedOc4,
+        SparseWgpuKernelVariant::Auto => {}
+    }
+
     if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_KERNEL") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "baseline" | "default" | "legacy" => return SparseConvKernelVariant::Baseline,
@@ -1264,12 +1424,13 @@ pub fn neighbor_rows_build_stats() -> NeighborRowsBuildStats {
 /// Launch sparse submanifold convolution directly on CubeCL tensors.
 ///
 /// All tensors stay device-resident during execution.
-pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
+fn sparse_subm_conv_forward_cubecl_impl<R: CubeRuntime>(
     config: &SparseSubmConvConfig,
     input: CubeTensor<R>,
     neighbor_rows: CubeTensor<R>,
     weight: CubeTensor<R>,
     bias: CubeTensor<R>,
+    forward: SparseWgpuForwardConfig,
 ) -> Result<CubeTensor<R>, String> {
     validate_tensor_shapes(config, &input, &neighbor_rows, &weight, &bias)?;
 
@@ -1291,10 +1452,12 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
     );
 
     let kernel_rows = kernel_rows(config)?;
-    let split_k = resolve_split_k(config, query_rows, kernel_rows);
+    let split_k = resolve_split_k(config, query_rows, kernel_rows, forward.split_k);
+    let kernel_variant =
+        resolve_sparse_conv_kernel_variant(config, query_rows, kernel_rows, forward.kernel_variant);
     let cube_dim = resolve_cube_dim();
     if split_k <= 1 {
-        match resolve_sparse_conv_kernel_variant(config, query_rows, kernel_rows) {
+        match kernel_variant {
             SparseConvKernelVariant::Baseline => {
                 let cube_count = calculate_cube_count_elemwise(output_elements, cube_dim);
                 unsafe {
@@ -1360,24 +1523,54 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
         let split_k_u32 = u32::try_from(split_k)
             .map_err(|_| "sparse conv split-k exceeds u32::MAX".to_string())?;
 
-        let partial_cube_count = calculate_cube_count_elemwise(partial_elements, cube_dim);
-        unsafe {
-            sparse_subm_conv_splitk_partial_kernel::launch_unchecked::<R>(
-                &input.client,
-                partial_cube_count,
-                cube_dim,
-                input.as_tensor_arg::<f32>(1),
-                neighbor_rows.as_tensor_arg::<i32>(1),
-                weight.as_tensor_arg::<f32>(1),
-                partial.as_tensor_arg::<f32>(1),
-                ScalarArg::new(config.out_channels as u32),
-                ScalarArg::new(kernel_rows as u32),
-                ScalarArg::new(config.in_channels as u32),
-                ScalarArg::new(config.in_channels_per_group as u32),
-                ScalarArg::new(config.out_channels_per_group as u32),
-                ScalarArg::new(output_elements_u32),
-                ScalarArg::new(split_k_u32),
-            );
+        match kernel_variant {
+            SparseConvKernelVariant::Baseline => {
+                let partial_cube_count = calculate_cube_count_elemwise(partial_elements, cube_dim);
+                unsafe {
+                    sparse_subm_conv_splitk_partial_kernel::launch_unchecked::<R>(
+                        &input.client,
+                        partial_cube_count,
+                        cube_dim,
+                        input.as_tensor_arg::<f32>(1),
+                        neighbor_rows.as_tensor_arg::<i32>(1),
+                        weight.as_tensor_arg::<f32>(1),
+                        partial.as_tensor_arg::<f32>(1),
+                        ScalarArg::new(config.out_channels as u32),
+                        ScalarArg::new(kernel_rows as u32),
+                        ScalarArg::new(config.in_channels as u32),
+                        ScalarArg::new(config.in_channels_per_group as u32),
+                        ScalarArg::new(config.out_channels_per_group as u32),
+                        ScalarArg::new(output_elements_u32),
+                        ScalarArg::new(split_k_u32),
+                    );
+                }
+            }
+            SparseConvKernelVariant::FusedOc4 => {
+                let blocks_per_row = config.out_channels.div_ceil(FUSED_OC_TILE as usize) as u32;
+                let partial_blocks = query_rows
+                    .checked_mul(blocks_per_row as usize)
+                    .and_then(|value| value.checked_mul(split_k))
+                    .ok_or_else(|| "sparse conv fused split-k tile count overflow".to_string())?;
+                let partial_cube_count = calculate_cube_count_elemwise(partial_blocks, cube_dim);
+                unsafe {
+                    sparse_subm_conv_splitk_partial_fused_oc4_kernel::launch_unchecked::<R>(
+                        &input.client,
+                        partial_cube_count,
+                        cube_dim,
+                        input.as_tensor_arg::<f32>(1),
+                        neighbor_rows.as_tensor_arg::<i32>(1),
+                        weight.as_tensor_arg::<f32>(1),
+                        partial.as_tensor_arg::<f32>(1),
+                        ScalarArg::new(config.out_channels as u32),
+                        ScalarArg::new(kernel_rows as u32),
+                        ScalarArg::new(config.in_channels as u32),
+                        ScalarArg::new(config.in_channels_per_group as u32),
+                        ScalarArg::new(config.out_channels_per_group as u32),
+                        ScalarArg::new(output_elements_u32),
+                        ScalarArg::new(split_k_u32),
+                    );
+                }
+            }
         }
 
         let finalize_cube_count = calculate_cube_count_elemwise(output_elements, cube_dim);
@@ -1399,6 +1592,23 @@ pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
     Ok(output)
 }
 
+pub fn sparse_subm_conv_forward_cubecl<R: CubeRuntime>(
+    config: &SparseSubmConvConfig,
+    input: CubeTensor<R>,
+    neighbor_rows: CubeTensor<R>,
+    weight: CubeTensor<R>,
+    bias: CubeTensor<R>,
+) -> Result<CubeTensor<R>, String> {
+    sparse_subm_conv_forward_cubecl_impl(
+        config,
+        input,
+        neighbor_rows,
+        weight,
+        bias,
+        SparseWgpuForwardConfig::default(),
+    )
+}
+
 /// Convenience wrapper for WGPU Burn tensors.
 pub fn sparse_subm_conv_forward_wgpu(
     config: &SparseSubmConvConfig,
@@ -1407,12 +1617,33 @@ pub fn sparse_subm_conv_forward_wgpu(
     weight: BurnTensor<DefaultWgpuBackend, 5>,
     bias: BurnTensor<DefaultWgpuBackend, 1>,
 ) -> Result<BurnTensor<DefaultWgpuBackend, 2>, String> {
-    let output = sparse_subm_conv_forward_cubecl(
+    let output = sparse_subm_conv_forward_cubecl_impl(
         config,
         input.into_primitive().tensor(),
         neighbor_rows.into_primitive(),
         weight.into_primitive().tensor(),
         bias.into_primitive().tensor(),
+        SparseWgpuForwardConfig::default(),
+    )?;
+    Ok(BurnTensor::from_primitive(TensorPrimitive::Float(output)))
+}
+
+/// Convenience wrapper for WGPU Burn tensors with explicit kernel scheduling controls.
+pub fn sparse_subm_conv_forward_wgpu_with_config(
+    config: &SparseSubmConvConfig,
+    input: BurnTensor<DefaultWgpuBackend, 2>,
+    neighbor_rows: BurnTensor<DefaultWgpuBackend, 2, Int>,
+    weight: BurnTensor<DefaultWgpuBackend, 5>,
+    bias: BurnTensor<DefaultWgpuBackend, 1>,
+    forward: SparseWgpuForwardConfig,
+) -> Result<BurnTensor<DefaultWgpuBackend, 2>, String> {
+    let output = sparse_subm_conv_forward_cubecl_impl(
+        config,
+        input.into_primitive().tensor(),
+        neighbor_rows.into_primitive(),
+        weight.into_primitive().tensor(),
+        bias.into_primitive().tensor(),
+        forward,
     )?;
     Ok(BurnTensor::from_primitive(TensorPrimitive::Float(output)))
 }
@@ -1563,7 +1794,8 @@ mod tests {
     use super::{
         DefaultWgpuBackend, clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
         neighbor_rows_tensor_from_coords, reset_neighbor_rows_build_stats,
-        sparse_subm_conv_forward_wgpu,
+        sparse_subm_conv_forward_wgpu, sparse_subm_conv_forward_wgpu_with_config,
+        SparseWgpuForwardConfig, SparseWgpuKernelVariant,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -2049,6 +2281,94 @@ mod tests {
                 "split-k mismatch at idx={idx}: lhs={lhs} rhs={rhs} diff={diff}"
             );
         }
+        unsafe {
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_SPLIT_K");
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_KERNEL");
+        }
+    }
+
+    #[test]
+    fn wgpu_fused_splitk_matches_baseline_output() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = SparseSubmConvConfig {
+            in_channels: 32,
+            out_channels: 64,
+            kernel_d: 3,
+            kernel_h: 3,
+            kernel_w: 3,
+            in_channels_per_group: 32,
+            out_channels_per_group: 64,
+            groups: 1,
+            axis_order: [0, 1, 2],
+            axis_sign: [1, 1, 1],
+        };
+        let coords = line_coords(256);
+        let mut rng = Lcg::new(1457);
+        let input: Vec<f32> = (0..coords.len() * cfg.in_channels)
+            .map(|_| rng.next_f32())
+            .collect();
+        let weight_len = cfg.out_channels
+            * cfg.kernel_d
+            * cfg.kernel_h
+            * cfg.kernel_w
+            * cfg.in_channels_per_group;
+        let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
+        let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
+
+        let device = burn_wgpu::WgpuDevice::default();
+        let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
+            .reshape([coords.len(), cfg.in_channels]);
+        let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
+            .reshape([
+                cfg.out_channels,
+                cfg.kernel_d,
+                cfg.kernel_h,
+                cfg.kernel_w,
+                cfg.in_channels_per_group,
+            ]);
+        let bias_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(bias.as_slice(), &device);
+        let neighbors_t =
+            neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device).expect("neighbors");
+
+        unsafe {
+            std::env::set_var("BURN_FLEX_GMM_WGPU_KERNEL", "baseline");
+            std::env::set_var("BURN_FLEX_GMM_WGPU_SPLIT_K", "off");
+        }
+        let baseline = sparse_subm_conv_forward_wgpu(
+            &cfg,
+            input_t.clone(),
+            neighbors_t.clone(),
+            weight_t.clone(),
+            bias_t.clone(),
+        )
+        .expect("baseline kernel")
+        .to_data();
+        let baseline = baseline.as_slice::<f32>().expect("f32").to_vec();
+
+        let fused_split = sparse_subm_conv_forward_wgpu_with_config(
+            &cfg,
+            input_t,
+            neighbors_t,
+            weight_t,
+            bias_t,
+            SparseWgpuForwardConfig {
+                kernel_variant: SparseWgpuKernelVariant::FusedOc4,
+                split_k: Some(4),
+            },
+        )
+        .expect("fused split-k kernel")
+        .to_data();
+        let fused_split = fused_split.as_slice::<f32>().expect("f32");
+
+        assert_eq!(baseline.len(), fused_split.len());
+        for (idx, (lhs, rhs)) in fused_split.iter().zip(baseline.iter()).enumerate() {
+            let diff = (lhs - rhs).abs();
+            assert!(
+                diff <= 1.0e-4,
+                "fused split-k mismatch at idx={idx}: lhs={lhs} rhs={rhs} diff={diff}"
+            );
+        }
+
         unsafe {
             std::env::remove_var("BURN_FLEX_GMM_WGPU_SPLIT_K");
             std::env::remove_var("BURN_FLEX_GMM_WGPU_KERNEL");
