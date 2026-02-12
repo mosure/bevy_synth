@@ -141,8 +141,8 @@ impl RectifiedFlowScheduler {
             self.init_step_index(timestep);
         }
         let step_index = self.step_index.unwrap_or(0);
-        let sigma = self.sigmas[step_index];
-        let sigma_next = self.sigmas[step_index + 1];
+        let sigma = *self.sigmas.get(step_index).unwrap_or(&0.0);
+        let sigma_next = *self.sigmas.get(step_index + 1).unwrap_or(&0.0);
 
         let output_dtype: FloatDType = model_output.dtype().into();
         let needs_cast = output_dtype != FloatDType::F32;
@@ -162,7 +162,9 @@ impl RectifiedFlowScheduler {
         } else {
             prev_sample
         };
-        self.step_index = Some(step_index + 1);
+        let max_step_index = self.sigmas.len().saturating_sub(1);
+        let next_step_index = (step_index + 1).min(max_step_index);
+        self.step_index = Some(next_step_index);
         prev_sample
     }
 

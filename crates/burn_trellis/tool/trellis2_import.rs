@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use burn_synth_import::plan::ArtifactPolicy;
 use burn_synth_import::shard::apply_artifact_policy;
 use burn_trellis::import::{QuantizationMode, TrellisImportOptions, import_trellis2_assets};
-use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
+use burn_trellis::paths::{
+    resolve_trellis2_weights_root, trellis2_repo_asset_root, trellis2_repo_image_large_root,
+};
 use clap::{Parser, ValueEnum};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -58,6 +60,9 @@ struct Args {
     #[arg(long)]
     output_root: Option<PathBuf>,
 
+    #[arg(long)]
+    image_large_output_root: Option<PathBuf>,
+
     #[arg(long, value_enum, default_value_t = Quantization::Both)]
     quantization: Quantization,
 
@@ -74,18 +79,29 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let weights_root = resolve_trellis2_weights_root(args.weights_root.as_deref());
-    let image_large_root = args
-        .image_large_root
-        .as_deref()
-        .map(|path| resolve_trellis2_image_large_root(Some(path)));
-    let output_root = args.output_root.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/TRELLIS.2-4B")
-    });
+    let image_large_root = Some(
+        args.image_large_root
+            .unwrap_or_else(trellis2_repo_image_large_root),
+    );
+    let output_root = args.output_root.unwrap_or_else(trellis2_repo_asset_root);
+    let image_large_output_root = Some(
+        args.image_large_output_root
+            .unwrap_or_else(trellis2_repo_image_large_root),
+    );
+    let image_large_root_display = image_large_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    let image_large_output_root_display = image_large_output_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
 
     let report = import_trellis2_assets(&TrellisImportOptions {
         weights_root: weights_root.clone(),
-        image_large_root,
+        image_large_root: image_large_root.clone(),
         output_root: output_root.clone(),
+        image_large_output_root: image_large_output_root.clone(),
         quantization: args.quantization.into(),
         overwrite: args.overwrite,
     })?;
@@ -112,9 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "[IMPORT] Trellis2 roots: weights='{}', output='{}'",
+        "[IMPORT] Trellis2 roots: weights='{}', output='{}', image_large_source='{}', image_large_output='{}'",
         weights_root.display(),
-        output_root.display()
+        output_root.display(),
+        image_large_root_display,
+        image_large_output_root_display
     );
     println!(
         "[IMPORT] copied json: {}, imported burnpacks: {}, missing sources: {}",
@@ -133,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for source in &report.manifest.missing_sources {
             println!("  - {source}");
         }
+        return Err("trellis2_import failed: missing required source files".into());
     }
     println!("[IMPORT] manifest: {}", report.manifest_path.display());
 

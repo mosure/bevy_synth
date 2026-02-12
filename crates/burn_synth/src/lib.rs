@@ -25,8 +25,8 @@ pub use progress::{
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{
-    ForegroundOutput, ForegroundRequest, InferenceBackend, MeshOutput as RuntimeMeshOutput,
-    MeshRequest, RuntimeConfig, RuntimeError, SynthRuntime,
+    DinoBackend, ForegroundOutput, ForegroundRequest, InferenceBackend,
+    MeshOutput as RuntimeMeshOutput, MeshRequest, RuntimeConfig, RuntimeError, SynthRuntime,
 };
 
 #[cfg(feature = "triposg")]

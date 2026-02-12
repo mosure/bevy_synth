@@ -76,8 +76,7 @@ Get-ChildItem crates/burn_foreground/assets/models/RMBG-2.0/model*.bpk
 ### Weights
 
 - Set `TRELLIS2_WEIGHTS_ROOT` to the TRELLIS.2-4B root containing `pipeline.json`.
-- Optional root for TRELLIS-image-large assets:
-  - `TRELLIS2_IMAGE_LARGE_ROOT`
+- Set `TRELLIS2_IMAGE_LARGE_ROOT` to the TRELLIS-image-large root for decoder assets.
 - Canonical in-repo locations:
   - `crates/burn_trellis/assets/models/TRELLIS.2-4B`
   - `crates/burn_trellis/assets/models/TRELLIS-image-large`
@@ -97,11 +96,18 @@ Get-ChildItem crates/burn_foreground/assets/models/RMBG-2.0/model*.bpk
 cargo run -p burn_trellis --features import --bin trellis2_import -- --quantization both
 ```
 
+- `trellis2_import` now writes:
+  - primary assets into `TRELLIS.2-4B`
+  - image-large assets into `TRELLIS-image-large`
+- Import fails on missing source checkpoints (no silent skip).
+
 ### Verify imported files
 
 ```powershell
 Get-ChildItem crates/burn_trellis/assets/models/TRELLIS.2-4B/ckpts -Filter *.bpk
 Get-ChildItem crates/burn_trellis/assets/models/TRELLIS.2-4B/ckpts -Filter *_f16.bpk
+Get-ChildItem crates/burn_trellis/assets/models/TRELLIS-image-large/ckpts -Filter *.bpk
+Get-ChildItem crates/burn_trellis/assets/models/TRELLIS-image-large/ckpts -Filter *_f16.bpk
 ```
 
 ### Hook parity checks

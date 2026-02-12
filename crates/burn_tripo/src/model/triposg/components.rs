@@ -1,4 +1,4 @@
-use burn::{module::Param, nn, prelude::*, tensor::Distribution, tensor::activation::softmax};
+use burn::{module::Param, nn, prelude::*, tensor::Distribution};
 
 use super::hooks::HookRecorder;
 
@@ -116,12 +116,12 @@ impl<B: Backend> CrossAttention<B> {
             None
         };
         let norm_q = if qk_norm {
-            RmsNorm::new(head_dim, 1e-6, device).into()
+            RmsNorm::new(head_dim, 1e-5, device).into()
         } else {
             None
         };
         let norm_k = if qk_norm {
-            RmsNorm::new(head_dim, 1e-6, device).into()
+            RmsNorm::new(head_dim, 1e-5, device).into()
         } else {
             None
         };
@@ -243,8 +243,11 @@ impl<B: Backend> CrossAttention<B> {
             k
         };
 
-        let attn = q.matmul(k.swap_dims(2, 3)).mul_scalar(self.scale);
-        let attn = softmax(attn, 3);
+        let attn_logits = q.matmul(k.swap_dims(2, 3)).mul_scalar(self.scale);
+        let attn_max = attn_logits.clone().max_dim(3);
+        let attn_exp = attn_logits.sub(attn_max).exp();
+        let attn_denom = attn_exp.clone().sum_dim(3);
+        let attn = attn_exp.div(attn_denom);
         record_tensor(&mut hook, &format!("{hook_prefix}.attn"), &attn);
 
         let out = attn.matmul(v).permute([0, 2, 1, 3]).reshape([b, n, c]);

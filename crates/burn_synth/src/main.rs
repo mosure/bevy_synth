@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use burn_synth::{
-    ForegroundRequest, ImageSource, MeshRequest, ModelSelection, ProgressVerbosity, RuntimeConfig,
-    RuntimeProgressObserver, SynthRuntime, default_log_progress_callback, write_glb_mesh,
+    DinoBackend, ForegroundRequest, ImageSource, MeshRequest, ModelSelection, ProgressVerbosity,
+    RuntimeConfig, RuntimeProgressObserver, SynthRuntime, default_log_progress_callback,
+    write_glb_mesh,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -16,7 +17,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    #[arg(long, value_enum, default_value_t = CliForegroundModel::Rmbg2)]
+    #[arg(long, value_enum, default_value_t = CliForegroundModel::Rmbg14)]
     rmbg_model: CliForegroundModel,
 
     #[arg(
@@ -62,6 +63,36 @@ struct Cli {
 
     #[arg(long)]
     seed: Option<u64>,
+
+    /// Match Python parity defaults (seed + decimation + CPU DINO on WGPU).
+    /// Enabled by default; pass --no-match-python to disable.
+    #[arg(long, default_value_t = true)]
+    match_python: bool,
+
+    /// Disable Python parity defaults.
+    #[arg(long, default_value_t = false)]
+    no_match_python: bool,
+
+    /// DINO backend (auto, cpu, gpu). `auto` uses CPU on WGPU when --match-python is enabled.
+    #[arg(long, value_enum, default_value_t = CliDinoBackend::Auto)]
+    dino_backend: CliDinoBackend,
+
+    /// Target face count for mesh decimation. Use 0 to disable.
+    /// Defaults to 10,000 when --match-python is enabled.
+    #[arg(long)]
+    faces: Option<usize>,
+
+    #[arg(long)]
+    flash_octree_depth: Option<usize>,
+
+    #[arg(long)]
+    flash_num_chunks: Option<usize>,
+
+    #[arg(long)]
+    flash_min_resolution: Option<usize>,
+
+    #[arg(long)]
+    flash_mini_grid_num: Option<usize>,
 
     #[arg(long, value_enum, default_value_t = CliProgress::Steps, global = true)]
     progress: CliProgress,
@@ -122,6 +153,14 @@ enum CliBackend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
+enum CliDinoBackend {
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
 enum CliTrellisQuality {
     Low,
     Medium,
@@ -139,14 +178,52 @@ enum CliProgress {
 fn main() {
     init_logging();
     let cli = Cli::parse();
-    if let Err(err) = run(cli) {
+    if let Err(err) = run_with_large_stack(cli) {
         eprintln!("burn_synth error: {err}");
         std::process::exit(1);
     }
 }
 
+fn run_with_large_stack(cli: Cli) -> Result<(), String> {
+    const STACK_SIZE_BYTES: usize = 256 * 1024 * 1024;
+    let handle = std::thread::Builder::new()
+        .name("burn_synth_main".to_string())
+        .stack_size(STACK_SIZE_BYTES)
+        .spawn(move || run(cli))
+        .map_err(|err| format!("failed to start burn_synth worker thread: {err}"))?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = if let Some(text) = payload.downcast_ref::<&str>() {
+                (*text).to_string()
+            } else if let Some(text) = payload.downcast_ref::<String>() {
+                text.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            Err(format!("burn_synth worker thread panicked: {message}"))
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<(), String> {
     let synthesis_models = sanitize_synthesis_models(cli.synthesis_models);
+    let match_python = if cli.no_match_python {
+        false
+    } else {
+        cli.match_python
+    };
+    let target_faces = match cli.faces {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => {
+            if match_python {
+                Some(10_000)
+            } else {
+                None
+            }
+        }
+    };
     let mut runtime_config = RuntimeConfig {
         model_selection: ModelSelection::new(
             synthesis_models.iter().copied().map(Into::into),
@@ -168,8 +245,23 @@ fn run(cli: Cli) -> Result<(), String> {
             .guidance_scale
             .unwrap_or(RuntimeConfig::default().guidance_scale),
         seed: cli.seed.or(RuntimeConfig::default().seed),
+        match_python,
+        dino_backend: cli.dino_backend.into(),
+        target_faces,
         ..RuntimeConfig::default()
     };
+    if let Some(value) = cli.flash_octree_depth {
+        runtime_config.flash_extract.octree_depth = value;
+    }
+    if let Some(value) = cli.flash_num_chunks {
+        runtime_config.flash_extract.num_chunks = value;
+    }
+    if let Some(value) = cli.flash_min_resolution {
+        runtime_config.flash_extract.min_resolution = value;
+    }
+    if let Some(value) = cli.flash_mini_grid_num {
+        runtime_config.flash_extract.mini_grid_num = value;
+    }
     if !matches!(cli.progress, CliProgress::Off) {
         runtime_config.progress = RuntimeProgressObserver::with_callback(
             cli.progress.into(),
@@ -344,6 +436,16 @@ impl From<CliBackend> for burn_synth::InferenceBackend {
             CliBackend::Cpu => Self::Cpu,
             CliBackend::Wgpu => Self::Wgpu,
             CliBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
+impl From<CliDinoBackend> for DinoBackend {
+    fn from(value: CliDinoBackend) -> Self {
+        match value {
+            CliDinoBackend::Auto => Self::Auto,
+            CliDinoBackend::Cpu => Self::Cpu,
+            CliDinoBackend::Gpu => Self::Gpu,
         }
     }
 }

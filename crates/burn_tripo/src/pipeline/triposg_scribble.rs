@@ -14,7 +14,6 @@ use crate::pipeline::geometry::{
 };
 use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 use crate::pipeline::triposg::TripoSGPipelineOutput;
-use crate::readback::tensor_to_vec_f32;
 
 #[derive(Debug)]
 pub struct TripoSGScribblePipeline<B: Backend> {
@@ -179,20 +178,8 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
     ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
         let resolution = resolution.max(2);
         let chunk_size = chunk_size.max(1);
-        let coords = super::triposg::generate_dense_grid_coords(bounds, resolution);
-        let mut values = Vec::with_capacity(coords.len() / 3);
-        let device = latents.device();
-
-        for chunk in coords.chunks(chunk_size * 3) {
-            let count = chunk.len() / 3;
-            let coords_tensor = Tensor::<B, 1>::from_floats(chunk, &device)
-                .reshape([count as i32, 3])
-                .unsqueeze_dim(0);
-            let decoded = self.vae.decode(coords_tensor, latents.clone(), None);
-            let data = tensor_to_vec_f32(decoded)
-                .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
-            values.extend_from_slice(&data);
-        }
+        let values =
+            super::triposg::decode_grid_values(&latents, &self.vae, bounds, resolution, chunk_size)?;
 
         Ok(DenseGrid {
             values,
@@ -297,41 +284,92 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
         weights_root: impl AsRef<std::path::Path>,
         device: &B::Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use crate::model::triposg::dit::import::load_triposg_dit;
-        use crate::model::triposg::image_encoder::import::{
-            load_dinov2_processor, load_triposg_dinov2,
+        use crate::model::triposg::dit::import::{
+            load_triposg_dit, load_triposg_dit_from_safetensors,
         };
-        use crate::model::triposg::vae::import::load_triposg_vae;
+        use crate::model::triposg::image_encoder::import::{
+            load_dinov2_processor, load_triposg_dinov2, load_triposg_dinov2_from_safetensors,
+        };
+        use crate::model::triposg::vae::import::{
+            load_triposg_vae, load_triposg_vae_from_safetensors,
+        };
 
         let root = weights_root.as_ref();
         let vae_path = root.join("vae/diffusion_pytorch_model.safetensors");
         let dit_path = root.join("transformer/diffusion_pytorch_model.safetensors");
         let scheduler_path = root.join("scheduler/scheduler_config.json");
         let dino_path = root.join("image_encoder_dinov2/model.safetensors");
+        let use_safetensors = std::env::var("TRIPOSG_LOAD_SAFETENSORS").is_ok();
 
         let vae_config_path = root.join("vae/config.json");
         let vae_config =
             crate::model::triposg::vae::TripoSGVaeConfig::from_config_file(vae_config_path)
                 .unwrap_or_else(|_| crate::model::triposg::vae::TripoSGVaeConfig::midi_3d());
-        let vae = load_triposg_vae(&vae_config, device, vae_path)?;
+        let vae = if use_safetensors {
+            load_triposg_vae_from_safetensors(&vae_config, device, &vae_path)?
+        } else {
+            load_triposg_vae(&vae_config, device, &vae_path)?
+        };
 
         let dit_config_path = root.join("transformer/config.json");
-        let dit_config =
-            crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(dit_config_path)
-                .unwrap_or_else(|_| {
-                    if dit_path.exists() {
-                        crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained()
-                    } else {
-                        crate::model::triposg::dit::TripoSGDiTConfig::midi_3d()
-                    }
-                });
-        let dit = load_triposg_dit(&dit_config, device, dit_path)?;
+        let mut dit_configs = Vec::new();
+        if let Ok(config) =
+            crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(&dit_config_path)
+        {
+            dit_configs.push(config);
+        } else if dit_path.exists() {
+            dit_configs.push(crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained());
+        } else {
+            dit_configs.push(crate::model::triposg::dit::TripoSGDiTConfig::midi_3d());
+        }
+
+        push_unique_dit_config(
+            &mut dit_configs,
+            crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained(),
+        );
+        push_unique_dit_config(
+            &mut dit_configs,
+            crate::model::triposg::dit::TripoSGDiTConfig::midi_3d(),
+        );
+
+        let mut load_errors = Vec::new();
+        let mut dit = None;
+        for config in dit_configs {
+            let loaded = if use_safetensors {
+                load_triposg_dit_from_safetensors(&config, device, &dit_path)
+            } else {
+                load_triposg_dit(&config, device, &dit_path)
+            };
+            match loaded {
+                Ok(model) => {
+                    dit = Some(model);
+                    break;
+                }
+                Err(err) => {
+                    load_errors.push(format!(
+                        "cross_attention_dim={} cross_attention_2_dim={:?}: {err}",
+                        config.cross_attention_dim, config.cross_attention_2_dim
+                    ));
+                }
+            }
+        }
+        let Some(dit) = dit else {
+            return Err(format!(
+                "failed to load TripoSG DiT with all known configs:\n{}",
+                load_errors.join("\n")
+            )
+            .into());
+        };
 
         let scheduler_config = RectifiedFlowSchedulerConfig::from_config_file(scheduler_path)
             .unwrap_or_else(|_| RectifiedFlowSchedulerConfig::midi_3d());
         let scheduler = RectifiedFlowScheduler::new(scheduler_config);
 
-        let image_encoder = load_triposg_dinov2(device, dino_path)?;
+        let image_encoder = if use_safetensors {
+            load_triposg_dinov2_from_safetensors(device, &dino_path)?
+        } else {
+            load_triposg_dinov2(device, &dino_path)?
+        };
         let image_processor = load_dinov2_processor(root)?;
 
         Ok(Self::new(
@@ -341,5 +379,22 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             image_encoder,
             image_processor,
         ))
+    }
+}
+
+#[cfg(feature = "import")]
+fn push_unique_dit_config(
+    configs: &mut Vec<crate::model::triposg::dit::TripoSGDiTConfig>,
+    candidate: crate::model::triposg::dit::TripoSGDiTConfig,
+) {
+    if !configs.iter().any(|existing| {
+        existing.in_channels == candidate.in_channels
+            && existing.width == candidate.width
+            && existing.num_layers == candidate.num_layers
+            && existing.num_attention_heads == candidate.num_attention_heads
+            && existing.cross_attention_dim == candidate.cross_attention_dim
+            && existing.cross_attention_2_dim == candidate.cross_attention_2_dim
+    }) {
+        configs.push(candidate);
     }
 }

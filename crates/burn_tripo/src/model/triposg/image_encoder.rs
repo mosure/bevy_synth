@@ -55,7 +55,9 @@ impl Default for DinoImageProcessor {
 
 impl DinoImageProcessor {
     pub fn preprocess<B: Backend>(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
-        if !cfg!(target_arch = "wasm32") && std::env::var("DINO_STRICT_PREPROCESS").is_ok() {
+        if !cfg!(target_arch = "wasm32")
+            && env_flag("DINO_STRICT_PREPROCESS", false)
+        {
             return self.preprocess_cpu(image);
         }
         let mut image = image;
@@ -234,6 +236,16 @@ impl DinoImageProcessor {
     }
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => default,
+    }
+}
+
 #[cfg(feature = "import")]
 pub mod import {
     use std::{
@@ -309,6 +321,31 @@ pub mod import {
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack: {err}"))?;
 
+        Ok(TripoSGImageEncoder::new(model))
+    }
+
+    pub fn load_triposg_dinov2_from_safetensors<B: Backend>(
+        device: &B::Device,
+        weights_path: impl AsRef<Path>,
+    ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
+        let weights_path = weights_path.as_ref();
+        let mut config = load_dinov2_config(weights_path)
+            .unwrap_or_else(|| DinoVisionTransformerConfig::vitl(None, None));
+        if let Some(target_size) = load_dinov2_preprocess_size(weights_path) {
+            let patch = config.patch_size.max(1);
+            let grid = target_size / patch;
+            if grid > 0 {
+                config.positional_encoding_interpolate.output_size = Some([grid, grid]);
+            }
+        }
+
+        let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
+            burn_dino::model::dino::DinoVisionTransformer::new(device, config);
+        let converted = convert_hf_dinov2(weights_path)?;
+        let mut store = build_store(converted)?;
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load dinov2 safetensors: {err}"))?;
         Ok(TripoSGImageEncoder::new(model))
     }
 
@@ -579,7 +616,7 @@ pub mod import {
         }
         let store = SafetensorsStore::from_bytes(Some(bytes))
             .with_from_adapter(PyTorchToBurnAdapter)
-            .allow_partial(true)
+            .allow_partial(false)
             .remap(remapper)
             .validate(true);
         Ok(store)

@@ -151,7 +151,7 @@ fn should_use_gpu_flash<B: Backend>() -> bool {
         return true;
     }
     let backend_name = std::any::type_name::<B>().to_ascii_lowercase();
-    if backend_name.contains("wgpu") {
+    if backend_name.contains("ndarray") {
         return false;
     }
     true
@@ -897,7 +897,10 @@ fn decode_flash_points_gpu<B: Backend>(
         *kv_cache = Some(cache);
 
         let values = decoded.reshape([end - start]);
-        out = out.scatter(0, indices_chunk, values);
+        // Burn scatter uses sum reduction. To get overwrite semantics, scatter deltas.
+        let current = out.clone().gather(0, indices_chunk.clone());
+        let delta = values - current;
+        out = out.scatter(0, indices_chunk, delta);
         start = end;
     }
 

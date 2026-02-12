@@ -210,7 +210,7 @@ pub enum TrellisQuality {
     High,
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DinoBackend {
     Auto,
     Cpu,

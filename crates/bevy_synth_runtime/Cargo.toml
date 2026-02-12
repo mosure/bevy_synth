@@ -26,7 +26,6 @@ burn-cuda = { version = "0.19", optional = true }
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 safetensors = "0.6"
-meshopt = "0.6.2"
 gltf = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

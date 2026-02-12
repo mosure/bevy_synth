@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
+use crate::paths::{
+    resolve_trellis2_weights_root, trellis2_repo_asset_root, trellis2_repo_image_large_root,
+};
 const F16_SUFFIX: &str = "_f16";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +39,7 @@ pub struct TrellisImportOptions {
     pub weights_root: PathBuf,
     pub image_large_root: Option<PathBuf>,
     pub output_root: PathBuf,
+    pub image_large_output_root: Option<PathBuf>,
     pub quantization: QuantizationMode,
     pub overwrite: bool,
 }
@@ -45,9 +48,9 @@ impl Default for TrellisImportOptions {
     fn default() -> Self {
         Self {
             weights_root: resolve_trellis2_weights_root(None),
-            image_large_root: Some(resolve_trellis2_image_large_root(None)),
-            output_root: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/models/TRELLIS.2-4B"),
+            image_large_root: Some(trellis2_repo_image_large_root()),
+            output_root: trellis2_repo_asset_root(),
+            image_large_output_root: Some(trellis2_repo_image_large_root()),
             quantization: QuantizationMode::Both,
             overwrite: false,
         }
@@ -67,6 +70,7 @@ pub struct ImportedBlobInfo {
 pub struct TrellisImportManifest {
     pub weights_root: String,
     pub image_large_root: Option<String>,
+    pub image_large_output_root: Option<String>,
     pub imported_blobs: Vec<ImportedBlobInfo>,
     pub copied_json_files: Vec<String>,
     pub missing_sources: Vec<String>,
@@ -128,10 +132,20 @@ pub fn import_trellis2_assets(
     let weights_root = resolve_trellis2_weights_root(Some(options.weights_root.as_path()));
     let image_large_root = options
         .image_large_root
-        .as_ref()
-        .map(|root| resolve_trellis2_image_large_root(Some(root.as_path())));
+        .clone()
+        .or_else(|| Some(trellis2_repo_image_large_root()));
     let output_root = options.output_root.clone();
+    let image_large_output_root = options.image_large_output_root.clone().or_else(|| {
+        if image_large_root.is_some() {
+            Some(trellis2_repo_image_large_root())
+        } else {
+            None
+        }
+    });
     fs::create_dir_all(&output_root)?;
+    if let Some(image_large_output_root) = image_large_output_root.as_ref() {
+        fs::create_dir_all(image_large_output_root)?;
+    }
 
     let pipeline_path = weights_root.join("pipeline.json");
     let pipeline_bytes = fs::read(&pipeline_path)?;
@@ -146,6 +160,7 @@ pub fn import_trellis2_assets(
     copied_json_files.push(output_pipeline_path.display().to_string());
 
     for stem in collect_model_stems(&pipeline_json) {
+        let model_in_image_large = is_image_large_stem(&stem);
         let source_json =
             resolve_model_source_path(&stem, "json", &weights_root, image_large_root.as_deref());
         let source_safetensors = resolve_model_source_path(
@@ -154,10 +169,17 @@ pub fn import_trellis2_assets(
             &weights_root,
             image_large_root.as_deref(),
         );
+        let model_output_root = if model_in_image_large {
+            image_large_output_root.as_ref().unwrap_or(&output_root)
+        } else {
+            &output_root
+        };
         let relative_json = model_relative_path(&stem, "json");
         let relative_safetensors = model_relative_path(&stem, "safetensors");
-        let output_json = output_root.join(relative_json);
-        let output_bpk = output_root.join(relative_safetensors).with_extension("bpk");
+        let output_json = model_output_root.join(relative_json);
+        let output_bpk = model_output_root
+            .join(relative_safetensors)
+            .with_extension("bpk");
         let import_kind = if source_json.exists() {
             model_import_kind(&source_json)
         } else {
@@ -204,6 +226,7 @@ pub fn import_trellis2_assets(
     let manifest = TrellisImportManifest {
         weights_root: weights_root.display().to_string(),
         image_large_root: image_large_root.map(|path| path.display().to_string()),
+        image_large_output_root: image_large_output_root.map(|path| path.display().to_string()),
         imported_blobs,
         copied_json_files,
         missing_sources,
@@ -548,8 +571,19 @@ fn resolve_model_source_path(
         return weights_root.join(format!("{stem}.{ext}"));
     }
     if let Some((_, suffix)) = stem.split_once("/ckpts/") {
-        let image_large_root = image_large_root.unwrap_or(weights_root);
-        return image_large_root.join(format!("ckpts/{suffix}.{ext}"));
+        let relative = format!("ckpts/{suffix}.{ext}");
+        if let Some(image_large_root) = image_large_root {
+            let image_candidate = image_large_root.join(&relative);
+            if image_candidate.exists() {
+                return image_candidate;
+            }
+            let weights_candidate = weights_root.join(&relative);
+            if weights_candidate.exists() {
+                return weights_candidate;
+            }
+            return image_candidate;
+        }
+        return weights_root.join(relative);
     }
     weights_root.join(format!("{stem}.{ext}"))
 }
@@ -562,6 +596,10 @@ fn model_relative_path(stem: &str, ext: &str) -> PathBuf {
         return PathBuf::from(format!("ckpts/{suffix}.{ext}"));
     }
     PathBuf::from(format!("{stem}.{ext}"))
+}
+
+fn is_image_large_stem(stem: &str) -> bool {
+    !stem.starts_with("ckpts/") && stem.split_once("/ckpts/").is_some()
 }
 
 fn copy_if_needed(source: &Path, destination: &Path, overwrite: bool) -> std::io::Result<()> {
@@ -654,6 +692,7 @@ mod tests {
             weights_root: root.clone(),
             image_large_root: None,
             output_root: output.clone(),
+            image_large_output_root: None,
             quantization: QuantizationMode::Both,
             overwrite: true,
         })
@@ -797,6 +836,7 @@ mod tests {
             weights_root: root.clone(),
             image_large_root: None,
             output_root: output.clone(),
+            image_large_output_root: None,
             quantization: QuantizationMode::Both,
             overwrite: true,
         })
@@ -819,6 +859,137 @@ mod tests {
             f16_size <= f32_size,
             "f16 burnpack should not exceed f32 size"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imports_image_large_stems_into_dedicated_output_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_import_image_large_{unique}"));
+        let weights_root = root.join("weights");
+        let image_large_root = root.join("image_large");
+        let output_root = root.join("out_main");
+        let image_large_output_root = root.join("out_image_large");
+
+        let weights_ckpts = weights_root.join("ckpts");
+        let image_large_ckpts = image_large_root.join("ckpts");
+        std::fs::create_dir_all(&weights_ckpts).expect("create weights ckpts");
+        std::fs::create_dir_all(&image_large_ckpts).expect("create image-large ckpts");
+
+        let pipeline = r#"{
+            "args": {
+                "models": {
+                    "shape": "ckpts/shape",
+                    "ss_dec": "microsoft/TRELLIS-image-large/ckpts/ss_dec"
+                }
+            }
+        }"#;
+        std::fs::write(weights_root.join("pipeline.json"), pipeline).expect("write pipeline");
+
+        std::fs::write(weights_ckpts.join("shape.json"), "{}").expect("write shape json");
+        std::fs::write(weights_ckpts.join("shape.safetensors"), b"shape_bytes")
+            .expect("write shape safetensors");
+
+        std::fs::write(image_large_ckpts.join("ss_dec.json"), "{}").expect("write ss_dec json");
+        std::fs::write(
+            image_large_ckpts.join("ss_dec.safetensors"),
+            b"image_large_bytes",
+        )
+        .expect("write ss_dec safetensors");
+
+        let report = import_trellis2_assets(&TrellisImportOptions {
+            weights_root: weights_root.clone(),
+            image_large_root: Some(image_large_root.clone()),
+            output_root: output_root.clone(),
+            image_large_output_root: Some(image_large_output_root.clone()),
+            quantization: QuantizationMode::F32,
+            overwrite: true,
+        })
+        .expect("import should succeed");
+
+        assert!(
+            report.manifest.missing_sources.is_empty(),
+            "missing sources: {:?}",
+            report.manifest.missing_sources
+        );
+        assert_eq!(
+            report.manifest.image_large_output_root.as_deref(),
+            Some(image_large_output_root.to_string_lossy().as_ref())
+        );
+
+        let shape_bpk = output_root.join("ckpts/shape.bpk");
+        let ss_dec_bpk = image_large_output_root.join("ckpts/ss_dec.bpk");
+        assert!(
+            shape_bpk.exists(),
+            "shape should remain in primary output root"
+        );
+        assert!(
+            ss_dec_bpk.exists(),
+            "image-large checkpoint should be written to dedicated output root"
+        );
+        assert!(
+            !output_root.join("ckpts/ss_dec.bpk").exists(),
+            "image-large checkpoint should not be written into primary output root"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imports_image_large_stems_with_weights_root_source_fallback() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("burn_trellis_import_image_large_fallback_{unique}"));
+        let weights_root = root.join("weights");
+        let image_large_root = root.join("image_large_empty");
+        let output_root = root.join("out_main");
+        let image_large_output_root = root.join("out_image_large");
+
+        let weights_ckpts = weights_root.join("ckpts");
+        std::fs::create_dir_all(&weights_ckpts).expect("create weights ckpts");
+        std::fs::create_dir_all(&image_large_root).expect("create empty image-large root");
+
+        let pipeline = r#"{
+            "args": {
+                "models": {
+                    "shape": "ckpts/shape",
+                    "ss_dec": "microsoft/TRELLIS-image-large/ckpts/ss_dec"
+                }
+            }
+        }"#;
+        std::fs::write(weights_root.join("pipeline.json"), pipeline).expect("write pipeline");
+
+        std::fs::write(weights_ckpts.join("shape.json"), "{}").expect("write shape json");
+        std::fs::write(weights_ckpts.join("shape.safetensors"), b"shape_bytes")
+            .expect("write shape safetensors");
+        std::fs::write(weights_ckpts.join("ss_dec.json"), "{}").expect("write ss_dec json");
+        std::fs::write(weights_ckpts.join("ss_dec.safetensors"), b"ss_dec_bytes")
+            .expect("write ss_dec safetensors");
+
+        let report = import_trellis2_assets(&TrellisImportOptions {
+            weights_root: weights_root.clone(),
+            image_large_root: Some(image_large_root.clone()),
+            output_root: output_root.clone(),
+            image_large_output_root: Some(image_large_output_root.clone()),
+            quantization: QuantizationMode::F32,
+            overwrite: true,
+        })
+        .expect("import should succeed");
+
+        assert!(
+            report.manifest.missing_sources.is_empty(),
+            "missing sources: {:?}",
+            report.manifest.missing_sources
+        );
+        assert!(output_root.join("ckpts/shape.bpk").exists());
+        assert!(image_large_output_root.join("ckpts/ss_dec.bpk").exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

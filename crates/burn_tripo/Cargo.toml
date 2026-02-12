@@ -53,6 +53,7 @@ serde_json = { version = "1.0", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 burn-cuda = { version = "0.19", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+meshopt = "0.6.2"
 
 
 

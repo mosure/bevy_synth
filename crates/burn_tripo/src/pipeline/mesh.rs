@@ -198,16 +198,14 @@ pub fn sdf_to_mesh_diff_dmc(grid: &DenseGrid) -> Option<Mesh> {
     let iso = 0.0f32;
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    let mut saw_nan = false;
     for &v in &grid.values {
-        if v.is_nan() {
-            saw_nan = true;
+        if !v.is_finite() {
             continue;
         }
         min = min.min(v);
         max = max.max(v);
     }
-    if !saw_nan && (min >= iso || max <= iso) {
+    if min == f32::INFINITY || max == f32::NEG_INFINITY || min >= iso || max <= iso {
         return None;
     }
 
@@ -221,7 +219,8 @@ pub fn sdf_to_mesh_diff_dmc(grid: &DenseGrid) -> Option<Mesh> {
             let src_base = (z * ny + y) * nx;
             let dst_base = ((z + 1) * py + (y + 1)) * px;
             for x in 0..nx {
-                padded[dst_base + x + 1] = grid.values[src_base + x];
+                let value = grid.values[src_base + x];
+                padded[dst_base + x + 1] = if value.is_finite() { value } else { pad };
             }
         }
     }
@@ -257,6 +256,64 @@ pub fn sdf_to_mesh_diff_dmc(grid: &DenseGrid) -> Option<Mesh> {
     }
 
     Some(Mesh { vertices, faces })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_dmc_treats_nan_background_as_outside() {
+        let size = [7usize, 7, 7];
+        let mut values = vec![f32::NAN; size[0] * size[1] * size[2]];
+        let c = 3usize;
+        for z in 0..size[2] {
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    let dx = x as f32 - c as f32;
+                    let dy = y as f32 - c as f32;
+                    let dz = z as f32 - c as f32;
+                    let r2 = dx * dx + dy * dy + dz * dz;
+                    if r2 <= 9.0 {
+                        let idx = (z * size[1] + y) * size[0] + x;
+                        values[idx] = r2.sqrt() - 2.0;
+                    }
+                }
+            }
+        }
+
+        let grid = DenseGrid {
+            values,
+            size,
+            bounds: [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
+        };
+        let mesh = sdf_to_mesh_diff_dmc(&grid).expect("expected non-empty mesh");
+        let (min, max) = mesh_bounds(&mesh);
+        for axis in 0..3 {
+            assert!(
+                min[axis] > -0.8,
+                "min bound too low on axis {axis}: {}",
+                min[axis]
+            );
+            assert!(
+                max[axis] < 0.8,
+                "max bound too high on axis {axis}: {}",
+                max[axis]
+            );
+        }
+    }
+
+    fn mesh_bounds(mesh: &Mesh) -> ([f32; 3], [f32; 3]) {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for v in &mesh.vertices {
+            for i in 0..3 {
+                min[i] = min[i].min(v[i]);
+                max[i] = max[i].max(v[i]);
+            }
+        }
+        (min, max)
+    }
 }
 
 fn edge_index_x(x: usize, y: usize, z: usize, nx: usize, ny: usize) -> usize {

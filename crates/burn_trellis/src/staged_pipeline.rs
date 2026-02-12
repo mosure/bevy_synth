@@ -4,9 +4,8 @@ use std::collections::HashMap;
 #[cfg(feature = "runtime-model")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "runtime-model")]
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::mesh::{Mesh, MeshMaterial, MeshPbrTextures, MeshTexture};
 use crate::preprocess::PreprocessOutput;
@@ -23,10 +22,51 @@ use crate::runtime_model::sparse_structure_flow::SparseStructureFlowRuntime;
 use crate::runtime_model::sparse_unet_vae_decoder::SparseUnetVaeDecoderRuntime;
 use crate::sampler::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig};
 use crate::trellis_config::{TrellisNormalization, TrellisPipelineArgs, TrellisSamplerConfig};
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_flex_gmm::wgpu::{neighbor_rows_build_stats, reset_neighbor_rows_build_stats};
 
 #[path = "staged_pipeline_decode.rs"]
 mod staged_pipeline_decode;
 use staged_pipeline_decode::*;
+
+static STAGE_LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
+static SYNTHETIC_COND_WARNED: OnceLock<()> = OnceLock::new();
+
+fn stage_log_timestamp() -> String {
+    let elapsed = STAGE_LOG_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs_f64();
+    let epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("ts_ms={epoch_ms} t+{elapsed:.3}s")
+}
+
+macro_rules! trellis_stage_log {
+    ($($arg:tt)*) => {{
+        std::eprintln!(
+            "[{}] {}",
+            $crate::staged_pipeline::stage_log_timestamp(),
+            format!($($arg)*)
+        );
+    }};
+}
+
+fn pipeline_type_uses_cascade(pipeline_type: &str) -> bool {
+    matches!(pipeline_type, "1024_cascade" | "1536_cascade")
+}
+
+fn warn_synthetic_cond_fallback() {
+    if SYNTHETIC_COND_WARNED.get().is_some() {
+        return;
+    }
+    let _ = SYNTHETIC_COND_WARNED.set(());
+    trellis_stage_log!(
+        "burn_trellis: using synthetic image conditioning features (DINOv3 extractor is not integrated in this runtime path); this is a known parity and quality gap vs TRELLIS.2."
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct SparseStructureSample {
@@ -344,6 +384,12 @@ impl TrellisStageRuntime {
         let pipeline_type = preferred_pipeline_type
             .unwrap_or(args.default_pipeline_type.as_str())
             .to_string();
+        if pipeline_type_uses_cascade(pipeline_type.as_str()) {
+            trellis_stage_log!(
+                "burn_trellis: pipeline_type='{}' currently runs a single-pass staged flow path (full canonical two-pass cascade is not yet implemented).",
+                pipeline_type
+            );
+        }
         let mut sparse_sampler = args.sparse_structure_sampler.clone();
         let mut shape_sampler = args.shape_slat_sampler.clone();
         let mut tex_sampler = args.tex_slat_sampler.clone();
@@ -351,7 +397,9 @@ impl TrellisStageRuntime {
             sparse_sampler.params.steps = steps_override;
             shape_sampler.params.steps = steps_override;
             tex_sampler.params.steps = steps_override;
-            eprintln!("burn_trellis: sampler steps override active (steps={steps_override})");
+            trellis_stage_log!(
+                "burn_trellis: sampler steps override active (steps={steps_override})"
+            );
         }
         #[cfg(feature = "runtime-model")]
         let runtime_model_disabled = std::env::var("TRELLIS2_DISABLE_RUNTIME_MODEL")
@@ -451,7 +499,7 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let shape_decoder_spec = if runtime_model_disabled || runtime_decoders_disabled {
             if runtime_decoders_disabled {
-                eprintln!(
+                trellis_stage_log!(
                     "burn_trellis: runtime decoders disabled by TRELLIS2_DISABLE_RUNTIME_DECODERS."
                 );
             }
@@ -495,11 +543,88 @@ impl TrellisStageRuntime {
         let tex_decoder = OnceLock::new();
         #[cfg(feature = "runtime-model")]
         if !runtime_lazy_model_load {
-            let _ = sparse_flow.set(load_flow_runtime_from_spec(sparse_flow_spec.as_ref()));
-            let _ = shape_flow.set(load_flow_runtime_from_spec(shape_flow_spec.as_ref()));
-            let _ = tex_flow.set(load_flow_runtime_from_spec(tex_flow_spec.as_ref()));
-            let _ = shape_decoder.set(load_shape_decoder_from_spec(shape_decoder_spec.as_ref()));
-            let _ = tex_decoder.set(load_tex_decoder_from_spec(tex_decoder_spec.as_ref()));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let sparse_spec_clone = sparse_flow_spec.clone();
+                let shape_spec_clone = shape_flow_spec.clone();
+                let tex_spec_clone = tex_flow_spec.clone();
+                let shape_decoder_spec_clone = shape_decoder_spec.clone();
+                let tex_decoder_spec_clone = tex_decoder_spec.clone();
+                let sparse_task = std::thread::spawn(move || {
+                    load_flow_runtime_from_spec(sparse_spec_clone.as_ref())
+                });
+                let shape_task = std::thread::spawn(move || {
+                    load_flow_runtime_from_spec(shape_spec_clone.as_ref())
+                });
+                let tex_task = std::thread::spawn(move || {
+                    load_flow_runtime_from_spec(tex_spec_clone.as_ref())
+                });
+                let shape_decoder_task = std::thread::spawn(move || {
+                    load_shape_decoder_from_spec(shape_decoder_spec_clone.as_ref())
+                });
+                let tex_decoder_task = std::thread::spawn(move || {
+                    load_tex_decoder_from_spec(tex_decoder_spec_clone.as_ref())
+                });
+                let sparse_loaded = match sparse_task.join() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        trellis_stage_log!(
+                            "burn_trellis: sparse runtime preload task panicked; deferring to lazy load fallback"
+                        );
+                        None
+                    }
+                };
+                let shape_loaded = match shape_task.join() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        trellis_stage_log!(
+                            "burn_trellis: shape runtime preload task panicked; deferring to lazy load fallback"
+                        );
+                        None
+                    }
+                };
+                let tex_loaded = match tex_task.join() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        trellis_stage_log!(
+                            "burn_trellis: tex runtime preload task panicked; deferring to lazy load fallback"
+                        );
+                        None
+                    }
+                };
+                let shape_decoder_loaded = match shape_decoder_task.join() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        trellis_stage_log!(
+                            "burn_trellis: shape decoder preload task panicked; deferring to lazy load fallback"
+                        );
+                        None
+                    }
+                };
+                let tex_decoder_loaded = match tex_decoder_task.join() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        trellis_stage_log!(
+                            "burn_trellis: tex decoder preload task panicked; deferring to lazy load fallback"
+                        );
+                        None
+                    }
+                };
+                let _ = sparse_flow.set(sparse_loaded);
+                let _ = shape_flow.set(shape_loaded);
+                let _ = tex_flow.set(tex_loaded);
+                let _ = shape_decoder.set(shape_decoder_loaded);
+                let _ = tex_decoder.set(tex_decoder_loaded);
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = sparse_flow.set(load_flow_runtime_from_spec(sparse_flow_spec.as_ref()));
+                let _ = shape_flow.set(load_flow_runtime_from_spec(shape_flow_spec.as_ref()));
+                let _ = tex_flow.set(load_flow_runtime_from_spec(tex_flow_spec.as_ref()));
+                let _ =
+                    shape_decoder.set(load_shape_decoder_from_spec(shape_decoder_spec.as_ref()));
+                let _ = tex_decoder.set(load_tex_decoder_from_spec(tex_decoder_spec.as_ref()));
+            }
         }
         Self {
             pipeline_type,
@@ -606,6 +731,12 @@ impl TrellisStageRuntime {
         let total_start = Instant::now();
         let stage_debug = runtime_stage_debug_enabled();
         let parity_strict = runtime_parity_strict();
+        if parity_strict && pipeline_type_uses_cascade(self.pipeline_type()) {
+            return Err(format!(
+                "burn_trellis: parity strict mode does not currently support '{}'; canonical two-pass cascade must be implemented first.",
+                self.pipeline_type()
+            ));
+        }
         let sparse_resolution = sparse_resolution_for_pipeline(self.pipeline_type());
         let mut rng = Lcg::new(seed);
         let sparse_noise_override = noise_overrides.and_then(|v| v.sparse_noise.as_deref());
@@ -623,6 +754,9 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let sparse_flow_runtime = self.sparse_flow_runtime();
         let sparse_start = Instant::now();
+        if stage_debug {
+            trellis_stage_log!("burn_trellis: stage sparse begin");
+        }
         let sparse = sample_sparse_structure(
             preprocess,
             sparse_resolution,
@@ -640,7 +774,7 @@ impl TrellisStageRuntime {
         )?;
         let sparse_ms = sparse_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: stage sparse complete ({sparse_ms:.2} ms, coords={})",
                 sparse.coords.len()
             );
@@ -649,6 +783,9 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let shape_flow_runtime = self.shape_flow_runtime();
         let shape_start = Instant::now();
+        if stage_debug {
+            trellis_stage_log!("burn_trellis: stage shape_slat begin");
+        }
         let shape_slat = sample_shape_slat(
             preprocess,
             &sparse.coords,
@@ -667,7 +804,7 @@ impl TrellisStageRuntime {
         )?;
         let shape_slat_ms = shape_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: stage shape_slat complete ({shape_slat_ms:.2} ms, rows={})",
                 shape_slat.coords.len()
             );
@@ -676,6 +813,9 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let tex_flow_runtime = self.tex_flow_runtime();
         let tex_start = Instant::now();
+        if stage_debug {
+            trellis_stage_log!("burn_trellis: stage tex_slat begin");
+        }
         let tex_slat = sample_tex_slat(
             preprocess,
             &shape_slat,
@@ -695,13 +835,16 @@ impl TrellisStageRuntime {
         )?;
         let tex_slat_ms = tex_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: stage tex_slat complete ({tex_slat_ms:.2} ms, rows={})",
                 tex_slat.coords.len()
             );
         }
 
         let decode_start = Instant::now();
+        if stage_debug {
+            trellis_stage_log!("burn_trellis: stage decode begin");
+        }
         let decoded = if runtime_skip_decode() {
             if parity_strict {
                 return Err(
@@ -729,7 +872,7 @@ impl TrellisStageRuntime {
         };
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: stage decode complete ({decode_ms:.2} ms, vertices={}, faces={})",
                 decoded.mesh.vertices.len(),
                 decoded.mesh.faces.len()
@@ -813,7 +956,16 @@ fn runtime_lazy_model_load_enabled() -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
         ),
-        Err(_) => true,
+        Err(_) => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                true
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                false
+            }
+        }
     }
 }
 
@@ -832,14 +984,14 @@ fn load_flow_runtime_from_spec(
         Ok(runtime) => {
             match spec.stage_label {
                 "sparse flow" => {
-                    eprintln!(
+                    trellis_stage_log!(
                         "burn_trellis: sparse flow runtime backend = {}",
                         runtime.backend_name()
                     );
                 }
                 "shape slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("shape_slat_flow_model");
-                    eprintln!(
+                    trellis_stage_log!(
                         "burn_trellis: shape slat runtime backend = {} (flow={}, dense_res={})",
                         runtime.backend_name(),
                         key,
@@ -848,7 +1000,7 @@ fn load_flow_runtime_from_spec(
                 }
                 "tex slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("tex_slat_flow_model");
-                    eprintln!(
+                    trellis_stage_log!(
                         "burn_trellis: tex slat runtime backend = {} (flow={}, dense_res={})",
                         runtime.backend_name(),
                         key,
@@ -862,20 +1014,20 @@ fn load_flow_runtime_from_spec(
         Err(err) => {
             match spec.stage_label {
                 "sparse flow" => {
-                    eprintln!(
+                    trellis_stage_log!(
                         "burn_trellis: sparse flow runtime model unavailable ({err}); using synthetic sparse stage fallback."
                     );
                 }
                 "shape slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("shape_slat_flow_model");
-                    eprintln!(
+                    trellis_stage_log!(
                         "burn_trellis: shape slat runtime model unavailable for key '{}' ({err}); using synthetic shape stage fallback.",
                         key
                     );
                 }
                 "tex slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("tex_slat_flow_model");
-                    eprintln!(
+                    trellis_stage_log!(
                         "burn_trellis: tex slat runtime model unavailable for key '{}' ({err}); using synthetic tex stage fallback.",
                         key
                     );
@@ -903,7 +1055,7 @@ fn load_shape_decoder_from_spec(
     ) {
         Ok(runtime) => Some(runtime),
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
             );
             None
@@ -927,7 +1079,7 @@ fn load_tex_decoder_from_spec(
     ) {
         Ok(runtime) => Some(runtime),
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
             );
             None
@@ -948,9 +1100,32 @@ fn runtime_decoder_conv_telemetry_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "runtime-model-wgpu")]
+fn reset_neighbor_build_stats() {
+    reset_neighbor_rows_build_stats();
+}
+
+#[cfg(not(feature = "runtime-model-wgpu"))]
+fn reset_neighbor_build_stats() {}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn log_neighbor_build_stats(stage: &str) {
+    let stats = neighbor_rows_build_stats();
+    trellis_stage_log!(
+        "burn_trellis: neighbor-map telemetry [{stage}] cache_hits={} cache_misses={} host_builds={} device_builds={}",
+        stats.cache_hits,
+        stats.cache_misses,
+        stats.host_builds,
+        stats.device_builds
+    );
+}
+
+#[cfg(not(feature = "runtime-model-wgpu"))]
+fn log_neighbor_build_stats(_stage: &str) {}
+
 #[cfg(feature = "runtime-model")]
 fn log_decoder_conv_telemetry(stage: &str, telemetry: &DecoderConvTelemetry) {
-    eprintln!(
+    trellis_stage_log!(
         "burn_trellis: decoder conv telemetry [{stage}] conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
         telemetry.conv_calls,
         telemetry.wgpu_calls,
@@ -964,7 +1139,7 @@ fn log_decoder_conv_telemetry(stage: &str, telemetry: &DecoderConvTelemetry) {
         telemetry.neighbor_elements
     );
     for block in telemetry.blocks.iter() {
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: decoder conv telemetry [{stage}] block='{}' conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
             block.context,
             block.conv_calls,
@@ -1006,7 +1181,7 @@ fn runtime_skip_pbr() -> bool {
 }
 
 fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
-    if let Some(explicit_limit) = runtime_max_sparse_coords() {
+    if let Some(explicit_limit) = runtime_max_sparse_coords_override() {
         return Some(explicit_limit);
     }
     if runtime_parity_strict() {
@@ -1020,6 +1195,20 @@ fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
             .or(Some(32_768));
     }
     None
+}
+
+fn runtime_max_sparse_coords_override() -> Option<usize> {
+    #[cfg(feature = "runtime-model")]
+    {
+        runtime_max_sparse_coords()
+    }
+    #[cfg(not(feature = "runtime-model"))]
+    {
+        std::env::var("TRELLIS2_MAX_SPARSE_COORDS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    }
 }
 
 fn resolve_sampler_settings(
@@ -1046,7 +1235,7 @@ fn dense_noise_with_override(
         if values.len() == expected_len {
             return values.to_vec();
         }
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: ignoring {stage} noise override due to len mismatch (expected {}, got {})",
             expected_len,
             values.len()
@@ -1166,19 +1355,20 @@ fn dense_cond_with_override(
             ));
         }
         if let Some(resized) = resize_override_values(values, expected) {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: resized {stage} cond override from {} to {} values",
                 values.len(),
                 expected
             );
             return Ok(resized);
         }
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: ignoring {stage} cond override due to len mismatch (expected {}, got {})",
             expected,
             values.len()
         );
     }
+    warn_synthetic_cond_fallback();
     Ok(build_sparse_cond_from_preprocess(
         preprocess,
         cond_tokens,
@@ -1204,14 +1394,14 @@ fn dense_neg_cond_with_override(
             ));
         }
         if let Some(resized) = resize_override_values(values, expected_len) {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: resized {stage} neg-cond override from {} to {} values",
                 values.len(),
                 expected_len
             );
             return Ok(resized);
         }
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: ignoring {stage} neg-cond override due to len mismatch (expected {}, got {})",
             expected_len,
             values.len()
@@ -1274,7 +1464,9 @@ fn merge_sparse_row_noise_override(
         merged += 1;
     }
     if runtime_stage_debug_enabled() {
-        eprintln!("burn_trellis: merged {merged} sparse-row noise overrides for stage {stage}");
+        trellis_stage_log!(
+            "burn_trellis: merged {merged} sparse-row noise overrides for stage {stage}"
+        );
     }
 }
 
@@ -1446,7 +1638,7 @@ fn sample_sparse_structure_with_model(
     ) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse flow cond override rejected ({err}); using synthetic sparse stage fallback."
             );
             return None;
@@ -1459,7 +1651,7 @@ fn sample_sparse_structure_with_model(
     ) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse flow neg-cond override rejected ({err}); using synthetic sparse stage fallback."
             );
             return None;
@@ -1468,7 +1660,7 @@ fn sample_sparse_structure_with_model(
     let cond_tensor = match sparse_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse flow cond preparation failed ({err}); using synthetic sparse stage fallback."
             );
             return None;
@@ -1477,7 +1669,7 @@ fn sample_sparse_structure_with_model(
     let neg_cond_tensor = match sparse_flow.prepare_condition(neg_cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse flow negative cond preparation failed ({err}); using synthetic sparse stage fallback."
             );
             return None;
@@ -1495,7 +1687,7 @@ fn sample_sparse_structure_with_model(
     ) {
         Ok(trace) => trace,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse flow model prediction failed ({err}); using synthetic sparse stage fallback."
             );
             return None;
@@ -1508,7 +1700,7 @@ fn sample_sparse_structure_with_model(
     let max_sparse_coords = runtime_max_sparse_coords_for_backend(sparse_flow.backend_name());
     let mut coords = if let Some(override_coords) = coords_override {
         if runtime_stage_debug_enabled() {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse runtime using hook coord override rows={}",
                 override_coords.len()
             );
@@ -1526,7 +1718,7 @@ fn sample_sparse_structure_with_model(
             ]);
         }
         if let Some(limit) = max_sparse_coords {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: sparse coords after threshold/cap = {} (limit={})",
                 sampled.len(),
                 limit
@@ -1634,7 +1826,7 @@ fn sample_shape_slat_with_model(
     ) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape slat cond override rejected ({err}); using synthetic shape stage fallback."
             );
             return None;
@@ -1647,7 +1839,7 @@ fn sample_shape_slat_with_model(
     ) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape slat neg-cond override rejected ({err}); using synthetic shape stage fallback."
             );
             return None;
@@ -1656,7 +1848,7 @@ fn sample_shape_slat_with_model(
     let cond_tensor = match shape_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape slat cond preparation failed ({err}); using synthetic shape stage fallback."
             );
             return None;
@@ -1665,7 +1857,7 @@ fn sample_shape_slat_with_model(
     let neg_cond_tensor = match shape_flow.prepare_condition(neg_cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape slat negative cond preparation failed ({err}); using synthetic shape stage fallback."
             );
             return None;
@@ -1684,7 +1876,7 @@ fn sample_shape_slat_with_model(
     ) {
         Ok(trace) => trace,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape slat runtime prediction failed ({err}); using synthetic shape stage fallback."
             );
             return None;
@@ -1791,7 +1983,7 @@ fn sample_tex_slat_with_model(
         .collect::<Vec<_>>();
     let concat_channels = config.in_channels.saturating_sub(config.out_channels);
     if concat_channels == 0 {
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: tex flow runtime has no concat channels; using synthetic tex stage fallback."
         );
         return None;
@@ -1853,7 +2045,7 @@ fn sample_tex_slat_with_model(
     ) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex slat cond override rejected ({err}); using synthetic tex stage fallback."
             );
             return None;
@@ -1866,7 +2058,7 @@ fn sample_tex_slat_with_model(
     ) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex slat neg-cond override rejected ({err}); using synthetic tex stage fallback."
             );
             return None;
@@ -1875,7 +2067,7 @@ fn sample_tex_slat_with_model(
     let cond_tensor = match tex_flow.prepare_condition(cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex slat cond preparation failed ({err}); using synthetic tex stage fallback."
             );
             return None;
@@ -1884,7 +2076,7 @@ fn sample_tex_slat_with_model(
     let neg_cond_tensor = match tex_flow.prepare_condition(neg_cond.as_slice(), cond_tokens) {
         Ok(cond) => cond,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex slat negative cond preparation failed ({err}); using synthetic tex stage fallback."
             );
             return None;
@@ -1903,7 +2095,7 @@ fn sample_tex_slat_with_model(
     ) {
         Ok(trace) => trace,
         Err(err) => {
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex slat runtime prediction failed ({err}); using synthetic tex stage fallback."
             );
             return None;
@@ -2240,7 +2432,7 @@ fn decode_latent_to_outputs(
                         .to_string(),
                 );
             }
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: shape runtime decoder missing; using canonical-cube decode fallback"
             );
             return Ok(decoded_fallback_output(
@@ -2254,7 +2446,7 @@ fn decode_latent_to_outputs(
                         .to_string(),
                 );
             }
-            eprintln!(
+            trellis_stage_log!(
                 "burn_trellis: tex runtime decoder missing; using canonical-cube decode fallback"
             );
             return Ok(decoded_fallback_output(
@@ -2274,7 +2466,7 @@ fn decode_latent_to_outputs(
                 if parity_strict {
                     Err(format!("burn_trellis: runtime decode pipeline failed: {err}"))
                 } else {
-                    eprintln!("burn_trellis: runtime decode pipeline failed ({err}); using canonical-cube decode fallback");
+                    trellis_stage_log!("burn_trellis: runtime decode pipeline failed ({err}); using canonical-cube decode fallback");
                     Ok(decoded_fallback_output(
                         DecodeStageSource::FallbackRuntimeError,
                     ))
@@ -2345,12 +2537,13 @@ fn decode_latent_with_runtime_decoders(
         ));
     }
     if stage_debug {
-        eprintln!("burn_trellis: decode runtime begin (rows={count})");
+        trellis_stage_log!("burn_trellis: decode runtime begin (rows={count})");
     }
     let conv_telemetry_debug = runtime_decoder_conv_telemetry_enabled();
     let shape_rows = &shape.features[..count];
     let tex_rows = &tex.features[..count];
     reset_decoder_conv_telemetry();
+    reset_neighbor_build_stats();
     let shape_decode_start = Instant::now();
     let shape_decoded = shape_decoder
         .decode_sparse(&shape.coords[..count], shape_rows)
@@ -2358,7 +2551,7 @@ fn decode_latent_with_runtime_decoders(
     let shape_decoder_ms = shape_decode_start.elapsed().as_secs_f64() * 1000.0;
     let shape_conv_telemetry = decoder_conv_telemetry();
     if stage_debug {
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: decode runtime shape-decoder complete ({:.2} ms, subs={}, coords={})",
             shape_decoder_ms,
             shape_decoded.subdivisions.len(),
@@ -2367,9 +2560,11 @@ fn decode_latent_with_runtime_decoders(
     }
     if stage_debug || conv_telemetry_debug {
         log_decoder_conv_telemetry("shape_decoder", &shape_conv_telemetry);
+        log_neighbor_build_stats("shape_decoder");
     }
 
     reset_decoder_conv_telemetry();
+    reset_neighbor_build_stats();
     let tex_decode_start = Instant::now();
     let tex_decoded = tex_decoder
         .decode_with_guidance(
@@ -2381,7 +2576,7 @@ fn decode_latent_with_runtime_decoders(
     let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
     let tex_conv_telemetry = decoder_conv_telemetry();
     if stage_debug {
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: decode runtime tex-decoder complete ({:.2} ms, coords={})",
             tex_decoder_ms,
             tex_decoded.coords.len()
@@ -2389,6 +2584,7 @@ fn decode_latent_with_runtime_decoders(
     }
     if stage_debug || conv_telemetry_debug {
         log_decoder_conv_telemetry("tex_decoder", &tex_conv_telemetry);
+        log_neighbor_build_stats("tex_decoder");
     }
 
     let final_resolution = final_resolution_for_pipeline(pipeline_type);
@@ -2409,7 +2605,7 @@ fn decode_latent_with_runtime_decoders(
         .collect::<Vec<_>>();
     let attr_merge_ms = attr_merge_start.elapsed().as_secs_f64() * 1000.0;
     if stage_debug {
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: decode runtime attr merge complete ({:.2} ms)",
             attr_merge_ms
         );
@@ -2432,7 +2628,7 @@ fn decode_latent_with_runtime_decoders(
     );
     let mesh_ms = mesh_start.elapsed().as_secs_f64() * 1000.0;
     if stage_debug {
-        eprintln!(
+        trellis_stage_log!(
             "burn_trellis: decode runtime mesh complete ({:.2} ms, vertices={}, faces={})",
             mesh_ms,
             vertices.len(),
@@ -2442,7 +2638,7 @@ fn decode_latent_with_runtime_decoders(
     let skip_pbr = runtime_skip_pbr();
     let (uvs, pbr_textures, pbr_debug, pbr_ms) = if skip_pbr {
         if stage_debug {
-            eprintln!("burn_trellis: decode runtime pbr skipped (TRELLIS2_SKIP_PBR=1)");
+            trellis_stage_log!("burn_trellis: decode runtime pbr skipped (TRELLIS2_SKIP_PBR=1)");
         }
         (Vec::new(), None, None, 0.0)
     } else {
@@ -2457,7 +2653,7 @@ fn decode_latent_with_runtime_decoders(
         );
         let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
         if stage_debug {
-            eprintln!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
+            trellis_stage_log!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
         }
         (uvs, pbr_textures, pbr_debug, pbr_ms)
     };
@@ -2832,7 +3028,7 @@ mod tests {
                 root.join("assets/hooks/trellis2_full_reference_alpha_512.safetensors")
             });
         if !reference_path.exists() {
-            eprintln!(
+            trellis_stage_log!(
                 "Skipping runtime_decoder_hook_alignment_report: missing reference hook '{}'",
                 reference_path.display()
             );
@@ -2873,7 +3069,7 @@ mod tests {
             .expect("decode input feats should decode");
             (coords, feats)
         } else {
-            eprintln!(
+            trellis_stage_log!(
                 "runtime_decoder_hook_alignment_report: reference hook missing decode_shape_slat.input.*; using sample_shape_slat.slat.* fallback (subdivision logit comparisons may be context-mismatched)."
             );
             let coords = tensor_to_coords4(
@@ -2944,7 +3140,7 @@ mod tests {
 
         let weights_root = resolve_trellis2_weights_root(None);
         if !weights_root.exists() {
-            eprintln!(
+            trellis_stage_log!(
                 "Skipping runtime_decoder_hook_alignment_report: missing weights root '{}'",
                 weights_root.display()
             );
@@ -3230,14 +3426,14 @@ mod tests {
         let reference_path = match std::env::var("TRELLIS2_DECODER_REFERENCE_HOOK") {
             Ok(path) => PathBuf::from(path),
             Err(_) => {
-                eprintln!(
+                trellis_stage_log!(
                     "Skipping runtime_decoder_stage0_subdivision_alignment_report: set TRELLIS2_DECODER_REFERENCE_HOOK to a stage0 alignment hook."
                 );
                 return;
             }
         };
         if !reference_path.exists() {
-            eprintln!(
+            trellis_stage_log!(
                 "Skipping runtime_decoder_stage0_subdivision_alignment_report: missing reference hook '{}'",
                 reference_path.display()
             );
@@ -3309,7 +3505,7 @@ mod tests {
         let reference_subdivisions = load_reference_subdivisions(&reference)
             .expect("reference shape subdivisions should decode");
         let Some(reference_stage0) = reference_subdivisions.first() else {
-            eprintln!(
+            trellis_stage_log!(
                 "Skipping runtime_decoder_stage0_subdivision_alignment_report: no decode_shape_slat.subs.0 in '{}'",
                 reference_path.display()
             );
@@ -3318,7 +3514,7 @@ mod tests {
 
         let weights_root = resolve_trellis2_weights_root(None);
         if !weights_root.exists() {
-            eprintln!(
+            trellis_stage_log!(
                 "Skipping runtime_decoder_stage0_subdivision_alignment_report: missing weights root '{}'",
                 weights_root.display()
             );

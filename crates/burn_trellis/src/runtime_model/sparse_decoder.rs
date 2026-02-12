@@ -1296,9 +1296,11 @@ impl SparseUnetDecoderRuntime {
                     && child_rows > 0
                     && let Some(context_gpu) = wgpu_context.as_deref_mut()
                 {
-                    let h_up_t =
-                        Tensor::<DefaultWgpuBackend, 1>::from_floats(h_up.as_slice(), &context_gpu.device)
-                            .reshape([child_rows, up.out_channels]);
+                    let h_up_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(
+                        h_up.as_slice(),
+                        &context_gpu.device,
+                    )
+                    .reshape([child_rows, up.out_channels]);
                     let h_up_t = layer_norm_wgpu(
                         context_gpu,
                         h_up_t,
@@ -1597,7 +1599,9 @@ impl SparseUnetDecoderRuntime {
                 Err(err) => {
                     state_feats_wgpu = None;
                     if decoder_conv_debug_enabled() {
-                        eprintln!("burn_trellis: wgpu stage0 convnext fallback to cpu reason={err}");
+                        eprintln!(
+                            "burn_trellis: wgpu stage0 convnext fallback to cpu reason={err}"
+                        );
                     }
                 }
             }
@@ -2263,9 +2267,7 @@ fn decoder_conv_impl() -> DecoderConvImpl {
         #[cfg(feature = "runtime-model-wgpu")]
         Some("wgpu") => DecoderConvImpl::Wgpu,
         Some("auto") | None => {
-            if env_flag("TRELLIS2_PARITY_STRICT") || env_flag("TRELLIS2_E2E_STRICT") {
-                DecoderConvImpl::Legacy
-            } else if !env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
+            if !env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
                 #[cfg(feature = "runtime-model-wgpu")]
                 {
                     DecoderConvImpl::Wgpu
@@ -2712,25 +2714,14 @@ fn conv_kernel_axis_order() -> [usize; 3] {
         };
     }
 
-    if env_flag("TRELLIS2_PARITY_STRICT") {
-        // Empirically closest to current TRELLIS2 decoder hook traces.
-        [1, 0, 2]
-    } else {
-        [0, 1, 2]
-    }
+    [0, 1, 2]
 }
 
 fn conv_kernel_axis_signs() -> [i32; 3] {
     let raw = std::env::var("TRELLIS2_CONV_AXIS_SIGN")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| {
-            if env_flag("TRELLIS2_PARITY_STRICT") {
-                "---".to_string()
-            } else {
-                "+++".to_string()
-            }
-        });
+        .unwrap_or_else(|| "+++".to_string());
     let mut signs = [1i32, 1, 1];
     for (idx, ch) in raw.chars().take(3).enumerate() {
         signs[idx] = if ch == '-' { -1 } else { 1 };
@@ -3667,13 +3658,16 @@ mod tests {
     }
 
     #[test]
-    fn decoder_conv_auto_uses_legacy_in_strict_mode() {
+    fn decoder_conv_auto_does_not_force_legacy_in_strict_mode() {
         let _guard = ENV_LOCK.lock().expect("lock env");
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
             std::env::set_var("TRELLIS2_E2E_STRICT", "1");
         }
-        assert_eq!(decoder_conv_impl(), DecoderConvImpl::Legacy);
+        #[cfg(feature = "runtime-model-wgpu")]
+        assert_eq!(decoder_conv_impl(), DecoderConvImpl::Wgpu);
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        assert_eq!(decoder_conv_impl(), DecoderConvImpl::FlexGmm);
         unsafe {
             std::env::remove_var("TRELLIS2_E2E_STRICT");
         }

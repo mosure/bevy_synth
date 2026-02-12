@@ -185,13 +185,14 @@ fn load_burnpack_from_manifest(manifest_path: &Path) -> Result<Vec<u8>, String> 
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         burnpack_manifest_candidates, candidate_burnpack_names, load_burnpack_asset_from_root,
-        prefer_f16_burnpack,
+        parse_shard_manifest_bytes, prefer_f16_burnpack, reconstruct_burnpack_from_shard_manifest,
     };
 
     fn unique_temp_dir() -> PathBuf {
@@ -245,5 +246,108 @@ mod tests {
         assert_eq!(bytes, b"abcdef");
 
         fs::remove_dir_all(root).expect("failed to cleanup temp root");
+    }
+
+    #[test]
+    fn loads_legacy_manifest_suffix_when_shards_manifest_missing() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).expect("failed to create temp root");
+
+        let manifest = root.join("model_f16.bpk.manifest.json");
+        let shard_a = root.join("model_f16.bpk.shard-aa");
+        let shard_b = root.join("model_f16.bpk.shard-ab");
+        fs::write(&shard_a, b"abc").expect("failed to write shard a");
+        fs::write(&shard_b, b"def").expect("failed to write shard b");
+        fs::write(
+            &manifest,
+            r#"{"total_bytes":6,"shards":["model_f16.bpk.shard-aa","model_f16.bpk.shard-ab"]}"#,
+        )
+        .expect("failed to write manifest");
+
+        let bytes =
+            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
+                .expect("failed to load burnpack from legacy manifest suffix");
+        assert_eq!(bytes, b"abcdef");
+
+        fs::remove_dir_all(root).expect("failed to cleanup temp root");
+    }
+
+    #[test]
+    fn loads_manifest_with_detailed_entries_and_nested_paths() {
+        let root = unique_temp_dir();
+        let shard_root = root.join("shards");
+        fs::create_dir_all(&shard_root).expect("failed to create temp root");
+
+        let manifest = root.join("model_f16.bpk.shards.json");
+        fs::write(shard_root.join("a.bin"), b"abc").expect("failed to write shard a");
+        fs::write(shard_root.join("b.bin"), b"def").expect("failed to write shard b");
+        fs::write(
+            &manifest,
+            r#"{"total_bytes":6,"files":[{"path":"shards/a.bin","size":3},{"path":"shards/b.bin","bytes":3}]}"#,
+        )
+        .expect("failed to write manifest");
+
+        let bytes =
+            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
+                .expect("failed to load burnpack from nested detailed manifest");
+        assert_eq!(bytes, b"abcdef");
+
+        fs::remove_dir_all(root).expect("failed to cleanup temp root");
+    }
+
+    #[test]
+    fn direct_burnpack_takes_precedence_over_manifest() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).expect("failed to create temp root");
+
+        fs::write(root.join("model_f16.bpk"), b"direct-bpk").expect("failed to write direct bpk");
+        fs::write(root.join("model_f16.bpk.shard-aa"), b"manifest").expect("write shard");
+        fs::write(
+            root.join("model_f16.bpk.shards.json"),
+            r#"{"total_bytes":8,"shards":["model_f16.bpk.shard-aa"]}"#,
+        )
+        .expect("write manifest");
+
+        let bytes =
+            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
+                .expect("failed to load direct burnpack");
+        assert_eq!(bytes, b"direct-bpk");
+
+        fs::remove_dir_all(root).expect("failed to cleanup temp root");
+    }
+
+    #[test]
+    fn reconstruct_rejects_empty_manifest_entries() {
+        let manifest =
+            parse_shard_manifest_bytes(br#"{"total_bytes":5}"#, "inline").expect("parse manifest");
+        let err = reconstruct_burnpack_from_shard_manifest(&manifest, |_| {
+            Err("loader should not be invoked".to_string())
+        })
+        .expect_err("expected empty manifest error");
+        assert!(
+            err.contains("no shard entries"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_rejects_total_byte_mismatch() {
+        let manifest =
+            parse_shard_manifest_bytes(br#"{"total_bytes":7,"shards":["a","b"]}"#, "inline")
+                .expect("parse manifest");
+        let mut shards = HashMap::new();
+        shards.insert("a".to_string(), b"abc".to_vec());
+        shards.insert("b".to_string(), b"def".to_vec());
+        let err = reconstruct_burnpack_from_shard_manifest(&manifest, |name| {
+            shards
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("missing shard: {name}"))
+        })
+        .expect_err("expected size mismatch");
+        assert!(
+            err.contains("expected 7 bytes"),
+            "unexpected error message: {err}"
+        );
     }
 }

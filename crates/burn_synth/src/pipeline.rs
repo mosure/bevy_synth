@@ -23,7 +23,7 @@ impl Default for ModelSelection {
     fn default() -> Self {
         Self {
             synthesis_models: vec![SynthesisModel::Triposg],
-            foreground_model: ForegroundModel::Rmbg2,
+            foreground_model: ForegroundModel::Rmbg14,
         }
     }
 }
@@ -112,6 +112,12 @@ mod tests {
             selection.synthesis_models,
             vec![SynthesisModel::Trellis, SynthesisModel::Triposg]
         );
+        assert_eq!(selection.foreground_model, ForegroundModel::Rmbg14);
+    }
+
+    #[test]
+    fn model_selection_default_prefers_rmbg14() {
+        let selection = ModelSelection::default();
         assert_eq!(selection.foreground_model, ForegroundModel::Rmbg14);
     }
 }

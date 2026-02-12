@@ -168,7 +168,6 @@ impl<B: Backend> TripoSGPipeline<B> {
         } else {
             batch_size
         };
-        let timestep_template = Tensor::<B, 1>::zeros([model_batch as i32], &device);
         for (step_index, &t) in timesteps.iter().enumerate() {
             let step_start = Instant::now();
             let latent_model_input = if do_guidance {
@@ -176,7 +175,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             } else {
                 latents.clone()
             };
-            let timestep = timestep_template.clone().add_scalar(t);
+            let timestep = Tensor::<B, 1>::from_floats(vec![t; model_batch].as_slice(), &device);
 
             let mut noise_pred = self.transformer.forward(
                 latent_model_input,
@@ -221,48 +220,7 @@ impl<B: Backend> TripoSGPipeline<B> {
     ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
         let resolution = resolution.max(2);
         let chunk_size = chunk_size.max(1);
-        let total = resolution * resolution * resolution;
-        let device = latents.device();
-        let mut values = vec![0.0f32; total];
-
-        let step_x = dense_grid_step(bounds[0], bounds[3], resolution);
-        let step_y = dense_grid_step(bounds[1], bounds[4], resolution);
-        let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
-
-        let mut coords = Vec::with_capacity(chunk_size * 3);
-        let mut chunk_start = 0usize;
-
-        for idx in 0..total {
-            let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
-            coords.push(bounds[0] + step_x * x as f32);
-            coords.push(bounds[1] + step_y * y as f32);
-            coords.push(bounds[2] + step_z * z as f32);
-            let count = coords.len() / 3;
-            if count >= chunk_size {
-                let end = chunk_start + count;
-                write_decoded_chunk_contiguous(
-                    &latents,
-                    &self.vae,
-                    &coords,
-                    &device,
-                    &mut values[chunk_start..end],
-                )?;
-                coords.clear();
-                chunk_start = end;
-            }
-        }
-
-        if !coords.is_empty() {
-            let count = coords.len() / 3;
-            let end = chunk_start + count;
-            write_decoded_chunk_contiguous(
-                &latents,
-                &self.vae,
-                &coords,
-                &device,
-                &mut values[chunk_start..end],
-            )?;
-        }
+        let values = decode_grid_values(&latents, &self.vae, bounds, resolution, chunk_size)?;
 
         Ok(DenseGrid {
             values,
@@ -473,32 +431,6 @@ impl<B: Backend> TripoSGPipeline<B> {
     }
 }
 
-pub(crate) fn generate_dense_grid_coords(bounds: [f32; 6], resolution: usize) -> Vec<f32> {
-    let xs = linspace(bounds[0], bounds[3], resolution);
-    let ys = linspace(bounds[1], bounds[4], resolution);
-    let zs = linspace(bounds[2], bounds[5], resolution);
-
-    let mut coords = Vec::with_capacity(resolution * resolution * resolution * 3);
-    for &z in &zs {
-        for &y in &ys {
-            for &x in &xs {
-                coords.push(x);
-                coords.push(y);
-                coords.push(z);
-            }
-        }
-    }
-    coords
-}
-
-pub(crate) fn linspace(start: f32, end: f32, steps: usize) -> Vec<f32> {
-    if steps <= 1 {
-        return vec![start];
-    }
-    let step = (end - start) / (steps as f32 - 1.0);
-    (0..steps).map(|i| start + step * i as f32).collect()
-}
-
 fn dense_grid_step(start: f32, end: f32, steps: usize) -> f32 {
     if steps <= 1 {
         0.0
@@ -514,6 +446,152 @@ fn dense_grid_index_to_xyz(index: usize, resolution: usize) -> (usize, usize, us
     let y = rem / resolution;
     let x = rem - y * resolution;
     (x, y, z)
+}
+
+pub(crate) fn decode_grid_values<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    bounds: [f32; 6],
+    resolution: usize,
+    chunk_size: usize,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let total = resolution * resolution * resolution;
+    let device = latents.device();
+    if should_device_decode_accumulate::<B>(total) {
+        decode_grid_values_device_accumulate(latents, vae, bounds, resolution, chunk_size, &device)
+    } else {
+        decode_grid_values_chunked_host(latents, vae, bounds, resolution, chunk_size, &device)
+    }
+}
+
+pub(crate) fn should_device_decode_accumulate<B: Backend>(total_points: usize) -> bool {
+    if !env_flag("TRIPOSG_DECODE_DEVICE_ACCUM", true) {
+        return false;
+    }
+    let backend = std::any::type_name::<B>().to_ascii_lowercase();
+    let is_gpu_backend =
+        backend.contains("wgpu") || backend.contains("cuda") || backend.contains("cube");
+    if !is_gpu_backend {
+        return false;
+    }
+    let max_points = std::env::var("TRIPOSG_DECODE_DEVICE_ACCUM_MAX_POINTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16_777_216);
+    total_points <= max_points
+}
+
+pub(crate) fn decode_grid_values_device_accumulate<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    bounds: [f32; 6],
+    resolution: usize,
+    chunk_size: usize,
+    device: &B::Device,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let total = resolution * resolution * resolution;
+    let step_x = dense_grid_step(bounds[0], bounds[3], resolution);
+    let step_y = dense_grid_step(bounds[1], bounds[4], resolution);
+    let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
+
+    let mut coords = Vec::with_capacity(chunk_size * 3);
+    let mut chunks = Vec::<Tensor<B, 3>>::new();
+    for idx in 0..total {
+        let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
+        coords.push(bounds[0] + step_x * x as f32);
+        coords.push(bounds[1] + step_y * y as f32);
+        coords.push(bounds[2] + step_z * z as f32);
+        let count = coords.len() / 3;
+        if count < chunk_size {
+            continue;
+        }
+        chunks.push(decoded_chunk_tensor(latents, vae, &coords, device)?);
+        coords.clear();
+    }
+
+    if !coords.is_empty() {
+        chunks.push(decoded_chunk_tensor(latents, vae, &coords, device)?);
+    }
+
+    if chunks.is_empty() {
+        return Ok(vec![]);
+    }
+    let decoded = if chunks.len() == 1 {
+        chunks.pop().expect("single chunk exists")
+    } else {
+        Tensor::cat(chunks, 1)
+    };
+    let mut values = tensor_to_vec_f32(decoded)
+        .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
+    values.truncate(total);
+    Ok(values)
+}
+
+fn decode_grid_values_chunked_host<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    bounds: [f32; 6],
+    resolution: usize,
+    chunk_size: usize,
+    device: &B::Device,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let total = resolution * resolution * resolution;
+    let mut values = vec![0.0f32; total];
+    let step_x = dense_grid_step(bounds[0], bounds[3], resolution);
+    let step_y = dense_grid_step(bounds[1], bounds[4], resolution);
+    let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
+
+    let mut coords = Vec::with_capacity(chunk_size * 3);
+    let mut chunk_start = 0usize;
+
+    for idx in 0..total {
+        let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
+        coords.push(bounds[0] + step_x * x as f32);
+        coords.push(bounds[1] + step_y * y as f32);
+        coords.push(bounds[2] + step_z * z as f32);
+        let count = coords.len() / 3;
+        if count < chunk_size {
+            continue;
+        }
+        let end = chunk_start + count;
+        write_decoded_chunk_contiguous(latents, vae, &coords, device, &mut values[chunk_start..end])?;
+        coords.clear();
+        chunk_start = end;
+    }
+
+    if !coords.is_empty() {
+        let count = coords.len() / 3;
+        let end = chunk_start + count;
+        write_decoded_chunk_contiguous(latents, vae, &coords, device, &mut values[chunk_start..end])?;
+    }
+
+    Ok(values)
+}
+
+fn decoded_chunk_tensor<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    coords: &[f32],
+    device: &B::Device,
+) -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
+    let count = coords.len() / 3;
+    if count == 0 {
+        return Ok(Tensor::<B, 3>::zeros([1, 0, 1], device));
+    }
+    let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
+        .reshape([count as i32, 3])
+        .unsqueeze_dim(0);
+    Ok(vae.decode(coords_tensor, latents.clone(), None))
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => default,
+    }
 }
 
 fn write_decoded_chunk_contiguous<B: Backend>(
@@ -543,41 +621,94 @@ impl<B: Backend> TripoSGPipeline<B> {
         weights_root: impl AsRef<std::path::Path>,
         device: &B::Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        use crate::model::triposg::dit::import::load_triposg_dit;
-        use crate::model::triposg::image_encoder::import::{
-            load_dinov2_processor, load_triposg_dinov2,
+        use crate::model::triposg::dit::import::{
+            load_triposg_dit, load_triposg_dit_from_safetensors,
         };
-        use crate::model::triposg::vae::import::load_triposg_vae;
+        use crate::model::triposg::image_encoder::import::{
+            load_dinov2_processor, load_triposg_dinov2, load_triposg_dinov2_from_safetensors,
+        };
+        use crate::model::triposg::vae::import::{
+            load_triposg_vae, load_triposg_vae_from_safetensors,
+        };
 
         let root = weights_root.as_ref();
         let vae_path = root.join("vae/diffusion_pytorch_model.safetensors");
         let dit_path = root.join("transformer/diffusion_pytorch_model.safetensors");
         let scheduler_path = root.join("scheduler/scheduler_config.json");
         let dino_path = root.join("image_encoder_dinov2/model.safetensors");
+        let use_safetensors = std::env::var("TRIPOSG_LOAD_SAFETENSORS").is_ok();
 
         let vae_config_path = root.join("vae/config.json");
         let vae_config =
             crate::model::triposg::vae::TripoSGVaeConfig::from_config_file(vae_config_path)
                 .unwrap_or_else(|_| crate::model::triposg::vae::TripoSGVaeConfig::midi_3d());
-        let vae = load_triposg_vae(&vae_config, device, vae_path)?;
+        let vae = if use_safetensors {
+            load_triposg_vae_from_safetensors(&vae_config, device, &vae_path)?
+        } else {
+            load_triposg_vae(&vae_config, device, &vae_path)?
+        };
 
         let dit_config_path = root.join("transformer/config.json");
-        let dit_config =
-            crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(dit_config_path)
-                .unwrap_or_else(|_| {
-                    if dit_path.exists() {
-                        crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained()
-                    } else {
-                        crate::model::triposg::dit::TripoSGDiTConfig::midi_3d()
-                    }
-                });
-        let dit = load_triposg_dit(&dit_config, device, dit_path)?;
+        let mut dit_configs = Vec::new();
+        if let Ok(config) =
+            crate::model::triposg::dit::TripoSGDiTConfig::from_config_file(&dit_config_path)
+        {
+            dit_configs.push(config);
+        } else if dit_path.exists() {
+            dit_configs.push(crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained());
+        } else {
+            dit_configs.push(crate::model::triposg::dit::TripoSGDiTConfig::midi_3d());
+        }
+
+        // Support both historical DiT variants by retrying with the alternate config when
+        // config.json and burnpack tensor shapes diverge.
+        push_unique_dit_config(
+            &mut dit_configs,
+            crate::model::triposg::dit::TripoSGDiTConfig::triposg_pretrained(),
+        );
+        push_unique_dit_config(
+            &mut dit_configs,
+            crate::model::triposg::dit::TripoSGDiTConfig::midi_3d(),
+        );
+
+        let mut load_errors = Vec::new();
+        let mut dit = None;
+        for config in dit_configs {
+            let loaded = if use_safetensors {
+                load_triposg_dit_from_safetensors(&config, device, &dit_path)
+            } else {
+                load_triposg_dit(&config, device, &dit_path)
+            };
+            match loaded {
+                Ok(model) => {
+                    dit = Some(model);
+                    break;
+                }
+                Err(err) => {
+                    load_errors.push(format!(
+                        "cross_attention_dim={} cross_attention_2_dim={:?}: {err}",
+                        config.cross_attention_dim, config.cross_attention_2_dim
+                    ));
+                }
+            }
+        }
+        let Some(dit) = dit else {
+            return Err(format!(
+                "failed to load TripoSG DiT with all known configs:\n{}",
+                load_errors.join("\n")
+            )
+            .into());
+        };
 
         let scheduler_config = RectifiedFlowSchedulerConfig::from_config_file(scheduler_path)
             .unwrap_or_else(|_| RectifiedFlowSchedulerConfig::midi_3d());
         let scheduler = RectifiedFlowScheduler::new(scheduler_config);
 
-        let image_encoder = load_triposg_dinov2(device, dino_path)?;
+        let image_encoder = if use_safetensors {
+            load_triposg_dinov2_from_safetensors(device, &dino_path)?
+        } else {
+            load_triposg_dinov2(device, &dino_path)?
+        };
         let image_processor = load_dinov2_processor(root)?;
 
         Ok(Self::new(
@@ -590,34 +721,35 @@ impl<B: Backend> TripoSGPipeline<B> {
     }
 }
 
+#[cfg(feature = "import")]
+fn push_unique_dit_config(
+    configs: &mut Vec<crate::model::triposg::dit::TripoSGDiTConfig>,
+    candidate: crate::model::triposg::dit::TripoSGDiTConfig,
+) {
+    if !configs.iter().any(|existing| {
+        existing.in_channels == candidate.in_channels
+            && existing.width == candidate.width
+            && existing.num_layers == candidate.num_layers
+            && existing.num_attention_heads == candidate.num_attention_heads
+            && existing.cross_attention_dim == candidate.cross_attention_dim
+            && existing.cross_attention_2_dim == candidate.cross_attention_2_dim
+    }) {
+        configs.push(candidate);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn dense_grid_coords_match_linspace_order() {
-        let bounds = [-1.0, -2.0, -3.0, 1.0, 2.0, 3.0];
-        let resolution = 4;
-        let coords = generate_dense_grid_coords(bounds, resolution);
-        let step_x = dense_grid_step(bounds[0], bounds[3], resolution);
-        let step_y = dense_grid_step(bounds[1], bounds[4], resolution);
-        let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
+    fn dense_grid_index_round_trip() {
+        let resolution = 8usize;
         let total = resolution * resolution * resolution;
         for idx in 0..total {
             let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
-            let base = idx * 3;
-            let expected = [
-                bounds[0] + step_x * x as f32,
-                bounds[1] + step_y * y as f32,
-                bounds[2] + step_z * z as f32,
-            ];
-            let actual = [coords[base], coords[base + 1], coords[base + 2]];
-            for i in 0..3 {
-                assert!(
-                    (expected[i] - actual[i]).abs() < 1e-6,
-                    "coord mismatch at idx {idx} axis {i}: expected {expected:?}, got {actual:?}"
-                );
-            }
+            let round_trip = x + y * resolution + z * resolution * resolution;
+            assert_eq!(round_trip, idx, "index mapping mismatch at idx={idx}");
         }
     }
 }

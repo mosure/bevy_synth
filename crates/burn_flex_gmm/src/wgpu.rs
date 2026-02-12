@@ -786,7 +786,7 @@ fn resolve_sparse_conv_kernel_variant(
     }
 }
 
-fn resolve_neighbor_backend(rows: usize, kernel_rows: usize) -> NeighborBuildBackend {
+fn resolve_neighbor_backend(_rows: usize, _kernel_rows: usize) -> NeighborBuildBackend {
     if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "host" | "cpu" => return NeighborBuildBackend::Host,
@@ -795,25 +795,12 @@ fn resolve_neighbor_backend(rows: usize, kernel_rows: usize) -> NeighborBuildBac
         }
     }
 
-    let work = rows.saturating_mul(kernel_rows);
     match resolve_neighbor_hash_build_mode() {
-        NeighborHashBuildMode::Host => {
-            if work > 131_072 {
-                NeighborBuildBackend::Host
-            } else {
-                NeighborBuildBackend::Device
-            }
-        }
+        NeighborHashBuildMode::Host => NeighborBuildBackend::Host,
         NeighborHashBuildMode::Wgsl => NeighborBuildBackend::Device,
-        NeighborHashBuildMode::Auto => {
-            // For large workloads, keep the robust host build path by default.
-            // WGSL hash build remains available via explicit env override.
-            if work > 131_072 {
-                NeighborBuildBackend::Host
-            } else {
-                NeighborBuildBackend::Device
-            }
-        }
+        // Prefer device-resident neighbor map generation by default.
+        // The device hash path already has guarded fallbacks for robustness.
+        NeighborHashBuildMode::Auto => NeighborBuildBackend::Device,
     }
 }
 
@@ -1792,10 +1779,10 @@ mod tests {
     use crate::{SparseSubmConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex};
 
     use super::{
-        DefaultWgpuBackend, clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
+        DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
+        clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
         neighbor_rows_tensor_from_coords, reset_neighbor_rows_build_stats,
         sparse_subm_conv_forward_wgpu, sparse_subm_conv_forward_wgpu_with_config,
-        SparseWgpuForwardConfig, SparseWgpuKernelVariant,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());

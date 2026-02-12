@@ -43,6 +43,10 @@ use burn_tripo::pipeline::{
         hierarchical_extract_geometry,
     },
     mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh, sdf_to_mesh_diff_dmc},
+    runtime_parity::{
+        DinoBackendChoice as SharedDinoBackendChoice, configure_triposg_parity_env,
+        decimate_tripo_mesh, resolve_dino_backend,
+    },
     triposg::TripoSGPipeline,
     triposg_scribble::TripoSGScribblePipeline,
 };
@@ -95,6 +99,10 @@ const DINO_PREPROCESSOR_RELPATHS: [&str; 3] = [
     "feature_extractor_2/preprocessor_config.json",
     "feature_extractor_1/preprocessor_config.json",
 ];
+#[cfg(any(target_arch = "wasm32", test))]
+const ONE_GIB: u64 = 1024 * 1024 * 1024;
+#[cfg(any(target_arch = "wasm32", test))]
+const DEFAULT_WEB_MAX_HOST_RAM_BYTES: u64 = 4 * ONE_GIB;
 
 struct Rmbg14Artifacts {
     burnpack: Vec<u8>,
@@ -111,6 +119,60 @@ struct TriposgArtifacts {
     scheduler_config_json: Option<String>,
     dino_config_json: Option<String>,
     dino_preproc_json: Option<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone)]
+struct WasmHostMemoryBudget {
+    limit_bytes: u64,
+    retained_bytes: u64,
+    peak_bytes: u64,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl WasmHostMemoryBudget {
+    fn new(limit_bytes: u64) -> Self {
+        Self {
+            limit_bytes: limit_bytes.max(1),
+            retained_bytes: 0,
+            peak_bytes: 0,
+        }
+    }
+
+    fn reserve_retained(&mut self, bytes: u64, context: &str) -> Result<(), String> {
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        self.observe_total(self.retained_bytes, context)
+    }
+
+    fn release_retained(&mut self, bytes: u64) {
+        self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+    }
+
+    fn observe_temporary(&mut self, temporary_bytes: u64, context: &str) -> Result<(), String> {
+        let total = self.retained_bytes.saturating_add(temporary_bytes);
+        self.observe_total(total, context)
+    }
+
+    fn observe_total(&mut self, total_bytes: u64, context: &str) -> Result<(), String> {
+        self.peak_bytes = self.peak_bytes.max(total_bytes);
+        if total_bytes > self.limit_bytes {
+            return Err(format!(
+                "wasm host RAM budget exceeded while {context}: {} used (limit {}). \
+set build-time BURN_SYNTH_WEB_MAX_HOST_RAM_BYTES to raise",
+                format_mebibytes(total_bytes),
+                format_mebibytes(self.limit_bytes)
+            ));
+        }
+        Ok(())
+    }
+
+    fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    fn limit_bytes(&self) -> u64 {
+        self.limit_bytes
+    }
 }
 
 fn synthesis_attempt_order(models: &[SynthesisModel]) -> Result<Vec<SynthesisModel>, String> {
@@ -131,6 +193,22 @@ fn synthesis_model_name(model: SynthesisModel) -> &'static str {
     match model {
         SynthesisModel::Triposg => "TripoSG",
         SynthesisModel::Trellis => "Trellis",
+    }
+}
+
+fn map_dino_backend_choice(value: DinoBackend) -> SharedDinoBackendChoice {
+    match value {
+        DinoBackend::Auto => SharedDinoBackendChoice::Auto,
+        DinoBackend::Cpu => SharedDinoBackendChoice::Cpu,
+        DinoBackend::Gpu => SharedDinoBackendChoice::Gpu,
+    }
+}
+
+fn map_dino_backend_choice_back(value: SharedDinoBackendChoice) -> DinoBackend {
+    match value {
+        SharedDinoBackendChoice::Auto => DinoBackend::Auto,
+        SharedDinoBackendChoice::Cpu => DinoBackend::Cpu,
+        SharedDinoBackendChoice::Gpu => DinoBackend::Gpu,
     }
 }
 
@@ -329,7 +407,9 @@ fn load_trellis_pipeline(args: &AppArgs) -> Result<Trellis2Pipeline, String> {
     if let Some(path) = args.trellis_weights_root.as_ref() {
         config.weights_root = path.clone();
     }
-    config.image_large_root = args.trellis_image_large_root.clone();
+    if let Some(path) = args.trellis_image_large_root.as_ref() {
+        config.image_large_root = Some(path.clone());
+    }
 
     let pipeline = Trellis2Pipeline::new(config)
         .map_err(|err| format!("failed to initialize Trellis2: {err}"))?;
@@ -590,21 +670,7 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         B::seed(&device, seed);
     }
 
-    if !cfg!(target_arch = "wasm32") && std::env::var("DINO_STRICT_PREPROCESS").is_err() {
-        unsafe {
-            std::env::set_var("DINO_STRICT_PREPROCESS", "1");
-        }
-    }
-    if std::env::var("RMBG_STRICT_INTERP").is_err() {
-        unsafe {
-            std::env::set_var("RMBG_STRICT_INTERP", "1");
-        }
-    }
-    if args.match_python && std::env::var("TRIPOSG_MAX_IMAGE_DIM").is_err() {
-        unsafe {
-            std::env::set_var("TRIPOSG_MAX_IMAGE_DIM", "2000");
-        }
-    }
+    configure_triposg_parity_env(args.match_python, None);
 
     let synthesis_models = args.synthesis_models.clone();
     let synthesis_order = synthesis_attempt_order(&synthesis_models)?;
@@ -612,26 +678,10 @@ fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, 
         .iter()
         .any(|model| matches!(model, SynthesisModel::Triposg));
 
-    let dino_backend = match args.dino_backend {
-        DinoBackend::Auto => {
-            if cfg!(target_arch = "wasm32") {
-                if is_gpu_backend::<B>() {
-                    DinoBackend::Gpu
-                } else {
-                    DinoBackend::Cpu
-                }
-            } else if is_gpu_backend::<B>() {
-                if args.match_python && is_wgpu_backend::<B>() {
-                    DinoBackend::Cpu
-                } else {
-                    DinoBackend::Gpu
-                }
-            } else {
-                DinoBackend::Cpu
-            }
-        }
-        other => other,
-    };
+    let dino_backend = map_dino_backend_choice_back(resolve_dino_backend::<B>(
+        map_dino_backend_choice(args.dino_backend),
+        args.match_python,
+    ));
 
     let chunk_size = tuned_chunk_size::<B>(args.chunk_size);
     let hierarchical = HierarchicalExtractConfig {
@@ -833,6 +883,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
     args: &AppArgs,
     event_tx: &Sender<WorkerEvent>,
 ) -> Result<PipelineState<B>, String> {
+    configure_triposg_parity_env(args.match_python, None);
     configure_cubecl_autotune::<B>();
     let bounds = parse_bounds(&args.bounds).map_err(|err| err.to_string())?;
     let device = B::Device::default();
@@ -847,16 +898,10 @@ async fn build_pipeline_state_wasm<B: Backend>(
         return Err("text/scribble mode is not supported on wasm yet".to_string());
     }
 
-    let dino_backend = match args.dino_backend {
-        DinoBackend::Auto => {
-            if is_gpu_backend::<B>() {
-                DinoBackend::Gpu
-            } else {
-                DinoBackend::Cpu
-            }
-        }
-        other => other,
-    };
+    let dino_backend = map_dino_backend_choice_back(resolve_dino_backend::<B>(
+        map_dino_backend_choice(args.dino_backend),
+        args.match_python,
+    ));
     let chunk_size = tuned_chunk_size::<B>(args.chunk_size);
     let hierarchical = HierarchicalExtractConfig {
         bounds,
@@ -879,7 +924,15 @@ async fn build_pipeline_state_wasm<B: Backend>(
     };
 
     let mut totals = DownloadTotals::default();
+    let mut host_ram_budget = WasmHostMemoryBudget::new(web_max_host_ram_bytes());
     send_worker_status(event_tx, "Loading model weights...");
+    send_worker_status(
+        event_tx,
+        format!(
+            "WASM host RAM budget for model loading: {}",
+            format_mebibytes(host_ram_budget.limit_bytes())
+        ),
+    );
 
     let mut rmbg_model = args.rmbg_model;
     if matches!(rmbg_model, RmbgModel::Rmbg2) {
@@ -893,7 +946,9 @@ async fn build_pipeline_state_wasm<B: Backend>(
     let rmbg_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), rmbg_model);
     let rmbg_root_url = normalize_web_path(&rmbg_root);
 
-    let rmbg_artifacts = load_rmbg14_artifacts_wasm(&rmbg_root_url, event_tx, &mut totals).await?;
+    let rmbg_artifacts =
+        load_rmbg14_artifacts_wasm(&rmbg_root_url, event_tx, &mut totals, &mut host_ram_budget)
+            .await?;
     let rmbg_config = if let Some(json) = rmbg_artifacts.config_json.as_ref() {
         load_rmbg_config_from_json_bytes(json.as_bytes())
             .map_err(|err| format!("failed to parse RMBG config: {err}"))?
@@ -907,17 +962,33 @@ async fn build_pipeline_state_wasm<B: Backend>(
         burn_foreground::preprocess::RmbgImageProcessor::default()
     };
     let rmbg_burnpack = rmbg_artifacts.burnpack;
+    let rmbg_burnpack_bytes = rmbg_burnpack.len() as u64;
+    host_ram_budget.reserve_retained(rmbg_burnpack_bytes, "retaining RMBG burnpack bytes")?;
 
     let (rmbg14_cpu, rmbg14_device) = match rmbg_backend {
         RmbgBackend::Cpu => {
             let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-            let model = load_rmbg_from_burnpack_bytes(&cpu_device, rmbg_burnpack, &rmbg_config)
-                .map_err(|err| format!("failed to load RMBG burnpack on CPU: {err}"))?;
+            let model =
+                match load_rmbg_from_burnpack_bytes(&cpu_device, rmbg_burnpack, &rmbg_config) {
+                    Ok(model) => model,
+                    Err(err) => {
+                        host_ram_budget.release_retained(rmbg_burnpack_bytes);
+                        return Err(format!("failed to load RMBG burnpack on CPU: {err}"));
+                    }
+                };
+            host_ram_budget.release_retained(rmbg_burnpack_bytes);
             (Some(RmbgPipeline::new(model, rmbg_processor.clone())), None)
         }
         RmbgBackend::Gpu | RmbgBackend::Auto => {
-            let model = load_rmbg_from_burnpack_bytes(&device, rmbg_burnpack, &rmbg_config)
-                .map_err(|err| format!("failed to load RMBG burnpack: {err}"))?;
+            let model = match load_rmbg_from_burnpack_bytes(&device, rmbg_burnpack, &rmbg_config)
+            {
+                Ok(model) => model,
+                Err(err) => {
+                    host_ram_budget.release_retained(rmbg_burnpack_bytes);
+                    return Err(format!("failed to load RMBG burnpack: {err}"));
+                }
+            };
+            host_ram_budget.release_retained(rmbg_burnpack_bytes);
             let mut pipeline = RmbgPipeline::new(model, rmbg_processor);
             cap_rmbg14_processor_for_backend::<B>(&mut pipeline, rmbg_backend);
             (None, Some(pipeline))
@@ -939,6 +1010,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
                     dino_backend,
                     event_tx,
                     &mut totals,
+                    &mut host_ram_budget,
                 )
                 .await
                 {
@@ -990,6 +1062,14 @@ async fn build_pipeline_state_wasm<B: Backend>(
         ));
     }
 
+    send_worker_status(
+        event_tx,
+        format!(
+            "Model weights loaded. peak host RAM during load: {}",
+            format_mebibytes(host_ram_budget.peak_bytes())
+        ),
+    );
+
     Ok(PipelineState {
         device,
         rmbg14_cpu,
@@ -1020,11 +1100,182 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
     dino_backend: DinoBackend,
     event_tx: &Sender<WorkerEvent>,
     totals: &mut DownloadTotals,
+    host_ram_budget: &mut WasmHostMemoryBudget,
 ) -> Result<(Option<DinoCpuState>, TripoSGPipeline<B>), String> {
     let triposg_root = resolve_triposg_root(args.weights_root.as_ref());
     let triposg_root_url = normalize_web_path(&triposg_root);
-    let artifacts = load_triposg_artifacts_wasm(&triposg_root_url, event_tx, totals).await?;
-    build_triposg_pipeline_from_artifacts::<B>(device, dino_backend, artifacts)
+
+    let vae_config_json =
+        fetch_optional_text(&join_web_path(&triposg_root_url, "vae/config.json")).await?;
+    let dit_config_json =
+        fetch_optional_text(&join_web_path(&triposg_root_url, "transformer/config.json")).await?;
+    let scheduler_config_json = fetch_optional_text(&join_web_path(
+        &triposg_root_url,
+        "scheduler/scheduler_config.json",
+    ))
+    .await?;
+    let dino_config_candidates = DINO_CONFIG_RELPATHS
+        .iter()
+        .map(|rel| join_web_path(&triposg_root_url, rel))
+        .collect::<Vec<_>>();
+    let dino_config_json = fetch_optional_text_candidates(&dino_config_candidates).await?;
+    let dino_preproc_candidates = DINO_PREPROCESSOR_RELPATHS
+        .iter()
+        .map(|rel| join_web_path(&triposg_root_url, rel))
+        .collect::<Vec<_>>();
+    let dino_preproc_json = fetch_optional_text_candidates(&dino_preproc_candidates).await?;
+
+    let vae_config = if let Some(json) = vae_config_json.as_ref() {
+        TripoSGVaeConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG VAE config: {err}"))?
+    } else {
+        TripoSGVaeConfig::midi_3d()
+    };
+    let dit_config = if let Some(json) = dit_config_json.as_ref() {
+        TripoSGDiTConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG DiT config: {err}"))?
+    } else {
+        TripoSGDiTConfig::triposg_pretrained()
+    };
+    let scheduler_config = if let Some(json) = scheduler_config_json.as_ref() {
+        RectifiedFlowSchedulerConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse scheduler config: {err}"))?
+    } else {
+        RectifiedFlowSchedulerConfig::midi_3d()
+    };
+    let parsed_dino_config = dino_config_json.as_ref().and_then(|json| {
+        burn_tripo::model::triposg::image_encoder::import::load_dinov2_config_from_json_bytes(
+            json.as_bytes(),
+        )
+    });
+    let dino_fallback_size = parsed_dino_config.as_ref().map(|cfg| cfg.image_size);
+    let mut dino_config = parsed_dino_config
+        .clone()
+        .unwrap_or_else(default_dinov2_config);
+    if let Some(size) = dino_preproc_json.as_ref().and_then(|json| {
+        burn_tripo::model::triposg::image_encoder::import::load_dinov2_preprocess_size_from_json_bytes(
+            json.as_bytes(),
+        )
+    }) {
+        let patch = dino_config.patch_size.max(1);
+        let grid = size / patch;
+        if grid > 0 {
+            dino_config.positional_encoding_interpolate.output_size = Some([grid, grid]);
+        }
+    }
+    let dino_processor = if let Some(json) = dino_preproc_json.as_ref() {
+        load_dinov2_processor_from_json_bytes(json.as_bytes(), dino_fallback_size)
+            .map_err(|err| format!("failed to parse DINO preprocessor config: {err}"))?
+    } else {
+        DinoImageProcessor::default()
+    };
+
+    let vae_burnpack = download_burnpack_asset(
+        &join_web_path(&triposg_root_url, "vae/diffusion_pytorch_model.safetensors"),
+        "TripoSG VAE",
+        "TRIPOSG_BPK_PRECISION",
+        event_tx,
+        totals,
+        host_ram_budget,
+    )
+    .await?;
+    let vae_burnpack_bytes = vae_burnpack.len() as u64;
+    host_ram_budget.reserve_retained(vae_burnpack_bytes, "retaining TripoSG VAE burnpack bytes")?;
+    let vae = match load_triposg_vae_from_burnpack_bytes(&vae_config, device, vae_burnpack) {
+        Ok(model) => model,
+        Err(err) => {
+            host_ram_budget.release_retained(vae_burnpack_bytes);
+            return Err(format!("failed to load TripoSG VAE burnpack: {err}"));
+        }
+    };
+    host_ram_budget.release_retained(vae_burnpack_bytes);
+
+    let dit_burnpack = download_burnpack_asset(
+        &join_web_path(
+            &triposg_root_url,
+            "transformer/diffusion_pytorch_model.safetensors",
+        ),
+        "TripoSG DiT",
+        "TRIPOSG_BPK_PRECISION",
+        event_tx,
+        totals,
+        host_ram_budget,
+    )
+    .await?;
+    let dit_burnpack_bytes = dit_burnpack.len() as u64;
+    host_ram_budget.reserve_retained(dit_burnpack_bytes, "retaining TripoSG DiT burnpack bytes")?;
+    let dit = match load_triposg_dit_from_burnpack_bytes(&dit_config, device, dit_burnpack) {
+        Ok(model) => model,
+        Err(err) => {
+            host_ram_budget.release_retained(dit_burnpack_bytes);
+            return Err(format!("failed to load TripoSG DiT burnpack: {err}"));
+        }
+    };
+    host_ram_budget.release_retained(dit_burnpack_bytes);
+
+    let dino_gpu_burnpack = download_burnpack_asset(
+        &join_web_path(&triposg_root_url, "image_encoder_dinov2/model.safetensors"),
+        "DINOv2",
+        "TRIPOSG_BPK_PRECISION",
+        event_tx,
+        totals,
+        host_ram_budget,
+    )
+    .await?;
+    let dino_gpu_burnpack_bytes = dino_gpu_burnpack.len() as u64;
+    host_ram_budget
+        .reserve_retained(dino_gpu_burnpack_bytes, "retaining DINOv2 GPU burnpack bytes")?;
+    let image_encoder =
+        match load_triposg_dinov2_from_burnpack_bytes(device, dino_config, dino_gpu_burnpack) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                host_ram_budget.release_retained(dino_gpu_burnpack_bytes);
+                return Err(format!("failed to load DINOv2 burnpack: {err}"));
+            }
+        };
+    host_ram_budget.release_retained(dino_gpu_burnpack_bytes);
+
+    let scheduler = scheduler_config.init();
+    let triposg = TripoSGPipeline::new(vae, dit, scheduler, image_encoder, dino_processor.clone());
+
+    let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
+        let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
+        let cpu_config = parsed_dino_config.unwrap_or_else(default_dinov2_config);
+
+        // Load CPU DINO from a separate download to avoid retaining two giant copies of the
+        // same burnpack simultaneously during wasm startup.
+        let dino_cpu_burnpack = download_burnpack_asset(
+            &join_web_path(&triposg_root_url, "image_encoder_dinov2/model.safetensors"),
+            "DINOv2 (CPU)",
+            "TRIPOSG_BPK_PRECISION",
+            event_tx,
+            totals,
+            host_ram_budget,
+        )
+        .await?;
+        let dino_cpu_burnpack_bytes = dino_cpu_burnpack.len() as u64;
+        host_ram_budget
+            .reserve_retained(dino_cpu_burnpack_bytes, "retaining DINOv2 CPU burnpack bytes")?;
+        let encoder =
+            match load_triposg_dinov2_from_burnpack_bytes(&cpu_device, cpu_config, dino_cpu_burnpack)
+            {
+                Ok(encoder) => encoder,
+                Err(err) => {
+                    host_ram_budget.release_retained(dino_cpu_burnpack_bytes);
+                    return Err(format!("failed to load DINOv2 burnpack on CPU: {err}"));
+                }
+            };
+        host_ram_budget.release_retained(dino_cpu_burnpack_bytes);
+        Some(DinoCpuState {
+            device: cpu_device,
+            encoder,
+            processor: dino_processor,
+        })
+    } else {
+        None
+    };
+
+    Ok((dino_cpu, triposg))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1032,6 +1283,7 @@ async fn load_rmbg14_artifacts_wasm(
     rmbg_root_url: &str,
     event_tx: &Sender<WorkerEvent>,
     totals: &mut DownloadTotals,
+    host_ram_budget: &mut WasmHostMemoryBudget,
 ) -> Result<Rmbg14Artifacts, String> {
     let burnpack = download_burnpack_asset(
         &join_web_path(rmbg_root_url, "model.safetensors"),
@@ -1039,6 +1291,7 @@ async fn load_rmbg14_artifacts_wasm(
         "RMBG_BPK_PRECISION",
         event_tx,
         totals,
+        host_ram_budget,
     )
     .await?;
     let config_json = fetch_optional_text(&join_web_path(rmbg_root_url, "config.json")).await?;
@@ -1048,71 +1301,6 @@ async fn load_rmbg14_artifacts_wasm(
         burnpack,
         config_json,
         processor_json,
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn load_triposg_artifacts_wasm(
-    triposg_root_url: &str,
-    event_tx: &Sender<WorkerEvent>,
-    totals: &mut DownloadTotals,
-) -> Result<TriposgArtifacts, String> {
-    let vae_burnpack = download_burnpack_asset(
-        &join_web_path(triposg_root_url, "vae/diffusion_pytorch_model.safetensors"),
-        "TripoSG VAE",
-        "TRIPOSG_BPK_PRECISION",
-        event_tx,
-        totals,
-    )
-    .await?;
-    let dit_burnpack = download_burnpack_asset(
-        &join_web_path(
-            triposg_root_url,
-            "transformer/diffusion_pytorch_model.safetensors",
-        ),
-        "TripoSG DiT",
-        "TRIPOSG_BPK_PRECISION",
-        event_tx,
-        totals,
-    )
-    .await?;
-    let dino_burnpack = download_burnpack_asset(
-        &join_web_path(triposg_root_url, "image_encoder_dinov2/model.safetensors"),
-        "DINOv2",
-        "TRIPOSG_BPK_PRECISION",
-        event_tx,
-        totals,
-    )
-    .await?;
-    let vae_config_json =
-        fetch_optional_text(&join_web_path(triposg_root_url, "vae/config.json")).await?;
-    let dit_config_json =
-        fetch_optional_text(&join_web_path(triposg_root_url, "transformer/config.json")).await?;
-    let scheduler_config_json = fetch_optional_text(&join_web_path(
-        triposg_root_url,
-        "scheduler/scheduler_config.json",
-    ))
-    .await?;
-    let dino_config_candidates = DINO_CONFIG_RELPATHS
-        .iter()
-        .map(|rel| join_web_path(triposg_root_url, rel))
-        .collect::<Vec<_>>();
-    let dino_config_json = fetch_optional_text_candidates(&dino_config_candidates).await?;
-    let dino_preproc_candidates = DINO_PREPROCESSOR_RELPATHS
-        .iter()
-        .map(|rel| join_web_path(triposg_root_url, rel))
-        .collect::<Vec<_>>();
-    let dino_preproc_json = fetch_optional_text_candidates(&dino_preproc_candidates).await?;
-
-    Ok(TriposgArtifacts {
-        vae_burnpack,
-        dit_burnpack,
-        dino_burnpack,
-        vae_config_json,
-        dit_config_json,
-        scheduler_config_json,
-        dino_config_json,
-        dino_preproc_json,
     })
 }
 
@@ -1139,14 +1327,22 @@ fn join_web_path(root: &str, rel: &str) -> String {
     out
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn format_mebibytes(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn web_max_host_ram_bytes() -> u64 {
+    option_env!("BURN_SYNTH_WEB_MAX_HOST_RAM_BYTES")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WEB_MAX_HOST_RAM_BYTES)
+}
+
 #[cfg(target_arch = "wasm32")]
 fn web_max_burnpack_bytes() -> u64 {
-    const DEFAULT_MAX_BPK_BYTES: u64 = 1_073_741_824; // 1 GiB
+    const DEFAULT_MAX_BPK_BYTES: u64 = ONE_GIB;
     option_env!("BURN_SYNTH_WEB_MAX_BPK_BYTES")
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1169,13 +1365,23 @@ async fn download_burnpack_asset(
     precision_env: &str,
     event_tx: &Sender<WorkerEvent>,
     totals: &mut DownloadTotals,
+    host_ram_budget: &mut WasmHostMemoryBudget,
 ) -> Result<Vec<u8>, String> {
     let candidates =
         candidate_burnpack_names(base_safetensors_url, prefer_f16_burnpack(precision_env));
     let max_bytes = web_max_burnpack_bytes();
     let mut last_error = "no matching burnpack candidate".to_string();
     for candidate in candidates {
-        match download_binary_with_status(&candidate, label, max_bytes, event_tx, totals).await {
+        match download_binary_with_status(
+            &candidate,
+            label,
+            max_bytes,
+            event_tx,
+            totals,
+            host_ram_budget,
+        )
+        .await
+        {
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 last_error = err;
@@ -1186,8 +1392,15 @@ async fn download_burnpack_asset(
         }
 
         for manifest_url in burnpack_manifest_candidates(&candidate) {
-            match download_burnpack_from_manifest(&manifest_url, label, max_bytes, event_tx, totals)
-                .await
+            match download_burnpack_from_manifest(
+                &manifest_url,
+                label,
+                max_bytes,
+                event_tx,
+                totals,
+                host_ram_budget,
+            )
+            .await
             {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
@@ -1215,6 +1428,7 @@ async fn download_burnpack_from_manifest(
     max_bytes: u64,
     event_tx: &Sender<WorkerEvent>,
     totals: &mut DownloadTotals,
+    host_ram_budget: &mut WasmHostMemoryBudget,
 ) -> Result<Vec<u8>, String> {
     let manifest_text = fetch_text(manifest_url).await?;
     let manifest = parse_shard_manifest_bytes(manifest_text.as_bytes(), manifest_url)?;
@@ -1225,13 +1439,28 @@ async fn download_burnpack_from_manifest(
         ));
     }
 
+    host_ram_budget.observe_temporary(
+        manifest.total_bytes,
+        &format!("allocating shard reconstruction buffer for {label}"),
+    )?;
+
     let mut output = Vec::with_capacity(manifest.total_bytes as usize);
     for (index, entry) in entries.iter().enumerate() {
         let shard_url = resolve_manifest_entry_uri(manifest_url, entry.path());
         let shard_label = format!("{label} shard {}/{}", index + 1, entries.len());
-        let bytes =
-            download_binary_with_status(&shard_url, &shard_label, max_bytes, event_tx, totals)
-                .await?;
+        let bytes = download_binary_with_status(
+            &shard_url,
+            &shard_label,
+            max_bytes,
+            event_tx,
+            totals,
+            host_ram_budget,
+        )
+        .await?;
+        host_ram_budget.observe_temporary(
+            output.len() as u64 + bytes.len() as u64,
+            &format!("reconstructing {label} from shard {}", index + 1),
+        )?;
         output.extend_from_slice(&bytes);
     }
 
@@ -1252,10 +1481,11 @@ async fn download_binary_with_status(
     max_bytes: u64,
     event_tx: &Sender<WorkerEvent>,
     totals: &mut DownloadTotals,
+    host_ram_budget: &mut WasmHostMemoryBudget,
 ) -> Result<Vec<u8>, String> {
     let mut registered_total = false;
     let mut prev = 0u64;
-    fetch_binary_with_progress(url, max_bytes, |loaded, total| {
+    let bytes = fetch_binary_with_progress(url, max_bytes, |loaded, total| {
         if let Some(total_bytes) = total
             && !registered_total
         {
@@ -1286,7 +1516,9 @@ async fn download_binary_with_status(
         };
         send_worker_status(event_tx, message);
     })
-    .await
+    .await?;
+    host_ram_budget.observe_temporary(bytes.len() as u64, &format!("downloading {label}"))?;
+    Ok(bytes)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2135,70 +2367,18 @@ fn apply_mesh_decimation(
 ) -> Option<SynthMesh> {
     let target_faces = target_faces.filter(|value| *value > 0);
     let mut mesh = mesh?;
+    if !mesh.uvs.is_empty() || mesh.material.is_some() || mesh.pbr_textures.is_some() {
+        return Some(mesh);
+    }
     if let Some(target) = target_faces
         && mesh.mesh.faces.len() > target
     {
-        match decimate_mesh(&mesh.mesh, target) {
+        match decimate_tripo_mesh(&mesh.mesh, target) {
             Ok(decimated) => mesh.mesh = decimated,
             Err(err) => warn!("mesh decimation failed ({err}); using full mesh."),
         }
     }
     Some(mesh)
-}
-
-fn decimate_mesh(mesh: &TripoMesh, target_faces: usize) -> Result<TripoMesh, String> {
-    if target_faces == 0 || mesh.faces.len() <= target_faces {
-        return Ok(mesh.clone());
-    }
-    if mesh.faces.is_empty() || mesh.vertices.is_empty() {
-        return Ok(mesh.clone());
-    }
-
-    let mut indices = Vec::with_capacity(mesh.faces.len() * 3);
-    for face in &mesh.faces {
-        indices.push(face[0]);
-        indices.push(face[1]);
-        indices.push(face[2]);
-    }
-    let target_index_count = (target_faces.saturating_mul(3)).min(indices.len());
-    if target_index_count < 3 {
-        return Err("target face count too small for decimation".to_string());
-    }
-
-    let vertices_bytes = meshopt::typed_to_bytes(mesh.vertices.as_slice());
-    let adapter =
-        meshopt::VertexDataAdapter::new(vertices_bytes, std::mem::size_of::<[f32; 3]>(), 0)
-            .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
-
-    let mut result_error = 0.0f32;
-    let mut simplified = meshopt::simplify(
-        &indices,
-        &adapter,
-        target_index_count,
-        1.0,
-        meshopt::SimplifyOptions::None,
-        Some(&mut result_error),
-    );
-    if simplified.len() > target_index_count {
-        simplified = meshopt::simplify_sloppy(&indices, &adapter, target_index_count, 1.0, None);
-    }
-    if simplified.len() < 3 {
-        return Err("meshopt simplification produced empty mesh".to_string());
-    }
-
-    let (vertex_count, remap) =
-        meshopt::generate_vertex_remap(mesh.vertices.as_slice(), Some(&simplified));
-    let vertices = meshopt::remap_vertex_buffer(mesh.vertices.as_slice(), vertex_count, &remap);
-    let indices = meshopt::remap_index_buffer(Some(&simplified), vertex_count, &remap);
-    if indices.len() < 3 {
-        return Err("meshopt remap produced empty mesh".to_string());
-    }
-
-    let faces = indices
-        .chunks_exact(3)
-        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
-        .collect::<Vec<[u32; 3]>>();
-    Ok(TripoMesh { vertices, faces })
 }
 
 fn parse_bounds(bounds: &[f32]) -> Result<[f32; 6], Box<dyn std::error::Error>> {
@@ -2208,4 +2388,109 @@ fn parse_bounds(bounds: &[f32]) -> Result<[f32; 6], Box<dyn std::error::Error>> 
     Ok([
         bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_mesh_grid(n: usize) -> TripoMesh {
+        let mut vertices = Vec::new();
+        let mut faces = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                vertices.push([x as f32, y as f32, 0.0]);
+            }
+        }
+        for y in 0..n {
+            for x in 0..n {
+                let i0 = (y * (n + 1) + x) as u32;
+                let i1 = i0 + 1;
+                let i2 = i0 + (n + 1) as u32;
+                let i3 = i2 + 1;
+                faces.push([i0, i1, i3]);
+                faces.push([i0, i3, i2]);
+            }
+        }
+        TripoMesh { vertices, faces }
+    }
+
+    #[test]
+    fn dino_backend_choice_mapping_round_trips() {
+        for value in [DinoBackend::Auto, DinoBackend::Cpu, DinoBackend::Gpu] {
+            assert_eq!(
+                map_dino_backend_choice_back(map_dino_backend_choice(value)),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mesh_decimation_reduces_untextured_mesh() {
+        let mesh = SynthMesh::from(sample_mesh_grid(20));
+        let original_faces = mesh.mesh.faces.len();
+        let output =
+            apply_mesh_decimation(Some(mesh), Some(300)).expect("decimation should return mesh");
+        assert!(output.mesh.faces.len() <= 300);
+        assert!(output.mesh.faces.len() > 0);
+        assert!(output.mesh.faces.len() < original_faces);
+    }
+
+    #[test]
+    fn apply_mesh_decimation_skips_textured_meshes() {
+        let mut mesh = SynthMesh::from(sample_mesh_grid(20));
+        mesh.uvs = vec![[0.0, 0.0]; mesh.mesh.vertices.len()];
+        let original_faces = mesh.mesh.faces.clone();
+        let output =
+            apply_mesh_decimation(Some(mesh), Some(300)).expect("decimation should return mesh");
+        assert_eq!(output.mesh.faces, original_faces);
+    }
+
+    #[test]
+    fn wasm_host_ram_budget_defaults_to_4gib() {
+        assert_eq!(web_max_host_ram_bytes(), 4 * ONE_GIB);
+    }
+
+    #[test]
+    fn wasm_host_ram_budget_rejects_over_limit_observation() {
+        let mut budget = WasmHostMemoryBudget::new(4 * ONE_GIB);
+        budget
+            .reserve_retained(3 * ONE_GIB, "retain model A")
+            .expect("reserve should succeed");
+        let err = budget
+            .observe_temporary((ONE_GIB * 2) - 1, "download model B shard")
+            .expect_err("should exceed 4 GiB budget");
+        assert!(
+            err.contains("exceeded"),
+            "unexpected budget error message: {err}"
+        );
+    }
+
+    #[test]
+    fn wasm_triposg_rmbg_streaming_sequence_stays_under_cap() {
+        // Simulated burnpack sizes (MiB) for [RMBG, VAE, DiT, DINO-GPU, DINO-CPU].
+        // Summed retention would exceed 4 GiB if loaded all-at-once.
+        let sizes_mib = [520_u64, 680, 1710, 920, 920];
+        let total_mib: u64 = sizes_mib.iter().sum();
+        assert!(total_mib > 4096, "test setup must exceed 4 GiB aggregate");
+
+        let mut budget = WasmHostMemoryBudget::new(4 * ONE_GIB);
+        for (idx, size_mib) in sizes_mib.iter().enumerate() {
+            let bytes = size_mib * 1024 * 1024;
+            budget
+                .observe_temporary(bytes, &format!("download stage {idx}"))
+                .expect("temporary download buffer should fit");
+            budget
+                .reserve_retained(bytes, &format!("retain stage {idx}"))
+                .expect("retention should fit");
+            budget.release_retained(bytes);
+        }
+
+        assert!(
+            budget.peak_bytes() < budget.limit_bytes(),
+            "streaming peak {} should remain below limit {}",
+            budget.peak_bytes(),
+            budget.limit_bytes()
+        );
+    }
 }

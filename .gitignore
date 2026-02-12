@@ -6,6 +6,7 @@ vendor/
 out/
 **/*.rs.bk
 *.pdb
+tmp/
 
 *.py
 
@@ -20,6 +21,7 @@ out/
 .DS_Store
 
 .tmp/
+*.patch
 
 scripts/
 src/dino/

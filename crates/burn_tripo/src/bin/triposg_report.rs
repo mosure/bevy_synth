@@ -43,8 +43,12 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-        std::env::set_var("RMBG_STRICT_INTERP", "1");
-        std::env::set_var("DINO_STRICT_PREPROCESS", "1");
+        if std::env::var("RMBG_STRICT_INTERP").is_err() {
+            std::env::set_var("RMBG_STRICT_INTERP", "1");
+        }
+        if std::env::var("DINO_STRICT_PREPROCESS").is_err() {
+            std::env::set_var("DINO_STRICT_PREPROCESS", "1");
+        }
     }
 
     let reference_path = std::env::var("TRIPOSG_REPORT_REFERENCE")
@@ -99,9 +103,11 @@ fn run_with_backend<B: Backend>(
     let output_latents = reference
         .get_input("output.latents")
         .ok_or("missing output.latents in reference")?;
-    let output_grid = reference
-        .get_input("output.grid_logits")
-        .ok_or("missing output.grid_logits in reference")?;
+    let output_grid = reference.get_input("output.grid_logits");
+    let skip_decode = std::env::var("TRIPOSG_REPORT_SKIP_DECODE").is_ok();
+    if !skip_decode && output_grid.is_none() {
+        return Err("missing output.grid_logits in reference".into());
+    }
 
     let num_steps = reference
         .get_scalar("meta.num_steps")
@@ -175,17 +181,24 @@ fn run_with_backend<B: Backend>(
 
     let mut pipeline = TripoSGPipeline::from_pretrained(weights_root, &device)?;
 
+    let processed = pipeline.image_processor.preprocess(input_image.clone());
     let mut reference_pixel_values = None;
     if let Some(reference_pixels) = reference.get_input("input.pixel_values") {
-        let processed = pipeline.image_processor.preprocess(input_image.clone());
         let stats = compute_stats_from_tensor_4d(&processed, &reference_pixels)?;
         print_stats("encoder.pixel_values", &stats);
         reference_pixel_values = Some(reference_pixels);
     }
+    let reference_tokens_pre_pos = reference.get_input("encoder.tokens_pre_pos");
+    let reference_pos_interp = reference.get_input("encoder.pos_interp");
+    let reference_hidden0 = reference.get_input("encoder.hidden.0");
+    if reference_tokens_pre_pos.is_some() || reference_pos_interp.is_some() || reference_hidden0.is_some() {
+        println!(
+            "encoder.debug_hooks: skipped (requires burn_dino.patch forward_from_tokens/debug_embeddings)"
+        );
+    }
 
     let image_embeds = pipeline.encode_image(input_image.clone());
     let reference_embeds = reference.get_input("input.image_embeds");
-
     if let Some(reference_embeds) = reference_embeds.as_ref() {
         let stats = compute_stats_from_tensor(&image_embeds, reference_embeds)?;
         print_stats("encoder.image_embeds", &stats);
@@ -215,6 +228,42 @@ fn run_with_backend<B: Backend>(
         .set_timesteps(num_steps, None, None, None)
         .map_err(|err| format!("failed to set timesteps: {err}"))?;
     let timesteps = pipeline.scheduler.timesteps().to_vec();
+    let report_all_steps = std::env::var("TRIPOSG_REPORT_ALL_STEPS").is_ok();
+
+    if report_all_steps {
+        let _ = report_denoise_steps(
+            &mut pipeline,
+            input_latents.clone(),
+            guided_embeds.clone(),
+            do_guidance,
+            guidance_scale,
+            num_tokens,
+            timesteps.as_slice(),
+            reference,
+            "steps.pipeline_embeds",
+        )?;
+
+        if let Some(reference_embeds) = reference_embeds.as_ref() {
+            let embeds_ref = tensor_from_data_3d::<B>(reference_embeds, &device)?;
+            let guided_embeds_ref = if do_guidance {
+                let zeros = Tensor::<B, 3>::zeros(embeds_ref.shape(), &device);
+                Tensor::cat(vec![zeros, embeds_ref], 0)
+            } else {
+                embeds_ref
+            };
+            let _ = report_denoise_steps(
+                &mut pipeline,
+                input_latents.clone(),
+                guided_embeds_ref,
+                do_guidance,
+                guidance_scale,
+                num_tokens,
+                timesteps.as_slice(),
+                reference,
+                "steps.reference_embeds",
+            )?;
+        }
+    }
 
     if let (Some(step0_noise_ref), Some(step0_latents_ref)) = (
         reference.get_input("output.noise_pred.step0"),
@@ -295,6 +344,63 @@ fn run_with_backend<B: Backend>(
         }
     }
 
+    if let (Some(reference_embeds), Some(step0_noise_ref), Some(step0_latents_ref)) = (
+        reference_embeds.as_ref(),
+        reference.get_input("output.noise_pred.step0"),
+        reference.get_input("output.latents.step0"),
+    ) && let Some(&t0) = timesteps.first()
+    {
+        pipeline
+            .scheduler
+            .set_timesteps(num_steps, None, None, None)
+            .map_err(|err| format!("failed to reset timesteps: {err}"))?;
+        let embeds_ref = tensor_from_data_3d::<B>(reference_embeds, &device)?;
+        let guided_embeds_ref = if do_guidance {
+            let zeros = Tensor::<B, 3>::zeros(embeds_ref.shape(), &device);
+            Tensor::cat(vec![zeros, embeds_ref], 0)
+        } else {
+            embeds_ref
+        };
+
+        let latent_model_input = if do_guidance {
+            Tensor::cat(vec![input_latents.clone(), input_latents.clone()], 0)
+        } else {
+            input_latents.clone()
+        };
+        let model_batch = latent_model_input.shape().dims::<3>()[0];
+        let timestep = Tensor::<B, 1>::from_floats(vec![t0; model_batch].as_slice(), &device);
+        let mut noise_pred = pipeline.transformer.forward(
+            latent_model_input,
+            timestep,
+            guided_embeds_ref,
+            None,
+            None,
+        );
+        if do_guidance {
+            let half = model_batch / 2;
+            let channels = pipeline.transformer.config().in_channels;
+            let noise_uncond = noise_pred
+                .clone()
+                .slice([0..half, 0..num_tokens, 0..channels]);
+            let noise_cond = noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
+            noise_pred =
+                noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+        }
+
+        let stats = compute_stats_from_tensor(&noise_pred, &step0_noise_ref)?;
+        print_stats("transformer.noise_pred.step0.from_reference_embeds", &stats);
+
+        let latents_step0 = pipeline
+            .scheduler
+            .step(noise_pred, t0, input_latents.clone());
+        let stats = compute_stats_from_tensor(&latents_step0, &step0_latents_ref)?;
+        print_stats("scheduler.latents.step0.from_reference_embeds", &stats);
+    }
+
+    if std::env::var("TRIPOSG_REPORT_STEPS_ONLY").is_ok() {
+        return Ok(());
+    }
+
     if std::env::var("TRIPOSG_REPORT_REF_EMBEDS").is_ok()
         && let Some(reference_embeds) = reference_embeds.as_ref()
     {
@@ -311,10 +417,16 @@ fn run_with_backend<B: Backend>(
 
         let stats = compute_stats_from_tensor(&output_ref.latents, &output_latents)?;
         print_stats("pipeline.latents.from_reference_embeds", &stats);
+        if !skip_decode {
+            let output_grid = output_grid.as_ref().expect("output.grid_logits checked above");
+            let grid = pipeline.decode_grid(output_ref.latents, bounds, resolution, chunk_size)?;
+            let stats = compute_stats(&grid.values, &output_grid.data);
+            print_stats("decoder.grid_logits.from_reference_embeds", &stats);
+        }
 
-        let grid = pipeline.decode_grid(output_ref.latents, bounds, resolution, chunk_size)?;
-        let stats = compute_stats(&grid.values, &output_grid.data);
-        print_stats("decoder.grid_logits.from_reference_embeds", &stats);
+        if std::env::var("TRIPOSG_REPORT_REF_EMBEDS_ONLY").is_ok() {
+            return Ok(());
+        }
     }
 
     if std::env::var("TRIPOSG_REPORT_CPU_DINO").is_ok()
@@ -351,10 +463,12 @@ fn run_with_backend<B: Backend>(
 
         let stats = compute_stats_from_tensor(&output_cpu.latents, &output_latents)?;
         print_stats("pipeline.latents.from_cpu_dino", &stats);
-
-        let grid = pipeline.decode_grid(output_cpu.latents, bounds, resolution, chunk_size)?;
-        let stats = compute_stats(&grid.values, &output_grid.data);
-        print_stats("decoder.grid_logits.from_cpu_dino", &stats);
+        if !skip_decode {
+            let output_grid = output_grid.as_ref().expect("output.grid_logits checked above");
+            let grid = pipeline.decode_grid(output_cpu.latents, bounds, resolution, chunk_size)?;
+            let stats = compute_stats(&grid.values, &output_grid.data);
+            print_stats("decoder.grid_logits.from_cpu_dino", &stats);
+        }
     }
 
     let output = pipeline.sample(
@@ -369,6 +483,11 @@ fn run_with_backend<B: Backend>(
     let stats = compute_stats_from_tensor(&output.latents, &output_latents)?;
     print_stats("pipeline.latents", &stats);
 
+    if skip_decode {
+        return Ok(());
+    }
+
+    let output_grid = output_grid.as_ref().expect("output.grid_logits checked above");
     let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
     let stats = compute_stats(&grid.values, &output_grid.data);
     print_stats("decoder.grid_logits", &stats);
@@ -392,6 +511,72 @@ fn print_stats(label: &str, stats: &MetricStats) {
         "{label}: mean_abs={:.6} max_abs={:.6} mse={:.6}",
         stats.mean_abs, stats.max_abs, stats.mse
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_denoise_steps<B: Backend>(
+    pipeline: &mut TripoSGPipeline<B>,
+    latents_start: Tensor<B, 3>,
+    conditioned_embeds: Tensor<B, 3>,
+    do_guidance: bool,
+    guidance_scale: f32,
+    num_tokens: usize,
+    timesteps: &[f32],
+    reference: &HookReference,
+    label_prefix: &str,
+) -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
+    pipeline
+        .scheduler
+        .set_timesteps(timesteps.len(), None, None, None)
+        .map_err(|err| format!("failed to set timesteps: {err}"))?;
+
+    let device = latents_start.device();
+    let mut latents = latents_start;
+    let channels = pipeline.transformer.config().in_channels;
+
+    for (step, &t) in timesteps.iter().enumerate() {
+        let noise_key = format!("output.noise_pred.step{step}");
+        let Some(noise_ref) = reference.get_input(&noise_key) else {
+            break;
+        };
+        let latents_key = format!("output.latents.step{step}");
+        let Some(latents_ref) = reference.get_input(&latents_key) else {
+            break;
+        };
+
+        let latent_model_input = if do_guidance {
+            Tensor::cat(vec![latents.clone(), latents.clone()], 0)
+        } else {
+            latents.clone()
+        };
+        let model_batch = latent_model_input.shape().dims::<3>()[0];
+        let timestep = Tensor::<B, 1>::from_floats(vec![t; model_batch].as_slice(), &device);
+
+        let mut noise_pred = pipeline.transformer.forward(
+            latent_model_input,
+            timestep,
+            conditioned_embeds.clone(),
+            None,
+            None,
+        );
+
+        if do_guidance {
+            let half = model_batch / 2;
+            let noise_uncond = noise_pred.clone().slice([0..half, 0..num_tokens, 0..channels]);
+            let noise_cond = noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
+            noise_pred =
+                noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);
+        }
+
+        let stats = compute_stats_from_tensor(&noise_pred, &noise_ref)?;
+        print_stats(&format!("{label_prefix}.noise_pred.step{step}"), &stats);
+
+        latents = pipeline.scheduler.step(noise_pred, t, latents);
+        let stats = compute_stats_from_tensor(&latents, &latents_ref)?;
+        print_stats(&format!("{label_prefix}.latents.step{step}"), &stats);
+    }
+
+    Ok(latents)
 }
 
 fn report_mesh(label: &str, mesh: &Option<TripoMesh>, reference: &Option<TripoMesh>) {

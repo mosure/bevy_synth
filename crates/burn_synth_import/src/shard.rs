@@ -302,9 +302,15 @@ fn resolve_manifest_entry_path(manifest_path: &Path, shard: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{read_shard_manifest, write_shards_for_burnpack};
+    use crate::plan::ArtifactPolicy;
+
+    use super::{
+        BurnpackShardEntry, apply_artifact_policy, read_shard_manifest, shard_manifest_path,
+        write_shards_for_burnpack,
+    };
 
     fn unique_temp_dir() -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -312,6 +318,23 @@ mod tests {
             .expect("clock drift")
             .as_nanos();
         std::env::temp_dir().join(format!("burn_synth_import_shard_{nanos}"))
+    }
+
+    fn patterned_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|idx| ((idx.wrapping_mul(37)).wrapping_add(11) % 251) as u8)
+            .collect()
+    }
+
+    fn read_reconstructed_bytes(manifest_path: &Path) -> Vec<u8> {
+        let manifest = read_shard_manifest(manifest_path).expect("read shard manifest");
+        let mut out = Vec::new();
+        for entry in manifest.shard_entries() {
+            let shard_path = super::resolve_manifest_entry_path(manifest_path, entry.path());
+            let bytes = std::fs::read(&shard_path).expect("read shard file");
+            out.extend_from_slice(&bytes);
+        }
+        out
     }
 
     #[test]
@@ -328,6 +351,139 @@ mod tests {
         let manifest = read_shard_manifest(&report.manifest_path).expect("read manifest");
         assert_eq!(manifest.total_bytes, (3 * 1024 * 1024 + 13) as u64);
         assert_eq!(manifest.shard_entries().len(), report.shard_paths.len());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn single_file_policy_skips_shard_output() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let burnpack = root.join("model.bpk");
+        std::fs::write(&burnpack, patterned_bytes(1024 * 1024)).expect("write burnpack");
+
+        let report = apply_artifact_policy(&burnpack, ArtifactPolicy::SingleFile, true)
+            .expect("apply artifact policy");
+        assert!(report.is_none());
+        assert!(!shard_manifest_path(&burnpack).exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn complete_manifest_is_reused_without_overwrite() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let burnpack = root.join("model.bpk");
+        std::fs::write(&burnpack, patterned_bytes(2 * 1024 * 1024 + 17)).expect("write burnpack");
+
+        let first = write_shards_for_burnpack(&burnpack, 1, true).expect("first split");
+        let manifest_before = std::fs::read(&first.manifest_path).expect("read manifest before");
+        let second = write_shards_for_burnpack(&burnpack, 1, false).expect("second split");
+        let manifest_after = std::fs::read(&second.manifest_path).expect("read manifest after");
+
+        assert_eq!(first.manifest_path, second.manifest_path);
+        assert_eq!(first.shard_paths, second.shard_paths);
+        assert_eq!(manifest_before, manifest_after);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_shard_forces_regeneration_without_overwrite() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let burnpack = root.join("model.bpk");
+        let source = patterned_bytes(2 * 1024 * 1024 + 99);
+        std::fs::write(&burnpack, source.as_slice()).expect("write burnpack");
+
+        let first = write_shards_for_burnpack(&burnpack, 1, true).expect("first split");
+        assert!(!first.shard_paths.is_empty());
+        std::fs::remove_file(&first.shard_paths[0]).expect("remove shard to simulate corruption");
+
+        let rebuilt =
+            write_shards_for_burnpack(&burnpack, 1, false).expect("rebuild missing shard split");
+        let manifest = read_shard_manifest(&rebuilt.manifest_path).expect("read rebuilt manifest");
+        assert_eq!(manifest.total_bytes as usize, source.len());
+        for entry in manifest.shard_entries() {
+            let shard_path =
+                super::resolve_manifest_entry_path(&rebuilt.manifest_path, entry.path());
+            assert!(
+                shard_path.exists(),
+                "missing shard {}",
+                shard_path.display()
+            );
+        }
+
+        let reconstructed = read_reconstructed_bytes(&rebuilt.manifest_path);
+        assert_eq!(reconstructed, source);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_and_shard_hashes_match_source_content() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let burnpack = root.join("model.bpk");
+        let source = patterned_bytes(3 * 1024 * 1024 + 31);
+        std::fs::write(&burnpack, source.as_slice()).expect("write burnpack");
+
+        let report = write_shards_for_burnpack(&burnpack, 1, true).expect("split burnpack");
+        let manifest = read_shard_manifest(&report.manifest_path).expect("read manifest");
+        assert_eq!(manifest.sha256, crate::io::sha256_bytes(source.as_slice()));
+        assert_eq!(manifest.total_bytes as usize, source.len());
+
+        for entry in manifest.shard_entries() {
+            match entry {
+                BurnpackShardEntry::Detailed {
+                    path,
+                    size,
+                    bytes,
+                    sha256,
+                } => {
+                    let shard_path =
+                        super::resolve_manifest_entry_path(&report.manifest_path, path);
+                    let shard_metadata = std::fs::metadata(&shard_path).expect("shard metadata");
+                    let expected_len = shard_metadata.len();
+                    assert_eq!(size.unwrap_or(expected_len), expected_len);
+                    assert_eq!(bytes.unwrap_or(expected_len), expected_len);
+                    let expected_sha = crate::io::sha256_file(&shard_path).expect("shard hash");
+                    assert_eq!(sha256.as_deref(), Some(expected_sha.as_str()));
+                }
+                BurnpackShardEntry::Path(path) => {
+                    panic!("writer should emit detailed shard entry, got path-only entry: {path}");
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shard_entries_support_legacy_files_and_parts_fields() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create temp dir");
+
+        let files_manifest = root.join("files_manifest.json");
+        std::fs::write(
+            &files_manifest,
+            br#"{"total_bytes":3,"files":[{"path":"legacy-files.shard"}]}"#,
+        )
+        .expect("write files manifest");
+        let files = read_shard_manifest(&files_manifest).expect("parse files manifest");
+        assert_eq!(files.shard_entries().len(), 1);
+        assert_eq!(files.shard_entries()[0].path(), "legacy-files.shard");
+
+        let parts_manifest = root.join("parts_manifest.json");
+        std::fs::write(
+            &parts_manifest,
+            br#"{"total_bytes":3,"parts":[{"path":"legacy-parts.shard"}]}"#,
+        )
+        .expect("write parts manifest");
+        let parts = read_shard_manifest(&parts_manifest).expect("parse parts manifest");
+        assert_eq!(parts.shard_entries().len(), 1);
+        assert_eq!(parts.shard_entries()[0].path(), "legacy-parts.shard");
 
         let _ = std::fs::remove_dir_all(root);
     }

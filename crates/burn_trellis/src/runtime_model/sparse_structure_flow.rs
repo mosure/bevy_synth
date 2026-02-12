@@ -460,11 +460,38 @@ impl<B: Backend> SelfAttention<B> {
 
     fn forward_chunked_stream(&self, x: Tensor<B, 3>, resolution: usize) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
-        let kv_chunk_tokens = sparse_flow_self_attn_kv_chunk_tokens(tokens);
-        let query_chunk_tokens = sparse_flow_self_attn_query_chunk_tokens(tokens);
+        let mut kv_chunk_tokens = sparse_flow_self_attn_kv_chunk_tokens(tokens);
+        let reuse_qkv = sparse_flow_stream_reuse_qkv_enabled(tokens, channels);
+        let mut query_chunk_tokens = if reuse_qkv {
+            kv_chunk_tokens
+        } else {
+            sparse_flow_self_attn_query_chunk_tokens(tokens)
+        };
+        let logits_budget = sparse_flow_attn_logits_budget_bytes();
+        let bytes_per_logit = batch
+            .saturating_mul(self.num_heads)
+            .saturating_mul(core::mem::size_of::<f32>())
+            .max(1);
+        if reuse_qkv {
+            let max_square = integer_sqrt(logits_budget / bytes_per_logit).max(1);
+            kv_chunk_tokens = kv_chunk_tokens.min(max_square).max(1);
+            query_chunk_tokens = kv_chunk_tokens;
+        } else {
+            let max_query = (logits_budget / bytes_per_logit)
+                .checked_div(kv_chunk_tokens.max(1))
+                .unwrap_or(1)
+                .max(1);
+            query_chunk_tokens = query_chunk_tokens.min(max_query).max(1);
+            let max_kv = (logits_budget / bytes_per_logit)
+                .checked_div(query_chunk_tokens.max(1))
+                .unwrap_or(1)
+                .max(1);
+            kv_chunk_tokens = kv_chunk_tokens.min(max_kv).max(1);
+        }
 
         let mut k_chunks: Vec<Tensor<B, 4>> = Vec::new();
         let mut v_chunks: Vec<Tensor<B, 4>> = Vec::new();
+        let mut q_chunks: Vec<Tensor<B, 4>> = Vec::new();
         let mut kv_start = 0usize;
         while kv_start < tokens {
             let kv_end = (kv_start + kv_chunk_tokens).min(tokens);
@@ -487,6 +514,7 @@ impl<B: Backend> SelfAttention<B> {
                 ])
                 .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
             let v = qkv
+                .clone()
                 .slice([
                     0..batch,
                     0..(kv_end - kv_start),
@@ -495,70 +523,89 @@ impl<B: Backend> SelfAttention<B> {
                     0..self.head_dim,
                 ])
                 .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
-
-            if let Some(norm) = self.k_rms_norm.as_ref() {
-                k = norm.forward(k);
-            }
-            if self.use_rope {
-                k = apply_rope_single(
-                    k,
-                    resolution,
-                    self.head_dim,
-                    self.rope_freq,
-                    kv_start,
-                );
-            }
-
-            k_chunks.push(k.permute([0, 2, 1, 3]));
-            v_chunks.push(v.permute([0, 2, 1, 3]));
-            kv_start = kv_end;
-        }
-
-        let mut out_chunks = Vec::new();
-        let mut q_start = 0usize;
-        while q_start < tokens {
-            let q_end = (q_start + query_chunk_tokens).min(tokens);
-            let x_chunk = x.clone().slice([0..batch, q_start..q_end, 0..channels]);
-            let qkv = self.to_qkv.forward(x_chunk).reshape([
-                batch,
-                q_end - q_start,
-                3,
-                self.num_heads,
-                self.head_dim,
-            ]);
             let mut q = qkv
                 .slice([
                     0..batch,
-                    0..(q_end - q_start),
+                    0..(kv_end - kv_start),
                     0..1,
                     0..self.num_heads,
                     0..self.head_dim,
                 ])
-                .reshape([batch, q_end - q_start, self.num_heads, self.head_dim]);
+                .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
+
+            if let Some(norm) = self.k_rms_norm.as_ref() {
+                k = norm.forward(k);
+            }
             if let Some(norm) = self.q_rms_norm.as_ref() {
                 q = norm.forward(q);
             }
             if self.use_rope {
-                q = apply_rope_single(
-                    q,
-                    resolution,
-                    self.head_dim,
-                    self.rope_freq,
-                    q_start,
-                );
+                k = apply_rope_single(k, resolution, self.head_dim, self.rope_freq, kv_start);
+                q = apply_rope_single(q, resolution, self.head_dim, self.rope_freq, kv_start);
             }
 
-            let out = scaled_dot_product_attention_stream_chunked_keys(
-                q.permute([0, 2, 1, 3]),
-                k_chunks.as_slice(),
-                v_chunks.as_slice(),
-                self.head_dim,
-            )
-            .permute([0, 2, 1, 3])
-            .reshape([batch, q_end - q_start, channels]);
+            k_chunks.push(k.permute([0, 2, 1, 3]));
+            v_chunks.push(v.permute([0, 2, 1, 3]));
+            if reuse_qkv {
+                q_chunks.push(q.permute([0, 2, 1, 3]));
+            }
+            kv_start = kv_end;
+        }
 
-            out_chunks.push(self.to_out.forward(out));
-            q_start = q_end;
+        let mut out_chunks = Vec::new();
+        if reuse_qkv {
+            for q in q_chunks.into_iter() {
+                let q_tokens = q.dims()[2];
+                let out = scaled_dot_product_attention_stream_chunked_keys(
+                    q,
+                    k_chunks.as_slice(),
+                    v_chunks.as_slice(),
+                    self.head_dim,
+                )
+                .permute([0, 2, 1, 3])
+                .reshape([batch, q_tokens, channels]);
+                out_chunks.push(self.to_out.forward(out));
+            }
+        } else {
+            let mut q_start = 0usize;
+            while q_start < tokens {
+                let q_end = (q_start + query_chunk_tokens).min(tokens);
+                let x_chunk = x.clone().slice([0..batch, q_start..q_end, 0..channels]);
+                let qkv = self.to_qkv.forward(x_chunk).reshape([
+                    batch,
+                    q_end - q_start,
+                    3,
+                    self.num_heads,
+                    self.head_dim,
+                ]);
+                let mut q = qkv
+                    .slice([
+                        0..batch,
+                        0..(q_end - q_start),
+                        0..1,
+                        0..self.num_heads,
+                        0..self.head_dim,
+                    ])
+                    .reshape([batch, q_end - q_start, self.num_heads, self.head_dim]);
+                if let Some(norm) = self.q_rms_norm.as_ref() {
+                    q = norm.forward(q);
+                }
+                if self.use_rope {
+                    q = apply_rope_single(q, resolution, self.head_dim, self.rope_freq, q_start);
+                }
+
+                let out = scaled_dot_product_attention_stream_chunked_keys(
+                    q.permute([0, 2, 1, 3]),
+                    k_chunks.as_slice(),
+                    v_chunks.as_slice(),
+                    self.head_dim,
+                )
+                .permute([0, 2, 1, 3])
+                .reshape([batch, q_end - q_start, channels]);
+
+                out_chunks.push(self.to_out.forward(out));
+                q_start = q_end;
+            }
         }
 
         Tensor::cat(out_chunks, 1)
@@ -814,7 +861,11 @@ impl<B: Backend> SparseStructureFlowModel<B> {
 
         let tokens = self.config.resolution * self.config.resolution * self.config.resolution;
         let mut h = x.reshape([batch, channels, tokens]).swap_dims(1, 2);
-        h = linear_forward_token_chunked(&self.input_layer, h, sparse_flow_linear_chunk_tokens(tokens));
+        h = linear_forward_token_chunked(
+            &self.input_layer,
+            h,
+            sparse_flow_linear_chunk_tokens(tokens),
+        );
 
         let t_emb = self
             .t_embedder
@@ -1457,17 +1508,13 @@ impl SparseStructureFlowRuntime {
                     {
                         eprintln!(
                             "burn_trellis: sparse flow wgpu disabled for model '{}' due estimated peak tensor bytes (resolution={}, model_channels={}); falling back to cpu.",
-                            model_stem,
-                            cfg.resolution,
-                            cfg.model_channels
+                            model_stem, cfg.resolution, cfg.model_channels
                         );
                     } else {
                         if sparse_flow_wgpu_may_overflow(cfg) {
                             eprintln!(
                                 "burn_trellis: sparse flow wgpu keeping model '{}' on device with chunked-forward path (resolution={}, model_channels={}).",
-                                model_stem,
-                                cfg.resolution,
-                                cfg.model_channels
+                                model_stem, cfg.resolution, cfg.model_channels
                             );
                         }
                         return Ok(Self::Wgpu(runtime));
@@ -1870,53 +1917,91 @@ fn sparse_flow_chunked_forward_enabled(tokens: usize) -> bool {
     attention_prefers_stream() && tokens >= 2_048
 }
 
+fn sparse_flow_stream_reuse_qkv_enabled(tokens: usize, channels: usize) -> bool {
+    if let Ok(raw) = std::env::var("TRELLIS2_SPARSE_FLOW_STREAM_REUSE_QKV") {
+        return !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        );
+    }
+    if !sparse_flow_chunked_forward_enabled(tokens) {
+        return false;
+    }
+    if env_flag_enabled("TRELLIS2_PARITY_STRICT") || env_flag_enabled("TRELLIS2_E2E_STRICT") {
+        return false;
+    }
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        // Cap extra cache pressure from storing streamed Q chunks while still
+        // eliminating the second QKV projection pass.
+        let q_cache_bytes = tokens
+            .checked_mul(channels)
+            .and_then(|value| value.checked_mul(core::mem::size_of::<f32>()))
+            .unwrap_or(usize::MAX);
+        let budget = sparse_flow_wgpu_max_peak_bytes().saturating_mul(2);
+        q_cache_bytes <= budget
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        let _ = channels;
+        false
+    }
+}
+
 fn sparse_flow_linear_chunk_tokens(tokens: usize) -> usize {
     let default = if sparse_flow_chunked_forward_enabled(tokens) {
-        4_096
+        8_192
     } else {
         tokens.max(1)
     };
-    env_chunk_tokens(
-        "TRELLIS2_SPARSE_FLOW_LINEAR_CHUNK",
-        default,
-        16_384,
-        tokens,
-    )
+    env_chunk_tokens("TRELLIS2_SPARSE_FLOW_LINEAR_CHUNK", default, 32_768, tokens)
+}
+
+fn sparse_flow_attn_logits_budget_bytes() -> usize {
+    std::env::var("TRELLIS2_SPARSE_FLOW_ATTN_LOGITS_BUDGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2_147_483_648)
+}
+
+fn integer_sqrt(value: usize) -> usize {
+    (value as f64).sqrt().floor() as usize
 }
 
 fn sparse_flow_mlp_chunk_tokens(tokens: usize) -> usize {
     let default = if sparse_flow_chunked_forward_enabled(tokens) {
-        512
+        2_048
     } else {
         tokens.max(1)
     };
-    env_chunk_tokens("TRELLIS2_SPARSE_FLOW_MLP_CHUNK", default, 8_192, tokens)
+    env_chunk_tokens("TRELLIS2_SPARSE_FLOW_MLP_CHUNK", default, 16_384, tokens)
 }
 
 fn sparse_flow_self_attn_query_chunk_tokens(tokens: usize) -> usize {
-    let default = if sparse_flow_chunked_forward_enabled(tokens) {
-        512
-    } else {
-        tokens.max(1)
-    };
-    env_chunk_tokens(
-        "TRELLIS2_SPARSE_FLOW_ATTN_QUERY_CHUNK",
-        default,
-        4_096,
-        tokens,
-    )
-}
-
-fn sparse_flow_self_attn_kv_chunk_tokens(tokens: usize) -> usize {
     let default = if sparse_flow_chunked_forward_enabled(tokens) {
         2_048
     } else {
         tokens.max(1)
     };
     env_chunk_tokens(
+        "TRELLIS2_SPARSE_FLOW_ATTN_QUERY_CHUNK",
+        default,
+        16_384,
+        tokens,
+    )
+}
+
+fn sparse_flow_self_attn_kv_chunk_tokens(tokens: usize) -> usize {
+    let default = if sparse_flow_chunked_forward_enabled(tokens) {
+        8_192
+    } else {
+        tokens.max(1)
+    };
+    env_chunk_tokens(
         "TRELLIS2_SPARSE_FLOW_ATTN_KV_CHUNK",
         default,
-        8_192,
+        32_768,
         tokens,
     )
 }
@@ -2175,8 +2260,8 @@ fn scaled_dot_product_attention_stream_chunked_keys<B: Backend>(
     let [batch, heads, query_tokens, _] = q.dims();
     let [_, _, _, value_dim] = v_chunks[0].dims();
 
-    let first_logits = matmul_4d_via_3d(q.clone(), k_chunks[0].clone().swap_dims(2, 3))
-        .mul_scalar(scale);
+    let first_logits =
+        matmul_4d_via_3d(q.clone(), k_chunks[0].clone().swap_dims(2, 3)).mul_scalar(scale);
     let mut max_scores = first_logits.clone().max_dim(3);
     let first_probs = first_logits.sub(max_scores.clone()).exp();
     let mut denom = first_probs.clone().sum_dim(3);
@@ -2320,7 +2405,8 @@ fn apply_rope_single<B: Backend>(
         return x;
     }
     let device = x.device();
-    let (rope_cos, rope_sin) = rope_cos_sin_range(resolution, token_start, tokens, pairs, rope_freq);
+    let (rope_cos, rope_sin) =
+        rope_cos_sin_range(resolution, token_start, tokens, pairs, rope_freq);
     let cos = Tensor::<B, 1>::from_floats(rope_cos.as_slice(), &device)
         .reshape([tokens, pairs])
         .reshape([1, tokens, 1, pairs]);
@@ -2656,9 +2742,9 @@ mod tests {
     use crate::sampler::FlowEulerSampleConfig;
 
     use super::{
-        BinaryBlob, BlobMetadata, CpuRuntimeBackend, SparseStructureFlowConfig,
+        BinaryBlob, BlobMetadata, CpuRuntimeBackend, SelfAttention, SparseStructureFlowConfig,
         SparseStructureFlowModel, SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl,
-        SelfAttention, host_transfer_stats, metadata_path, reset_host_transfer_stats,
+        host_transfer_stats, metadata_path, reset_host_transfer_stats,
         scaled_dot_product_attention_dense, scaled_dot_product_attention_stream,
     };
 
@@ -3061,9 +3147,8 @@ mod tests {
             let x = idx as f32 * 0.011 + 0.37;
             values.push(x.sin() * 0.5 + x.cos() * 0.5);
         }
-        let input =
-            Tensor::<CpuRuntimeBackend, 1>::from_floats(values.as_slice(), &device)
-                .reshape([1, tokens, channels]);
+        let input = Tensor::<CpuRuntimeBackend, 1>::from_floats(values.as_slice(), &device)
+            .reshape([1, tokens, channels]);
 
         unsafe {
             std::env::set_var("TRELLIS2_ATTN_BACKEND", "stream");
