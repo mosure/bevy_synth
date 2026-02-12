@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 #[cfg(feature = "runtime-model")]
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "runtime-model")]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

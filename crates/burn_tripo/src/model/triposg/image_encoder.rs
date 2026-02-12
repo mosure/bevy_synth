@@ -34,6 +34,7 @@ pub struct DinoImageProcessor {
     pub do_center_crop: bool,
     pub crop_size: Option<[usize; 2]>,
     pub resize_mode: InterpolateMode,
+    pub strict_preprocess: Option<bool>,
 }
 
 impl Default for DinoImageProcessor {
@@ -49,15 +50,28 @@ impl Default for DinoImageProcessor {
             do_center_crop: false,
             crop_size: None,
             resize_mode: InterpolateMode::Bicubic,
+            strict_preprocess: None,
         }
     }
 }
 
 impl DinoImageProcessor {
+    pub fn with_strict_preprocess(mut self, strict: bool) -> Self {
+        self.strict_preprocess = Some(strict);
+        self
+    }
+
+    pub fn set_strict_preprocess(&mut self, strict: bool) {
+        self.strict_preprocess = Some(strict);
+    }
+
+    fn strict_preprocess_enabled(&self) -> bool {
+        self.strict_preprocess
+            .unwrap_or_else(|| env_flag("DINO_STRICT_PREPROCESS", false))
+    }
+
     pub fn preprocess<B: Backend>(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
-        if !cfg!(target_arch = "wasm32")
-            && env_flag("DINO_STRICT_PREPROCESS", false)
-        {
+        if !cfg!(target_arch = "wasm32") && self.strict_preprocess_enabled() {
             return self.preprocess_cpu(image);
         }
         let mut image = image;
@@ -267,10 +281,9 @@ pub mod import {
         tensor::{SafeTensors, TensorView},
     };
 
+    use super::super::load_policy::{BurnpackLoadPolicy, burnpack_path, candidate_burnpack_paths};
     use super::{DinoImageProcessor, TripoSGImageEncoder};
     use burn_dino::model::dino::DinoVisionTransformerConfig;
-
-    const F16_SUFFIX: &str = "_f16";
 
     #[derive(Debug)]
     pub struct Dinov2ImportError(pub String);
@@ -287,6 +300,14 @@ pub mod import {
         device: &B::Device,
         weights_path: impl AsRef<Path>,
     ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
+        load_triposg_dinov2_with_policy(device, weights_path, default_burnpack_policy())
+    }
+
+    pub fn load_triposg_dinov2_with_policy<B: Backend>(
+        device: &B::Device,
+        weights_path: impl AsRef<Path>,
+        policy: BurnpackLoadPolicy,
+    ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
         let mut config = load_dinov2_config(weights_path)
             .unwrap_or_else(|| DinoVisionTransformerConfig::vitl(None, None));
@@ -297,7 +318,7 @@ pub mod import {
                 config.positional_encoding_interpolate.output_size = Some([grid, grid]);
             }
         }
-        let burnpack_candidates = candidate_burnpack_paths(weights_path);
+        let burnpack_candidates = candidate_burnpack_paths(weights_path, policy);
         let burnpack_path = burnpack_candidates
             .iter()
             .find(|candidate| candidate.exists())
@@ -364,17 +385,46 @@ pub mod import {
         Ok(TripoSGImageEncoder::new(model))
     }
 
+    const CANONICAL_DINO_SHORT_EDGE: usize = 256;
+    const CANONICAL_DINO_CROP: usize = 224;
+    const LEGACY_DINO_SIZE_CAP: usize = 384;
+
     pub fn load_dinov2_processor(
         weights_root: impl AsRef<Path>,
     ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
         let root = weights_root.as_ref();
         let fallback_size = load_dinov2_image_size(root);
-        for path in dinov2_preprocessor_config_paths(root) {
-            if let Ok(bytes) = fs::read(path)
-                && let Ok(processor) = load_dinov2_processor_from_json_bytes(&bytes, fallback_size)
-            {
+        let mut legacy_processor = None;
+
+        for (kind, path) in dinov2_preprocessor_config_paths(root) {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(config) = load_dinov2_processor_config_from_json_bytes(&bytes) else {
+                continue;
+            };
+            if !is_bit_image_processor(&config) {
+                continue;
+            }
+
+            let processor = processor_from_config(config, fallback_size);
+            if matches!(kind, Dinov2PreprocessorPathKind::Dedicated) {
                 return Ok(processor);
             }
+            if legacy_processor.is_none() {
+                legacy_processor = Some(processor);
+            }
+        }
+
+        if let Some(processor) = legacy_processor {
+            if should_force_canonical_processor(root, &processor) {
+                return Ok(canonical_dinov2_processor());
+            }
+            return Ok(processor);
+        }
+
+        if has_dinov2_weights_root(root) && !allow_legacy_dinov2_preprocessor() {
+            return Ok(canonical_dinov2_processor());
         }
 
         let mut processor = DinoImageProcessor::default();
@@ -391,7 +441,20 @@ pub mod import {
         bytes: &[u8],
         fallback_size: Option<usize>,
     ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
-        let config: Dinov2ProcessorConfig = serde_json::from_slice(bytes)?;
+        let config = load_dinov2_processor_config_from_json_bytes(bytes)?;
+        Ok(processor_from_config(config, fallback_size))
+    }
+
+    fn load_dinov2_processor_config_from_json_bytes(
+        bytes: &[u8],
+    ) -> Result<Dinov2ProcessorConfig, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    fn processor_from_config(
+        config: Dinov2ProcessorConfig,
+        fallback_size: Option<usize>,
+    ) -> DinoImageProcessor {
         let resize_mode = match config.resample.unwrap_or(3) {
             3 => InterpolateMode::Bicubic,
             2 => InterpolateMode::Bilinear,
@@ -409,6 +472,7 @@ pub mod import {
             do_center_crop: config.do_center_crop.unwrap_or(false),
             crop_size: config.crop_size.map(|size| [size.height, size.width]),
             resize_mode,
+            strict_preprocess: None,
         };
 
         if processor.size_shortest_edge.is_none()
@@ -421,11 +485,12 @@ pub mod import {
             processor.crop_size = Some([target_size, target_size]);
         }
 
-        Ok(processor)
+        processor
     }
 
     #[derive(serde::Deserialize)]
     struct Dinov2ProcessorConfig {
+        image_processor_type: Option<String>,
         image_mean: Option<[f32; 3]>,
         image_std: Option<[f32; 3]>,
         rescale_factor: Option<f32>,
@@ -449,17 +514,20 @@ pub mod import {
         width: usize,
     }
 
-    fn load_dinov2_image_size(weights_root: &Path) -> Option<usize> {
-        let config_path = weights_root.join("image_encoder_dinov2/config.json");
-        let bytes = fs::read(config_path).ok()?;
-        load_dinov2_image_size_from_json_bytes(&bytes)
+    #[derive(Clone, Copy)]
+    enum Dinov2PreprocessorPathKind {
+        Dedicated,
+        LegacyBit,
+        LegacyClip,
     }
 
-    fn load_dinov2_preprocess_size(weights_path: &Path) -> Option<usize> {
-        let weights_root = weights_path.parent()?.parent()?;
-        for path in dinov2_preprocessor_config_paths(weights_root) {
+    fn load_dinov2_image_size(weights_root: &Path) -> Option<usize> {
+        for path in [
+            weights_root.join("image_encoder_dinov2/config.json"),
+            weights_root.join("image_encoder_2/config.json"),
+        ] {
             if let Ok(bytes) = fs::read(path)
-                && let Some(size) = load_dinov2_preprocess_size_from_json_bytes(&bytes)
+                && let Some(size) = load_dinov2_image_size_from_json_bytes(&bytes)
             {
                 return Some(size);
             }
@@ -467,16 +535,64 @@ pub mod import {
         None
     }
 
-    fn dinov2_preprocessor_config_paths(weights_root: &Path) -> [PathBuf; 3] {
+    fn load_dinov2_preprocess_size(weights_path: &Path) -> Option<usize> {
+        let weights_root = weights_path.parent()?.parent()?;
+        let mut legacy_size = None;
+        for (kind, path) in dinov2_preprocessor_config_paths(weights_root) {
+            let Ok(bytes) = fs::read(path) else {
+                continue;
+            };
+            let Some(size) = load_dinov2_preprocess_size_from_json_bytes(&bytes) else {
+                continue;
+            };
+            match kind {
+                Dinov2PreprocessorPathKind::Dedicated => return Some(size),
+                Dinov2PreprocessorPathKind::LegacyBit | Dinov2PreprocessorPathKind::LegacyClip => {
+                    if legacy_size.is_none() {
+                        legacy_size = Some(size);
+                    }
+                }
+            }
+        }
+        if let Some(size) = legacy_size {
+            if has_dinov2_weights_root(weights_root)
+                && !allow_legacy_dinov2_preprocessor()
+                && size > LEGACY_DINO_SIZE_CAP
+            {
+                return Some(CANONICAL_DINO_CROP);
+            }
+            return Some(size);
+        }
+        if has_dinov2_weights_root(weights_root) && !allow_legacy_dinov2_preprocessor() {
+            return Some(CANONICAL_DINO_CROP);
+        }
+        None
+    }
+
+    fn dinov2_preprocessor_config_paths(
+        weights_root: &Path,
+    ) -> [(Dinov2PreprocessorPathKind, PathBuf); 3] {
         [
-            weights_root.join("feature_extractor_dinov2/preprocessor_config.json"),
-            weights_root.join("feature_extractor_2/preprocessor_config.json"),
-            weights_root.join("feature_extractor_1/preprocessor_config.json"),
+            (
+                Dinov2PreprocessorPathKind::Dedicated,
+                weights_root.join("feature_extractor_dinov2/preprocessor_config.json"),
+            ),
+            (
+                Dinov2PreprocessorPathKind::LegacyBit,
+                weights_root.join("feature_extractor_2/preprocessor_config.json"),
+            ),
+            (
+                Dinov2PreprocessorPathKind::LegacyClip,
+                weights_root.join("feature_extractor_1/preprocessor_config.json"),
+            ),
         ]
     }
 
     pub fn load_dinov2_preprocess_size_from_json_bytes(bytes: &[u8]) -> Option<usize> {
         let config: Dinov2ProcessorConfig = serde_json::from_slice(bytes).ok()?;
+        if !is_bit_image_processor(&config) {
+            return None;
+        }
         if config.do_center_crop.unwrap_or(false)
             && let Some(crop) = config.crop_size
         {
@@ -490,6 +606,58 @@ pub mod import {
         None
     }
 
+    fn is_bit_image_processor(config: &Dinov2ProcessorConfig) -> bool {
+        config
+            .image_processor_type
+            .as_deref()
+            .map(|name| name.eq_ignore_ascii_case("BitImageProcessor"))
+            .unwrap_or(true)
+    }
+
+    fn allow_legacy_dinov2_preprocessor() -> bool {
+        std::env::var("TRIPOSG_ALLOW_LEGACY_DINO_PREPROCESS")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn has_dinov2_weights_root(weights_root: &Path) -> bool {
+        let dino_dir = weights_root.join("image_encoder_dinov2");
+        dino_dir.join("model.safetensors").exists()
+            || dino_dir.join("model.bpk").exists()
+            || dino_dir.join("model_f16.bpk").exists()
+    }
+
+    fn should_force_canonical_processor(
+        weights_root: &Path,
+        processor: &DinoImageProcessor,
+    ) -> bool {
+        if !has_dinov2_weights_root(weights_root) || allow_legacy_dinov2_preprocessor() {
+            return false;
+        }
+        let size = processor
+            .crop_size
+            .map(|crop| crop[0].min(crop[1]))
+            .or(processor.size_shortest_edge)
+            .unwrap_or(0);
+        size > LEGACY_DINO_SIZE_CAP
+    }
+
+    fn canonical_dinov2_processor() -> DinoImageProcessor {
+        DinoImageProcessor {
+            do_resize: true,
+            size_shortest_edge: Some(CANONICAL_DINO_SHORT_EDGE),
+            do_center_crop: true,
+            crop_size: Some([CANONICAL_DINO_CROP, CANONICAL_DINO_CROP]),
+            ..DinoImageProcessor::default()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::fs;
@@ -497,7 +665,10 @@ pub mod import {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        use super::load_dinov2_processor;
+        use super::{
+            load_dinov2_preprocess_size, load_dinov2_preprocess_size_from_json_bytes,
+            load_dinov2_processor,
+        };
 
         static TEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -545,6 +716,50 @@ pub mod import {
             assert_eq!(processor.crop_size, Some([512, 512]));
 
             let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn canonicalizes_oversized_legacy_bit_preprocessor_for_dinov2_assets() {
+            let root = make_temp_root("canonicalize");
+            let legacy = root.join("feature_extractor_2");
+            let dino_dir = root.join("image_encoder_dinov2");
+            fs::create_dir_all(&legacy).expect("create legacy preprocessor dir");
+            fs::create_dir_all(&dino_dir).expect("create dino dir");
+            fs::write(dino_dir.join("model.bpk"), b"stub").expect("write dino marker");
+            fs::write(
+                legacy.join("preprocessor_config.json"),
+                r#"{
+                    "image_processor_type": "BitImageProcessor",
+                    "crop_size": { "height": 512, "width": 512 },
+                    "do_center_crop": true,
+                    "do_resize": true,
+                    "size": { "shortest_edge": 512 }
+                }"#,
+            )
+            .expect("write legacy preprocessor config");
+
+            let processor = load_dinov2_processor(&root).expect("load processor");
+            assert_eq!(processor.size_shortest_edge, Some(256));
+            assert_eq!(processor.crop_size, Some([224, 224]));
+
+            let weights_path = dino_dir.join("model.safetensors");
+            fs::write(&weights_path, b"stub").expect("write weights marker");
+            let preprocess_size = load_dinov2_preprocess_size(&weights_path);
+            assert_eq!(preprocess_size, Some(224));
+
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn ignores_clip_preprocessor_for_dinov2_size_selection() {
+            let clip_json = br#"{
+                "image_processor_type": "CLIPImageProcessor",
+                "crop_size": { "height": 224, "width": 224 },
+                "do_center_crop": true,
+                "do_resize": true,
+                "size": { "shortest_edge": 224 }
+            }"#;
+            assert_eq!(load_dinov2_preprocess_size_from_json_bytes(clip_json), None);
         }
 
         #[test]
@@ -867,72 +1082,8 @@ pub mod import {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/MIDI-3D")
     }
 
-    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
-        let default = burnpack_path(path, false);
-        let f16 = burnpack_path(path, true);
-        if f16 == default {
-            vec![default]
-        } else if prefer_f16_burnpack() {
-            vec![f16, default]
-        } else {
-            vec![default, f16]
-        }
-    }
-
-    fn prefer_f16_burnpack() -> bool {
-        preferred_precision_from_env("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
-    }
-
-    fn preferred_precision_from_env(primary: &str, fallback: &str) -> bool {
-        let value = std::env::var(primary)
-            .ok()
-            .or_else(|| std::env::var(fallback).ok());
-        match value
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("f32" | "fp32" | "float32" | "32") => false,
-            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-            Some(_) | None => true,
-        }
-    }
-
-    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
-        let path = if path
-            .extension()
-            .map(|ext| ext.eq_ignore_ascii_case("bpk"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            path.with_extension("bpk")
-        };
-
-        if use_f16 {
-            with_file_stem_suffix(&path, F16_SUFFIX)
-        } else {
-            path
-        }
-    }
-
-    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
-        let Some(stem) = path.file_stem() else {
-            return path.to_path_buf();
-        };
-        let stem = stem.to_string_lossy();
-        if stem.ends_with(suffix) {
-            return path.to_path_buf();
-        }
-
-        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        let mut file_name = format!("{stem}{suffix}");
-        if !ext.is_empty() {
-            file_name.push('.');
-            file_name.push_str(ext);
-        }
-        path.with_file_name(file_name)
+    fn default_burnpack_policy() -> BurnpackLoadPolicy {
+        BurnpackLoadPolicy::from_env_compat("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
     }
 
     pub fn import_triposg_dinov2_burnpack<B: Backend>(
@@ -950,7 +1101,11 @@ pub mod import {
                 config.positional_encoding_interpolate.output_size = Some([grid, grid]);
             }
         }
-        let burnpack_path = burnpack_path(weights_path, use_f16);
+        let burnpack_path = burnpack_path(
+            weights_path,
+            use_f16,
+            BurnpackLoadPolicy::default().f16_suffix,
+        );
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
 

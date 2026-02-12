@@ -577,17 +577,25 @@ pub mod import {
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
 
+    use super::super::load_policy::{BurnpackLoadPolicy, burnpack_path, candidate_burnpack_paths};
     use super::{TripoSGVae, TripoSGVaeConfig};
-
-    const F16_SUFFIX: &str = "_f16";
 
     pub fn load_triposg_vae<B: Backend>(
         config: &TripoSGVaeConfig,
         device: &B::Device,
         path: impl AsRef<Path>,
     ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
+        load_triposg_vae_with_policy(config, device, path, default_burnpack_policy())
+    }
+
+    pub fn load_triposg_vae_with_policy<B: Backend>(
+        config: &TripoSGVaeConfig,
+        device: &B::Device,
+        path: impl AsRef<Path>,
+        policy: BurnpackLoadPolicy,
+    ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        let burnpack_candidates = candidate_burnpack_paths(path);
+        let burnpack_candidates = candidate_burnpack_paths(path, policy);
         let burnpack_path = burnpack_candidates
             .iter()
             .find(|candidate| candidate.exists())
@@ -626,72 +634,8 @@ pub mod import {
         Ok(model)
     }
 
-    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
-        let default = burnpack_path(path, false);
-        let f16 = burnpack_path(path, true);
-        if f16 == default {
-            vec![default]
-        } else if prefer_f16_burnpack() {
-            vec![f16, default]
-        } else {
-            vec![default, f16]
-        }
-    }
-
-    fn prefer_f16_burnpack() -> bool {
-        preferred_precision_from_env("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
-    }
-
-    fn preferred_precision_from_env(primary: &str, fallback: &str) -> bool {
-        let value = std::env::var(primary)
-            .ok()
-            .or_else(|| std::env::var(fallback).ok());
-        match value
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("f32" | "fp32" | "float32" | "32") => false,
-            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-            Some(_) | None => true,
-        }
-    }
-
-    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
-        let path = if path
-            .extension()
-            .map(|ext| ext.eq_ignore_ascii_case("bpk"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            path.with_extension("bpk")
-        };
-
-        if use_f16 {
-            with_file_stem_suffix(&path, F16_SUFFIX)
-        } else {
-            path
-        }
-    }
-
-    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
-        let Some(stem) = path.file_stem() else {
-            return path.to_path_buf();
-        };
-        let stem = stem.to_string_lossy();
-        if stem.ends_with(suffix) {
-            return path.to_path_buf();
-        }
-
-        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        let mut file_name = format!("{stem}{suffix}");
-        if !ext.is_empty() {
-            file_name.push('.');
-            file_name.push_str(ext);
-        }
-        path.with_file_name(file_name)
+    fn default_burnpack_policy() -> BurnpackLoadPolicy {
+        BurnpackLoadPolicy::from_env_compat("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
     }
 
     pub fn load_triposg_vae_from_safetensors<B: Backend>(
@@ -714,7 +658,7 @@ pub mod import {
         use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        let burnpack_path = burnpack_path(path, use_f16);
+        let burnpack_path = burnpack_path(path, use_f16, BurnpackLoadPolicy::default().f16_suffix);
         let model = load_triposg_vae_from_safetensors::<B>(config, device, path)?;
         let model = if use_f16 {
             cast_module_float_dtype(model, FloatDType::F16)

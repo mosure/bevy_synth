@@ -151,7 +151,10 @@ fn bench_sparse_subm_conv(c: &mut Criterion) {
         unsafe {
             std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO", "hash");
         }
-        group.bench_function("wgpu_neighbor_device_hash_uncached", |b| {
+        unsafe {
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
+        }
+        group.bench_function("wgpu_neighbor_device_hash_auto_uncached", |b| {
             b.iter(|| {
                 clear_neighbor_rows_tensor_cache();
                 let tensor = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
@@ -159,6 +162,40 @@ fn bench_sparse_subm_conv(c: &mut Criterion) {
                 let _ = tensor.to_data();
             })
         });
+        unsafe {
+            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD", "host");
+        }
+        group.bench_function("wgpu_neighbor_device_hash_host_table_uncached", |b| {
+            b.iter(|| {
+                clear_neighbor_rows_tensor_cache();
+                let tensor = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
+                    .expect("device hash (host table) neighbor tensor");
+                let _ = tensor.to_data();
+            })
+        });
+        unsafe {
+            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD", "wgsl");
+        }
+        clear_neighbor_rows_tensor_cache();
+        match neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device) {
+            Ok(_) => {
+                group.bench_function("wgpu_neighbor_device_hash_wgsl_table_uncached", |b| {
+                    b.iter(|| {
+                        clear_neighbor_rows_tensor_cache();
+                        let tensor =
+                            neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
+                                .expect("device hash (wgsl table) neighbor tensor");
+                        let _ = tensor.to_data();
+                    })
+                });
+            }
+            Err(err) => {
+                eprintln!("Skipping bench wgpu_neighbor_device_hash_wgsl_table_uncached: {err}");
+            }
+        }
+        unsafe {
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
+        }
         clear_neighbor_rows_tensor_cache();
         let _ = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
             .expect("cached warmup");
@@ -224,6 +261,7 @@ fn bench_sparse_subm_conv(c: &mut Criterion) {
             std::env::remove_var("BURN_FLEX_GMM_WGPU_KERNEL");
             std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND");
             std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO");
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
         }
         clear_neighbor_rows_tensor_cache();
     }

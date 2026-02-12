@@ -2,6 +2,8 @@ use burn::{prelude::*, tensor::Distribution};
 use std::time::Instant;
 
 #[cfg(feature = "import")]
+use crate::model::triposg::load_policy::BurnpackLoadPolicy;
+#[cfg(feature = "import")]
 use crate::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
 use crate::model::triposg::{
     dit::TripoSGDiT,
@@ -44,6 +46,34 @@ pub struct TripoSGSamplerProgress {
     pub total_steps: usize,
     pub timestep: f32,
     pub step_ms: f64,
+}
+
+#[cfg(feature = "import")]
+#[derive(Debug, Clone, Copy)]
+/// Loader options for `TripoSGPipeline::from_pretrained_with_options`.
+pub struct TripoSGLoadOptions {
+    /// Load source `.safetensors` directly instead of `.bpk` burnpacks.
+    pub use_safetensors: bool,
+    /// Burnpack file selection policy (`_f16.bpk` vs `.bpk` preference).
+    pub burnpack_policy: BurnpackLoadPolicy,
+    /// Explicit strict-DINO preprocessing mode.
+    ///
+    /// `None` preserves legacy env fallback (`DINO_STRICT_PREPROCESS`).
+    pub strict_dino_preprocess: Option<bool>,
+}
+
+#[cfg(feature = "import")]
+impl Default for TripoSGLoadOptions {
+    fn default() -> Self {
+        Self {
+            use_safetensors: std::env::var("TRIPOSG_LOAD_SAFETENSORS").is_ok(),
+            burnpack_policy: BurnpackLoadPolicy::from_env_compat(
+                "TRIPOSG_BPK_PRECISION",
+                "BURN_SYNTH_BPK_PRECISION",
+            ),
+            strict_dino_preprocess: None,
+        }
+    }
 }
 
 impl<B: Backend> TripoSGPipeline<B> {
@@ -554,7 +584,13 @@ fn decode_grid_values_chunked_host<B: Backend>(
             continue;
         }
         let end = chunk_start + count;
-        write_decoded_chunk_contiguous(latents, vae, &coords, device, &mut values[chunk_start..end])?;
+        write_decoded_chunk_contiguous(
+            latents,
+            vae,
+            &coords,
+            device,
+            &mut values[chunk_start..end],
+        )?;
         coords.clear();
         chunk_start = end;
     }
@@ -562,7 +598,13 @@ fn decode_grid_values_chunked_host<B: Backend>(
     if !coords.is_empty() {
         let count = coords.len() / 3;
         let end = chunk_start + count;
-        write_decoded_chunk_contiguous(latents, vae, &coords, device, &mut values[chunk_start..end])?;
+        write_decoded_chunk_contiguous(
+            latents,
+            vae,
+            &coords,
+            device,
+            &mut values[chunk_start..end],
+        )?;
     }
 
     Ok(values)
@@ -621,14 +663,23 @@ impl<B: Backend> TripoSGPipeline<B> {
         weights_root: impl AsRef<std::path::Path>,
         device: &B::Device,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_pretrained_with_options(weights_root, device, TripoSGLoadOptions::default())
+    }
+
+    pub fn from_pretrained_with_options(
+        weights_root: impl AsRef<std::path::Path>,
+        device: &B::Device,
+        options: TripoSGLoadOptions,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         use crate::model::triposg::dit::import::{
-            load_triposg_dit, load_triposg_dit_from_safetensors,
+            load_triposg_dit_from_safetensors, load_triposg_dit_with_policy,
         };
         use crate::model::triposg::image_encoder::import::{
-            load_dinov2_processor, load_triposg_dinov2, load_triposg_dinov2_from_safetensors,
+            load_dinov2_processor, load_triposg_dinov2_from_safetensors,
+            load_triposg_dinov2_with_policy,
         };
         use crate::model::triposg::vae::import::{
-            load_triposg_vae, load_triposg_vae_from_safetensors,
+            load_triposg_vae_from_safetensors, load_triposg_vae_with_policy,
         };
 
         let root = weights_root.as_ref();
@@ -636,7 +687,7 @@ impl<B: Backend> TripoSGPipeline<B> {
         let dit_path = root.join("transformer/diffusion_pytorch_model.safetensors");
         let scheduler_path = root.join("scheduler/scheduler_config.json");
         let dino_path = root.join("image_encoder_dinov2/model.safetensors");
-        let use_safetensors = std::env::var("TRIPOSG_LOAD_SAFETENSORS").is_ok();
+        let use_safetensors = options.use_safetensors;
 
         let vae_config_path = root.join("vae/config.json");
         let vae_config =
@@ -645,7 +696,7 @@ impl<B: Backend> TripoSGPipeline<B> {
         let vae = if use_safetensors {
             load_triposg_vae_from_safetensors(&vae_config, device, &vae_path)?
         } else {
-            load_triposg_vae(&vae_config, device, &vae_path)?
+            load_triposg_vae_with_policy(&vae_config, device, &vae_path, options.burnpack_policy)?
         };
 
         let dit_config_path = root.join("transformer/config.json");
@@ -677,7 +728,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             let loaded = if use_safetensors {
                 load_triposg_dit_from_safetensors(&config, device, &dit_path)
             } else {
-                load_triposg_dit(&config, device, &dit_path)
+                load_triposg_dit_with_policy(&config, device, &dit_path, options.burnpack_policy)
             };
             match loaded {
                 Ok(model) => {
@@ -707,9 +758,12 @@ impl<B: Backend> TripoSGPipeline<B> {
         let image_encoder = if use_safetensors {
             load_triposg_dinov2_from_safetensors(device, &dino_path)?
         } else {
-            load_triposg_dinov2(device, &dino_path)?
+            load_triposg_dinov2_with_policy(device, &dino_path, options.burnpack_policy)?
         };
-        let image_processor = load_dinov2_processor(root)?;
+        let mut image_processor = load_dinov2_processor(root)?;
+        if let Some(strict) = options.strict_dino_preprocess {
+            image_processor.set_strict_preprocess(strict);
+        }
 
         Ok(Self::new(
             vae,

@@ -1531,6 +1531,7 @@ dependencies = [
  "safetensors 0.6.2",
  "serde",
  "serde_json",
+ "sysinfo 0.36.1",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -2323,6 +2324,7 @@ dependencies = [
 name = "burn_synth_import"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "hex",
  "serde",
  "serde_json",

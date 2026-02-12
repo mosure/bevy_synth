@@ -77,7 +77,7 @@ impl MeshCacheResource {
         match MeshCache::load_default() {
             Ok(cache) => Self { cache },
             Err(err) => {
-                warn!("Mesh cache unavailable; continuing without persisted cache: {err}");
+                warn!("mesh cache unavailable; continuing without persisted cache: {err}");
                 Self {
                     cache: MeshCache::empty_default(),
                 }
@@ -332,7 +332,7 @@ fn setup(
     if let Some(cached_camera) = cache.cache.camera_state()
         && !apply_cached_camera_state(cached_camera, &mut camera_transform, &mut camera_orbit)
     {
-        warn!("Ignoring cached camera state due to invalid values.");
+        warn!("ignoring cached camera state due to invalid values.");
     }
 
     commands.spawn((
@@ -412,7 +412,7 @@ fn setup(
                 mesh_path.clone(),
             );
         } else {
-            warn!("Mesh path {:?} does not exist; skipping", mesh_path);
+            warn!("mesh path {:?} does not exist; skipping", mesh_path);
         }
     }
 
@@ -449,14 +449,14 @@ fn hydrate_from_cache(
             Ok(Some(mesh)) => mesh,
             Ok(None) => {
                 warn!(
-                    "Cache metadata exists for key {} but mesh payload is missing.",
+                    "cache metadata exists for key {} but mesh payload is missing.",
                     metadata.cache_key
                 );
                 continue;
             }
             Err(err) => {
                 warn!(
-                    "Failed to load cached mesh for key {}: {err}",
+                    "failed to load cached mesh for key {}: {err}",
                     metadata.cache_key
                 );
                 continue;
@@ -486,14 +486,14 @@ fn hydrate_from_cache(
     for item in world_items {
         let Some((mesh, material)) = handles_by_key.get(&item.cache_key) else {
             warn!(
-                "Skipping cached world item for unknown cache key {}",
+                "skipping cached world item for unknown cache key {}",
                 item.cache_key
             );
             continue;
         };
         let Some(transform) = transform_from_cached_world_item(&item) else {
             warn!(
-                "Skipping cached world item with invalid transform for key {}",
+                "skipping cached world item with invalid transform for key {}",
                 item.cache_key
             );
             continue;
@@ -513,7 +513,7 @@ fn hydrate_from_cache(
     }
     if loaded_meshes > 0 || loaded_world_items > 0 {
         info!(
-            "Loaded {loaded_meshes} cached catalog mesh(es) and {loaded_world_items} cached world item(s)."
+            "loaded {loaded_meshes} cached catalog mesh(es) and {loaded_world_items} cached world item(s)."
         );
     }
 }
@@ -667,9 +667,9 @@ fn handle_open_file_dialog(
     if (ctrl || os) && keys.just_pressed(KeyCode::KeyO) {
         commands
             .dialog()
-            .set_title("Open Image")
+            .set_title("open image")
             .add_filter(
-                "Images",
+                "images",
                 &[
                     "png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "tif", "tiff",
                 ],
@@ -705,7 +705,7 @@ fn handle_file_dialog_loads(
             &mut commands,
             &asset_server,
             &mut materials,
-            "Selected file",
+            "selected file",
         );
     }
 
@@ -741,7 +741,7 @@ fn handle_dropped_files(
             &mut commands,
             &asset_server,
             &mut materials,
-            "Dropped file",
+            "dropped file",
         );
     }
     if queued > 0 {
@@ -766,12 +766,12 @@ fn ingest_candidate_file(
         if is_image_file(path) {
             let request = enqueue_inference(path.to_path_buf(), args, queue);
             catalog.add_pending(&request);
-            info!("Queued inference for {}", path.display());
+            info!("queued inference for {}", path.display());
             return 1;
         }
         if is_mesh_file(path) {
             spawn_mesh_asset(commands, asset_server, materials, path.to_path_buf());
-            info!("Loaded mesh asset {}", path.display());
+            info!("loaded mesh asset {}", path.display());
             return 0;
         }
         warn!(
@@ -790,7 +790,7 @@ fn ingest_candidate_file(
             queue,
         );
         catalog.add_pending(&request);
-        info!("Queued uploaded inference for {file_name}");
+        info!("queued uploaded inference for {file_name}");
         return 1;
     }
     if is_mesh_file(inferred_path) {
@@ -1659,7 +1659,7 @@ fn persist_world_cache(
             persistence.dirty = false;
         }
         Err(err) => {
-            warn!("Failed to persist world cache state: {err}");
+            warn!("failed to persist world cache state: {err}");
             persistence.timer.reset();
         }
     }

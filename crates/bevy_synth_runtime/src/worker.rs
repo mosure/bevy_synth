@@ -110,6 +110,7 @@ struct Rmbg14Artifacts {
     processor_json: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct TriposgArtifacts {
     vae_burnpack: Vec<u8>,
     dit_burnpack: Vec<u8>,
@@ -479,6 +480,7 @@ fn load_triposg_artifacts_from_root(root: &std::path::Path) -> Result<TriposgArt
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_triposg_pipeline_from_artifacts<B: Backend>(
     device: &B::Device,
     dino_backend: DinoBackend,
@@ -980,8 +982,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
             (Some(RmbgPipeline::new(model, rmbg_processor.clone())), None)
         }
         RmbgBackend::Gpu | RmbgBackend::Auto => {
-            let model = match load_rmbg_from_burnpack_bytes(&device, rmbg_burnpack, &rmbg_config)
-            {
+            let model = match load_rmbg_from_burnpack_bytes(&device, rmbg_burnpack, &rmbg_config) {
                 Ok(model) => model,
                 Err(err) => {
                     host_ram_budget.release_retained(rmbg_burnpack_bytes);
@@ -1223,8 +1224,10 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
     )
     .await?;
     let dino_gpu_burnpack_bytes = dino_gpu_burnpack.len() as u64;
-    host_ram_budget
-        .reserve_retained(dino_gpu_burnpack_bytes, "retaining DINOv2 GPU burnpack bytes")?;
+    host_ram_budget.reserve_retained(
+        dino_gpu_burnpack_bytes,
+        "retaining DINOv2 GPU burnpack bytes",
+    )?;
     let image_encoder =
         match load_triposg_dinov2_from_burnpack_bytes(device, dino_config, dino_gpu_burnpack) {
             Ok(encoder) => encoder,
@@ -1254,17 +1257,21 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
         )
         .await?;
         let dino_cpu_burnpack_bytes = dino_cpu_burnpack.len() as u64;
-        host_ram_budget
-            .reserve_retained(dino_cpu_burnpack_bytes, "retaining DINOv2 CPU burnpack bytes")?;
-        let encoder =
-            match load_triposg_dinov2_from_burnpack_bytes(&cpu_device, cpu_config, dino_cpu_burnpack)
-            {
-                Ok(encoder) => encoder,
-                Err(err) => {
-                    host_ram_budget.release_retained(dino_cpu_burnpack_bytes);
-                    return Err(format!("failed to load DINOv2 burnpack on CPU: {err}"));
-                }
-            };
+        host_ram_budget.reserve_retained(
+            dino_cpu_burnpack_bytes,
+            "retaining DINOv2 CPU burnpack bytes",
+        )?;
+        let encoder = match load_triposg_dinov2_from_burnpack_bytes(
+            &cpu_device,
+            cpu_config,
+            dino_cpu_burnpack,
+        ) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                host_ram_budget.release_retained(dino_cpu_burnpack_bytes);
+                return Err(format!("failed to load DINOv2 burnpack on CPU: {err}"));
+            }
+        };
         host_ram_budget.release_retained(dino_cpu_burnpack_bytes);
         Some(DinoCpuState {
             device: cpu_device,
@@ -2393,6 +2400,18 @@ fn parse_bounds(bounds: &[f32]) -> Result<[f32; 6], Box<dyn std::error::Error>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use clap::Parser;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use std::sync::Arc;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use std::thread;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use std::time::Duration;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 
     fn sample_mesh_grid(n: usize) -> TripoMesh {
         let mut vertices = Vec::new();
@@ -2467,30 +2486,148 @@ mod tests {
     }
 
     #[test]
-    fn wasm_triposg_rmbg_streaming_sequence_stays_under_cap() {
-        // Simulated burnpack sizes (MiB) for [RMBG, VAE, DiT, DINO-GPU, DINO-CPU].
-        // Summed retention would exceed 4 GiB if loaded all-at-once.
-        let sizes_mib = [520_u64, 680, 1710, 920, 920];
-        let total_mib: u64 = sizes_mib.iter().sum();
-        assert!(total_mib > 4096, "test setup must exceed 4 GiB aggregate");
-
+    fn wasm_host_ram_budget_tracks_peak_observation() {
         let mut budget = WasmHostMemoryBudget::new(4 * ONE_GIB);
-        for (idx, size_mib) in sizes_mib.iter().enumerate() {
-            let bytes = size_mib * 1024 * 1024;
-            budget
-                .observe_temporary(bytes, &format!("download stage {idx}"))
-                .expect("temporary download buffer should fit");
-            budget
-                .reserve_retained(bytes, &format!("retain stage {idx}"))
-                .expect("retention should fit");
-            budget.release_retained(bytes);
-        }
-
+        budget
+            .reserve_retained(512 * 1024 * 1024, "retain model")
+            .expect("retain should fit");
+        budget
+            .observe_temporary(256 * 1024 * 1024, "download shard")
+            .expect("temporary should fit");
+        budget
+            .observe_temporary(128 * 1024 * 1024, "smaller temporary")
+            .expect("temporary should fit");
+        budget.release_retained(512 * 1024 * 1024);
+        assert!(
+            budget.peak_bytes() >= 768 * 1024 * 1024,
+            "peak should track retained + temporary observations"
+        );
         assert!(
             budget.peak_bytes() < budget.limit_bytes(),
-            "streaming peak {} should remain below limit {}",
+            "peak {} should remain below limit {}",
             budget.peak_bytes(),
             budget.limit_bytes()
+        );
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    fn refresh_process_rss_bytes(system: &mut System, pid: Pid) -> Option<u64> {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        system.process(pid).map(|process| process.memory())
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    struct ProcessMemoryMonitor {
+        done: Arc<AtomicBool>,
+        peak_bytes: Arc<AtomicU64>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    impl ProcessMemoryMonitor {
+        fn start(pid: Pid, baseline_bytes: u64) -> Self {
+            let done = Arc::new(AtomicBool::new(false));
+            let peak_bytes = Arc::new(AtomicU64::new(baseline_bytes));
+            let done_thread = Arc::clone(&done);
+            let peak_thread = Arc::clone(&peak_bytes);
+            let join = thread::Builder::new()
+                .name("worker_rss_monitor".to_string())
+                .spawn(move || {
+                    let mut system = System::new();
+                    while !done_thread.load(Ordering::Relaxed) {
+                        if let Some(bytes) = refresh_process_rss_bytes(&mut system, pid) {
+                            peak_thread.fetch_max(bytes, Ordering::Relaxed);
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    if let Some(bytes) = refresh_process_rss_bytes(&mut system, pid) {
+                        peak_thread.fetch_max(bytes, Ordering::Relaxed);
+                    }
+                })
+                .expect("failed to spawn RSS monitor");
+            Self {
+                done,
+                peak_bytes,
+                join: Some(join),
+            }
+        }
+
+        fn stop(mut self) -> u64 {
+            self.done.store(true, Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+            self.peak_bytes.load(Ordering::Relaxed)
+        }
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_wgpu_triposg_rmbg_load_peak_ram_under_budget_when_configured() {
+        let Some(weights_root) = std::env::var_os("TRIPOSG_WEIGHTS_ROOT") else {
+            eprintln!("skipping: TRIPOSG_WEIGHTS_ROOT not set");
+            return;
+        };
+        let Some(rmbg_root) = std::env::var_os("RMBG_WEIGHTS_ROOT")
+            .or_else(|| std::env::var_os("RMBG14_WEIGHTS_ROOT"))
+        else {
+            eprintln!("skipping: RMBG_WEIGHTS_ROOT or RMBG14_WEIGHTS_ROOT not set");
+            return;
+        };
+        let max_ram_bytes = std::env::var("BURN_SYNTH_NATIVE_LOAD_MAX_RAM_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_WEB_MAX_HOST_RAM_BYTES);
+
+        let cli = vec![
+            "bevy_synth".to_string(),
+            "--backend".to_string(),
+            "wgpu".to_string(),
+            "--synthesis-models".to_string(),
+            "triposg".to_string(),
+            "--rmbg-model".to_string(),
+            "rmbg14".to_string(),
+            "--rmbg-backend".to_string(),
+            "gpu".to_string(),
+            "--dino-backend".to_string(),
+            "gpu".to_string(),
+            "--weights-root".to_string(),
+            weights_root.to_string_lossy().into_owned(),
+            "--bg-weights-root".to_string(),
+            rmbg_root.to_string_lossy().into_owned(),
+        ];
+        let args = crate::args::build_app_args(crate::args::Args::parse_from(cli));
+        let handle = thread::Builder::new()
+            .name("native-load-ram-check".to_string())
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || -> Result<u64, String> {
+                let pid = get_current_pid().map_err(|err| format!("failed to get PID: {err}"))?;
+                let mut system = System::new();
+                let baseline_bytes = refresh_process_rss_bytes(&mut system, pid).unwrap_or(0);
+                let monitor = ProcessMemoryMonitor::start(pid, baseline_bytes);
+                let _state = build_pipeline_state::<burn_wgpu::Wgpu>(&args)?;
+                thread::sleep(Duration::from_millis(20));
+                let peak_bytes = monitor.stop();
+                Ok(peak_bytes.saturating_sub(baseline_bytes))
+            })
+            .expect("failed to spawn native load RAM check thread");
+        let peak_delta = handle
+            .join()
+            .expect("native load RAM check thread panicked");
+        let peak_delta = peak_delta.expect(
+            "failed to load configured model roots for RAM check; fix model roots/import before asserting RAM budget",
+        );
+
+        assert!(
+            peak_delta <= max_ram_bytes,
+            "native load peak host RAM delta exceeded budget: {} MiB > {} MiB",
+            peak_delta as f64 / (1024.0 * 1024.0),
+            max_ram_bytes as f64 / (1024.0 * 1024.0)
         );
     }
 }

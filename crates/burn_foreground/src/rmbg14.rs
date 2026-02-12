@@ -6,6 +6,7 @@ use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 
 use crate::resize::resize_chw_align_corners_false;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Config, Debug)]
 pub struct RmbgConfig {
@@ -491,9 +492,35 @@ impl<B: Backend> BriaRmbg<B> {
     }
 }
 
+const STRICT_INTERP_DEFAULT: u8 = 0;
+const STRICT_INTERP_FORCED_OFF: u8 = 1;
+const STRICT_INTERP_FORCED_ON: u8 = 2;
+
+static RMBG_STRICT_INTERP_OVERRIDE: AtomicU8 = AtomicU8::new(STRICT_INTERP_DEFAULT);
+
+/// Override strict interpolation mode for RMBG-1.4 upsampling.
+///
+/// `None` reverts to env compatibility (`RMBG_STRICT_INTERP`).
+pub fn set_rmbg_strict_interp_override(value: Option<bool>) {
+    let encoded = match value {
+        Some(false) => STRICT_INTERP_FORCED_OFF,
+        Some(true) => STRICT_INTERP_FORCED_ON,
+        None => STRICT_INTERP_DEFAULT,
+    };
+    RMBG_STRICT_INTERP_OVERRIDE.store(encoded, Ordering::Relaxed);
+}
+
+fn strict_interp_enabled() -> bool {
+    match RMBG_STRICT_INTERP_OVERRIDE.load(Ordering::Relaxed) {
+        STRICT_INTERP_FORCED_OFF => false,
+        STRICT_INTERP_FORCED_ON => true,
+        _ => std::env::var("RMBG_STRICT_INTERP").is_ok(),
+    }
+}
+
 fn upsample_like<B: Backend>(src: Tensor<B, 4>, target: &Tensor<B, 4>) -> Tensor<B, 4> {
     let [_b, _c, height, width] = target.dims();
-    if std::env::var("RMBG_STRICT_INTERP").is_ok() {
+    if strict_interp_enabled() {
         return interpolate_align_corners_false(src, height, width);
     }
     let options = InterpolateOptions {

@@ -461,6 +461,46 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_replaces_manifest_and_removes_stale_shards() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let burnpack = root.join("model.bpk");
+
+        std::fs::write(&burnpack, patterned_bytes(3 * 1024 * 1024 + 19)).expect("write burnpack");
+        let first = write_shards_for_burnpack(&burnpack, 1, true).expect("first split");
+        let first_shards = first.shard_paths.clone();
+        assert!(
+            first_shards.len() >= 4,
+            "expected multiple shards before overwrite"
+        );
+
+        // Rewrite with much smaller source and force overwrite to ensure stale shards get removed.
+        std::fs::write(&burnpack, patterned_bytes(1024 * 1024 + 7)).expect("rewrite burnpack");
+        let second = write_shards_for_burnpack(&burnpack, 1, true).expect("second split");
+        let second_manifest = read_shard_manifest(&second.manifest_path).expect("read manifest");
+        assert_eq!(second_manifest.total_bytes, (1024 * 1024 + 7) as u64);
+        assert!(
+            second.shard_paths.len() <= 2,
+            "expected fewer shards after overwrite"
+        );
+
+        for stale in first_shards {
+            if !second.shard_paths.contains(&stale) {
+                assert!(
+                    !stale.exists(),
+                    "stale shard should be removed during overwrite: {}",
+                    stale.display()
+                );
+            }
+        }
+
+        let reconstructed = read_reconstructed_bytes(&second.manifest_path);
+        assert_eq!(reconstructed.len(), 1024 * 1024 + 7);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn shard_entries_support_legacy_files_and_parts_fields() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("create temp dir");

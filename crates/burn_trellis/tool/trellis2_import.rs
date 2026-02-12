@@ -69,7 +69,7 @@ struct Args {
     #[arg(long)]
     overwrite: bool,
 
-    #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::SingleFile)]
+    #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::Both)]
     artifact_policy: ArtifactPolicyArg,
 
     #[arg(long, default_value_t = 64)]

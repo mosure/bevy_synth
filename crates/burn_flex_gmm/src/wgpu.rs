@@ -1331,8 +1331,6 @@ fn build_neighbor_rows_tensor_device_hash(
     coords: &[[u32; 4]],
     device: &burn_wgpu::WgpuDevice,
 ) -> Result<BurnTensor<DefaultWgpuBackend, 2, Int>, String> {
-    let rows = coords.len();
-    let table_size = resolve_neighbor_hash_table_size(rows);
     match resolve_neighbor_hash_build_mode() {
         NeighborHashBuildMode::Host => {
             build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
@@ -1341,24 +1339,10 @@ fn build_neighbor_rows_tensor_device_hash(
             build_neighbor_rows_tensor_device_hash_wgsl_table(config, coords, device)
         }
         NeighborHashBuildMode::Auto => {
-            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_neighbor_rows_tensor_device_hash_wgsl_table(config, coords, device)
-            }));
-            match attempt {
-                Ok(Ok(tensor)) => Ok(tensor),
-                Ok(Err(err)) => {
-                    eprintln!(
-                        "burn_flex_gmm: device hash-table build failed for rows={rows}, table_size={table_size}; falling back to host table build: {err}"
-                    );
-                    build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
-                }
-                Err(_) => {
-                    eprintln!(
-                        "burn_flex_gmm: device hash-table build panicked for rows={rows}, table_size={table_size}; falling back to host table build"
-                    );
-                    build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
-                }
-            }
+            // Current WGSL hash-table insertion is serialized and can be an order of magnitude
+            // slower than host-table build+device query on real sparse decoder workloads.
+            // Keep `auto` on the faster host-table path until a parallel device build lands.
+            build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
         }
     }
 }
@@ -2110,6 +2094,71 @@ mod tests {
         unsafe {
             std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND");
             std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO");
+        }
+    }
+
+    #[test]
+    fn neighbor_rows_device_hash_build_modes_match_scan() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = SparseSubmConvConfig {
+            in_channels: 4,
+            out_channels: 4,
+            kernel_d: 3,
+            kernel_h: 3,
+            kernel_w: 1,
+            in_channels_per_group: 4,
+            out_channels_per_group: 4,
+            groups: 1,
+            axis_order: [0, 1, 2],
+            axis_sign: [1, 1, 1],
+        };
+        let coords = line_coords(192);
+        let device = burn_wgpu::WgpuDevice::default();
+
+        clear_neighbor_rows_tensor_cache();
+        reset_neighbor_rows_build_stats();
+        unsafe {
+            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "device");
+            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO", "scan");
+        }
+        let scan_rows = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
+            .expect("scan rows")
+            .to_data();
+        let scan_rows = scan_rows.as_slice::<i32>().expect("i32").to_vec();
+
+        for hash_build in ["host", "wgsl"] {
+            clear_neighbor_rows_tensor_cache();
+            reset_neighbor_rows_build_stats();
+            unsafe {
+                std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "device");
+                std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO", "hash");
+                std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD", hash_build);
+            }
+            let hash_rows = match neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
+            {
+                Ok(rows) => rows,
+                Err(err) if hash_build == "wgsl" => {
+                    eprintln!(
+                        "skipping strict wgsl hash-build parity check on this adapter: {err}"
+                    );
+                    continue;
+                }
+                Err(err) => panic!("hash rows ({hash_build}) failed: {err}"),
+            };
+            let hash_rows = hash_rows.to_data();
+            let hash_rows = hash_rows.as_slice::<i32>().expect("i32").to_vec();
+            assert_eq!(
+                scan_rows, hash_rows,
+                "hash-build mode '{hash_build}' diverged from scan baseline"
+            );
+        }
+
+        clear_neighbor_rows_tensor_cache();
+        reset_neighbor_rows_build_stats();
+        unsafe {
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND");
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO");
+            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
         }
     }
 

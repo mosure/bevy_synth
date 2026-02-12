@@ -512,6 +512,21 @@ mod tests {
         (0..count as u32).map(|x| [0, x, 0, 0]).collect()
     }
 
+    fn make_sparse_grid_coords(nx: u32, ny: u32, nz: u32) -> Vec<[u32; 4]> {
+        let mut coords = Vec::new();
+        for x in 0..nx {
+            for y in 0..ny {
+                for z in 0..nz {
+                    // Keep a sparse subset so neighborhood lookup exercises invalid rows too.
+                    if (x + y + z) % 2 == 0 {
+                        coords.push([0, x, y, z]);
+                    }
+                }
+            }
+        }
+        coords
+    }
+
     #[test]
     fn flex_matches_legacy_for_small_kernel() {
         let cfg = SparseSubmConvConfig {
@@ -626,6 +641,64 @@ mod tests {
                 diff <= 1.0e-5,
                 "mismatch at idx={idx}: expected={lhs} actual={rhs} diff={diff}"
             );
+        }
+    }
+
+    #[test]
+    fn flex_matches_legacy_for_axis_permutations_and_signs() {
+        let axis_orders = [[0, 1, 2], [2, 1, 0], [1, 2, 0]];
+        let axis_signs = [[1, 1, 1], [-1, 1, 1], [1, -1, -1]];
+        let coords = make_sparse_grid_coords(6, 5, 4);
+        let mut rng = Lcg::new(991);
+
+        let in_channels = 6usize;
+        let out_channels = 8usize;
+        let kernel_d = 3usize;
+        let kernel_h = 3usize;
+        let kernel_w = 3usize;
+        let in_channels_per_group = 3usize;
+        let out_channels_per_group = 4usize;
+        let groups = 2usize;
+
+        let input: Vec<f32> = (0..coords.len() * in_channels)
+            .map(|_| rng.next_f32())
+            .collect();
+        let weight_len = out_channels * kernel_d * kernel_h * kernel_w * in_channels_per_group;
+        let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
+        let bias: Vec<f32> = (0..out_channels).map(|_| rng.next_f32()).collect();
+        let weights = SparseSubmConvWeights {
+            weight: &weight,
+            bias: &bias,
+        };
+
+        for axis_order in axis_orders {
+            for axis_sign in axis_signs {
+                let cfg = SparseSubmConvConfig {
+                    in_channels,
+                    out_channels,
+                    kernel_d,
+                    kernel_h,
+                    kernel_w,
+                    in_channels_per_group,
+                    out_channels_per_group,
+                    groups,
+                    axis_order,
+                    axis_sign,
+                };
+                let legacy =
+                    sparse_subm_conv_forward_legacy(&cfg, weights, coords.as_slice(), &input)
+                        .expect("legacy");
+                let flex = sparse_subm_conv_forward_flex(&cfg, weights, coords.as_slice(), &input)
+                    .expect("flex");
+                assert_eq!(legacy.len(), flex.len());
+                for (idx, (lhs, rhs)) in legacy.iter().zip(flex.iter()).enumerate() {
+                    let diff = (lhs - rhs).abs();
+                    assert!(
+                        diff <= 2.0e-5,
+                        "axis_order={axis_order:?} axis_sign={axis_sign:?} mismatch at idx={idx}: lhs={lhs} rhs={rhs} diff={diff}"
+                    );
+                }
+            }
         }
     }
 }

@@ -191,7 +191,10 @@ fn run_with_backend<B: Backend>(
     let reference_tokens_pre_pos = reference.get_input("encoder.tokens_pre_pos");
     let reference_pos_interp = reference.get_input("encoder.pos_interp");
     let reference_hidden0 = reference.get_input("encoder.hidden.0");
-    if reference_tokens_pre_pos.is_some() || reference_pos_interp.is_some() || reference_hidden0.is_some() {
+    if reference_tokens_pre_pos.is_some()
+        || reference_pos_interp.is_some()
+        || reference_hidden0.is_some()
+    {
         println!(
             "encoder.debug_hooks: skipped (requires burn_dino.patch forward_from_tokens/debug_embeddings)"
         );
@@ -418,7 +421,9 @@ fn run_with_backend<B: Backend>(
         let stats = compute_stats_from_tensor(&output_ref.latents, &output_latents)?;
         print_stats("pipeline.latents.from_reference_embeds", &stats);
         if !skip_decode {
-            let output_grid = output_grid.as_ref().expect("output.grid_logits checked above");
+            let output_grid = output_grid
+                .as_ref()
+                .expect("output.grid_logits checked above");
             let grid = pipeline.decode_grid(output_ref.latents, bounds, resolution, chunk_size)?;
             let stats = compute_stats(&grid.values, &output_grid.data);
             print_stats("decoder.grid_logits.from_reference_embeds", &stats);
@@ -464,7 +469,9 @@ fn run_with_backend<B: Backend>(
         let stats = compute_stats_from_tensor(&output_cpu.latents, &output_latents)?;
         print_stats("pipeline.latents.from_cpu_dino", &stats);
         if !skip_decode {
-            let output_grid = output_grid.as_ref().expect("output.grid_logits checked above");
+            let output_grid = output_grid
+                .as_ref()
+                .expect("output.grid_logits checked above");
             let grid = pipeline.decode_grid(output_cpu.latents, bounds, resolution, chunk_size)?;
             let stats = compute_stats(&grid.values, &output_grid.data);
             print_stats("decoder.grid_logits.from_cpu_dino", &stats);
@@ -487,7 +494,9 @@ fn run_with_backend<B: Backend>(
         return Ok(());
     }
 
-    let output_grid = output_grid.as_ref().expect("output.grid_logits checked above");
+    let output_grid = output_grid
+        .as_ref()
+        .expect("output.grid_logits checked above");
     let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
     let stats = compute_stats(&grid.values, &output_grid.data);
     print_stats("decoder.grid_logits", &stats);
@@ -562,7 +571,9 @@ fn report_denoise_steps<B: Backend>(
 
         if do_guidance {
             let half = model_batch / 2;
-            let noise_uncond = noise_pred.clone().slice([0..half, 0..num_tokens, 0..channels]);
+            let noise_uncond = noise_pred
+                .clone()
+                .slice([0..half, 0..num_tokens, 0..channels]);
             let noise_cond = noise_pred.slice([half..(half * 2), 0..num_tokens, 0..channels]);
             noise_pred =
                 noise_uncond.clone() + (noise_cond - noise_uncond).mul_scalar(guidance_scale);

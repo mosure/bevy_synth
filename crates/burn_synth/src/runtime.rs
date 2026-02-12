@@ -12,22 +12,23 @@ use burn_foreground::pipeline::{
 use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
+use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 use burn_trellis::TrellisQuality;
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
 use burn_tripo::model::triposg::image_encoder::DinoImageProcessor;
 use burn_tripo::model::triposg::image_encoder::import::{
-    load_dinov2_processor, load_triposg_dinov2,
+    load_dinov2_processor, load_triposg_dinov2_with_policy,
 };
 use burn_tripo::paths::resolve_triposg_weights_root;
 use burn_tripo::pipeline::geometry::{FlashExtractConfig, flash_extract_geometry};
 use burn_tripo::pipeline::mesh::{Mesh as TripoMesh, sdf_to_mesh_diff_dmc};
 use burn_tripo::pipeline::runtime_parity::{
-    DinoBackendChoice, configure_triposg_parity_env, decimate_tripo_mesh,
-    should_use_cpu_dino_backend,
+    DinoBackendChoice, decimate_tripo_mesh, should_use_cpu_dino_backend,
+    triposg_runtime_parity_profile,
 };
-use burn_tripo::pipeline::triposg::{TripoSGPipeline, TripoSGSamplerProgress};
+use burn_tripo::pipeline::triposg::{TripoSGLoadOptions, TripoSGPipeline, TripoSGSamplerProgress};
 use image::{ImageFormat, RgbaImage};
 
 use crate::io::ImageSource;
@@ -337,7 +338,11 @@ pub struct SynthRuntime {
 
 impl SynthRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
-        configure_triposg_parity_env(config.match_python, Some(config.mesh_prepare.max_dimension));
+        let parity = triposg_runtime_parity_profile(
+            config.match_python,
+            Some(config.mesh_prepare.max_dimension),
+        );
+        set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
         Self {
             config,
             foreground: ForegroundRuntime::default(),
@@ -1008,21 +1013,30 @@ fn load_backend_state<B: Backend>(
         B::seed(&device, seed);
     }
     let weights_root = resolve_triposg_weights_root(config.weights_root.as_deref());
+    let parity = triposg_runtime_parity_profile(
+        config.match_python,
+        Some(config.mesh_prepare.max_dimension),
+    );
+    let mut load_options = TripoSGLoadOptions::default();
+    load_options.burnpack_policy = parity.burnpack_policy;
+    load_options.strict_dino_preprocess = Some(parity.strict_dino_preprocess);
     let pipeline =
-        TripoSGPipeline::<B>::from_pretrained(&weights_root, &device).map_err(|err| {
-            RuntimeError::new(format!(
-                "failed to load TripoSG weights at {}: {err}",
-                weights_root.display()
-            ))
-        })?;
+        TripoSGPipeline::<B>::from_pretrained_with_options(&weights_root, &device, load_options)
+            .map_err(|err| {
+                RuntimeError::new(format!(
+                    "failed to load TripoSG weights at {}: {err}",
+                    weights_root.display()
+                ))
+            })?;
     let cpu_dino = if should_use_cpu_dino_backend::<B>(
         map_dino_backend(config.dino_backend),
         config.match_python,
     ) {
         let cpu_device = <NdArray<f32> as Backend>::Device::default();
-        let encoder = load_triposg_dinov2::<NdArray<f32>>(
+        let encoder = load_triposg_dinov2_with_policy(
             &cpu_device,
             weights_root.join("image_encoder_dinov2/model.safetensors"),
+            parity.burnpack_policy,
         )
         .map_err(|err| {
             RuntimeError::new(format!(
@@ -1030,12 +1044,13 @@ fn load_backend_state<B: Backend>(
                 weights_root.display()
             ))
         })?;
-        let processor = load_dinov2_processor(&weights_root).map_err(|err| {
+        let mut processor = load_dinov2_processor(&weights_root).map_err(|err| {
             RuntimeError::new(format!(
                 "failed to load DINO processor config at {}: {err}",
                 weights_root.display()
             ))
         })?;
+        processor.set_strict_preprocess(parity.strict_dino_preprocess);
         Some(CpuDinoState {
             device: cpu_device,
             encoder,
@@ -1425,24 +1440,10 @@ fn unique_temp_png_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::Mutex;
 
     use image::{DynamicImage, Rgba};
 
     use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn set_env_var(key: &str, value: Option<&str>) {
-        match value {
-            Some(value) => unsafe {
-                std::env::set_var(key, value);
-            },
-            None => unsafe {
-                std::env::remove_var(key);
-            },
-        }
-    }
 
     #[test]
     fn foreground_passthrough_alpha_from_bytes() {
@@ -1544,67 +1545,21 @@ mod tests {
         ));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn runtime_sets_triposg_parity_env_defaults() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let prev_dino = std::env::var("DINO_STRICT_PREPROCESS").ok();
-        let prev_rmbg = std::env::var("RMBG_STRICT_INTERP").ok();
-        let prev_max_dim = std::env::var("TRIPOSG_MAX_IMAGE_DIM").ok();
-
-        set_env_var("DINO_STRICT_PREPROCESS", None);
-        set_env_var("RMBG_STRICT_INTERP", None);
-        set_env_var("TRIPOSG_MAX_IMAGE_DIM", None);
-
-        let _runtime = SynthRuntime::new(RuntimeConfig::default());
-
-        assert_eq!(
-            std::env::var("DINO_STRICT_PREPROCESS").ok().as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            std::env::var("RMBG_STRICT_INTERP").ok().as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            std::env::var("TRIPOSG_MAX_IMAGE_DIM").ok().as_deref(),
-            Some("2000")
-        );
-
-        set_env_var("DINO_STRICT_PREPROCESS", prev_dino.as_deref());
-        set_env_var("RMBG_STRICT_INTERP", prev_rmbg.as_deref());
-        set_env_var("TRIPOSG_MAX_IMAGE_DIM", prev_max_dim.as_deref());
+    fn parity_profile_match_python_prefers_f32_and_caps_dimension() {
+        let profile = triposg_runtime_parity_profile(true, Some(777));
+        assert!(profile.strict_dino_preprocess);
+        assert!(profile.strict_rmbg_interp);
+        assert_eq!(profile.max_image_dim, Some(2000));
+        assert!(!profile.burnpack_policy.precision.prefer_f16());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn runtime_does_not_override_existing_triposg_env() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let prev_dino = std::env::var("DINO_STRICT_PREPROCESS").ok();
-        let prev_rmbg = std::env::var("RMBG_STRICT_INTERP").ok();
-        let prev_max_dim = std::env::var("TRIPOSG_MAX_IMAGE_DIM").ok();
-
-        set_env_var("DINO_STRICT_PREPROCESS", Some("0"));
-        set_env_var("RMBG_STRICT_INTERP", Some("0"));
-        set_env_var("TRIPOSG_MAX_IMAGE_DIM", Some("777"));
-
-        let _runtime = SynthRuntime::new(RuntimeConfig::default());
-
-        assert_eq!(
-            std::env::var("DINO_STRICT_PREPROCESS").ok().as_deref(),
-            Some("0")
-        );
-        assert_eq!(
-            std::env::var("RMBG_STRICT_INTERP").ok().as_deref(),
-            Some("0")
-        );
-        assert_eq!(
-            std::env::var("TRIPOSG_MAX_IMAGE_DIM").ok().as_deref(),
-            Some("777")
-        );
-
-        set_env_var("DINO_STRICT_PREPROCESS", prev_dino.as_deref());
-        set_env_var("RMBG_STRICT_INTERP", prev_rmbg.as_deref());
-        set_env_var("TRIPOSG_MAX_IMAGE_DIM", prev_max_dim.as_deref());
+    fn parity_profile_non_python_keeps_f16_preference_and_fallback_dimension() {
+        let profile = triposg_runtime_parity_profile(false, Some(777));
+        assert!(profile.strict_dino_preprocess);
+        assert!(profile.strict_rmbg_interp);
+        assert_eq!(profile.max_image_dim, Some(777));
+        assert!(profile.burnpack_policy.precision.prefer_f16());
     }
 }

@@ -178,8 +178,9 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
     ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
         let resolution = resolution.max(2);
         let chunk_size = chunk_size.max(1);
-        let values =
-            super::triposg::decode_grid_values(&latents, &self.vae, bounds, resolution, chunk_size)?;
+        let values = super::triposg::decode_grid_values(
+            &latents, &self.vae, bounds, resolution, chunk_size,
+        )?;
 
         Ok(DenseGrid {
             values,

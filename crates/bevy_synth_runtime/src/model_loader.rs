@@ -41,7 +41,7 @@ pub(crate) fn parse_shard_manifest_bytes(
         .map_err(|err| format!("failed to parse shard manifest {source}: {err}"))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn reconstruct_burnpack_from_shard_manifest<F>(
     manifest: &BurnpackShardManifest,
     mut load_shard: F,
@@ -85,6 +85,8 @@ pub(crate) fn resolve_manifest_entry_uri(manifest_uri: &str, entry_uri: &str) ->
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
@@ -165,9 +167,16 @@ fn load_burnpack_from_manifest(manifest_path: &Path) -> Result<Vec<u8>, String> 
     })?;
     let manifest =
         parse_shard_manifest_bytes(&manifest_bytes, &manifest_path.display().to_string())?;
+    let shards = manifest.shard_entries();
+    if shards.is_empty() {
+        return Err("shard manifest contains no shard entries".to_string());
+    }
 
-    reconstruct_burnpack_from_shard_manifest(&manifest, |shard| {
-        let shard_path = Path::new(shard);
+    // Reconstruct directly into the destination buffer so peak host RAM stays close to
+    // `total_bytes` (+ allocator overhead), instead of `total_bytes + current_shard`.
+    let mut output = Vec::with_capacity(manifest.total_bytes as usize);
+    for shard in shards {
+        let shard_path = Path::new(shard.path());
         let full_path = if shard_path.is_absolute() {
             shard_path.to_path_buf()
         } else {
@@ -178,22 +187,134 @@ fn load_burnpack_from_manifest(manifest_path: &Path) -> Result<Vec<u8>, String> 
                     format!("invalid shard manifest path '{}'", manifest_path.display())
                 })?
         };
-        fs::read(&full_path)
-            .map_err(|err| format!("failed to read shard {}: {err}", full_path.display()))
-    })
+        let mut file = fs::File::open(&full_path)
+            .map_err(|err| format!("failed to open shard {}: {err}", full_path.display()))?;
+        file.read_to_end(&mut output)
+            .map_err(|err| format!("failed to read shard {}: {err}", full_path.display()))?;
+    }
+
+    if manifest.total_bytes > 0 && output.len() as u64 != manifest.total_bytes {
+        return Err(format!(
+            "shard manifest expected {} bytes but reconstructed {} bytes",
+            manifest.total_bytes,
+            output.len()
+        ));
+    }
+    Ok(output)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::cmp;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use burn_synth_import::io::{sha256_bytes, sha256_file};
+    use burn_synth_import::shard::write_shards_for_burnpack;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 
     use super::{
         burnpack_manifest_candidates, candidate_burnpack_names, load_burnpack_asset_from_root,
         parse_shard_manifest_bytes, prefer_f16_burnpack, reconstruct_burnpack_from_shard_manifest,
     };
+
+    const ONE_MIB: u64 = 1024 * 1024;
+
+    struct ProcessMemoryMonitor {
+        done: Arc<AtomicBool>,
+        peak_bytes: Arc<AtomicU64>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ProcessMemoryMonitor {
+        fn start(pid: Pid, baseline_bytes: u64) -> Self {
+            let done = Arc::new(AtomicBool::new(false));
+            let peak_bytes = Arc::new(AtomicU64::new(baseline_bytes));
+            let done_thread = Arc::clone(&done);
+            let peak_thread = Arc::clone(&peak_bytes);
+            let join = thread::Builder::new()
+                .name("burn_synth_rss_monitor".to_string())
+                .spawn(move || {
+                    let mut system = System::new();
+                    while !done_thread.load(Ordering::Relaxed) {
+                        if let Some(bytes) = refresh_process_rss_bytes(&mut system, pid) {
+                            peak_thread.fetch_max(bytes, Ordering::Relaxed);
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    if let Some(bytes) = refresh_process_rss_bytes(&mut system, pid) {
+                        peak_thread.fetch_max(bytes, Ordering::Relaxed);
+                    }
+                })
+                .expect("failed to spawn process memory monitor");
+            Self {
+                done,
+                peak_bytes,
+                join: Some(join),
+            }
+        }
+
+        fn stop(mut self) -> u64 {
+            self.done.store(true, Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+            self.peak_bytes.load(Ordering::Relaxed)
+        }
+    }
+
+    fn refresh_process_rss_bytes(system: &mut System, pid: Pid) -> Option<u64> {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        system.process(pid).map(|process| process.memory())
+    }
+
+    fn measure_peak_rss_delta_bytes<F, T>(action: F) -> (T, u64)
+    where
+        F: FnOnce() -> T,
+    {
+        let pid = get_current_pid().expect("failed to get current process id");
+        let mut system = System::new();
+        let baseline_bytes = refresh_process_rss_bytes(&mut system, pid).unwrap_or(0);
+        let monitor = ProcessMemoryMonitor::start(pid, baseline_bytes);
+        let output = action();
+        // Give allocator work a moment to settle so transient peaks are captured.
+        thread::sleep(Duration::from_millis(20));
+        let peak_bytes = monitor.stop();
+        (output, peak_bytes.saturating_sub(baseline_bytes))
+    }
+
+    fn write_patterned_file(path: &std::path::Path, total_bytes: u64) {
+        let mut file = fs::File::create(path).expect("failed to create source burnpack");
+        let mut remaining = total_bytes;
+        let mut seed = 0u8;
+        let mut chunk = vec![0u8; ONE_MIB as usize];
+        while remaining > 0 {
+            let write_now = cmp::min(remaining, chunk.len() as u64) as usize;
+            for byte in chunk.iter_mut().take(write_now) {
+                *byte = seed;
+                seed = seed.wrapping_add(17);
+            }
+            file.write_all(&chunk[..write_now])
+                .expect("failed to write source burnpack chunk");
+            remaining -= write_now as u64;
+        }
+        file.flush().expect("failed to flush source burnpack");
+    }
+
+    fn format_mebibytes(bytes: u64) -> String {
+        format!("{:.1} MiB", bytes as f64 / ONE_MIB as f64)
+    }
 
     fn unique_temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -349,5 +470,49 @@ mod tests {
             err.contains("expected 7 bytes"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn sharded_load_process_ram_spike_respects_total_plus_shard_cap() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).expect("failed to create temp root");
+
+        let source_path = root.join("source_model_f16.bpk");
+        let load_path = root.join("model_f16.bpk");
+        let total_bytes = 96 * ONE_MIB;
+        write_patterned_file(&source_path, total_bytes);
+        let source_hash = sha256_file(&source_path).expect("failed to hash source burnpack");
+
+        for shard_size_mib in [4_u64, 32_u64] {
+            fs::copy(&source_path, &load_path).expect("failed to copy source burnpack");
+            write_shards_for_burnpack(&load_path, shard_size_mib, true)
+                .expect("failed to shard burnpack");
+            fs::remove_file(&load_path).expect("failed to remove direct burnpack");
+
+            let (loaded, peak_delta) = measure_peak_rss_delta_bytes(|| {
+                load_burnpack_asset_from_root(
+                    &root,
+                    "model.safetensors",
+                    "BURN_SYNTH_TEST_PRECISION",
+                )
+                .expect("failed to load sharded burnpack")
+            });
+
+            assert_eq!(loaded.len() as u64, total_bytes);
+            assert_eq!(sha256_bytes(&loaded), source_hash);
+
+            let shard_bytes = shard_size_mib * ONE_MIB;
+            // Bound process RSS spike to reconstructed payload + one shard + allocator slack.
+            let allowed_peak_delta = total_bytes + shard_bytes + (64 * ONE_MIB);
+            assert!(
+                peak_delta <= allowed_peak_delta,
+                "peak host RAM delta {} exceeded bound {} for shard size {} MiB",
+                format_mebibytes(peak_delta),
+                format_mebibytes(allowed_peak_delta),
+                shard_size_mib
+            );
+        }
+
+        fs::remove_dir_all(root).expect("failed to cleanup temp root");
     }
 }
