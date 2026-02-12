@@ -43,22 +43,14 @@ pub fn resolve_trellis2_weights_root(explicit: Option<&Path>) -> PathBuf {
     {
         return root;
     }
-    let env_root = normalized_env_root("TRELLIS2_WEIGHTS_ROOT")
-        .or_else(|| option_env!("TRELLIS2_WEIGHTS_ROOT").and_then(normalized_option_root));
     let local = trellis2_repo_asset_root();
-    select_bpk_preferred_root(env_root, local)
+    select_bpk_preferred_root(None, local)
 }
 
 #[cfg(target_arch = "wasm32")]
 pub fn resolve_trellis2_weights_root(explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
-    }
-    if let Some(root) = env_non_empty_path("TRELLIS2_WEIGHTS_ROOT") {
-        return root;
-    }
-    if let Some(root) = option_env!("TRELLIS2_WEIGHTS_ROOT").and_then(non_empty_path) {
-        return root;
     }
     web_asset_root().join("models/TRELLIS.2-4B")
 }
@@ -70,20 +62,16 @@ pub fn resolve_trellis2_image_large_root(explicit: Option<&Path>) -> PathBuf {
     {
         return root;
     }
-    let image_env_root = normalized_env_root("TRELLIS2_IMAGE_LARGE_ROOT")
-        .or_else(|| option_env!("TRELLIS2_IMAGE_LARGE_ROOT").and_then(normalized_option_root));
     let image_local_root = trellis2_repo_image_large_root();
-    let image_selected = select_bpk_preferred_root(image_env_root, image_local_root);
+    let image_selected = select_bpk_preferred_root(None, image_local_root);
     if root_contains_bpk(image_selected.as_path()) {
         return image_selected;
     }
 
     // Keep runtime/import functional even when TRELLIS-image-large is not materialized as a
     // separate directory by falling back to the main TRELLIS.2-4B root.
-    let weights_env_root = normalized_env_root("TRELLIS2_WEIGHTS_ROOT")
-        .or_else(|| option_env!("TRELLIS2_WEIGHTS_ROOT").and_then(normalized_option_root));
     let weights_local_root = trellis2_repo_asset_root();
-    let weights_selected = select_bpk_preferred_root(weights_env_root, weights_local_root);
+    let weights_selected = select_bpk_preferred_root(None, weights_local_root);
     if root_contains_bpk(weights_selected.as_path()) {
         return weights_selected;
     }
@@ -95,12 +83,6 @@ pub fn resolve_trellis2_image_large_root(explicit: Option<&Path>) -> PathBuf {
 pub fn resolve_trellis2_image_large_root(explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
-    }
-    if let Some(root) = env_non_empty_path("TRELLIS2_IMAGE_LARGE_ROOT") {
-        return root;
-    }
-    if let Some(root) = option_env!("TRELLIS2_IMAGE_LARGE_ROOT").and_then(non_empty_path) {
-        return root;
     }
     web_asset_root().join("models/TRELLIS-image-large")
 }
@@ -117,28 +99,6 @@ fn normalize_root(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn normalized_env_root(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| non_empty_path(value.as_str()))
-        .and_then(|path| normalize_root(path.as_path()))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn normalized_option_root(value: &str) -> Option<PathBuf> {
-    non_empty_path(value).and_then(|path| normalize_root(path.as_path()))
-}
-
-fn non_empty_path(value: &str) -> Option<PathBuf> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn preferred_local_asset_root(repo_relative: &str, crate_relative: &str) -> PathBuf {
     for candidate in [PathBuf::from(repo_relative), PathBuf::from(crate_relative)] {
         if let Some(root) = normalize_root(candidate.as_path()) {
@@ -147,13 +107,6 @@ fn preferred_local_asset_root(repo_relative: &str, crate_relative: &str) -> Path
     }
     let manifest_fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(crate_relative);
     normalize_root(manifest_fallback.as_path()).unwrap_or_else(|| PathBuf::from(repo_relative))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn env_non_empty_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| non_empty_path(value.as_str()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -188,12 +141,6 @@ fn root_contains_bpk(root: &Path) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn web_asset_root() -> PathBuf {
-    if let Some(root) = option_env!("BURN_SYNTH_WEB_ASSET_ROOT") {
-        let trimmed = root.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
     PathBuf::from("assets")
 }
 

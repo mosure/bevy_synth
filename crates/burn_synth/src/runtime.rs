@@ -25,8 +25,7 @@ use burn_tripo::paths::resolve_triposg_weights_root;
 use burn_tripo::pipeline::geometry::{FlashExtractConfig, flash_extract_geometry};
 use burn_tripo::pipeline::mesh::{Mesh as TripoMesh, sdf_to_mesh_diff_dmc};
 use burn_tripo::pipeline::runtime_parity::{
-    DinoBackendChoice, decimate_tripo_mesh, should_use_cpu_dino_backend,
-    triposg_runtime_parity_profile,
+    DinoBackendChoice, decimate_tripo_mesh, should_use_cpu_dino_backend, triposg_runtime_profile,
 };
 use burn_tripo::pipeline::triposg::{TripoSGLoadOptions, TripoSGPipeline, TripoSGSamplerProgress};
 use image::{ImageFormat, RgbaImage};
@@ -110,7 +109,6 @@ pub struct RuntimeConfig {
     pub num_tokens: usize,
     pub guidance_scale: f32,
     pub seed: Option<u64>,
-    pub match_python: bool,
     pub dino_backend: DinoBackend,
     pub target_faces: Option<usize>,
     pub flash_extract: FlashExtractConfig,
@@ -135,7 +133,6 @@ impl Default for RuntimeConfig {
             num_tokens: DEFAULT_NUM_TOKENS,
             guidance_scale: DEFAULT_GUIDANCE_SCALE,
             seed: Some(DEFAULT_SEED),
-            match_python: true,
             dino_backend: DinoBackend::Auto,
             target_faces: Some(DEFAULT_TARGET_FACES),
             flash_extract: default_flash_config(),
@@ -338,10 +335,7 @@ pub struct SynthRuntime {
 
 impl SynthRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
-        let parity = triposg_runtime_parity_profile(
-            config.match_python,
-            Some(config.mesh_prepare.max_dimension),
-        );
+        let parity = triposg_runtime_profile(Some(config.mesh_prepare.max_dimension));
         set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
         Self {
             config,
@@ -1013,13 +1007,12 @@ fn load_backend_state<B: Backend>(
         B::seed(&device, seed);
     }
     let weights_root = resolve_triposg_weights_root(config.weights_root.as_deref());
-    let parity = triposg_runtime_parity_profile(
-        config.match_python,
-        Some(config.mesh_prepare.max_dimension),
-    );
-    let mut load_options = TripoSGLoadOptions::default();
-    load_options.burnpack_policy = parity.burnpack_policy;
-    load_options.strict_dino_preprocess = Some(parity.strict_dino_preprocess);
+    let parity = triposg_runtime_profile(Some(config.mesh_prepare.max_dimension));
+    let load_options = TripoSGLoadOptions {
+        burnpack_policy: parity.burnpack_policy,
+        strict_dino_preprocess: Some(parity.strict_dino_preprocess),
+        ..TripoSGLoadOptions::default()
+    };
     let pipeline =
         TripoSGPipeline::<B>::from_pretrained_with_options(&weights_root, &device, load_options)
             .map_err(|err| {
@@ -1028,10 +1021,7 @@ fn load_backend_state<B: Backend>(
                     weights_root.display()
                 ))
             })?;
-    let cpu_dino = if should_use_cpu_dino_backend::<B>(
-        map_dino_backend(config.dino_backend),
-        config.match_python,
-    ) {
+    let cpu_dino = if should_use_cpu_dino_backend::<B>(map_dino_backend(config.dino_backend)) {
         let cpu_device = <NdArray<f32> as Backend>::Device::default();
         let encoder = load_triposg_dinov2_with_policy(
             &cpu_device,
@@ -1534,29 +1524,15 @@ mod tests {
 
     #[cfg(feature = "wgpu")]
     #[test]
-    fn auto_dino_backend_uses_cpu_on_wgpu_with_match_python() {
-        assert!(should_use_cpu_dino_backend::<WgpuBackend>(
-            DinoBackendChoice::Auto,
-            true
-        ));
+    fn auto_dino_backend_uses_gpu_on_wgpu() {
         assert!(!should_use_cpu_dino_backend::<WgpuBackend>(
-            DinoBackendChoice::Auto,
-            false
+            DinoBackendChoice::Auto
         ));
     }
 
     #[test]
-    fn parity_profile_match_python_prefers_f32_and_caps_dimension() {
-        let profile = triposg_runtime_parity_profile(true, Some(777));
-        assert!(profile.strict_dino_preprocess);
-        assert!(profile.strict_rmbg_interp);
-        assert_eq!(profile.max_image_dim, Some(2000));
-        assert!(!profile.burnpack_policy.precision.prefer_f16());
-    }
-
-    #[test]
-    fn parity_profile_non_python_keeps_f16_preference_and_fallback_dimension() {
-        let profile = triposg_runtime_parity_profile(false, Some(777));
+    fn parity_profile_keeps_f16_preference_and_fallback_dimension() {
+        let profile = triposg_runtime_profile(Some(777));
         assert!(profile.strict_dino_preprocess);
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));

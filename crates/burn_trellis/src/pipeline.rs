@@ -62,38 +62,7 @@ fn hook_max_dense_elements() -> usize {
 }
 
 fn stage_runtime_cache_disabled() -> bool {
-    env_bool("TRELLIS2_DISABLE_STAGE_RUNTIME_CACHE")
-}
-
-fn env_bool(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn env_bool_default_true(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
-}
-
-fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    false
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -533,11 +502,11 @@ impl Trellis2Pipeline {
         StageRuntimeCacheKey {
             preferred_pipeline_type: options.quality.settings().pipeline_type.to_string(),
             prefer_wgpu: !matches!(options.device, TrellisDevice::Cpu),
-            sampler_steps_override: env_usize("TRELLIS2_SAMPLER_STEPS_OVERRIDE"),
-            runtime_model_disabled: env_bool("TRELLIS2_DISABLE_RUNTIME_MODEL"),
-            runtime_decoders_disabled: env_bool("TRELLIS2_DISABLE_RUNTIME_DECODERS"),
-            runtime_lazy_model_load: env_bool_default_true("TRELLIS2_RUNTIME_LAZY_MODEL_LOAD"),
-            slat_dense_resolution: env_usize("TRELLIS2_SLAT_DENSE_RESOLUTION"),
+            sampler_steps_override: None,
+            runtime_model_disabled: false,
+            runtime_decoders_disabled: false,
+            runtime_lazy_model_load: true,
+            slat_dense_resolution: None,
         }
     }
 

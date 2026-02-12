@@ -1,5 +1,4 @@
 use burn::prelude::Backend;
-use std::collections::HashMap;
 
 use crate::model::triposg::load_policy::{BpkPrecisionPreference, BurnpackLoadPolicy};
 use crate::pipeline::mesh::Mesh;
@@ -12,15 +11,12 @@ pub enum DinoBackendChoice {
 }
 
 impl DinoBackendChoice {
-    pub fn resolve<B: Backend>(self, match_python: bool) -> Self {
-        resolve_dino_backend::<B>(self, match_python)
+    pub fn resolve<B: Backend>(self) -> Self {
+        resolve_dino_backend::<B>(self)
     }
 }
 
-pub fn resolve_dino_backend<B: Backend>(
-    requested: DinoBackendChoice,
-    match_python: bool,
-) -> DinoBackendChoice {
+pub fn resolve_dino_backend<B: Backend>(requested: DinoBackendChoice) -> DinoBackendChoice {
     match requested {
         DinoBackendChoice::Auto => {
             if cfg!(target_arch = "wasm32") {
@@ -30,11 +26,7 @@ pub fn resolve_dino_backend<B: Backend>(
                     DinoBackendChoice::Cpu
                 }
             } else if is_gpu_backend::<B>() {
-                if match_python && is_wgpu_backend::<B>() {
-                    DinoBackendChoice::Cpu
-                } else {
-                    DinoBackendChoice::Gpu
-                }
+                DinoBackendChoice::Gpu
             } else {
                 DinoBackendChoice::Cpu
             }
@@ -43,14 +35,8 @@ pub fn resolve_dino_backend<B: Backend>(
     }
 }
 
-pub fn should_use_cpu_dino_backend<B: Backend>(
-    requested: DinoBackendChoice,
-    match_python: bool,
-) -> bool {
-    matches!(
-        resolve_dino_backend::<B>(requested, match_python),
-        DinoBackendChoice::Cpu
-    )
+pub fn should_use_cpu_dino_backend<B: Backend>(requested: DinoBackendChoice) -> bool {
+    matches!(resolve_dino_backend::<B>(requested), DinoBackendChoice::Cpu)
 }
 
 pub fn is_wgpu_backend<B: Backend>() -> bool {
@@ -77,62 +63,18 @@ pub struct TripoSGRuntimeParityProfile {
     pub burnpack_policy: BurnpackLoadPolicy,
 }
 
-pub fn triposg_runtime_parity_profile(
-    match_python: bool,
+pub fn triposg_runtime_profile(
     fallback_max_image_dim: Option<usize>,
 ) -> TripoSGRuntimeParityProfile {
-    let max_image_dim = if match_python {
-        Some(2000)
-    } else {
-        fallback_max_image_dim.filter(|value| *value > 0 && *value != usize::MAX)
-    };
-    let burnpack_policy = if match_python {
-        BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF32)
-    } else {
-        BurnpackLoadPolicy::default()
-    };
+    let max_image_dim = fallback_max_image_dim.filter(|value| *value > 0 && *value != usize::MAX);
+    let burnpack_policy =
+        BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF16);
 
     TripoSGRuntimeParityProfile {
         strict_dino_preprocess: true,
         strict_rmbg_interp: true,
         max_image_dim,
         burnpack_policy,
-    }
-}
-
-pub fn configure_triposg_parity_env(match_python: bool, fallback_max_image_dim: Option<usize>) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let profile = triposg_runtime_parity_profile(match_python, fallback_max_image_dim);
-        if std::env::var("DINO_STRICT_PREPROCESS").is_err() && profile.strict_dino_preprocess {
-            unsafe {
-                std::env::set_var("DINO_STRICT_PREPROCESS", "1");
-            }
-        }
-        if std::env::var("RMBG_STRICT_INTERP").is_err() && profile.strict_rmbg_interp {
-            unsafe {
-                std::env::set_var("RMBG_STRICT_INTERP", "1");
-            }
-        }
-        if std::env::var("TRIPOSG_MAX_IMAGE_DIM").is_err()
-            && let Some(max_dim) = profile.max_image_dim
-        {
-            unsafe {
-                std::env::set_var("TRIPOSG_MAX_IMAGE_DIM", max_dim.to_string());
-            }
-        }
-        if !profile.burnpack_policy.precision.prefer_f16() {
-            if std::env::var("TRIPOSG_BPK_PRECISION").is_err() {
-                unsafe {
-                    std::env::set_var("TRIPOSG_BPK_PRECISION", "f32");
-                }
-            }
-            if std::env::var("BURN_SYNTH_BPK_PRECISION").is_err() {
-                unsafe {
-                    std::env::set_var("BURN_SYNTH_BPK_PRECISION", "f32");
-                }
-            }
-        }
     }
 }
 
@@ -150,57 +92,35 @@ pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, Str
         indices.push(face[1]);
         indices.push(face[2]);
     }
-    let (welded_vertices, welded_indices) = weld_close_vertices(&mesh.vertices, &indices);
-    if welded_vertices.is_empty() || welded_indices.len() < 3 {
-        return Ok(mesh.clone());
-    }
-
-    let indices = welded_indices;
     let target_index_count = (target_faces.saturating_mul(3)).min(indices.len());
     if target_index_count < 3 {
         return Err("target face count too small for decimation".to_string());
     }
 
-    let vertices_bytes = meshopt::typed_to_bytes(welded_vertices.as_slice());
+    let vertices_bytes = meshopt::typed_to_bytes(mesh.vertices.as_slice());
     let adapter =
         meshopt::VertexDataAdapter::new(vertices_bytes, std::mem::size_of::<[f32; 3]>(), 0)
             .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
-
-    let target_error = std::env::var("TRIPOSG_DECIMATE_TARGET_ERROR")
-        .ok()
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or(0.02)
-        .clamp(1e-6, 1.0);
-    let allow_sloppy = std::env::var("TRIPOSG_DECIMATE_ALLOW_SLOPPY")
-        .ok()
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(false);
 
     let mut result_error = 0.0f32;
     let mut simplified = meshopt::simplify(
         &indices,
         &adapter,
         target_index_count,
-        target_error,
+        1.0,
         meshopt::SimplifyOptions::None,
         Some(&mut result_error),
     );
-    if allow_sloppy && simplified.len() > target_index_count {
-        simplified =
-            meshopt::simplify_sloppy(&indices, &adapter, target_index_count, target_error, None);
+    if simplified.len() > target_index_count {
+        simplified = meshopt::simplify_sloppy(&indices, &adapter, target_index_count, 1.0, None);
     }
     if simplified.len() < 3 {
         return Err("meshopt simplification produced empty mesh".to_string());
     }
 
     let (vertex_count, remap) =
-        meshopt::generate_vertex_remap(welded_vertices.as_slice(), Some(&simplified));
-    let vertices = meshopt::remap_vertex_buffer(welded_vertices.as_slice(), vertex_count, &remap);
+        meshopt::generate_vertex_remap(mesh.vertices.as_slice(), Some(&simplified));
+    let vertices = meshopt::remap_vertex_buffer(mesh.vertices.as_slice(), vertex_count, &remap);
     let indices = meshopt::remap_index_buffer(Some(&simplified), vertex_count, &remap);
     if indices.len() < 3 {
         return Err("meshopt remap produced empty mesh".to_string());
@@ -213,94 +133,25 @@ pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, Str
     Ok(Mesh { vertices, faces })
 }
 
-fn weld_close_vertices(vertices: &[[f32; 3]], indices: &[u32]) -> (Vec<[f32; 3]>, Vec<u32>) {
-    if vertices.is_empty() || indices.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for vertex in vertices {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(vertex[axis]);
-            max[axis] = max[axis].max(vertex[axis]);
-        }
-    }
-    let diag =
-        ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2) + (max[2] - min[2]).powi(2)).sqrt();
-    let tolerance = std::env::var("TRIPOSG_DECIMATE_WELD_TOLERANCE")
-        .ok()
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or_else(|| (diag * 1e-6).max(1e-8));
-    if !tolerance.is_finite() || tolerance <= 0.0 {
-        return (vertices.to_vec(), indices.to_vec());
-    }
-
-    let inv_tol = 1.0 / tolerance;
-    let mut key_to_new = HashMap::<(i64, i64, i64), u32>::new();
-    let mut old_to_new = vec![0u32; vertices.len()];
-    let mut welded = Vec::<[f32; 3]>::with_capacity(vertices.len());
-
-    for (idx, vertex) in vertices.iter().enumerate() {
-        let key = (
-            (vertex[0] * inv_tol).round() as i64,
-            (vertex[1] * inv_tol).round() as i64,
-            (vertex[2] * inv_tol).round() as i64,
-        );
-        let entry = key_to_new.entry(key).or_insert_with(|| {
-            let next = welded.len() as u32;
-            welded.push(*vertex);
-            next
-        });
-        old_to_new[idx] = *entry;
-    }
-
-    let mut welded_indices = Vec::<u32>::with_capacity(indices.len());
-    for tri in indices.chunks_exact(3) {
-        let a = old_to_new[tri[0] as usize];
-        let b = old_to_new[tri[1] as usize];
-        let c = old_to_new[tri[2] as usize];
-        if a == b || b == c || a == c {
-            continue;
-        }
-        welded_indices.push(a);
-        welded_indices.push(b);
-        welded_indices.push(c);
-    }
-
-    (welded, welded_indices)
-}
-
 #[cfg(test)]
 mod tests {
     use burn::backend::NdArray;
 
-    use super::{DinoBackendChoice, resolve_dino_backend};
+    use super::{
+        DinoBackendChoice, decimate_tripo_mesh, resolve_dino_backend, triposg_runtime_profile,
+    };
 
     #[test]
     fn auto_dino_backend_resolves_to_cpu_on_ndarray() {
         assert_eq!(
-            resolve_dino_backend::<NdArray<f32>>(DinoBackendChoice::Auto, true),
-            DinoBackendChoice::Cpu
-        );
-        assert_eq!(
-            resolve_dino_backend::<NdArray<f32>>(DinoBackendChoice::Auto, false),
+            resolve_dino_backend::<NdArray<f32>>(DinoBackendChoice::Auto),
             DinoBackendChoice::Cpu
         );
     }
 
     #[test]
-    fn parity_profile_match_python_prefers_f32() {
-        let profile = super::triposg_runtime_parity_profile(true, Some(777));
-        assert!(profile.strict_dino_preprocess);
-        assert!(profile.strict_rmbg_interp);
-        assert_eq!(profile.max_image_dim, Some(2000));
-        assert!(!profile.burnpack_policy.precision.prefer_f16());
-    }
-
-    #[test]
-    fn parity_profile_non_python_prefers_f16() {
-        let profile = super::triposg_runtime_parity_profile(false, Some(777));
+    fn parity_profile_has_strict_defaults() {
+        let profile = triposg_runtime_profile(Some(777));
         assert!(profile.strict_dino_preprocess);
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
@@ -309,15 +160,45 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn auto_dino_backend_uses_cpu_only_for_python_parity_on_wgpu() {
+    fn auto_dino_backend_uses_gpu_on_wgpu() {
         type WgpuBackend = burn_wgpu::Wgpu<f32, i32, u32>;
         assert_eq!(
-            resolve_dino_backend::<WgpuBackend>(DinoBackendChoice::Auto, true),
-            DinoBackendChoice::Cpu
-        );
-        assert_eq!(
-            resolve_dino_backend::<WgpuBackend>(DinoBackendChoice::Auto, false),
+            resolve_dino_backend::<WgpuBackend>(DinoBackendChoice::Auto),
             DinoBackendChoice::Gpu
         );
+    }
+
+    #[test]
+    fn decimation_reduces_faces_and_preserves_index_bounds() {
+        let n = 24usize;
+        let mut vertices = Vec::with_capacity((n + 1) * (n + 1));
+        let mut faces = Vec::with_capacity(n * n * 2);
+        for y in 0..=n {
+            for x in 0..=n {
+                vertices.push([x as f32, y as f32, 0.0]);
+            }
+        }
+        for y in 0..n {
+            for x in 0..n {
+                let i0 = (y * (n + 1) + x) as u32;
+                let i1 = i0 + 1;
+                let i2 = i0 + (n + 1) as u32;
+                let i3 = i2 + 1;
+                faces.push([i0, i1, i3]);
+                faces.push([i0, i3, i2]);
+            }
+        }
+        let original_faces = faces.len();
+        let mesh = crate::pipeline::mesh::Mesh { vertices, faces };
+        let decimated = decimate_tripo_mesh(&mesh, 200).expect("decimation should succeed");
+        assert!(decimated.faces.len() <= 200);
+        assert!(!decimated.faces.is_empty());
+        assert!(decimated.faces.len() < original_faces);
+        let vertex_count = decimated.vertices.len() as u32;
+        for face in &decimated.faces {
+            assert!(face[0] < vertex_count);
+            assert!(face[1] < vertex_count);
+            assert!(face[2] < vertex_count);
+        }
     }
 }

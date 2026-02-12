@@ -24,21 +24,3 @@ pub(crate) fn tensor_to_vec_f32<B: Backend, const D: usize>(
 ) -> Result<Vec<f32>, String> {
     Err(readback_not_supported())
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn tensor_to_vec_i32<B: Backend, const D: usize>(
-    tensor: Tensor<B, D, Int>,
-) -> Result<Vec<i32>, String> {
-    tensor
-        .into_data()
-        .convert::<i32>()
-        .to_vec::<i32>()
-        .map_err(|_| "failed to read tensor data".to_string())
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn tensor_to_vec_i32<B: Backend, const D: usize>(
-    _tensor: Tensor<B, D, Int>,
-) -> Result<Vec<i32>, String> {
-    Err(readback_not_supported())
-}

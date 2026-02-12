@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::mpsc::TryRecvError;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{fs, io};
 
@@ -46,7 +50,9 @@ use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
 
-use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
+use bevy_synth_runtime::args::{
+    AppArgs, Args, BackendKind, DinoBackend, RmbgBackend, build_app_args,
+};
 use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
@@ -175,14 +181,16 @@ pub(crate) struct InferenceContext<'w, 's> {
 }
 
 pub(crate) fn run() {
-    #[cfg(not(target_arch = "wasm32"))]
-    if std::env::var("RUST_MIN_STACK").is_err() {
-        unsafe {
-            std::env::set_var("RUST_MIN_STACK", "67108864");
-        }
-    }
     let args = Args::parse();
     let app_args = build_app_args(args);
+    #[cfg(not(target_arch = "wasm32"))]
+    if should_run_headless_once(&app_args) {
+        if let Err(err) = run_headless_once(&app_args) {
+            eprintln!("headless synthesis failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     let mcp_scene_control = McpSceneControl::from_args(&app_args);
 
@@ -258,6 +266,126 @@ pub(crate) fn run() {
     );
 
     app.run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn should_run_headless_once(args: &AppArgs) -> bool {
+    if args.image.is_none() || args.output.is_none() || args.mesh.is_some() {
+        return false;
+    }
+    true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_headless_once(args: &AppArgs) -> Result<(), String> {
+    let image_path = args
+        .image
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "headless mode requires --image".to_string())?;
+    if !image_path.exists() {
+        return Err(format!("input image not found: {}", image_path.display()));
+    }
+    let output_path = resolve_output_path(args.output.as_ref(), &image_path, 0)
+        .ok_or_else(|| "headless mode requires --output".to_string())?;
+
+    println!(
+        "running headless bevy_synth inference: input={} output={}",
+        image_path.display(),
+        output_path.display()
+    );
+
+    let start = Instant::now();
+    let mut attempt_args = args.clone();
+    let mesh = match run_headless_once_inference(&attempt_args, &image_path) {
+        Ok(mesh) => mesh,
+        Err(primary_err) if matches!(attempt_args.backend, BackendKind::Wgpu) => {
+            eprintln!(
+                "wgpu headless inference failed ({primary_err}); retrying once with cpu backend."
+            );
+            attempt_args.backend = BackendKind::Cpu;
+            attempt_args.rmbg_backend = RmbgBackend::Cpu;
+            attempt_args.dino_backend = DinoBackend::Cpu;
+            run_headless_once_inference(&attempt_args, &image_path)?
+        }
+        Err(err) => return Err(err),
+    };
+
+    write_glb(&output_path, &mesh)
+        .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
+    println!(
+        "headless synthesis completed in {:.2}s -> {}",
+        start.elapsed().as_secs_f32(),
+        output_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<SynthMesh, String> {
+    let worker = start_worker(args);
+    let request = InferenceRequest {
+        id: 0,
+        image_path: image_path.to_path_buf(),
+        image_contents: None,
+        output_path: None,
+    };
+    worker
+        .sender
+        .send(WorkerCommand::Infer(vec![request]))
+        .map_err(|err| format!("failed to queue inference request: {err}"))?;
+
+    let mut result = None;
+    let start = Instant::now();
+    while result.is_none() {
+        let next = {
+            let receiver = worker
+                .receiver
+                .lock()
+                .map_err(|_| "failed to lock worker receiver".to_string())?;
+            receiver.recv_timeout(Duration::from_millis(500))
+        };
+
+        match next {
+            Ok(event) => {
+                if let Some(message) = event.status_message {
+                    println!("{message}");
+                }
+                if event.requests.is_empty() && event.results.is_empty() {
+                    continue;
+                }
+                let mut results = event.results.into_iter();
+                result = Some(
+                    results
+                        .next()
+                        .ok_or_else(|| "worker returned empty inference result".to_string())?,
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if start.elapsed() > Duration::from_secs(60 * 30) {
+                    let _ = worker.sender.send(WorkerCommand::Shutdown);
+                    return Err("timed out waiting for worker inference result".to_string());
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = worker.sender.send(WorkerCommand::Shutdown);
+                return Err("inference worker disconnected before returning a result".to_string());
+            }
+        }
+    }
+
+    let _ = worker.sender.send(WorkerCommand::Shutdown);
+    match result.expect("result must be set before loop exits") {
+        Ok(Some(mesh)) => Ok(mesh),
+        Ok(None) => Err(format!(
+            "synthesis produced an empty mesh for {}",
+            image_path.display()
+        )),
+        Err(err) => Err(format!(
+            "synthesis inference failed for {}: {err}",
+            image_path.display()
+        )),
+    }
 }
 
 fn configure_mesh_picking(mut settings: ResMut<MeshPickingSettings>) {

@@ -6,12 +6,6 @@ pub fn resolve_triposg_weights_root(explicit: Option<&Path>) -> PathBuf {
     {
         return root;
     }
-    if let Ok(root) = std::env::var("TRIPOSG_WEIGHTS_ROOT") {
-        let path = PathBuf::from(root);
-        if let Some(root) = normalize_weights_root(&path) {
-            return root;
-        }
-    }
     let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/MIDI-3D");
     normalize_weights_root(&local).unwrap_or(local)
 }

@@ -14,9 +14,6 @@ pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    if let Some(root) = option_env!("TRIPOSG_WEIGHTS_ROOT") {
-        return PathBuf::from(root);
-    }
     web_asset_root().join("models/MIDI-3D")
 }
 
@@ -26,28 +23,6 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) ->
         && let Some(root) = normalize_rmbg_root(path)
     {
         return root;
-    }
-    if matches!(model, RmbgModel::Rmbg2)
-        && let Ok(root) = std::env::var("RMBG2_WEIGHTS_ROOT")
-    {
-        let path = PathBuf::from(root);
-        if let Some(root) = normalize_rmbg_root(&path) {
-            return root;
-        }
-    }
-    if matches!(model, RmbgModel::Rmbg14)
-        && let Ok(root) = std::env::var("RMBG14_WEIGHTS_ROOT")
-    {
-        let path = PathBuf::from(root);
-        if let Some(root) = normalize_rmbg_root(&path) {
-            return root;
-        }
-    }
-    if let Ok(root) = std::env::var("RMBG_WEIGHTS_ROOT") {
-        let path = PathBuf::from(root);
-        if let Some(root) = normalize_rmbg_root(&path) {
-            return root;
-        }
     }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let model_dir = match model {
@@ -67,19 +42,6 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) ->
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    if matches!(model, RmbgModel::Rmbg2)
-        && let Some(root) = option_env!("RMBG2_WEIGHTS_ROOT")
-    {
-        return PathBuf::from(root);
-    }
-    if matches!(model, RmbgModel::Rmbg14)
-        && let Some(root) = option_env!("RMBG14_WEIGHTS_ROOT")
-    {
-        return PathBuf::from(root);
-    }
-    if let Some(root) = option_env!("RMBG_WEIGHTS_ROOT") {
-        return PathBuf::from(root);
-    }
     let model_dir = match model {
         RmbgModel::Rmbg14 => "RMBG-1.4",
         RmbgModel::Rmbg2 => "RMBG-2.0",
@@ -94,12 +56,6 @@ pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
     {
         return root;
     }
-    if let Ok(root) = std::env::var("TRIPOSG_SCRIBBLE_WEIGHTS_ROOT") {
-        let path = PathBuf::from(root);
-        if let Some(root) = normalize_weights_root(&path) {
-            return root;
-        }
-    }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let local = manifest_dir.join("../burn_tripo/assets/models/TripoSG-scribble");
     normalize_weights_root(&local).unwrap_or(local)
@@ -109,9 +65,6 @@ pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
 pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
-    }
-    if let Some(root) = option_env!("TRIPOSG_SCRIBBLE_WEIGHTS_ROOT") {
-        return PathBuf::from(root);
     }
     web_asset_root().join("models/TripoSG-scribble")
 }
@@ -155,11 +108,5 @@ fn normalize_rmbg_root(path: &Path) -> Option<PathBuf> {
 
 #[cfg(target_arch = "wasm32")]
 fn web_asset_root() -> PathBuf {
-    if let Some(root) = option_env!("BURN_SYNTH_WEB_ASSET_ROOT") {
-        let trimmed = root.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
     PathBuf::from("assets")
 }

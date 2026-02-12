@@ -300,7 +300,7 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
         let dit_path = root.join("transformer/diffusion_pytorch_model.safetensors");
         let scheduler_path = root.join("scheduler/scheduler_config.json");
         let dino_path = root.join("image_encoder_dinov2/model.safetensors");
-        let use_safetensors = std::env::var("TRIPOSG_LOAD_SAFETENSORS").is_ok();
+        let use_safetensors = false;
 
         let vae_config_path = root.join("vae/config.json");
         let vae_config =

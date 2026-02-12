@@ -499,8 +499,6 @@ const STRICT_INTERP_FORCED_ON: u8 = 2;
 static RMBG_STRICT_INTERP_OVERRIDE: AtomicU8 = AtomicU8::new(STRICT_INTERP_DEFAULT);
 
 /// Override strict interpolation mode for RMBG-1.4 upsampling.
-///
-/// `None` reverts to env compatibility (`RMBG_STRICT_INTERP`).
 pub fn set_rmbg_strict_interp_override(value: Option<bool>) {
     let encoded = match value {
         Some(false) => STRICT_INTERP_FORCED_OFF,
@@ -514,7 +512,7 @@ fn strict_interp_enabled() -> bool {
     match RMBG_STRICT_INTERP_OVERRIDE.load(Ordering::Relaxed) {
         STRICT_INTERP_FORCED_OFF => false,
         STRICT_INTERP_FORCED_ON => true,
-        _ => std::env::var("RMBG_STRICT_INTERP").is_ok(),
+        _ => false,
     }
 }
 
@@ -656,6 +654,19 @@ pub mod import {
         Ok(model)
     }
 
+    pub fn load_rmbg_from_burnpack_file<B: Backend>(
+        device: &B::Device,
+        burnpack_path: impl AsRef<Path>,
+        config: &RmbgConfig,
+    ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
+        let mut model = BriaRmbg::new(device, config.clone());
+        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load RMBG burnpack file: {err}"))?;
+        Ok(model)
+    }
+
     pub fn load_rmbg_config_from_json_bytes(
         bytes: &[u8],
     ) -> Result<RmbgConfig, Box<dyn std::error::Error>> {
@@ -673,12 +684,6 @@ pub mod import {
     }
 
     pub fn resolve_rmbg_weights_root() -> PathBuf {
-        if let Ok(root) = std::env::var("RMBG_WEIGHTS_ROOT") {
-            let path = PathBuf::from(root);
-            if path.exists() {
-                return path;
-            }
-        }
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/RMBG-1.4")
     }
 
@@ -739,23 +744,7 @@ pub mod import {
     }
 
     fn prefer_f16_burnpack() -> bool {
-        preferred_precision_from_env("RMBG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
-    }
-
-    fn preferred_precision_from_env(primary: &str, fallback: &str) -> bool {
-        let value = std::env::var(primary)
-            .ok()
-            .or_else(|| std::env::var(fallback).ok());
-        match value
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("f32" | "fp32" | "float32" | "32") => false,
-            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-            Some(_) | None => true,
-        }
+        true
     }
 
     fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {

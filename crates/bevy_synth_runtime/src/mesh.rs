@@ -6,19 +6,29 @@ use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
 use crate::SynthMesh;
 
 pub fn to_bevy_mesh(mesh: &TripoMesh) -> BevyMesh {
-    to_bevy_mesh_with_uvs(mesh, None)
+    to_bevy_mesh_with_uvs(mesh, None, false)
 }
 
 pub fn to_bevy_mesh_synth(mesh: &SynthMesh) -> BevyMesh {
-    let uvs = if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
+    let has_uvs = mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty();
+    let uvs = if has_uvs {
         Some(mesh.uvs.as_slice())
     } else {
         None
     };
-    to_bevy_mesh_with_uvs(&mesh.mesh, uvs)
+    let has_normal_map = mesh
+        .pbr_textures
+        .as_ref()
+        .and_then(|pbr| pbr.normal.as_ref())
+        .is_some();
+    to_bevy_mesh_with_uvs(&mesh.mesh, uvs, has_uvs && has_normal_map)
 }
 
-fn to_bevy_mesh_with_uvs(mesh: &TripoMesh, uvs_opt: Option<&[[f32; 2]]>) -> BevyMesh {
+fn to_bevy_mesh_with_uvs(
+    mesh: &TripoMesh,
+    uvs_opt: Option<&[[f32; 2]]>,
+    generate_tangents: bool,
+) -> BevyMesh {
     let mut bevy_mesh = BevyMesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -38,14 +48,20 @@ fn to_bevy_mesh_with_uvs(mesh: &TripoMesh, uvs_opt: Option<&[[f32; 2]]>) -> Bevy
     bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_NORMAL, normals);
     bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_UV_0, uvs);
     bevy_mesh.insert_indices(Indices::U32(indices));
-    let _ = bevy_mesh.generate_tangents();
+    if generate_tangents {
+        let _ = bevy_mesh.generate_tangents();
+    }
     bevy_mesh
 }
 
-fn compute_normals(mesh: &TripoMesh) -> Vec<[f32; 3]> {
+pub(crate) fn compute_normals(mesh: &TripoMesh) -> Vec<[f32; 3]> {
     let mut normals = vec![[0.0f32; 3]; mesh.vertices.len()];
+    let vertex_count = mesh.vertices.len() as u32;
     for face in &mesh.faces {
         let [i0, i1, i2] = *face;
+        if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
+            continue;
+        }
         let v0 = mesh.vertices[i0 as usize];
         let v1 = mesh.vertices[i1 as usize];
         let v2 = mesh.vertices[i2 as usize];
@@ -99,10 +115,41 @@ mod tests {
         }
     }
 
+    fn sample_synth_mesh_with_normal_map() -> SynthMesh {
+        SynthMesh {
+            pbr_textures: Some(crate::SynthMeshPbrTextures {
+                base_color: crate::SynthMeshTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![255; 16],
+                },
+                metallic_roughness: crate::SynthMeshTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![255; 16],
+                },
+                normal: Some(crate::SynthMeshTexture {
+                    width: 2,
+                    height: 2,
+                    rgba8: vec![255; 16],
+                }),
+                emissive: None,
+                occlusion: None,
+            }),
+            ..sample_synth_mesh()
+        }
+    }
+
     #[test]
-    fn bevy_mesh_generation_includes_uvs_and_tangents() {
+    fn bevy_mesh_generation_includes_uvs() {
         let mesh = to_bevy_mesh_synth(&sample_synth_mesh());
         assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_UV_0));
+        assert!(!mesh.contains_attribute(BevyMesh::ATTRIBUTE_TANGENT));
+    }
+
+    #[test]
+    fn bevy_mesh_generation_adds_tangents_when_normal_map_present() {
+        let mesh = to_bevy_mesh_synth(&sample_synth_mesh_with_normal_map());
         assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_TANGENT));
     }
 }

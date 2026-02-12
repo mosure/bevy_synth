@@ -49,7 +49,7 @@ pub struct TripoSGSamplerProgress {
 }
 
 #[cfg(feature = "import")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 /// Loader options for `TripoSGPipeline::from_pretrained_with_options`.
 pub struct TripoSGLoadOptions {
     /// Load source `.safetensors` directly instead of `.bpk` burnpacks.
@@ -60,20 +60,6 @@ pub struct TripoSGLoadOptions {
     ///
     /// `None` preserves legacy env fallback (`DINO_STRICT_PREPROCESS`).
     pub strict_dino_preprocess: Option<bool>,
-}
-
-#[cfg(feature = "import")]
-impl Default for TripoSGLoadOptions {
-    fn default() -> Self {
-        Self {
-            use_safetensors: std::env::var("TRIPOSG_LOAD_SAFETENSORS").is_ok(),
-            burnpack_policy: BurnpackLoadPolicy::from_env_compat(
-                "TRIPOSG_BPK_PRECISION",
-                "BURN_SYNTH_BPK_PRECISION",
-            ),
-            strict_dino_preprocess: None,
-        }
-    }
 }
 
 impl<B: Backend> TripoSGPipeline<B> {
@@ -495,19 +481,13 @@ pub(crate) fn decode_grid_values<B: Backend>(
 }
 
 pub(crate) fn should_device_decode_accumulate<B: Backend>(total_points: usize) -> bool {
-    if !env_flag("TRIPOSG_DECODE_DEVICE_ACCUM", true) {
-        return false;
-    }
     let backend = std::any::type_name::<B>().to_ascii_lowercase();
     let is_gpu_backend =
         backend.contains("wgpu") || backend.contains("cuda") || backend.contains("cube");
     if !is_gpu_backend {
         return false;
     }
-    let max_points = std::env::var("TRIPOSG_DECODE_DEVICE_ACCUM_MAX_POINTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(16_777_216);
+    let max_points = 16_777_216usize;
     total_points <= max_points
 }
 
@@ -624,16 +604,6 @@ fn decoded_chunk_tensor<B: Backend>(
         .reshape([count as i32, 3])
         .unsqueeze_dim(0);
     Ok(vae.decode(coords_tensor, latents.clone(), None))
-}
-
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => default,
-    }
 }
 
 fn write_decoded_chunk_contiguous<B: Backend>(

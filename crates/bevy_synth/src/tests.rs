@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState};
 
-use crate::app::{MeshCacheResource, drive_inference, enqueue_inference};
+use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend, RmbgModel, SynthesisModel,
     TrellisQuality,
@@ -40,7 +40,6 @@ fn test_args() -> AppArgs {
         num_tokens: 4,
         guidance_scale: 1.0,
         seed: None,
-        match_python: false,
         resolution: 16,
         chunk_size: 256,
         bounds: vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
@@ -210,4 +209,20 @@ fn ui_plugin_update_has_no_query_conflicts() {
     app.add_plugins(BurnSynthUiPlugin);
 
     app.update();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn headless_once_requires_image_and_output_without_mesh() {
+    let mut args = test_args();
+    assert!(!should_run_headless_once(&args));
+
+    args.image = Some(PathBuf::from("docs/input_chair.jpg"));
+    assert!(!should_run_headless_once(&args));
+
+    args.output = Some(PathBuf::from("docs/output.glb"));
+    assert!(should_run_headless_once(&args));
+
+    args.mesh = Some(PathBuf::from("docs/output.glb"));
+    assert!(!should_run_headless_once(&args));
 }

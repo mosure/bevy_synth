@@ -251,11 +251,7 @@ pub(super) fn summarize_material(
 }
 
 pub(super) fn runtime_pbr_texture_size() -> usize {
-    std::env::var("TRELLIS2_PBR_TEX_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= 64)
-        .unwrap_or(256)
+    256
 }
 
 #[allow(clippy::type_complexity)]
@@ -1126,10 +1122,7 @@ pub(super) fn occupancy_to_coords(
 
 #[cfg(feature = "runtime-model")]
 pub(super) fn runtime_max_sparse_coords() -> Option<usize> {
-    std::env::var("TRELLIS2_MAX_SPARSE_COORDS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    None
 }
 
 #[cfg(feature = "runtime-model")]

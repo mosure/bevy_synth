@@ -602,34 +602,11 @@ fn mesh_to_glb(mesh: &SynthMesh) -> CacheResult<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn default_native_cache_root() -> PathBuf {
-    if let Ok(explicit) = std::env::var("BURN_SYNTH_CACHE_DIR") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local_app_data)
-            .join("burn_synth")
-            .join("mesh_cache");
-    }
     PathBuf::from(".burn_synth_cache")
 }
 
 #[cfg(target_arch = "wasm32")]
 fn default_web_cache_prefix() -> String {
-    if let Ok(explicit) = std::env::var("BURN_SYNTH_CACHE_PREFIX") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Some(prefix) = option_env!("BURN_SYNTH_CACHE_PREFIX") {
-        let trimmed = prefix.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
     "burn_synth/cache/v3".to_string()
 }
 

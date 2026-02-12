@@ -7,6 +7,7 @@ use burn::prelude::*;
 use image::ImageEncoder;
 use safetensors::tensor::{SafeTensors, TensorView};
 
+use crate::mesh::compute_normals;
 use crate::{SynthMesh, SynthMeshTexture};
 
 pub fn write_glb(path: &Path, mesh: &SynthMesh) -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +41,8 @@ struct MeshBinaryLayout {
     buffer: Vec<u8>,
     positions_byte_offset: usize,
     positions_byte_length: usize,
+    normals_byte_offset: usize,
+    normals_byte_length: usize,
     indices_byte_offset: usize,
     indices_byte_length: usize,
     uvs_byte_offset: Option<usize>,
@@ -73,14 +76,24 @@ fn build_mesh_binary_layout(
     }
 
     let mut buffer =
-        Vec::with_capacity(mesh.mesh.vertices.len() * 12 + mesh.mesh.faces.len() * 12 + 8192);
+        Vec::with_capacity(mesh.mesh.vertices.len() * 24 + mesh.mesh.faces.len() * 12 + 8192);
     let positions_byte_offset = buffer.len();
     for vertex in &mesh.mesh.vertices {
         for component in vertex {
             buffer.extend_from_slice(&component.to_le_bytes());
         }
     }
-    let positions_byte_length = buffer.len();
+    let positions_byte_length = buffer.len() - positions_byte_offset;
+
+    pad_buffer_4(&mut buffer);
+    let normals = compute_normals(&mesh.mesh);
+    let normals_byte_offset = buffer.len();
+    for normal in &normals {
+        for component in normal {
+            buffer.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    let normals_byte_length = buffer.len() - normals_byte_offset;
 
     let mut uvs_byte_offset = None;
     let mut uvs_byte_length = None;
@@ -147,6 +160,8 @@ fn build_mesh_binary_layout(
         buffer,
         positions_byte_offset,
         positions_byte_length,
+        normals_byte_offset,
+        normals_byte_length,
         indices_byte_offset,
         indices_byte_length,
         uvs_byte_offset,
@@ -164,13 +179,14 @@ fn build_mesh_binary_layout(
 fn gltf_json(mesh: &SynthMesh, layout: &MeshBinaryLayout) -> serde_json::Value {
     let mut primitive = serde_json::json!({
         "attributes": {
-            "POSITION": 0
+            "POSITION": 0,
+            "NORMAL": 1
         },
-        "indices": 1,
+        "indices": 2,
         "mode": 4
     });
     if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
-        primitive["attributes"]["TEXCOORD_0"] = serde_json::json!(2);
+        primitive["attributes"]["TEXCOORD_0"] = serde_json::json!(3);
     }
 
     let buffers = vec![serde_json::json!({
@@ -182,6 +198,12 @@ fn gltf_json(mesh: &SynthMesh, layout: &MeshBinaryLayout) -> serde_json::Value {
         "buffer": 0,
         "byteOffset": layout.positions_byte_offset,
         "byteLength": layout.positions_byte_length,
+        "target": 34962
+    }));
+    buffer_views.push(serde_json::json!({
+        "buffer": 0,
+        "byteOffset": layout.normals_byte_offset,
+        "byteLength": layout.normals_byte_length,
         "target": 34962
     }));
     buffer_views.push(serde_json::json!({
@@ -210,13 +232,19 @@ fn gltf_json(mesh: &SynthMesh, layout: &MeshBinaryLayout) -> serde_json::Value {
     }));
     accessors.push(serde_json::json!({
         "bufferView": 1,
+        "componentType": 5126,
+        "count": mesh.mesh.vertices.len(),
+        "type": "VEC3"
+    }));
+    accessors.push(serde_json::json!({
+        "bufferView": 2,
         "componentType": 5125,
         "count": mesh.mesh.faces.len() * 3,
         "type": "SCALAR"
     }));
     if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
         accessors.push(serde_json::json!({
-            "bufferView": 2,
+            "bufferView": 3,
             "componentType": 5126,
             "count": mesh.uvs.len(),
             "type": "VEC2"
@@ -479,5 +507,35 @@ fn tensor_view_to_f32(view: &TensorView<'_>) -> Result<Vec<f32>, Box<dyn std::er
             Ok(data.iter().map(|value| f32::from(*value)).collect())
         }
         other => Err(format!("unsupported text embedding dtype {other:?}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn glb_export_contains_normal_attribute() {
+        let mesh = SynthMesh {
+            mesh: crate::TripoMesh {
+                vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.75, 0.0]],
+                faces: vec![[0, 1, 2]],
+            },
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            material: None,
+            pbr_textures: None,
+        };
+
+        let glb_bytes = mesh_to_glb_bytes(&mesh).expect("glb export");
+        let glb = gltf::Glb::from_slice(glb_bytes.as_slice()).expect("parse glb");
+        let json: Value = serde_json::from_slice(glb.json.as_ref()).expect("parse glb json");
+        let primitive = &json["meshes"][0]["primitives"][0];
+
+        assert_eq!(primitive["attributes"]["POSITION"], 0);
+        assert_eq!(primitive["attributes"]["NORMAL"], 1);
+        assert_eq!(primitive["indices"], 2);
+        assert_eq!(primitive["attributes"]["TEXCOORD_0"], 3);
+        assert_eq!(json["accessors"][1]["type"], "VEC3");
     }
 }

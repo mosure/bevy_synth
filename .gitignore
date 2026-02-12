@@ -53,3 +53,4 @@ assets/images/
 *.ggml
 output/
 sandbox/
+.burn_synth_cache/

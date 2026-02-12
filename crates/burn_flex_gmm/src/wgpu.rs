@@ -680,13 +680,7 @@ fn neighbor_hash_query_kernel(
 }
 
 fn resolve_cube_dim() -> CubeDim {
-    let default = CubeDim::default();
-    let requested = std::env::var("BURN_FLEX_GMM_WGPU_WORKGROUP_SIZE")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| (32..=1024).contains(value))
-        .unwrap_or(default.num_elems());
-    CubeDim::new_1d(requested)
+    CubeDim::default()
 }
 
 fn resolve_split_k(
@@ -698,29 +692,6 @@ fn resolve_split_k(
     let max_split = 8usize;
     let mut split = if let Some(override_split) = split_k_override {
         override_split.clamp(1, max_split)
-    } else if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K") {
-        let value = raw.trim().to_ascii_lowercase();
-        if value == "off" || value == "0" || value == "1" {
-            1
-        } else if value != "auto" {
-            value
-                .parse::<usize>()
-                .ok()
-                .map(|parsed| parsed.clamp(1, max_split))
-                .unwrap_or(1)
-        } else {
-            let k_in = kernel_rows.saturating_mul(config.in_channels_per_group);
-            let work = rows
-                .saturating_mul(config.out_channels_per_group)
-                .saturating_mul(k_in);
-            if work >= 64 * 1024 * 1024 {
-                4
-            } else if work >= 24 * 1024 * 1024 {
-                2
-            } else {
-                1
-            }
-        }
     } else {
         let k_in = kernel_rows.saturating_mul(config.in_channels_per_group);
         let work = rows
@@ -737,11 +708,7 @@ fn resolve_split_k(
 
     let output_elements = rows.saturating_mul(config.out_channels);
     let output_bytes = output_elements.saturating_mul(core::mem::size_of::<f32>());
-    let max_partial_bytes = std::env::var("BURN_FLEX_GMM_WGPU_SPLIT_K_MAX_PARTIAL_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(256 * 1024 * 1024);
+    let max_partial_bytes = 256 * 1024 * 1024usize;
     while split > 1 {
         let partial_bytes = output_bytes.saturating_mul(split);
         if partial_bytes <= max_partial_bytes {
@@ -764,15 +731,6 @@ fn resolve_sparse_conv_kernel_variant(
         SparseWgpuKernelVariant::Auto => {}
     }
 
-    if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_KERNEL") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "baseline" | "default" | "legacy" => return SparseConvKernelVariant::Baseline,
-            "fused" | "fused_oc4" => return SparseConvKernelVariant::FusedOc4,
-            "auto" => {}
-            _ => {}
-        }
-    }
-
     let inner_work = kernel_rows.saturating_mul(config.in_channels_per_group);
     let output_work = rows.saturating_mul(config.out_channels_per_group);
     if config.out_channels_per_group >= FUSED_OC_TILE as usize
@@ -787,14 +745,6 @@ fn resolve_sparse_conv_kernel_variant(
 }
 
 fn resolve_neighbor_backend(_rows: usize, _kernel_rows: usize) -> NeighborBuildBackend {
-    if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "host" | "cpu" => return NeighborBuildBackend::Host,
-            "device" | "gpu" => return NeighborBuildBackend::Device,
-            _ => {}
-        }
-    }
-
     match resolve_neighbor_hash_build_mode() {
         NeighborHashBuildMode::Host => NeighborBuildBackend::Host,
         NeighborHashBuildMode::Wgsl => NeighborBuildBackend::Device,
@@ -805,15 +755,6 @@ fn resolve_neighbor_backend(_rows: usize, _kernel_rows: usize) -> NeighborBuildB
 }
 
 fn resolve_neighbor_device_algo(rows: usize, kernel_rows: usize) -> NeighborDeviceAlgo {
-    if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "scan" => return NeighborDeviceAlgo::Scan,
-            "hash" => return NeighborDeviceAlgo::Hash,
-            "auto" => {}
-            _ => {}
-        }
-    }
-
     let work = rows.saturating_mul(kernel_rows);
     if work >= 131_072 {
         NeighborDeviceAlgo::Hash
@@ -823,23 +764,11 @@ fn resolve_neighbor_device_algo(rows: usize, kernel_rows: usize) -> NeighborDevi
 }
 
 fn resolve_neighbor_hash_build_mode() -> NeighborHashBuildMode {
-    if let Ok(raw) = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "host" | "cpu" => return NeighborHashBuildMode::Host,
-            "wgsl" | "device" | "gpu" => return NeighborHashBuildMode::Wgsl,
-            "auto" => return NeighborHashBuildMode::Auto,
-            _ => {}
-        }
-    }
     NeighborHashBuildMode::Auto
 }
 
 fn resolve_neighbor_hash_load_factor() -> usize {
-    std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_LOAD_FACTOR")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value >= 2)
-        .unwrap_or(DEFAULT_NEIGHBOR_HASH_LOAD_FACTOR)
+    DEFAULT_NEIGHBOR_HASH_LOAD_FACTOR
 }
 
 fn resolve_neighbor_hash_table_size(rows: usize) -> usize {
@@ -854,21 +783,13 @@ fn resolve_neighbor_hash_table_size(rows: usize) -> usize {
 
 fn resolve_neighbor_hash_max_probe(table_size: usize) -> usize {
     // Large default probe windows can cause pathological WGSL loop cost and buffer invalidation.
-    // Keep a conservative cap by default; callers can raise/lower with env override.
-    let limit = std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_MAX_PROBE")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
+    // Keep a conservative cap by default.
+    let limit = 128usize;
     limit.min(table_size).max(1)
 }
 
 fn neighbor_cache_max_entries() -> usize {
-    std::env::var("BURN_FLEX_GMM_WGPU_NEIGHBOR_CACHE_MAX")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_NEIGHBOR_CACHE_MAX)
+    DEFAULT_NEIGHBOR_CACHE_MAX
 }
 
 fn trim_cache(cache: &mut HashMap<NeighborRowsCacheKey, BurnTensor<DefaultWgpuBackend, 2, Int>>) {

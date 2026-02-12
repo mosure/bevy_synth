@@ -2257,56 +2257,18 @@ enum DecoderConvImpl {
 }
 
 fn decoder_conv_impl() -> DecoderConvImpl {
-    match std::env::var("TRELLIS2_DECODER_CONV_IMPL")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
+    #[cfg(feature = "runtime-model-wgpu")]
     {
-        Some("legacy") => DecoderConvImpl::Legacy,
-        Some("flex") | Some("flex_gmm") => DecoderConvImpl::FlexGmm,
-        #[cfg(feature = "runtime-model-wgpu")]
-        Some("wgpu") => DecoderConvImpl::Wgpu,
-        Some("auto") | None => {
-            if !env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
-                #[cfg(feature = "runtime-model-wgpu")]
-                {
-                    DecoderConvImpl::Wgpu
-                }
-                #[cfg(not(feature = "runtime-model-wgpu"))]
-                {
-                    DecoderConvImpl::FlexGmm
-                }
-            } else {
-                DecoderConvImpl::FlexGmm
-            }
-        }
-        Some(_) => {
-            #[cfg(feature = "runtime-model-wgpu")]
-            {
-                if !env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
-                    DecoderConvImpl::Wgpu
-                } else {
-                    DecoderConvImpl::FlexGmm
-                }
-            }
-            #[cfg(not(feature = "runtime-model-wgpu"))]
-            {
-                DecoderConvImpl::FlexGmm
-            }
-        }
+        DecoderConvImpl::Wgpu
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        DecoderConvImpl::FlexGmm
     }
 }
 
 fn decoder_conv_debug_enabled() -> bool {
-    std::env::var("TRELLIS2_DECODER_CONV_DEBUG")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 pub(crate) fn reset_decoder_conv_telemetry() {
@@ -2425,31 +2387,18 @@ fn telemetry_record_wgpu_success(
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_neighbor_from_coords() -> bool {
-    let Some(raw) = std::env::var("TRELLIS2_DECODER_WGPU_NEIGHBOR_SOURCE").ok() else {
-        return true;
-    };
-    !matches!(raw.trim().to_ascii_lowercase().as_str(), "rows" | "host")
+    true
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_clear_cache_after_decode() -> bool {
-    let Some(raw) = std::env::var("TRELLIS2_DECODER_WGPU_CLEAR_CACHE_AFTER_DECODE").ok() else {
-        // Persist decoder tensors by default to avoid per-inference cache rebuild stalls.
-        return false;
-    };
-    !matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
+    // Persist decoder tensors by default to avoid per-inference cache rebuild stalls.
+    false
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_tensor_cache_max() -> usize {
-    std::env::var("TRELLIS2_DECODER_WGPU_TENSOR_CACHE_MAX")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DECODER_WGPU_TENSOR_CACHE_MAX)
+    DECODER_WGPU_TENSOR_CACHE_MAX
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -2465,28 +2414,12 @@ fn decoder_wgpu_device_math_enabled() -> bool {
     if decoder_conv_impl() != DecoderConvImpl::Wgpu {
         return false;
     }
-    std::env::var("TRELLIS2_DECODER_WGPU_DEVICE_MATH")
-        .ok()
-        .map(|raw| {
-            !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+    true
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_device_math_allow_fp16() -> bool {
-    std::env::var("TRELLIS2_DECODER_WGPU_DEVICE_MATH_FP16")
-        .ok()
-        .map(|raw| {
-            !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+    true
 }
 
 fn flex_config_for_layer(layer: &SparseConvLayer) -> FlexConvConfig {
@@ -2700,33 +2633,11 @@ fn sparse_subm_conv_forward_legacy(
 }
 
 fn conv_kernel_axis_order() -> [usize; 3] {
-    if let Some(value) = std::env::var("TRELLIS2_CONV_AXIS_ORDER")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-    {
-        return match value.as_str() {
-            "xzy" => [0, 2, 1],
-            "yxz" => [1, 0, 2],
-            "yzx" => [1, 2, 0],
-            "zxy" => [2, 0, 1],
-            "zyx" => [2, 1, 0],
-            _ => [0, 1, 2],
-        };
-    }
-
     [0, 1, 2]
 }
 
 fn conv_kernel_axis_signs() -> [i32; 3] {
-    let raw = std::env::var("TRELLIS2_CONV_AXIS_SIGN")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "+++".to_string());
-    let mut signs = [1i32, 1, 1];
-    for (idx, ch) in raw.chars().take(3).enumerate() {
-        signs[idx] = if ch == '-' { -1 } else { 1 };
-    }
-    signs
+    [1, 1, 1]
 }
 
 fn layer_norm_inplace(
@@ -2822,27 +2733,11 @@ fn row_center_logits(data: &mut [f32], rows: usize) {
 }
 
 fn should_center_subdivision_logits() -> bool {
-    std::env::var("TRELLIS2_DECODER_CENTER_SUBDIV_LOGITS")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 fn decoder_force_fp32() -> bool {
-    std::env::var("TRELLIS2_DECODER_FORCE_FP32")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 fn add_inplace(lhs: &mut [f32], rhs: &[f32]) {
@@ -2907,18 +2802,6 @@ fn logits_to_mask(
 }
 
 fn decoder_max_children_per_parent() -> Option<usize> {
-    if let Ok(value) = std::env::var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT")
-        && let Ok(parsed) = value.trim().parse::<usize>()
-    {
-        if parsed == 0 {
-            return None;
-        }
-        return Some(parsed.min(8));
-    }
-
-    if env_flag("TRELLIS2_PARITY_STRICT") || env_flag("TRELLIS2_DECODER_UNCAPPED") {
-        return None;
-    }
     // Default to uncapped subdivision for decoder parity.
     None
 }
@@ -2936,33 +2819,18 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_max_output_bytes() -> usize {
-    std::env::var("TRELLIS2_DECODER_WGPU_MAX_OUTPUT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(256 * 1024 * 1024)
+    256 * 1024 * 1024
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_max_input_bytes() -> usize {
-    std::env::var("TRELLIS2_DECODER_WGPU_MAX_INPUT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1024 * 1024 * 1024)
+    1024 * 1024 * 1024
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_chunk_rows(rows: usize, bytes_per_row: usize, max_output_bytes: usize) -> usize {
     if rows == 0 {
         return 1;
-    }
-    if let Some(explicit) = std::env::var("TRELLIS2_DECODER_WGPU_CHUNK_ROWS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-    {
-        return explicit.min(rows).max(1);
     }
     if bytes_per_row == 0 {
         return rows;
@@ -2974,24 +2842,12 @@ fn decoder_wgpu_chunk_rows(rows: usize, bytes_per_row: usize, max_output_bytes: 
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_hotspot_min_output_bytes() -> usize {
-    std::env::var("TRELLIS2_DECODER_WGPU_HOTSPOT_MIN_OUTPUT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(384 * 1024 * 1024)
+    384 * 1024 * 1024
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_hotspot_fused_enabled() -> bool {
-    std::env::var("TRELLIS2_DECODER_WGPU_HOTSPOT_FUSED")
-        .ok()
-        .map(|raw| {
-            !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+    true
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -3016,18 +2872,6 @@ fn decoder_wgpu_forward_config_for_call(
     } else {
         SparseWgpuForwardConfig::default()
     }
-}
-
-fn env_flag(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn channel2spatial(
@@ -3127,7 +2971,7 @@ fn map_guide_subdivision_logits(
     }
 
     let mut out = Vec::with_capacity(coords.len() * 8);
-    let strict = env_flag("TRELLIS2_PARITY_STRICT");
+    let strict = false;
     for coord in coords {
         if let Some(row) = map.get(coord) {
             out.extend_from_slice(row);
@@ -3287,19 +3131,7 @@ fn resolve_model_weight_candidates(
 }
 
 fn prefer_f16_burnpack() -> bool {
-    let precision = std::env::var("TRELLIS2_BPK_PRECISION")
-        .ok()
-        .or_else(|| std::env::var("BURN_SYNTH_BPK_PRECISION").ok());
-    match precision
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("f32" | "fp32" | "float32" | "32") => false,
-        Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-        Some(_) | None => true,
-    }
+    true
 }
 
 fn resolve_model_source_path(

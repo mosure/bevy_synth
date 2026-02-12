@@ -19,8 +19,7 @@ impl BpkPrecisionPreference {
 
 /// Burnpack path selection policy used by model loaders.
 ///
-/// Prefer passing this explicitly from runtime configuration. Environment-variable
-/// parsing remains available as a compatibility fallback.
+/// Prefer passing this explicitly from runtime configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BurnpackLoadPolicy {
     pub precision: BpkPrecisionPreference,
@@ -45,12 +44,9 @@ impl BurnpackLoadPolicy {
         Self { f16_suffix, ..self }
     }
 
-    /// Compatibility helper for legacy env-driven precision selection.
-    pub fn from_env_compat(primary: &str, fallback: &str) -> Self {
-        let value = std::env::var(primary)
-            .ok()
-            .or_else(|| std::env::var(fallback).ok());
-        Self::default().with_precision(parse_precision_value(value.as_deref()))
+    /// Compatibility helper retained for API stability.
+    pub fn from_env_compat(_primary: &str, _fallback: &str) -> Self {
+        Self::default()
     }
 }
 
@@ -102,14 +98,6 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(file_name)
 }
 
-fn parse_precision_value(value: Option<&str>) -> BpkPrecisionPreference {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("f32" | "fp32" | "float32" | "32") => BpkPrecisionPreference::PreferF32,
-        Some("f16" | "fp16" | "float16" | "half" | "16") => BpkPrecisionPreference::PreferF16,
-        Some(_) | None => BpkPrecisionPreference::PreferF16,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -117,7 +105,7 @@ mod tests {
     };
 
     #[test]
-    fn defaults_to_f16_when_env_is_missing_or_unknown() {
+    fn compatibility_env_parser_defaults_to_f16() {
         let default = BurnpackLoadPolicy::from_env_compat(
             "BURN_TRIPO_TEST_MISSING_PRIMARY",
             "BURN_TRIPO_TEST_MISSING_FALLBACK",

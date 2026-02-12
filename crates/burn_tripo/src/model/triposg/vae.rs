@@ -634,6 +634,19 @@ pub mod import {
         Ok(model)
     }
 
+    pub fn load_triposg_vae_from_burnpack_file<B: Backend>(
+        config: &TripoSGVaeConfig,
+        device: &B::Device,
+        burnpack_path: impl AsRef<Path>,
+    ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
+        let mut model = TripoSGVae::new(device, config.clone());
+        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load TripoSG VAE burnpack file: {err}"))?;
+        Ok(model)
+    }
+
     fn default_burnpack_policy() -> BurnpackLoadPolicy {
         BurnpackLoadPolicy::from_env_compat("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
     }

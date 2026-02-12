@@ -1835,25 +1835,9 @@ enum AttentionImpl {
     Stream,
 }
 
-fn env_flag_enabled(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|raw| {
-            matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 #[cfg(feature = "runtime-model-wgpu")]
 fn sparse_flow_wgpu_max_peak_bytes() -> usize {
-    std::env::var("TRELLIS2_SPARSE_FLOW_WGPU_MAX_PEAK_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(3 * 1024 * 1024 * 1024)
+    3 * 1024 * 1024 * 1024
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -1881,7 +1865,7 @@ fn sparse_flow_wgpu_may_overflow(config: &SparseStructureFlowConfig) -> bool {
 }
 
 fn attention_debug_enabled() -> bool {
-    env_flag_enabled("TRELLIS2_ATTN_DEBUG")
+    false
 }
 
 fn attention_prefers_stream() -> bool {
@@ -1896,38 +1880,17 @@ fn attention_prefers_stream() -> bool {
 }
 
 fn env_chunk_tokens(key: &str, default: usize, max_chunk: usize, tokens: usize) -> usize {
-    let requested = std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default.max(1));
+    let _ = key;
+    let requested = default.max(1);
     requested.min(max_chunk.max(1)).min(tokens.max(1))
 }
 
 fn sparse_flow_chunked_forward_enabled(tokens: usize) -> bool {
-    if let Ok(raw) = std::env::var("TRELLIS2_SPARSE_FLOW_CHUNKED_FORWARD") {
-        return !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        );
-    }
-    if env_flag_enabled("TRELLIS2_PARITY_STRICT") || env_flag_enabled("TRELLIS2_E2E_STRICT") {
-        return false;
-    }
     attention_prefers_stream() && tokens >= 2_048
 }
 
 fn sparse_flow_stream_reuse_qkv_enabled(tokens: usize, channels: usize) -> bool {
-    if let Ok(raw) = std::env::var("TRELLIS2_SPARSE_FLOW_STREAM_REUSE_QKV") {
-        return !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        );
-    }
     if !sparse_flow_chunked_forward_enabled(tokens) {
-        return false;
-    }
-    if env_flag_enabled("TRELLIS2_PARITY_STRICT") || env_flag_enabled("TRELLIS2_E2E_STRICT") {
         return false;
     }
     #[cfg(feature = "runtime-model-wgpu")]
@@ -1958,11 +1921,7 @@ fn sparse_flow_linear_chunk_tokens(tokens: usize) -> usize {
 }
 
 fn sparse_flow_attn_logits_budget_bytes() -> usize {
-    std::env::var("TRELLIS2_SPARSE_FLOW_ATTN_LOGITS_BUDGET_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2_147_483_648)
+    2_147_483_648
 }
 
 fn integer_sqrt(value: usize) -> usize {
@@ -2044,31 +2003,13 @@ fn matmul_4d_via_3d<B: Backend>(lhs: Tensor<B, 4>, rhs: Tensor<B, 4>) -> Tensor<
 }
 
 fn attention_impl(query_tokens: usize, key_tokens: usize) -> AttentionImpl {
-    let auto =
-        if env_flag_enabled("TRELLIS2_PARITY_STRICT") || env_flag_enabled("TRELLIS2_E2E_STRICT") {
-            AttentionImpl::Dense
-        } else {
-            let work = query_tokens.saturating_mul(key_tokens);
-            if (attention_prefers_stream() && work >= 64usize.saturating_mul(64))
-                || work >= 512usize.saturating_mul(512)
-            {
-                AttentionImpl::Stream
-            } else {
-                AttentionImpl::Dense
-            }
-        };
-
-    match std::env::var("TRELLIS2_ATTN_BACKEND")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
+    let work = query_tokens.saturating_mul(key_tokens);
+    if (attention_prefers_stream() && work >= 64usize.saturating_mul(64))
+        || work >= 512usize.saturating_mul(512)
     {
-        Some("dense") | Some("chunked") | Some("naive") | Some("sdpa") => AttentionImpl::Dense,
-        Some("stream") | Some("flash") | Some("flash_like") | Some("varlen") => {
-            AttentionImpl::Stream
-        }
-        Some("auto") | None => auto,
-        Some(_) => auto,
+        AttentionImpl::Stream
+    } else {
+        AttentionImpl::Dense
     }
 }
 
@@ -2326,57 +2267,29 @@ fn attention_logits_bytes(
 }
 
 fn attention_logits_budget_bytes() -> usize {
-    std::env::var("TRELLIS2_ATTN_MAX_LOGITS_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            if attention_prefers_stream() {
-                512 * 1024 * 1024
-            } else {
-                usize::MAX
-            }
-        })
+    if attention_prefers_stream() {
+        512 * 1024 * 1024
+    } else {
+        usize::MAX
+    }
 }
 
 fn attention_query_chunk(tokens: usize, default_chunk: usize) -> usize {
-    let env_chunk = std::env::var("TRELLIS2_ATTN_QUERY_CHUNK")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_chunk);
-    let max_chunk = std::env::var("TRELLIS2_ATTN_QUERY_CHUNK_MAX")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            if attention_prefers_stream() {
-                256
-            } else {
-                usize::MAX
-            }
-        });
-    env_chunk.min(max_chunk).min(tokens.max(1))
+    let max_chunk = if attention_prefers_stream() {
+        256
+    } else {
+        usize::MAX
+    };
+    default_chunk.min(max_chunk).min(tokens.max(1))
 }
 
 fn attention_key_chunk(tokens: usize) -> usize {
-    let env_chunk = std::env::var("TRELLIS2_ATTN_KEY_CHUNK")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    let max_chunk = std::env::var("TRELLIS2_ATTN_KEY_CHUNK_MAX")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            if attention_prefers_stream() {
-                512
-            } else {
-                usize::MAX
-            }
-        });
-    env_chunk.min(max_chunk).min(tokens.max(1))
+    let max_chunk = if attention_prefers_stream() {
+        512
+    } else {
+        usize::MAX
+    };
+    128usize.min(max_chunk).min(tokens.max(1))
 }
 
 fn apply_rope<B: Backend>(
@@ -2677,19 +2590,7 @@ fn resolve_model_weight_candidates(
 }
 
 fn prefer_f16_burnpack() -> bool {
-    let precision = std::env::var("TRELLIS2_BPK_PRECISION")
-        .ok()
-        .or_else(|| std::env::var("BURN_SYNTH_BPK_PRECISION").ok());
-    match precision
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("f32" | "fp32" | "float32" | "32") => false,
-        Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-        Some(_) | None => true,
-    }
+    true
 }
 
 fn resolve_model_source_path(

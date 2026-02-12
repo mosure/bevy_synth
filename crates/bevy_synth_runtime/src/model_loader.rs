@@ -1,25 +1,11 @@
-use std::env;
-
 use burn_synth_import::layout::{
     burnpack_manifest_candidates as shared_manifest_candidates,
     candidate_burnpack_names as shared_candidate_burnpack_names,
 };
 use burn_synth_import::shard::BurnpackShardManifest;
 
-pub(crate) fn prefer_f16_burnpack(primary: &str) -> bool {
-    let value = env::var(primary)
-        .ok()
-        .or_else(|| env::var("BURN_SYNTH_BPK_PRECISION").ok());
-    match value
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("f32" | "fp32" | "float32" | "32") => false,
-        Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-        Some(_) | None => true,
-    }
+pub(crate) fn prefer_f16_burnpack(_primary: &str) -> bool {
+    true
 }
 
 pub(crate) fn candidate_burnpack_names(
@@ -86,7 +72,7 @@ pub(crate) fn resolve_manifest_entry_uri(manifest_uri: &str, entry_uri: &str) ->
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::Read;
+use std::io::{self, Write};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
@@ -118,20 +104,31 @@ pub(crate) fn load_optional_text_candidates_from_root(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn load_burnpack_asset_from_root(
+pub(crate) fn resolve_burnpack_asset_path_from_root(
     root: &Path,
     base_safetensors_rel: &str,
     precision_env: &str,
-) -> Result<Vec<u8>, String> {
-    let candidates =
-        candidate_burnpack_names(base_safetensors_rel, prefer_f16_burnpack(precision_env));
+) -> Result<PathBuf, String> {
+    resolve_burnpack_asset_path_from_root_with_preference(
+        root,
+        base_safetensors_rel,
+        prefer_f16_burnpack(precision_env),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn resolve_burnpack_asset_path_from_root_with_preference(
+    root: &Path,
+    base_safetensors_rel: &str,
+    prefer_f16: bool,
+) -> Result<PathBuf, String> {
+    let candidates = candidate_burnpack_names(base_safetensors_rel, prefer_f16);
     let mut checked = Vec::new();
     for candidate in candidates {
         let candidate_path = root.join(Path::new(&candidate));
         checked.push(candidate_path.display().to_string());
         if candidate_path.exists() {
-            return fs::read(&candidate_path)
-                .map_err(|err| format!("failed to read {}: {err}", candidate_path.display()));
+            return Ok(candidate_path);
         }
 
         for manifest_path in burnpack_manifest_candidate_paths(&candidate_path) {
@@ -139,7 +136,8 @@ pub(crate) fn load_burnpack_asset_from_root(
             if !manifest_path.exists() {
                 continue;
             }
-            return load_burnpack_from_manifest(&manifest_path);
+            materialize_burnpack_from_manifest(&manifest_path, &candidate_path)?;
+            return Ok(candidate_path);
         }
     }
 
@@ -158,7 +156,22 @@ fn burnpack_manifest_candidate_paths(candidate_path: &Path) -> [PathBuf; 2] {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_burnpack_from_manifest(manifest_path: &Path) -> Result<Vec<u8>, String> {
+fn resolve_manifest_entry_path(manifest_path: &Path, shard_path: &str) -> Result<PathBuf, String> {
+    let shard_path = Path::new(shard_path);
+    if shard_path.is_absolute() {
+        return Ok(shard_path.to_path_buf());
+    }
+    manifest_path
+        .parent()
+        .map(|parent| parent.join(shard_path))
+        .ok_or_else(|| format!("invalid shard manifest path '{}'", manifest_path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn materialize_burnpack_from_manifest(
+    manifest_path: &Path,
+    destination_path: &Path,
+) -> Result<(), String> {
     let manifest_bytes = fs::read(manifest_path).map_err(|err| {
         format!(
             "failed to read shard manifest {}: {err}",
@@ -172,35 +185,65 @@ fn load_burnpack_from_manifest(manifest_path: &Path) -> Result<Vec<u8>, String> 
         return Err("shard manifest contains no shard entries".to_string());
     }
 
-    // Reconstruct directly into the destination buffer so peak host RAM stays close to
-    // `total_bytes` (+ allocator overhead), instead of `total_bytes + current_shard`.
-    let mut output = Vec::with_capacity(manifest.total_bytes as usize);
+    if let Some(parent) = destination_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create burnpack output directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let destination_tmp = destination_path.with_extension(
+        destination_path
+            .extension()
+            .map(|ext| format!("{}.tmp", ext.to_string_lossy()))
+            .unwrap_or_else(|| "tmp".to_string()),
+    );
+    let mut output = fs::File::create(&destination_tmp).map_err(|err| {
+        format!(
+            "failed to create reconstructed burnpack {}: {err}",
+            destination_tmp.display()
+        )
+    })?;
+    let mut bytes_written = 0u64;
     for shard in shards {
-        let shard_path = Path::new(shard.path());
-        let full_path = if shard_path.is_absolute() {
-            shard_path.to_path_buf()
-        } else {
-            manifest_path
-                .parent()
-                .map(|parent| parent.join(shard_path))
-                .ok_or_else(|| {
-                    format!("invalid shard manifest path '{}'", manifest_path.display())
-                })?
-        };
+        let full_path = resolve_manifest_entry_path(manifest_path, shard.path())?;
         let mut file = fs::File::open(&full_path)
             .map_err(|err| format!("failed to open shard {}: {err}", full_path.display()))?;
-        file.read_to_end(&mut output)
-            .map_err(|err| format!("failed to read shard {}: {err}", full_path.display()))?;
+        bytes_written = bytes_written.saturating_add(
+            io::copy(&mut file, &mut output)
+                .map_err(|err| format!("failed to read shard {}: {err}", full_path.display()))?,
+        );
     }
+    output.flush().map_err(|err| {
+        format!(
+            "failed to flush reconstructed burnpack {}: {err}",
+            destination_tmp.display()
+        )
+    })?;
 
-    if manifest.total_bytes > 0 && output.len() as u64 != manifest.total_bytes {
+    if manifest.total_bytes > 0 && bytes_written != manifest.total_bytes {
         return Err(format!(
             "shard manifest expected {} bytes but reconstructed {} bytes",
-            manifest.total_bytes,
-            output.len()
+            manifest.total_bytes, bytes_written
         ));
     }
-    Ok(output)
+
+    if destination_path.exists() {
+        fs::remove_file(destination_path).map_err(|err| {
+            format!(
+                "failed to replace stale burnpack {}: {err}",
+                destination_path.display()
+            )
+        })?;
+    }
+    fs::rename(&destination_tmp, destination_path).map_err(|err| {
+        format!(
+            "failed to finalize reconstructed burnpack {}: {err}",
+            destination_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -221,8 +264,10 @@ mod tests {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 
     use super::{
-        burnpack_manifest_candidates, candidate_burnpack_names, load_burnpack_asset_from_root,
-        parse_shard_manifest_bytes, prefer_f16_burnpack, reconstruct_burnpack_from_shard_manifest,
+        burnpack_manifest_candidates, candidate_burnpack_names, parse_shard_manifest_bytes,
+        prefer_f16_burnpack, reconstruct_burnpack_from_shard_manifest,
+        resolve_burnpack_asset_path_from_root,
+        resolve_burnpack_asset_path_from_root_with_preference,
     };
 
     const ONE_MIB: u64 = 1024 * 1024;
@@ -316,6 +361,16 @@ mod tests {
         format!("{:.1} MiB", bytes as f64 / ONE_MIB as f64)
     }
 
+    fn load_burnpack_bytes_for_test(root: &std::path::Path, base_safetensors_rel: &str) -> Vec<u8> {
+        let path = resolve_burnpack_asset_path_from_root(
+            root,
+            base_safetensors_rel,
+            "BURN_SYNTH_TEST_PRECISION",
+        )
+        .expect("failed to resolve burnpack path");
+        fs::read(&path).expect("failed to read burnpack bytes")
+    }
+
     fn unique_temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -361,9 +416,7 @@ mod tests {
         )
         .expect("failed to write manifest");
 
-        let bytes =
-            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
-                .expect("failed to load sharded burnpack");
+        let bytes = load_burnpack_bytes_for_test(&root, "model.safetensors");
         assert_eq!(bytes, b"abcdef");
 
         fs::remove_dir_all(root).expect("failed to cleanup temp root");
@@ -385,9 +438,7 @@ mod tests {
         )
         .expect("failed to write manifest");
 
-        let bytes =
-            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
-                .expect("failed to load burnpack from legacy manifest suffix");
+        let bytes = load_burnpack_bytes_for_test(&root, "model.safetensors");
         assert_eq!(bytes, b"abcdef");
 
         fs::remove_dir_all(root).expect("failed to cleanup temp root");
@@ -408,9 +459,7 @@ mod tests {
         )
         .expect("failed to write manifest");
 
-        let bytes =
-            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
-                .expect("failed to load burnpack from nested detailed manifest");
+        let bytes = load_burnpack_bytes_for_test(&root, "model.safetensors");
         assert_eq!(bytes, b"abcdef");
 
         fs::remove_dir_all(root).expect("failed to cleanup temp root");
@@ -429,9 +478,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let bytes =
-            load_burnpack_asset_from_root(&root, "model.safetensors", "BURN_SYNTH_TEST_PRECISION")
-                .expect("failed to load direct burnpack");
+        let bytes = load_burnpack_bytes_for_test(&root, "model.safetensors");
         assert_eq!(bytes, b"direct-bpk");
 
         fs::remove_dir_all(root).expect("failed to cleanup temp root");
@@ -490,12 +537,7 @@ mod tests {
             fs::remove_file(&load_path).expect("failed to remove direct burnpack");
 
             let (loaded, peak_delta) = measure_peak_rss_delta_bytes(|| {
-                load_burnpack_asset_from_root(
-                    &root,
-                    "model.safetensors",
-                    "BURN_SYNTH_TEST_PRECISION",
-                )
-                .expect("failed to load sharded burnpack")
+                load_burnpack_bytes_for_test(&root, "model.safetensors")
             });
 
             assert_eq!(loaded.len() as u64, total_bytes);
@@ -512,6 +554,65 @@ mod tests {
                 shard_size_mib
             );
         }
+
+        fs::remove_dir_all(root).expect("failed to cleanup temp root");
+    }
+
+    #[test]
+    fn sharded_materialize_path_process_ram_spike_stays_under_128mib() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).expect("failed to create temp root");
+
+        let source_path = root.join("source_model_f16.bpk");
+        let load_path = root.join("model_f16.bpk");
+        let total_bytes = 96 * ONE_MIB;
+        write_patterned_file(&source_path, total_bytes);
+        let source_hash = sha256_file(&source_path).expect("failed to hash source burnpack");
+
+        for shard_size_mib in [4_u64, 32_u64] {
+            fs::copy(&source_path, &load_path).expect("failed to copy source burnpack");
+            write_shards_for_burnpack(&load_path, shard_size_mib, true)
+                .expect("failed to shard burnpack");
+            fs::remove_file(&load_path).expect("failed to remove direct burnpack");
+
+            let (resolved, peak_delta) = measure_peak_rss_delta_bytes(|| {
+                resolve_burnpack_asset_path_from_root_with_preference(
+                    &root,
+                    "model.safetensors",
+                    true,
+                )
+                .expect("failed to resolve sharded burnpack path")
+            });
+
+            assert!(resolved.exists(), "resolved path should exist");
+            assert_eq!(
+                sha256_file(&resolved).expect("failed to hash resolved burnpack"),
+                source_hash
+            );
+
+            // Streaming materialization should stay well below a full-model host allocation.
+            let allowed_peak_delta = 128 * ONE_MIB;
+            assert!(
+                peak_delta <= allowed_peak_delta,
+                "peak host RAM delta {} exceeded streaming budget {} for shard size {} MiB",
+                format_mebibytes(peak_delta),
+                format_mebibytes(allowed_peak_delta),
+                shard_size_mib
+            );
+            fs::remove_file(&resolved).expect("failed to remove materialized burnpack");
+        }
+
+        // Validate the precision-env helper resolves identically.
+        let resolved = resolve_burnpack_asset_path_from_root(
+            &root,
+            "model.safetensors",
+            "BURN_SYNTH_TEST_PRECISION",
+        )
+        .expect("resolve via precision env helper");
+        assert!(
+            resolved.exists(),
+            "precision helper should materialize file"
+        );
 
         fs::remove_dir_all(root).expect("failed to cleanup temp root");
     }

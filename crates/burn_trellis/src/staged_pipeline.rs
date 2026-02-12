@@ -404,30 +404,11 @@ impl TrellisStageRuntime {
             );
         }
         #[cfg(feature = "runtime-model")]
-        let runtime_model_disabled = std::env::var("TRELLIS2_DISABLE_RUNTIME_MODEL")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let runtime_model_disabled = false;
         #[cfg(feature = "runtime-model")]
-        let runtime_decoders_disabled = std::env::var("TRELLIS2_DISABLE_RUNTIME_DECODERS")
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let runtime_decoders_disabled = false;
         #[cfg(feature = "runtime-model")]
-        let slat_dense_resolution = std::env::var("TRELLIS2_SLAT_DENSE_RESOLUTION")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0);
+        let slat_dense_resolution = None;
         #[cfg(feature = "runtime-model")]
         let prefer_512_slat = matches!(pipeline_type.as_str(), "512" | "512_base");
         #[cfg(feature = "runtime-model")]
@@ -919,55 +900,26 @@ impl TrellisStageRuntime {
 }
 
 fn runtime_sampler_steps_override() -> Option<usize> {
-    std::env::var("TRELLIS2_SAMPLER_STEPS_OVERRIDE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    None
 }
 
 fn runtime_parity_strict() -> bool {
-    for key in ["TRELLIS2_PARITY_STRICT", "TRELLIS2_E2E_STRICT"] {
-        if let Ok(value) = std::env::var(key)
-            && matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        {
-            return true;
-        }
-    }
     false
 }
 
 fn runtime_stage_debug_enabled() -> bool {
-    std::env::var("TRELLIS2_STAGE_DEBUG")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 #[cfg(feature = "runtime-model")]
 fn runtime_lazy_model_load_enabled() -> bool {
-    match std::env::var("TRELLIS2_RUNTIME_LAZY_MODEL_LOAD") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => {
-            #[cfg(target_arch = "wasm32")]
-            {
-                true
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                false
-            }
-        }
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
     }
 }
 
@@ -1091,15 +1043,7 @@ fn load_tex_decoder_from_spec(
 
 #[cfg(feature = "runtime-model")]
 fn runtime_decoder_conv_telemetry_enabled() -> bool {
-    std::env::var("TRELLIS2_DECODER_CONV_TELEMETRY")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -1159,27 +1103,11 @@ fn log_decoder_conv_telemetry(stage: &str, telemetry: &DecoderConvTelemetry) {
 }
 
 fn runtime_skip_decode() -> bool {
-    std::env::var("TRELLIS2_SKIP_DECODE")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 fn runtime_skip_pbr() -> bool {
-    std::env::var("TRELLIS2_SKIP_PBR")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    false
 }
 
 fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
@@ -1190,11 +1118,7 @@ fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
         return None;
     }
     if backend_name == "wgpu" {
-        return std::env::var("TRELLIS2_MAX_SPARSE_COORDS_WGPU_DEFAULT")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .or(Some(32_768));
+        return Some(32_768);
     }
     None
 }
@@ -1206,10 +1130,7 @@ fn runtime_max_sparse_coords_override() -> Option<usize> {
     }
     #[cfg(not(feature = "runtime-model"))]
     {
-        std::env::var("TRELLIS2_MAX_SPARSE_COORDS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
+        None
     }
 }
 
@@ -2769,10 +2690,7 @@ mod tests {
     #[cfg(feature = "runtime-model")]
     use std::path::PathBuf;
 
-    use super::{
-        FlowEulerSampleConfig, ShapeSLatSample, TexSLatSample, bake_pbr_from_voxels,
-        decode_latent_to_outputs, summarize_material,
-    };
+    use super::{bake_pbr_from_voxels, summarize_material};
     #[cfg(feature = "runtime-model")]
     use crate::hook_diff::{HookSnapshot, compute_stats};
     use crate::mesh::MeshPbrTextures;

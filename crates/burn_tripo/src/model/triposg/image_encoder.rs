@@ -66,8 +66,7 @@ impl DinoImageProcessor {
     }
 
     fn strict_preprocess_enabled(&self) -> bool {
-        self.strict_preprocess
-            .unwrap_or_else(|| env_flag("DINO_STRICT_PREPROCESS", false))
+        self.strict_preprocess.unwrap_or(false)
     }
 
     pub fn preprocess<B: Backend>(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
@@ -250,16 +249,6 @@ impl DinoImageProcessor {
     }
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => default,
-    }
-}
-
 #[cfg(feature = "import")]
 pub mod import {
     use std::{
@@ -382,6 +371,20 @@ pub mod import {
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack bytes: {err}"))?;
+        Ok(TripoSGImageEncoder::new(model))
+    }
+
+    pub fn load_triposg_dinov2_from_burnpack_file<B: Backend>(
+        device: &B::Device,
+        config: DinoVisionTransformerConfig,
+        burnpack_path: impl AsRef<Path>,
+    ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
+        let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
+            burn_dino::model::dino::DinoVisionTransformer::new(device, config);
+        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load dinov2 burnpack file: {err}"))?;
         Ok(TripoSGImageEncoder::new(model))
     }
 
@@ -615,15 +618,7 @@ pub mod import {
     }
 
     fn allow_legacy_dinov2_preprocessor() -> bool {
-        std::env::var("TRIPOSG_ALLOW_LEGACY_DINO_PREPROCESS")
-            .ok()
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(false)
+        false
     }
 
     fn has_dinov2_weights_root(weights_root: &Path) -> bool {
@@ -1076,14 +1071,11 @@ pub mod import {
     }
 
     pub fn resolve_triposg_weights_root() -> PathBuf {
-        if let Ok(root) = std::env::var("TRIPOSG_WEIGHTS_ROOT") {
-            return PathBuf::from(root);
-        }
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/MIDI-3D")
     }
 
     fn default_burnpack_policy() -> BurnpackLoadPolicy {
-        BurnpackLoadPolicy::from_env_compat("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
+        BurnpackLoadPolicy::default()
     }
 
     pub fn import_triposg_dinov2_burnpack<B: Backend>(

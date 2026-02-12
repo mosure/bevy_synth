@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::model::triposg::vae::TripoSGVae;
 use crate::pipeline::mesh::DenseGrid;
-use crate::readback::{tensor_to_vec_f32, tensor_to_vec_i32};
+use crate::readback::tensor_to_vec_f32;
 
 const FLASH_INVALID_SENTINEL: f32 = -10000.0;
 const FLASH_INVALID_THRESHOLD: f32 = -9000.0;
 const FLASH_WGPU_MAX_POINTS: usize = 4096;
+const FLASH_DEBUG: bool = false;
 static FLASH_FORCE_CPU: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
@@ -118,7 +119,7 @@ pub fn flash_extract_geometry<B: Backend>(
     let latents_cpu = latents.clone();
     match flash_extract_geometry_gpu(latents, vae, config) {
         Ok(grid) => {
-            if grid_is_all_nan(&grid) && std::env::var("TRIPOSG_FLASH_NO_FALLBACK").is_err() {
+            if grid_is_all_nan(&grid) {
                 eprintln!(
                     "flash_extract_geometry: GPU grid was all NaNs, retrying with CPU flash path."
                 );
@@ -128,27 +129,18 @@ pub fn flash_extract_geometry<B: Backend>(
             Ok(grid)
         }
         Err(err) => {
-            if std::env::var("TRIPOSG_FLASH_NO_FALLBACK").is_err() {
-                eprintln!(
-                    "flash_extract_geometry: GPU flash failed ({err}), retrying with CPU flash path."
-                );
-                FLASH_FORCE_CPU.store(true, Ordering::Relaxed);
-                return flash_extract_geometry_cpu(latents_cpu, vae, config);
-            }
-            Err(err)
+            eprintln!(
+                "flash_extract_geometry: GPU flash failed ({err}), retrying with CPU flash path."
+            );
+            FLASH_FORCE_CPU.store(true, Ordering::Relaxed);
+            flash_extract_geometry_cpu(latents_cpu, vae, config)
         }
     }
 }
 
 fn should_use_gpu_flash<B: Backend>() -> bool {
-    if std::env::var("TRIPOSG_FLASH_CPU").is_ok() {
-        return false;
-    }
     if FLASH_FORCE_CPU.load(Ordering::Relaxed) {
         return false;
-    }
-    if std::env::var("TRIPOSG_FLASH_GPU").is_ok() {
-        return true;
     }
     let backend_name = std::any::type_name::<B>().to_ascii_lowercase();
     if backend_name.contains("ndarray") {
@@ -158,11 +150,6 @@ fn should_use_gpu_flash<B: Backend>() -> bool {
 }
 
 fn flash_max_points<B: Backend>() -> usize {
-    if let Ok(raw) = std::env::var("TRIPOSG_FLASH_MAX_POINTS")
-        && let Ok(parsed) = raw.parse::<usize>()
-    {
-        return parsed.max(1);
-    }
     let backend_name = std::any::type_name::<B>().to_ascii_lowercase();
     if backend_name.contains("wgpu") {
         return FLASH_WGPU_MAX_POINTS;
@@ -302,7 +289,7 @@ fn grid_is_all_nan(grid: &DenseGrid) -> bool {
 }
 
 fn log_flash_stats<B: Backend>(label: &str, grid: &Tensor<B, 3>, size: usize) {
-    if std::env::var("TRIPOSG_FLASH_DEBUG").is_err() {
+    if !FLASH_DEBUG {
         return;
     }
     let data = match tensor_to_vec_f32(grid.clone()) {
@@ -342,7 +329,7 @@ fn grid_all_invalid<B: Backend>(grid: &Tensor<B, 3>) -> bool {
 }
 
 fn log_flash_level_empty(reason: &str, level_idx: usize, curr: usize, next: usize) {
-    if std::env::var("TRIPOSG_FLASH_DEBUG").is_err() {
+    if !FLASH_DEBUG {
         return;
     }
     eprintln!(
@@ -516,7 +503,7 @@ fn eval_flash_base_grid<B: Backend>(
     let points_per_block = mini_size * mini_size * mini_size;
     let mut blocks_per_batch = (num_chunks / points_per_block).max(1);
     let max_points = flash_max_points::<B>();
-    if std::env::var("TRIPOSG_FLASH_DEBUG").is_ok() {
+    if FLASH_DEBUG {
         eprintln!(
             "flash_extract_geometry[base]: points_per_block={points_per_block} num_chunks={num_chunks} max_points={max_points}"
         );
@@ -800,7 +787,7 @@ fn eval_flash_base_grid_gpu<B: Backend>(
         let coords_world = coords_to_world_2(coords_idx.clone(), bounds, step);
         let indices = coords_to_linear_indices_2(coords_idx, grid_size);
 
-        if std::env::var("TRIPOSG_FLASH_DEBUG").is_ok()
+        if FLASH_DEBUG
             && start == 0
             && let Ok(coord_data) = tensor_to_vec_f32(coords_world.clone())
         {
@@ -914,79 +901,6 @@ fn maybe_group_flash_coords<B: Backend>(
     coords: Tensor<B, 2>,
     indices: Tensor<B, 1, Int>,
 ) -> Result<FlashCoords<B>, Box<dyn std::error::Error>> {
-    if std::env::var("TRIPOSG_FLASH_GROUP").is_err() {
-        return Ok((coords, indices));
-    }
-
-    let grid = std::env::var("TRIPOSG_FLASH_GROUP_GRID")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(6)
-        .max(1);
-    let device = coords.device();
-
-    let coords_data = tensor_to_vec_f32(coords.clone())
-        .map_err(|err| format!("failed to read flash coords for grouping: {err}"))?;
-    let indices_data = tensor_to_vec_i32(indices.clone())
-        .map_err(|err| format!("failed to read flash indices for grouping: {err}"))?;
-
-    let count = indices_data.len();
-    if count == 0 {
-        return Ok((coords, indices));
-    }
-
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for i in 0..count {
-        let base = i * 3;
-        let x = coords_data[base];
-        let y = coords_data[base + 1];
-        let z = coords_data[base + 2];
-        min[0] = min[0].min(x);
-        min[1] = min[1].min(y);
-        min[2] = min[2].min(z);
-        max[0] = max[0].max(x);
-        max[1] = max[1].max(y);
-        max[2] = max[2].max(z);
-    }
-
-    let mut order: Vec<(u32, usize)> = Vec::with_capacity(count);
-    let grid_f = grid as f32;
-    let eps = 1e-6f32;
-    for i in 0..count {
-        let base = i * 3;
-        let x = coords_data[base];
-        let y = coords_data[base + 1];
-        let z = coords_data[base + 2];
-
-        let nx = ((x - min[0]) / (max[0] - min[0] + eps) * (grid_f - 0.001))
-            .floor()
-            .clamp(0.0, grid_f - 1.0) as u32;
-        let ny = ((y - min[1]) / (max[1] - min[1] + eps) * (grid_f - 0.001))
-            .floor()
-            .clamp(0.0, grid_f - 1.0) as u32;
-        let nz = ((z - min[2]) / (max[2] - min[2] + eps) * (grid_f - 0.001))
-            .floor()
-            .clamp(0.0, grid_f - 1.0) as u32;
-        let key = nx * (grid as u32 * grid as u32) + ny * grid as u32 + nz;
-        order.push((key, i));
-    }
-    order.sort_by_key(|(key, _)| *key);
-
-    let mut coords_sorted = vec![0.0f32; coords_data.len()];
-    let mut indices_sorted = vec![0i32; indices_data.len()];
-    for (dst, (_, src)) in order.iter().enumerate() {
-        let src_base = src * 3;
-        let dst_base = dst * 3;
-        coords_sorted[dst_base] = coords_data[src_base];
-        coords_sorted[dst_base + 1] = coords_data[src_base + 1];
-        coords_sorted[dst_base + 2] = coords_data[src_base + 2];
-        indices_sorted[dst] = indices_data[*src];
-    }
-
-    let coords = Tensor::<B, 2>::from_data(TensorData::new(coords_sorted, [count, 3]), &device);
-    let idx_data = TensorData::new(indices_sorted, [count]);
-    let indices = Tensor::<B, 1, Int>::from_data(idx_data.convert::<i32>(), &device);
     Ok((coords, indices))
 }
 

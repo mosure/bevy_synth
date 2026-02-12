@@ -64,21 +64,12 @@ struct Cli {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Match Python parity defaults (seed + decimation + CPU DINO on WGPU).
-    /// Enabled by default; pass --no-match-python to disable.
-    #[arg(long, default_value_t = true)]
-    match_python: bool,
-
-    /// Disable Python parity defaults.
-    #[arg(long, default_value_t = false)]
-    no_match_python: bool,
-
-    /// DINO backend (auto, cpu, gpu). `auto` uses CPU on WGPU when --match-python is enabled.
+    /// DINO backend (auto, cpu, gpu).
     #[arg(long, value_enum, default_value_t = CliDinoBackend::Auto)]
     dino_backend: CliDinoBackend,
 
     /// Target face count for mesh decimation. Use 0 to disable.
-    /// Defaults to 10,000 when --match-python is enabled.
+    /// Defaults to 10,000.
     #[arg(long)]
     faces: Option<usize>,
 
@@ -208,21 +199,10 @@ fn run_with_large_stack(cli: Cli) -> Result<(), String> {
 
 fn run(cli: Cli) -> Result<(), String> {
     let synthesis_models = sanitize_synthesis_models(cli.synthesis_models);
-    let match_python = if cli.no_match_python {
-        false
-    } else {
-        cli.match_python
-    };
     let target_faces = match cli.faces {
         Some(0) => None,
         Some(value) => Some(value),
-        None => {
-            if match_python {
-                Some(10_000)
-            } else {
-                None
-            }
-        }
+        None => Some(10_000),
     };
     let mut runtime_config = RuntimeConfig {
         model_selection: ModelSelection::new(
@@ -245,7 +225,6 @@ fn run(cli: Cli) -> Result<(), String> {
             .guidance_scale
             .unwrap_or(RuntimeConfig::default().guidance_scale),
         seed: cli.seed.or(RuntimeConfig::default().seed),
-        match_python,
         dino_backend: cli.dino_backend.into(),
         target_faces,
         ..RuntimeConfig::default()

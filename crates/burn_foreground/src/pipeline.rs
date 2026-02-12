@@ -414,14 +414,7 @@ fn infer_alpha_mask<B: Backend>(
         .map(|value| (value * 255.0) as u8)
         .collect::<Vec<u8>>();
 
-    let mut thresh = otsu_threshold(&alpha_u8) as i32;
-    if let Some(bias) = std::env::var("RMBG_OTSU_BIAS")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-    {
-        thresh = (thresh + bias).clamp(0, 255);
-    }
-    let thresh = thresh as u8;
+    let thresh = otsu_threshold(&alpha_u8) as u8;
     for value in &mut alpha_u8 {
         *value = if *value > thresh { 255 } else { 0 };
     }

@@ -54,15 +54,6 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = QualityPreset::Full)]
     pub quality: QualityPreset,
 
-    /// Match Python TripoSG defaults for parity (full quality + fixed seed + decimation target).
-    /// Enabled by default; pass --no-match-python to disable.
-    #[arg(long, default_value_t = true)]
-    pub match_python: bool,
-
-    /// Disable Python parity defaults (use CLI-provided settings).
-    #[arg(long, default_value_t = false)]
-    pub no_match_python: bool,
-
     /// Number of diffusion steps (overrides --quality).
     #[arg(long)]
     pub num_steps: Option<usize>,
@@ -134,7 +125,7 @@ pub struct Args {
     pub flash_mc_level: Option<f32>,
 
     /// Target face count for mesh decimation (post-process). Use 0 to disable.
-    /// Defaults to 10,000 when --match-python is enabled.
+    /// Defaults to 10,000 for TripoSG.
     #[arg(long)]
     pub faces: Option<usize>,
 
@@ -326,7 +317,6 @@ pub struct AppArgs {
     pub num_tokens: usize,
     pub guidance_scale: f32,
     pub seed: Option<u64>,
-    pub match_python: bool,
     pub resolution: usize,
     pub chunk_size: usize,
     pub bounds: Vec<f32>,
@@ -353,27 +343,12 @@ pub struct AppArgs {
 }
 
 pub fn build_app_args(args: Args) -> AppArgs {
-    let match_python = if args.no_match_python {
-        false
-    } else {
-        args.match_python
-    };
-    let defaults = if match_python {
-        QualityPreset::Full.defaults()
-    } else {
-        args.quality.defaults()
-    };
-    let seed = args.seed.or(if match_python { Some(42) } else { None });
+    let defaults = args.quality.defaults();
+    let seed = args.seed;
     let target_faces = match args.faces {
         Some(0) => None,
         Some(value) => Some(value),
-        None => {
-            if match_python {
-                Some(10_000)
-            } else {
-                None
-            }
-        }
+        None => Some(10_000),
     };
     AppArgs {
         image: args.image,
@@ -391,7 +366,6 @@ pub fn build_app_args(args: Args) -> AppArgs {
         num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),
         guidance_scale: args.guidance_scale.unwrap_or(defaults.guidance_scale),
         seed,
-        match_python,
         resolution: args.resolution.unwrap_or(defaults.resolution),
         chunk_size: args.chunk_size.unwrap_or(defaults.chunk_size),
         bounds: args.bounds,

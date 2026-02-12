@@ -99,14 +99,7 @@ impl Rmbg2Pipeline {
                 .map(|value| (value * 255.0).clamp(0.0, 255.0) as u8)
                 .collect::<Vec<u8>>();
 
-            let mut thresh = otsu_threshold(&alpha_u8) as i32;
-            if let Some(bias) = std::env::var("RMBG_OTSU_BIAS")
-                .ok()
-                .and_then(|v| v.parse::<i32>().ok())
-            {
-                thresh = (thresh + bias).clamp(0, 255);
-            }
-            let thresh = thresh as u8;
+            let thresh = otsu_threshold(&alpha_u8) as u8;
             for value in &mut alpha_u8 {
                 *value = if *value > thresh { 255 } else { 0 };
             }
@@ -297,19 +290,6 @@ pub mod import {
     }
 
     pub fn resolve_rmbg2_weights_root() -> PathBuf {
-        if let Ok(root) = std::env::var("RMBG2_WEIGHTS_ROOT") {
-            let path = PathBuf::from(root);
-            if path.exists() {
-                return path;
-            }
-        }
-        if let Ok(root) = std::env::var("RMBG_WEIGHTS_ROOT") {
-            let path = PathBuf::from(root);
-            if path.exists() {
-                return path;
-            }
-        }
-
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let candidates = [manifest.join("assets/models/RMBG-2.0")];
         for path in candidates {
@@ -437,18 +417,6 @@ pub mod import {
             return Ok(root.to_path_buf());
         }
 
-        if let Ok(explicit) = std::env::var("RMBG2_ONNX_FILE") {
-            let explicit = PathBuf::from(explicit);
-            let path = if explicit.is_relative() {
-                root.join(explicit)
-            } else {
-                explicit
-            };
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-
         let candidates = if use_f16 {
             MODEL_CANDIDATES_F16
         } else {
@@ -481,28 +449,7 @@ pub mod import {
     }
 
     fn prefer_f16_burnpack() -> bool {
-        preferred_precision_from_env(
-            "RMBG2_BPK_PRECISION",
-            "RMBG_BPK_PRECISION",
-            "BURN_SYNTH_BPK_PRECISION",
-        )
-    }
-
-    fn preferred_precision_from_env(primary: &str, fallback1: &str, fallback2: &str) -> bool {
-        let value = std::env::var(primary)
-            .ok()
-            .or_else(|| std::env::var(fallback1).ok())
-            .or_else(|| std::env::var(fallback2).ok());
-        match value
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("f32" | "fp32" | "float32" | "32") => false,
-            Some("f16" | "fp16" | "float16" | "half" | "16") => true,
-            Some(_) | None => true,
-        }
+        true
     }
 
     fn burnpack_path(root: &Path, use_f16: bool) -> PathBuf {
