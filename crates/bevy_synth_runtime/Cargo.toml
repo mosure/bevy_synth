@@ -8,8 +8,8 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["wgpu"]
-wgpu = ["dep:burn-wgpu"]
-cuda = ["burn-cuda"]
+wgpu = ["dep:burn-wgpu", "burn_synth/wgpu"]
+cuda = ["burn-cuda", "burn_synth/cuda"]
 
 [dependencies]
 bevy = "0.17"
@@ -33,6 +33,7 @@ burn_trellis = { path = "../burn_trellis", features = ["runtime-model"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+burn_synth = { path = "../burn_synth", default-features = false, features = ["runtime"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [

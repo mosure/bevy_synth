@@ -3,7 +3,7 @@ name = "bevy_synth"
 version = "0.1.0"
 edition = "2024"
 
-description = "Bevy app for TripoSG image/text to mesh"
+description = "bevy media synthesis plugin"
 license = "MIT OR Apache-2.0"
 
 [features]

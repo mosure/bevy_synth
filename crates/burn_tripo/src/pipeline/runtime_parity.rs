@@ -68,7 +68,7 @@ pub fn triposg_runtime_profile(
 ) -> TripoSGRuntimeParityProfile {
     let max_image_dim = fallback_max_image_dim.filter(|value| *value > 0 && *value != usize::MAX);
     let burnpack_policy =
-        BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF16);
+        BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF32);
 
     TripoSGRuntimeParityProfile {
         strict_dino_preprocess: true,
@@ -102,17 +102,37 @@ pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, Str
         meshopt::VertexDataAdapter::new(vertices_bytes, std::mem::size_of::<[f32; 3]>(), 0)
             .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
 
+    // Start from low-error simplification and only relax if we can't reach target count.
+    // This avoids aggressive topology collapse at moderate face budgets (e.g. 10k).
     let mut result_error = 0.0f32;
-    let mut simplified = meshopt::simplify(
-        &indices,
-        &adapter,
-        target_index_count,
-        1.0,
-        meshopt::SimplifyOptions::None,
-        Some(&mut result_error),
-    );
+    let mut simplified = Vec::<u32>::new();
+    for error_limit in [0.02f32, 0.05, 0.1, 0.25, 0.5, 1.0] {
+        let mut stage_error = 0.0f32;
+        let candidate = meshopt::simplify(
+            &indices,
+            &adapter,
+            target_index_count,
+            error_limit,
+            meshopt::SimplifyOptions::None,
+            Some(&mut stage_error),
+        );
+        if candidate.len() < 3 {
+            continue;
+        }
+        result_error = stage_error;
+        simplified = candidate;
+        if simplified.len() <= target_index_count {
+            break;
+        }
+    }
     if simplified.len() > target_index_count {
-        simplified = meshopt::simplify_sloppy(&indices, &adapter, target_index_count, 1.0, None);
+        simplified = meshopt::simplify_sloppy(
+            &indices,
+            &adapter,
+            target_index_count,
+            result_error.max(0.25),
+            None,
+        );
     }
     if simplified.len() < 3 {
         return Err("meshopt simplification produced empty mesh".to_string());
@@ -155,7 +175,7 @@ mod tests {
         assert!(profile.strict_dino_preprocess);
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
-        assert!(profile.burnpack_policy.precision.prefer_f16());
+        assert!(!profile.burnpack_policy.precision.prefer_f16());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

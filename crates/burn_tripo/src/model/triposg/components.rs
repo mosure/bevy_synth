@@ -116,12 +116,13 @@ impl<B: Backend> CrossAttention<B> {
             None
         };
         let norm_q = if qk_norm {
-            RmsNorm::new(head_dim, 1e-5, device).into()
+            // Diffusers TripoSG attention uses qk_norm="rms_norm" with eps=1e-6.
+            RmsNorm::new(head_dim, 1e-6, device).into()
         } else {
             None
         };
         let norm_k = if qk_norm {
-            RmsNorm::new(head_dim, 1e-5, device).into()
+            RmsNorm::new(head_dim, 1e-6, device).into()
         } else {
             None
         };

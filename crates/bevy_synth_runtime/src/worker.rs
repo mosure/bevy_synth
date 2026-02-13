@@ -1,5 +1,7 @@
 use std::any::TypeId;
 use std::sync::Mutex;
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use std::sync::Once;
 #[cfg(target_arch = "wasm32")]
 use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -19,12 +21,12 @@ use burn_foreground::pipeline::{
     prepare_image_data_from_bytes, prepare_image_tensor, prepare_image_tensor_from_bytes,
 };
 use burn_foreground::rmbg2::Rmbg2Pipeline;
+use burn_foreground::rmbg14::import::load_rmbg_config_from_json_bytes;
 #[cfg(target_arch = "wasm32")]
 use burn_foreground::rmbg14::import::load_rmbg_from_burnpack_bytes;
-use burn_foreground::rmbg14::import::{
-    load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_file,
-    load_rmbg_processor_from_json_bytes,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use burn_foreground::rmbg14::import::load_rmbg_from_burnpack_file;
+use burn_foreground::rmbg14::import::load_rmbg_processor_from_json_bytes;
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 use burn_trellis::config::TrellisQuality as TrellisRuntimeQuality;
 use burn_trellis::pipeline::{
@@ -33,21 +35,28 @@ use burn_trellis::pipeline::{
 use burn_tripo::model::triposg::dit::TripoSGDiTConfig;
 #[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::dit::import::load_triposg_dit_from_burnpack_bytes;
+#[cfg(not(target_arch = "wasm32"))]
 use burn_tripo::model::triposg::dit::import::load_triposg_dit_from_burnpack_file;
+use burn_tripo::model::triposg::image_encoder::import::default_dinov2_config;
 #[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::image_encoder::import::load_dinov2_processor_from_json_bytes;
 #[cfg(target_arch = "wasm32")]
 use burn_tripo::model::triposg::image_encoder::import::load_triposg_dinov2_from_burnpack_bytes;
+#[cfg(not(target_arch = "wasm32"))]
 use burn_tripo::model::triposg::image_encoder::import::{
-    default_dinov2_config, load_dinov2_config_from_json_bytes, load_dinov2_processor,
+    load_dinov2_config_from_json_bytes, load_dinov2_processor,
     load_triposg_dinov2_from_burnpack_file,
 };
 use burn_tripo::model::triposg::image_encoder::{DinoImageProcessor, TripoSGImageEncoder};
+#[cfg(not(target_arch = "wasm32"))]
 use burn_tripo::model::triposg::load_policy::BurnpackLoadPolicy;
 use burn_tripo::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
 use burn_tripo::model::triposg::vae::TripoSGVaeConfig;
 #[cfg(target_arch = "wasm32")]
-use burn_tripo::model::triposg::vae::import::load_triposg_vae_from_burnpack_bytes;
+use burn_tripo::model::triposg::vae::import::load_triposg_vae_decoder_from_burnpack_bytes;
+#[cfg(not(target_arch = "wasm32"))]
+use burn_tripo::model::triposg::vae::import::load_triposg_vae_decoder_from_burnpack_file;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use burn_tripo::model::triposg::vae::import::load_triposg_vae_from_burnpack_file;
 use burn_tripo::pipeline::{
     geometry::{
@@ -98,6 +107,12 @@ use web_sys::{ReadableStreamDefaultReader, Response};
 mod worker_unavailable;
 #[cfg(any(target_arch = "wasm32", not(feature = "wgpu"), not(feature = "cuda")))]
 use worker_unavailable::worker_loop_backend_unavailable;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "worker_runtime_bridge.rs"]
+mod worker_runtime_bridge;
+
+#[cfg(feature = "wgpu")]
+type WgpuRuntimeBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 
 const WGPU_CHUNK_SIZE_CAP: usize = 8_192;
 const CUDA_CHUNK_SIZE_CAP: usize = 32_768;
@@ -119,7 +134,10 @@ const ONE_GIB: u64 = 1024 * 1024 * 1024;
 const DEFAULT_WEB_MAX_HOST_RAM_BYTES: u64 = 4 * ONE_GIB;
 
 struct Rmbg14Artifacts {
+    #[cfg(not(target_arch = "wasm32"))]
     burnpack_path: std::path::PathBuf,
+    #[cfg(target_arch = "wasm32")]
+    burnpack: Vec<u8>,
     config_json: Option<String>,
     processor_json: Option<String>,
 }
@@ -290,6 +308,12 @@ pub fn start_worker(args: &AppArgs) -> InferenceWorker {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn worker_loop(args: AppArgs, command_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
+    if worker_runtime_bridge::supports_shared_runtime(&args) {
+        info!("Using shared burn_synth runtime worker path.");
+        worker_runtime_bridge::worker_loop_shared_runtime(args, command_rx, event_tx);
+        return;
+    }
+    info!("Using legacy bevy_synth_runtime worker path.");
     match args.backend {
         BackendKind::Cpu => {
             worker_loop_backend::<burn::backend::NdArray<f32>>(args, command_rx, event_tx)
@@ -297,7 +321,7 @@ fn worker_loop(args: AppArgs, command_rx: Receiver<WorkerCommand>, event_tx: Sen
         BackendKind::Wgpu => {
             #[cfg(feature = "wgpu")]
             {
-                worker_loop_backend::<burn_wgpu::Wgpu>(args, command_rx, event_tx);
+                worker_loop_backend::<WgpuRuntimeBackend>(args, command_rx, event_tx);
             }
             #[cfg(not(feature = "wgpu"))]
             {
@@ -339,7 +363,7 @@ async fn worker_loop_wasm(
         BackendKind::Wgpu => {
             #[cfg(feature = "wgpu")]
             {
-                worker_loop_backend_wasm::<burn_wgpu::Wgpu>(args, command_rx, event_tx).await;
+                worker_loop_backend_wasm::<WgpuRuntimeBackend>(args, command_rx, event_tx).await;
             }
             #[cfg(not(feature = "wgpu"))]
             {
@@ -421,6 +445,7 @@ fn load_rmbg14_pipelines<B: Backend>(
                 load_rmbg_from_burnpack_file(&cpu_device, &artifacts.burnpack_path, &rmbg_config)
                     .map_err(|err| format!("failed to load RMBG burnpack on CPU: {err}"))?;
             <burn::backend::NdArray<f32> as Backend>::sync(&cpu_device);
+            <burn::backend::NdArray<f32> as Backend>::memory_cleanup(&cpu_device);
             let rmbg = RmbgPipeline::new(model, rmbg_processor);
             Ok((Some(rmbg), None))
         }
@@ -429,6 +454,7 @@ fn load_rmbg14_pipelines<B: Backend>(
                 load_rmbg_from_burnpack_file(device, &artifacts.burnpack_path, &rmbg_config)
                     .map_err(|err| format!("failed to load RMBG burnpack: {err}"))?;
             B::sync(device);
+            B::memory_cleanup(device);
             let mut rmbg = RmbgPipeline::new(model, rmbg_processor);
             cap_rmbg14_processor_for_backend::<B>(&mut rmbg, rmbg_backend);
             Ok((None, Some(rmbg)))
@@ -568,25 +594,21 @@ fn build_triposg_pipeline_from_artifacts<B: Backend>(
         }
     }
 
-    let vae =
-        load_triposg_vae_from_burnpack_file(&vae_config, device, &artifacts.vae_burnpack_path)
-            .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
+    let vae = load_triposg_vae_decoder_from_burnpack_file(
+        &vae_config,
+        device,
+        &artifacts.vae_burnpack_path,
+    )
+    .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
     B::sync(device);
+    B::memory_cleanup(device);
     let dit =
         load_triposg_dit_from_burnpack_file(&dit_config, device, &artifacts.dit_burnpack_path)
             .map_err(|err| format!("failed to load TripoSG DiT burnpack: {err}"))?;
     B::sync(device);
-    let image_encoder = load_triposg_dinov2_from_burnpack_file(
-        device,
-        dino_config.clone(),
-        &artifacts.dino_burnpack_path,
-    )
-    .map_err(|err| format!("failed to load DINOv2 burnpack: {err}"))?;
-    B::sync(device);
+    B::memory_cleanup(device);
     let scheduler = scheduler_config.init();
-    let triposg = TripoSGPipeline::new(vae, dit, scheduler, image_encoder, dino_processor.clone());
-
-    let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
+    let (image_encoder, dino_cpu) = if matches!(dino_backend, DinoBackend::Cpu) {
         let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
         let encoder = load_triposg_dinov2_from_burnpack_file(
             &cpu_device,
@@ -595,14 +617,33 @@ fn build_triposg_pipeline_from_artifacts<B: Backend>(
         )
         .map_err(|err| format!("failed to load DINOv2 burnpack on CPU: {err}"))?;
         <burn::backend::NdArray<f32> as Backend>::sync(&cpu_device);
-        Some(DinoCpuState {
-            device: cpu_device,
-            encoder,
-            processor: dino_processor,
-        })
+        <burn::backend::NdArray<f32> as Backend>::memory_cleanup(&cpu_device);
+        (
+            None,
+            Some(DinoCpuState {
+                device: cpu_device,
+                encoder,
+                processor: dino_processor.clone(),
+            }),
+        )
     } else {
-        None
+        let image_encoder = load_triposg_dinov2_from_burnpack_file(
+            device,
+            dino_config.clone(),
+            &artifacts.dino_burnpack_path,
+        )
+        .map_err(|err| format!("failed to load DINOv2 burnpack: {err}"))?;
+        B::sync(device);
+        B::memory_cleanup(device);
+        (Some(image_encoder), None)
     };
+    let triposg = TripoSGPipeline::new_with_optional_image_encoder(
+        vae,
+        dit,
+        scheduler,
+        image_encoder,
+        dino_processor.clone(),
+    );
 
     Ok((dino_cpu, triposg))
 }
@@ -1016,6 +1057,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
                     }
                 };
             <burn::backend::NdArray<f32> as Backend>::sync(&cpu_device);
+            <burn::backend::NdArray<f32> as Backend>::memory_cleanup(&cpu_device);
             host_ram_budget.release_retained(rmbg_burnpack_bytes);
             (Some(RmbgPipeline::new(model, rmbg_processor.clone())), None)
         }
@@ -1028,6 +1070,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
                 }
             };
             B::sync(&device);
+            B::memory_cleanup(&device);
             host_ram_budget.release_retained(rmbg_burnpack_bytes);
             let mut pipeline = RmbgPipeline::new(model, rmbg_processor);
             cap_rmbg14_processor_for_backend::<B>(&mut pipeline, rmbg_backend);
@@ -1226,7 +1269,8 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
     .await?;
     let vae_burnpack_bytes = vae_burnpack.len() as u64;
     host_ram_budget.reserve_retained(vae_burnpack_bytes, "retaining TripoSG VAE burnpack bytes")?;
-    let vae = match load_triposg_vae_from_burnpack_bytes(&vae_config, device, vae_burnpack) {
+    let vae = match load_triposg_vae_decoder_from_burnpack_bytes(&vae_config, device, vae_burnpack)
+    {
         Ok(model) => model,
         Err(err) => {
             host_ram_budget.release_retained(vae_burnpack_bytes);
@@ -1234,6 +1278,7 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
         }
     };
     B::sync(device);
+    B::memory_cleanup(device);
     host_ram_budget.release_retained(vae_burnpack_bytes);
 
     let dit_burnpack = download_burnpack_asset(
@@ -1258,44 +1303,11 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
         }
     };
     B::sync(device);
+    B::memory_cleanup(device);
     host_ram_budget.release_retained(dit_burnpack_bytes);
 
-    let dino_gpu_burnpack = download_burnpack_asset(
-        &join_web_path(&triposg_root_url, "image_encoder_dinov2/model.safetensors"),
-        "DINOv2",
-        prefer_f16_burnpack,
-        event_tx,
-        totals,
-        host_ram_budget,
-    )
-    .await?;
-    let dino_gpu_burnpack_bytes = dino_gpu_burnpack.len() as u64;
-    host_ram_budget.reserve_retained(
-        dino_gpu_burnpack_bytes,
-        "retaining DINOv2 GPU burnpack bytes",
-    )?;
-    let image_encoder = match load_triposg_dinov2_from_burnpack_bytes(
-        device,
-        dino_config.clone(),
-        dino_gpu_burnpack,
-    ) {
-        Ok(encoder) => encoder,
-        Err(err) => {
-            host_ram_budget.release_retained(dino_gpu_burnpack_bytes);
-            return Err(format!("failed to load DINOv2 burnpack: {err}"));
-        }
-    };
-    B::sync(device);
-    host_ram_budget.release_retained(dino_gpu_burnpack_bytes);
-
-    let scheduler = scheduler_config.init();
-    let triposg = TripoSGPipeline::new(vae, dit, scheduler, image_encoder, dino_processor.clone());
-
-    let dino_cpu = if matches!(dino_backend, DinoBackend::Cpu) {
+    let (image_encoder, dino_cpu) = if matches!(dino_backend, DinoBackend::Cpu) {
         let cpu_device = <burn::backend::NdArray<f32> as Backend>::Device::default();
-
-        // Load CPU DINO from a separate download to avoid retaining two giant copies of the
-        // same burnpack simultaneously during wasm startup.
         let dino_cpu_burnpack = download_burnpack_asset(
             &join_web_path(&triposg_root_url, "image_encoder_dinov2/model.safetensors"),
             "DINOv2 (CPU)",
@@ -1322,15 +1334,56 @@ async fn load_triposg_pipeline_wasm<B: Backend>(
             }
         };
         <burn::backend::NdArray<f32> as Backend>::sync(&cpu_device);
+        <burn::backend::NdArray<f32> as Backend>::memory_cleanup(&cpu_device);
         host_ram_budget.release_retained(dino_cpu_burnpack_bytes);
-        Some(DinoCpuState {
-            device: cpu_device,
-            encoder,
-            processor: dino_processor,
-        })
+        (
+            None,
+            Some(DinoCpuState {
+                device: cpu_device,
+                encoder,
+                processor: dino_processor.clone(),
+            }),
+        )
     } else {
-        None
+        let dino_gpu_burnpack = download_burnpack_asset(
+            &join_web_path(&triposg_root_url, "image_encoder_dinov2/model.safetensors"),
+            "DINOv2",
+            prefer_f16_burnpack,
+            event_tx,
+            totals,
+            host_ram_budget,
+        )
+        .await?;
+        let dino_gpu_burnpack_bytes = dino_gpu_burnpack.len() as u64;
+        host_ram_budget.reserve_retained(
+            dino_gpu_burnpack_bytes,
+            "retaining DINOv2 GPU burnpack bytes",
+        )?;
+        let image_encoder = match load_triposg_dinov2_from_burnpack_bytes(
+            device,
+            dino_config.clone(),
+            dino_gpu_burnpack,
+        ) {
+            Ok(encoder) => encoder,
+            Err(err) => {
+                host_ram_budget.release_retained(dino_gpu_burnpack_bytes);
+                return Err(format!("failed to load DINOv2 burnpack: {err}"));
+            }
+        };
+        B::sync(device);
+        B::memory_cleanup(device);
+        host_ram_budget.release_retained(dino_gpu_burnpack_bytes);
+        (Some(image_encoder), None)
     };
+
+    let scheduler = scheduler_config.init();
+    let triposg = TripoSGPipeline::new_with_optional_image_encoder(
+        vae,
+        dit,
+        scheduler,
+        image_encoder,
+        dino_processor.clone(),
+    );
 
     Ok((dino_cpu, triposg))
 }
@@ -1990,7 +2043,11 @@ fn run_triposg_batch<B: Backend>(
         convert_embeds_to_device(&cpu_embeds, &state.device)?
     } else {
         let processed = preprocess_and_stack_images(&pipeline.image_processor, images)?;
-        pipeline.image_encoder.forward(processed)
+        pipeline
+            .image_encoder
+            .as_ref()
+            .ok_or_else(|| "DINO GPU encoder not loaded".to_string())?
+            .forward(processed)
     };
 
     let [batch_size, _, _] = image_embeds.shape().dims::<3>();
@@ -2310,15 +2367,10 @@ fn is_gpu_backend<B: Backend>() -> bool {
 }
 
 fn is_wgpu_backend<B: Backend>() -> bool {
-    #[cfg(feature = "wgpu")]
-    {
-        TypeId::of::<B>() == TypeId::of::<burn_wgpu::Wgpu>()
-    }
-    #[cfg(not(feature = "wgpu"))]
-    {
-        let _ = TypeId::of::<B>();
-        false
-    }
+    let _ = TypeId::of::<B>();
+    std::any::type_name::<B>()
+        .to_ascii_lowercase()
+        .contains("wgpu")
 }
 
 fn is_cuda_backend<B: Backend>() -> bool {
@@ -2335,6 +2387,25 @@ fn is_cuda_backend<B: Backend>() -> bool {
 
 fn configure_cubecl_autotune<B: Backend>() {
     let _ = TypeId::of::<B>();
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    if is_wgpu_backend::<B>() {
+        configure_wgpu_runtime_memory_profile();
+    }
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn configure_wgpu_runtime_memory_profile() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let device = burn_wgpu::WgpuDevice::default();
+        let options = burn_wgpu::RuntimeOptions {
+            tasks_max: 32,
+            memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
+        };
+        let _setup =
+            burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(&device, options);
+        info!("Configured WGPU runtime memory profile: ExclusivePages.");
+    });
 }
 
 fn prepare_image_config_for_backend<B: Backend>(
@@ -2438,6 +2509,8 @@ mod tests {
     use super::*;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     use clap::Parser;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    type WgpuLoadTestBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     use std::fs;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
@@ -2850,7 +2923,7 @@ mod tests {
                 let mut system = System::new();
                 let baseline_bytes = refresh_process_rss_bytes(&mut system, pid).unwrap_or(0);
                 let monitor = ProcessMemoryMonitor::start(pid, baseline_bytes);
-                let _state = build_pipeline_state::<burn_wgpu::Wgpu>(&args)?;
+                let _state = build_pipeline_state::<WgpuLoadTestBackend>(&args)?;
                 thread::sleep(Duration::from_millis(20));
                 let peak_bytes = monitor.stop();
                 Ok(peak_bytes.saturating_sub(baseline_bytes))
@@ -2862,6 +2935,165 @@ mod tests {
     }
 
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    fn measure_peak_and_final_rss_delta_bytes<F>(action: F) -> Result<(u64, u64), String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let pid = get_current_pid().map_err(|err| format!("failed to get PID: {err}"))?;
+        let mut system = System::new();
+        let baseline = refresh_process_rss_bytes(&mut system, pid).unwrap_or(0);
+        let monitor = ProcessMemoryMonitor::start(pid, baseline);
+        action()?;
+        thread::sleep(Duration::from_millis(20));
+        let final_bytes = refresh_process_rss_bytes(&mut system, pid).unwrap_or(baseline);
+        let peak_bytes = monitor.stop();
+        Ok((
+            peak_bytes.saturating_sub(baseline),
+            final_bytes.saturating_sub(baseline),
+        ))
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    fn format_mib(bytes: u64) -> f64 {
+        bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "component-level TripoSG + RMBG WGPU load RAM telemetry"]
+    fn native_wgpu_component_load_peak_ram_report() {
+        let (args, _isolated_root_guard) = build_native_wgpu_load_args();
+        let weights_root = resolve_triposg_root(args.weights_root.as_ref());
+        let rmbg_root = resolve_rmbg_root(args.bg_weights_root.as_ref(), RmbgModel::Rmbg14);
+        let parity = triposg_parity_profile();
+        let artifacts = load_triposg_artifacts_from_root(&weights_root, parity.burnpack_policy)
+            .expect("resolve TripoSG burnpack artifact paths");
+        let device = <WgpuLoadTestBackend as Backend>::Device::default();
+
+        let vae_config = if let Some(json) = artifacts.vae_config_json.as_ref() {
+            TripoSGVaeConfig::from_config_bytes(json.as_bytes()).expect("parse TripoSG VAE config")
+        } else {
+            TripoSGVaeConfig::midi_3d()
+        };
+        let dit_config = if let Some(json) = artifacts.dit_config_json.as_ref() {
+            TripoSGDiTConfig::from_config_bytes(json.as_bytes()).expect("parse TripoSG DiT config")
+        } else {
+            TripoSGDiTConfig::triposg_pretrained()
+        };
+        let parsed_dino_config = artifacts
+            .dino_config_json
+            .as_ref()
+            .and_then(|json| load_dinov2_config_from_json_bytes(json.as_bytes()));
+        let dino_fallback_size = parsed_dino_config.as_ref().map(|cfg| cfg.image_size);
+        let mut dino_config = parsed_dino_config
+            .clone()
+            .unwrap_or_else(default_dinov2_config);
+        let dino_processor = artifacts
+            .dino_processor
+            .with_strict_preprocess(parity.strict_dino_preprocess);
+        if let Some(target_size) = dino_processor_target_size(&dino_processor, dino_fallback_size) {
+            let patch = dino_config.patch_size.max(1);
+            let grid = target_size / patch;
+            if grid > 0 {
+                dino_config.positional_encoding_interpolate.output_size = Some([grid, grid]);
+            }
+        }
+        let rmbg_config = load_optional_text_from_root(&rmbg_root, "config.json")
+            .expect("read RMBG config")
+            .map(|json| {
+                load_rmbg_config_from_json_bytes(json.as_bytes()).expect("parse RMBG config json")
+            })
+            .unwrap_or_else(burn_foreground::rmbg14::RmbgConfig::rmbg_1_4);
+        let rmbg_burnpack_path = crate::model_loader::resolve_burnpack_asset_path_from_root(
+            &rmbg_root,
+            "model.safetensors",
+            "RMBG_BPK_PRECISION",
+        )
+        .expect("resolve RMBG burnpack path");
+
+        let (vae_peak, vae_final) = measure_peak_and_final_rss_delta_bytes(|| {
+            let model = load_triposg_vae_from_burnpack_file::<WgpuLoadTestBackend>(
+                &vae_config,
+                &device,
+                &artifacts.vae_burnpack_path,
+            )
+            .map_err(|err| format!("load VAE: {err}"))?;
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            drop(model);
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            <WgpuLoadTestBackend as Backend>::memory_cleanup(&device);
+            Ok(())
+        })
+        .expect("measure VAE load RAM");
+
+        let (dit_peak, dit_final) = measure_peak_and_final_rss_delta_bytes(|| {
+            let model = load_triposg_dit_from_burnpack_file::<WgpuLoadTestBackend>(
+                &dit_config,
+                &device,
+                &artifacts.dit_burnpack_path,
+            )
+            .map_err(|err| format!("load DiT: {err}"))?;
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            drop(model);
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            <WgpuLoadTestBackend as Backend>::memory_cleanup(&device);
+            Ok(())
+        })
+        .expect("measure DiT load RAM");
+
+        let (dino_peak, dino_final) = measure_peak_and_final_rss_delta_bytes(|| {
+            let model = load_triposg_dinov2_from_burnpack_file::<WgpuLoadTestBackend>(
+                &device,
+                dino_config.clone(),
+                &artifacts.dino_burnpack_path,
+            )
+            .map_err(|err| format!("load DINOv2: {err}"))?;
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            drop(model);
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            <WgpuLoadTestBackend as Backend>::memory_cleanup(&device);
+            Ok(())
+        })
+        .expect("measure DINOv2 load RAM");
+
+        let (rmbg_peak, rmbg_final) = measure_peak_and_final_rss_delta_bytes(|| {
+            let model = load_rmbg_from_burnpack_file::<WgpuLoadTestBackend>(
+                &device,
+                &rmbg_burnpack_path,
+                &rmbg_config,
+            )
+            .map_err(|err| format!("load RMBG: {err}"))?;
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            drop(model);
+            <WgpuLoadTestBackend as Backend>::sync(&device);
+            <WgpuLoadTestBackend as Backend>::memory_cleanup(&device);
+            Ok(())
+        })
+        .expect("measure RMBG load RAM");
+
+        println!(
+            "[RAM] VAE peak {:.1} MiB final {:.1} MiB",
+            format_mib(vae_peak),
+            format_mib(vae_final)
+        );
+        println!(
+            "[RAM] DiT peak {:.1} MiB final {:.1} MiB",
+            format_mib(dit_peak),
+            format_mib(dit_final)
+        );
+        println!(
+            "[RAM] DINO peak {:.1} MiB final {:.1} MiB",
+            format_mib(dino_peak),
+            format_mib(dino_final)
+        );
+        println!(
+            "[RAM] RMBG peak {:.1} MiB final {:.1} MiB",
+            format_mib(rmbg_peak),
+            format_mib(rmbg_final)
+        );
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     #[test]
     #[ignore = "full TripoSG+RMBG WGPU worker init smoke; run explicitly"]
     fn native_wgpu_triposg_worker_init_smoke() {
@@ -2870,7 +3102,7 @@ mod tests {
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {
                 let (args, _isolated_root_guard) = build_native_wgpu_load_args();
-                let state = build_pipeline_state::<burn_wgpu::Wgpu>(&args)
+                let state = build_pipeline_state::<WgpuLoadTestBackend>(&args)
                     .expect("build WGPU pipeline state without DINO mismatch");
                 assert!(
                     state.triposg.is_some() || state.scribble.is_some(),
@@ -2903,7 +3135,7 @@ mod tests {
                 args.chunk_size = 4096;
                 args.target_faces = Some(2_000);
 
-                let mut state = build_pipeline_state::<burn_wgpu::Wgpu>(&args)
+                let mut state = build_pipeline_state::<WgpuLoadTestBackend>(&args)
                     .expect("build WGPU pipeline state");
                 let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .parent()

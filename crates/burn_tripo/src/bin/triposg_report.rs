@@ -208,7 +208,11 @@ fn run_with_backend<B: Backend>(
 
         if let Some(reference_pixels) = reference_pixel_values {
             let pixel_tensor = tensor_from_data_4d::<B>(&reference_pixels, &device)?;
-            let embeds_from_pixels = pipeline.image_encoder.forward(pixel_tensor);
+            let embeds_from_pixels = pipeline
+                .image_encoder
+                .as_ref()
+                .expect("TripoSG image encoder unavailable")
+                .forward(pixel_tensor);
             let stats = compute_stats_from_tensor(&embeds_from_pixels, reference_embeds)?;
             print_stats("encoder.image_embeds_from_pixels", &stats);
         }

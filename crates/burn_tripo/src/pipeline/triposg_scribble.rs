@@ -371,7 +371,8 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
         } else {
             load_triposg_dinov2(device, &dino_path)?
         };
-        let image_processor = load_dinov2_processor(root)?;
+        let mut image_processor = load_dinov2_processor(root)?;
+        image_processor.set_strict_preprocess(true);
 
         Ok(Self::new(
             vae,

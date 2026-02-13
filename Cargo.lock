@@ -1498,6 +1498,7 @@ dependencies = [
  "burn-cuda",
  "burn-wgpu",
  "burn_foreground",
+ "burn_synth",
  "burn_synth_import",
  "burn_trellis",
  "burn_tripo",
@@ -2241,8 +2242,6 @@ dependencies = [
 [[package]]
 name = "burn_dino"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8900f0381f8d2b9c919d4ad976049b89dc2b9db01fa7866f466810d0eff3ba38"
 dependencies = [
  "burn",
  "console_error_panic_hook",
@@ -3455,8 +3454,6 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d59a7d737259a784247595e2f0cc5a97d3e50f45cdaefbd4cc7d7fd2126f7a58"
 dependencies = [
  "ash",
  "async-channel",

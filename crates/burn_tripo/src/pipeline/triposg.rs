@@ -23,7 +23,7 @@ pub struct TripoSGPipeline<B: Backend> {
     pub vae: TripoSGVae<B>,
     pub transformer: TripoSGDiT<B>,
     pub scheduler: RectifiedFlowScheduler,
-    pub image_encoder: TripoSGImageEncoder<B>,
+    pub image_encoder: Option<TripoSGImageEncoder<B>>,
     pub image_processor: DinoImageProcessor,
 }
 
@@ -49,17 +49,36 @@ pub struct TripoSGSamplerProgress {
 }
 
 #[cfg(feature = "import")]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 /// Loader options for `TripoSGPipeline::from_pretrained_with_options`.
 pub struct TripoSGLoadOptions {
     /// Load source `.safetensors` directly instead of `.bpk` burnpacks.
     pub use_safetensors: bool,
     /// Burnpack file selection policy (`_f16.bpk` vs `.bpk` preference).
     pub burnpack_policy: BurnpackLoadPolicy,
+    /// Whether to load the backend-resident DINO image encoder.
+    ///
+    /// Set this to `false` when a separate CPU DINO path is used to avoid
+    /// loading duplicate image-encoder weights.
+    pub load_image_encoder: bool,
     /// Explicit strict-DINO preprocessing mode.
     ///
-    /// `None` preserves legacy env fallback (`DINO_STRICT_PREPROCESS`).
+    /// `Some(true)` is the canonical behavior to match upstream TripoSG.
+    /// `Some(false)` keeps the fast backend-native interpolation path.
+    /// `None` preserves the processor-config default.
     pub strict_dino_preprocess: Option<bool>,
+}
+
+#[cfg(feature = "import")]
+impl Default for TripoSGLoadOptions {
+    fn default() -> Self {
+        Self {
+            use_safetensors: false,
+            burnpack_policy: BurnpackLoadPolicy::default(),
+            load_image_encoder: true,
+            strict_dino_preprocess: Some(true),
+        }
+    }
 }
 
 impl<B: Backend> TripoSGPipeline<B> {
@@ -68,6 +87,22 @@ impl<B: Backend> TripoSGPipeline<B> {
         transformer: TripoSGDiT<B>,
         scheduler: RectifiedFlowScheduler,
         image_encoder: TripoSGImageEncoder<B>,
+        image_processor: DinoImageProcessor,
+    ) -> Self {
+        Self::new_with_optional_image_encoder(
+            vae,
+            transformer,
+            scheduler,
+            Some(image_encoder),
+            image_processor,
+        )
+    }
+
+    pub fn new_with_optional_image_encoder(
+        vae: TripoSGVae<B>,
+        transformer: TripoSGDiT<B>,
+        scheduler: RectifiedFlowScheduler,
+        image_encoder: Option<TripoSGImageEncoder<B>>,
         image_processor: DinoImageProcessor,
     ) -> Self {
         Self {
@@ -81,7 +116,10 @@ impl<B: Backend> TripoSGPipeline<B> {
 
     pub fn encode_image(&self, image: Tensor<B, 4>) -> Tensor<B, 3> {
         let image = self.image_processor.preprocess(image);
-        self.image_encoder.forward(image)
+        self.image_encoder
+            .as_ref()
+            .expect("TripoSG image encoder unavailable")
+            .forward(image)
     }
 
     pub fn prepare_latents(
@@ -191,7 +229,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             } else {
                 latents.clone()
             };
-            let timestep = Tensor::<B, 1>::from_floats(vec![t; model_batch].as_slice(), &device);
+            let timestep = Tensor::<B, 1>::full([model_batch], t, &device);
 
             let mut noise_pred = self.transformer.forward(
                 latent_model_input,
@@ -725,17 +763,21 @@ impl<B: Backend> TripoSGPipeline<B> {
             .unwrap_or_else(|_| RectifiedFlowSchedulerConfig::midi_3d());
         let scheduler = RectifiedFlowScheduler::new(scheduler_config);
 
-        let image_encoder = if use_safetensors {
-            load_triposg_dinov2_from_safetensors(device, &dino_path)?
+        let image_encoder = if options.load_image_encoder {
+            Some(if use_safetensors {
+                load_triposg_dinov2_from_safetensors(device, &dino_path)?
+            } else {
+                load_triposg_dinov2_with_policy(device, &dino_path, options.burnpack_policy)?
+            })
         } else {
-            load_triposg_dinov2_with_policy(device, &dino_path, options.burnpack_policy)?
+            None
         };
         let mut image_processor = load_dinov2_processor(root)?;
         if let Some(strict) = options.strict_dino_preprocess {
             image_processor.set_strict_preprocess(strict);
         }
 
-        Ok(Self::new(
+        Ok(Self::new_with_optional_image_encoder(
             vae,
             dit,
             scheduler,

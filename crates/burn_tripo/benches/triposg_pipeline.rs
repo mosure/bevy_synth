@@ -165,12 +165,20 @@ fn bench_with_backend<B: Backend>(c: &mut Criterion) {
     let processed = pipeline.image_processor.preprocess(image_tensor.clone());
     group.bench_function(BenchmarkId::new("image_encode", backend_name::<B>()), |b| {
         b.iter(|| {
-            let embeds = pipeline.image_encoder.forward(processed.clone());
+            let embeds = pipeline
+                .image_encoder
+                .as_ref()
+                .expect("TripoSG image encoder unavailable")
+                .forward(processed.clone());
             std::hint::black_box(embeds)
         })
     });
 
-    let image_embeds = pipeline.image_encoder.forward(processed.clone());
+    let image_embeds = pipeline
+        .image_encoder
+        .as_ref()
+        .expect("TripoSG image encoder unavailable")
+        .forward(processed.clone());
     if run_diffusion {
         group.bench_function(BenchmarkId::new("diffusion", backend_name::<B>()), |b| {
             b.iter(|| {

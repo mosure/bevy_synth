@@ -106,7 +106,11 @@ fn profile_with_backend<B: Backend>() {
     let preprocess_ms = elapsed_ms(t0);
 
     let t0 = Instant::now();
-    let embeds = pipeline.image_encoder.forward(processed);
+    let embeds = pipeline
+        .image_encoder
+        .as_ref()
+        .expect("TripoSG image encoder unavailable")
+        .forward(processed);
     B::sync(&device);
     let encode_ms = elapsed_ms(t0);
 

@@ -69,6 +69,14 @@ impl DinoImageProcessor {
         self.strict_preprocess.unwrap_or(false)
     }
 
+    /// Returns whether strict preprocessing is enabled.
+    ///
+    /// Strict mode uses the CPU reference resize/crop path to match the
+    /// upstream TripoSG preprocessing behavior.
+    pub fn is_strict_preprocess(&self) -> bool {
+        self.strict_preprocess_enabled()
+    }
+
     pub fn preprocess<B: Backend>(&self, image: Tensor<B, 4>) -> Tensor<B, 4> {
         if !cfg!(target_arch = "wasm32") && self.strict_preprocess_enabled() {
             return self.preprocess_cpu(image);
@@ -263,7 +271,8 @@ pub mod import {
     use burn::tensor::FloatDType;
     use burn::tensor::ops::InterpolateMode;
     use burn_store::{
-        BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
+        ApplyResult, BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter,
+        SafetensorsStore,
     };
     use safetensors::{
         Dtype, serialize,
@@ -327,9 +336,10 @@ pub mod import {
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
         let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
-        model
+        let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack: {err}"))?;
+        validate_apply_result("dinov2 burnpack", &apply)?;
 
         Ok(TripoSGImageEncoder::new(model))
     }
@@ -353,9 +363,10 @@ pub mod import {
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
         let converted = convert_hf_dinov2(weights_path)?;
         let mut store = build_store(converted)?;
-        model
+        let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 safetensors: {err}"))?;
+        validate_apply_result("dinov2 safetensors", &apply)?;
         Ok(TripoSGImageEncoder::new(model))
     }
 
@@ -368,9 +379,10 @@ pub mod import {
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
         let mut store =
             BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes))).validate(true);
-        model
+        let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack bytes: {err}"))?;
+        validate_apply_result("dinov2 burnpack bytes", &apply)?;
         Ok(TripoSGImageEncoder::new(model))
     }
 
@@ -382,9 +394,10 @@ pub mod import {
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
         let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
-        model
+        let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack file: {err}"))?;
+        validate_apply_result("dinov2 burnpack file", &apply)?;
         Ok(TripoSGImageEncoder::new(model))
     }
 
@@ -830,6 +843,64 @@ pub mod import {
             .remap(remapper)
             .validate(true);
         Ok(store)
+    }
+
+    fn validate_apply_result(
+        label: &str,
+        result: &ApplyResult,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if result.missing.is_empty() && result.skipped.is_empty() && result.unused.is_empty() {
+            return Ok(());
+        }
+
+        let mut parts = Vec::new();
+        if !result.missing.is_empty() {
+            let preview = result
+                .missing
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!(
+                "missing={} [{}{}]",
+                result.missing.len(),
+                preview,
+                if result.missing.len() > 8 { ", ..." } else { "" }
+            ));
+        }
+        if !result.skipped.is_empty() {
+            let preview = result
+                .skipped
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!(
+                "skipped={} [{}{}]",
+                result.skipped.len(),
+                preview,
+                if result.skipped.len() > 8 { ", ..." } else { "" }
+            ));
+        }
+        if !result.unused.is_empty() {
+            let preview = result
+                .unused
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!(
+                "unused={} [{}{}]",
+                result.unused.len(),
+                preview,
+                if result.unused.len() > 8 { ", ..." } else { "" }
+            ));
+        }
+
+        Err(format!("{label} import mismatch: {}", parts.join("; ")).into())
     }
 
     fn key_remap_rules() -> &'static [(&'static str, &'static str)] {

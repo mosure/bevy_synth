@@ -219,8 +219,7 @@ pub fn sdf_to_mesh_diff_dmc(grid: &DenseGrid) -> Option<Mesh> {
             let src_base = (z * ny + y) * nx;
             let dst_base = ((z + 1) * py + (y + 1)) * px;
             for x in 0..nx {
-                let value = grid.values[src_base + x];
-                padded[dst_base + x + 1] = if value.is_finite() { value } else { pad };
+                padded[dst_base + x + 1] = grid.values[src_base + x];
             }
         }
     }
@@ -301,6 +300,25 @@ mod tests {
                 max[axis]
             );
         }
+    }
+
+    #[test]
+    fn diff_dmc_skips_cells_with_nan_corners() {
+        let size = [3usize, 3, 3];
+        let mut values = vec![f32::NAN; size[0] * size[1] * size[2]];
+        let center = (size[1] + 1) * size[0] + 1;
+        values[center] = -1.0;
+
+        let grid = DenseGrid {
+            values,
+            size,
+            bounds: [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
+        };
+        let mesh = sdf_to_mesh_diff_dmc(&grid);
+        assert!(
+            mesh.is_none(),
+            "expected no surface when every candidate cell includes NaN corners"
+        );
     }
 
     fn mesh_bounds(mesh: &Mesh) -> ([f32; 3], [f32; 3]) {
@@ -747,6 +765,9 @@ fn get_cell_code(grid: &[f32], dims: [usize; 3], x: usize, y: usize, z: usize, i
         let cy = (y as i32 + corner[1]) as usize;
         let cz = (z as i32 + corner[2]) as usize;
         let v = grid[grid_index(cx, cy, cz, dims[0], dims[1])];
+        if !v.is_finite() {
+            return 0;
+        }
         if v >= iso {
             code |= 1u8 << i;
         }

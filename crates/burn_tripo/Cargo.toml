@@ -123,41 +123,49 @@ path = "src/lib.rs"
 name = "import"
 path = "tool/import.rs"
 required-features = ["import-cli"]
+test = false
 
 [[bin]]
 name = "triposg_hook"
 path = "tool/triposg_hook.rs"
 required-features = ["import-cli"]
+test = false
 
 [[bin]]
 name = "triposg_dit_hook"
 path = "tool/triposg_dit_hook.rs"
 required-features = ["import-cli"]
+test = false
 
 [[bin]]
 name = "triposg_dino_hook"
 path = "tool/triposg_dino_hook.rs"
 required-features = ["import-cli"]
+test = false
 
 [[bin]]
 name = "triposg_profile"
 path = "tool/triposg_profile.rs"
 required-features = ["import", "foreground"]
+test = false
 
 [[bin]]
 name = "triposg_import"
 path = "tool/triposg_import.rs"
 required-features = ["import"]
+test = false
 
 [[bin]]
 name = "list_safetensors"
 path = "tool/list_safetensors.rs"
 required-features = ["import-cli"]
+test = false
 
 [[bin]]
 name = "triposg_report"
 path = "src/bin/triposg_report.rs"
 required-features = ["import", "report", "foreground"]
+test = false
 
 [[bench]]
 name = "triposg_pipeline"

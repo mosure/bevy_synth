@@ -29,7 +29,7 @@ pub struct BurnpackLoadPolicy {
 impl Default for BurnpackLoadPolicy {
     fn default() -> Self {
         Self {
-            precision: BpkPrecisionPreference::PreferF16,
+            precision: BpkPrecisionPreference::PreferF32,
             f16_suffix: DEFAULT_F16_SUFFIX,
         }
     }
@@ -105,27 +105,27 @@ mod tests {
     };
 
     #[test]
-    fn compatibility_env_parser_defaults_to_f16() {
+    fn compatibility_env_parser_defaults_to_f32() {
         let default = BurnpackLoadPolicy::from_env_compat(
             "BURN_TRIPO_TEST_MISSING_PRIMARY",
             "BURN_TRIPO_TEST_MISSING_FALLBACK",
         );
-        assert_eq!(default.precision, BpkPrecisionPreference::PreferF16);
+        assert_eq!(default.precision, BpkPrecisionPreference::PreferF32);
     }
 
     #[test]
     fn path_candidates_follow_precision_preference() {
         let path = std::path::Path::new("model.safetensors");
 
-        let f16_first = candidate_burnpack_paths(path, BurnpackLoadPolicy::default());
+        let f32_first_default = candidate_burnpack_paths(path, BurnpackLoadPolicy::default());
+        assert_eq!(f32_first_default[0], burnpack_path(path, false, "_f16"));
+        assert_eq!(f32_first_default[1], burnpack_path(path, true, "_f16"));
+
+        let f16_first = candidate_burnpack_paths(
+            path,
+            BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF16),
+        );
         assert_eq!(f16_first[0], burnpack_path(path, true, "_f16"));
         assert_eq!(f16_first[1], burnpack_path(path, false, "_f16"));
-
-        let f32_first = candidate_burnpack_paths(
-            path,
-            BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF32),
-        );
-        assert_eq!(f32_first[0], burnpack_path(path, false, "_f16"));
-        assert_eq!(f32_first[1], burnpack_path(path, true, "_f16"));
     }
 }

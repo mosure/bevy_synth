@@ -601,7 +601,8 @@ impl SynthRuntime {
             )),
         );
         let preprocess_start = Instant::now();
-        let prepared = self.prepare_image_for_mesh(input_image_path, foreground_model)?;
+        let prepared =
+            self.prepare_image_for_mesh(input_image_path, foreground_model, backend)?;
         progress.stage_completed(
             "mesh.preprocess_foreground",
             None,
@@ -842,6 +843,7 @@ impl SynthRuntime {
         &mut self,
         input_path: &Path,
         selected_model: ForegroundModel,
+        backend: InferenceBackend,
     ) -> RuntimeResult<PreparedImageData> {
         if let Ok(prepared) =
             prepare_image_data::<NdArray<f32>>(input_path, None, &self.config.mesh_prepare)
@@ -855,10 +857,55 @@ impl SynthRuntime {
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
                 );
-                let pipeline = self.foreground.ensure_rmbg14(&root)?;
-                prepare_image_data(input_path, Some(pipeline), &self.config.mesh_prepare).map_err(
-                    |err| RuntimeError::new(format!("RMBG-1.4 preprocessing failed: {err}")),
-                )
+                match backend {
+                    InferenceBackend::Cpu => {
+                        let pipeline = self.foreground.ensure_rmbg14(&root)?;
+                        prepare_image_data(input_path, Some(pipeline), &self.config.mesh_prepare)
+                            .map_err(|err| {
+                                RuntimeError::new(format!("RMBG-1.4 preprocessing failed: {err}"))
+                            })
+                    }
+                    InferenceBackend::Wgpu => {
+                        #[cfg(feature = "wgpu")]
+                        {
+                            let pipeline = self.foreground.ensure_rmbg14_wgpu(&root)?;
+                            prepare_image_data(
+                                input_path,
+                                Some(pipeline),
+                                &self.config.mesh_prepare,
+                            )
+                            .map_err(|err| {
+                                RuntimeError::new(format!("RMBG-1.4 preprocessing failed: {err}"))
+                            })
+                        }
+                        #[cfg(not(feature = "wgpu"))]
+                        {
+                            Err(RuntimeError::new(
+                                "wgpu backend not enabled; build with burn_synth feature `wgpu`",
+                            ))
+                        }
+                    }
+                    InferenceBackend::Cuda => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            let pipeline = self.foreground.ensure_rmbg14_cuda(&root)?;
+                            prepare_image_data(
+                                input_path,
+                                Some(pipeline),
+                                &self.config.mesh_prepare,
+                            )
+                            .map_err(|err| {
+                                RuntimeError::new(format!("RMBG-1.4 preprocessing failed: {err}"))
+                            })
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            Err(RuntimeError::new(
+                                "cuda backend not enabled; build with burn_synth feature `cuda`",
+                            ))
+                        }
+                    }
+                }
             }
             ForegroundModel::Rmbg2 => {
                 let root = resolve_foreground_weights_root(
@@ -879,6 +926,10 @@ impl SynthRuntime {
 #[derive(Default)]
 struct ForegroundRuntime {
     rmbg14: Option<RmbgPipeline<NdArray<f32>>>,
+    #[cfg(feature = "wgpu")]
+    rmbg14_wgpu: Option<RmbgPipeline<WgpuBackend>>,
+    #[cfg(feature = "cuda")]
+    rmbg14_cuda: Option<RmbgPipeline<CudaBackend>>,
     rmbg2: Option<Rmbg2Pipeline>,
 }
 
@@ -912,6 +963,40 @@ impl ForegroundRuntime {
         self.rmbg2
             .as_ref()
             .ok_or_else(|| RuntimeError::new("RMBG-2.0 pipeline unavailable"))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn ensure_rmbg14_wgpu(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<WgpuBackend>> {
+        if self.rmbg14_wgpu.is_none() {
+            let device = <WgpuBackend as Backend>::Device::default();
+            let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
+                RuntimeError::new(format!(
+                    "failed to load RMBG-1.4 (wgpu) at {}: {err}",
+                    root.display()
+                ))
+            })?;
+            self.rmbg14_wgpu = Some(pipeline);
+        }
+        self.rmbg14_wgpu
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("RMBG-1.4 WGPU pipeline unavailable"))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_rmbg14_cuda(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<CudaBackend>> {
+        if self.rmbg14_cuda.is_none() {
+            let device = <CudaBackend as Backend>::Device::default();
+            let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
+                RuntimeError::new(format!(
+                    "failed to load RMBG-1.4 (cuda) at {}: {err}",
+                    root.display()
+                ))
+            })?;
+            self.rmbg14_cuda = Some(pipeline);
+        }
+        self.rmbg14_cuda
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("RMBG-1.4 CUDA pipeline unavailable"))
     }
 }
 
@@ -1008,8 +1093,10 @@ fn load_backend_state<B: Backend>(
     }
     let weights_root = resolve_triposg_weights_root(config.weights_root.as_deref());
     let parity = triposg_runtime_profile(Some(config.mesh_prepare.max_dimension));
+    let use_cpu_dino = should_use_cpu_dino_backend::<B>(map_dino_backend(config.dino_backend));
     let load_options = TripoSGLoadOptions {
         burnpack_policy: parity.burnpack_policy,
+        load_image_encoder: !use_cpu_dino,
         strict_dino_preprocess: Some(parity.strict_dino_preprocess),
         ..TripoSGLoadOptions::default()
     };
@@ -1021,7 +1108,7 @@ fn load_backend_state<B: Backend>(
                     weights_root.display()
                 ))
             })?;
-    let cpu_dino = if should_use_cpu_dino_backend::<B>(map_dino_backend(config.dino_backend)) {
+    let cpu_dino = if use_cpu_dino {
         let cpu_device = <NdArray<f32> as Backend>::Device::default();
         let encoder = load_triposg_dinov2_with_policy(
             &cpu_device,
@@ -1142,10 +1229,27 @@ fn run_backend_inference<B: Backend>(
         let batch = embeds.shape().dims::<3>()[0];
         (embeds, batch)
     } else {
-        let image = image.expect("image tensor should exist when CPU DINO is disabled");
-        let batch = image.shape().dims::<4>()[0];
-        let embeds = state.pipeline.encode_image(image);
-        (embeds, batch)
+        if state.pipeline.image_processor.is_strict_preprocess() {
+            // Keep strict preprocessing numerics while avoiding a backend->CPU readback:
+            // preprocess on CPU first, then upload once to the active backend.
+            let cpu_device = <NdArray<f32> as Backend>::Device::default();
+            let cpu_image = prepared.to_tensor::<NdArray<f32>>(&cpu_device);
+            let cpu_processed = state.pipeline.image_processor.preprocess(cpu_image);
+            let batch = cpu_processed.shape().dims::<4>()[0];
+            let processed = convert_image_to_backend::<B>(cpu_processed, &state.device)?;
+            let embeds = state
+                .pipeline
+                .image_encoder
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new("TripoSG image encoder unavailable"))?
+                .forward(processed);
+            (embeds, batch)
+        } else {
+            let image = image.expect("image tensor should exist when CPU DINO is disabled");
+            let batch = image.shape().dims::<4>()[0];
+            let embeds = state.pipeline.encode_image(image);
+            (embeds, batch)
+        }
     };
     progress.stage_completed(
         "triposg.encode_image",
@@ -1248,6 +1352,25 @@ fn convert_embeddings_to_backend<B: Backend>(
         .map_err(|err| RuntimeError::new(format!("failed to read CPU DINO embeddings: {err:?}")))?;
     let flat = Tensor::<B, 1>::from_floats(data.as_slice(), device);
     Ok(flat.reshape([shape[0] as i32, shape[1] as i32, shape[2] as i32]))
+}
+
+fn convert_image_to_backend<B: Backend>(
+    image: Tensor<NdArray<f32>, 4>,
+    device: &B::Device,
+) -> RuntimeResult<Tensor<B, 4>> {
+    let shape = image.shape().dims::<4>();
+    let data = image
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| RuntimeError::new(format!("failed to read CPU image tensor: {err:?}")))?;
+    let flat = Tensor::<B, 1>::from_floats(data.as_slice(), device);
+    Ok(flat.reshape([
+        shape[0] as i32,
+        shape[1] as i32,
+        shape[2] as i32,
+        shape[3] as i32,
+    ]))
 }
 
 fn decimate_mesh(mut mesh: Mesh, target_faces: Option<usize>) -> Result<Mesh, String> {
@@ -1531,11 +1654,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_profile_keeps_f16_preference_and_fallback_dimension() {
+    fn parity_profile_keeps_f32_preference_and_fallback_dimension() {
         let profile = triposg_runtime_profile(Some(777));
         assert!(profile.strict_dino_preprocess);
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
-        assert!(profile.burnpack_policy.precision.prefer_f16());
+        assert!(!profile.burnpack_policy.precision.prefer_f16());
     }
 }

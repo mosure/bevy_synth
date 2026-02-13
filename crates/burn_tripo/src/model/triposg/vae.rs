@@ -95,9 +95,9 @@ pub struct TripoSGVaeOutput<B: Backend> {
 
 #[derive(Module, Debug)]
 pub struct TripoSGVae<B: Backend> {
-    pub encoder: TripoSGEncoder<B>,
+    pub encoder: Option<TripoSGEncoder<B>>,
     pub decoder: TripoSGDecoder<B>,
-    pub quant: nn::Linear<B>,
+    pub quant: Option<nn::Linear<B>>,
     pub post_quant: nn::Linear<B>,
     freq_embed: Ignored<FrequencyPositionalEmbedding>,
     in_channels: usize,
@@ -137,14 +137,56 @@ impl<B: Backend> TripoSGVae<B> {
             .init(device);
 
         Self {
-            encoder,
+            encoder: Some(encoder),
             decoder,
-            quant,
+            quant: Some(quant),
             post_quant,
             freq_embed: Ignored(freq_embed),
             in_channels: config.in_channels,
             latent_channels: config.latent_channels,
         }
+    }
+
+    pub fn new_decode_only(device: &B::Device, config: TripoSGVaeConfig) -> Self {
+        let freq_embed = FrequencyPositionalEmbedding {
+            num_freq: config.embed_frequency,
+            include_pi: config.embed_include_pi,
+        };
+        let embed_dim = freq_embed.embed_dim(3);
+        let decoder_in_dim = embed_dim;
+
+        let decoder = TripoSGDecoder::new(
+            device,
+            decoder_in_dim,
+            config.width_decoder,
+            config.num_layers_decoder,
+            config.num_attention_heads,
+        );
+        let post_quant = nn::LinearConfig::new(config.latent_channels, config.width_decoder)
+            .with_bias(true)
+            .init(device);
+
+        Self {
+            encoder: None,
+            decoder,
+            quant: None,
+            post_quant,
+            freq_embed: Ignored(freq_embed),
+            in_channels: config.in_channels,
+            latent_channels: config.latent_channels,
+        }
+    }
+
+    fn encoder_ref(&self) -> &TripoSGEncoder<B> {
+        self.encoder
+            .as_ref()
+            .expect("TripoSGVae encoder unavailable in decode-only mode")
+    }
+
+    fn quant_ref(&self) -> &nn::Linear<B> {
+        self.quant
+            .as_ref()
+            .expect("TripoSGVae quant layer unavailable in decode-only mode")
     }
 
     pub fn encode(
@@ -173,10 +215,12 @@ impl<B: Backend> TripoSGVae<B> {
         record_tensor(&mut hook, "encoder.input", &input_q);
         record_tensor(&mut hook, "encoder.input.kv", &input_kv);
 
-        let hidden = self.encoder.forward(input_q, input_kv, hook.as_deref_mut());
+        let hidden = self
+            .encoder_ref()
+            .forward(input_q, input_kv, hook.as_deref_mut());
         record_tensor(&mut hook, "encoder.hidden", &hidden);
 
-        let stats = self.quant.forward(hidden);
+        let stats = self.quant_ref().forward(hidden);
         record_tensor(&mut hook, "encoder.quant", &stats);
 
         let [b, n, _] = stats.shape().dims();
@@ -634,6 +678,24 @@ pub mod import {
         Ok(model)
     }
 
+    /// Load only the VAE decode path (post-quant + decoder) from burnpack.
+    ///
+    /// This keeps memory lower for inference-only pipelines that never call `encode`.
+    pub fn load_triposg_vae_decoder_from_burnpack_bytes<B: Backend>(
+        config: &TripoSGVaeConfig,
+        device: &B::Device,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
+        let mut model = TripoSGVae::new_decode_only(device, config.clone());
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .allow_partial(true)
+            .validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load TripoSG VAE decoder burnpack bytes: {err}"))?;
+        Ok(model)
+    }
+
     pub fn load_triposg_vae_from_burnpack_file<B: Backend>(
         config: &TripoSGVaeConfig,
         device: &B::Device,
@@ -644,6 +706,24 @@ pub mod import {
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE burnpack file: {err}"))?;
+        Ok(model)
+    }
+
+    /// Load only the VAE decode path (post-quant + decoder) from burnpack.
+    ///
+    /// This keeps memory lower for inference-only pipelines that never call `encode`.
+    pub fn load_triposg_vae_decoder_from_burnpack_file<B: Backend>(
+        config: &TripoSGVaeConfig,
+        device: &B::Device,
+        burnpack_path: impl AsRef<Path>,
+    ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
+        let mut model = TripoSGVae::new_decode_only(device, config.clone());
+        let mut store = BurnpackStore::from_file(burnpack_path.as_ref())
+            .allow_partial(true)
+            .validate(true);
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load TripoSG VAE decoder burnpack file: {err}"))?;
         Ok(model)
     }
 

@@ -62,6 +62,7 @@ pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
 pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();

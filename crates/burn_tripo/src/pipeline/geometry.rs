@@ -8,7 +8,7 @@ use crate::readback::tensor_to_vec_f32;
 
 const FLASH_INVALID_SENTINEL: f32 = -10000.0;
 const FLASH_INVALID_THRESHOLD: f32 = -9000.0;
-const FLASH_WGPU_MAX_POINTS: usize = 4096;
+const FLASH_WGPU_MAX_POINTS: usize = 8192;
 const FLASH_DEBUG: bool = false;
 static FLASH_FORCE_CPU: AtomicBool = AtomicBool::new(false);
 
@@ -190,10 +190,6 @@ fn flash_extract_geometry_gpu<B: Backend>(
     )?;
     let mut grid_size = base_grid;
     log_flash_stats("base", &grid_logits, grid_size);
-    if grid_all_invalid(&grid_logits) {
-        return Err("flash base grid decode returned only sentinel values".into());
-    }
-
     let mut shared_kv_cache = Some(kv_cache);
     for (level_idx, &res) in resolutions.iter().enumerate().skip(1) {
         let next_size = res + 1;
@@ -271,9 +267,9 @@ fn flash_extract_geometry_gpu<B: Backend>(
     let grid_logits = grid_logits.mask_where(invalid, nan);
 
     let octree_resolution = 1usize << octree_depth;
-    let sdf = grid_logits
-        .mul_scalar(-1.0 / octree_resolution as f32)
-        .permute([2, 1, 0]);
+    // Keep voxel memory layout consistent with the CPU flash path (z-major flattening).
+    // This avoids axis-dependent remapping drift between GPU and CPU extraction results.
+    let sdf = grid_logits.mul_scalar(-1.0 / octree_resolution as f32);
     let sdf_values =
         tensor_to_vec_f32(sdf).map_err(|err| format!("failed to read flash grid logits: {err}"))?;
 
@@ -317,15 +313,6 @@ fn log_flash_stats<B: Backend>(label: &str, grid: &Tensor<B, 3>, size: usize) {
             "flash_extract_geometry[{label}]: grid {size}^3 min={min:.4} max={max:.4} nan={nan_count}"
         );
     }
-}
-
-fn grid_all_invalid<B: Backend>(grid: &Tensor<B, 3>) -> bool {
-    let Ok(values) = tensor_to_vec_f32(grid.clone()) else {
-        return false;
-    };
-    values
-        .iter()
-        .all(|value| value.is_nan() || *value <= FLASH_INVALID_THRESHOLD)
 }
 
 fn log_flash_level_empty(reason: &str, level_idx: usize, curr: usize, next: usize) {
@@ -833,9 +820,9 @@ fn coords_to_linear_indices_2<B: Backend>(
     let y = coords.clone().select(1, idx1).squeeze_dim(1);
     let z = coords.select(1, idx2).squeeze_dim(1);
 
-    let stride_x = (size * size) as i32;
+    let stride_z = (size * size) as i32;
     let stride_y = size as i32;
-    x.mul_scalar(stride_x) + y.mul_scalar(stride_y) + z
+    z.mul_scalar(stride_z) + y.mul_scalar(stride_y) + x
 }
 
 fn coords_to_world_2<B: Backend>(
@@ -866,8 +853,8 @@ fn decode_flash_points_gpu<B: Backend>(
     }
 
     let mut out = output.clone();
-    let max_points = flash_max_points::<B>();
-    let chunk_points = num_chunks.min(max_points);
+    let max_points = flash_max_points::<B>().max(1);
+    let chunk_points = num_chunks.max(1).min(max_points);
     let mut start = 0usize;
     while start < total {
         let end = (start + chunk_points).min(total);
@@ -875,18 +862,14 @@ fn decode_flash_points_gpu<B: Backend>(
         #[allow(clippy::single_range_in_vec_init)]
         let indices_chunk = indices.clone().slice([start..end]);
 
-        let (decoded, cache) = vae.decode_with_latent_projection(
-            coords_chunk,
-            latent_proj.clone(),
-            kv_cache.take(),
-            None,
-        );
+        let (decoded, cache) =
+            vae.decode_with_latent_projection(coords_chunk, latent_proj.clone(), kv_cache.take(), None);
         *kv_cache = Some(cache);
 
         let values = decoded.reshape([end - start]);
-        // Burn scatter uses sum reduction. To get overwrite semantics, scatter deltas.
-        let current = out.clone().gather(0, indices_chunk.clone());
-        let delta = values - current;
+        // Burn scatter uses sum reduction. Flash indices are unique per decode pass, so
+        // subtracting the sentinel converts additive scatter into overwrite semantics.
+        let delta = values.add_scalar(-FLASH_INVALID_SENTINEL);
         out = out.scatter(0, indices_chunk, delta);
         start = end;
     }

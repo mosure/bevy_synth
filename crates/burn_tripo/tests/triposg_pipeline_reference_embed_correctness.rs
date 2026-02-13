@@ -28,10 +28,6 @@ const GRID_MSE: f32 = 1e-6;
 #[test]
 fn triposg_pipeline_from_reference_embeds_matches_reference_strictly()
 -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        std::env::set_var("DINO_STRICT_PREPROCESS", "1");
-    }
-
     let reference_path = asset_path("assets/hooks/triposg_pipeline_reference.safetensors");
     if !reference_path.exists() {
         eprintln!(
@@ -99,7 +95,11 @@ fn triposg_pipeline_from_reference_embeds_matches_reference_strictly()
 
     let mut pipeline = TripoSGPipeline::from_pretrained(weights_root, &device)?;
 
-    let embeds_from_pixels = pipeline.image_encoder.forward(pixel_tensor);
+    let embeds_from_pixels = pipeline
+        .image_encoder
+        .as_ref()
+        .expect("TripoSG image encoder unavailable")
+        .forward(pixel_tensor);
     let stats = compute_stats_from_tensor(&embeds_from_pixels, &image_embeds_ref)?;
     assert_within(
         "image_embeds_from_pixels",
@@ -129,6 +129,24 @@ fn triposg_pipeline_from_reference_embeds_matches_reference_strictly()
 
     let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
     let stats = compute_stats(&grid.values, &output_grid.data);
+    println!(
+        "decoder.grid_logits.from_reference_embeds mean_abs={:.6} max_abs={:.6} mse={:.6}",
+        stats.mean_abs, stats.max_abs, stats.mse
+    );
+
+    let output_latents_tensor =
+        tensor_from_data_3d::<burn::backend::NdArray<f32>>(&output_latents, &device)?;
+    let grid_from_reference_latents =
+        pipeline.decode_grid(output_latents_tensor, bounds, resolution, chunk_size)?;
+    let stats_from_reference_latents =
+        compute_stats(&grid_from_reference_latents.values, &output_grid.data);
+    println!(
+        "decoder.grid_logits.from_reference_latents mean_abs={:.6} max_abs={:.6} mse={:.6}",
+        stats_from_reference_latents.mean_abs,
+        stats_from_reference_latents.max_abs,
+        stats_from_reference_latents.mse
+    );
+
     assert_within(
         "decoder.grid_logits.from_reference_embeds",
         &stats,

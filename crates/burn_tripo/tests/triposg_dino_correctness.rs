@@ -27,9 +27,6 @@ const PREP_MSE: f32 = 1e-3;
 
 #[test]
 fn triposg_dino_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        std::env::set_var("DINO_STRICT_PREPROCESS", "1");
-    }
     let reference_path = asset_path("assets/hooks/triposg_dino_reference.safetensors");
     if !reference_path.exists() {
         eprintln!(
@@ -52,7 +49,8 @@ fn triposg_dino_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>
     let reference = HookReference::load(reference_path.as_path())?;
     let device = Default::default();
     let image_encoder = load_triposg_dinov2::<burn::backend::NdArray<f32>>(&device, &weights_path)?;
-    let image_processor = load_dinov2_processor(weights_root)?;
+    let mut image_processor = load_dinov2_processor(weights_root)?;
+    image_processor.set_strict_preprocess(true);
 
     let input = reference
         .get_input("input.image")

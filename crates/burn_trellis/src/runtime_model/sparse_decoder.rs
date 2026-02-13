@@ -777,9 +777,6 @@ impl DecoderWgpuConvContext {
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn create_wgpu_decoder_context() -> Option<Arc<Mutex<DecoderWgpuConvContext>>> {
-    if env_flag("TRELLIS2_DECODER_DISABLE_WGPU") {
-        return None;
-    }
     let context = std::panic::catch_unwind(DecoderWgpuConvContext::new)
         .ok()?
         .ok()?;
