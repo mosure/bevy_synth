@@ -38,5 +38,4 @@ codegen-units = 1
 panic = "abort"
 
 [patch.crates-io]
-cubecl-wgpu = { path = "crates/cubecl-wgpu-patched" }
 burn_dino = { path = "crates/vendor/burn_dino_new" }

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture};
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const INDEX_FILE_NAME: &str = "index.json";
 #[cfg(not(target_arch = "wasm32"))]
 const MESH_DIR_NAME: &str = "meshes";
@@ -298,6 +298,13 @@ impl MeshCache {
     }
 
     pub fn load_mesh(&self, cache_key: &str) -> CacheResult<Option<SynthMesh>> {
+        if let Some(glb_bytes) = self.read_glb_output(cache_key)? {
+            let mesh = crate::io::mesh_from_glb_bytes(glb_bytes.as_slice())
+                .map_err(|err| CacheError::InvalidData(err.to_string()))?;
+            return Ok(Some(mesh));
+        }
+
+        // Backward compatibility: older cache versions stored the full mesh payload JSON.
         let mesh_payload = self.read_mesh_payload(cache_key)?;
         let Some(mesh_payload) = mesh_payload else {
             return Ok(None);
@@ -320,21 +327,20 @@ impl MeshCache {
             .unwrap_or("image")
             .to_string();
 
-        let payload = MeshPayload::from(mesh);
-        let payload_json = serde_json::to_string(&payload)
-            .map_err(|err| CacheError::Serialization(err.to_string()))?;
-        self.write_mesh_payload(&cache_key, &payload_json)?;
+        // GLB is the canonical cache payload; remove any legacy mesh JSON sidecar.
+        self.remove_mesh_payload(&cache_key)?;
 
         let glb = mesh_to_glb(mesh)?;
         self.write_glb_output(&cache_key, &glb)?;
+        let glb_output_id = self.glb_output_id(&cache_key);
 
         let metadata = CachedMeshMetadata {
             cache_key: cache_key.clone(),
             source_image_path: source_image_path.clone(),
             label,
-            mesh_payload_id: self.mesh_payload_id(&cache_key),
+            mesh_payload_id: glb_output_id.clone(),
             gltf_output_id: None,
-            glb_output_id: self.glb_output_id(&cache_key),
+            glb_output_id,
             updated_at_unix_ms: now_unix_ms(),
         };
 
@@ -422,14 +428,25 @@ impl MeshCache {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn write_mesh_payload(&self, cache_key: &str, payload_json: &str) -> CacheResult<()> {
-        fs::write(self.mesh_payload_path(cache_key), payload_json)
+    fn read_glb_output(&self, cache_key: &str) -> CacheResult<Option<Vec<u8>>> {
+        let path = self.glb_output_path(cache_key);
+        if !path.exists() {
+            return Ok(None);
+        }
+        fs::read(path)
+            .map(Some)
             .map_err(|err| CacheError::Io(err.to_string()))
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn write_mesh_payload(&self, cache_key: &str, payload_json: &str) -> CacheResult<()> {
-        web_storage_set(&self.mesh_payload_storage_key(cache_key), payload_json)
+    fn read_glb_output(&self, cache_key: &str) -> CacheResult<Option<Vec<u8>>> {
+        let Some(encoded) = web_storage_get(&self.glb_output_storage_key(cache_key))? else {
+            return Ok(None);
+        };
+        let bytes = BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|err| CacheError::InvalidData(err.to_string()))?;
+        Ok(Some(bytes))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -506,19 +523,6 @@ impl MeshCache {
     #[cfg(target_arch = "wasm32")]
     fn mesh_payload_storage_key(&self, cache_key: &str) -> String {
         format!("{}/mesh/{cache_key}", self.prefix)
-    }
-
-    fn mesh_payload_id(&self, cache_key: &str) -> String {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.mesh_payload_path(cache_key)
-                .to_string_lossy()
-                .to_string()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.mesh_payload_storage_key(cache_key)
-        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -607,7 +611,7 @@ fn default_native_cache_root() -> PathBuf {
 
 #[cfg(target_arch = "wasm32")]
 fn default_web_cache_prefix() -> String {
-    "burn_synth/cache/v3".to_string()
+    "burn_synth/cache/v4".to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -745,6 +749,35 @@ mod tests {
             .expect("mesh exists");
         assert_eq!(loaded.mesh.vertices[1], [2.0, 0.0, 0.0]);
         assert!(loaded.material.is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn upsert_mesh_stores_glb_without_redundant_mesh_payload_json() {
+        let root = temp_root("glb_only");
+        let image = PathBuf::from("C:/data/input/chair.png");
+
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let entry = cache
+            .upsert_mesh_for_image(&image, &dummy_mesh(1.0))
+            .expect("insert mesh");
+
+        let payload_path = cache.mesh_payload_path(&entry.cache_key);
+        assert!(
+            !payload_path.exists(),
+            "legacy mesh payload JSON should not be written"
+        );
+        let glb_path = PathBuf::from(&entry.glb_output_id);
+        assert!(glb_path.exists(), "GLB cache artifact should exist");
+
+        let loaded = cache
+            .load_mesh(&entry.cache_key)
+            .expect("read mesh")
+            .expect("mesh exists");
+        assert_eq!(loaded.mesh.vertices.len(), 3);
+        assert_eq!(loaded.mesh.faces.len(), 1);
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }

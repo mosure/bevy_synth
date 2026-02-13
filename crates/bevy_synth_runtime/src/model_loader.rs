@@ -4,7 +4,7 @@ use burn_synth_import::layout::{
 };
 use burn_synth_import::shard::BurnpackShardManifest;
 
-pub(crate) fn prefer_f16_burnpack(_primary: &str) -> bool {
+pub(crate) fn prefer_f16_burnpack() -> bool {
     true
 }
 
@@ -107,12 +107,11 @@ pub(crate) fn load_optional_text_candidates_from_root(
 pub(crate) fn resolve_burnpack_asset_path_from_root(
     root: &Path,
     base_safetensors_rel: &str,
-    precision_env: &str,
 ) -> Result<PathBuf, String> {
     resolve_burnpack_asset_path_from_root_with_preference(
         root,
         base_safetensors_rel,
-        prefer_f16_burnpack(precision_env),
+        prefer_f16_burnpack(),
     )
 }
 
@@ -362,12 +361,8 @@ mod tests {
     }
 
     fn load_burnpack_bytes_for_test(root: &std::path::Path, base_safetensors_rel: &str) -> Vec<u8> {
-        let path = resolve_burnpack_asset_path_from_root(
-            root,
-            base_safetensors_rel,
-            "BURN_SYNTH_TEST_PRECISION",
-        )
-        .expect("failed to resolve burnpack path");
+        let path = resolve_burnpack_asset_path_from_root(root, base_safetensors_rel)
+            .expect("failed to resolve burnpack path");
         fs::read(&path).expect("failed to read burnpack bytes")
     }
 
@@ -397,7 +392,7 @@ mod tests {
 
     #[test]
     fn prefer_f16_default_is_true() {
-        assert!(prefer_f16_burnpack("BURN_SYNTH_TEST_BPK_PRECISION"));
+        assert!(prefer_f16_burnpack());
     }
 
     #[test]
@@ -603,12 +598,8 @@ mod tests {
         }
 
         // Validate the precision-env helper resolves identically.
-        let resolved = resolve_burnpack_asset_path_from_root(
-            &root,
-            "model.safetensors",
-            "BURN_SYNTH_TEST_PRECISION",
-        )
-        .expect("resolve via precision env helper");
+        let resolved = resolve_burnpack_asset_path_from_root(&root, "model.safetensors")
+            .expect("resolve default precision path");
         assert!(
             resolved.exists(),
             "precision helper should materialize file"

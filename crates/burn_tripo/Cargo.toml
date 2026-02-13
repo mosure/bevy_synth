@@ -150,6 +150,12 @@ required-features = ["import", "foreground"]
 test = false
 
 [[bin]]
+name = "triposg_decode_mode_ab"
+path = "tool/triposg_decode_mode_ab.rs"
+required-features = ["import", "foreground"]
+test = false
+
+[[bin]]
 name = "triposg_import"
 path = "tool/triposg_import.rs"
 required-features = ["import"]

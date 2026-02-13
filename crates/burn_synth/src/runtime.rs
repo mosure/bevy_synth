@@ -1641,7 +1641,7 @@ mod tests {
         let original_faces = mesh.faces.len();
         let simplified = decimate_mesh(mesh, Some(200)).expect("decimation should succeed");
         assert!(simplified.faces.len() <= 200);
-        assert!(simplified.faces.len() > 0);
+        assert!(!simplified.faces.is_empty());
         assert!(simplified.faces.len() < original_faces);
     }
 

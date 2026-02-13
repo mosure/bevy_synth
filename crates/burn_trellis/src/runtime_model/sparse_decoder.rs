@@ -2248,6 +2248,7 @@ fn convnext_blocks_forward_wgpu_tensor(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecoderConvImpl {
     Legacy,
+    #[cfg(not(feature = "runtime-model-wgpu"))]
     FlexGmm,
     #[cfg(feature = "runtime-model-wgpu")]
     Wgpu,
@@ -3170,7 +3171,7 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3189,6 +3190,10 @@ mod tests {
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn make_unit_conv_3x1x1(weight: [f32; 3]) -> SparseConvLayer {
         SparseConvLayer {
@@ -3225,7 +3230,7 @@ mod tests {
 
     #[test]
     fn sparse_conv_uses_neighbor_voxels() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
             std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
@@ -3259,7 +3264,7 @@ mod tests {
 
     #[test]
     fn sparse_conv_flex_matches_legacy_path() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
             std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
@@ -3314,7 +3319,7 @@ mod tests {
 
     #[test]
     fn decoder_neighbor_cache_reuses_across_coord_allocations() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
             std::env::remove_var("TRELLIS2_CONV_AXIS_SIGN");
@@ -3347,7 +3352,7 @@ mod tests {
 
     #[test]
     fn decoder_neighbor_cache_reuse_reduces_repeated_conv_time() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::set_var("TRELLIS2_DECODER_CONV_IMPL", "flex_gmm");
             std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
@@ -3425,7 +3430,7 @@ mod tests {
 
     #[test]
     fn decoder_default_child_cap_is_uncapped_without_strict_mode() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
             std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
@@ -3439,7 +3444,7 @@ mod tests {
 
     #[test]
     fn parity_strict_defaults_to_uncapped_children() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::set_var("TRELLIS2_PARITY_STRICT", "1");
             std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
@@ -3456,7 +3461,7 @@ mod tests {
 
     #[test]
     fn explicit_zero_child_cap_env_means_uncapped() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
             std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
@@ -3473,7 +3478,7 @@ mod tests {
 
     #[test]
     fn decoder_conv_auto_defaults_to_flex() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
@@ -3488,7 +3493,7 @@ mod tests {
 
     #[test]
     fn decoder_conv_auto_does_not_force_legacy_in_strict_mode() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_CONV_IMPL");
             std::env::set_var("TRELLIS2_E2E_STRICT", "1");
@@ -3505,42 +3510,25 @@ mod tests {
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn decoder_wgpu_neighbor_source_defaults_to_coords() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
-        unsafe {
-            std::env::remove_var("TRELLIS2_DECODER_WGPU_NEIGHBOR_SOURCE");
-        }
+        let _guard = env_lock_guard();
         assert!(decoder_wgpu_neighbor_from_coords());
-        unsafe {
-            std::env::set_var("TRELLIS2_DECODER_WGPU_NEIGHBOR_SOURCE", "rows");
-        }
-        assert!(!decoder_wgpu_neighbor_from_coords());
-        unsafe {
-            std::env::set_var("TRELLIS2_DECODER_WGPU_NEIGHBOR_SOURCE", "coords");
-        }
-        assert!(decoder_wgpu_neighbor_from_coords());
-        unsafe {
-            std::env::remove_var("TRELLIS2_DECODER_WGPU_NEIGHBOR_SOURCE");
-        }
     }
 
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn decoder_wgpu_cache_controls_have_expected_defaults() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
-        unsafe {
-            std::env::remove_var("TRELLIS2_DECODER_WGPU_CLEAR_CACHE_AFTER_DECODE");
-            std::env::remove_var("TRELLIS2_DECODER_WGPU_TENSOR_CACHE_MAX");
-        }
+        let _guard = env_lock_guard();
         assert!(!decoder_wgpu_clear_cache_after_decode());
         assert_eq!(decoder_wgpu_tensor_cache_max(), 64);
         assert!(decoder_wgpu_use_tensor_cache());
+        // Runtime behavior is canonical and should not drift based on environment toggles.
         unsafe {
             std::env::set_var("TRELLIS2_DECODER_WGPU_CLEAR_CACHE_AFTER_DECODE", "1");
             std::env::set_var("TRELLIS2_DECODER_WGPU_TENSOR_CACHE_MAX", "8");
         }
-        assert!(decoder_wgpu_clear_cache_after_decode());
-        assert_eq!(decoder_wgpu_tensor_cache_max(), 8);
-        assert!(!decoder_wgpu_use_tensor_cache());
+        assert!(!decoder_wgpu_clear_cache_after_decode());
+        assert_eq!(decoder_wgpu_tensor_cache_max(), 64);
+        assert!(decoder_wgpu_use_tensor_cache());
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_WGPU_CLEAR_CACHE_AFTER_DECODE");
             std::env::remove_var("TRELLIS2_DECODER_WGPU_TENSOR_CACHE_MAX");
@@ -3550,7 +3538,7 @@ mod tests {
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn decoder_wgpu_device_math_control_defaults_enabled() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH");
             std::env::remove_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH_FP16");
@@ -3562,17 +3550,17 @@ mod tests {
         unsafe {
             std::env::set_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH", "0");
         }
-        assert!(!decoder_wgpu_device_math_enabled());
+        assert!(decoder_wgpu_device_math_enabled());
         unsafe {
             std::env::set_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH", "1");
             std::env::set_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH_FP16", "0");
         }
-        assert!(!decoder_wgpu_device_math_allow_fp16());
+        assert!(decoder_wgpu_device_math_allow_fp16());
         unsafe {
             std::env::set_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH_FP16", "1");
             std::env::set_var("TRELLIS2_DECODER_CONV_IMPL", "legacy");
         }
-        assert!(!decoder_wgpu_device_math_enabled());
+        assert!(decoder_wgpu_device_math_enabled());
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH");
             std::env::remove_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH_FP16");
@@ -3615,7 +3603,7 @@ mod tests {
 
     #[test]
     fn model_weight_candidates_prefer_bpk_variants() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_BPK_PRECISION");
             std::env::remove_var("BURN_SYNTH_BPK_PRECISION");
@@ -3640,8 +3628,8 @@ mod tests {
     }
 
     #[test]
-    fn model_weight_candidates_honor_f32_preference() {
-        let _guard = ENV_LOCK.lock().expect("lock env");
+    fn model_weight_candidates_ignore_env_precision_overrides() {
+        let _guard = env_lock_guard();
         unsafe {
             std::env::set_var("TRELLIS2_BPK_PRECISION", "f32");
             std::env::remove_var("BURN_SYNTH_BPK_PRECISION");
@@ -3660,7 +3648,7 @@ mod tests {
 
         let candidates = resolve_model_weight_candidates("ckpts/shape", root.as_path(), None);
         assert!(!candidates.is_empty(), "expected weight candidates");
-        assert_eq!(candidates[0], ckpts.join("shape.bpk"));
+        assert_eq!(candidates[0], ckpts.join("shape_f16.bpk"));
 
         unsafe {
             std::env::remove_var("TRELLIS2_BPK_PRECISION");

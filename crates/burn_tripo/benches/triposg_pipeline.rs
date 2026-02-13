@@ -1,17 +1,26 @@
 #![recursion_limit = "256"]
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+#[cfg(feature = "import")]
+use std::path::{Path, PathBuf};
 
+use criterion::{Criterion, criterion_group, criterion_main};
+#[cfg(feature = "import")]
+use criterion::BenchmarkId;
+
+#[cfg(feature = "import")]
 use burn::prelude::*;
+#[cfg(feature = "import")]
 use burn_foreground::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_tensor};
+#[cfg(feature = "import")]
 use burn_tripo::pipeline::geometry::{
     FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
     hierarchical_extract_geometry,
 };
+#[cfg(feature = "import")]
 use burn_tripo::pipeline::mesh::{grid_to_mesh, sdf_to_mesh_surface_nets};
+#[cfg(feature = "import")]
 use burn_tripo::pipeline::triposg::TripoSGPipeline;
 
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +30,7 @@ enum BenchPreset {
     Full,
 }
 
+#[cfg(feature = "import")]
 #[derive(Clone, Copy, Debug)]
 struct BenchDefaults {
     steps: usize,
@@ -337,6 +347,7 @@ fn bench_with_backend<B: Backend>(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "import")]
 fn backend_name<B: Backend>() -> &'static str {
     let name = std::any::type_name::<B>();
     if name.contains("Wgpu") {
@@ -380,6 +391,7 @@ fn bench_preset() -> BenchPreset {
     BenchPreset::Fast
 }
 
+#[cfg(feature = "import")]
 fn bench_defaults(preset: BenchPreset) -> BenchDefaults {
     match preset {
         BenchPreset::Fast => BenchDefaults {
@@ -427,6 +439,7 @@ fn bench_defaults(preset: BenchPreset) -> BenchDefaults {
     }
 }
 
+#[cfg(feature = "import")]
 fn resolve_weights_root(env_var: &str, fallback: &str) -> Option<PathBuf> {
     if let Ok(value) = std::env::var(env_var) {
         let path = PathBuf::from(value);
@@ -438,6 +451,7 @@ fn resolve_weights_root(env_var: &str, fallback: &str) -> Option<PathBuf> {
     normalize_weights_root(&fallback)
 }
 
+#[cfg(feature = "import")]
 fn normalize_weights_root(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());

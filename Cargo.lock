@@ -3454,6 +3454,8 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d59a7d737259a784247595e2f0cc5a97d3e50f45cdaefbd4cc7d7fd2126f7a58"
 dependencies = [
  "ash",
  "async-channel",

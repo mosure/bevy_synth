@@ -43,11 +43,6 @@ impl BurnpackLoadPolicy {
     pub const fn with_f16_suffix(self, f16_suffix: &'static str) -> Self {
         Self { f16_suffix, ..self }
     }
-
-    /// Compatibility helper retained for API stability.
-    pub fn from_env_compat(_primary: &str, _fallback: &str) -> Self {
-        Self::default()
-    }
 }
 
 pub fn candidate_burnpack_paths(path: &Path, policy: BurnpackLoadPolicy) -> Vec<PathBuf> {
@@ -105,11 +100,8 @@ mod tests {
     };
 
     #[test]
-    fn compatibility_env_parser_defaults_to_f32() {
-        let default = BurnpackLoadPolicy::from_env_compat(
-            "BURN_TRIPO_TEST_MISSING_PRIMARY",
-            "BURN_TRIPO_TEST_MISSING_FALLBACK",
-        );
+    fn default_policy_prefers_f32() {
+        let default = BurnpackLoadPolicy::default();
         assert_eq!(default.precision, BpkPrecisionPreference::PreferF32);
     }
 

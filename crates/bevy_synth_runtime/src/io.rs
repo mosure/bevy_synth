@@ -36,6 +36,148 @@ pub fn mesh_to_glb_bytes(mesh: &SynthMesh) -> Result<Vec<u8>, Box<dyn std::error
     Ok(glb)
 }
 
+pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error::Error>> {
+    let gltf = gltf::Gltf::from_slice(bytes)?;
+    let blob = gltf
+        .blob
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "GLB binary chunk missing"))?;
+
+    let mesh = gltf
+        .meshes()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "GLB has no meshes"))?;
+    let primitive = mesh
+        .primitives()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "GLB mesh has no primitives"))?;
+
+    let reader = primitive.reader(|_buffer| Some(blob));
+
+    let vertices: Vec<[f32; 3]> = reader
+        .read_positions()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "GLB missing POSITION data"))?
+        .collect();
+    if vertices.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GLB mesh has no vertices",
+        )));
+    }
+
+    let indices: Vec<u32> = reader
+        .read_indices()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "GLB missing index data"))?
+        .into_u32()
+        .collect();
+    if !indices.len().is_multiple_of(3) {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GLB indices are not triangles",
+        )));
+    }
+    let vertex_count = vertices.len() as u32;
+    let mut faces = Vec::with_capacity(indices.len() / 3);
+    for tri in indices.chunks_exact(3) {
+        if tri[0] >= vertex_count || tri[1] >= vertex_count || tri[2] >= vertex_count {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GLB indices reference out-of-range vertices",
+            )));
+        }
+        faces.push([tri[0], tri[1], tri[2]]);
+    }
+
+    let mut uvs: Vec<[f32; 2]> = reader
+        .read_tex_coords(0)
+        .map(|coords| coords.into_f32().collect())
+        .unwrap_or_default();
+    if uvs.len() != vertices.len() {
+        uvs.clear();
+    }
+
+    let material_ref = primitive.material();
+    let pbr = material_ref.pbr_metallic_roughness();
+    let base_factor = pbr.base_color_factor();
+    let material = material_ref.index().map(|_| crate::SynthMeshMaterial {
+        base_color: [base_factor[0], base_factor[1], base_factor[2]],
+        metallic: pbr.metallic_factor(),
+        roughness: pbr.roughness_factor(),
+        alpha: base_factor[3],
+    });
+
+    let base_color = pbr
+        .base_color_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let metallic_roughness = pbr
+        .metallic_roughness_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let normal = material_ref
+        .normal_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let emissive = material_ref
+        .emissive_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let occlusion = material_ref
+        .occlusion_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+
+    let pbr_textures = match (base_color, metallic_roughness) {
+        (Some(base_color), Some(metallic_roughness)) => Some(crate::SynthMeshPbrTextures {
+            base_color,
+            metallic_roughness,
+            normal,
+            emissive,
+            occlusion,
+        }),
+        _ => None,
+    };
+
+    Ok(SynthMesh {
+        mesh: crate::TripoMesh { vertices, faces },
+        uvs,
+        material,
+        pbr_textures,
+    })
+}
+
+fn decode_texture_from_glb(
+    texture: gltf::Texture<'_>,
+    blob: &[u8],
+) -> Result<SynthMeshTexture, Box<dyn std::error::Error>> {
+    let source = texture.source().source();
+    let encoded = match source {
+        gltf::image::Source::View { view, .. } => {
+            let start = view.offset();
+            let end = start.saturating_add(view.length());
+            blob.get(start..end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GLB image buffer view was out of range",
+                )
+            })?
+        }
+        gltf::image::Source::Uri { .. } => {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GLB cache loader does not support URI texture sources",
+            )));
+        }
+    };
+
+    let rgba = image::load_from_memory(encoded)?.to_rgba8();
+    Ok(SynthMeshTexture {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba8: rgba.into_raw(),
+    })
+}
+
 #[derive(Clone, Debug)]
 struct MeshBinaryLayout {
     buffer: Vec<u8>,

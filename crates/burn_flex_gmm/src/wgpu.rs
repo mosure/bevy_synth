@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use burn::tensor::{DType, Int, Shape, Tensor as BurnTensor, TensorData, TensorPrimitive};
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::{calculate_cube_count_elemwise, prelude::*};
-use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
+use burn_cubecl::{tensor::CubeTensor, CubeRuntime};
 
-use crate::{SparseSubmConvConfig, build_neighbor_rows, kernel_rows};
+use crate::{build_neighbor_rows, kernel_rows, SparseSubmConvConfig};
 
 /// Default WGPU backend type used by the tensor convenience wrappers.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
@@ -31,6 +31,7 @@ pub struct NeighborRowsBuildStats {
     pub device_builds: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum NeighborBuildBackend {
     Host,
@@ -41,13 +42,6 @@ enum NeighborBuildBackend {
 enum NeighborDeviceAlgo {
     Scan,
     Hash,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NeighborHashBuildMode {
-    Auto,
-    Host,
-    Wgsl,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -745,13 +739,9 @@ fn resolve_sparse_conv_kernel_variant(
 }
 
 fn resolve_neighbor_backend(_rows: usize, _kernel_rows: usize) -> NeighborBuildBackend {
-    match resolve_neighbor_hash_build_mode() {
-        NeighborHashBuildMode::Host => NeighborBuildBackend::Host,
-        NeighborHashBuildMode::Wgsl => NeighborBuildBackend::Device,
-        // Prefer device-resident neighbor map generation by default.
-        // The device hash path already has guarded fallbacks for robustness.
-        NeighborHashBuildMode::Auto => NeighborBuildBackend::Device,
-    }
+    // Prefer device-resident neighbor map generation by default.
+    // The device hash path already has guarded fallbacks for robustness.
+    NeighborBuildBackend::Device
 }
 
 fn resolve_neighbor_device_algo(rows: usize, kernel_rows: usize) -> NeighborDeviceAlgo {
@@ -761,10 +751,6 @@ fn resolve_neighbor_device_algo(rows: usize, kernel_rows: usize) -> NeighborDevi
     } else {
         NeighborDeviceAlgo::Scan
     }
-}
-
-fn resolve_neighbor_hash_build_mode() -> NeighborHashBuildMode {
-    NeighborHashBuildMode::Auto
 }
 
 fn resolve_neighbor_hash_load_factor() -> usize {
@@ -1104,6 +1090,7 @@ fn build_neighbor_rows_tensor_device_hash_host_table(
     Ok(neighbor_rows_1d.reshape([rows, kernel_rows]))
 }
 
+#[allow(dead_code)]
 fn build_neighbor_rows_tensor_device_hash_wgsl_table(
     config: &SparseSubmConvConfig,
     coords: &[[u32; 4]],
@@ -1252,20 +1239,11 @@ fn build_neighbor_rows_tensor_device_hash(
     coords: &[[u32; 4]],
     device: &burn_wgpu::WgpuDevice,
 ) -> Result<BurnTensor<DefaultWgpuBackend, 2, Int>, String> {
-    match resolve_neighbor_hash_build_mode() {
-        NeighborHashBuildMode::Host => {
-            build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
-        }
-        NeighborHashBuildMode::Wgsl => {
-            build_neighbor_rows_tensor_device_hash_wgsl_table(config, coords, device)
-        }
-        NeighborHashBuildMode::Auto => {
-            // Current WGSL hash-table insertion is serialized and can be an order of magnitude
-            // slower than host-table build+device query on real sparse decoder workloads.
-            // Keep `auto` on the faster host-table path until a parallel device build lands.
-            build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
-        }
-    }
+    // Current WGSL hash-table insertion is serialized and can be an order of
+    // magnitude slower than host-table build + device query on sparse decoder
+    // workloads. Keep the canonical path on host-table build until a parallel
+    // device-side table build is implemented.
+    build_neighbor_rows_tensor_device_hash_host_table(config, coords, device)
 }
 
 fn build_neighbor_rows_tensor_device(
@@ -1677,20 +1655,24 @@ fn validate_tensor_shapes<R: CubeRuntime>(
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     use burn::tensor::Tensor;
 
-    use crate::{SparseSubmConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex};
+    use crate::{sparse_subm_conv_forward_flex, SparseSubmConvConfig, SparseSubmConvWeights};
 
     use super::{
-        DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
         clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
         neighbor_rows_tensor_from_coords, reset_neighbor_rows_build_stats,
         sparse_subm_conv_forward_wgpu, sparse_subm_conv_forward_wgpu_with_config,
+        DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[derive(Clone)]
     struct Lcg {
@@ -1714,7 +1696,7 @@ mod tests {
 
     #[test]
     fn wgpu_kernel_matches_cpu_flex_path() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 8,
             out_channels: 12,
@@ -1780,7 +1762,7 @@ mod tests {
 
     #[test]
     fn neighbor_rows_tensor_shape_is_consistent() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 2,
             out_channels: 2,
@@ -1807,7 +1789,7 @@ mod tests {
 
     #[test]
     fn neighbor_rows_cache_reuses_across_equivalent_coord_allocations() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "host");
         }
@@ -1844,8 +1826,8 @@ mod tests {
         let stats = neighbor_rows_build_stats();
         assert_eq!(stats.cache_misses, 1);
         assert_eq!(stats.cache_hits, 1);
-        assert_eq!(stats.host_builds, 1);
-        assert_eq!(stats.device_builds, 0);
+        assert_eq!(stats.host_builds, 0);
+        assert_eq!(stats.device_builds, 1);
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -1856,7 +1838,7 @@ mod tests {
 
     #[test]
     fn neighbor_rows_cache_reuses_across_channel_variants_with_same_topology() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         unsafe {
             std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "host");
         }
@@ -1903,8 +1885,8 @@ mod tests {
         let stats = neighbor_rows_build_stats();
         assert_eq!(stats.cache_misses, 1);
         assert_eq!(stats.cache_hits, 1);
-        assert_eq!(stats.host_builds, 1);
-        assert_eq!(stats.device_builds, 0);
+        assert_eq!(stats.host_builds, 0);
+        assert_eq!(stats.device_builds, 1);
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -1915,7 +1897,7 @@ mod tests {
 
     #[test]
     fn neighbor_rows_device_backend_matches_host_backend() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 4,
             out_channels: 4,
@@ -1956,7 +1938,8 @@ mod tests {
         let host_rows = host_rows.as_slice::<i32>().expect("i32").to_vec();
         let host_stats = neighbor_rows_build_stats();
         assert_eq!(host_stats.cache_misses, 1);
-        assert_eq!(host_stats.host_builds, 1);
+        assert_eq!(host_stats.host_builds, 0);
+        assert_eq!(host_stats.device_builds, 1);
 
         assert_eq!(device_rows, host_rows);
 
@@ -1970,7 +1953,7 @@ mod tests {
 
     #[test]
     fn neighbor_rows_device_hash_matches_scan() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 4,
             out_channels: 4,
@@ -2020,7 +2003,7 @@ mod tests {
 
     #[test]
     fn neighbor_rows_device_hash_build_modes_match_scan() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 4,
             out_channels: 4,
@@ -2085,7 +2068,7 @@ mod tests {
 
     #[test]
     fn wgpu_fused_oc4_matches_baseline_output() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 32,
             out_channels: 64,
@@ -2166,7 +2149,7 @@ mod tests {
 
     #[test]
     fn wgpu_splitk_matches_default_kernel_output() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 32,
             out_channels: 64,
@@ -2246,7 +2229,7 @@ mod tests {
 
     #[test]
     fn wgpu_fused_splitk_matches_baseline_output() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_lock_guard();
         let cfg = SparseSubmConvConfig {
             in_channels: 32,
             out_channels: 64,

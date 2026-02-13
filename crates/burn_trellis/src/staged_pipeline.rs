@@ -2692,6 +2692,10 @@ mod tests {
 
     use super::{bake_pbr_from_voxels, summarize_material};
     #[cfg(feature = "runtime-model")]
+    use super::{
+        FlowEulerSampleConfig, ShapeSLatSample, TexSLatSample, decode_latent_to_outputs,
+    };
+    #[cfg(feature = "runtime-model")]
     use crate::hook_diff::{HookSnapshot, compute_stats};
     use crate::mesh::MeshPbrTextures;
     #[cfg(feature = "runtime-model")]

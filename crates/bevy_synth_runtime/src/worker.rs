@@ -493,8 +493,7 @@ fn load_triposg_pipeline<B: Backend>(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_rmbg14_artifacts_from_root(root: &std::path::Path) -> Result<Rmbg14Artifacts, String> {
-    let burnpack_path =
-        resolve_burnpack_asset_path_from_root(root, "model.safetensors", "RMBG_BPK_PRECISION")?;
+    let burnpack_path = resolve_burnpack_asset_path_from_root(root, "model.safetensors")?;
     let config_json = load_optional_text_from_root(root, "config.json")?;
     let processor_json = load_optional_text_from_root(root, "preprocessor_config.json")?;
     Ok(Rmbg14Artifacts {
@@ -1398,7 +1397,7 @@ async fn load_rmbg14_artifacts_wasm(
     let burnpack = download_burnpack_asset(
         &join_web_path(rmbg_root_url, "model.safetensors"),
         "RMBG",
-        prefer_f16_burnpack("RMBG_BPK_PRECISION"),
+        prefer_f16_burnpack(),
         event_tx,
         totals,
         host_ram_budget,
@@ -3007,7 +3006,6 @@ mod tests {
         let rmbg_burnpack_path = crate::model_loader::resolve_burnpack_asset_path_from_root(
             &rmbg_root,
             "model.safetensors",
-            "RMBG_BPK_PRECISION",
         )
         .expect("resolve RMBG burnpack path");
 

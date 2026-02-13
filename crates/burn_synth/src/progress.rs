@@ -239,7 +239,6 @@ mod tests {
             verbosity: ProgressVerbosity::Steps,
             step_interval: 3,
             callback: Some(Arc::new(|_| {})),
-            ..RuntimeProgressObserver::default()
         };
         assert!(!observer.should_emit_step(2, 10));
         assert!(observer.should_emit_step(1, 10));
@@ -253,7 +252,6 @@ mod tests {
             verbosity: ProgressVerbosity::Stages,
             step_interval: 1,
             callback: Some(Arc::new(|_| {})),
-            ..RuntimeProgressObserver::default()
         };
         assert!(!observer.should_emit_step(1, 10));
     }

@@ -1,4 +1,7 @@
-use burn::{prelude::*, tensor::Distribution};
+use burn::{
+    prelude::*,
+    tensor::{Distribution, TensorData},
+};
 use std::time::Instant;
 
 #[cfg(feature = "import")]
@@ -12,10 +15,10 @@ use crate::model::triposg::{
     vae::TripoSGVae,
 };
 use crate::pipeline::geometry::{
-    FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
-    hierarchical_extract_geometry,
+    flash_extract_geometry, hierarchical_extract_geometry, FlashExtractConfig,
+    HierarchicalExtractConfig,
 };
-use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
+use crate::pipeline::mesh::{grid_to_mesh, sdf_to_mesh_diff_dmc, DenseGrid, Mesh};
 use crate::readback::tensor_to_vec_f32;
 
 #[derive(Debug)]
@@ -543,33 +546,42 @@ pub(crate) fn decode_grid_values_device_accumulate<B: Backend>(
     let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
 
     let mut coords = Vec::with_capacity(chunk_size * 3);
-    let mut chunks = Vec::<Tensor<B, 3>>::new();
+    let mut chunk_indices = Vec::<i32>::with_capacity(chunk_size);
+    let mut values = Tensor::<B, 1>::zeros([total], device);
     for idx in 0..total {
         let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
         coords.push(bounds[0] + step_x * x as f32);
         coords.push(bounds[1] + step_y * y as f32);
         coords.push(bounds[2] + step_z * z as f32);
+        chunk_indices.push(idx as i32);
         let count = coords.len() / 3;
         if count < chunk_size {
             continue;
         }
-        chunks.push(decoded_chunk_tensor(latents, vae, &coords, device)?);
+        values = write_decoded_chunk_scatter_device(
+            latents,
+            vae,
+            &coords,
+            &chunk_indices,
+            device,
+            values,
+        )?;
         coords.clear();
+        chunk_indices.clear();
     }
 
     if !coords.is_empty() {
-        chunks.push(decoded_chunk_tensor(latents, vae, &coords, device)?);
+        values = write_decoded_chunk_scatter_device(
+            latents,
+            vae,
+            &coords,
+            &chunk_indices,
+            device,
+            values,
+        )?;
     }
 
-    if chunks.is_empty() {
-        return Ok(vec![]);
-    }
-    let decoded = if chunks.len() == 1 {
-        chunks.pop().expect("single chunk exists")
-    } else {
-        Tensor::cat(chunks, 1)
-    };
-    let mut values = tensor_to_vec_f32(decoded)
+    let mut values = tensor_to_vec_f32(values)
         .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
     values.truncate(total);
     Ok(values)
@@ -642,6 +654,33 @@ fn decoded_chunk_tensor<B: Backend>(
         .reshape([count as i32, 3])
         .unsqueeze_dim(0);
     Ok(vae.decode(coords_tensor, latents.clone(), None))
+}
+
+fn write_decoded_chunk_scatter_device<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    coords: &[f32],
+    indices: &[i32],
+    device: &B::Device,
+    output: Tensor<B, 1>,
+) -> Result<Tensor<B, 1>, Box<dyn std::error::Error>> {
+    if coords.is_empty() {
+        return Ok(output);
+    }
+    let count = coords.len() / 3;
+    if count != indices.len() {
+        return Err(format!(
+            "decoded chunk scatter mismatch: coords_points={count} indices={}",
+            indices.len()
+        )
+        .into());
+    }
+
+    let decoded = decoded_chunk_tensor(latents, vae, coords, device)?;
+    let values = decoded.reshape([count]);
+    let indices =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(indices.to_vec(), [count]), device);
+    Ok(output.scatter(0, indices, values))
 }
 
 fn write_decoded_chunk_contiguous<B: Backend>(
@@ -807,6 +846,7 @@ fn push_unique_dit_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::triposg::vae::{TripoSGVae, TripoSGVaeConfig};
 
     #[test]
     fn dense_grid_index_round_trip() {
@@ -817,5 +857,49 @@ mod tests {
             let round_trip = x + y * resolution + z * resolution * resolution;
             assert_eq!(round_trip, idx, "index mapping mismatch at idx={idx}");
         }
+    }
+
+    #[test]
+    fn decode_grid_device_accumulate_matches_chunked_host() {
+        type B = burn::backend::NdArray<f32>;
+        let device = <B as Backend>::Device::default();
+        let vae = TripoSGVae::new(
+            &device,
+            TripoSGVaeConfig {
+                embed_frequency: 2,
+                embed_include_pi: false,
+                embedding_type: "frequency".to_string(),
+                in_channels: 3,
+                latent_channels: 4,
+                num_attention_heads: 1,
+                num_layers_decoder: 1,
+                num_layers_encoder: 1,
+                width_decoder: 8,
+                width_encoder: 8,
+            },
+        );
+        let latents = Tensor::<B, 3>::random([1, 32, 4], Distribution::Normal(0.0, 1.0), &device);
+        let bounds = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let resolution = 10usize;
+        let chunk_size = 37usize;
+
+        let device_values = decode_grid_values_device_accumulate(
+            &latents, &vae, bounds, resolution, chunk_size, &device,
+        )
+        .expect("device accumulate path");
+        let host_values = decode_grid_values_chunked_host(
+            &latents, &vae, bounds, resolution, chunk_size, &device,
+        )
+        .expect("host chunked path");
+
+        assert_eq!(device_values.len(), host_values.len());
+        let mut max_abs = 0.0f32;
+        for (lhs, rhs) in device_values.iter().zip(host_values.iter()) {
+            max_abs = max_abs.max((lhs - rhs).abs());
+        }
+        assert!(
+            max_abs <= 1.0e-6,
+            "device/host grid decode mismatch max_abs={max_abs}"
+        );
     }
 }

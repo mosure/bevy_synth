@@ -728,7 +728,7 @@ pub mod import {
     }
 
     fn default_burnpack_policy() -> BurnpackLoadPolicy {
-        BurnpackLoadPolicy::from_env_compat("TRIPOSG_BPK_PRECISION", "BURN_SYNTH_BPK_PRECISION")
+        BurnpackLoadPolicy::default()
     }
 
     pub fn load_triposg_vae_from_safetensors<B: Backend>(
