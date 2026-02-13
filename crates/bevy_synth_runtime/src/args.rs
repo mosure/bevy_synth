@@ -256,7 +256,7 @@ impl QualityPreset {
                 num_tokens: 512,
                 guidance_scale: 7.0,
                 resolution: 128,
-                chunk_size: 8192,
+                chunk_size: DEFAULT_CHUNK_SIZE,
                 dense_octree_depth: 6,
                 hierarchical_octree_depth: 7,
                 band_threshold: 1.0,
@@ -271,7 +271,7 @@ impl QualityPreset {
                 num_tokens: 1024,
                 guidance_scale: 7.0,
                 resolution: 192,
-                chunk_size: 8192,
+                chunk_size: DEFAULT_CHUNK_SIZE,
                 dense_octree_depth: 7,
                 hierarchical_octree_depth: 8,
                 band_threshold: 1.0,
@@ -419,7 +419,7 @@ fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel>
 mod tests {
     use clap::Parser;
 
-    use super::{Args, RmbgModel, SynthesisModel, build_app_args};
+    use super::{Args, DEFAULT_CHUNK_SIZE, RmbgModel, SynthesisModel, build_app_args};
 
     #[test]
     fn defaults_use_rmbg14_and_batch_one() {
@@ -469,5 +469,13 @@ mod tests {
             app_args.synthesis_models,
             vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
         );
+    }
+
+    #[test]
+    fn fast_and_balanced_presets_use_backend_tuned_chunk_default() {
+        let fast = build_app_args(Args::parse_from(["bevy_synth", "--quality", "fast"]));
+        let balanced = build_app_args(Args::parse_from(["bevy_synth", "--quality", "balanced"]));
+        assert_eq!(fast.chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq!(balanced.chunk_size, DEFAULT_CHUNK_SIZE);
     }
 }

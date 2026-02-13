@@ -472,26 +472,7 @@ fn setup(
         RenderLayers::layer(0).with(12),
         MainCamera,
     ));
-    ambient_light.color = Color::srgb(0.95, 0.95, 0.95);
-    ambient_light.brightness = 80.0;
-    commands.spawn((
-        DirectionalLight {
-            color: Color::WHITE,
-            illuminance: lux::AMBIENT_DAYLIGHT,
-            shadows_enabled: true,
-            shadow_depth_bias: 0.15,
-            shadow_normal_bias: 1.0,
-            ..default()
-        },
-        Transform::from_xyz(7.0, 10.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
-        CascadeShadowConfigBuilder {
-            first_cascade_far_bound: 10.0,
-            maximum_distance: 48.0,
-            ..default()
-        }
-        .build(),
-        preview_light_layers(),
-    ));
+    spawn_default_lighting(&mut commands, &mut ambient_light);
 
     commands.spawn((
         InfiniteGridBundle {
@@ -550,6 +531,52 @@ fn setup(
     }
 
     update_status_message(&args, &queue, &mut status);
+}
+
+fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLight) {
+    ambient_light.color = Color::srgb(0.84, 0.88, 0.95);
+    ambient_light.brightness = 220.0;
+
+    commands.spawn((
+        DirectionalLight {
+            color: Color::srgb(1.0, 0.97, 0.93),
+            illuminance: lux::AMBIENT_DAYLIGHT,
+            shadows_enabled: true,
+            shadow_depth_bias: 0.12,
+            shadow_normal_bias: 0.8,
+            ..default()
+        },
+        Transform::from_xyz(9.0, 12.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
+        CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 12.0,
+            maximum_distance: 72.0,
+            ..default()
+        }
+        .build(),
+        preview_light_layers(),
+    ));
+
+    commands.spawn((
+        DirectionalLight {
+            color: Color::srgb(0.72, 0.82, 1.0),
+            illuminance: 14_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(-10.0, 6.0, -8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        preview_light_layers(),
+    ));
+
+    commands.spawn((
+        DirectionalLight {
+            color: Color::srgb(1.0, 0.92, 0.84),
+            illuminance: 8_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(0.0, 9.5, -12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        preview_light_layers(),
+    ));
 }
 
 fn hydrate_from_cache(

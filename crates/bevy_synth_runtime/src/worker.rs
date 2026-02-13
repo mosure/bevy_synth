@@ -114,7 +114,8 @@ mod worker_runtime_bridge;
 #[cfg(feature = "wgpu")]
 type WgpuRuntimeBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 
-const WGPU_CHUNK_SIZE_CAP: usize = 8_192;
+const WGPU_CHUNK_SIZE_TARGET: usize = 32_768;
+const WGPU_CHUNK_SIZE_CAP: usize = 65_536;
 const CUDA_CHUNK_SIZE_CAP: usize = 32_768;
 // Keep runtime DINO config resolution aligned with burn_tripo canonical loader.
 // Legacy image_encoder_{1,2} configs can have incompatible channel layouts (e.g. 7-channel
@@ -2333,7 +2334,7 @@ fn tuned_chunk_size<B: Backend>(requested: usize) -> usize {
     let requested = requested.max(1);
     let mut chunk_size = if requested == DEFAULT_CHUNK_SIZE && is_gpu_backend::<B>() {
         if is_wgpu_backend::<B>() {
-            WGPU_CHUNK_SIZE_CAP
+            WGPU_CHUNK_SIZE_TARGET
         } else if is_cuda_backend::<B>() {
             CUDA_CHUNK_SIZE_CAP
         } else {
