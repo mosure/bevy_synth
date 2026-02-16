@@ -6,6 +6,9 @@ edition = "2024"
 description = "Runtime services for the bevy_synth app (worker, args, cache, IO)"
 license = "MIT OR Apache-2.0"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [features]
 default = ["wgpu"]
 wgpu = ["dep:burn-wgpu", "burn_synth/wgpu"]
@@ -36,6 +39,7 @@ burn-wgpu = { version = "0.19", optional = true, default-features = false, featu
 burn_synth = { path = "../burn_synth", default-features = false, features = ["runtime"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+burn_synth = { path = "../burn_synth", default-features = false }
 web-sys = { version = "0.3", features = [
   "Storage",
   "Window",
@@ -49,6 +53,7 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 sysinfo = "0.36"

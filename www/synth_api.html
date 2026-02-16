@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>burn_synth wasm app</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: #0d1117;
+        color: #d6deeb;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      body {
+        display: grid;
+        place-items: center;
+      }
+      #boot {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        border: 1px solid rgba(180, 200, 240, 0.22);
+        border-radius: 10px;
+        background: rgba(7, 11, 18, 0.9);
+      }
+      #boot-text {
+        font-size: 14px;
+        letter-spacing: 0.01em;
+      }
+      #boot-start {
+        appearance: none;
+        border: 1px solid rgba(180, 200, 240, 0.28);
+        background: rgba(32, 64, 104, 0.4);
+        color: #d6deeb;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #boot-start:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="boot">
+      <div id="boot-text">click start to initialize burn_synth wasm</div>
+      <button id="boot-start" type="button">Start</button>
+      <input id="image-file" type="file" accept=".png,.jpg,.jpeg,.webp" disabled />
+      <button id="run-infer" type="button" disabled>Infer GLB</button>
+      <a id="download" style="display: none" download="burn_synth_output.glb">download glb</a>
+    </div>
+    <script type="module">
+      import init, * as wasm from "./out/burn_synth.js";
+
+      const text = document.getElementById("boot-text");
+      const startButton = document.getElementById("boot-start");
+      const imageInput = document.getElementById("image-file");
+      const runButton = document.getElementById("run-infer");
+      const download = document.getElementById("download");
+      window.__burnSynthWasm = wasm;
+
+      const start = async () => {
+        startButton.disabled = true;
+        text.textContent = "loading wasm module...";
+        try {
+          await init();
+          window.__burnSynthWasmReady = true;
+          let hasWebGpu = false;
+          if (typeof wasm.webgpu_available === "function") {
+            hasWebGpu = await wasm.webgpu_available();
+          }
+          if (!hasWebGpu) {
+            imageInput.disabled = true;
+            runButton.disabled = true;
+            text.textContent = "module ready (WebGPU unavailable in this browser/runtime)";
+          } else {
+            imageInput.disabled = false;
+            runButton.disabled = false;
+            text.textContent = "module ready";
+          }
+        } catch (err) {
+          console.error("failed to initialize burn_synth wasm api", err);
+          text.textContent = "failed to load wasm module";
+          startButton.disabled = false;
+        }
+      };
+
+      const infer = async () => {
+        const file = imageInput.files?.[0];
+        if (!file) {
+          text.textContent = "choose an input image first";
+          return;
+        }
+        runButton.disabled = true;
+        download.style.display = "none";
+        text.textContent = "running inference...";
+        try {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          const glb = await wasm.infer_glb_from_image_bytes(bytes, file.name);
+          const blob = new Blob([glb], { type: "model/gltf-binary" });
+          download.href = URL.createObjectURL(blob);
+          download.style.display = "inline";
+          text.textContent = `inference complete (${(glb.byteLength / (1024 * 1024)).toFixed(1)} MiB)`;
+        } catch (err) {
+          console.error("burn_synth wasm inference failed", err);
+          text.textContent = `inference failed: ${String(err)}`;
+        } finally {
+          runButton.disabled = false;
+        }
+      };
+
+      startButton.addEventListener("click", start);
+      runButton.addEventListener("click", infer);
+    </script>
+  </body>
+</html>

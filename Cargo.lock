@@ -1504,6 +1504,7 @@ dependencies = [
  "burn_tripo",
  "bytemuck",
  "clap",
+ "console_error_panic_hook",
  "gloo-timers",
  "gltf",
  "half",
@@ -2287,20 +2288,30 @@ dependencies = [
  "burn-cuda",
  "burn-wgpu",
  "burn_foreground",
+ "burn_synth_import",
  "burn_trellis",
  "burn_tripo",
  "clap",
+ "console_error_panic_hook",
  "env_logger",
+ "getrandom 0.3.4",
  "gltf",
  "image",
+ "js-sys",
  "log",
  "serde_json",
+ "sha2",
+ "sysinfo 0.36.1",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
 name = "burn_synth_import"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "clap",
  "hex",
  "serde",
@@ -2374,6 +2385,7 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]
@@ -3454,8 +3466,6 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d59a7d737259a784247595e2f0cc5a97d3e50f45cdaefbd4cc7d7fd2126f7a58"
 dependencies = [
  "ash",
  "async-channel",

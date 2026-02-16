@@ -1,8 +1,9 @@
-use burn::{
-    prelude::*,
-    tensor::Distribution,
-};
+use burn::{prelude::*, tensor::Distribution};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 #[cfg(feature = "import")]
 use crate::model::triposg::load_policy::BurnpackLoadPolicy;
@@ -15,10 +16,10 @@ use crate::model::triposg::{
     vae::TripoSGVae,
 };
 use crate::pipeline::geometry::{
-    flash_extract_geometry, hierarchical_extract_geometry, FlashExtractConfig,
-    HierarchicalExtractConfig,
+    FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
+    hierarchical_extract_geometry,
 };
-use crate::pipeline::mesh::{grid_to_mesh, sdf_to_mesh_diff_dmc, DenseGrid, Mesh};
+use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 use crate::readback::tensor_to_vec_f32;
 
 #[derive(Debug)]

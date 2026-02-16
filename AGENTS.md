@@ -32,6 +32,8 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 3. Capture GPU utilization, memory, and stage timestamps during benchmarks.
 4. Large GPU idle gaps imply pipeline or transfer bottlenecks and must be investigated.
 5. Prefer device-resident execution through decode/PBR; minimize host readbacks/transfers.
+6. On wasm, never rely on synchronous GPU tensor readback; prefer async tensor readback APIs.
+7. Preserve GPU backend parity across native/wasm whenever feasible; avoid wasm-only CPU fallbacks unless correctness or platform limits force it.
 
 ## Model Import and Loading
 

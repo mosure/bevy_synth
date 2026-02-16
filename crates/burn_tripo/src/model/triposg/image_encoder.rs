@@ -120,10 +120,40 @@ impl DinoImageProcessor {
         }
 
         if self.do_normalize {
-            let device = image.device();
-            let mean = Tensor::<B, 1>::from_floats(self.mean, &device).reshape([1, 3, 1, 1]);
-            let std = Tensor::<B, 1>::from_floats(self.std, &device).reshape([1, 3, 1, 1]);
-            image = image.sub(mean).div(std);
+            if cfg!(target_arch = "wasm32") && is_wgpu_backend::<B>() {
+                // WebGPU storage bindings require 4-byte alignment. Avoid creating tiny
+                // 3-element f16 tensors for mean/std on wasm by normalizing per-channel
+                // with scalar ops.
+                let [batch, channels, height, width] = image.shape().dims();
+                if channels == 3 {
+                    let c0 = image
+                        .clone()
+                        .slice([0..batch, 0..1, 0..height, 0..width])
+                        .sub_scalar(self.mean[0])
+                        .div_scalar(self.std[0]);
+                    let c1 = image
+                        .clone()
+                        .slice([0..batch, 1..2, 0..height, 0..width])
+                        .sub_scalar(self.mean[1])
+                        .div_scalar(self.std[1]);
+                    let c2 = image
+                        .slice([0..batch, 2..3, 0..height, 0..width])
+                        .sub_scalar(self.mean[2])
+                        .div_scalar(self.std[2]);
+                    image = Tensor::cat(vec![c0, c1, c2], 1);
+                } else {
+                    let device = image.device();
+                    let mean =
+                        Tensor::<B, 1>::from_floats(self.mean, &device).reshape([1, 3, 1, 1]);
+                    let std = Tensor::<B, 1>::from_floats(self.std, &device).reshape([1, 3, 1, 1]);
+                    image = image.sub(mean).div(std);
+                }
+            } else {
+                let device = image.device();
+                let mean = Tensor::<B, 1>::from_floats(self.mean, &device).reshape([1, 3, 1, 1]);
+                let std = Tensor::<B, 1>::from_floats(self.std, &device).reshape([1, 3, 1, 1]);
+                image = image.sub(mean).div(std);
+            }
         }
 
         image
@@ -257,6 +287,12 @@ impl DinoImageProcessor {
     }
 }
 
+fn is_wgpu_backend<B: Backend>() -> bool {
+    std::any::type_name::<B>()
+        .to_ascii_lowercase()
+        .contains("wgpu")
+}
+
 #[cfg(feature = "import")]
 pub mod import {
     use std::{
@@ -335,7 +371,8 @@ pub mod import {
 
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
-        let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
+        let mut store =
+            BurnpackStore::from_file(&burnpack_path).validate(should_validate_burnpack());
         let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack: {err}"))?;
@@ -377,8 +414,8 @@ pub mod import {
     ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
-        let mut store =
-            BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes))).validate(true);
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(should_validate_burnpack());
         let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack bytes: {err}"))?;
@@ -393,7 +430,8 @@ pub mod import {
     ) -> Result<TripoSGImageEncoder<B>, Box<dyn std::error::Error>> {
         let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
             burn_dino::model::dino::DinoVisionTransformer::new(device, config);
-        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        let mut store =
+            BurnpackStore::from_file(burnpack_path.as_ref()).validate(should_validate_burnpack());
         let apply = model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack file: {err}"))?;
@@ -404,6 +442,10 @@ pub mod import {
     const CANONICAL_DINO_SHORT_EDGE: usize = 256;
     const CANONICAL_DINO_CROP: usize = 224;
     const LEGACY_DINO_SIZE_CAP: usize = 384;
+
+    fn should_validate_burnpack() -> bool {
+        cfg!(all(not(target_arch = "wasm32"), debug_assertions))
+    }
 
     pub fn load_dinov2_processor(
         weights_root: impl AsRef<Path>,
@@ -866,7 +908,11 @@ pub mod import {
                 "missing={} [{}{}]",
                 result.missing.len(),
                 preview,
-                if result.missing.len() > 8 { ", ..." } else { "" }
+                if result.missing.len() > 8 {
+                    ", ..."
+                } else {
+                    ""
+                }
             ));
         }
         if !result.skipped.is_empty() {
@@ -881,7 +927,11 @@ pub mod import {
                 "skipped={} [{}{}]",
                 result.skipped.len(),
                 preview,
-                if result.skipped.len() > 8 { ", ..." } else { "" }
+                if result.skipped.len() > 8 {
+                    ", ..."
+                } else {
+                    ""
+                }
             ));
         }
         if !result.unused.is_empty() {

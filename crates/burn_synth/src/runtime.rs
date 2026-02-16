@@ -601,8 +601,7 @@ impl SynthRuntime {
             )),
         );
         let preprocess_start = Instant::now();
-        let prepared =
-            self.prepare_image_for_mesh(input_image_path, foreground_model, backend)?;
+        let prepared = self.prepare_image_for_mesh(input_image_path, foreground_model, backend)?;
         progress.stage_completed(
             "mesh.preprocess_foreground",
             None,

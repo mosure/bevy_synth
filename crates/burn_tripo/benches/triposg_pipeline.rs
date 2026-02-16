@@ -5,9 +5,9 @@ use std::time::Duration;
 #[cfg(feature = "import")]
 use std::path::{Path, PathBuf};
 
-use criterion::{Criterion, criterion_group, criterion_main};
 #[cfg(feature = "import")]
 use criterion::BenchmarkId;
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "import")]
 use burn::prelude::*;

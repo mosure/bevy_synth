@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 
 mod app;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod wasm_cpp_alloc;
 
 #[cfg(test)]
 mod tests;

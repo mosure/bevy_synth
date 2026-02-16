@@ -490,7 +490,8 @@ pub mod import {
         };
 
         let mut model = TripoSGDiT::new(device, config.clone());
-        let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
+        let mut store =
+            BurnpackStore::from_file(&burnpack_path).validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG DiT burnpack: {err}"))?;
@@ -503,12 +504,25 @@ pub mod import {
         burnpack_bytes: Vec<u8>,
     ) -> Result<TripoSGDiT<B>, Box<dyn std::error::Error>> {
         let mut model = TripoSGDiT::new(device, config.clone());
-        let mut store =
-            BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes))).validate(true);
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG DiT burnpack bytes: {err}"))?;
         Ok(model)
+    }
+
+    pub fn apply_triposg_dit_burnpack_part_bytes<B: Backend>(
+        model: &mut TripoSGDiT<B>,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .allow_partial(true)
+            .validate(should_validate_burnpack());
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load TripoSG DiT burnpack part bytes: {err}"))?;
+        Ok(())
     }
 
     pub fn load_triposg_dit_from_burnpack_file<B: Backend>(
@@ -517,7 +531,8 @@ pub mod import {
         burnpack_path: impl AsRef<Path>,
     ) -> Result<TripoSGDiT<B>, Box<dyn std::error::Error>> {
         let mut model = TripoSGDiT::new(device, config.clone());
-        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        let mut store =
+            BurnpackStore::from_file(burnpack_path.as_ref()).validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG DiT burnpack file: {err}"))?;
@@ -526,6 +541,10 @@ pub mod import {
 
     fn default_burnpack_policy() -> BurnpackLoadPolicy {
         BurnpackLoadPolicy::default()
+    }
+
+    fn should_validate_burnpack() -> bool {
+        cfg!(all(not(target_arch = "wasm32"), debug_assertions))
     }
 
     pub fn load_triposg_dit_from_safetensors<B: Backend>(

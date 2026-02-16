@@ -51,21 +51,21 @@ impl TextPrompt {
     }
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use std::borrow::Cow;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use std::fs;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use std::io;
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use crate::mesh::{Mesh, MeshTexture};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use image::ImageEncoder;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use serde_json::{Value, json};
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 #[derive(Clone, Debug)]
 struct MeshBinaryLayout {
     buffer: Vec<u8>,
@@ -84,14 +84,14 @@ struct MeshBinaryLayout {
     max: [f32; 3],
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 pub fn write_glb_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
     ensure_parent_dir(path).map_err(|err| err.to_string())?;
     let bytes = mesh_to_glb_bytes(mesh)?;
     fs::write(path, bytes).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 pub fn mesh_to_glb_bytes(mesh: &Mesh) -> Result<Vec<u8>, String> {
     let layout = build_mesh_binary_layout(mesh)?;
     let gltf = gltf_json(mesh, &layout);
@@ -110,7 +110,7 @@ pub fn mesh_to_glb_bytes(mesh: &Mesh) -> Result<Vec<u8>, String> {
     .map_err(|err| format!("failed to build GLB: {err}"))
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
     if mesh.vertices.is_empty() {
         return Err("cannot export empty mesh".to_string());
@@ -214,7 +214,7 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
     })
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
     let mut primitive = json!({
         "attributes": {
@@ -383,14 +383,14 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
     gltf
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 fn pad_buffer_4(buffer: &mut Vec<u8>) {
     while !buffer.len().is_multiple_of(4) {
         buffer.push(0);
     }
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 fn encode_rgba_texture_png(texture: &MeshTexture) -> Result<Vec<u8>, String> {
     let expected = texture.width as usize * texture.height as usize * 4;
     if texture.rgba8.len() != expected {
@@ -413,7 +413,7 @@ fn encode_rgba_texture_png(texture: &MeshTexture) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

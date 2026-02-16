@@ -1,0 +1,942 @@
+#![cfg(all(target_arch = "wasm32", feature = "wasm-api"))]
+
+use std::sync::Once;
+#[cfg(feature = "wasm-api-wgpu")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use burn::prelude::*;
+use burn_foreground::pipeline::{
+    PrepareImageConfig, RmbgPipeline, prepare_image_data_from_bytes_async,
+};
+use burn_foreground::rmbg14::import::{
+    load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_bytes,
+    load_rmbg_processor_from_json_bytes,
+};
+use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
+use burn_tripo::model::triposg::dit::import::{
+    apply_triposg_dit_burnpack_part_bytes, load_triposg_dit_from_burnpack_bytes,
+};
+use burn_tripo::model::triposg::dit::{TripoSGDiT, TripoSGDiTConfig};
+use burn_tripo::model::triposg::image_encoder::DinoImageProcessor;
+use burn_tripo::model::triposg::image_encoder::import::{
+    default_dinov2_config, load_dinov2_processor_from_json_bytes,
+    load_triposg_dinov2_from_burnpack_bytes,
+};
+use burn_tripo::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
+use burn_tripo::model::triposg::vae::TripoSGVaeConfig;
+use burn_tripo::model::triposg::vae::import::load_triposg_vae_decoder_from_burnpack_bytes;
+use burn_tripo::pipeline::mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh};
+use burn_tripo::pipeline::runtime_parity::{decimate_tripo_mesh, triposg_runtime_profile};
+use burn_tripo::pipeline::triposg::TripoSGPipeline;
+use js_sys::Uint8Array;
+#[cfg(feature = "wasm-api-wgpu")]
+use js_sys::{Function, Promise, Reflect};
+use sha2::{Digest, Sha256};
+#[cfg(feature = "wasm-api-wgpu")]
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
+#[cfg(feature = "wasm-api-wgpu")]
+use wasm_bindgen_futures::JsFuture;
+
+use crate::mesh::Mesh;
+use crate::mesh_to_glb_bytes;
+use crate::model_loader::{
+    candidate_burnpack_names, parse_parts_manifest_bytes, prefer_f16_burnpack,
+    resolve_manifest_entry_uri,
+};
+use crate::wasm::WasmInferencePreset;
+use crate::wasm_loader::{
+    DownloadTotals, WasmHostMemoryBudget, download_binary_with_status, download_burnpack_asset,
+    fetch_optional_text, fetch_optional_text_candidates, join_web_path, normalize_web_path,
+    web_max_burnpack_bytes, web_max_host_ram_bytes,
+};
+
+#[cfg(feature = "wasm-api-wgpu")]
+type WgpuBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+#[cfg(feature = "wasm-api-wgpu")]
+type WgpuRmbgBackend = burn_wgpu::Wgpu<f32, i32, u32>;
+
+const DEFAULT_GUIDANCE_SCALE: f32 = 7.0;
+const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
+const DINO_CONFIG_RELPATHS: [&str; 2] = [
+    "image_encoder_2/config.json",
+    "image_encoder_dinov2/config.json",
+];
+const DINO_PREPROCESSOR_RELPATHS: [&str; 3] = [
+    "feature_extractor_2/preprocessor_config.json",
+    "feature_extractor_1/preprocessor_config.json",
+    "feature_extractor_dinov2/preprocessor_config.json",
+];
+const ROOT_TRIPOSG: &str = "models/MIDI-3D";
+const ROOT_RMBG14: &str = "models/RMBG-1.4";
+const RMBG_WGPU_DIMENSION_CAP: usize = 384;
+const WGPU_CHUNK_SIZE: usize = 32_768;
+const CPU_CHUNK_SIZE: usize = 8_192;
+
+static PANIC_HOOK_ONCE: Once = Once::new();
+
+struct WasmPipelineState<BTriposg: Backend, BRmbg: Backend> {
+    triposg_device: BTriposg::Device,
+    rmbg: RmbgPipeline<BRmbg>,
+    triposg: TripoSGPipeline<BTriposg>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TripoWasmLoadOptions {
+    strict_dino_preprocess: bool,
+    prefer_f16_vae: bool,
+    prefer_f16_dit: bool,
+    prefer_f16_dino: bool,
+}
+
+struct WasmLoadContext<'a, F: FnMut(String)> {
+    totals: &'a mut DownloadTotals,
+    host_ram_budget: &'a mut WasmHostMemoryBudget,
+    on_status: &'a mut F,
+}
+
+impl<F: FnMut(String)> WasmLoadContext<'_, F> {
+    fn status(&mut self, message: String) {
+        (self.on_status)(message);
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Clone, Debug, Default)]
+pub struct WasmInferOptions {
+    num_steps: u32,
+    num_tokens: u32,
+    resolution: u32,
+    faces: u32,
+    backend: Option<String>,
+    dino_backend: Option<String>,
+}
+
+#[wasm_bindgen]
+impl WasmInferOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_num_steps(&mut self, value: u32) {
+        self.num_steps = value;
+    }
+
+    pub fn set_num_tokens(&mut self, value: u32) {
+        self.num_tokens = value;
+    }
+
+    pub fn set_resolution(&mut self, value: u32) {
+        self.resolution = value;
+    }
+
+    pub fn set_faces(&mut self, value: u32) {
+        self.faces = value;
+    }
+
+    pub fn set_backend(&mut self, value: String) {
+        self.backend = Some(value);
+    }
+
+    pub fn clear_backend(&mut self) {
+        self.backend = None;
+    }
+
+    pub fn set_dino_backend(&mut self, value: String) {
+        self.dino_backend = Some(value);
+    }
+
+    pub fn clear_dino_backend(&mut self) {
+        self.dino_backend = None;
+    }
+}
+
+impl WasmInferOptions {
+    pub fn from_preset(preset: &WasmInferencePreset) -> Self {
+        Self {
+            num_steps: preset.num_steps as u32,
+            num_tokens: preset.num_tokens as u32,
+            resolution: preset.resolution as u32,
+            faces: preset.faces as u32,
+            backend: Some(preset.backend.to_string()),
+            dino_backend: Some(preset.dino_backend.to_string()),
+        }
+    }
+
+    fn apply_to_preset(&self, preset: &mut WasmInferencePreset) {
+        if self.num_steps > 0 {
+            preset.num_steps = self.num_steps as usize;
+        }
+        if self.num_tokens > 0 {
+            preset.num_tokens = self.num_tokens as usize;
+        }
+        if self.resolution > 0 {
+            preset.resolution = self.resolution as usize;
+        }
+        if self.faces > 0 {
+            preset.faces = self.faces as usize;
+        }
+        if let Some(value) = self.backend.as_ref() {
+            preset.backend = if value.eq_ignore_ascii_case("cpu") {
+                "cpu"
+            } else {
+                "wgpu"
+            };
+        }
+        if let Some(value) = self.dino_backend.as_ref() {
+            preset.dino_backend = if value.eq_ignore_ascii_case("cpu") {
+                "cpu"
+            } else if value.eq_ignore_ascii_case("gpu") {
+                "gpu"
+            } else {
+                "auto"
+            };
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub async fn infer_glb_from_image_bytes(
+    image_bytes: Vec<u8>,
+    _file_name: Option<String>,
+) -> Result<Uint8Array, JsValue> {
+    infer_glb_from_image_bytes_with_options(image_bytes, None, None).await
+}
+
+#[wasm_bindgen]
+pub async fn infer_glb_from_image_bytes_with_options(
+    image_bytes: Vec<u8>,
+    _file_name: Option<String>,
+    options: Option<WasmInferOptions>,
+) -> Result<Uint8Array, JsValue> {
+    PANIC_HOOK_ONCE.call_once(console_error_panic_hook::set_once);
+    if image_bytes.is_empty() {
+        return Err(JsValue::from_str("image bytes are empty"));
+    }
+
+    let mut preset = WasmInferencePreset::default();
+    if let Some(options) = options.as_ref() {
+        options.apply_to_preset(&mut preset);
+    }
+
+    #[cfg(feature = "wasm-api-wgpu")]
+    {
+        if preset.backend.eq_ignore_ascii_case("wgpu") {
+            if !wasm_webgpu_available().await {
+                return Err(JsValue::from_str(
+                    "WebGPU is unavailable in this browser/runtime; CPU fallback is disabled for TripoSG wasm to avoid OOM. Use a WebGPU-enabled browser/device.",
+                ));
+            }
+            initialize_wgpu_runtime_for_wasm().await.map_err(|err| {
+                JsValue::from_str(&format!("failed to initialize WebGPU runtime: {err}"))
+            })?;
+            let bytes = infer_glb_once::<WgpuBackend, WgpuRmbgBackend>(&image_bytes, &preset)
+                .await
+                .map_err(|err| JsValue::from_str(&format!("WebGPU inference failed: {err}")))?;
+            return Ok(Uint8Array::from(bytes.as_slice()));
+        }
+    }
+
+    if preset.backend.eq_ignore_ascii_case("wgpu") {
+        return Err(JsValue::from_str(
+            "This build does not include wasm WebGPU support (`wasm-api-wgpu` feature missing).",
+        ));
+    }
+
+    if preset.backend.eq_ignore_ascii_case("cpu") {
+        return Err(JsValue::from_str(
+            "CPU backend is unsupported for TripoSG wasm due model memory footprint; use backend=wgpu.",
+        ));
+    }
+
+    Err(JsValue::from_str(
+        "invalid wasm backend selection; expected `wgpu` or `cpu`",
+    ))
+}
+
+#[wasm_bindgen]
+pub async fn webgpu_available() -> bool {
+    #[cfg(feature = "wasm-api-wgpu")]
+    {
+        wasm_webgpu_available().await
+    }
+    #[cfg(not(feature = "wasm-api-wgpu"))]
+    {
+        false
+    }
+}
+
+async fn infer_glb_once<BTriposg: Backend, BRmbg: Backend>(
+    image_bytes: &[u8],
+    preset: &WasmInferencePreset,
+) -> Result<Vec<u8>, String> {
+    let mut state = load_pipeline_state::<BTriposg, BRmbg>(preset).await?;
+    run_inference_once(&mut state, image_bytes, preset).await
+}
+
+async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
+    state: &mut WasmPipelineState<BTriposg, BRmbg>,
+    image_bytes: &[u8],
+    preset: &WasmInferencePreset,
+) -> Result<Vec<u8>, String> {
+    // Keep RMBG forward on an f32 wasm backend to avoid WebGPU storage binding
+    // validation failures in f16 scalar/tiny buffers, then upload prepared image
+    // once to the main TripoSG backend.
+    let prepared = prepare_image_data_from_bytes_async::<BRmbg>(
+        image_bytes,
+        Some(&state.rmbg),
+        &prepare_image_config_for_backend::<BRmbg>(),
+    )
+    .await
+    .map_err(|err| format!("failed to prepare image tensor: {err}"))?;
+    let image = prepared.to_tensor::<BTriposg>(&state.triposg_device);
+
+    let processed = state.triposg.image_processor.preprocess(image);
+    let image_embeds = state
+        .triposg
+        .image_encoder
+        .as_ref()
+        .ok_or_else(|| "TripoSG image encoder is unavailable".to_string())?
+        .forward(processed);
+    let [batch_size, _, _] = image_embeds.shape().dims::<3>();
+
+    let output = state.triposg.sample_from_embeds(
+        image_embeds,
+        batch_size,
+        preset.num_steps.max(1),
+        preset.num_tokens.max(64),
+        DEFAULT_GUIDANCE_SCALE,
+        None,
+        None,
+    );
+    let [_, latent_tokens, latent_channels] = output.latents.shape().dims::<3>();
+    let sample = output
+        .latents
+        .slice([0..1, 0..latent_tokens, 0..latent_channels]);
+
+    let resolution = preset.resolution.max(32);
+    let values = decode_grid_values_chunked_async(
+        &sample,
+        &state.triposg.vae,
+        DEFAULT_BOUNDS,
+        resolution,
+        if is_wgpu_backend::<BTriposg>() {
+            WGPU_CHUNK_SIZE
+        } else {
+            CPU_CHUNK_SIZE
+        },
+    )
+    .await?;
+    let grid = DenseGrid {
+        values,
+        size: [resolution, resolution, resolution],
+        bounds: DEFAULT_BOUNDS,
+    };
+
+    let mut mesh = grid_to_mesh(&grid, 0.0)
+        .ok_or_else(|| "TripoSG mesh extraction returned an empty mesh".to_string())?;
+    if preset.faces > 0 && mesh.faces.len() > preset.faces {
+        mesh = decimate_tripo_mesh(&mesh, preset.faces)
+            .map_err(|err| format!("mesh decimation failed: {err}"))?;
+    }
+
+    let mesh = tripo_mesh_to_mesh(mesh);
+    mesh_to_glb_bytes(&mesh).map_err(|err| format!("failed to serialize GLB: {err}"))
+}
+
+async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
+    preset: &WasmInferencePreset,
+) -> Result<WasmPipelineState<BTriposg, BRmbg>, String> {
+    let parity = triposg_runtime_profile(Some(preset.resolution));
+    set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
+    let prefer_f16_default = parity.burnpack_policy.precision.prefer_f16() || prefer_f16_burnpack();
+    let use_wgpu = is_wgpu_backend::<BTriposg>();
+    // Keep RMBG on f32 for wasm wgpu path; some f16 kernels currently trigger
+    // storage-buffer alignment validation errors on web runtimes.
+    let prefer_f16_rmbg = false;
+    // CPU wasm path cannot fit full-f32 model footprints under the 4 GiB host cap.
+    // Prefer f16 artifacts for TripoSG weights on both backends.
+    let prefer_f16_vae = if use_wgpu { prefer_f16_default } else { true };
+    let prefer_f16_dit = if use_wgpu { prefer_f16_default } else { true };
+    let prefer_f16_dino = if use_wgpu { prefer_f16_default } else { true };
+
+    let triposg_device = BTriposg::Device::default();
+    let rmbg_device = BRmbg::Device::default();
+    let mut totals = DownloadTotals::default();
+    let mut host_ram_budget = WasmHostMemoryBudget::new(web_max_host_ram_bytes());
+    let mut emit_status = |message: String| web_sys::console::log_1(&message.into());
+
+    let options = TripoWasmLoadOptions {
+        strict_dino_preprocess: parity.strict_dino_preprocess,
+        prefer_f16_vae,
+        prefer_f16_dit,
+        prefer_f16_dino,
+    };
+    let mut load_ctx = WasmLoadContext {
+        totals: &mut totals,
+        host_ram_budget: &mut host_ram_budget,
+        on_status: &mut emit_status,
+    };
+
+    let rmbg = load_rmbg14_pipeline_wasm(&rmbg_device, prefer_f16_rmbg, &mut load_ctx).await?;
+    let triposg = load_triposg_pipeline_wasm(&triposg_device, options, &mut load_ctx).await?;
+
+    Ok(WasmPipelineState {
+        triposg_device,
+        rmbg,
+        triposg,
+    })
+}
+
+async fn load_rmbg14_pipeline_wasm<B: Backend, F>(
+    device: &B::Device,
+    prefer_f16: bool,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<RmbgPipeline<B>, String>
+where
+    F: FnMut(String),
+{
+    let rmbg_root = wasm_model_root(ROOT_RMBG14);
+    let burnpack = download_burnpack_asset(
+        &join_web_path(&rmbg_root, "model.safetensors"),
+        "RMBG",
+        prefer_f16,
+        load_ctx.totals,
+        load_ctx.host_ram_budget,
+        load_ctx.on_status,
+    )
+    .await?;
+    let config_json = fetch_optional_text(&join_web_path(&rmbg_root, "config.json")).await?;
+    let processor_json =
+        fetch_optional_text(&join_web_path(&rmbg_root, "preprocessor_config.json")).await?;
+
+    let config = if let Some(json) = config_json.as_ref() {
+        load_rmbg_config_from_json_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse RMBG config: {err}"))?
+    } else {
+        burn_foreground::rmbg14::RmbgConfig::rmbg_1_4()
+    };
+    let processor = if let Some(json) = processor_json.as_ref() {
+        load_rmbg_processor_from_json_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse RMBG preprocessor config: {err}"))?
+    } else {
+        burn_foreground::preprocess::RmbgImageProcessor::default()
+    };
+
+    let model = load_rmbg_from_burnpack_bytes(device, burnpack, &config)
+        .map_err(|err| format!("failed to load RMBG burnpack bytes: {err}"))?;
+    let mut pipeline = RmbgPipeline::new(model, processor);
+    cap_rmbg14_processor_for_backend::<B>(&mut pipeline);
+    Ok(pipeline)
+}
+
+async fn load_triposg_pipeline_wasm<B: Backend, F>(
+    device: &B::Device,
+    options: TripoWasmLoadOptions,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<TripoSGPipeline<B>, String>
+where
+    F: FnMut(String),
+{
+    let root = wasm_model_root(ROOT_TRIPOSG);
+
+    let vae_config_json = fetch_optional_text(&join_web_path(&root, "vae/config.json")).await?;
+    let dit_config_json =
+        fetch_optional_text(&join_web_path(&root, "transformer/config.json")).await?;
+    let scheduler_config_json =
+        fetch_optional_text(&join_web_path(&root, "scheduler/scheduler_config.json")).await?;
+    let dino_config_candidates = DINO_CONFIG_RELPATHS
+        .iter()
+        .map(|rel| join_web_path(&root, rel))
+        .collect::<Vec<_>>();
+    let dino_config_json = fetch_optional_text_candidates(&dino_config_candidates).await?;
+    let dino_preproc_candidates = DINO_PREPROCESSOR_RELPATHS
+        .iter()
+        .map(|rel| join_web_path(&root, rel))
+        .collect::<Vec<_>>();
+    let dino_preproc_json = fetch_optional_text_candidates(&dino_preproc_candidates).await?;
+
+    let vae_config = if let Some(json) = vae_config_json.as_ref() {
+        TripoSGVaeConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG VAE config: {err}"))?
+    } else {
+        TripoSGVaeConfig::midi_3d()
+    };
+    let dit_config = if let Some(json) = dit_config_json.as_ref() {
+        TripoSGDiTConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG DiT config: {err}"))?
+    } else {
+        TripoSGDiTConfig::triposg_pretrained()
+    };
+    let scheduler_config = if let Some(json) = scheduler_config_json.as_ref() {
+        RectifiedFlowSchedulerConfig::from_config_bytes(json.as_bytes())
+            .map_err(|err| format!("failed to parse TripoSG scheduler config: {err}"))?
+    } else {
+        RectifiedFlowSchedulerConfig::midi_3d()
+    };
+
+    let parsed_dino_config = dino_config_json.as_ref().and_then(|json| {
+        burn_tripo::model::triposg::image_encoder::import::load_dinov2_config_from_json_bytes(
+            json.as_bytes(),
+        )
+    });
+    let dino_fallback_size = parsed_dino_config
+        .as_ref()
+        .map(|cfg| cfg.image_size)
+        .unwrap_or(518);
+    let mut dino_config = parsed_dino_config
+        .clone()
+        .unwrap_or_else(default_dinov2_config);
+    let mut dino_processor = if let Some(json) = dino_preproc_json.as_ref() {
+        load_dinov2_processor_from_json_bytes(json.as_bytes(), Some(dino_fallback_size))
+            .map_err(|err| format!("failed to parse DINO preprocessor config: {err}"))?
+    } else {
+        default_wasm_dino_processor(dino_fallback_size)
+    }
+    .with_strict_preprocess(options.strict_dino_preprocess);
+    if is_wgpu_backend::<B>()
+        && let Some(target_size) =
+            dino_processor_target_size(&dino_processor, Some(dino_fallback_size))
+    {
+        let adjusted = adjust_dino_target_size_for_wgpu_f16(target_size, dino_config.patch_size);
+        if adjusted != target_size {
+            load_ctx.status(format!(
+                "Adjusting DINO preprocess size from {target_size} to {adjusted} for wasm WebGPU f16 alignment",
+            ));
+            dino_processor.do_resize = true;
+            dino_processor.size_shortest_edge = Some(adjusted);
+            dino_processor.do_center_crop = true;
+            dino_processor.crop_size = Some([adjusted, adjusted]);
+        }
+    }
+    if let Some(target_size) = dino_processor_target_size(&dino_processor, Some(dino_fallback_size))
+    {
+        let patch = dino_config.patch_size.max(1);
+        let grid = target_size / patch;
+        if grid > 0 {
+            dino_config.positional_encoding_interpolate.output_size = Some([grid, grid]);
+        }
+    }
+
+    let vae_burnpack = download_burnpack_asset(
+        &join_web_path(&root, "vae/diffusion_pytorch_model.safetensors"),
+        "TripoSG VAE",
+        options.prefer_f16_vae,
+        load_ctx.totals,
+        load_ctx.host_ram_budget,
+        load_ctx.on_status,
+    )
+    .await?;
+
+    load_ctx.status("Applying TripoSG VAE burnpack to decode-only model...".to_string());
+    let vae = load_triposg_vae_decoder_from_burnpack_bytes(&vae_config, device, vae_burnpack)
+        .map_err(|err| format!("failed to load TripoSG VAE burnpack bytes: {err}"))?;
+    load_ctx.status("Loaded TripoSG VAE burnpack".to_string());
+
+    let dit =
+        load_triposg_dit_wasm(device, &root, &dit_config, options.prefer_f16_dit, load_ctx).await?;
+
+    let dino_burnpack = download_burnpack_asset(
+        &join_web_path(&root, "image_encoder_dinov2/model.safetensors"),
+        "DINOv2",
+        options.prefer_f16_dino,
+        load_ctx.totals,
+        load_ctx.host_ram_budget,
+        load_ctx.on_status,
+    )
+    .await?;
+
+    load_ctx.status("Applying DINOv2 burnpack...".to_string());
+    let image_encoder = load_triposg_dinov2_from_burnpack_bytes(device, dino_config, dino_burnpack)
+        .map_err(|err| format!("failed to load DINOv2 burnpack bytes: {err}"))?;
+    load_ctx.status("Loaded DINOv2 burnpack".to_string());
+    let scheduler = scheduler_config.init();
+
+    Ok(TripoSGPipeline::new_with_optional_image_encoder(
+        vae,
+        dit,
+        scheduler,
+        Some(image_encoder),
+        dino_processor,
+    ))
+}
+
+async fn load_triposg_dit_wasm<B: Backend, F>(
+    device: &B::Device,
+    root: &str,
+    dit_config: &TripoSGDiTConfig,
+    prefer_f16: bool,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<TripoSGDiT<B>, String>
+where
+    F: FnMut(String),
+{
+    let base_safetensors_url = join_web_path(
+        &join_web_path(root, "transformer"),
+        "diffusion_pytorch_model.safetensors",
+    );
+    if let Some(model) = try_load_triposg_dit_from_parts_wasm(
+        device,
+        dit_config,
+        &base_safetensors_url,
+        prefer_f16,
+        load_ctx,
+    )
+    .await?
+    {
+        return Ok(model);
+    }
+
+    let dit_burnpack = download_burnpack_asset(
+        &base_safetensors_url,
+        "TripoSG DiT",
+        prefer_f16,
+        load_ctx.totals,
+        load_ctx.host_ram_budget,
+        load_ctx.on_status,
+    )
+    .await?;
+    load_ctx.status("Applying TripoSG DiT burnpack...".to_string());
+    let dit = load_triposg_dit_from_burnpack_bytes(dit_config, device, dit_burnpack)
+        .map_err(|err| format!("failed to load TripoSG DiT burnpack bytes: {err}"))?;
+    load_ctx.status("Loaded TripoSG DiT burnpack".to_string());
+    Ok(dit)
+}
+
+async fn try_load_triposg_dit_from_parts_wasm<B: Backend, F>(
+    device: &B::Device,
+    dit_config: &TripoSGDiTConfig,
+    base_safetensors_url: &str,
+    prefer_f16: bool,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<Option<TripoSGDiT<B>>, String>
+where
+    F: FnMut(String),
+{
+    let max_bytes = web_max_burnpack_bytes();
+    for candidate in candidate_burnpack_names(base_safetensors_url, prefer_f16) {
+        let manifest_url = format!("{candidate}.parts.json");
+        let Some(manifest_text) = fetch_optional_text(&manifest_url).await? else {
+            continue;
+        };
+        let manifest = parse_parts_manifest_bytes(manifest_text.as_bytes(), &manifest_url)?;
+        if manifest.parts.is_empty() {
+            return Err(format!(
+                "burnpack parts manifest {manifest_url} contains no parts"
+            ));
+        }
+
+        load_ctx.status(format!(
+            "Loading TripoSG DiT from {} burnpack parts...",
+            manifest.parts.len()
+        ));
+        let mut model = TripoSGDiT::new(device, dit_config.clone());
+        for (index, part) in manifest.parts.iter().enumerate() {
+            let part_url = resolve_manifest_entry_uri(&manifest_url, &part.path);
+            let part_label = format!("TripoSG DiT part {}/{}", index + 1, manifest.parts.len());
+            let bytes = download_binary_with_status(
+                &part_url,
+                &part_label,
+                max_bytes,
+                load_ctx.totals,
+                load_ctx.host_ram_budget,
+                load_ctx.on_status,
+            )
+            .await?;
+            if part.bytes > 0 && bytes.len() as u64 != part.bytes {
+                return Err(format!(
+                    "TripoSG DiT part {} expected {} bytes but downloaded {} bytes",
+                    part.path,
+                    part.bytes,
+                    bytes.len()
+                ));
+            }
+            let verify_part_checksum = should_verify_wasm_part_checksums();
+            if verify_part_checksum && !part.sha256.trim().is_empty() {
+                load_ctx.status(format!(
+                    "Verifying checksum for TripoSG DiT part {}/{}...",
+                    index + 1,
+                    manifest.parts.len()
+                ));
+                let actual_sha = sha256_hex(&bytes);
+                if !actual_sha.eq_ignore_ascii_case(part.sha256.trim()) {
+                    return Err(format!(
+                        "TripoSG DiT part {} checksum mismatch: expected {}, got {}",
+                        part.path,
+                        part.sha256.trim(),
+                        actual_sha
+                    ));
+                }
+                load_ctx.status(format!(
+                    "Verified checksum for TripoSG DiT part {}/{}",
+                    index + 1,
+                    manifest.parts.len()
+                ));
+            } else if !verify_part_checksum {
+                load_ctx.status(format!(
+                    "Skipping checksum verification for TripoSG DiT part {}/{} in release wasm build",
+                    index + 1,
+                    manifest.parts.len()
+                ));
+            }
+            load_ctx.status(format!(
+                "Applying TripoSG DiT part {}/{}...",
+                index + 1,
+                manifest.parts.len()
+            ));
+            apply_triposg_dit_burnpack_part_bytes(&mut model, bytes).map_err(|err| {
+                format!(
+                    "failed to apply TripoSG DiT part {}/{} from {}: {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part.path
+                )
+            })?;
+            load_ctx.status(format!(
+                "Applied TripoSG DiT part {}/{}",
+                index + 1,
+                manifest.parts.len()
+            ));
+        }
+
+        return Ok(Some(model));
+    }
+
+    Ok(None)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn should_verify_wasm_part_checksums() -> bool {
+    cfg!(debug_assertions)
+}
+
+fn prepare_image_config_for_backend<B: Backend>() -> PrepareImageConfig {
+    let mut config = PrepareImageConfig::default();
+    if is_wgpu_backend::<B>() {
+        config.max_dimension = config.max_dimension.min(384);
+    }
+    config
+}
+
+fn cap_rmbg14_processor_for_backend<B: Backend>(pipeline: &mut RmbgPipeline<B>) {
+    if !is_wgpu_backend::<B>() {
+        return;
+    }
+    let previous = pipeline.processor.size;
+    let next = match previous {
+        Some([height, width]) => [
+            height.min(RMBG_WGPU_DIMENSION_CAP),
+            width.min(RMBG_WGPU_DIMENSION_CAP),
+        ],
+        None => [RMBG_WGPU_DIMENSION_CAP, RMBG_WGPU_DIMENSION_CAP],
+    };
+    if previous != Some(next) {
+        pipeline.processor.size = Some(next);
+    }
+}
+
+fn dino_processor_target_size(
+    processor: &DinoImageProcessor,
+    fallback_size: Option<usize>,
+) -> Option<usize> {
+    processor
+        .crop_size
+        .map(|[height, width]| height.min(width))
+        .or(processor.size_shortest_edge)
+        .or(fallback_size)
+        .filter(|size| *size > 0)
+}
+
+fn default_wasm_dino_processor(target_size: usize) -> DinoImageProcessor {
+    DinoImageProcessor {
+        do_resize: true,
+        size_shortest_edge: Some(target_size),
+        do_center_crop: true,
+        crop_size: Some([target_size, target_size]),
+        ..DinoImageProcessor::default()
+    }
+}
+
+fn adjust_dino_target_size_for_wgpu_f16(target_size: usize, patch_size: usize) -> usize {
+    let patch = patch_size.max(1);
+    let grid = target_size / patch;
+    if grid == 0 || grid % 2 == 1 {
+        return target_size;
+    }
+    (grid + 1) * patch
+}
+
+fn tripo_mesh_to_mesh(mesh: TripoMesh) -> Mesh {
+    Mesh {
+        vertices: mesh.vertices,
+        faces: mesh.faces,
+        uvs: Vec::new(),
+        material: None,
+        pbr_textures: None,
+    }
+}
+
+async fn decode_grid_values_chunked_async<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &burn_tripo::model::triposg::vae::TripoSGVae<B>,
+    bounds: [f32; 6],
+    resolution: usize,
+    chunk_size: usize,
+) -> Result<Vec<f32>, String> {
+    let total = resolution * resolution * resolution;
+    let device = latents.device();
+    let mut values = vec![0.0f32; total];
+    let step_x = dense_grid_step(bounds[0], bounds[3], resolution);
+    let step_y = dense_grid_step(bounds[1], bounds[4], resolution);
+    let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
+
+    let mut coords = Vec::with_capacity(chunk_size.saturating_mul(3));
+    let mut chunk_start = 0usize;
+    for idx in 0..total {
+        let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
+        coords.push(bounds[0] + step_x * x as f32);
+        coords.push(bounds[1] + step_y * y as f32);
+        coords.push(bounds[2] + step_z * z as f32);
+        let count = coords.len() / 3;
+        if count < chunk_size {
+            continue;
+        }
+        let end = chunk_start + count;
+        write_decoded_chunk_contiguous_async(
+            latents,
+            vae,
+            &coords,
+            &device,
+            &mut values[chunk_start..end],
+        )
+        .await?;
+        coords.clear();
+        chunk_start = end;
+    }
+
+    if !coords.is_empty() {
+        let count = coords.len() / 3;
+        let end = chunk_start + count;
+        write_decoded_chunk_contiguous_async(
+            latents,
+            vae,
+            &coords,
+            &device,
+            &mut values[chunk_start..end],
+        )
+        .await?;
+    }
+
+    Ok(values)
+}
+
+async fn write_decoded_chunk_contiguous_async<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &burn_tripo::model::triposg::vae::TripoSGVae<B>,
+    coords: &[f32],
+    device: &B::Device,
+    output_slice: &mut [f32],
+) -> Result<(), String> {
+    let count = coords.len() / 3;
+    if count == 0 {
+        return Ok(());
+    }
+    let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
+        .reshape([count as i32, 3])
+        .unsqueeze_dim(0);
+    let decoded = vae.decode(coords_tensor, latents.clone(), None);
+    let data = decoded
+        .into_data_async()
+        .await
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to convert decoded grid: {err:?}"))?;
+    output_slice.copy_from_slice(&data[..output_slice.len()]);
+    Ok(())
+}
+
+fn dense_grid_step(min: f32, max: f32, resolution: usize) -> f32 {
+    if resolution <= 1 {
+        return 0.0;
+    }
+    (max - min) / (resolution as f32 - 1.0)
+}
+
+fn dense_grid_index_to_xyz(idx: usize, resolution: usize) -> (usize, usize, usize) {
+    let area = resolution * resolution;
+    let z = idx / area;
+    let rem = idx - z * area;
+    let y = rem / resolution;
+    let x = rem - y * resolution;
+    (x, y, z)
+}
+
+fn is_wgpu_backend<B: Backend>() -> bool {
+    std::any::type_name::<B>()
+        .to_ascii_lowercase()
+        .contains("wgpu")
+}
+
+fn wasm_model_root(rel_root: &str) -> String {
+    let root = option_env!("BURN_SYNTH_WEB_ASSET_ROOT").unwrap_or("assets");
+    normalize_web_path(&std::path::Path::new(root).join(rel_root))
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+async fn wasm_webgpu_available() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let window_js: wasm_bindgen::JsValue = window.into();
+    let navigator = match Reflect::get(&window_js, &wasm_bindgen::JsValue::from_str("navigator")) {
+        Ok(value) if !value.is_undefined() && !value.is_null() => value,
+        _ => return false,
+    };
+    let gpu = match Reflect::get(&navigator, &wasm_bindgen::JsValue::from_str("gpu")) {
+        Ok(value) if !value.is_undefined() && !value.is_null() => value,
+        _ => return false,
+    };
+    let request_adapter =
+        match Reflect::get(&gpu, &wasm_bindgen::JsValue::from_str("requestAdapter")) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+    let request_adapter = match request_adapter.dyn_into::<Function>() {
+        Ok(func) => func,
+        Err(_) => return false,
+    };
+    let promise = match request_adapter.call0(&gpu) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let promise = match promise.dyn_into::<Promise>() {
+        Ok(promise) => promise,
+        Err(_) => return false,
+    };
+    match JsFuture::from(promise).await {
+        Ok(adapter) => !adapter.is_null() && !adapter.is_undefined(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+async fn initialize_wgpu_runtime_for_wasm() -> Result<(), String> {
+    static INIT_DONE: AtomicBool = AtomicBool::new(false);
+    if INIT_DONE.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let device = burn_wgpu::WgpuDevice::default();
+    let options = burn_wgpu::RuntimeOptions {
+        tasks_max: 32,
+        memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
+    };
+    burn_wgpu::init_setup_async::<burn_wgpu::graphics::WebGpu>(&device, options).await;
+    INIT_DONE.store(true, Ordering::Release);
+    Ok(())
+}

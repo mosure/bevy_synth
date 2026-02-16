@@ -96,15 +96,30 @@ fn run() {
     let latents = output.latents;
 
     let device_values = decode_grid_values_device_scatter(
-        &latents, &pipeline.vae, bounds, resolution, chunk_size, &device,
+        &latents,
+        &pipeline.vae,
+        bounds,
+        resolution,
+        chunk_size,
+        &device,
     );
     <BackendImpl as Backend>::sync(&device);
     let host_values = decode_grid_values_host_chunked(
-        &latents, &pipeline.vae, bounds, resolution, chunk_size, &device,
+        &latents,
+        &pipeline.vae,
+        bounds,
+        resolution,
+        chunk_size,
+        &device,
     );
     <BackendImpl as Backend>::sync(&device);
     let cat_values = decode_grid_values_device_cat(
-        &latents, &pipeline.vae, bounds, resolution, chunk_size, &device,
+        &latents,
+        &pipeline.vae,
+        bounds,
+        resolution,
+        chunk_size,
+        &device,
     );
     <BackendImpl as Backend>::sync(&device);
 
@@ -186,13 +201,27 @@ fn decode_grid_values_device_scatter<B: Backend>(
         if count < chunk_size {
             continue;
         }
-        values = write_scatter_chunk(latents, vae, coords.as_slice(), chunk_indices.as_slice(), device, values);
+        values = write_scatter_chunk(
+            latents,
+            vae,
+            coords.as_slice(),
+            chunk_indices.as_slice(),
+            device,
+            values,
+        );
         coords.clear();
         chunk_indices.clear();
     }
 
     if !coords.is_empty() {
-        values = write_scatter_chunk(latents, vae, coords.as_slice(), chunk_indices.as_slice(), device, values);
+        values = write_scatter_chunk(
+            latents,
+            vae,
+            coords.as_slice(),
+            chunk_indices.as_slice(),
+            device,
+            values,
+        );
     }
 
     values
@@ -325,7 +354,9 @@ fn write_scatter_chunk<B: Backend>(
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
         .reshape([count as i32, 3])
         .unsqueeze_dim(0);
-    let decoded = vae.decode(coords_tensor, latents.clone(), None).reshape([count]);
+    let decoded = vae
+        .decode(coords_tensor, latents.clone(), None)
+        .reshape([count]);
     let indices_tensor =
         Tensor::<B, 1, Int>::from_data(TensorData::new(indices.to_vec(), [count]), device);
     output.scatter(0, indices_tensor, decoded)
@@ -428,7 +459,8 @@ fn benchmark_decode_modes<B: Backend>(
         );
         let cat = bench_mode(
             || {
-                let _ = decode_grid_values_device_cat(latents, vae, bounds, resolution, chunk, device);
+                let _ =
+                    decode_grid_values_device_cat(latents, vae, bounds, resolution, chunk, device);
                 B::sync(device);
             },
             warmup_iters,
@@ -436,7 +468,9 @@ fn benchmark_decode_modes<B: Backend>(
         );
         let host = bench_mode(
             || {
-                let _ = decode_grid_values_host_chunked(latents, vae, bounds, resolution, chunk, device);
+                let _ = decode_grid_values_host_chunked(
+                    latents, vae, bounds, resolution, chunk, device,
+                );
                 B::sync(device);
             },
             warmup_iters,

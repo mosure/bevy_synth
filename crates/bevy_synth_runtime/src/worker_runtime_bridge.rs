@@ -16,9 +16,7 @@ use burn_synth::runtime::{
 use burn_synth::{ForegroundModel, ImageSource, SynthesisModel};
 use burn_trellis::TrellisQuality as RuntimeTrellisQuality;
 
-use crate::args::{
-    AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality,
-};
+use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
 use crate::state::{InferenceRequest, WorkerCommand, WorkerEvent};
 use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture, TripoMesh};
 

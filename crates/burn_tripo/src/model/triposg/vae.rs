@@ -657,7 +657,8 @@ pub mod import {
         };
 
         let mut model = TripoSGVae::new(device, config.clone());
-        let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
+        let mut store =
+            BurnpackStore::from_file(&burnpack_path).validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
@@ -670,8 +671,8 @@ pub mod import {
         burnpack_bytes: Vec<u8>,
     ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
         let mut model = TripoSGVae::new(device, config.clone());
-        let mut store =
-            BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes))).validate(true);
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE burnpack bytes: {err}"))?;
@@ -689,7 +690,7 @@ pub mod import {
         let mut model = TripoSGVae::new_decode_only(device, config.clone());
         let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
             .allow_partial(true)
-            .validate(true);
+            .validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE decoder burnpack bytes: {err}"))?;
@@ -702,7 +703,8 @@ pub mod import {
         burnpack_path: impl AsRef<Path>,
     ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
         let mut model = TripoSGVae::new(device, config.clone());
-        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        let mut store =
+            BurnpackStore::from_file(burnpack_path.as_ref()).validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE burnpack file: {err}"))?;
@@ -720,7 +722,7 @@ pub mod import {
         let mut model = TripoSGVae::new_decode_only(device, config.clone());
         let mut store = BurnpackStore::from_file(burnpack_path.as_ref())
             .allow_partial(true)
-            .validate(true);
+            .validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE decoder burnpack file: {err}"))?;
@@ -729,6 +731,10 @@ pub mod import {
 
     fn default_burnpack_policy() -> BurnpackLoadPolicy {
         BurnpackLoadPolicy::default()
+    }
+
+    fn should_validate_burnpack() -> bool {
+        cfg!(all(not(target_arch = "wasm32"), debug_assertions))
     }
 
     pub fn load_triposg_vae_from_safetensors<B: Backend>(

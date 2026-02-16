@@ -481,6 +481,9 @@ fn build_uv_raster_domain(
     faces: &[[u32; 3]],
     texture_size: usize,
 ) -> UvRasterDomain {
+    #[cfg(target_arch = "wasm32")]
+    let _ = texture_size;
+
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(domain) = build_uv_raster_domain_xatlas(vertices, faces, texture_size) {
         return domain;

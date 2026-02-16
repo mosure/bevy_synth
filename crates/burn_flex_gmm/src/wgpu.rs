@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use burn::tensor::{DType, Int, Shape, Tensor as BurnTensor, TensorData, TensorPrimitive};
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::{calculate_cube_count_elemwise, prelude::*};
-use burn_cubecl::{tensor::CubeTensor, CubeRuntime};
+use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
 
-use crate::{build_neighbor_rows, kernel_rows, SparseSubmConvConfig};
+use crate::{SparseSubmConvConfig, build_neighbor_rows, kernel_rows};
 
 /// Default WGPU backend type used by the tensor convenience wrappers.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
@@ -1659,19 +1659,21 @@ mod tests {
 
     use burn::tensor::Tensor;
 
-    use crate::{sparse_subm_conv_forward_flex, SparseSubmConvConfig, SparseSubmConvWeights};
+    use crate::{SparseSubmConvConfig, SparseSubmConvWeights, sparse_subm_conv_forward_flex};
 
     use super::{
+        DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
         clear_neighbor_rows_tensor_cache, neighbor_rows_build_stats,
         neighbor_rows_tensor_from_coords, reset_neighbor_rows_build_stats,
         sparse_subm_conv_forward_wgpu, sparse_subm_conv_forward_wgpu_with_config,
-        DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_lock_guard() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[derive(Clone)]

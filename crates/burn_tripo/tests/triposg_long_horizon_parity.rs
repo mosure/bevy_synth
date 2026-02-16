@@ -7,12 +7,12 @@ use std::{
 };
 
 use burn::prelude::*;
+use burn_tripo::model::triposg::dit::import::load_triposg_dit_with_policy;
 use burn_tripo::model::triposg::{
     dit::{TripoSGDiT, TripoSGDiTConfig, import::load_triposg_dit_from_safetensors},
     load_policy::BurnpackLoadPolicy,
     scheduler::RectifiedFlowSchedulerConfig,
 };
-use burn_tripo::model::triposg::dit::import::load_triposg_dit_with_policy;
 use safetensors::tensor::{SafeTensors, TensorView};
 
 const TRIPOSG_ROOT: &str = r"E:\repos\TripoSG\pretrained_weights\TripoSG";
@@ -74,8 +74,8 @@ fn triposg_long_horizon_reports_bpk_vs_safetensors() -> Result<(), Box<dyn std::
         tensor_from_data_3d::<burn::backend::NdArray<f32>>(&input_latents_ref, &device)?;
 
     let run_mode = std::env::var("TRIPOSG_LONG_MODE").unwrap_or_else(|_| "bpk".to_string());
-    let use_safetensors = run_mode.eq_ignore_ascii_case("safe")
-        || run_mode.eq_ignore_ascii_case("safetensors");
+    let use_safetensors =
+        run_mode.eq_ignore_ascii_case("safe") || run_mode.eq_ignore_ascii_case("safetensors");
     let run_label = if use_safetensors { "safe" } else { "bpk" };
     let out = run_denoise_only(
         &weights_root,

@@ -3192,7 +3192,9 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_lock_guard() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn make_unit_conv_3x1x1(weight: [f32; 3]) -> SparseConvLayer {

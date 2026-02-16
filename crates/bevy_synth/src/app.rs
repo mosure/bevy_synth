@@ -50,9 +50,9 @@ use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
 
-use bevy_synth_runtime::args::{
-    AppArgs, Args, BackendKind, DinoBackend, RmbgBackend, build_app_args,
-};
+use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::args::{BackendKind, DinoBackend, RmbgBackend};
 use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;

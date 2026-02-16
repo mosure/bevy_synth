@@ -250,6 +250,7 @@ pub mod import {
 
     use crate::preprocess::{RmbgImageProcessor, RmbgProcessorConfig};
 
+    #[cfg(not(target_arch = "wasm32"))]
     const F16_SUFFIX: &str = "_f16";
 
     const MODEL_CANDIDATES_F16: &[&str] = &[
@@ -380,7 +381,8 @@ pub mod import {
             bytes: Param::initialized(ParamId::new(), zeros),
         };
 
-        let mut store = BurnpackStore::from_file(path).validate(true);
+        let mut store = BurnpackStore::from_file(path)
+            .validate(cfg!(all(not(target_arch = "wasm32"), debug_assertions)));
         blob.load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG-2.0 burnpack {}: {err}", path.display()))?;
         let bytes = blob
@@ -436,6 +438,7 @@ pub mod import {
         ))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn candidate_burnpack_paths(root: &Path) -> Vec<PathBuf> {
         let default = burnpack_path(root, false);
         let f16 = burnpack_path(root, true);
@@ -452,6 +455,7 @@ pub mod import {
         true
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn burnpack_path(root: &Path, use_f16: bool) -> PathBuf {
         let path = if root
             .extension()
@@ -472,6 +476,7 @@ pub mod import {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
         let Some(stem) = path.file_stem() else {
             return path.to_path_buf();
@@ -490,6 +495,7 @@ pub mod import {
         path.with_file_name(file_name)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn burnpack_metadata_path(path: &Path) -> PathBuf {
         let file_name = path
             .file_name()

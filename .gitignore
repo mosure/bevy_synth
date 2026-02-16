@@ -3,6 +3,11 @@ __pycache__/
 debug/
 target/
 vendor/
+!crates/vendor/
+!crates/vendor/burn_dino_new/
+!crates/vendor/burn_dino_new/**
+!crates/vendor/cubecl-wgpu/
+!crates/vendor/cubecl-wgpu/**
 out/
 **/*.rs.bk
 *.pdb
@@ -54,3 +59,4 @@ assets/images/
 output/
 sandbox/
 .burn_synth_cache/
+tools/

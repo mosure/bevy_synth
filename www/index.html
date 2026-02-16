@@ -85,12 +85,13 @@
       <button id="boot-start" type="button">Start</button>
     </div>
     <script type="module">
-      import init from "./out/bevy_synth.js";
+      import init, * as wasm from "./out/bevy_synth.js";
 
       const boot = document.getElementById("boot");
       const text = document.getElementById("boot-text");
       const startButton = document.getElementById("boot-start");
       let started = false;
+      window.__burnSynthWasm = wasm;
 
       const start = async () => {
         if (started) return;
@@ -99,6 +100,7 @@
         text.textContent = "loading wasm module...";
         try {
           await init();
+          window.__burnSynthWasmReady = true;
           text.textContent = "module ready";
           setTimeout(() => boot.remove(), 1200);
         } catch (err) {

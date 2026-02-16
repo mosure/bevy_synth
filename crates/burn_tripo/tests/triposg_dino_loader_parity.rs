@@ -16,8 +16,8 @@ use burn_tripo::model::triposg::image_encoder::import::{
 const TRIPOSG_ROOT: &str = r"E:\repos\TripoSG\pretrained_weights\TripoSG";
 
 #[test]
-fn dino_burnpack_and_safetensors_loader_outputs_match_reference() -> Result<(), Box<dyn std::error::Error>>
-{
+fn dino_burnpack_and_safetensors_loader_outputs_match_reference()
+-> Result<(), Box<dyn std::error::Error>> {
     let reference_path = std::env::var("TRIPOSG_DINO_PARITY_REFERENCE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| asset_path("assets/hooks/triposg_pipeline_reference.safetensors"));
@@ -59,8 +59,10 @@ fn dino_burnpack_and_safetensors_loader_outputs_match_reference() -> Result<(), 
     let pixel_tensor = tensor_from_data_4d::<burn::backend::NdArray<f32>>(&pixel_values, &device)?;
 
     let encoder_bpk = load_triposg_dinov2::<burn::backend::NdArray<f32>>(&device, &dino_weights)?;
-    let encoder_safe =
-        load_triposg_dinov2_from_safetensors::<burn::backend::NdArray<f32>>(&device, &dino_weights)?;
+    let encoder_safe = load_triposg_dinov2_from_safetensors::<burn::backend::NdArray<f32>>(
+        &device,
+        &dino_weights,
+    )?;
 
     let embeds_bpk = encoder_bpk.forward(pixel_tensor.clone());
     let embeds_safe = encoder_safe.forward(pixel_tensor);
@@ -73,19 +75,13 @@ fn dino_burnpack_and_safetensors_loader_outputs_match_reference() -> Result<(), 
     let [batch, tokens, channels] = embeds_bpk.shape().dims();
     let token_stride = tokens * channels;
     let patch_count = tokens.saturating_sub(1);
-    let cls_stats = compute_stats(
-        &bpk_data[0..channels],
-        &ref_data[0..channels],
-    );
+    let cls_stats = compute_stats(&bpk_data[0..channels], &ref_data[0..channels]);
     let patch_stats = compute_stats(
         &bpk_data[channels..token_stride],
         &ref_data[channels..token_stride],
     );
     let cls_swapped_stats = if patch_count > 0 {
-        compute_stats(
-            &bpk_data[0..channels],
-            &ref_data[channels..(channels * 2)],
-        )
+        compute_stats(&bpk_data[0..channels], &ref_data[channels..(channels * 2)])
     } else {
         MetricStats {
             mean_abs: 0.0,
@@ -263,7 +259,9 @@ fn compute_stats_tensors<B: Backend>(
     Ok(compute_stats(&lhs_data, &rhs_data))
 }
 
-fn tensor_to_vec3<B: Backend>(tensor: &Tensor<B, 3>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn tensor_to_vec3<B: Backend>(
+    tensor: &Tensor<B, 3>,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     tensor
         .clone()
         .into_data()

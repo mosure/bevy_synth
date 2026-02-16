@@ -508,6 +508,14 @@ pub fn set_rmbg_strict_interp_override(value: Option<bool>) {
     RMBG_STRICT_INTERP_OVERRIDE.store(encoded, Ordering::Relaxed);
 }
 
+#[cfg(target_arch = "wasm32")]
+fn strict_interp_enabled() -> bool {
+    // The strict path performs a synchronous tensor readback, which is not
+    // supported on wasm WebGPU backends.
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn strict_interp_enabled() -> bool {
     match RMBG_STRICT_INTERP_OVERRIDE.load(Ordering::Relaxed) {
         STRICT_INTERP_FORCED_OFF => false,
@@ -633,7 +641,8 @@ pub mod import {
         };
 
         let mut model = BriaRmbg::new(device, config.clone());
-        let mut store = BurnpackStore::from_file(&burnpack_path).validate(true);
+        let mut store =
+            BurnpackStore::from_file(&burnpack_path).validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG burnpack: {err}"))?;
@@ -646,8 +655,8 @@ pub mod import {
         config: &RmbgConfig,
     ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
         let mut model = BriaRmbg::new(device, config.clone());
-        let mut store =
-            BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes))).validate(true);
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG burnpack bytes: {err}"))?;
@@ -660,7 +669,8 @@ pub mod import {
         config: &RmbgConfig,
     ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
         let mut model = BriaRmbg::new(device, config.clone());
-        let mut store = BurnpackStore::from_file(burnpack_path.as_ref()).validate(true);
+        let mut store =
+            BurnpackStore::from_file(burnpack_path.as_ref()).validate(should_validate_burnpack());
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG burnpack file: {err}"))?;
@@ -745,6 +755,10 @@ pub mod import {
 
     fn prefer_f16_burnpack() -> bool {
         true
+    }
+
+    fn should_validate_burnpack() -> bool {
+        cfg!(all(not(target_arch = "wasm32"), debug_assertions))
     }
 
     fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {

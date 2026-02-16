@@ -862,8 +862,12 @@ fn decode_flash_points_gpu<B: Backend>(
         #[allow(clippy::single_range_in_vec_init)]
         let indices_chunk = indices.clone().slice([start..end]);
 
-        let (decoded, cache) =
-            vae.decode_with_latent_projection(coords_chunk, latent_proj.clone(), kv_cache.take(), None);
+        let (decoded, cache) = vae.decode_with_latent_projection(
+            coords_chunk,
+            latent_proj.clone(),
+            kv_cache.take(),
+            None,
+        );
         *kv_cache = Some(cache);
 
         let values = decoded.reshape([end - start]);

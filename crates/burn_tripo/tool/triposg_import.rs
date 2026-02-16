@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use burn::backend::NdArray;
 use burn_synth_import::io::ensure_parent_dir;
 use burn_synth_import::layout::{burnpack_path, precision_label};
+use burn_synth_import::parts::write_burnpack_parts_for_wasm;
 use burn_synth_import::plan::ArtifactPolicy;
 use burn_synth_import::shard::apply_artifact_policy;
 use clap::{Parser, ValueEnum};
@@ -17,6 +18,7 @@ use burn_tripo::model::triposg::{
 
 type CpuBackend = NdArray<f32>;
 type GpuBackend = burn_wgpu::Wgpu;
+const WASM_MAX_BURNPACK_PART_MIB: u64 = 256;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum Quantization {
@@ -192,13 +194,12 @@ fn import_if_needed<F>(
 where
     F: FnOnce() -> Result<PathBuf, Box<dyn std::error::Error>>,
 {
-    if !weights_path.exists() {
+    let burnpack = burnpack_path(weights_path, use_f16);
+    if !weights_path.exists() && !burnpack.exists() {
         return Err(format!("missing {label} weights at {}", weights_path.display()).into());
     }
-
-    let burnpack = burnpack_path(weights_path, use_f16);
     let precision = precision_label(use_f16);
-    let output = if burnpack.exists() && !overwrite {
+    let output = if burnpack.exists() && (!overwrite || !weights_path.exists()) {
         println!(
             "[IMPORT] {label} ({precision}) burnpack already exists at {}, skipping.",
             burnpack.display()
@@ -219,6 +220,17 @@ where
             "[IMPORT] {label} ({precision}) shard manifest: {} ({} shards, {:.1} MiB)",
             report.manifest_path.display(),
             report.shard_paths.len(),
+            report.total_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    if let Some(report) =
+        write_burnpack_parts_for_wasm(&output, WASM_MAX_BURNPACK_PART_MIB, overwrite)?
+    {
+        println!(
+            "[IMPORT] {label} ({precision}) wasm parts manifest: {} ({} parts, {:.1} MiB)",
+            report.manifest_path.display(),
+            report.part_paths.len(),
             report.total_bytes as f64 / (1024.0 * 1024.0),
         );
     }

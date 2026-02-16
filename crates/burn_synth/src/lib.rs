@@ -2,15 +2,23 @@
 
 pub mod io;
 pub mod mesh;
+pub mod model_loader;
 pub mod pipeline;
 #[cfg(feature = "runtime")]
 pub mod progress;
 #[cfg(feature = "runtime")]
 pub mod runtime;
+pub mod wasm;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-api"))]
+pub mod wasm_api;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_loader;
 
-pub use io::{ImageSource, TextPrompt};
+#[cfg(any(feature = "runtime", feature = "wasm-api"))]
+pub use io::mesh_to_glb_bytes;
 #[cfg(feature = "runtime")]
-pub use io::{mesh_to_glb_bytes, write_glb_mesh};
+pub use io::write_glb_mesh;
+pub use io::{ImageSource, TextPrompt};
 pub use mesh::{
     Mesh, MeshLike, MeshMaterial, MeshPbrTextures, MeshStats, MeshTexture, mesh_bounds, mesh_stats,
 };

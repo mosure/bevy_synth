@@ -120,6 +120,26 @@ pub fn prepare_image_data_from_bytes<B: Backend>(
     prepare_loaded_image(loaded, pipeline, config)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn prepare_image_data_async<B: Backend>(
+    path: &Path,
+    pipeline: Option<&RmbgPipeline<B>>,
+    config: &PrepareImageConfig,
+) -> Result<PreparedImageData, PrepareImageError> {
+    let loaded = load_image_rgb(path, config.max_dimension)?;
+    prepare_loaded_image_async(loaded, pipeline, config).await
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn prepare_image_data_from_bytes_async<B: Backend>(
+    bytes: &[u8],
+    pipeline: Option<&RmbgPipeline<B>>,
+    config: &PrepareImageConfig,
+) -> Result<PreparedImageData, PrepareImageError> {
+    let loaded = load_image_rgb_from_bytes(bytes, config.max_dimension)?;
+    prepare_loaded_image_async(loaded, pipeline, config).await
+}
+
 fn prepare_loaded_image<B: Backend>(
     loaded: LoadedImage,
     pipeline: Option<&RmbgPipeline<B>>,
@@ -156,6 +176,52 @@ fn prepare_loaded_image<B: Backend>(
             PrepareImageError("RMBG pipeline required for images without alpha".to_string())
         })?;
         let alpha = infer_alpha_mask(pipeline, &rgb, width, height, config.min_component_size)?;
+        (alpha.alpha_mask, Some(alpha.alpha_probs), Some(alpha.bbox))
+    };
+
+    let bbox = bbox.ok_or_else(|| PrepareImageError("missing bounding box".to_string()))?;
+    build_prepared_image_from_alpha(&rgb, width, height, alpha_mask, alpha_probs, bbox, config)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn prepare_loaded_image_async<B: Backend>(
+    loaded: LoadedImage,
+    pipeline: Option<&RmbgPipeline<B>>,
+    config: &PrepareImageConfig,
+) -> Result<PreparedImageData, PrepareImageError> {
+    let rgb = loaded.rgb;
+    let alpha = loaded.alpha;
+    let width = loaded.width;
+    let height = loaded.height;
+    let has_alpha = loaded.has_alpha;
+
+    let alpha = if has_alpha {
+        alpha.and_then(|alpha| {
+            if is_valid_alpha(&alpha, width, height, 0.01) {
+                Some(alpha)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    let (alpha_mask, alpha_probs, bbox) = if let Some(alpha) = alpha {
+        let alpha_mask = alpha
+            .iter()
+            .map(|value| *value as f32 / 255.0)
+            .collect::<Vec<f32>>();
+        let bbox = bbox_from_mask_all(&alpha, width, height)
+            .ok_or_else(|| PrepareImageError("input image too small".to_string()))?;
+        (alpha_mask, None, Some(bbox))
+    } else {
+        let pipeline = pipeline.ok_or_else(|| {
+            PrepareImageError("RMBG pipeline required for images without alpha".to_string())
+        })?;
+        let alpha =
+            infer_alpha_mask_async(pipeline, &rgb, width, height, config.min_component_size)
+                .await?;
         (alpha.alpha_mask, Some(alpha.alpha_probs), Some(alpha.bbox))
     };
 
@@ -215,6 +281,30 @@ pub fn prepare_image_tensor_from_bytes<B: Backend>(
     config: &PrepareImageConfig,
 ) -> Result<Tensor<B, 4>, PrepareImageError> {
     let prepared = prepare_image_data_from_bytes(bytes, pipeline, config)?;
+    let flat = Tensor::<B, 1>::from_floats(prepared.data.as_slice(), device);
+    Ok(flat.reshape([1, 3, prepared.height as i32, prepared.width as i32]))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn prepare_image_tensor_async<B: Backend>(
+    path: &Path,
+    pipeline: Option<&RmbgPipeline<B>>,
+    device: &B::Device,
+    config: &PrepareImageConfig,
+) -> Result<Tensor<B, 4>, PrepareImageError> {
+    let prepared = prepare_image_data_async(path, pipeline, config).await?;
+    let flat = Tensor::<B, 1>::from_floats(prepared.data.as_slice(), device);
+    Ok(flat.reshape([1, 3, prepared.height as i32, prepared.width as i32]))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn prepare_image_tensor_from_bytes_async<B: Backend>(
+    bytes: &[u8],
+    pipeline: Option<&RmbgPipeline<B>>,
+    device: &B::Device,
+    config: &PrepareImageConfig,
+) -> Result<Tensor<B, 4>, PrepareImageError> {
+    let prepared = prepare_image_data_from_bytes_async(bytes, pipeline, config).await?;
     let flat = Tensor::<B, 1>::from_floats(prepared.data.as_slice(), device);
     Ok(flat.reshape([1, 3, prepared.height as i32, prepared.width as i32]))
 }
@@ -383,6 +473,114 @@ fn infer_alpha_mask<B: Backend>(
         .to_vec::<f32>()
         .map_err(|err| PrepareImageError(format!("failed to read RMBG mask: {err:?}")))?;
 
+    postprocess_alpha_mask(
+        mask_data,
+        target_height,
+        target_width,
+        width,
+        height,
+        min_component_size,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn infer_alpha_mask_async<B: Backend>(
+    pipeline: &RmbgPipeline<B>,
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    min_component_size: usize,
+) -> Result<AlphaMaskResult, PrepareImageError> {
+    let device = &pipeline.model.conv_in.weight.val().device();
+    let pixels = width * height;
+    let mut rgb_chw = Vec::with_capacity(pixels * 3);
+    for c in 0..3 {
+        for idx in 0..pixels {
+            rgb_chw.push(rgb[idx * 3 + c] as f32);
+        }
+    }
+
+    let processor = &pipeline.processor;
+    let target_size = if processor.do_resize {
+        processor.size.unwrap_or([height, width])
+    } else {
+        [height, width]
+    };
+    let [target_height, target_width] = target_size;
+    let mut resized = resize_chw_align_corners_false(
+        &rgb_chw,
+        3,
+        height,
+        width,
+        target_height,
+        target_width,
+        processor.resize_mode.clone(),
+    );
+
+    if processor.do_rescale {
+        for value in &mut resized {
+            *value *= processor.rescale_factor;
+        }
+    }
+
+    let max_value = resized.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max_value < 1e-3 {
+        return Err(PrepareImageError(
+            "invalid image: pure black image".to_string(),
+        ));
+    }
+
+    if processor.do_normalize {
+        let pixels = target_height * target_width;
+        for c in 0..3 {
+            let mean = processor.mean[c];
+            let std = processor.std[c];
+            let offset = c * pixels;
+            for idx in 0..pixels {
+                let value = resized[offset + idx];
+                resized[offset + idx] = (value - mean) / std;
+            }
+        }
+    }
+
+    let input = Tensor::<B, 1>::from_floats(resized.as_slice(), device).reshape([
+        1,
+        3,
+        target_height as i32,
+        target_width as i32,
+    ]);
+
+    let output = pipeline.model.forward(input);
+    let mask = output
+        .masks
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Tensor::<B, 4>::zeros([1, 1, 1, 1], device));
+    let mask_data = mask
+        .into_data_async()
+        .await
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| PrepareImageError(format!("failed to read RMBG mask: {err:?}")))?;
+
+    postprocess_alpha_mask(
+        mask_data,
+        target_height,
+        target_width,
+        width,
+        height,
+        min_component_size,
+    )
+}
+
+fn postprocess_alpha_mask(
+    mask_data: Vec<f32>,
+    target_height: usize,
+    target_width: usize,
+    width: usize,
+    height: usize,
+    min_component_size: usize,
+) -> Result<AlphaMaskResult, PrepareImageError> {
     let data = if target_height != height || target_width != width {
         resize_chw_align_corners_false(
             &mask_data,
