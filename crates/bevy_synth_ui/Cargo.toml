@@ -6,6 +6,11 @@ edition = "2024"
 description = "UI plugin and catalog interactions for bevy_synth"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["triposg"]
+triposg = ["bevy_synth_runtime/triposg"]
+trellis = ["bevy_synth_runtime/trellis"]
+
 [dependencies]
 bevy = "0.17"
 bevy_editor_core = { path = "../bevy_editor_core" }

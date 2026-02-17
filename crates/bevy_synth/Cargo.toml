@@ -7,7 +7,9 @@ description = "bevy media synthesis plugin"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "triposg"]
+triposg = ["bevy_synth_runtime/triposg", "bevy_synth_ui/triposg"]
+trellis = ["bevy_synth_runtime/trellis", "bevy_synth_ui/trellis"]
 wgpu = ["bevy_synth_runtime/wgpu"]
 cuda = ["bevy_synth_runtime/cuda"]
 solari = []

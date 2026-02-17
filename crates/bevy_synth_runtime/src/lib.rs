@@ -54,6 +54,7 @@ impl From<TripoMesh> for SynthMesh {
     }
 }
 
+#[cfg(feature = "trellis")]
 impl From<burn_trellis::Mesh> for SynthMesh {
     fn from(mesh: burn_trellis::Mesh) -> Self {
         Self {

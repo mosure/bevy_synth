@@ -35,7 +35,9 @@ use burn_foreground::rmbg14::import::load_rmbg_from_burnpack_bytes;
 use burn_foreground::rmbg14::import::load_rmbg_from_burnpack_file;
 use burn_foreground::rmbg14::import::load_rmbg_processor_from_json_bytes;
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
+#[cfg(feature = "trellis")]
 use burn_trellis::config::TrellisQuality as TrellisRuntimeQuality;
+#[cfg(feature = "trellis")]
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
@@ -80,6 +82,7 @@ use burn_tripo::pipeline::{
 };
 
 use crate::SynthMesh;
+#[cfg(feature = "trellis")]
 use crate::args::TrellisQuality;
 use crate::args::{
     AppArgs, BackendKind, DEFAULT_CHUNK_SIZE, DinoBackend, MeshMode, RmbgBackend, RmbgModel,
@@ -119,12 +122,17 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 mod worker_unavailable;
 #[cfg(any(target_arch = "wasm32", not(feature = "wgpu"), not(feature = "cuda")))]
 use worker_unavailable::worker_loop_backend_unavailable;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "shared-runtime"))]
 #[path = "worker_runtime_bridge.rs"]
 mod worker_runtime_bridge;
 
 #[cfg(feature = "wgpu")]
 type WgpuRuntimeBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+
+#[cfg(feature = "trellis")]
+type TrellisPipeline = Trellis2Pipeline;
+#[cfg(not(feature = "trellis"))]
+type TrellisPipeline = ();
 
 const WGPU_CHUNK_SIZE_TARGET: usize = 32_768;
 const WGPU_CHUNK_SIZE_CAP: usize = 65_536;
@@ -447,6 +455,7 @@ fn wasm_virtual_upload_path(file_name: &str, request_id: u32) -> std::path::Path
 
 #[cfg(not(target_arch = "wasm32"))]
 fn worker_loop(args: AppArgs, command_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
+    #[cfg(feature = "shared-runtime")]
     if worker_runtime_bridge::supports_shared_runtime(&args) {
         info!("Using shared burn_synth runtime worker path.");
         worker_runtime_bridge::worker_loop_shared_runtime(args, command_rx, event_tx);
@@ -550,7 +559,7 @@ struct PipelineState<B: Backend> {
     dino_cpu: Option<DinoCpuState>,
     triposg: Option<TripoSGPipeline<B>>,
     scribble: Option<TripoSGScribblePipeline<B>>,
-    trellis: Option<Trellis2Pipeline>,
+    trellis: Option<TrellisPipeline>,
     trellis_load_error: Option<String>,
     synthesis_models: Vec<SynthesisModel>,
     triposg_load_error: Option<String>,
@@ -617,6 +626,7 @@ fn load_rmbg14_pipelines<B: Backend>(
     }
 }
 
+#[cfg(feature = "trellis")]
 fn load_trellis_pipeline(args: &AppArgs) -> Result<Trellis2Pipeline, String> {
     let mut config = Trellis2PipelineConfig::default();
     if let Some(path) = args.trellis_weights_root.as_ref() {
@@ -632,6 +642,14 @@ fn load_trellis_pipeline(args: &AppArgs) -> Result<Trellis2Pipeline, String> {
         .validate_runtime()
         .map_err(|err| format!("Trellis2 runtime unavailable: {err}"))?;
     Ok(pipeline)
+}
+
+#[cfg(not(feature = "trellis"))]
+fn load_trellis_pipeline(_args: &AppArgs) -> Result<(), String> {
+    Err(
+        "Trellis backend is not enabled in this build (enable `bevy_synth_runtime/trellis`)."
+            .to_string(),
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -802,6 +820,7 @@ fn build_triposg_pipeline_from_artifacts<B: Backend>(
     Ok((dino_cpu, triposg))
 }
 
+#[cfg(feature = "trellis")]
 fn trellis_quality_to_runtime(quality: TrellisQuality) -> TrellisRuntimeQuality {
     match quality {
         TrellisQuality::Low => TrellisRuntimeQuality::Low,
@@ -810,6 +829,7 @@ fn trellis_quality_to_runtime(quality: TrellisQuality) -> TrellisRuntimeQuality 
     }
 }
 
+#[cfg(feature = "trellis")]
 fn trellis_device_for_backend(backend: BackendKind) -> TrellisDevice {
     match backend {
         BackendKind::Cpu => TrellisDevice::Cpu,
@@ -1832,6 +1852,7 @@ fn select_synthesis_backend<B: Backend>(
     Err("No synthesis backend is available.".to_string())
 }
 
+#[cfg(feature = "trellis")]
 fn run_trellis_batch<B: Backend>(
     state: &mut PipelineState<B>,
     args: &AppArgs,
@@ -1876,6 +1897,18 @@ fn run_trellis_batch<B: Backend>(
         }
     }
     Ok(results)
+}
+
+#[cfg(not(feature = "trellis"))]
+fn run_trellis_batch<B: Backend>(
+    _state: &mut PipelineState<B>,
+    _args: &AppArgs,
+    _requests: &[InferenceRequest],
+) -> Result<Vec<Result<Option<SynthMesh>, String>>, String> {
+    Err(
+        "Trellis backend is not enabled in this build (enable `bevy_synth_runtime/trellis`)."
+            .to_string(),
+    )
 }
 
 fn prepare_request<B: Backend>(
