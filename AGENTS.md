@@ -56,6 +56,18 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 2. `bevy_synth_runtime` should adapt/wrap canonical pipeline behavior, not reimplement it.
 3. Avoid duplicate mesh/postprocess logic across CLI/runtime/app layers.
 4. Keep modules focused and maintainable; split overly large implementation files.
+5. `bevy_synth` (UI/headless app) is a runtime shell, not an inference implementation.
+6. Native inference in `bevy_synth` paths must go through `burn_synth::runtime` via `bevy_synth_runtime`.
+7. Do not keep dormant legacy native inference branches in bevy crates; remove them entirely.
+8. If a wrapper path cannot support a requested mode, fail fast with an explicit error (no silent fallback).
+
+## Wrapper Parity Contract
+
+1. For equivalent input/config/backend, `bevy_synth` and `burn_synth` must be numerically aligned within defined tolerance.
+2. `bevy_synth_runtime` argument mapping must preserve canonical runtime semantics (seed, mesh mode, backend, quality, target faces).
+3. Canonical defaults are owned by `burn_synth` runtime; wrappers may expose flags but must not silently rewrite behavior.
+4. Backend failures in wrapper flows must be surfaced as errors; do not auto-switch to CPU or alternate synthesis paths.
+5. New inference features should be implemented in `burn_synth` first, then exposed in wrappers.
 
 ## Testing and Quality Gates
 
@@ -130,6 +142,7 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
    - `cargo check -p bevy_synth_runtime`
 3. `bevy_synth` integration changes:
    - `cargo check -p bevy_synth`
+   - one headless parity smoke run against `burn_synth` with matched args (compare mesh stats and/or hash)
 4. wasm path changes:
    - `cargo check -p burn_synth --target wasm32-unknown-unknown --features wasm-api,wasm-api-wgpu`
    - relevant wasm smoke/parity tests when available
@@ -140,6 +153,7 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 2. Do not silently rewrite user-requested quality/mesh settings in runtime startup; prefer explicit presets and clear logs.
 3. Runtime startup logs should include effective backend, mesh mode, and precision policy for reproducibility.
 4. Performance-oriented alternatives must be opt-in and labeled; correctness-first defaults must remain stable.
+5. Wrapper/runtime layers must not introduce hidden backend fallbacks that change correctness behavior.
 
 ## Script and Automation Conventions
 
