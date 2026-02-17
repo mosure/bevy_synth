@@ -12,9 +12,9 @@ use burn_synth::progress::{
 };
 use burn_synth::runtime::{
     DinoBackend as RuntimeDinoBackend, InferenceBackend, MeshRequest, RuntimeConfig, SynthRuntime,
+    TrellisQuality as RuntimeTrellisQuality,
 };
 use burn_synth::{ForegroundModel, ImageSource, SynthesisModel};
-use burn_trellis::TrellisQuality as RuntimeTrellisQuality;
 
 use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
 use crate::state::{InferenceRequest, WorkerCommand, WorkerEvent};
@@ -238,11 +238,7 @@ fn configure_wgpu_runtime_memory_profile() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let device = burn_wgpu::WgpuDevice::default();
-        let options = burn_wgpu::RuntimeOptions {
-            // Raise queue depth so command submission doesn't idle between stages.
-            tasks_max: 96,
-            memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
-        };
+        let options = burn_wgpu::RuntimeOptions::default();
         let _setup =
             burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(&device, options);
     });

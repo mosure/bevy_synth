@@ -5,11 +5,19 @@ use burn_synth_import::layout::{
 use burn_synth_import::parts::BurnpackPartsManifest;
 use burn_synth_import::shard::BurnpackShardManifest;
 
+/// Default artifact precision preference for generic model loader paths.
+///
+/// Note: do not use this to decide TripoSG runtime precision in parity-critical paths.
+/// Use `burn_tripo::pipeline::runtime_parity::should_prefer_f16_triposg_weights` instead.
 #[cfg(target_arch = "wasm32")]
 pub fn prefer_f16_burnpack() -> bool {
     true
 }
 
+/// Default artifact precision preference for generic model loader paths.
+///
+/// Note: do not use this to decide TripoSG runtime precision in parity-critical paths.
+/// Use `burn_tripo::pipeline::runtime_parity::should_prefer_f16_triposg_weights` instead.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn prefer_f16_burnpack() -> bool {
     true

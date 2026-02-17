@@ -13,12 +13,12 @@ crate-type = ["cdylib", "rlib"]
 default = []
 triposg = ["dep:burn_tripo"]
 trellis = ["dep:burn_trellis", "burn_trellis/runtime-model"]
+trellis-wgpu = ["trellis", "burn_trellis/runtime-model-wgpu"]
 bg-removal = ["dep:burn_foreground"]
 wasm-api = ["import", "dep:burn", "dep:gltf", "dep:image", "dep:log"]
 wasm-api-wgpu = ["wasm-api", "dep:burn-wgpu"]
 runtime = [
   "import",
-  "trellis",
   "dep:burn",
   "dep:clap",
   "dep:env_logger",
@@ -26,7 +26,7 @@ runtime = [
   "dep:image",
   "dep:log",
 ]
-wgpu = ["runtime", "dep:burn-wgpu", "burn_trellis/runtime-model-wgpu"]
+wgpu = ["runtime", "dep:burn-wgpu"]
 cuda = ["runtime", "dep:burn-cuda"]
 import = [
   "triposg",
@@ -77,5 +77,4 @@ sysinfo = "0.36"
 name = "burn_synth"
 path = "src/main.rs"
 required-features = ["runtime"]
-
 

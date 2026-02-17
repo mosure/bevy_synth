@@ -15,6 +15,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bevy::prelude::*;
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use bevy::render::renderer::{
+    RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue, WgpuWrapper,
+};
 use burn::prelude::*;
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
@@ -75,7 +79,8 @@ use burn_tripo::pipeline::{
     mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh, sdf_to_mesh_diff_dmc},
     runtime_parity::{
         DinoBackendChoice as SharedDinoBackendChoice, TripoSGRuntimeParityProfile,
-        decimate_tripo_mesh, resolve_dino_backend, triposg_runtime_profile,
+        decimate_tripo_mesh, resolve_dino_backend, should_prefer_f16_triposg_weights,
+        triposg_runtime_profile,
     },
     triposg::TripoSGPipeline,
     triposg_scribble::TripoSGScribblePipeline,
@@ -92,8 +97,6 @@ use crate::args::{
 use crate::io::load_text_embeds;
 #[cfg(target_arch = "wasm32")]
 use crate::io::mesh_to_glb_bytes;
-#[cfg(target_arch = "wasm32")]
-use crate::model_loader::prefer_f16_burnpack;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model_loader::{
     load_optional_text_candidates_from_root, load_optional_text_from_root,
@@ -128,6 +131,10 @@ mod worker_runtime_bridge;
 
 #[cfg(feature = "wgpu")]
 type WgpuRuntimeBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub type SharedWgpuDevice = burn_wgpu::WgpuDevice;
+#[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
+pub type SharedWgpuDevice = ();
 
 #[cfg(feature = "trellis")]
 type TrellisPipeline = Trellis2Pipeline;
@@ -149,6 +156,35 @@ const DINO_PREPROCESSOR_RELPATHS: [&str; 3] = [
     "feature_extractor_2/preprocessor_config.json",
     "feature_extractor_1/preprocessor_config.json",
 ];
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn unwrap_wgpu_wrapper<T: Clone>(wrapper: &WgpuWrapper<T>) -> T {
+    <WgpuWrapper<T> as Clone>::clone(wrapper).into_inner()
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn native_wgpu_runtime_options() -> burn_wgpu::RuntimeOptions {
+    burn_wgpu::RuntimeOptions::default()
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub fn init_shared_wgpu_device_from_bevy_render(
+    render_adapter: &RenderAdapter,
+    render_adapter_info: &RenderAdapterInfo,
+    render_device: &RenderDevice,
+    render_instance: &RenderInstance,
+    render_queue: &RenderQueue,
+) -> SharedWgpuDevice {
+    let setup = burn_wgpu::WgpuSetup {
+        adapter: unwrap_wgpu_wrapper(&render_adapter.0),
+        device: render_device.wgpu_device().clone(),
+        instance: unwrap_wgpu_wrapper(&render_instance.0),
+        queue: unwrap_wgpu_wrapper(&render_queue.0),
+        backend: render_adapter_info.backend,
+    };
+    let options = native_wgpu_runtime_options();
+    burn_wgpu::init_device(setup, options)
+}
 
 #[cfg(target_arch = "wasm32")]
 fn wasm_console_log(message: &str) {
@@ -294,6 +330,14 @@ fn triposg_parity_profile() -> TripoSGRuntimeParityProfile {
     triposg_runtime_profile(None)
 }
 
+fn triposg_weight_precision_label(parity: TripoSGRuntimeParityProfile) -> &'static str {
+    if should_prefer_f16_triposg_weights(parity) {
+        "f16"
+    } else {
+        "f32"
+    }
+}
+
 fn dino_processor_target_size(
     processor: &DinoImageProcessor,
     fallback_size: Option<usize>,
@@ -323,13 +367,23 @@ fn synthesis_unavailable_message(
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn start_worker(args: &AppArgs) -> InferenceWorker {
+    start_worker_with_shared_wgpu_device(args, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_worker_with_shared_wgpu_device(
+    args: &AppArgs,
+    shared_wgpu_device: Option<SharedWgpuDevice>,
+) -> InferenceWorker {
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let args = args.clone();
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    let shared_wgpu_device = shared_wgpu_device.clone();
     let _ = thread::Builder::new()
         .name("synth-worker".to_string())
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || worker_loop(args, command_rx, event_tx))
+        .spawn(move || worker_loop(args, command_rx, event_tx, shared_wgpu_device))
         .expect("failed to spawn synth worker thread");
     InferenceWorker {
         sender: command_tx,
@@ -454,7 +508,12 @@ fn wasm_virtual_upload_path(file_name: &str, request_id: u32) -> std::path::Path
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn worker_loop(args: AppArgs, command_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
+fn worker_loop(
+    args: AppArgs,
+    command_rx: Receiver<WorkerCommand>,
+    event_tx: Sender<WorkerEvent>,
+    shared_wgpu_device: Option<SharedWgpuDevice>,
+) {
     #[cfg(feature = "shared-runtime")]
     if worker_runtime_bridge::supports_shared_runtime(&args) {
         info!("Using shared burn_synth runtime worker path.");
@@ -464,12 +523,20 @@ fn worker_loop(args: AppArgs, command_rx: Receiver<WorkerCommand>, event_tx: Sen
     info!("Using legacy bevy_synth_runtime worker path.");
     match args.backend {
         BackendKind::Cpu => {
-            worker_loop_backend::<burn::backend::NdArray<f32>>(args, command_rx, event_tx)
+            worker_loop_backend::<burn::backend::NdArray<f32>>(args, None, command_rx, event_tx)
         }
         BackendKind::Wgpu => {
             #[cfg(feature = "wgpu")]
             {
-                worker_loop_backend::<WgpuRuntimeBackend>(args, command_rx, event_tx);
+                if shared_wgpu_device.is_some() {
+                    info!("Using Bevy-shared WGPU device for inference worker.");
+                }
+                worker_loop_backend::<WgpuRuntimeBackend>(
+                    args,
+                    shared_wgpu_device,
+                    command_rx,
+                    event_tx,
+                );
             }
             #[cfg(not(feature = "wgpu"))]
             {
@@ -483,7 +550,7 @@ fn worker_loop(args: AppArgs, command_rx: Receiver<WorkerCommand>, event_tx: Sen
         BackendKind::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                worker_loop_backend::<burn_cuda::Cuda>(args, command_rx, event_tx);
+                worker_loop_backend::<burn_cuda::Cuda>(args, None, command_rx, event_tx);
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -841,10 +908,14 @@ fn trellis_device_for_backend(backend: BackendKind) -> TrellisDevice {
 #[cfg(not(target_arch = "wasm32"))]
 fn worker_loop_backend<B: Backend>(
     args: AppArgs,
+    device_override: Option<B::Device>,
     command_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
 ) {
-    let mut state = build_pipeline_state::<B>(&args);
+    let mut state = match device_override {
+        Some(device) => build_pipeline_state_with_device::<B>(&args, Some(device)),
+        None => build_pipeline_state::<B>(&args),
+    };
     if let Err(err) = state.as_ref() {
         warn!("Inference worker failed to initialize: {err}");
     }
@@ -922,14 +993,26 @@ async fn worker_loop_backend_wasm<B: Backend>(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn build_pipeline_state<B: Backend>(args: &AppArgs) -> Result<PipelineState<B>, String> {
-    configure_cubecl_autotune::<B>();
+    build_pipeline_state_with_device::<B>(args, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_pipeline_state_with_device<B: Backend>(
+    args: &AppArgs,
+    device_override: Option<B::Device>,
+) -> Result<PipelineState<B>, String> {
+    configure_cubecl_autotune::<B>(device_override.is_some());
     let bounds = parse_bounds(&args.bounds).map_err(|err| err.to_string())?;
-    let device = B::Device::default();
+    let device = device_override.unwrap_or_else(B::Device::default);
     if let Some(seed) = args.seed {
         B::seed(&device, seed);
     }
     let triposg_parity = triposg_parity_profile();
     set_rmbg_strict_interp_override(Some(triposg_parity.strict_rmbg_interp));
+    info!(
+        "TripoSG weight precision policy: {} (runtime parity profile).",
+        triposg_weight_precision_label(triposg_parity)
+    );
 
     let synthesis_models = args.synthesis_models.clone();
     let synthesis_order = synthesis_attempt_order(&synthesis_models)?;
@@ -1135,7 +1218,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
     event_tx: &Sender<WorkerEvent>,
 ) -> Result<PipelineState<B>, String> {
     wasm_console_log("build_pipeline_state_wasm start");
-    configure_cubecl_autotune::<B>();
+    configure_cubecl_autotune::<B>(false);
     let bounds = parse_bounds(&args.bounds).map_err(|err| err.to_string())?;
     let device = B::Device::default();
     if let Some(seed) = args.seed {
@@ -1143,8 +1226,16 @@ async fn build_pipeline_state_wasm<B: Backend>(
     }
     let triposg_parity = triposg_parity_profile();
     set_rmbg_strict_interp_override(Some(triposg_parity.strict_rmbg_interp));
-    let prefer_f16_weights = is_wgpu_backend::<B>()
-        && (triposg_parity.burnpack_policy.precision.prefer_f16() || prefer_f16_burnpack());
+    let prefer_f16_weights = should_prefer_f16_triposg_weights(triposg_parity);
+    let precision_label = triposg_weight_precision_label(triposg_parity);
+    send_worker_status(
+        event_tx,
+        format!("TripoSG weight precision policy: {precision_label} (runtime parity profile)."),
+    );
+    info!(
+        "TripoSG weight precision policy: {} (runtime parity profile).",
+        precision_label
+    );
 
     let synthesis_models = args.synthesis_models.clone();
     let synthesis_order = synthesis_attempt_order(&synthesis_models)?;
@@ -2653,10 +2744,14 @@ fn is_cuda_backend<B: Backend>() -> bool {
     }
 }
 
-fn configure_cubecl_autotune<B: Backend>() {
+fn configure_cubecl_autotune<B: Backend>(using_shared_device: bool) {
     let _ = TypeId::of::<B>();
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     if is_wgpu_backend::<B>() {
+        if using_shared_device {
+            info!("Using shared WGPU device; skipping default runtime setup.");
+            return;
+        }
         configure_wgpu_runtime_memory_profile();
     }
 }
@@ -2666,13 +2761,10 @@ fn configure_wgpu_runtime_memory_profile() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let device = burn_wgpu::WgpuDevice::default();
-        let options = burn_wgpu::RuntimeOptions {
-            tasks_max: 32,
-            memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
-        };
+        let options = native_wgpu_runtime_options();
         let _setup =
             burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(&device, options);
-        info!("Configured WGPU runtime memory profile: ExclusivePages.");
+        info!("Configured native WGPU runtime profile with default CubeCL memory settings.");
     });
 }
 
@@ -2776,6 +2868,10 @@ fn parse_bounds(bounds: &[f32]) -> Result<[f32; 6], Box<dyn std::error::Error>> 
 mod tests {
     use super::*;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    use bevy::render::renderer::{
+        RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue, WgpuWrapper,
+    };
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     use clap::Parser;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     type WgpuLoadTestBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
@@ -2829,6 +2925,69 @@ mod tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn wasm_triposg_weight_precision_follows_default_parity_profile() {
+        let parity = triposg_parity_profile();
+        assert!(
+            !should_prefer_f16_triposg_weights(parity),
+            "default TripoSG runtime parity should prefer f32 wasm burnpacks for correctness"
+        );
+    }
+
+    #[test]
+    fn wasm_triposg_weight_precision_respects_explicit_f16_preference() {
+        use burn_tripo::model::triposg::load_policy::BpkPrecisionPreference;
+
+        let mut parity = triposg_parity_profile();
+        parity.burnpack_policy = parity
+            .burnpack_policy
+            .with_precision(BpkPrecisionPreference::PreferF16);
+        assert!(
+            should_prefer_f16_triposg_weights(parity),
+            "explicit parity override should allow f16 burnpack preference"
+        );
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn shared_wgpu_device_initializer_returns_existing_device() {
+        let setup = match std::panic::catch_unwind(|| {
+            let device = burn_wgpu::WgpuDevice::default();
+            burn_wgpu::init_setup::<burn_wgpu::graphics::AutoGraphicsApi>(
+                &device,
+                burn_wgpu::RuntimeOptions::default(),
+            )
+        }) {
+            Ok(setup) => setup,
+            Err(_) => {
+                eprintln!("Skipping shared WGPU device initializer test: no adapter available.");
+                return;
+            }
+        };
+
+        let render_instance = RenderInstance(std::sync::Arc::new(WgpuWrapper::new(
+            setup.instance.clone(),
+        )));
+        let render_adapter =
+            RenderAdapter(std::sync::Arc::new(WgpuWrapper::new(setup.adapter.clone())));
+        let render_adapter_info = RenderAdapterInfo(WgpuWrapper::new(setup.adapter.get_info()));
+        let render_device = RenderDevice::new(WgpuWrapper::new(setup.device.clone()));
+        let render_queue = RenderQueue(std::sync::Arc::new(WgpuWrapper::new(setup.queue.clone())));
+
+        let shared = init_shared_wgpu_device_from_bevy_render(
+            &render_adapter,
+            &render_adapter_info,
+            &render_device,
+            &render_instance,
+            &render_queue,
+        );
+
+        assert!(
+            matches!(shared, burn_wgpu::WgpuDevice::Existing(_)),
+            "expected Burn shared WGPU device to use Existing(_), got {shared:?}"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3426,6 +3585,65 @@ mod tests {
         handle
             .join()
             .expect("worker WGPU inference smoke thread panicked");
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "full TripoSG+RMBG WGPU flash inference smoke"]
+    fn native_wgpu_triposg_worker_flash_inference_smoke() {
+        let handle = std::thread::Builder::new()
+            .name("worker_wgpu_flash_inference_smoke".to_string())
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let (mut args, _isolated_root_guard) = build_native_wgpu_load_args();
+                args.mesh_mode = MeshMode::Flash;
+                args.num_steps = 12;
+                args.num_tokens = 512;
+                args.resolution = 128;
+                args.target_faces = Some(2_000);
+
+                let mut state = build_pipeline_state::<WgpuLoadTestBackend>(&args)
+                    .expect("build WGPU pipeline state");
+                let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|path| path.parent())
+                    .expect("resolve workspace root from CARGO_MANIFEST_DIR");
+                let request = InferenceRequest {
+                    id: 1,
+                    image_path: repo_root.join("docs/input_chair.jpg"),
+                    image_contents: None,
+                    output_path: None,
+                };
+                let results = run_inference_with_state(&mut state, &args, &[request]);
+                assert_eq!(results.len(), 1);
+                let mesh = results[0]
+                    .as_ref()
+                    .expect("worker flash inference should succeed")
+                    .as_ref()
+                    .expect("worker flash inference should return mesh");
+                assert!(
+                    !mesh.mesh.vertices.is_empty(),
+                    "expected non-empty vertex list from flash inference"
+                );
+                assert!(
+                    !mesh.mesh.faces.is_empty(),
+                    "expected non-empty face list from flash inference"
+                );
+                let all_finite = mesh
+                    .mesh
+                    .vertices
+                    .iter()
+                    .flat_map(|vertex| vertex.iter())
+                    .all(|value| value.is_finite());
+                assert!(
+                    all_finite,
+                    "expected finite vertex coordinates from flash inference"
+                );
+            })
+            .expect("spawn worker WGPU flash inference smoke thread");
+        handle
+            .join()
+            .expect("worker WGPU flash inference smoke thread panicked");
     }
 
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]

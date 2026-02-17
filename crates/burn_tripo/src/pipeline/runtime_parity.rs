@@ -78,6 +78,10 @@ pub fn triposg_runtime_profile(
     }
 }
 
+pub fn should_prefer_f16_triposg_weights(parity: TripoSGRuntimeParityProfile) -> bool {
+    parity.burnpack_policy.precision.prefer_f16()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, String> {
     if target_faces == 0 || mesh.faces.len() <= target_faces {
@@ -222,7 +226,8 @@ mod tests {
     use burn::backend::NdArray;
 
     use super::{
-        DinoBackendChoice, decimate_tripo_mesh, resolve_dino_backend, triposg_runtime_profile,
+        DinoBackendChoice, decimate_tripo_mesh, resolve_dino_backend,
+        should_prefer_f16_triposg_weights, triposg_runtime_profile,
     };
 
     #[test]
@@ -240,6 +245,23 @@ mod tests {
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
         assert!(!profile.burnpack_policy.precision.prefer_f16());
+    }
+
+    #[test]
+    fn default_profile_prefers_f32_weights() {
+        let profile = triposg_runtime_profile(None);
+        assert!(!should_prefer_f16_triposg_weights(profile));
+    }
+
+    #[test]
+    fn explicit_f16_profile_is_respected() {
+        use crate::model::triposg::load_policy::BpkPrecisionPreference;
+
+        let mut profile = triposg_runtime_profile(None);
+        profile.burnpack_policy = profile
+            .burnpack_policy
+            .with_precision(BpkPrecisionPreference::PreferF16);
+        assert!(should_prefer_f16_triposg_weights(profile));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

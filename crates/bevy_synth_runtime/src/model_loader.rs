@@ -1,4 +1,6 @@
 #[cfg(target_arch = "wasm32")]
+// Generic loader precision helper (memory-oriented).
+// TripoSG runtime parity uses burn_tripo::pipeline::runtime_parity policy helpers instead.
 pub(crate) use burn_synth::model_loader::prefer_f16_burnpack;
 
 #[cfg(not(target_arch = "wasm32"))]

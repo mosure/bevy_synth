@@ -26,7 +26,9 @@ use burn_tripo::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
 use burn_tripo::model::triposg::vae::TripoSGVaeConfig;
 use burn_tripo::model::triposg::vae::import::load_triposg_vae_decoder_from_burnpack_bytes;
 use burn_tripo::pipeline::mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh};
-use burn_tripo::pipeline::runtime_parity::{decimate_tripo_mesh, triposg_runtime_profile};
+use burn_tripo::pipeline::runtime_parity::{
+    decimate_tripo_mesh, should_prefer_f16_triposg_weights, triposg_runtime_profile,
+};
 use burn_tripo::pipeline::triposg::TripoSGPipeline;
 use js_sys::Uint8Array;
 #[cfg(feature = "wasm-api-wgpu")]
@@ -41,8 +43,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::mesh::Mesh;
 use crate::mesh_to_glb_bytes;
 use crate::model_loader::{
-    candidate_burnpack_names, parse_parts_manifest_bytes, prefer_f16_burnpack,
-    resolve_manifest_entry_uri,
+    candidate_burnpack_names, parse_parts_manifest_bytes, resolve_manifest_entry_uri,
 };
 use crate::wasm::WasmInferencePreset;
 use crate::wasm_loader::{
@@ -350,13 +351,18 @@ async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
 ) -> Result<WasmPipelineState<BTriposg, BRmbg>, String> {
     let parity = triposg_runtime_profile(Some(preset.resolution));
     set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
-    let prefer_f16_default = parity.burnpack_policy.precision.prefer_f16() || prefer_f16_burnpack();
+    let prefer_f16_default = should_prefer_f16_triposg_weights(parity);
+    let precision_label = if prefer_f16_default { "f16" } else { "f32" };
+    web_sys::console::log_1(
+        &format!("TripoSG weight precision policy: {precision_label} (runtime parity profile).")
+            .into(),
+    );
     let use_wgpu = is_wgpu_backend::<BTriposg>();
     // Keep RMBG on f32 for wasm wgpu path; some f16 kernels currently trigger
     // storage-buffer alignment validation errors on web runtimes.
     let prefer_f16_rmbg = false;
     // CPU wasm path cannot fit full-f32 model footprints under the 4 GiB host cap.
-    // Prefer f16 artifacts for TripoSG weights on both backends.
+    // Keep CPU fallback on f16, but let WebGPU follow the runtime parity precision policy.
     let prefer_f16_vae = if use_wgpu { prefer_f16_default } else { true };
     let prefer_f16_dit = if use_wgpu { prefer_f16_default } else { true };
     let prefer_f16_dino = if use_wgpu { prefer_f16_default } else { true };

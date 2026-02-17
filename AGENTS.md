@@ -85,3 +85,65 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 3. Memory: load/init RAM behavior measured on realistic model set.
 4. Tooling: relevant tests pass, relevant clippy scope is clean.
 5. Integration: CLI + runtime/app paths both exercise the same core implementation.
+
+## Standard Workflow (Agent + Contributor)
+
+1. Reproduce first with an exact command, backend, mesh mode, and seed.
+2. Isolate the first failing stage (preprocess, encode, sample, decode, mesh, postprocess) before changing code.
+3. Fix in the canonical layer first (`burn_synth` / `burn_tripo`) and adapt in wrappers second.
+4. Add the smallest realistic test that fails before the fix and passes after it.
+5. Run the required validation matrix for the touched area.
+6. Record evidence (commands + key metrics) in a stable location, not ad hoc scratch files.
+
+## Workspace Hygiene and Artifact Layout
+
+1. Never create new ad hoc files at repository root for experiments.
+2. Put all temporary run outputs under `tmp/runs/<run_id>/`.
+3. Use `tmp/upstream/<project>/<version>/` for upstream snapshots/patch prep.
+4. Use `tmp/wasm/<run_id>/` for wasm/browser loop logs and diagnostics.
+5. For committed evidence, use `docs/reports/<topic>/<run_id>.md` plus machine-readable sidecars (`.json`/`.csv`).
+6. Before merge, ensure no accidental large generated artifacts are included in commits.
+
+## Run ID and Naming Conventions
+
+1. Use run id format: `YYYYMMDDTHHMMSSZ_<pipeline>_<backend>_<goal>`.
+2. Name logs by stage when possible: `01_build.log`, `02_bindgen.log`, `03_infer.log`, etc.
+3. Name benchmark outputs with the same run id for easy cross-linking.
+4. Avoid ambiguous names like `run1`, `new`, `temp`, `debug_final`.
+
+## Test Harness Conventions
+
+1. Use test suffixes consistently: `*_smoke`, `*_correctness`, `*_parity`, `*_reference`.
+2. `smoke` tests validate load/shape/non-crash and may be backend-gated (`BURN_WGPU_SMOKE=1`, `BURN_CUDA_SMOKE=1`).
+3. `correctness` tests validate numeric tolerances and may be backend-gated (`BURN_WGPU_CORRECTNESS=1`).
+4. `reference` tests validate against canonical saved outputs and should use explicit gates (for example `TRIPOSG_FULL_REFERENCE=1`).
+5. Expensive runtime integration tests should be `#[ignore = "..."]` with clear run instructions in the ignore reason.
+6. Skip messages must explicitly state which env var enables the test.
+
+## Required Validation Matrix (Minimum)
+
+1. Tripo model/pipeline changes:
+   - `cargo test -p burn_tripo --features import pipeline::runtime_parity::tests:: -- --nocapture`
+   - relevant `*_correctness`/`*_parity` tests for touched stages
+2. `bevy_synth_runtime` changes:
+   - targeted worker tests
+   - `cargo check -p bevy_synth_runtime`
+3. `bevy_synth` integration changes:
+   - `cargo check -p bevy_synth`
+4. wasm path changes:
+   - `cargo check -p burn_synth --target wasm32-unknown-unknown --features wasm-api,wasm-api-wgpu`
+   - relevant wasm smoke/parity tests when available
+
+## Configuration Safety Rails
+
+1. Parity-critical runtime decisions (for example Tripo weight precision) must come from canonical parity helpers, not ad hoc boolean composition.
+2. Do not silently rewrite user-requested quality/mesh settings in runtime startup; prefer explicit presets and clear logs.
+3. Runtime startup logs should include effective backend, mesh mode, and precision policy for reproducibility.
+4. Performance-oriented alternatives must be opt-in and labeled; correctness-first defaults must remain stable.
+
+## Script and Automation Conventions
+
+1. Reusable automation belongs in `scripts/`, not `tmp/`.
+2. Script names should be domain-first and action-specific (for example `triposg_stage_bench.*`, `wasm_playwright_loop.*`).
+3. Keep cross-platform parity for important workflows (`.sh` and `.ps1`) when feasible.
+4. One-off investigation scripts should live under `tmp/runs/<run_id>/` and are not part of long-term workflow.

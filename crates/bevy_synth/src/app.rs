@@ -28,7 +28,13 @@ use bevy::light::{
 use bevy::math::primitives::Cuboid;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+use bevy::render::RenderApp;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+use bevy::render::renderer::{
+    RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue,
+};
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 use bevy_editor_core::selection::{
@@ -50,6 +56,8 @@ use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+use bevy_synth_runtime::args::MeshMode;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::args::{BackendKind, DinoBackend, RmbgBackend};
@@ -61,6 +69,11 @@ use bevy_synth_runtime::state::{
     WorkerCommand,
 };
 use bevy_synth_runtime::worker::start_worker;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+use bevy_synth_runtime::worker::{
+    SharedWgpuDevice, init_shared_wgpu_device_from_bevy_render,
+    start_worker_with_shared_wgpu_device,
+};
 use bevy_synth_runtime::{SynthMesh, SynthMeshTexture};
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
@@ -122,6 +135,84 @@ impl McpSceneControl {
             last_modified: None,
         }
     }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+#[derive(Resource, Default, Clone)]
+struct SharedWgpuInferenceDevice {
+    device: Option<SharedWgpuDevice>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+struct SharedWgpuInferenceDevicePlugin;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+impl Plugin for SharedWgpuInferenceDevicePlugin {
+    fn build(&self, _app: &mut App) {}
+
+    fn finish(&self, app: &mut App) {
+        let wants_shared_wgpu = app
+            .world()
+            .get_resource::<AppArgs>()
+            .map(should_share_wgpu_inference_device)
+            .unwrap_or(false);
+        if !wants_shared_wgpu {
+            return;
+        }
+
+        let shared_device = {
+            let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+                warn!(
+                    "RenderApp unavailable; Burn WGPU inference will use an isolated runtime device."
+                );
+                return;
+            };
+            let world = render_app.world();
+            Some(init_shared_wgpu_device_from_bevy_render(
+                world.resource::<RenderAdapter>(),
+                world.resource::<RenderAdapterInfo>(),
+                world.resource::<RenderDevice>(),
+                world.resource::<RenderInstance>(),
+                world.resource::<RenderQueue>(),
+            ))
+        };
+
+        if shared_device.is_some() {
+            info!("Initialized shared Burn WGPU device from Bevy render context.");
+        }
+        app.insert_resource(SharedWgpuInferenceDevice {
+            device: shared_device,
+        });
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+pub(crate) fn should_share_wgpu_inference_device(args: &AppArgs) -> bool {
+    should_share_wgpu_inference_device_for_platform(args, cfg!(target_os = "linux"))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+pub(crate) fn should_share_wgpu_inference_device_for_platform(
+    args: &AppArgs,
+    is_linux: bool,
+) -> bool {
+    if !matches!(args.backend, BackendKind::Wgpu) {
+        return false;
+    }
+
+    let full_flash_workload = matches!(args.mesh_mode, MeshMode::Flash)
+        && args.flash_octree_depth >= 9
+        && args.flash_min_resolution >= 63;
+    if is_linux && full_flash_workload {
+        info!(
+            "Using isolated Burn WGPU device for Linux full+flash workload \
+             (octree_depth={}, min_resolution={}) to avoid render swapchain instability.",
+            args.flash_octree_depth, args.flash_min_resolution
+        );
+        return false;
+    }
+
+    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -217,6 +308,8 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
     add_default_plugins(&mut app);
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+    app.add_plugins(SharedWgpuInferenceDevicePlugin);
     if !app.is_plugin_added::<PointerInputPlugin>() {
         app.add_plugins(DefaultPickingPlugins);
     }
@@ -438,6 +531,9 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut ambient_light: ResMut<AmbientLight>,
     args: Res<AppArgs>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
+        Res<SharedWgpuInferenceDevice>,
+    >,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
@@ -496,6 +592,14 @@ fn setup(
         },
     ));
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+    let worker = start_worker_with_shared_wgpu_device(
+        args.as_ref(),
+        shared_wgpu_device
+            .as_ref()
+            .and_then(|shared| shared.device.clone()),
+    );
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "wgpu")))]
     let worker = start_worker(args.as_ref());
     commands.insert_resource(worker);
 

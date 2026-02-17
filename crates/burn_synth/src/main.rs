@@ -199,6 +199,7 @@ fn run_with_large_stack(cli: Cli) -> Result<(), String> {
 
 fn run(cli: Cli) -> Result<(), String> {
     let synthesis_models = sanitize_synthesis_models(cli.synthesis_models);
+    ensure_requested_models_supported(&synthesis_models)?;
     let target_faces = match cli.faces {
         Some(0) => None,
         Some(value) => Some(value),
@@ -369,6 +370,26 @@ fn sanitize_synthesis_models(models: Vec<CliSynthesisModel>) -> Vec<CliSynthesis
     out
 }
 
+#[cfg(feature = "trellis")]
+fn ensure_requested_models_supported(_models: &[CliSynthesisModel]) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(feature = "trellis"))]
+fn ensure_requested_models_supported(models: &[CliSynthesisModel]) -> Result<(), String> {
+    if models
+        .iter()
+        .any(|model| matches!(model, CliSynthesisModel::Trellis))
+    {
+        return Err(
+            "trellis synthesis model requested, but this build does not enable burn_synth feature `trellis`"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 fn foreground_model_name(model: burn_synth::ForegroundModel) -> &'static str {
     match model {
         burn_synth::ForegroundModel::Rmbg14 => "rmbg14",
@@ -429,7 +450,7 @@ impl From<CliDinoBackend> for DinoBackend {
     }
 }
 
-impl From<CliTrellisQuality> for burn_synth::trellis::TrellisQuality {
+impl From<CliTrellisQuality> for burn_synth::TrellisQuality {
     fn from(value: CliTrellisQuality) -> Self {
         match value {
             CliTrellisQuality::Low => Self::Low,

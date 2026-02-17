@@ -13,7 +13,7 @@ use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
-use burn_trellis::TrellisQuality;
+#[cfg(feature = "trellis")]
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
@@ -86,6 +86,14 @@ impl DinoBackend {
             Self::Gpu => "gpu",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrellisQuality {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
 #[derive(Clone, Debug)]
@@ -674,6 +682,7 @@ impl SynthRuntime {
         }
     }
 
+    #[cfg(feature = "trellis")]
     fn infer_mesh_trellis(
         &mut self,
         input_image_path: &Path,
@@ -731,7 +740,7 @@ impl SynthRuntime {
             InferenceBackend::Cuda => TrellisDevice::Cuda,
         };
         let options = TrellisRunOptions {
-            quality: self.config.trellis_quality,
+            quality: map_trellis_quality(self.config.trellis_quality),
             device: trellis_device,
             seed: self.config.seed,
             hook_output: None,
@@ -794,6 +803,19 @@ impl SynthRuntime {
         progress.stage_completed("trellis.decode", None, profiled.timings.decode_ms, None);
         let _ = std::fs::remove_file(temp_input);
         Ok(profiled.mesh.into())
+    }
+
+    #[cfg(not(feature = "trellis"))]
+    fn infer_mesh_trellis(
+        &mut self,
+        _input_image_path: &Path,
+        _foreground_model: ForegroundModel,
+        _backend: InferenceBackend,
+        _progress: &ProgressRun,
+    ) -> RuntimeResult<Mesh> {
+        Err(RuntimeError::new(
+            "Trellis backend not enabled; build with burn_synth feature `trellis`",
+        ))
     }
 
     fn compute_alpha_mask(
@@ -1018,6 +1040,7 @@ struct SynthesisRuntime {
     wgpu: Option<BackendSynthesisState<WgpuBackend>>,
     #[cfg(feature = "cuda")]
     cuda: Option<BackendSynthesisState<CudaBackend>>,
+    #[cfg(feature = "trellis")]
     trellis: Option<Trellis2Pipeline>,
 }
 
@@ -1034,6 +1057,7 @@ impl SynthesisRuntime {
             .ok_or_else(|| RuntimeError::new("CPU synthesis backend unavailable"))
     }
 
+    #[cfg(feature = "trellis")]
     fn ensure_trellis(&mut self, config: &RuntimeConfig) -> RuntimeResult<&mut Trellis2Pipeline> {
         if self.trellis.is_none() {
             let mut trellis_config = Trellis2PipelineConfig::default();
@@ -1150,6 +1174,15 @@ fn map_dino_backend(value: DinoBackend) -> DinoBackendChoice {
     }
 }
 
+#[cfg(feature = "trellis")]
+fn map_trellis_quality(value: TrellisQuality) -> burn_trellis::TrellisQuality {
+    match value {
+        TrellisQuality::Low => burn_trellis::TrellisQuality::Low,
+        TrellisQuality::Medium => burn_trellis::TrellisQuality::Medium,
+        TrellisQuality::High => burn_trellis::TrellisQuality::High,
+    }
+}
+
 fn foreground_model_label(model: ForegroundModel) -> &'static str {
     match model {
         ForegroundModel::Rmbg14 => "rmbg14",
@@ -1172,6 +1205,7 @@ fn synthesis_models_label(models: &[SynthesisModel]) -> String {
         .join(",")
 }
 
+#[cfg(feature = "trellis")]
 fn avg_step_detail(elapsed_ms: f64, total_steps: usize, source: &str) -> String {
     if total_steps == 0 {
         return format!("source={source} avg_step_ms={elapsed_ms:.1}");
@@ -1610,6 +1644,28 @@ mod tests {
         assert_eq!(output.synthesis_models, vec![SynthesisModel::Trellis]);
         assert_eq!(output.backend, InferenceBackend::Cpu);
         assert_eq!(output.foreground_model, ForegroundModel::Rmbg2);
+    }
+
+    #[cfg(not(feature = "trellis"))]
+    #[test]
+    fn trellis_request_errors_when_feature_disabled() {
+        let mut runtime = SynthRuntime::new(RuntimeConfig {
+            backend: InferenceBackend::Cpu,
+            ..RuntimeConfig::default()
+        });
+        let err = runtime
+            .synthesize_mesh(MeshRequest {
+                image: ImageSource::from_path("unused.png"),
+                foreground_model: Some(ForegroundModel::Rmbg14),
+                synthesis_models: Some(vec![SynthesisModel::Trellis]),
+                backend: Some(InferenceBackend::Cpu),
+                dry_run: false,
+            })
+            .expect_err("trellis requests should fail when feature is disabled");
+        assert!(
+            err.to_string().contains("feature `trellis`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

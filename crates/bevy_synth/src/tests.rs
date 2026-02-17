@@ -9,6 +9,8 @@ use bevy::prelude::*;
 use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState};
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend, RmbgModel, SynthesisModel,
@@ -225,4 +227,37 @@ fn headless_once_requires_image_and_output_without_mesh() {
 
     args.mesh = Some(PathBuf::from("docs/output.glb"));
     assert!(!should_run_headless_once(&args));
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+#[test]
+fn linux_full_flash_workload_uses_isolated_wgpu_device() {
+    let mut args = test_args();
+    args.backend = BackendKind::Wgpu;
+    args.mesh_mode = MeshMode::Flash;
+    args.flash_octree_depth = 9;
+    args.flash_min_resolution = 63;
+    assert!(
+        !should_share_wgpu_inference_device_for_platform(&args, true),
+        "Linux full+flash should isolate Burn WGPU device from Bevy render device"
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+#[test]
+fn non_linux_or_lighter_flash_workloads_keep_shared_wgpu_device() {
+    let mut args = test_args();
+    args.backend = BackendKind::Wgpu;
+    args.mesh_mode = MeshMode::Flash;
+    args.flash_octree_depth = 8;
+    args.flash_min_resolution = 31;
+
+    assert!(
+        should_share_wgpu_inference_device_for_platform(&args, true),
+        "Linux lower flash workloads should continue to share the Bevy render device"
+    );
+    assert!(
+        should_share_wgpu_inference_device_for_platform(&args, false),
+        "Non-Linux platforms should continue to share the Bevy render device"
+    );
 }
