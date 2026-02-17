@@ -8,10 +8,10 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["wgpu", "triposg"]
-triposg = ["bevy_synth_runtime/triposg", "bevy_synth_ui/triposg"]
-trellis = ["bevy_synth_runtime/trellis", "bevy_synth_ui/trellis"]
-wgpu = ["bevy_synth_runtime/wgpu"]
-cuda = ["bevy_synth_runtime/cuda"]
+triposg = ["bevy_synth_runtime/triposg", "bevy_synth_runtime/shared-runtime", "bevy_synth_ui/triposg"]
+trellis = ["bevy_synth_runtime/trellis", "bevy_synth_runtime/shared-runtime", "bevy_synth_ui/trellis"]
+wgpu = ["bevy_synth_runtime/wgpu", "bevy_synth_runtime/shared-runtime"]
+cuda = ["bevy_synth_runtime/cuda", "bevy_synth_runtime/shared-runtime"]
 solari = []
 dlss = []
 force_disable_dlss = []
@@ -28,7 +28,7 @@ bevy_transform_gizmos = { path = "../bevy_transform_gizmos" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bevy_synth_runtime = { path = "../bevy_synth_runtime", default-features = false }
+bevy_synth_runtime = { path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 bevy_synth_ui = { path = "../bevy_synth_ui" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -10,11 +10,11 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["wgpu", "triposg"]
-triposg = []
+default = ["wgpu", "triposg", "shared-runtime"]
+triposg = ["burn_synth/triposg"]
 trellis = ["dep:burn_trellis", "burn_synth/trellis"]
-wgpu = ["dep:burn-wgpu"]
-cuda = ["burn-cuda"]
+wgpu = ["dep:burn-wgpu", "burn_synth/wgpu"]
+cuda = ["burn-cuda", "burn_synth/cuda"]
 shared-runtime = ["burn_synth/runtime"]
 
 [dependencies]

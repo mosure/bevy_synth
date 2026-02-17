@@ -58,11 +58,11 @@ use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
 
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::args::BackendKind;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy_synth_runtime::args::MeshMode;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_synth_runtime::args::{BackendKind, DinoBackend, RmbgBackend};
 use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
@@ -576,20 +576,7 @@ fn run_headless_once(args: &AppArgs) -> Result<(), String> {
     );
 
     let start = Instant::now();
-    let mut attempt_args = args.clone();
-    let mesh = match run_headless_once_inference(&attempt_args, &image_path) {
-        Ok(mesh) => mesh,
-        Err(primary_err) if matches!(attempt_args.backend, BackendKind::Wgpu) => {
-            eprintln!(
-                "wgpu headless inference failed ({primary_err}); retrying once with cpu backend."
-            );
-            attempt_args.backend = BackendKind::Cpu;
-            attempt_args.rmbg_backend = RmbgBackend::Cpu;
-            attempt_args.dino_backend = DinoBackend::Cpu;
-            run_headless_once_inference(&attempt_args, &image_path)?
-        }
-        Err(err) => return Err(err),
-    };
+    let mesh = run_headless_once_inference(args, &image_path)?;
 
     write_glb(&output_path, &mesh)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::args::RmbgModel;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
     burn_tripo::paths::resolve_triposg_weights_root(explicit.map(|path| path.as_path()))
 }
@@ -18,6 +19,7 @@ pub(crate) fn resolve_triposg_root(explicit: Option<&PathBuf>) -> PathBuf {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) -> PathBuf {
     if let Some(path) = explicit
         && let Some(root) = normalize_rmbg_root(path)
@@ -50,6 +52,7 @@ pub(crate) fn resolve_rmbg_root(explicit: Option<&PathBuf>, model: RmbgModel) ->
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
     if let Some(path) = explicit
         && let Some(root) = normalize_weights_root(path)
@@ -71,6 +74,7 @@ pub(crate) fn resolve_scribble_root(explicit: Option<&PathBuf>) -> PathBuf {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn normalize_weights_root(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());
@@ -84,6 +88,7 @@ fn normalize_weights_root(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn normalize_rmbg_root(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());

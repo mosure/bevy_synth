@@ -5,7 +5,6 @@ use std::sync::Once;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
-use burn_foreground::pipeline::PrepareImageConfig;
 use burn_synth::pipeline::ModelSelection;
 use burn_synth::progress::{
     ProgressVerbosity, RuntimeProgressObserver, default_log_progress_callback,
@@ -23,11 +22,20 @@ use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
 
-pub(crate) fn supports_shared_runtime(args: &AppArgs) -> bool {
-    args.prompt.is_none()
-        && args.text_embeds.is_none()
-        && args.scribble_weights_root.is_none()
-        && matches!(args.mesh_mode, MeshMode::Flash)
+pub(crate) fn validate_canonical_runtime_args(args: &AppArgs) -> Result<(), String> {
+    if args.prompt.is_some() || args.text_embeds.is_some() || args.scribble_weights_root.is_some() {
+        return Err(
+            "prompt/scribble inference is not supported in canonical burn_synth runtime mode"
+                .to_string(),
+        );
+    }
+    if !matches!(args.mesh_mode, MeshMode::Flash) {
+        return Err(format!(
+            "mesh mode {:?} is unsupported in canonical burn_synth runtime mode; use flash",
+            args.mesh_mode
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn worker_loop_shared_runtime(
@@ -88,6 +96,7 @@ pub(crate) fn worker_loop_shared_runtime(
 }
 
 fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
+    validate_canonical_runtime_args(args)?;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     if matches!(args.backend, BackendKind::Wgpu) {
         configure_wgpu_runtime_memory_profile();
@@ -112,7 +121,7 @@ fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
         num_steps: args.num_steps,
         num_tokens: args.num_tokens,
         guidance_scale: args.guidance_scale,
-        seed: args.seed,
+        seed: args.seed.or(RuntimeConfig::default().seed),
         dino_backend: map_dino_backend(args.dino_backend),
         target_faces: args.target_faces,
         ..RuntimeConfig::default()
@@ -122,9 +131,6 @@ fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
         1,
         default_log_progress_callback(),
     );
-    let prepare = prepare_image_config(args);
-    config.mesh_prepare = prepare.clone();
-    config.foreground_prepare = prepare;
 
     let bounds = parse_bounds(args.bounds.as_slice())?;
     config.flash_extract.bounds = bounds;
@@ -229,14 +235,6 @@ fn map_dino_backend(value: DinoBackend) -> RuntimeDinoBackend {
     }
 }
 
-fn prepare_image_config(args: &AppArgs) -> PrepareImageConfig {
-    let mut config = PrepareImageConfig::default();
-    if matches!(args.backend, BackendKind::Wgpu) {
-        config.max_dimension = config.max_dimension.min(1024);
-    }
-    config
-}
-
 fn map_trellis_quality(value: TrellisQuality) -> RuntimeTrellisQuality {
     match value {
         TrellisQuality::Low => RuntimeTrellisQuality::Low,
@@ -281,36 +279,39 @@ fn parse_bounds(raw: &[f32]) -> Result<[f32; 6], String> {
 mod tests {
     use clap::Parser;
 
-    use super::{parse_bounds, supports_shared_runtime};
+    use super::{parse_bounds, validate_canonical_runtime_args};
     use crate::args::{Args, MeshMode, SynthesisModel, build_app_args};
 
     #[test]
-    fn supports_shared_runtime_for_trellis_flash_pipeline() {
+    fn validates_canonical_runtime_for_trellis_flash_pipeline() {
         let args = build_app_args(Args::parse_from([
             "bevy_synth",
             "--synthesis-models",
             "trellis",
         ]));
-        assert!(supports_shared_runtime(&args));
+        validate_canonical_runtime_args(&args).expect("trellis flash pipeline should be valid");
     }
 
     #[test]
-    fn shared_runtime_supports_triposg_but_disables_prompt_or_non_flash_mesh_mode() {
+    fn canonical_runtime_rejects_prompt_and_non_flash_mesh_mode() {
         let args = build_app_args(Args::parse_from(["bevy_synth"]));
         assert!(
             args.synthesis_models
                 .iter()
                 .any(|model| matches!(model, SynthesisModel::Triposg))
         );
-        assert!(supports_shared_runtime(&args));
+        validate_canonical_runtime_args(&args).expect("default triposg flash should be valid");
 
         let mut args = build_app_args(Args::parse_from(["bevy_synth"]));
         args.prompt = Some("chair".to_string());
-        assert!(!supports_shared_runtime(&args));
+        let err = validate_canonical_runtime_args(&args).expect_err("prompt should be rejected");
+        assert!(err.contains("prompt/scribble inference"));
 
         let mut args = build_app_args(Args::parse_from(["bevy_synth"]));
         args.mesh_mode = MeshMode::Dense;
-        assert!(!supports_shared_runtime(&args));
+        let err =
+            validate_canonical_runtime_args(&args).expect_err("non-flash mesh mode should fail");
+        assert!(err.contains("unsupported"));
     }
 
     #[test]

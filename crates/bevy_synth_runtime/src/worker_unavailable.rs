@@ -11,14 +11,14 @@ pub(super) fn worker_loop_backend_unavailable(
         match command {
             WorkerCommand::Infer(requests) => {
                 let results = vec![Err(message.to_string()); requests.len()];
-                let sent = event_tx.send(WorkerEvent {
+                let _sent = event_tx.send(WorkerEvent {
                     requests,
                     results,
                     elapsed: std::time::Duration::ZERO,
                     status_message: None,
                 });
                 #[cfg(not(target_arch = "wasm32"))]
-                if sent.is_ok()
+                if _sent.is_ok()
                     && let Some(wake) = wake_callback.as_ref()
                 {
                     wake();

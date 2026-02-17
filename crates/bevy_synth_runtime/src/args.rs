@@ -235,6 +235,7 @@ pub enum MeshMode {
 }
 
 pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
+pub const DEFAULT_SEED: u64 = 42;
 
 #[derive(Clone, Copy, Debug)]
 pub struct QualityDefaults {
@@ -350,7 +351,7 @@ pub struct AppArgs {
 
 pub fn build_app_args(args: Args) -> AppArgs {
     let defaults = args.quality.defaults();
-    let seed = args.seed;
+    let seed = args.seed.or(Some(DEFAULT_SEED));
     let target_faces = match args.faces {
         Some(0) => None,
         Some(value) => Some(value),
@@ -426,7 +427,9 @@ fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel>
 mod tests {
     use clap::Parser;
 
-    use super::{Args, DEFAULT_CHUNK_SIZE, RmbgModel, SynthesisModel, build_app_args};
+    use super::{
+        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, RmbgModel, SynthesisModel, build_app_args,
+    };
 
     #[test]
     fn defaults_use_rmbg14_and_batch_one() {
@@ -497,5 +500,14 @@ mod tests {
             "false",
         ]));
         assert!(!disabled.pause_render_during_inference);
+    }
+
+    #[test]
+    fn seed_defaults_to_canonical_value_unless_overridden() {
+        let default_args = build_app_args(Args::parse_from(["bevy_synth"]));
+        assert_eq!(default_args.seed, Some(DEFAULT_SEED));
+
+        let custom = build_app_args(Args::parse_from(["bevy_synth", "--seed", "7"]));
+        assert_eq!(custom.seed, Some(7));
     }
 }
