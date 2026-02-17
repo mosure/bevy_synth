@@ -1,4 +1,6 @@
 use std::any::TypeId;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use std::sync::Once;
@@ -135,6 +137,8 @@ type WgpuRuntimeBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 pub type SharedWgpuDevice = burn_wgpu::WgpuDevice;
 #[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
 pub type SharedWgpuDevice = ();
+#[cfg(not(target_arch = "wasm32"))]
+pub type WorkerWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(feature = "trellis")]
 type TrellisPipeline = Trellis2Pipeline;
@@ -367,7 +371,15 @@ fn synthesis_unavailable_message(
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn start_worker(args: &AppArgs) -> InferenceWorker {
-    start_worker_with_shared_wgpu_device(args, None)
+    start_worker_with_wake(args, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_worker_with_wake(
+    args: &AppArgs,
+    wake_callback: Option<WorkerWakeCallback>,
+) -> InferenceWorker {
+    start_worker_with_shared_wgpu_device_and_wake(args, None, wake_callback)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -375,15 +387,33 @@ pub fn start_worker_with_shared_wgpu_device(
     args: &AppArgs,
     shared_wgpu_device: Option<SharedWgpuDevice>,
 ) -> InferenceWorker {
+    start_worker_with_shared_wgpu_device_and_wake(args, shared_wgpu_device, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_worker_with_shared_wgpu_device_and_wake(
+    args: &AppArgs,
+    shared_wgpu_device: Option<SharedWgpuDevice>,
+    wake_callback: Option<WorkerWakeCallback>,
+) -> InferenceWorker {
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let args = args.clone();
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     let shared_wgpu_device = shared_wgpu_device.clone();
+    let wake_callback = wake_callback.clone();
     let _ = thread::Builder::new()
         .name("synth-worker".to_string())
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || worker_loop(args, command_rx, event_tx, shared_wgpu_device))
+        .spawn(move || {
+            worker_loop(
+                args,
+                command_rx,
+                event_tx,
+                shared_wgpu_device,
+                wake_callback,
+            )
+        })
         .expect("failed to spawn synth worker thread");
     InferenceWorker {
         sender: command_tx,
@@ -513,18 +543,30 @@ fn worker_loop(
     command_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
     shared_wgpu_device: Option<SharedWgpuDevice>,
+    wake_callback: Option<WorkerWakeCallback>,
 ) {
+    #[cfg(not(feature = "wgpu"))]
+    let _ = &shared_wgpu_device;
     #[cfg(feature = "shared-runtime")]
     if worker_runtime_bridge::supports_shared_runtime(&args) {
         info!("Using shared burn_synth runtime worker path.");
-        worker_runtime_bridge::worker_loop_shared_runtime(args, command_rx, event_tx);
+        worker_runtime_bridge::worker_loop_shared_runtime(
+            args,
+            command_rx,
+            event_tx,
+            wake_callback,
+        );
         return;
     }
     info!("Using legacy bevy_synth_runtime worker path.");
     match args.backend {
-        BackendKind::Cpu => {
-            worker_loop_backend::<burn::backend::NdArray<f32>>(args, None, command_rx, event_tx)
-        }
+        BackendKind::Cpu => worker_loop_backend::<burn::backend::NdArray<f32>>(
+            args,
+            None,
+            command_rx,
+            event_tx,
+            wake_callback,
+        ),
         BackendKind::Wgpu => {
             #[cfg(feature = "wgpu")]
             {
@@ -536,6 +578,7 @@ fn worker_loop(
                     shared_wgpu_device,
                     command_rx,
                     event_tx,
+                    wake_callback,
                 );
             }
             #[cfg(not(feature = "wgpu"))]
@@ -544,13 +587,20 @@ fn worker_loop(
                     command_rx,
                     event_tx,
                     "wgpu backend not enabled (enable the `wgpu` feature)",
+                    wake_callback,
                 );
             }
         }
         BackendKind::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                worker_loop_backend::<burn_cuda::Cuda>(args, None, command_rx, event_tx);
+                worker_loop_backend::<burn_cuda::Cuda>(
+                    args,
+                    None,
+                    command_rx,
+                    event_tx,
+                    wake_callback,
+                );
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -558,6 +608,7 @@ fn worker_loop(
                     command_rx,
                     event_tx,
                     "cuda backend not enabled (enable the `cuda` feature)",
+                    wake_callback,
                 );
             }
         }
@@ -911,6 +962,7 @@ fn worker_loop_backend<B: Backend>(
     device_override: Option<B::Device>,
     command_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
+    wake_callback: Option<WorkerWakeCallback>,
 ) {
     let mut state = match device_override {
         Some(device) => build_pipeline_state_with_device::<B>(&args, Some(device)),
@@ -927,12 +979,17 @@ fn worker_loop_backend<B: Backend>(
                     Ok(state) => run_inference_with_state(state, &args, &requests),
                     Err(err) => vec![Err(err.clone()); requests.len()],
                 };
-                let _ = event_tx.send(WorkerEvent {
+                let sent = event_tx.send(WorkerEvent {
                     requests,
                     results,
                     elapsed: start.elapsed(),
                     status_message: None,
                 });
+                if sent.is_ok()
+                    && let Some(wake) = wake_callback.as_ref()
+                {
+                    wake();
+                }
             }
             WorkerCommand::Shutdown => break,
         }
@@ -2746,6 +2803,8 @@ fn is_cuda_backend<B: Backend>() -> bool {
 
 fn configure_cubecl_autotune<B: Backend>(using_shared_device: bool) {
     let _ = TypeId::of::<B>();
+    #[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
+    let _ = using_shared_device;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     if is_wgpu_backend::<B>() {
         if using_shared_device {

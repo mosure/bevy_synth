@@ -9,6 +9,8 @@ use bevy::prelude::*;
 use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::should_pause_render_during_inference;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
@@ -63,6 +65,7 @@ fn test_args() -> AppArgs {
         backend: BackendKind::Cpu,
         rmbg_backend: RmbgBackend::Auto,
         dino_backend: DinoBackend::Auto,
+        pause_render_during_inference: true,
         max_batch_size: 1,
         mcp_scene_control_path: None,
     }
@@ -227,6 +230,21 @@ fn headless_once_requires_image_and_output_without_mesh() {
 
     args.mesh = Some(PathBuf::from("docs/output.glb"));
     assert!(!should_run_headless_once(&args));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn render_pause_toggle_follows_queue_state() {
+    let mut args = test_args();
+    let mut queue = InferenceQueue::default();
+
+    assert!(!should_pause_render_during_inference(&args, &queue, false));
+    enqueue_inference(PathBuf::from("chair.png"), &args, &mut queue);
+    assert!(should_pause_render_during_inference(&args, &queue, false));
+    assert!(!should_pause_render_during_inference(&args, &queue, true));
+
+    args.pause_render_during_inference = false;
+    assert!(!should_pause_render_during_inference(&args, &queue, false));
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]

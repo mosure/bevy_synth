@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use bevy::prelude::Resource;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(about = "bevy_synth", version)]
@@ -165,6 +165,11 @@ pub struct Args {
     /// Inference backend (cpu, wgpu, cuda).
     #[arg(long, value_enum, default_value_t = BackendKind::Wgpu)]
     pub backend: BackendKind,
+
+    /// Pause Bevy window updates/renders while inference is running.
+    /// This is a temporary workaround for upstream Linux swapchain instability.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pause_render_during_inference: bool,
 
     /// Maximum number of queued images to batch per inference dispatch.
     #[arg(long, default_value_t = 1)]
@@ -338,6 +343,7 @@ pub struct AppArgs {
     pub backend: BackendKind,
     pub rmbg_backend: RmbgBackend,
     pub dino_backend: DinoBackend,
+    pub pause_render_during_inference: bool,
     pub max_batch_size: usize,
     pub mcp_scene_control_path: Option<PathBuf>,
 }
@@ -397,6 +403,7 @@ pub fn build_app_args(args: Args) -> AppArgs {
         backend: args.backend,
         rmbg_backend: args.rmbg_backend,
         dino_backend: args.dino_backend,
+        pause_render_during_inference: args.pause_render_during_inference,
         max_batch_size: args.max_batch_size.max(1),
         mcp_scene_control_path: args.mcp_scene_control_path,
     }
@@ -477,5 +484,18 @@ mod tests {
         let balanced = build_app_args(Args::parse_from(["bevy_synth", "--quality", "balanced"]));
         assert_eq!(fast.chunk_size, DEFAULT_CHUNK_SIZE);
         assert_eq!(balanced.chunk_size, DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn pause_render_during_inference_defaults_on_and_can_be_disabled() {
+        let default_args = build_app_args(Args::parse_from(["bevy_synth"]));
+        assert!(default_args.pause_render_during_inference);
+
+        let disabled = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--pause-render-during-inference",
+            "false",
+        ]));
+        assert!(!disabled.pause_render_during_inference);
     }
 }

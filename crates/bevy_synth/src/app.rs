@@ -37,6 +37,8 @@ use bevy::render::renderer::{
 };
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
 use bevy_editor_core::selection::{
     EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
 };
@@ -71,9 +73,11 @@ use bevy_synth_runtime::state::{
 use bevy_synth_runtime::worker::start_worker;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy_synth_runtime::worker::{
-    SharedWgpuDevice, init_shared_wgpu_device_from_bevy_render,
-    start_worker_with_shared_wgpu_device,
+    SharedWgpuDevice, WorkerWakeCallback, init_shared_wgpu_device_from_bevy_render,
+    start_worker_with_shared_wgpu_device_and_wake,
 };
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "wgpu")))]
+use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
 use bevy_synth_runtime::{SynthMesh, SynthMeshTexture};
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
@@ -184,6 +188,183 @@ impl Plugin for SharedWgpuInferenceDevicePlugin {
             device: shared_device,
         });
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const INFERENCE_PAUSE_WAIT: Duration = Duration::from_secs(60 * 60);
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct InferencePauseOverlay;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Debug, Default, Clone)]
+pub(crate) struct InferenceRenderPauseState {
+    pub(crate) applied: bool,
+    pub(crate) pending_apply: bool,
+    pub(crate) overlay_visible: bool,
+    pub(crate) saved_settings: Option<WinitSettings>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn paused_winit_settings() -> WinitSettings {
+    let mode = UpdateMode::Reactive {
+        wait: INFERENCE_PAUSE_WAIT,
+        react_to_device_events: false,
+        react_to_user_events: true,
+        react_to_window_events: false,
+    };
+    WinitSettings {
+        focused_mode: mode,
+        unfocused_mode: mode,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn should_pause_render_during_inference(
+    args: &AppArgs,
+    queue: &InferenceQueue,
+    exit_requested: bool,
+) -> bool {
+    if !args.pause_render_during_inference || exit_requested {
+        return false;
+    }
+    let active = queue
+        .active
+        .as_ref()
+        .map(|batch| !batch.is_empty())
+        .unwrap_or(false);
+    active || !queue.pending.is_empty()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_inference_render_pause(
+    args: Res<AppArgs>,
+    queue: Res<InferenceQueue>,
+    exit_state: Res<ExitState>,
+    mut pause_state: ResMut<InferenceRenderPauseState>,
+    winit_settings: Option<ResMut<WinitSettings>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    mut overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
+) {
+    let mut request_wakeup = false;
+    let should_pause = should_pause_render_during_inference(&args, &queue, exit_state.requested);
+    let Some(mut winit_settings) = winit_settings else {
+        pause_state.applied = false;
+        pause_state.pending_apply = false;
+        pause_state.overlay_visible = false;
+        pause_state.saved_settings = None;
+        set_inference_pause_overlay_visibility(false, &mut overlays);
+        return;
+    };
+
+    if should_pause {
+        if !pause_state.overlay_visible {
+            pause_state.overlay_visible = true;
+            set_inference_pause_overlay_visibility(true, &mut overlays);
+        }
+
+        if !pause_state.applied {
+            if !pause_state.pending_apply {
+                // Show the overlay first, then freeze on the next update.
+                pause_state.pending_apply = true;
+                request_wakeup = true;
+            } else {
+                pause_state.saved_settings = Some(winit_settings.clone());
+                *winit_settings = paused_winit_settings();
+                pause_state.applied = true;
+                pause_state.pending_apply = false;
+            }
+        } else {
+            pause_state.pending_apply = false;
+        }
+    } else {
+        pause_state.pending_apply = false;
+        if let Some(saved) = pause_state.saved_settings.take() {
+            *winit_settings = saved;
+            request_wakeup = true;
+        }
+        pause_state.applied = false;
+        if pause_state.overlay_visible {
+            pause_state.overlay_visible = false;
+            set_inference_pause_overlay_visibility(false, &mut overlays);
+        }
+    }
+
+    if request_wakeup && let Some(proxy) = event_loop_proxy.as_ref() {
+        let _ = proxy.send_event(WakeUp);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_inference_pause_overlay_visibility(
+    visible: bool,
+    overlays: &mut Query<&mut Visibility, With<InferencePauseOverlay>>,
+) {
+    let next = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut visibility in overlays.iter_mut() {
+        *visibility = next;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_inference_render_pause_before(
+    args: Res<AppArgs>,
+    queue: Res<InferenceQueue>,
+    exit_state: Res<ExitState>,
+    pause_state: ResMut<InferenceRenderPauseState>,
+    winit_settings: Option<ResMut<WinitSettings>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
+) {
+    sync_inference_render_pause(
+        args,
+        queue,
+        exit_state,
+        pause_state,
+        winit_settings,
+        event_loop_proxy,
+        overlays,
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_inference_render_pause_after(
+    args: Res<AppArgs>,
+    queue: Res<InferenceQueue>,
+    exit_state: Res<ExitState>,
+    pause_state: ResMut<InferenceRenderPauseState>,
+    winit_settings: Option<ResMut<WinitSettings>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
+) {
+    sync_inference_render_pause(
+        args,
+        queue,
+        exit_state,
+        pause_state,
+        winit_settings,
+        event_loop_proxy,
+        overlays,
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn make_worker_wake_callback(
+    args: &AppArgs,
+    event_loop_proxy: Option<&Res<EventLoopProxyWrapper<WakeUp>>>,
+) -> Option<WorkerWakeCallback> {
+    if !args.pause_render_during_inference {
+        return None;
+    }
+    let proxy = event_loop_proxy.map(|proxy| EventLoopProxy::clone(&**proxy))?;
+    Some(std::sync::Arc::new(move || {
+        let _ = proxy.send_event(WakeUp);
+    }))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
@@ -306,6 +487,8 @@ pub(crate) fn run() {
             worker_message: None,
         });
     #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<InferenceRenderPauseState>();
+    #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
     add_default_plugins(&mut app);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
@@ -325,7 +508,11 @@ pub(crate) fn run() {
                 handle_open_file_dialog,
                 handle_file_dialog_loads,
                 handle_dropped_files,
+                #[cfg(not(target_arch = "wasm32"))]
+                sync_inference_render_pause_before.before(drive_inference),
                 drive_inference,
+                #[cfg(not(target_arch = "wasm32"))]
+                sync_inference_render_pause_after.after(drive_inference),
                 handle_catalog_spawn_requests,
                 handle_catalog_delete_requests,
                 delete_selected_meshes,
@@ -522,6 +709,54 @@ fn web_asset_root() -> String {
     "assets".to_string()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_inference_pause_overlay(commands: &mut Commands) {
+    commands
+        .spawn((
+            InferencePauseOverlay,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            GlobalZIndex(10_000),
+            BackgroundColor(Color::srgba(0.03, 0.04, 0.06, 0.9)),
+            Visibility::Hidden,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    width: Val::Percent(72.0),
+                    max_width: Val::Px(880.0),
+                    padding: UiRect::all(Val::Px(24.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.82, 0.88, 0.98, 0.75)),
+                BackgroundColor(Color::srgba(0.09, 0.11, 0.16, 0.96)),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new(
+                        "rendering paused during inference.\ntemporary workaround for an open wgpu bug.\nthe viewport will resume after inference completes.",
+                    ),
+                    TextFont::from_font_size(22.0),
+                    TextColor(Color::srgb(0.94, 0.96, 1.0)),
+                    TextLayout::new_with_justify(Justify::Center),
+                ));
+            });
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
@@ -533,6 +768,9 @@ fn setup(
     args: Res<AppArgs>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
         Res<SharedWgpuInferenceDevice>,
+    >,
+    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<
+        Res<EventLoopProxyWrapper<WakeUp>>,
     >,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
@@ -591,15 +829,22 @@ fn setup(
             ..default()
         },
     ));
+    #[cfg(not(target_arch = "wasm32"))]
+    spawn_inference_pause_overlay(&mut commands);
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let wake_callback = make_worker_wake_callback(args.as_ref(), event_loop_proxy.as_ref());
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
-    let worker = start_worker_with_shared_wgpu_device(
+    let worker = start_worker_with_shared_wgpu_device_and_wake(
         args.as_ref(),
         shared_wgpu_device
             .as_ref()
             .and_then(|shared| shared.device.clone()),
+        wake_callback,
     );
-    #[cfg(not(all(not(target_arch = "wasm32"), feature = "wgpu")))]
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "wgpu")))]
+    let worker = start_worker_with_wake(args.as_ref(), wake_callback);
+    #[cfg(target_arch = "wasm32")]
     let worker = start_worker(args.as_ref());
     commands.insert_resource(worker);
 

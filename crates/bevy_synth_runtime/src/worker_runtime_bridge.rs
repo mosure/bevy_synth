@@ -18,6 +18,7 @@ use burn_synth::{ForegroundModel, ImageSource, SynthesisModel};
 
 use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
 use crate::state::{InferenceRequest, WorkerCommand, WorkerEvent};
+use crate::worker::WorkerWakeCallback;
 use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture, TripoMesh};
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
@@ -33,6 +34,7 @@ pub(crate) fn worker_loop_shared_runtime(
     args: AppArgs,
     command_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
+    wake_callback: Option<WorkerWakeCallback>,
 ) {
     let mut runtime = match build_runtime(&args) {
         Ok(runtime) => runtime,
@@ -40,12 +42,17 @@ pub(crate) fn worker_loop_shared_runtime(
             for command in command_rx {
                 match command {
                     WorkerCommand::Infer(requests) => {
-                        let _ = event_tx.send(WorkerEvent {
+                        let sent = event_tx.send(WorkerEvent {
                             results: vec![Err(err.clone()); requests.len()],
                             requests,
                             elapsed: Default::default(),
                             status_message: None,
                         });
+                        if sent.is_ok()
+                            && let Some(wake) = wake_callback.as_ref()
+                        {
+                            wake();
+                        }
                     }
                     WorkerCommand::Shutdown => break,
                 }
@@ -63,12 +70,17 @@ pub(crate) fn worker_loop_shared_runtime(
                     let result = infer_one_request(&mut runtime, &args, request).map(Some);
                     results.push(result);
                 }
-                let _ = event_tx.send(WorkerEvent {
+                let sent = event_tx.send(WorkerEvent {
                     requests,
                     results,
                     elapsed: started.elapsed(),
                     status_message: None,
                 });
+                if sent.is_ok()
+                    && let Some(wake) = wake_callback.as_ref()
+                {
+                    wake();
+                }
             }
             WorkerCommand::Shutdown => break,
         }
