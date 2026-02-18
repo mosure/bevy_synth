@@ -82,7 +82,6 @@ pub fn should_prefer_f16_triposg_weights(parity: TripoSGRuntimeParityProfile) ->
     parity.burnpack_policy.precision.prefer_f16()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, String> {
     if target_faces == 0 || mesh.faces.len() <= target_faces {
         return Ok(mesh.clone());
@@ -155,69 +154,6 @@ pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, Str
         .chunks_exact(3)
         .map(|chunk| [chunk[0], chunk[1], chunk[2]])
         .collect::<Vec<[u32; 3]>>();
-    Ok(Mesh { vertices, faces })
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, String> {
-    if target_faces == 0 || mesh.faces.len() <= target_faces {
-        return Ok(mesh.clone());
-    }
-    if mesh.faces.is_empty() || mesh.vertices.is_empty() {
-        return Ok(mesh.clone());
-    }
-
-    // Keep wasm path free of meshopt C++ symbols that force wasm `env` shims.
-    // Use deterministic face-stride selection and compact vertices afterward.
-    let step = mesh.faces.len().div_ceil(target_faces).max(1);
-    let mut selected = Vec::with_capacity(target_faces.min(mesh.faces.len()));
-    let mut face_index = 0usize;
-    while face_index < mesh.faces.len() && selected.len() < target_faces {
-        selected.push(mesh.faces[face_index]);
-        face_index += step;
-    }
-    if selected.is_empty() {
-        return Err("wasm decimation produced empty face set".to_string());
-    }
-
-    remap_decimated_faces(mesh, &selected)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn remap_decimated_faces(mesh: &Mesh, selected: &[[u32; 3]]) -> Result<Mesh, String> {
-    use std::collections::HashMap;
-
-    let mut remap = HashMap::<u32, u32>::new();
-    let mut vertices = Vec::<[f32; 3]>::new();
-    let mut faces = Vec::<[u32; 3]>::with_capacity(selected.len());
-
-    for face in selected {
-        let mut out = [0u32; 3];
-        for (slot, src_index) in face.iter().enumerate() {
-            let src = *src_index as usize;
-            if src >= mesh.vertices.len() {
-                return Err(format!(
-                    "wasm decimation index out of bounds: {src} >= {}",
-                    mesh.vertices.len()
-                ));
-            }
-            let dst = if let Some(existing) = remap.get(src_index) {
-                *existing
-            } else {
-                let new_index = vertices.len() as u32;
-                vertices.push(mesh.vertices[src]);
-                remap.insert(*src_index, new_index);
-                new_index
-            };
-            out[slot] = dst;
-        }
-        faces.push(out);
-    }
-
-    if faces.is_empty() || vertices.is_empty() {
-        return Err("wasm decimation produced empty mesh".to_string());
-    }
-
     Ok(Mesh { vertices, faces })
 }
 

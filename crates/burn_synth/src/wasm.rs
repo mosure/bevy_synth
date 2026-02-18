@@ -9,6 +9,7 @@ pub struct WasmInferencePreset {
     pub num_tokens: usize,
     pub resolution: usize,
     pub faces: usize,
+    pub seed: u64,
     pub backend: &'static str,
     pub rmbg_backend: &'static str,
     pub dino_backend: &'static str,
@@ -23,6 +24,7 @@ impl Default for WasmInferencePreset {
             // On wasm this maps to flash extraction min_resolution.
             resolution: 63,
             faces: 10_000,
+            seed: 42,
             backend: "wgpu",
             rmbg_backend: "auto",
             dino_backend: "auto",
@@ -45,6 +47,8 @@ impl WasmInferencePreset {
             self.resolution.to_string(),
             "--faces".to_string(),
             self.faces.to_string(),
+            "--seed".to_string(),
+            self.seed.to_string(),
             "--backend".to_string(),
             self.backend.to_string(),
             "--rmbg-backend".to_string(),
@@ -78,6 +82,8 @@ mod tests {
                 "63",
                 "--faces",
                 "10000",
+                "--seed",
+                "42",
                 "--backend",
                 "wgpu",
                 "--rmbg-backend",
@@ -98,5 +104,6 @@ mod tests {
         assert_eq!(preset.num_tokens, runtime.num_tokens);
         assert_eq!(preset.resolution, runtime.flash_extract.min_resolution);
         assert_eq!(preset.faces, runtime.target_faces.unwrap_or_default());
+        assert_eq!(Some(preset.seed), runtime.seed);
     }
 }

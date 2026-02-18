@@ -4,9 +4,10 @@ use std::sync::Once;
 #[cfg(feature = "wasm-api-wgpu")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use burn::backend::NdArray;
 use burn::prelude::*;
 use burn_foreground::pipeline::{
-    PrepareImageConfig, RmbgPipeline, prepare_image_data_from_bytes_async,
+    PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data_from_bytes_async,
 };
 use burn_foreground::rmbg14::import::{
     load_rmbg_config_from_json_bytes, load_rmbg_from_burnpack_bytes,
@@ -111,7 +112,8 @@ pub struct WasmInferOptions {
     num_steps: u32,
     num_tokens: u32,
     resolution: u32,
-    faces: u32,
+    faces: Option<u32>,
+    seed: Option<u64>,
     backend: Option<String>,
     dino_backend: Option<String>,
 }
@@ -136,7 +138,19 @@ impl WasmInferOptions {
     }
 
     pub fn set_faces(&mut self, value: u32) {
-        self.faces = value;
+        self.faces = Some(value);
+    }
+
+    pub fn clear_faces(&mut self) {
+        self.faces = None;
+    }
+
+    pub fn set_seed(&mut self, value: u64) {
+        self.seed = Some(value);
+    }
+
+    pub fn clear_seed(&mut self) {
+        self.seed = None;
     }
 
     pub fn set_backend(&mut self, value: String) {
@@ -162,7 +176,8 @@ impl WasmInferOptions {
             num_steps: preset.num_steps as u32,
             num_tokens: preset.num_tokens as u32,
             resolution: preset.resolution as u32,
-            faces: preset.faces as u32,
+            faces: Some(preset.faces as u32),
+            seed: Some(preset.seed),
             backend: Some(preset.backend.to_string()),
             dino_backend: Some(preset.dino_backend.to_string()),
         }
@@ -178,8 +193,11 @@ impl WasmInferOptions {
         if self.resolution > 0 {
             preset.resolution = self.resolution as usize;
         }
-        if self.faces > 0 {
-            preset.faces = self.faces as usize;
+        if let Some(value) = self.faces {
+            preset.faces = value as usize;
+        }
+        if let Some(value) = self.seed {
+            preset.seed = value;
         }
         if let Some(value) = self.backend.as_ref() {
             preset.backend = if value.eq_ignore_ascii_case("cpu") {
@@ -236,19 +254,37 @@ pub async fn infer_glb_from_image_bytes_with_options(
                 JsValue::from_str(&format!("failed to initialize WebGPU runtime: {err}"))
             })?;
             let shader_f16_supported = wasm_webgpu_shader_f16_supported().await;
-            let bytes = if shader_f16_supported {
-                web_sys::console::log_1(
-                    &"WebGPU adapter supports shader-f16; running TripoSG with fp16 backend."
+            web_sys::console::log_1(
+                &"Running TripoSG wasm with fp32 WebGPU backend for parity.".into(),
+            );
+            let bytes = match infer_glb_once::<WgpuBackendF32, WgpuRmbgBackend>(
+                &image_bytes,
+                &preset,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(f32_err) if shader_f16_supported => {
+                    web_sys::console::log_1(
+                        &format!(
+                            "fp32 WebGPU inference failed ({f32_err}); retrying with fp16 backend."
+                        )
                         .into(),
-                );
-                infer_glb_once::<WgpuBackendF16, WgpuRmbgBackend>(&image_bytes, &preset).await
-            } else {
-                web_sys::console::log_1(
-                    &"WebGPU adapter lacks shader-f16; running TripoSG with fp32 backend.".into(),
-                );
-                infer_glb_once::<WgpuBackendF32, WgpuRmbgBackend>(&image_bytes, &preset).await
-            }
-            .map_err(|err| JsValue::from_str(&format!("WebGPU inference failed: {err}")))?;
+                    );
+                    infer_glb_once::<WgpuBackendF16, WgpuRmbgBackend>(&image_bytes, &preset)
+                        .await
+                        .map_err(|f16_err| {
+                            JsValue::from_str(&format!(
+                                "WebGPU inference failed on fp32 ({f32_err}) and fp16 ({f16_err})"
+                            ))
+                        })?
+                }
+                Err(f32_err) => {
+                    return Err(JsValue::from_str(&format!(
+                        "WebGPU inference failed on fp32 backend: {f32_err}"
+                    )));
+                }
+            };
             return Ok(Uint8Array::from(bytes.as_slice()));
         }
     }
@@ -302,15 +338,8 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
     )
     .await
     .map_err(|err| format!("failed to prepare image tensor: {err}"))?;
-    let image = prepared.to_tensor::<BTriposg>(&state.triposg_device);
-
-    let processed = state.triposg.image_processor.preprocess(image);
-    let image_embeds = state
-        .triposg
-        .image_encoder
-        .as_ref()
-        .ok_or_else(|| "TripoSG image encoder is unavailable".to_string())?
-        .forward(processed);
+    BTriposg::seed(&state.triposg_device, preset.seed);
+    let image_embeds = encode_image_embeds_for_wasm(state, &prepared)?;
 
     let flash = FlashExtractConfig {
         bounds: DEFAULT_BOUNDS,
@@ -353,7 +382,7 @@ async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
     set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
     let prefer_f16_default = should_prefer_f16_triposg_weights(parity);
     let use_wgpu = is_wgpu_backend::<BTriposg>();
-    let prefer_f16_wasm_wgpu = use_wgpu;
+    let prefer_f16_wasm_wgpu = use_wgpu && backend_uses_f16::<BTriposg>();
     let effective_prefer_f16 = prefer_f16_default || prefer_f16_wasm_wgpu;
     let precision_label = if effective_prefer_f16 { "f16" } else { "f32" };
     web_sys::console::log_1(
@@ -717,6 +746,46 @@ fn prepare_image_config_for_backend<B: Backend>() -> PrepareImageConfig {
     PrepareImageConfig::default()
 }
 
+fn encode_image_embeds_for_wasm<BTriposg: Backend, BRmbg: Backend>(
+    state: &WasmPipelineState<BTriposg, BRmbg>,
+    prepared: &PreparedImageData,
+) -> Result<Tensor<BTriposg, 3>, String> {
+    let processed = if state.triposg.image_processor.is_strict_preprocess() {
+        let cpu_device = <NdArray<f32> as Backend>::Device::default();
+        let cpu_image = prepared.to_tensor::<NdArray<f32>>(&cpu_device);
+        let cpu_processed = state.triposg.image_processor.preprocess(cpu_image);
+        convert_image_to_backend::<BTriposg>(cpu_processed, &state.triposg_device)?
+    } else {
+        let image = prepared.to_tensor::<BTriposg>(&state.triposg_device);
+        state.triposg.image_processor.preprocess(image)
+    };
+    state
+        .triposg
+        .image_encoder
+        .as_ref()
+        .ok_or_else(|| "TripoSG image encoder is unavailable".to_string())
+        .map(|encoder| encoder.forward(processed))
+}
+
+fn convert_image_to_backend<B: Backend>(
+    image: Tensor<NdArray<f32>, 4>,
+    device: &B::Device,
+) -> Result<Tensor<B, 4>, String> {
+    let shape = image.shape().dims::<4>();
+    let data = image
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to read CPU image tensor: {err:?}"))?;
+    let flat = Tensor::<B, 1>::from_floats(data.as_slice(), device);
+    Ok(flat.reshape([
+        shape[0] as i32,
+        shape[1] as i32,
+        shape[2] as i32,
+        shape[3] as i32,
+    ]))
+}
+
 fn dino_processor_target_size(
     processor: &DinoImageProcessor,
     fallback_size: Option<usize>,
@@ -753,6 +822,12 @@ fn is_wgpu_backend<B: Backend>() -> bool {
     std::any::type_name::<B>()
         .to_ascii_lowercase()
         .contains("wgpu")
+}
+
+fn backend_uses_f16<B: Backend>() -> bool {
+    std::any::type_name::<B>()
+        .to_ascii_lowercase()
+        .contains("f16")
 }
 
 fn wasm_model_root(rel_root: &str) -> String {

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../" && pwd)"
 TEST_DIR="${ROOT_DIR}/crates/burn_synth/tests/web_playwright"
 OUT_DIR="${ROOT_DIR}/www/out"
+TMP_DIR="${TEST_DIR}/tmp"
+NATIVE_REF_GLB="${TMP_DIR}/native_reference.glb"
 
 unset RUSTFLAGS
 unset CARGO_ENCODED_RUSTFLAGS
@@ -12,6 +14,7 @@ unset CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS
 unset RUSTDOCFLAGS
 
 mkdir -p "${OUT_DIR}"
+mkdir -p "${TMP_DIR}"
 
 echo "[web-e2e] build burn_synth wasm (wasm-api + wasm-api-wgpu)"
 cargo build \
@@ -32,5 +35,28 @@ echo "[web-e2e] playwright deps"
 npm install --no-audit --no-fund
 npx playwright install chromium
 
+if [[ "${BURN_SYNTH_WEB_SKIP_NATIVE_REF:-0}" != "1" ]]; then
+  echo "[web-e2e] build native reference GLB (burn_synth CLI)"
+  cargo run \
+    -p burn_synth \
+    --features runtime,wgpu \
+    -- \
+    --backend wgpu \
+    --dino-backend auto \
+    --num-steps 2 \
+    --num-tokens 512 \
+    --flash-min-resolution 15 \
+    --faces 1000 \
+    --seed 42 \
+    --progress off \
+    mesh \
+    --input "${ROOT_DIR}/docs/input_chair.jpg" \
+    --output "${NATIVE_REF_GLB}"
+else
+  rm -f "${NATIVE_REF_GLB}"
+fi
+
 echo "[web-e2e] run synth_api integration test"
-npx playwright test --config playwright.config.mjs --workers=1 --reporter=list
+BURN_SYNTH_NATIVE_REF_GLB="${NATIVE_REF_GLB}" \
+  BURN_SYNTH_WEB_TMP_DIR="${TMP_DIR}" \
+  npx playwright test --config playwright.config.mjs --workers=1 --reporter=list
