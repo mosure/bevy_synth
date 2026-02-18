@@ -1482,8 +1482,11 @@ dependencies = [
  "bevy_transform_gizmos",
  "clap",
  "console_error_panic_hook",
+ "js-sys",
  "serde",
  "serde_json",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

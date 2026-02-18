@@ -1,6 +1,7 @@
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -594,10 +595,19 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        return SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // wasm32-unknown-unknown std::time::SystemTime panics at runtime.
+        // Use browser wall-clock time for cache metadata timestamps.
+        return js_sys::Date::now() as u64;
+    }
 }
 
 fn mesh_to_glb(mesh: &SynthMesh) -> CacheResult<Vec<u8>> {

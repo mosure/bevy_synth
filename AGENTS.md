@@ -31,9 +31,11 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 2. Stage-level benchmarking is required (not only end-to-end mega benches).
 3. Capture GPU utilization, memory, and stage timestamps during benchmarks.
 4. Large GPU idle gaps imply pipeline or transfer bottlenecks and must be investigated.
-5. Prefer device-resident execution through decode/PBR; minimize host readbacks/transfers.
+5. Prefer fully device-resident execution through decode/PBR; host readbacks/transfers are exceptions, not defaults.
 6. On wasm, never rely on synchronous GPU tensor readback; prefer async tensor readback APIs.
 7. Preserve GPU backend parity across native/wasm whenever feasible; avoid wasm-only CPU fallbacks unless correctness or platform limits force it.
+8. For GPU-capable backends, default inference/extraction paths must stay on GPU and fail fast on GPU errors rather than silently rerouting to CPU.
+9. If host transfer is unavoidable, keep it narrow (stage boundary only), explicit in code, and documented with rationale.
 
 ## Model Import and Loading
 
@@ -68,6 +70,7 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 3. Canonical defaults are owned by `burn_synth` runtime; wrappers may expose flags but must not silently rewrite behavior.
 4. Backend failures in wrapper flows must be surfaced as errors; do not auto-switch to CPU or alternate synthesis paths.
 5. New inference features should be implemented in `burn_synth` first, then exposed in wrappers.
+6. Web/native wrappers must invoke the same canonical GPU extraction mode for the same mesh/backend settings (for example flash mode), with only platform-required readback mechanics differing.
 
 ## Deduplication and Modularity Ethos
 

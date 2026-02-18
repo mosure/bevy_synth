@@ -49,6 +49,7 @@ pub(crate) fn worker_loop_shared_runtime(
         Err(err) => {
             for command in command_rx {
                 match command {
+                    WorkerCommand::Warmup => {}
                     WorkerCommand::Infer(requests) => {
                         let sent = event_tx.send(WorkerEvent {
                             results: vec![Err(err.clone()); requests.len()],
@@ -71,6 +72,7 @@ pub(crate) fn worker_loop_shared_runtime(
 
     for command in command_rx {
         match command {
+            WorkerCommand::Warmup => {}
             WorkerCommand::Infer(requests) => {
                 let started = Instant::now();
                 let mut results = Vec::with_capacity(requests.len());

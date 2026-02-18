@@ -58,9 +58,17 @@ pub struct InferenceWorker {
 }
 
 pub enum WorkerCommand {
+    Warmup,
     Infer(Vec<InferenceRequest>),
     Shutdown,
 }
+
+#[cfg(target_arch = "wasm32")]
+pub const WASM_STATUS_LOADING_MODELS: &str = "Loading model weights...";
+#[cfg(target_arch = "wasm32")]
+pub const WASM_STATUS_MODEL_READY: &str = "Model weights ready.";
+#[cfg(target_arch = "wasm32")]
+pub const WASM_STATUS_MODEL_LOAD_FAILED_PREFIX: &str = "Model load failed:";
 
 pub struct WorkerEvent {
     pub requests: Vec<InferenceRequest>,

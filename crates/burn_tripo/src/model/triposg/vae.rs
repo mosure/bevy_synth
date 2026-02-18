@@ -697,6 +697,19 @@ pub mod import {
         Ok(model)
     }
 
+    pub fn apply_triposg_vae_decoder_burnpack_part_bytes<B: Backend>(
+        model: &mut TripoSGVae<B>,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .allow_partial(true)
+            .validate(should_validate_burnpack());
+        model.load_from(&mut store).map_err(|err| {
+            format!("failed to load TripoSG VAE decoder burnpack part bytes: {err}")
+        })?;
+        Ok(())
+    }
+
     pub fn load_triposg_vae_from_burnpack_file<B: Backend>(
         config: &TripoSGVaeConfig,
         device: &B::Device,

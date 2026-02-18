@@ -16,7 +16,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::asset::io::web::WebAssetPlugin;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::{AssetMetaCheck, AssetMode, AssetPlugin, UnapprovedPathMode};
-use bevy::camera::ClearColorConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -35,7 +35,6 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::renderer::{
     RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue,
 };
-use bevy::ui::IsDefaultUiCamera;
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
@@ -48,12 +47,20 @@ use bevy_file_dialog::prelude::{
 use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
+#[cfg(not(target_arch = "wasm32"))]
 use bevy_picking::DefaultPickingPlugins;
 use bevy_picking::hover::PickingInteraction;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy_picking::input::PointerInputPlugin;
-use bevy_picking::prelude::{MeshPickingCamera, MeshPickingSettings, Pickable};
-use bevy_transform_gizmos::prelude::{GizmoCamera, TransformGizmoPlugin};
-use bevy_transform_gizmos::{GizmoTransformable, TransformGizmo, TransformGizmoSystems};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_picking::prelude::MeshPickingSettings;
+use bevy_picking::prelude::{MeshPickingCamera, Pickable};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_transform_gizmos::TransformGizmoSystems;
+use bevy_transform_gizmos::prelude::GizmoCamera;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_transform_gizmos::prelude::TransformGizmoPlugin;
+use bevy_transform_gizmos::{GizmoTransformable, TransformGizmo};
 use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
@@ -62,13 +69,17 @@ use serde::Deserialize;
 use bevy_synth_runtime::args::BackendKind;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy_synth_runtime::args::MeshMode;
-use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
+use bevy_synth_runtime::args::{AppArgs, Args, WeightPrecision, build_app_args};
 use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceRequest, InferenceWorker, Spinner, TitlePulse, UiStatus,
     WorkerCommand,
+};
+#[cfg(target_arch = "wasm32")]
+use bevy_synth_runtime::state::{
+    WASM_STATUS_LOADING_MODELS, WASM_STATUS_MODEL_LOAD_FAILED_PREFIX, WASM_STATUS_MODEL_READY,
 };
 use bevy_synth_runtime::worker::start_worker;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
@@ -129,6 +140,31 @@ impl Default for WorldCachePersistence {
 struct McpSceneControl {
     path: Option<PathBuf>,
     last_modified: Option<SystemTime>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmStartupGate {
+    model_ready: bool,
+    model_failed: bool,
+    scene_initialized: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource)]
+struct WasmWarmupKickoff {
+    sent: bool,
+    timer: Timer,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Default for WasmWarmupKickoff {
+    fn default() -> Self {
+        Self {
+            sent: false,
+            timer: Timer::from_seconds(1.5, TimerMode::Once),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -450,11 +486,15 @@ pub(crate) struct InferenceContext<'w, 's> {
     status: ResMut<'w, UiStatus>,
     catalog: ResMut<'w, CatalogState>,
     exit_state: Res<'w, ExitState>,
+    #[cfg(target_arch = "wasm32")]
+    wasm_startup: ResMut<'w, WasmStartupGate>,
 }
 
 pub(crate) fn run() {
     let args = Args::parse();
-    let app_args = build_app_args(args);
+    let mut app_args = build_app_args(args);
+    #[cfg(target_arch = "wasm32")]
+    apply_wasm_url_overrides(&mut app_args);
     #[cfg(not(target_arch = "wasm32"))]
     if should_run_headless_once(&app_args) {
         if let Err(err) = run_headless_once(&app_args) {
@@ -486,6 +526,10 @@ pub(crate) fn run() {
             processing: false,
             worker_message: None,
         });
+    #[cfg(target_arch = "wasm32")]
+    app.insert_resource(WasmStartupGate::default());
+    #[cfg(target_arch = "wasm32")]
+    app.insert_resource(WasmWarmupKickoff::default());
     #[cfg(not(target_arch = "wasm32"))]
     app.init_resource::<InferenceRenderPauseState>();
     #[cfg(not(target_arch = "wasm32"))]
@@ -493,51 +537,67 @@ pub(crate) fn run() {
     add_default_plugins(&mut app);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
     app.add_plugins(SharedWgpuInferenceDevicePlugin);
+    #[cfg(not(target_arch = "wasm32"))]
     if !app.is_plugin_added::<PointerInputPlugin>() {
         app.add_plugins(DefaultPickingPlugins);
     }
-    app.add_plugins(TransformGizmoPlugin)
-        .add_plugins(PanOrbitCameraPlugin)
-        .add_plugins(InfiniteGridPlugin)
-        .add_plugins(BurnSynthUiPlugin)
-        .add_systems(Startup, (setup, configure_mesh_picking).chain())
-        .add_systems(
-            Update,
-            (
-                handle_exit_requests,
-                handle_open_file_dialog,
-                handle_file_dialog_loads,
-                handle_dropped_files,
-                #[cfg(not(target_arch = "wasm32"))]
-                sync_inference_render_pause_before.before(drive_inference),
-                drive_inference,
-                #[cfg(not(target_arch = "wasm32"))]
-                sync_inference_render_pause_after.after(drive_inference),
-                handle_catalog_spawn_requests,
-                handle_catalog_delete_requests,
-                delete_selected_meshes,
-                (mark_world_cache_dirty, persist_world_cache).chain(),
-                update_spinner,
-                rotate_spinner,
-                update_window_title,
-            ),
-        )
-        .add_systems(
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_plugins(TransformGizmoPlugin);
+    app.add_plugins(PanOrbitCameraPlugin);
+    app.add_plugins(InfiniteGridPlugin);
+    app.add_plugins(BurnSynthUiPlugin);
+    app.add_systems(
+        Update,
+        (
+            handle_exit_requests,
+            handle_open_file_dialog,
+            handle_file_dialog_loads,
+            handle_dropped_files,
+            #[cfg(target_arch = "wasm32")]
+            kickoff_wasm_warmup.before(finish_wasm_startup_when_models_ready),
+            #[cfg(target_arch = "wasm32")]
+            finish_wasm_startup_when_models_ready.before(drive_inference),
+            #[cfg(not(target_arch = "wasm32"))]
+            sync_inference_render_pause_before.before(drive_inference),
+            drive_inference,
+            #[cfg(not(target_arch = "wasm32"))]
+            sync_inference_render_pause_after.after(drive_inference),
+            handle_catalog_spawn_requests,
+            handle_catalog_delete_requests,
+            delete_selected_meshes,
+            (mark_world_cache_dirty, persist_world_cache).chain(),
+            update_spinner,
+            rotate_spinner,
+            update_window_title,
+        ),
+    );
+    app.add_systems(
+        PostUpdate,
+        (sync_panorbit_bindings, sync_panorbit_enabled).before(PanOrbitCameraSystemSet),
+    );
+    app.add_plugins(
+        FileDialogPlugin::new()
+            .with_load_file::<ImagePickDialog>()
+            .with_drop_file::<ImagePickDialog>(),
+    );
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        app.add_systems(Startup, (setup, configure_mesh_picking).chain());
+        app.add_systems(
             PostUpdate,
             (
                 remove_entity_from_selection_if_despawned,
                 update_selection_from_primary_click.after(TransformGizmoSystems::Main),
             ),
-        )
-        .add_systems(
-            PostUpdate,
-            (sync_panorbit_bindings, sync_panorbit_enabled).before(PanOrbitCameraSystemSet),
-        )
-        .add_plugins(
-            FileDialogPlugin::new()
-                .with_load_file::<ImagePickDialog>()
-                .with_drop_file::<ImagePickDialog>(),
         );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.add_systems(Startup, setup);
+        app.add_systems(PostUpdate, remove_entity_from_selection_if_despawned);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(
@@ -655,6 +715,7 @@ fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<Synt
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn configure_mesh_picking(mut settings: ResMut<MeshPickingSettings>) {
     // Avoid ambiguous multi-camera rays by limiting picking to explicitly marked cameras/targets.
     settings.require_markers = true;
@@ -694,6 +755,74 @@ fn web_asset_root() -> String {
         }
     }
     "assets".to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_weight_precision_override(value: &str) -> Option<WeightPrecision> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "f16" | "fp16" => Some(WeightPrecision::F16),
+        "f32" | "fp32" => Some(WeightPrecision::F32),
+        "auto" => Some(WeightPrecision::Auto),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn apply_wasm_url_overrides(args: &mut AppArgs) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(search) = window.location().search() else {
+        return;
+    };
+    if search.is_empty() {
+        return;
+    }
+
+    for pair in search.trim_start_matches('?').split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut parts = pair.splitn(2, '=');
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let value = parts.next().unwrap_or_default();
+        let key = key.trim().to_ascii_lowercase();
+
+        if matches!(
+            key.as_str(),
+            "weights_precision" | "triposg_weights_precision"
+        ) {
+            if let Some(precision) = parse_weight_precision_override(value) {
+                args.weights_precision = precision;
+            }
+            continue;
+        }
+
+        if key == "rmbg_weights_precision"
+            && let Some(precision) = parse_weight_precision_override(value)
+        {
+            args.rmbg_weights_precision = precision;
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_console_log(message: &str) {
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(message));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_set_warmup_state(state: &str) {
+    if let Some(window) = web_sys::window() {
+        let window_js: wasm_bindgen::JsValue = window.into();
+        let _ = js_sys::Reflect::set(
+            &window_js,
+            &wasm_bindgen::JsValue::from_str("__bevySynthWarmupState"),
+            &wasm_bindgen::JsValue::from_str(state),
+        );
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -745,28 +874,20 @@ fn spawn_inference_pause_overlay(commands: &mut Commands) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn setup(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut meshes: ResMut<Assets<BevyMesh>>,
-    mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut ambient_light: ResMut<AmbientLight>,
-    args: Res<AppArgs>,
-    #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
-        Res<SharedWgpuInferenceDevice>,
-    >,
-    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<
-        Res<EventLoopProxyWrapper<WakeUp>>,
-    >,
-    mut queue: ResMut<InferenceQueue>,
-    mut status: ResMut<UiStatus>,
-    mut catalog: ResMut<CatalogState>,
-    mut cache: ResMut<MeshCacheResource>,
-    mut world_cache: ResMut<WorldCachePersistence>,
+fn initialize_interactive_scene(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    ambient_light: &mut ResMut<AmbientLight>,
+    args: &AppArgs,
+    queue: &mut ResMut<InferenceQueue>,
+    status: &mut ResMut<UiStatus>,
+    catalog: &mut ResMut<CatalogState>,
+    cache: &mut ResMut<MeshCacheResource>,
+    world_cache: &mut ResMut<WorldCachePersistence>,
 ) {
-    info!("bevy_synth args: {:?}", *args);
-
     let mut camera_transform =
         Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)).looking_at(Vec3::ZERO, Vec3::Y);
     let mut camera_orbit = PanOrbitCamera {
@@ -793,7 +914,7 @@ fn setup(
         RenderLayers::layer(0).with(12),
         MainCamera,
     ));
-    spawn_default_lighting(&mut commands, &mut ambient_light);
+    spawn_default_lighting(commands, ambient_light);
 
     commands.spawn((
         InfiniteGridBundle {
@@ -806,6 +927,51 @@ fn setup(
         Pickable::IGNORE,
         RenderLayers::layer(0),
     ));
+
+    hydrate_from_cache(commands, meshes, images, materials, queue, catalog, cache);
+    seed_default_catalog_cube(meshes, materials, queue, catalog);
+    world_cache.dirty = false;
+    world_cache.timer.reset();
+
+    if let Some(mesh_path) = args.mesh.as_ref() {
+        if mesh_path.exists() {
+            spawn_mesh_asset(commands, asset_server, materials, mesh_path.clone());
+        } else {
+            warn!("mesh path {:?} does not exist; skipping", mesh_path);
+        }
+    }
+
+    if let Some(image_path) = args.image.as_ref() {
+        let request = enqueue_inference(image_path.clone(), args, queue);
+        catalog.add_pending(&request);
+    }
+
+    update_status_message(args, queue, status);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+fn setup(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ambient_light: ResMut<AmbientLight>,
+    args: Res<AppArgs>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
+        Res<SharedWgpuInferenceDevice>,
+    >,
+    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<
+        Res<EventLoopProxyWrapper<WakeUp>>,
+    >,
+    mut queue: ResMut<InferenceQueue>,
+    mut status: ResMut<UiStatus>,
+    mut catalog: ResMut<CatalogState>,
+    mut cache: ResMut<MeshCacheResource>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+) {
+    info!("bevy_synth args: {:?}", *args);
 
     commands.spawn((
         Camera2d,
@@ -831,42 +997,109 @@ fn setup(
     );
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "wgpu")))]
     let worker = start_worker_with_wake(args.as_ref(), wake_callback);
-    #[cfg(target_arch = "wasm32")]
-    let worker = start_worker(args.as_ref());
     commands.insert_resource(worker);
 
-    hydrate_from_cache(
+    initialize_interactive_scene(
         &mut commands,
+        &asset_server,
         &mut meshes,
         &mut images,
         &mut materials,
+        &mut ambient_light,
+        args.as_ref(),
         &mut queue,
+        &mut status,
         &mut catalog,
         &mut cache,
+        &mut world_cache,
     );
-    seed_default_catalog_cube(&mut meshes, &mut materials, &mut queue, &mut catalog);
-    world_cache.dirty = false;
-    world_cache.timer.reset();
+}
 
-    if let Some(mesh_path) = args.mesh.as_ref() {
-        if mesh_path.exists() {
-            spawn_mesh_asset(
-                &mut commands,
-                &asset_server,
-                &mut materials,
-                mesh_path.clone(),
-            );
-        } else {
-            warn!("mesh path {:?} does not exist; skipping", mesh_path);
+#[cfg(target_arch = "wasm32")]
+fn setup(mut commands: Commands, args: Res<AppArgs>, mut status: ResMut<UiStatus>) {
+    info!("bevy_synth args: {:?}", *args);
+    wasm_set_warmup_state("idle");
+
+    let worker = start_worker(args.as_ref());
+    commands.insert_resource(worker);
+
+    status.worker_message = Some("Initializing wasm runtime...".to_string());
+    status.message = "Initializing wasm runtime...".to_string();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn kickoff_wasm_warmup(
+    time: Res<Time>,
+    mut warmup: ResMut<WasmWarmupKickoff>,
+    worker: Res<InferenceWorker>,
+    mut status: ResMut<UiStatus>,
+    exit_state: Res<ExitState>,
+) {
+    if warmup.sent || exit_state.requested {
+        return;
+    }
+    warmup.timer.tick(time.delta());
+    if !warmup.timer.is_finished() {
+        return;
+    }
+
+    match worker.sender.send(WorkerCommand::Warmup) {
+        Ok(()) => {
+            warmup.sent = true;
+            status.worker_message = Some(WASM_STATUS_LOADING_MODELS.to_string());
+            status.message = WASM_STATUS_LOADING_MODELS.to_string();
+            wasm_set_warmup_state("requested");
+            wasm_console_log("bevy_synth wasm warmup: requested");
+        }
+        Err(err) => {
+            let message = format!("failed to request wasm model warmup: {err}");
+            status.worker_message = Some(message.clone());
+            status.message = message;
+            wasm_set_warmup_state("failed");
+            warn!("{}", status.message);
         }
     }
+}
 
-    if let Some(image_path) = args.image.as_ref() {
-        let request = enqueue_inference(image_path.clone(), &args, &mut queue);
-        catalog.add_pending(&request);
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
+fn finish_wasm_startup_when_models_ready(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ambient_light: ResMut<AmbientLight>,
+    args: Res<AppArgs>,
+    mut queue: ResMut<InferenceQueue>,
+    mut status: ResMut<UiStatus>,
+    mut catalog: ResMut<CatalogState>,
+    mut cache: ResMut<MeshCacheResource>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+    mut startup: ResMut<WasmStartupGate>,
+) {
+    if startup.scene_initialized || (!startup.model_ready && !startup.model_failed) {
+        return;
     }
-
-    update_status_message(&args, &queue, &mut status);
+    initialize_interactive_scene(
+        &mut commands,
+        &asset_server,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut ambient_light,
+        args.as_ref(),
+        &mut queue,
+        &mut status,
+        &mut catalog,
+        &mut cache,
+        &mut world_cache,
+    );
+    startup.scene_initialized = true;
+    if startup.model_ready {
+        status.worker_message = None;
+        update_status_message(args.as_ref(), &queue, &mut status);
+    }
 }
 
 fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLight) {
@@ -1525,6 +1758,21 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
         match receiver.try_recv() {
             Ok(event) => {
                 if let Some(message) = event.status_message {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if message == WASM_STATUS_MODEL_READY {
+                            ctx.wasm_startup.model_ready = true;
+                            wasm_set_warmup_state("ready");
+                            wasm_console_log("bevy_synth wasm warmup: ready");
+                        } else if message == WASM_STATUS_LOADING_MODELS {
+                            wasm_set_warmup_state("loading");
+                            wasm_console_log("bevy_synth wasm warmup: loading");
+                        } else if message.starts_with(WASM_STATUS_MODEL_LOAD_FAILED_PREFIX) {
+                            ctx.wasm_startup.model_failed = true;
+                            wasm_set_warmup_state("failed");
+                            wasm_console_log("bevy_synth wasm warmup: failed");
+                        }
+                    }
                     ctx.status.worker_message = Some(message.clone());
                     ctx.status.message = message;
                 }
@@ -1577,6 +1825,12 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
                 break;
             }
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    if !ctx.wasm_startup.scene_initialized || !ctx.wasm_startup.model_ready {
+        update_status_message(&ctx.args, &ctx.queue, &mut ctx.status);
+        return;
     }
 
     if ctx.queue.active.is_none() && !ctx.queue.pending.is_empty() {
@@ -2273,6 +2527,7 @@ fn delete_selected_meshes(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
 fn update_selection_from_primary_click(
     buttons: Res<ButtonInput<MouseButton>>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
@@ -2379,6 +2634,7 @@ fn update_selection_from_primary_click(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn world_aabb(
     local_center: Vec3,
     local_half_extents: Vec3,
@@ -2401,6 +2657,7 @@ fn world_aabb(
     (world_min, world_max)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ray_aabb_intersection(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let mut t_min: f32 = 0.0;
     let mut t_max: f32 = f32::INFINITY;

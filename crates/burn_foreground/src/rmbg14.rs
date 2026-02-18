@@ -663,6 +663,19 @@ pub mod import {
         Ok(model)
     }
 
+    pub fn apply_rmbg_burnpack_part_bytes<B: Backend>(
+        model: &mut BriaRmbg<B>,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .allow_partial(true)
+            .validate(should_validate_burnpack());
+        model
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load RMBG burnpack part bytes: {err}"))?;
+        Ok(())
+    }
+
     pub fn load_rmbg_from_burnpack_file<B: Backend>(
         device: &B::Device,
         burnpack_path: impl AsRef<Path>,

@@ -154,6 +154,7 @@ pub async fn download_burnpack_asset<F>(
     base_safetensors_url: &str,
     label: &str,
     prefer_f16: bool,
+    allow_cross_precision_fallback: bool,
     totals: &mut DownloadTotals,
     host_ram_budget: &mut WasmHostMemoryBudget,
     on_status: &mut F,
@@ -161,7 +162,10 @@ pub async fn download_burnpack_asset<F>(
 where
     F: FnMut(String),
 {
-    let candidates = candidate_burnpack_names(base_safetensors_url, prefer_f16);
+    let mut candidates = candidate_burnpack_names(base_safetensors_url, prefer_f16);
+    if !allow_cross_precision_fallback {
+        candidates.truncate(1);
+    }
     let max_bytes = web_max_burnpack_bytes();
     let mut last_error = "no matching burnpack candidate".to_string();
     for candidate in candidates {

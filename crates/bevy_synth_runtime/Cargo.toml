@@ -42,7 +42,7 @@ burn-wgpu = { version = "0.19", optional = true, default-features = false, featu
 burn_synth = { path = "../burn_synth", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-burn_synth = { path = "../burn_synth", default-features = false }
+burn_synth = { path = "../burn_synth", default-features = false, features = ["wasm-api", "wasm-api-wgpu"] }
 web-sys = { version = "0.3", features = [
   "Storage",
   "Window",

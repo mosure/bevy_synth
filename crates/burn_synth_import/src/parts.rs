@@ -98,10 +98,6 @@ pub fn write_burnpack_parts_for_wasm(
     let total_bytes = fs::metadata(burnpack_path)
         .map_err(|err| format!("failed to read {} metadata: {err}", burnpack_path.display()))?
         .len();
-    if total_bytes <= max_part_bytes {
-        return Ok(None);
-    }
-
     let manifest_path = burnpack_parts_manifest_path(burnpack_path);
     if manifest_path.exists() && !overwrite && manifest_has_all_parts(&manifest_path) {
         let manifest = read_parts_manifest(&manifest_path)?;

@@ -13,6 +13,8 @@ pub struct WasmInferencePreset {
     pub backend: &'static str,
     pub rmbg_backend: &'static str,
     pub dino_backend: &'static str,
+    pub weights_precision: &'static str,
+    pub rmbg_weights_precision: &'static str,
 }
 
 impl Default for WasmInferencePreset {
@@ -28,6 +30,8 @@ impl Default for WasmInferencePreset {
             backend: "wgpu",
             rmbg_backend: "auto",
             dino_backend: "auto",
+            weights_precision: "f32",
+            rmbg_weights_precision: "auto",
         }
     }
 }
@@ -55,6 +59,10 @@ impl WasmInferencePreset {
             self.rmbg_backend.to_string(),
             "--dino-backend".to_string(),
             self.dino_backend.to_string(),
+            "--weights-precision".to_string(),
+            self.weights_precision.to_string(),
+            "--rmbg-weights-precision".to_string(),
+            self.rmbg_weights_precision.to_string(),
         ]
     }
 }
@@ -89,6 +97,10 @@ mod tests {
                 "--rmbg-backend",
                 "auto",
                 "--dino-backend",
+                "auto",
+                "--weights-precision",
+                "f32",
+                "--rmbg-weights-precision",
                 "auto",
             ]
         );

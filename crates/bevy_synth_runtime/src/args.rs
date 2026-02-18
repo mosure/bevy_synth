@@ -162,6 +162,16 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = DinoBackend::Auto)]
     pub dino_backend: DinoBackend,
 
+    /// TripoSG burnpack precision preference on web/native (auto, f16, f32).
+    /// `f32` is correctness-first and the default.
+    #[arg(long, value_enum, default_value_t = WeightPrecision::F32)]
+    pub weights_precision: WeightPrecision,
+
+    /// RMBG burnpack precision preference (auto, f16, f32).
+    /// On wasm, `auto` favors f16 to reduce startup memory pressure.
+    #[arg(long, value_enum, default_value_t = WeightPrecision::Auto)]
+    pub rmbg_weights_precision: WeightPrecision,
+
     /// Inference backend (cpu, wgpu, cuda).
     #[arg(long, value_enum, default_value_t = BackendKind::Wgpu)]
     pub backend: BackendKind,
@@ -211,6 +221,13 @@ pub enum DinoBackend {
     Auto,
     Cpu,
     Gpu,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightPrecision {
+    Auto,
+    F16,
+    F32,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -344,6 +361,8 @@ pub struct AppArgs {
     pub backend: BackendKind,
     pub rmbg_backend: RmbgBackend,
     pub dino_backend: DinoBackend,
+    pub weights_precision: WeightPrecision,
+    pub rmbg_weights_precision: WeightPrecision,
     pub pause_render_during_inference: bool,
     pub max_batch_size: usize,
     pub mcp_scene_control_path: Option<PathBuf>,
@@ -404,6 +423,8 @@ pub fn build_app_args(args: Args) -> AppArgs {
         backend: args.backend,
         rmbg_backend: args.rmbg_backend,
         dino_backend: args.dino_backend,
+        weights_precision: args.weights_precision,
+        rmbg_weights_precision: args.rmbg_weights_precision,
         pause_render_during_inference: args.pause_render_during_inference,
         max_batch_size: args.max_batch_size.max(1),
         mcp_scene_control_path: args.mcp_scene_control_path,
@@ -428,7 +449,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, RmbgModel, SynthesisModel, build_app_args,
+        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, RmbgModel, SynthesisModel, WeightPrecision,
+        build_app_args,
     };
 
     #[test]
@@ -500,6 +522,13 @@ mod tests {
             "false",
         ]));
         assert!(!disabled.pause_render_during_inference);
+    }
+
+    #[test]
+    fn weight_precision_defaults_to_f32_with_rmbg_auto() {
+        let app_args = build_app_args(Args::parse_from(["bevy_synth"]));
+        assert_eq!(app_args.weights_precision, WeightPrecision::F32);
+        assert_eq!(app_args.rmbg_weights_precision, WeightPrecision::Auto);
     }
 
     #[test]

@@ -92,13 +92,14 @@ function relDiff(a, b) {
   return Math.abs(a - b) / denom;
 }
 
-test('burn_synth wasm sharded web inference produces a GLB', async ({ page }) => {
+test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }) => {
   test.setTimeout(1800000);
 
   const pageErrors = [];
   const consoleErrors = [];
   const modelRequests = [];
-  const shardRequests = new Set();
+  const partRequests = new Set();
+  const shardManifestRequests = new Set();
   const failedModelResponses = [];
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
@@ -111,8 +112,11 @@ test('burn_synth wasm sharded web inference produces a GLB', async ({ page }) =>
     const url = request.url();
     if (url.includes('/assets/models/')) {
       modelRequests.push(url);
-      if (url.includes('.bpk.shards/') || url.endsWith('.bpk.shards.json')) {
-        shardRequests.add(url);
+      if (url.endsWith('.bpk.parts.json') || url.includes('.bpk.part-')) {
+        partRequests.add(url);
+      }
+      if (url.endsWith('.bpk.shards.json')) {
+        shardManifestRequests.add(url);
       }
     }
   });
@@ -240,7 +244,11 @@ test('burn_synth wasm sharded web inference produces a GLB', async ({ page }) =>
     }
   }
   expect(modelRequests.length).toBeGreaterThan(0);
-  expect(shardRequests.size).toBeGreaterThan(0);
+  expect(partRequests.size).toBeGreaterThan(0);
+  expect(
+    Array.from(shardManifestRequests),
+    `unexpected shard manifest requests in parts-first loader: ${Array.from(shardManifestRequests).join(' | ')}`,
+  ).toEqual([]);
   expect(
     modelRequests.some((url) => url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/config.json')),
     'expected dedicated DINOv2 config request',
@@ -260,24 +268,58 @@ test('burn_synth wasm sharded web inference produces a GLB', async ({ page }) =>
     ).toBe(false);
   }
   const requestedDinoF16 = modelRequests.some((url) =>
-    url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model_f16.bpk'),
+    url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model_f16.bpk.parts.json'),
   );
   const requestedDinoF32 = modelRequests.some((url) =>
-    url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model.bpk'),
+    url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model.bpk.parts.json'),
   );
   expect(
     requestedDinoF16 || requestedDinoF32,
     'expected DINOv2 burnpack requests (f32 primary, f16 fallback)',
   ).toBe(true);
+  const requestedTransformerF32PartsManifest = modelRequests.some((url) =>
+    url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model.bpk.parts.json'),
+  );
+  expect(
+    requestedTransformerF32PartsManifest,
+    'expected fp32 transformer parts manifest request for wasm fp32 runtime',
+  ).toBe(true);
+  const requestedVaeF32PartsManifest = modelRequests.some((url) =>
+    url.includes('/assets/models/MIDI-3D/vae/diffusion_pytorch_model.bpk.parts.json'),
+  );
+  expect(
+    requestedVaeF32PartsManifest,
+    'expected fp32 VAE parts manifest request for wasm fp32 runtime',
+  ).toBe(true);
+  const requestedRmbgPartsManifest = modelRequests.some((url) =>
+    url.includes('/assets/models/RMBG-1.4/model_f16.bpk.parts.json') ||
+    url.includes('/assets/models/RMBG-1.4/model.bpk.parts.json'),
+  );
+  expect(
+    requestedRmbgPartsManifest,
+    'expected RMBG parts manifest request for wasm runtime',
+  ).toBe(true);
+  const requestedTransformerF16Parts = modelRequests.some(
+    (url) =>
+      url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model_f16.bpk.parts.json') ||
+      url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model_f16.bpk.part-'),
+  );
+  expect(
+    requestedTransformerF16Parts,
+    'unexpected fp16 transformer parts requests in wasm fp32 run',
+  ).toBe(false);
   const nonBenignFailedModelResponses = failedModelResponses.filter(
     (entry) =>
       !(
         entry.includes('404 ') &&
         (
-          entry.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model.bpk.parts.json') ||
+          entry.includes('.bpk.parts.json') ||
+          entry.includes('.bpk.part-') ||
           entry.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model.bpk') ||
           entry.includes('/assets/models/MIDI-3D/vae/diffusion_pytorch_model.bpk') ||
           entry.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model.bpk') ||
+          entry.includes('/assets/models/RMBG-1.4/model.bpk') ||
+          entry.includes('/assets/models/RMBG-1.4/model_f16.bpk') ||
           entry.includes('/assets/models/MIDI-3D/image_encoder_dinov2/config.json') ||
           entry.includes('/assets/models/MIDI-3D/feature_extractor_dinov2/preprocessor_config.json')
         )

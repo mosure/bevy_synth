@@ -15,12 +15,12 @@ use crate::model::triposg::{
     scheduler::RectifiedFlowScheduler,
     vae::TripoSGVae,
 };
+#[cfg(target_arch = "wasm32")]
+use crate::pipeline::geometry::flash_extract_geometry_async_wasm;
 use crate::pipeline::geometry::{
     FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
     hierarchical_extract_geometry,
 };
-#[cfg(target_arch = "wasm32")]
-use crate::pipeline::geometry::flash_extract_geometry_async_wasm;
 use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 use crate::readback::tensor_to_vec_f32;
 

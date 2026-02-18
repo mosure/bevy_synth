@@ -407,6 +407,15 @@ pub mod import {
         Ok(TripoSGImageEncoder::new(model))
     }
 
+    pub fn init_triposg_dinov2_model<B: Backend>(
+        device: &B::Device,
+        config: DinoVisionTransformerConfig,
+    ) -> TripoSGImageEncoder<B> {
+        let model: burn_dino::model::dino::DinoVisionTransformer<B> =
+            burn_dino::model::dino::DinoVisionTransformer::new(device, config);
+        TripoSGImageEncoder::new(model)
+    }
+
     pub fn load_triposg_dinov2_from_burnpack_bytes<B: Backend>(
         device: &B::Device,
         config: DinoVisionTransformerConfig,
@@ -421,6 +430,20 @@ pub mod import {
             .map_err(|err| format!("failed to load dinov2 burnpack bytes: {err}"))?;
         validate_apply_result("dinov2 burnpack bytes", &apply)?;
         Ok(TripoSGImageEncoder::new(model))
+    }
+
+    pub fn apply_triposg_dinov2_burnpack_part_bytes<B: Backend>(
+        model: &mut TripoSGImageEncoder<B>,
+        burnpack_bytes: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(burnpack_bytes)))
+            .allow_partial(true)
+            .validate(should_validate_burnpack());
+        model
+            .dino
+            .load_from(&mut store)
+            .map_err(|err| format!("failed to load dinov2 burnpack part bytes: {err}"))?;
+        Ok(())
     }
 
     pub fn load_triposg_dinov2_from_burnpack_file<B: Backend>(

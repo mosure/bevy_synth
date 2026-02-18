@@ -9,6 +9,7 @@ pub(super) fn worker_loop_backend_unavailable(
 ) {
     for command in command_rx {
         match command {
+            WorkerCommand::Warmup => {}
             WorkerCommand::Infer(requests) => {
                 let results = vec![Err(message.to_string()); requests.len()];
                 let _sent = event_tx.send(WorkerEvent {
