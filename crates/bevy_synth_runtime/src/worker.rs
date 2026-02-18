@@ -128,7 +128,9 @@ compile_error!(
 );
 
 #[cfg(all(feature = "wgpu", target_arch = "wasm32"))]
-type WgpuRuntimeBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+type WgpuRuntimeBackendF16 = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+#[cfg(all(feature = "wgpu", target_arch = "wasm32"))]
+type WgpuRuntimeBackendF32 = burn_wgpu::Wgpu<f32, i32, u32>;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub type SharedWgpuDevice = burn_wgpu::WgpuDevice;
 #[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
@@ -208,35 +210,63 @@ fn wasm_elapsed_since(start_ms: f64) -> Duration {
 
 #[cfg(target_arch = "wasm32")]
 pub async fn wasm_webgpu_available() -> bool {
-    let Some(window) = web_sys::window() else {
+    wasm_webgpu_request_adapter().await.is_some()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn wasm_webgpu_shader_f16_supported() -> bool {
+    let Some(adapter) = wasm_webgpu_request_adapter().await else {
         return false;
+    };
+    let features = match Reflect::get(&adapter, &wasm_bindgen::JsValue::from_str("features")) {
+        Ok(value) if !value.is_undefined() && !value.is_null() => value,
+        _ => return false,
+    };
+    let has_method = match Reflect::get(&features, &wasm_bindgen::JsValue::from_str("has")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let has_method = match has_method.dyn_into::<Function>() {
+        Ok(func) => func,
+        Err(_) => return false,
+    };
+    match has_method.call1(&features, &wasm_bindgen::JsValue::from_str("shader-f16")) {
+        Ok(value) => value.as_bool().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn wasm_webgpu_request_adapter() -> Option<wasm_bindgen::JsValue> {
+    let Some(window) = web_sys::window() else {
+        return None;
     };
     let navigator = window.navigator();
     let navigator_js: wasm_bindgen::JsValue = navigator.into();
     let gpu = match Reflect::get(&navigator_js, &wasm_bindgen::JsValue::from_str("gpu")) {
         Ok(value) if !value.is_undefined() && !value.is_null() => value,
-        _ => return false,
+        _ => return None,
     };
     let request_adapter =
         match Reflect::get(&gpu, &wasm_bindgen::JsValue::from_str("requestAdapter")) {
             Ok(value) => value,
-            Err(_) => return false,
+            Err(_) => return None,
         };
     let request_adapter = match request_adapter.dyn_into::<Function>() {
         Ok(func) => func,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let promise = match request_adapter.call0(&gpu) {
         Ok(value) => value,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let promise = match promise.dyn_into::<Promise>() {
         Ok(promise) => promise,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     match JsFuture::from(promise).await {
-        Ok(adapter) => !adapter.is_null() && !adapter.is_undefined(),
-        Err(_) => false,
+        Ok(adapter) if !adapter.is_null() && !adapter.is_undefined() => Some(adapter),
+        _ => None,
     }
 }
 
@@ -326,12 +356,8 @@ fn triposg_parity_profile() -> TripoSGRuntimeParityProfile {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn triposg_weight_precision_label(parity: TripoSGRuntimeParityProfile) -> &'static str {
-    if should_prefer_f16_triposg_weights(parity) {
-        "f16"
-    } else {
-        "f32"
-    }
+fn triposg_weight_precision_label(prefer_f16: bool) -> &'static str {
+    if prefer_f16 { "f16" } else { "f32" }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -557,24 +583,34 @@ async fn worker_loop_wasm(
         }
         BackendKind::Wgpu => {
             if !wasm_webgpu_available().await {
-                warn!(
-                    "webgpu adapter unavailable on wasm32; falling back to CPU backend for wasm inference"
+                worker_loop_backend_unavailable(
+                    command_rx,
+                    event_tx,
+                    "WebGPU is unavailable in this browser/runtime; CPU fallback is disabled for wasm TripoSG.",
                 );
-                worker_loop_backend_wasm::<burn::backend::NdArray<f32>>(args, command_rx, event_tx)
-                    .await;
                 return;
             }
             #[cfg(feature = "wgpu")]
             {
                 if let Err(err) = initialize_wgpu_runtime_for_wasm().await {
-                    warn!("failed to initialize wasm webgpu runtime: {}", err);
-                    worker_loop_backend_wasm::<burn::backend::NdArray<f32>>(
-                        args, command_rx, event_tx,
-                    )
-                    .await;
+                    warn!("failed to initialize wasm WebGPU runtime: {}", err);
+                    worker_loop_backend_unavailable(
+                        command_rx,
+                        event_tx,
+                        "failed to initialize wasm WebGPU runtime",
+                    );
                     return;
                 }
-                worker_loop_backend_wasm::<WgpuRuntimeBackend>(args, command_rx, event_tx).await;
+                if wasm_webgpu_shader_f16_supported().await {
+                    worker_loop_backend_wasm::<WgpuRuntimeBackendF16>(args, command_rx, event_tx)
+                        .await;
+                } else {
+                    warn!(
+                        "WebGPU adapter lacks shader-f16; running TripoSG wasm on fp32 WebGPU backend."
+                    );
+                    worker_loop_backend_wasm::<WgpuRuntimeBackendF32>(args, command_rx, event_tx)
+                        .await;
+                }
             }
             #[cfg(not(feature = "wgpu"))]
             {
@@ -735,12 +771,20 @@ async fn build_pipeline_state_wasm<B: Backend>(
     }
     let triposg_parity = triposg_parity_profile();
     set_rmbg_strict_interp_override(Some(triposg_parity.strict_rmbg_interp));
-    let prefer_f16_weights = should_prefer_f16_triposg_weights(triposg_parity);
-    let precision_label = triposg_weight_precision_label(triposg_parity);
+    let prefer_f16_default = should_prefer_f16_triposg_weights(triposg_parity);
+    let force_f16_for_wasm_wgpu = is_wgpu_backend::<B>();
+    let prefer_f16_weights = prefer_f16_default || force_f16_for_wasm_wgpu;
+    let precision_label = triposg_weight_precision_label(prefer_f16_weights);
     send_worker_status(
         event_tx,
         format!("TripoSG weight precision policy: {precision_label} (runtime parity profile)."),
     );
+    if force_f16_for_wasm_wgpu && !prefer_f16_default {
+        send_worker_status(
+            event_tx,
+            "WASM WebGPU runtime active; preferring f16 burnpacks for stable model load.",
+        );
+    }
     info!(
         "TripoSG weight precision policy: {} (runtime parity profile).",
         precision_label
@@ -852,8 +896,7 @@ async fn build_pipeline_state_wasm<B: Backend>(
                 Ok(Ok(model)) => {
                     // Avoid blocking sync/readback semantics on wasm GPU backends.
                     host_ram_budget.release_retained(rmbg_burnpack_bytes);
-                    let mut pipeline = RmbgPipeline::new(model, rmbg_processor);
-                    cap_rmbg14_processor_for_backend::<B>(&mut pipeline, rmbg_backend);
+                    let pipeline = RmbgPipeline::new(model, rmbg_processor);
                     wasm_console_log("build_pipeline_state_wasm RMBG GPU load complete");
                     (None, Some(pipeline))
                 }
@@ -1827,27 +1870,37 @@ async fn decode_triposg_mesh_wasm<B: Backend>(
     latents: Tensor<B, 3>,
     config: &DecodeConfig<'_>,
 ) -> Result<(Option<TripoMesh>, DenseGrid), String> {
-    if !matches!(config.mesh_mode, MeshMode::Dense) {
-        warn!(
-            "WASM decode forcing dense mesh mode from {:?} to avoid sync-only readback ops.",
-            config.mesh_mode
-        );
+    match config.mesh_mode {
+        MeshMode::Flash => {
+            let output = pipeline
+                .extract_flash_mesh_from_latents_async_wasm(latents, config.flash)
+                .await
+                .map_err(|err| format!("TripoSG flash extraction failed on wasm: {err}"))?;
+            Ok((output.mesh, output.grid))
+        }
+        MeshMode::Dense | MeshMode::Hierarchical => {
+            if matches!(config.mesh_mode, MeshMode::Hierarchical) {
+                warn!(
+                    "WASM TripoSG hierarchical decode is unavailable with async readback; falling back to dense mode."
+                );
+            }
+            let values = decode_grid_values_chunked_async(
+                &latents,
+                &pipeline.vae,
+                config.bounds,
+                config.resolution,
+                config.chunk_size,
+            )
+            .await?;
+            let grid = DenseGrid {
+                values,
+                size: [config.resolution, config.resolution, config.resolution],
+                bounds: config.bounds,
+            };
+            let mesh = grid_to_mesh(&grid, 0.0);
+            Ok((mesh, grid))
+        }
     }
-    let values = decode_grid_values_chunked_async(
-        &latents,
-        &pipeline.vae,
-        config.bounds,
-        config.resolution,
-        config.chunk_size,
-    )
-    .await?;
-    let grid = DenseGrid {
-        values,
-        size: [config.resolution, config.resolution, config.resolution],
-        bounds: config.bounds,
-    };
-    let mesh = grid_to_mesh(&grid, 0.0);
-    Ok((mesh, grid))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2048,46 +2101,8 @@ fn prepare_image_config_for_backend<B: Backend>(
     rmbg_model: RmbgModel,
     rmbg_backend: RmbgBackend,
 ) -> PrepareImageConfig {
-    let mut config = PrepareImageConfig::default();
-    if is_wgpu_backend::<B>() {
-        config.max_dimension = config.max_dimension.min(1024);
-        if matches!(rmbg_model, RmbgModel::Rmbg14) && matches!(rmbg_backend, RmbgBackend::Gpu) {
-            // Avoid large im2col allocations in wgpu conv autotune for RMBG-1.4.
-            config.max_dimension = config.max_dimension.min(384);
-        }
-    }
-    config
-}
-
-#[cfg(target_arch = "wasm32")]
-fn cap_rmbg14_processor_for_backend<B: Backend>(
-    pipeline: &mut RmbgPipeline<B>,
-    rmbg_backend: RmbgBackend,
-) {
-    if !is_wgpu_backend::<B>() || !matches!(rmbg_backend, RmbgBackend::Gpu) {
-        return;
-    }
-    let cap = rmbg_processor_size_cap();
-    if cap == 0 {
-        return;
-    }
-    let previous = pipeline.processor.size;
-    let next = match previous {
-        Some([height, width]) => [height.min(cap), width.min(cap)],
-        None => [cap, cap],
-    };
-    if previous != Some(next) {
-        warn!(
-            "Capping RMBG-1.4 processor size from {:?} to {:?} for WGPU stability.",
-            previous, next
-        );
-        pipeline.processor.size = Some(next);
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn rmbg_processor_size_cap() -> usize {
-    384
+    let _ = (std::any::type_name::<B>(), rmbg_model, rmbg_backend);
+    PrepareImageConfig::default()
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -1,7 +1,7 @@
 /// Canonical wasm inference preset for JS-facing API entry points.
 ///
-/// These values intentionally target stable browser execution for smoke testing while
-/// still exercising the real TripoSG + RMBG path.
+/// Defaults mirror native TripoSG "full" quality settings so web and native runs
+/// are configured consistently unless callers override fields explicitly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WasmInferencePreset {
     pub quality: &'static str,
@@ -17,10 +17,11 @@ pub struct WasmInferencePreset {
 impl Default for WasmInferencePreset {
     fn default() -> Self {
         Self {
-            quality: "fast",
-            num_steps: 8,
-            num_tokens: 512,
-            resolution: 128,
+            quality: "full",
+            num_steps: 50,
+            num_tokens: 2048,
+            // On wasm this maps to flash extraction min_resolution.
+            resolution: 63,
             faces: 10_000,
             backend: "wgpu",
             rmbg_backend: "auto",
@@ -57,6 +58,8 @@ impl WasmInferencePreset {
 #[cfg(test)]
 mod tests {
     use super::WasmInferencePreset;
+    #[cfg(feature = "runtime")]
+    use crate::RuntimeConfig;
 
     #[test]
     fn preset_generates_expected_args() {
@@ -66,13 +69,13 @@ mod tests {
             vec![
                 "bevy_synth",
                 "--quality",
-                "fast",
+                "full",
                 "--num-steps",
-                "8",
+                "50",
                 "--num-tokens",
-                "512",
+                "2048",
                 "--resolution",
-                "128",
+                "63",
                 "--faces",
                 "10000",
                 "--backend",
@@ -83,5 +86,17 @@ mod tests {
                 "auto",
             ]
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn preset_matches_runtime_triposg_defaults() {
+        let preset = WasmInferencePreset::default();
+        let runtime = RuntimeConfig::default();
+
+        assert_eq!(preset.num_steps, runtime.num_steps);
+        assert_eq!(preset.num_tokens, runtime.num_tokens);
+        assert_eq!(preset.resolution, runtime.flash_extract.min_resolution);
+        assert_eq!(preset.faces, runtime.target_faces.unwrap_or_default());
     }
 }

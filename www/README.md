@@ -2,6 +2,8 @@
 
 - `cargo build --release --target wasm32-unknown-unknown -p bevy_synth`
 - `wasm-bindgen --out-dir ./www/out --target web target/wasm32-unknown-unknown/release/bevy_synth.wasm`
+- run full `burn_synth` wasm integration (build + bindgen + playwright sharded inference):
+  - `./crates/burn_synth/tests/web_playwright/run.sh`
 - bundle model assets into `www/assets/models`:
   - `pwsh ./scripts/bundle_web_assets.ps1`
 - preview the bundle plan without copying files:

@@ -25,7 +25,8 @@ use burn_tripo::model::triposg::image_encoder::import::{
 use burn_tripo::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
 use burn_tripo::model::triposg::vae::TripoSGVaeConfig;
 use burn_tripo::model::triposg::vae::import::load_triposg_vae_decoder_from_burnpack_bytes;
-use burn_tripo::pipeline::mesh::{DenseGrid, Mesh as TripoMesh, grid_to_mesh};
+use burn_tripo::pipeline::geometry::FlashExtractConfig;
+use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
 use burn_tripo::pipeline::runtime_parity::{
     decimate_tripo_mesh, should_prefer_f16_triposg_weights, triposg_runtime_profile,
 };
@@ -53,26 +54,28 @@ use crate::wasm_loader::{
 };
 
 #[cfg(feature = "wasm-api-wgpu")]
-type WgpuBackend = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+type WgpuBackendF16 = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
+#[cfg(feature = "wasm-api-wgpu")]
+type WgpuBackendF32 = burn_wgpu::Wgpu<f32, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
 type WgpuRmbgBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
 const DEFAULT_GUIDANCE_SCALE: f32 = 7.0;
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
 const DINO_CONFIG_RELPATHS: [&str; 2] = [
-    "image_encoder_2/config.json",
     "image_encoder_dinov2/config.json",
+    "image_encoder_2/config.json",
 ];
 const DINO_PREPROCESSOR_RELPATHS: [&str; 3] = [
+    "feature_extractor_dinov2/preprocessor_config.json",
     "feature_extractor_2/preprocessor_config.json",
     "feature_extractor_1/preprocessor_config.json",
-    "feature_extractor_dinov2/preprocessor_config.json",
 ];
 const ROOT_TRIPOSG: &str = "models/MIDI-3D";
 const ROOT_RMBG14: &str = "models/RMBG-1.4";
-const RMBG_WGPU_DIMENSION_CAP: usize = 384;
-const WGPU_CHUNK_SIZE: usize = 32_768;
-const CPU_CHUNK_SIZE: usize = 8_192;
+const DEFAULT_FLASH_OCTREE_DEPTH: usize = 9;
+const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
+const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
 
 static PANIC_HOOK_ONCE: Once = Once::new();
 
@@ -232,9 +235,20 @@ pub async fn infer_glb_from_image_bytes_with_options(
             initialize_wgpu_runtime_for_wasm().await.map_err(|err| {
                 JsValue::from_str(&format!("failed to initialize WebGPU runtime: {err}"))
             })?;
-            let bytes = infer_glb_once::<WgpuBackend, WgpuRmbgBackend>(&image_bytes, &preset)
-                .await
-                .map_err(|err| JsValue::from_str(&format!("WebGPU inference failed: {err}")))?;
+            let shader_f16_supported = wasm_webgpu_shader_f16_supported().await;
+            let bytes = if shader_f16_supported {
+                web_sys::console::log_1(
+                    &"WebGPU adapter supports shader-f16; running TripoSG with fp16 backend."
+                        .into(),
+                );
+                infer_glb_once::<WgpuBackendF16, WgpuRmbgBackend>(&image_bytes, &preset).await
+            } else {
+                web_sys::console::log_1(
+                    &"WebGPU adapter lacks shader-f16; running TripoSG with fp32 backend.".into(),
+                );
+                infer_glb_once::<WgpuBackendF32, WgpuRmbgBackend>(&image_bytes, &preset).await
+            }
+            .map_err(|err| JsValue::from_str(&format!("WebGPU inference failed: {err}")))?;
             return Ok(Uint8Array::from(bytes.as_slice()));
         }
     }
@@ -281,9 +295,6 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
     image_bytes: &[u8],
     preset: &WasmInferencePreset,
 ) -> Result<Vec<u8>, String> {
-    // Keep RMBG forward on an f32 wasm backend to avoid WebGPU storage binding
-    // validation failures in f16 scalar/tiny buffers, then upload prepared image
-    // once to the main TripoSG backend.
     let prepared = prepare_image_data_from_bytes_async::<BRmbg>(
         image_bytes,
         Some(&state.rmbg),
@@ -300,43 +311,32 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
         .as_ref()
         .ok_or_else(|| "TripoSG image encoder is unavailable".to_string())?
         .forward(processed);
-    let [batch_size, _, _] = image_embeds.shape().dims::<3>();
 
-    let output = state.triposg.sample_from_embeds(
-        image_embeds,
-        batch_size,
-        preset.num_steps.max(1),
-        preset.num_tokens.max(64),
-        DEFAULT_GUIDANCE_SCALE,
-        None,
-        None,
-    );
-    let [_, latent_tokens, latent_channels] = output.latents.shape().dims::<3>();
-    let sample = output
-        .latents
-        .slice([0..1, 0..latent_tokens, 0..latent_channels]);
-
-    let resolution = preset.resolution.max(32);
-    let values = decode_grid_values_chunked_async(
-        &sample,
-        &state.triposg.vae,
-        DEFAULT_BOUNDS,
-        resolution,
-        if is_wgpu_backend::<BTriposg>() {
-            WGPU_CHUNK_SIZE
-        } else {
-            CPU_CHUNK_SIZE
-        },
-    )
-    .await?;
-    let grid = DenseGrid {
-        values,
-        size: [resolution, resolution, resolution],
+    let flash = FlashExtractConfig {
         bounds: DEFAULT_BOUNDS,
+        octree_depth: DEFAULT_FLASH_OCTREE_DEPTH,
+        num_chunks: DEFAULT_FLASH_NUM_CHUNKS,
+        mc_level: 0.0,
+        min_resolution: preset.resolution.max(2),
+        mini_grid_num: DEFAULT_FLASH_MINI_GRID_NUM,
     };
+    let flash_output = state
+        .triposg
+        .sample_mesh_flash_from_embeds_async_wasm(
+            image_embeds,
+            preset.num_steps.max(1),
+            preset.num_tokens.max(64),
+            DEFAULT_GUIDANCE_SCALE,
+            &flash,
+            None,
+        )
+        .await
+        .map_err(|err| format!("TripoSG flash geometry extraction failed: {err}"))?;
 
-    let mut mesh = grid_to_mesh(&grid, 0.0)
+    let mut mesh = flash_output
+        .mesh
         .ok_or_else(|| "TripoSG mesh extraction returned an empty mesh".to_string())?;
+
     if preset.faces > 0 && mesh.faces.len() > preset.faces {
         mesh = decimate_tripo_mesh(&mesh, preset.faces)
             .map_err(|err| format!("mesh decimation failed: {err}"))?;
@@ -352,20 +352,27 @@ async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
     let parity = triposg_runtime_profile(Some(preset.resolution));
     set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
     let prefer_f16_default = should_prefer_f16_triposg_weights(parity);
-    let precision_label = if prefer_f16_default { "f16" } else { "f32" };
+    let use_wgpu = is_wgpu_backend::<BTriposg>();
+    let prefer_f16_wasm_wgpu = use_wgpu;
+    let effective_prefer_f16 = prefer_f16_default || prefer_f16_wasm_wgpu;
+    let precision_label = if effective_prefer_f16 { "f16" } else { "f32" };
     web_sys::console::log_1(
         &format!("TripoSG weight precision policy: {precision_label} (runtime parity profile).")
             .into(),
     );
-    let use_wgpu = is_wgpu_backend::<BTriposg>();
+    if prefer_f16_wasm_wgpu && !prefer_f16_default {
+        web_sys::console::log_1(
+            &"WASM WebGPU runtime active; preferring f16 burnpacks for stable model load.".into(),
+        );
+    }
     // Keep RMBG on f32 for wasm wgpu path; some f16 kernels currently trigger
     // storage-buffer alignment validation errors on web runtimes.
     let prefer_f16_rmbg = false;
     // CPU wasm path cannot fit full-f32 model footprints under the 4 GiB host cap.
-    // Keep CPU fallback on f16, but let WebGPU follow the runtime parity precision policy.
-    let prefer_f16_vae = if use_wgpu { prefer_f16_default } else { true };
-    let prefer_f16_dit = if use_wgpu { prefer_f16_default } else { true };
-    let prefer_f16_dino = if use_wgpu { prefer_f16_default } else { true };
+    // Keep CPU fallback on f16, and prefer f16 burnpacks for wasm WebGPU fp16 runtime.
+    let prefer_f16_vae = if use_wgpu { effective_prefer_f16 } else { true };
+    let prefer_f16_dit = if use_wgpu { effective_prefer_f16 } else { true };
+    let prefer_f16_dino = if use_wgpu { effective_prefer_f16 } else { true };
 
     let triposg_device = BTriposg::Device::default();
     let rmbg_device = BRmbg::Device::default();
@@ -432,9 +439,7 @@ where
 
     let model = load_rmbg_from_burnpack_bytes(device, burnpack, &config)
         .map_err(|err| format!("failed to load RMBG burnpack bytes: {err}"))?;
-    let mut pipeline = RmbgPipeline::new(model, processor);
-    cap_rmbg14_processor_for_backend::<B>(&mut pipeline);
-    Ok(pipeline)
+    Ok(RmbgPipeline::new(model, processor))
 }
 
 async fn load_triposg_pipeline_wasm<B: Backend, F>(
@@ -494,28 +499,13 @@ where
     let mut dino_config = parsed_dino_config
         .clone()
         .unwrap_or_else(default_dinov2_config);
-    let mut dino_processor = if let Some(json) = dino_preproc_json.as_ref() {
+    let dino_processor = if let Some(json) = dino_preproc_json.as_ref() {
         load_dinov2_processor_from_json_bytes(json.as_bytes(), Some(dino_fallback_size))
             .map_err(|err| format!("failed to parse DINO preprocessor config: {err}"))?
     } else {
         default_wasm_dino_processor(dino_fallback_size)
     }
     .with_strict_preprocess(options.strict_dino_preprocess);
-    if is_wgpu_backend::<B>()
-        && let Some(target_size) =
-            dino_processor_target_size(&dino_processor, Some(dino_fallback_size))
-    {
-        let adjusted = adjust_dino_target_size_for_wgpu_f16(target_size, dino_config.patch_size);
-        if adjusted != target_size {
-            load_ctx.status(format!(
-                "Adjusting DINO preprocess size from {target_size} to {adjusted} for wasm WebGPU f16 alignment",
-            ));
-            dino_processor.do_resize = true;
-            dino_processor.size_shortest_edge = Some(adjusted);
-            dino_processor.do_center_crop = true;
-            dino_processor.crop_size = Some([adjusted, adjusted]);
-        }
-    }
     if let Some(target_size) = dino_processor_target_size(&dino_processor, Some(dino_fallback_size))
     {
         let patch = dino_config.patch_size.max(1);
@@ -723,28 +713,8 @@ fn should_verify_wasm_part_checksums() -> bool {
 }
 
 fn prepare_image_config_for_backend<B: Backend>() -> PrepareImageConfig {
-    let mut config = PrepareImageConfig::default();
-    if is_wgpu_backend::<B>() {
-        config.max_dimension = config.max_dimension.min(384);
-    }
-    config
-}
-
-fn cap_rmbg14_processor_for_backend<B: Backend>(pipeline: &mut RmbgPipeline<B>) {
-    if !is_wgpu_backend::<B>() {
-        return;
-    }
-    let previous = pipeline.processor.size;
-    let next = match previous {
-        Some([height, width]) => [
-            height.min(RMBG_WGPU_DIMENSION_CAP),
-            width.min(RMBG_WGPU_DIMENSION_CAP),
-        ],
-        None => [RMBG_WGPU_DIMENSION_CAP, RMBG_WGPU_DIMENSION_CAP],
-    };
-    if previous != Some(next) {
-        pipeline.processor.size = Some(next);
-    }
+    let _ = std::any::type_name::<B>();
+    PrepareImageConfig::default()
 }
 
 fn dino_processor_target_size(
@@ -769,15 +739,6 @@ fn default_wasm_dino_processor(target_size: usize) -> DinoImageProcessor {
     }
 }
 
-fn adjust_dino_target_size_for_wgpu_f16(target_size: usize, patch_size: usize) -> usize {
-    let patch = patch_size.max(1);
-    let grid = target_size / patch;
-    if grid == 0 || grid % 2 == 1 {
-        return target_size;
-    }
-    (grid + 1) * patch
-}
-
 fn tripo_mesh_to_mesh(mesh: TripoMesh) -> Mesh {
     Mesh {
         vertices: mesh.vertices,
@@ -786,101 +747,6 @@ fn tripo_mesh_to_mesh(mesh: TripoMesh) -> Mesh {
         material: None,
         pbr_textures: None,
     }
-}
-
-async fn decode_grid_values_chunked_async<B: Backend>(
-    latents: &Tensor<B, 3>,
-    vae: &burn_tripo::model::triposg::vae::TripoSGVae<B>,
-    bounds: [f32; 6],
-    resolution: usize,
-    chunk_size: usize,
-) -> Result<Vec<f32>, String> {
-    let total = resolution * resolution * resolution;
-    let device = latents.device();
-    let mut values = vec![0.0f32; total];
-    let step_x = dense_grid_step(bounds[0], bounds[3], resolution);
-    let step_y = dense_grid_step(bounds[1], bounds[4], resolution);
-    let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
-
-    let mut coords = Vec::with_capacity(chunk_size.saturating_mul(3));
-    let mut chunk_start = 0usize;
-    for idx in 0..total {
-        let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
-        coords.push(bounds[0] + step_x * x as f32);
-        coords.push(bounds[1] + step_y * y as f32);
-        coords.push(bounds[2] + step_z * z as f32);
-        let count = coords.len() / 3;
-        if count < chunk_size {
-            continue;
-        }
-        let end = chunk_start + count;
-        write_decoded_chunk_contiguous_async(
-            latents,
-            vae,
-            &coords,
-            &device,
-            &mut values[chunk_start..end],
-        )
-        .await?;
-        coords.clear();
-        chunk_start = end;
-    }
-
-    if !coords.is_empty() {
-        let count = coords.len() / 3;
-        let end = chunk_start + count;
-        write_decoded_chunk_contiguous_async(
-            latents,
-            vae,
-            &coords,
-            &device,
-            &mut values[chunk_start..end],
-        )
-        .await?;
-    }
-
-    Ok(values)
-}
-
-async fn write_decoded_chunk_contiguous_async<B: Backend>(
-    latents: &Tensor<B, 3>,
-    vae: &burn_tripo::model::triposg::vae::TripoSGVae<B>,
-    coords: &[f32],
-    device: &B::Device,
-    output_slice: &mut [f32],
-) -> Result<(), String> {
-    let count = coords.len() / 3;
-    if count == 0 {
-        return Ok(());
-    }
-    let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
-        .reshape([count as i32, 3])
-        .unsqueeze_dim(0);
-    let decoded = vae.decode(coords_tensor, latents.clone(), None);
-    let data = decoded
-        .into_data_async()
-        .await
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|err| format!("failed to convert decoded grid: {err:?}"))?;
-    output_slice.copy_from_slice(&data[..output_slice.len()]);
-    Ok(())
-}
-
-fn dense_grid_step(min: f32, max: f32, resolution: usize) -> f32 {
-    if resolution <= 1 {
-        return 0.0;
-    }
-    (max - min) / (resolution as f32 - 1.0)
-}
-
-fn dense_grid_index_to_xyz(idx: usize, resolution: usize) -> (usize, usize, usize) {
-    let area = resolution * resolution;
-    let z = idx / area;
-    let rem = idx - z * area;
-    let y = rem / resolution;
-    let x = rem - y * resolution;
-    (x, y, z)
 }
 
 fn is_wgpu_backend<B: Backend>() -> bool {
@@ -896,38 +762,66 @@ fn wasm_model_root(rel_root: &str) -> String {
 
 #[cfg(feature = "wasm-api-wgpu")]
 async fn wasm_webgpu_available() -> bool {
-    let Some(window) = web_sys::window() else {
+    wasm_webgpu_request_adapter().await.is_some()
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+async fn wasm_webgpu_shader_f16_supported() -> bool {
+    let Some(adapter) = wasm_webgpu_request_adapter().await else {
         return false;
+    };
+    let features = match Reflect::get(&adapter, &wasm_bindgen::JsValue::from_str("features")) {
+        Ok(value) if !value.is_null() && !value.is_undefined() => value,
+        _ => return false,
+    };
+    let has_method = match Reflect::get(&features, &wasm_bindgen::JsValue::from_str("has")) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let has_method = match has_method.dyn_into::<Function>() {
+        Ok(func) => func,
+        Err(_) => return false,
+    };
+    match has_method.call1(&features, &wasm_bindgen::JsValue::from_str("shader-f16")) {
+        Ok(value) => value.as_bool().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+async fn wasm_webgpu_request_adapter() -> Option<wasm_bindgen::JsValue> {
+    let Some(window) = web_sys::window() else {
+        return None;
     };
     let window_js: wasm_bindgen::JsValue = window.into();
     let navigator = match Reflect::get(&window_js, &wasm_bindgen::JsValue::from_str("navigator")) {
         Ok(value) if !value.is_undefined() && !value.is_null() => value,
-        _ => return false,
+        _ => return None,
     };
     let gpu = match Reflect::get(&navigator, &wasm_bindgen::JsValue::from_str("gpu")) {
         Ok(value) if !value.is_undefined() && !value.is_null() => value,
-        _ => return false,
+        _ => return None,
     };
     let request_adapter =
         match Reflect::get(&gpu, &wasm_bindgen::JsValue::from_str("requestAdapter")) {
             Ok(value) => value,
-            Err(_) => return false,
+            Err(_) => return None,
         };
     let request_adapter = match request_adapter.dyn_into::<Function>() {
         Ok(func) => func,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let promise = match request_adapter.call0(&gpu) {
         Ok(value) => value,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let promise = match promise.dyn_into::<Promise>() {
         Ok(promise) => promise,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     match JsFuture::from(promise).await {
-        Ok(adapter) => !adapter.is_null() && !adapter.is_undefined(),
-        Err(_) => false,
+        Ok(adapter) if !adapter.is_null() && !adapter.is_undefined() => Some(adapter),
+        _ => None,
     }
 }
 

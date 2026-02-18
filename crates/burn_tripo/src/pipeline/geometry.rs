@@ -138,6 +138,256 @@ pub fn flash_extract_geometry<B: Backend>(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn flash_extract_geometry_async_wasm<B: Backend>(
+    latents: Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    config: &FlashExtractConfig,
+) -> Result<DenseGrid, String> {
+    let bounds = config.bounds;
+    let octree_depth = config.octree_depth.max(1);
+    let num_chunks = config.num_chunks.max(1);
+    let min_resolution = config.min_resolution.max(2);
+    let mini_grid_num = config.mini_grid_num.max(1);
+
+    let resolutions = build_flash_resolutions(octree_depth, min_resolution, mini_grid_num);
+    if resolutions.is_empty() {
+        return Err("flash extractor produced empty resolution list".to_string());
+    }
+
+    let base_res = resolutions[0];
+    let base_grid = base_res + 1;
+    let (xs, ys, zs) = (
+        linspace(bounds[0], bounds[3], base_grid),
+        linspace(bounds[1], bounds[4], base_grid),
+        linspace(bounds[2], bounds[5], base_grid),
+    );
+
+    let mut grid_logits =
+        eval_flash_base_grid_async_wasm(&latents, vae, &xs, &ys, &zs, num_chunks, mini_grid_num)
+            .await?;
+    let mut grid_size = base_grid;
+
+    for (level_idx, &res) in resolutions.iter().enumerate().skip(1) {
+        let next_size = res + 1;
+        let step_x = (bounds[3] - bounds[0]) / res as f32;
+        let step_y = (bounds[4] - bounds[1]) / res as f32;
+        let step_z = (bounds[5] - bounds[2]) / res as f32;
+
+        let mut next_logits = vec![FLASH_INVALID_SENTINEL; next_size * next_size * next_size];
+
+        let mut curr_mask = extract_near_surface_mask(&grid_logits, grid_size, config.mc_level);
+        for idx in 0..curr_mask.len() {
+            if grid_logits[idx].abs() < 0.95 {
+                curr_mask[idx] = 1;
+            }
+        }
+
+        let expand_num = if level_idx == resolutions.len() - 1 {
+            0
+        } else {
+            1
+        };
+        for _ in 0..expand_num {
+            curr_mask = dilate_mask(&curr_mask, grid_size);
+            curr_mask = dilate_mask(&curr_mask, grid_size);
+        }
+
+        let mut next_index = vec![0u8; next_logits.len()];
+        for z in 0..grid_size {
+            for y in 0..grid_size {
+                for x in 0..grid_size {
+                    let idx = (z * grid_size + y) * grid_size + x;
+                    if curr_mask[idx] == 0 {
+                        continue;
+                    }
+                    let nx = x * 2;
+                    let ny = y * 2;
+                    let nz = z * 2;
+                    if nx < next_size && ny < next_size && nz < next_size {
+                        let nidx = (nz * next_size + ny) * next_size + nx;
+                        next_index[nidx] = 1;
+                    }
+                }
+            }
+        }
+
+        for _ in 0..(2 - expand_num) {
+            next_index = dilate_mask(&next_index, next_size);
+        }
+
+        let coords = collect_coords(&next_index, next_size, bounds, step_x, step_y, step_z);
+        decode_flash_points_async_wasm(
+            &latents,
+            vae,
+            &coords,
+            next_size,
+            num_chunks,
+            &mut next_logits,
+        )
+        .await?;
+
+        grid_logits = next_logits;
+        grid_size = next_size;
+    }
+
+    let octree_resolution = 1usize << octree_depth;
+    let mut sdf_values = Vec::with_capacity(grid_logits.len());
+    for value in grid_logits {
+        if value <= FLASH_INVALID_THRESHOLD {
+            sdf_values.push(f32::NAN);
+        } else {
+            sdf_values.push(-value / octree_resolution as f32);
+        }
+    }
+
+    Ok(DenseGrid {
+        values: sdf_values,
+        size: [grid_size, grid_size, grid_size],
+        bounds,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn eval_flash_base_grid_async_wasm<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    xs: &[f32],
+    ys: &[f32],
+    zs: &[f32],
+    num_chunks: usize,
+    mini_grid_num: usize,
+) -> Result<Vec<f32>, String> {
+    let grid_size = xs.len();
+    let mini_grid_num = mini_grid_num.max(1);
+    if !grid_size.is_multiple_of(mini_grid_num) {
+        return Err(format!(
+            "flash base grid size {grid_size} not divisible by mini_grid_num {mini_grid_num}"
+        ));
+    }
+    let mini_size = (grid_size / mini_grid_num).max(1);
+    let points_per_block = mini_size * mini_size * mini_size;
+    let blocks_per_batch = (num_chunks / points_per_block).max(1);
+
+    let mut grid_values = vec![0.0f32; grid_size * grid_size * grid_size];
+    let device = latents.device();
+
+    let mut blocks = Vec::with_capacity(mini_grid_num * mini_grid_num * mini_grid_num);
+    for bx in 0..mini_grid_num {
+        for by in 0..mini_grid_num {
+            for bz in 0..mini_grid_num {
+                blocks.push([bx, by, bz]);
+            }
+        }
+    }
+
+    let mut coords = Vec::with_capacity(blocks_per_batch * points_per_block * 3);
+    let mut indices = Vec::with_capacity(blocks_per_batch * points_per_block);
+    let mut start = 0usize;
+    while start < blocks.len() {
+        let end = (start + blocks_per_batch).min(blocks.len());
+        let batch_blocks = &blocks[start..end];
+        let batch = batch_blocks.len();
+
+        coords.clear();
+        indices.clear();
+        coords.reserve(batch * points_per_block * 3);
+        indices.reserve(batch * points_per_block);
+        for &[bx, by, bz] in batch_blocks {
+            let base_x = bx * mini_size;
+            let base_y = by * mini_size;
+            let base_z = bz * mini_size;
+            for ix in 0..mini_size {
+                let gx = base_x + ix;
+                for iy in 0..mini_size {
+                    let gy = base_y + iy;
+                    for iz in 0..mini_size {
+                        let gz = base_z + iz;
+                        let idx = (gz * grid_size + gy) * grid_size + gx;
+                        coords.push(xs[gx]);
+                        coords.push(ys[gy]);
+                        coords.push(zs[gz]);
+                        indices.push(idx);
+                    }
+                }
+            }
+        }
+
+        let coords_tensor = Tensor::<B, 1>::from_floats(coords.as_slice(), &device).reshape([
+            batch as i32,
+            points_per_block as i32,
+            3,
+        ]);
+        let latents_batch = latents.clone().repeat_dim(0, batch);
+        let decoded = vae.decode(coords_tensor, latents_batch, None);
+        let data = tensor_to_vec_f32_async_wasm(decoded)
+            .await
+            .map_err(|err| format!("failed to decode flash base grid: {err}"))?;
+        for (i, &idx) in indices.iter().enumerate() {
+            grid_values[idx] = data[i];
+        }
+        start = end;
+    }
+
+    Ok(grid_values)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn decode_flash_points_async_wasm<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    coords: &[([usize; 3], [f32; 3])],
+    size: usize,
+    num_chunks: usize,
+    output: &mut [f32],
+) -> Result<(), String> {
+    if coords.is_empty() {
+        return Ok(());
+    }
+    let device = latents.device();
+    let mut coord_buf = Vec::with_capacity(num_chunks * 3);
+    let mut indices = Vec::with_capacity(num_chunks);
+    let mut start = 0usize;
+    while start < coords.len() {
+        let end = (start + num_chunks).min(coords.len());
+        let slice = &coords[start..end];
+        coord_buf.clear();
+        indices.clear();
+        coord_buf.reserve(slice.len().saturating_mul(3));
+        indices.reserve(slice.len());
+        for (grid_idx, world) in slice {
+            coord_buf.extend_from_slice(world);
+            indices.push((grid_idx[2] * size + grid_idx[1]) * size + grid_idx[0]);
+        }
+        let coords_tensor = Tensor::<B, 1>::from_floats(coord_buf.as_slice(), &device).reshape([
+            1,
+            slice.len() as i32,
+            3,
+        ]);
+        let decoded = vae.decode(coords_tensor, latents.clone(), None);
+        let data = tensor_to_vec_f32_async_wasm(decoded)
+            .await
+            .map_err(|err| format!("failed to decode flash grid values: {err}"))?;
+        for (i, &idx) in indices.iter().enumerate() {
+            output[idx] = data[i];
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn tensor_to_vec_f32_async_wasm<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+) -> Result<Vec<f32>, String> {
+    tensor
+        .into_data_async()
+        .await
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to read tensor data: {err:?}"))
+}
+
 fn should_use_gpu_flash<B: Backend>() -> bool {
     if FLASH_FORCE_CPU.load(Ordering::Relaxed) {
         return false;

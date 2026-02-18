@@ -69,6 +69,20 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 4. Backend failures in wrapper flows must be surfaced as errors; do not auto-switch to CPU or alternate synthesis paths.
 5. New inference features should be implemented in `burn_synth` first, then exposed in wrappers.
 
+## Deduplication and Modularity Ethos
+
+1. Each inference stage must have one canonical implementation owner:
+   - model math and extraction internals in `burn_tripo`
+   - pipeline orchestration and defaults in `burn_synth`
+   - UI/runtime adaptation only in bevy crates
+2. Wrappers must call canonical APIs and must not duplicate stage math (sampling, decode, extraction, mesh conversion) inline.
+3. If native and wasm require different mechanics (for example sync vs async readback), keep both paths in the same canonical module behind explicit `cfg` gates, with shared API shape and shared constants.
+4. Avoid copy-pasting constants and formulas across crates; define once in the canonical owner and reuse.
+5. Platform-specific branches must be narrow and local; do not fork whole pipeline flows when only one stage differs.
+6. When duplicate logic is discovered, priority is to extract and centralize it before adding more features on top.
+7. New public wrapper features should be thin pass-throughs to canonical pipeline methods, not new parallel implementations.
+8. Refactors must reduce total duplicated stage code over time; adding new duplication requires explicit justification in PR notes.
+
 ## Testing and Quality Gates
 
 1. Add/maintain tests that reflect real workload behavior.

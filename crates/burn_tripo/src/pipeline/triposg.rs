@@ -19,6 +19,8 @@ use crate::pipeline::geometry::{
     FlashExtractConfig, HierarchicalExtractConfig, flash_extract_geometry,
     hierarchical_extract_geometry,
 };
+#[cfg(target_arch = "wasm32")]
+use crate::pipeline::geometry::flash_extract_geometry_async_wasm;
 use crate::pipeline::mesh::{DenseGrid, Mesh, grid_to_mesh, sdf_to_mesh_diff_dmc};
 use crate::readback::tensor_to_vec_f32;
 
@@ -449,13 +451,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             latents,
             &mut on_step,
         );
-        let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
-        let mesh = sdf_to_mesh_diff_dmc(&grid);
-        Ok(TripoSGMeshOutput {
-            latents: output.latents,
-            grid,
-            mesh,
-        })
+        self.extract_flash_mesh_from_latents(output.latents, config)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -479,10 +475,84 @@ impl<B: Backend> TripoSGPipeline<B> {
             None,
             latents,
         );
-        let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        self.extract_flash_mesh_from_latents(output.latents, config)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Generate a mesh with flash extraction from precomputed image embeddings (wasm async).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn sample_mesh_flash_from_embeds_async_wasm(
+        &mut self,
+        image_embeds: Tensor<B, 3>,
+        num_inference_steps: usize,
+        num_tokens: usize,
+        guidance_scale: f32,
+        config: &FlashExtractConfig,
+        latents: Option<Tensor<B, 3>>,
+    ) -> Result<TripoSGMeshOutput<B>, String> {
+        let batch_size = image_embeds.shape().dims::<3>()[0];
+        let output = self.sample_from_embeds(
+            image_embeds,
+            batch_size,
+            num_inference_steps,
+            num_tokens,
+            guidance_scale,
+            None,
+            latents,
+        );
+        self.extract_flash_mesh_from_latents_async_wasm(output.latents, config)
+            .await
+    }
+
+    /// Extract flash geometry/mesh from sampled latents using the canonical native path.
+    pub fn extract_flash_grid_from_latents(
+        &self,
+        latents: Tensor<B, 3>,
+        config: &FlashExtractConfig,
+    ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
+        flash_extract_geometry(latents, &self.vae, config)
+    }
+
+    /// Extract flash geometry/mesh from sampled latents using the canonical native path.
+    pub fn extract_flash_mesh_from_latents(
+        &self,
+        latents: Tensor<B, 3>,
+        config: &FlashExtractConfig,
+    ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
+        let grid = self.extract_flash_grid_from_latents(latents.clone(), config)?;
         let mesh = sdf_to_mesh_diff_dmc(&grid);
         Ok(TripoSGMeshOutput {
-            latents: output.latents,
+            latents,
+            grid,
+            mesh,
+        })
+    }
+
+    /// Extract flash geometry/mesh from sampled latents using async tensor readback on wasm.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn extract_flash_grid_from_latents_async_wasm(
+        &self,
+        latents: Tensor<B, 3>,
+        config: &FlashExtractConfig,
+    ) -> Result<DenseGrid, String> {
+        flash_extract_geometry_async_wasm(latents, &self.vae, config)
+            .await
+            .map_err(|err| format!("flash extraction failed: {err}"))
+    }
+
+    /// Extract flash geometry/mesh from sampled latents using async tensor readback on wasm.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn extract_flash_mesh_from_latents_async_wasm(
+        &self,
+        latents: Tensor<B, 3>,
+        config: &FlashExtractConfig,
+    ) -> Result<TripoSGMeshOutput<B>, String> {
+        let grid = self
+            .extract_flash_grid_from_latents_async_wasm(latents.clone(), config)
+            .await?;
+        let mesh = sdf_to_mesh_diff_dmc(&grid);
+        Ok(TripoSGMeshOutput {
+            latents,
             grid,
             mesh,
         })

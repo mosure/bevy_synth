@@ -22,7 +22,7 @@ use burn_tripo::model::triposg::image_encoder::import::{
     load_dinov2_processor, load_triposg_dinov2_with_policy,
 };
 use burn_tripo::paths::resolve_triposg_weights_root;
-use burn_tripo::pipeline::geometry::{FlashExtractConfig, flash_extract_geometry};
+use burn_tripo::pipeline::geometry::FlashExtractConfig;
 use burn_tripo::pipeline::mesh::{Mesh as TripoMesh, sdf_to_mesh_diff_dmc};
 use burn_tripo::pipeline::runtime_parity::{
     DinoBackendChoice, decimate_tripo_mesh, should_use_cpu_dino_backend, triposg_runtime_profile,
@@ -1343,12 +1343,10 @@ fn run_backend_inference<B: Backend>(
         )),
     );
     let extract_start = Instant::now();
-    let grid = flash_extract_geometry(
-        output.latents.clone(),
-        &state.pipeline.vae,
-        &config.flash_extract,
-    )
-    .map_err(|err| RuntimeError::new(format!("TripoSG geometry extraction failed: {err}")))?;
+    let grid = state
+        .pipeline
+        .extract_flash_grid_from_latents(output.latents.clone(), &config.flash_extract)
+        .map_err(|err| RuntimeError::new(format!("TripoSG geometry extraction failed: {err}")))?;
     progress.stage_completed(
         "triposg.flash_extract",
         None,

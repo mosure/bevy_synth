@@ -441,6 +441,7 @@ pub mod import {
 
     const CANONICAL_DINO_SHORT_EDGE: usize = 256;
     const CANONICAL_DINO_CROP: usize = 224;
+    const CANONICAL_DINO_INPUT_CHANNELS: usize = 3;
     const LEGACY_DINO_SIZE_CAP: usize = 384;
 
     fn should_validate_burnpack() -> bool {
@@ -716,8 +717,8 @@ pub mod import {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         use super::{
-            load_dinov2_preprocess_size, load_dinov2_preprocess_size_from_json_bytes,
-            load_dinov2_processor,
+            load_dinov2_config_from_json_bytes, load_dinov2_preprocess_size,
+            load_dinov2_preprocess_size_from_json_bytes, load_dinov2_processor,
         };
 
         static TEST_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -837,6 +838,19 @@ pub mod import {
 
             let _ = fs::remove_dir_all(root);
         }
+
+        #[test]
+        fn canonicalizes_invalid_dino_num_channels_to_rgb() {
+            let config = load_dinov2_config_from_json_bytes(
+                br#"{
+                    "image_size": 518,
+                    "patch_size": 14,
+                    "num_channels": 7
+                }"#,
+            )
+            .expect("load dino config");
+            assert_eq!(config.input_channels, 3);
+        }
     }
 
     fn load_dinov2_config(weights_path: &Path) -> Option<DinoVisionTransformerConfig> {
@@ -860,7 +874,13 @@ pub mod import {
         let patch_size = config.patch_size.unwrap_or(14);
         let mut dino = DinoVisionTransformerConfig::vitl(Some(image_size), Some(patch_size));
         if let Some(channels) = config.num_channels {
-            dino.input_channels = channels;
+            // TripoSG DINOv2 consumes canonical RGB images; some exported configs
+            // incorrectly report non-RGB channel counts (for example 7).
+            dino.input_channels = if channels == CANONICAL_DINO_INPUT_CHANNELS {
+                channels
+            } else {
+                CANONICAL_DINO_INPUT_CHANNELS
+            };
         }
         Some(dino)
     }
