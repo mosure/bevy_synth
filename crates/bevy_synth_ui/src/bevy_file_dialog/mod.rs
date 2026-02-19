@@ -2,6 +2,11 @@
 
 //! Bevy plugin that allows you to save and load files with file dialogs.
 //!
+//! NOTE: This module is an internalized copy of the standalone
+//! `bevy_file_dialog` crate while upstreaming/publishing is in progress.
+//! Keep behavior aligned with upstream and switch back to the published crate
+//! when available.
+//!
 //! In order to use it you need to add [`FileDialogPlugin`] to your [`App`] with
 //! at least one or more calls to:
 //! - [`FileDialogPlugin::with_save_file::<T>`]
@@ -33,7 +38,7 @@
 //!
 //! [`FileDialog`] can be created by calling [`FileDialogExt::dialog`],
 //! [`FileDialogExt`] as an extension trait implemented for [`Commands`]
-//! and is included in `bevy_file_dialog::prelude`:
+//! and is included in `bevy_synth_ui::bevy_file_dialog::prelude`:
 //!
 //! ```rust
 //! fn system(mut commands: Commands) {
@@ -83,13 +88,13 @@ pub use drop::*;
 
 pub mod prelude {
     //! Prelude containing all types you need for saving/loading files with dialogs.
-    pub use crate::{
+    pub use super::{
         DialogFileDropCanceled, DialogFileDropped, DialogFileLoadCanceled, DialogFileLoaded,
         DialogFileSaveCanceled, DialogFileSaved, FileDialogExt, FileDialogPlugin,
     };
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub use crate::{
+    pub use super::{
         DialogDirectoryPickCanceled, DialogDirectoryPicked, DialogFilePickCanceled,
         DialogFilePicked,
     };

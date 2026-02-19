@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 
-use crate::actions::ActionWorldExt;
+use super::actions::ActionWorldExt;
 
 /// Editor keybinding plugin.
 #[derive(Default)]
@@ -39,12 +39,12 @@ impl Default for Keybindings {
     }
 }
 
-/// A keybinding for an editor [`Action`](crate::actions::Action).
+/// A keybinding for an editor [`Action`](super::actions::Action).
 ///
 /// # Example
 /// This example binds the "load-gltf" action to <kbd>Ctrl</kbd> + <kbd>L</kbd>.
 /// ```no_run
-/// # use bevy_editor_core::prelude::*;
+/// # use bevy_synth_ui::bevy_editor_core::prelude::*;
 /// # use bevy::prelude::*;
 /// # let mut app = App::new();
 /// app.register_keybinding(Keybinding::new("load-gltf", KeyCode::KeyL).ctrl());

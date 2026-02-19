@@ -19,9 +19,23 @@ trellis = ["bevy_synth_runtime/trellis"]
 
 [dependencies]
 bevy = "0.17"
-bevy_editor_core = { version = "0.1.0", path = "../bevy_editor_core" }
 bevy_mesh = "0.17"
 bevy_picking = "0.17"
-bevy_file_dialog = { version = "0.9.1", path = "../bevy_file_dialog" }
-bevy_synth_runtime = { version = "0.1.0", path = "../bevy_synth_runtime", default-features = false }
+bevy_synth_runtime = { version = "0.1.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
+crossbeam-channel = "0.5"
+bevy_tasks = { version = "0.17", features = ["multi_threaded"] }
+bevy_app = { version = "0.17", default-features = false }
+bevy_ecs = { version = "0.17", default-features = false }
+bevy_utils = "0.17"
+bevy_window = { version = "0.17", default-features = false }
+bevy_winit = { version = "0.17" }
+bevy_derive = "0.17"
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["DataTransfer", "Document", "DragEvent", "EventTarget", "File", "FileList", "Window"] }
 

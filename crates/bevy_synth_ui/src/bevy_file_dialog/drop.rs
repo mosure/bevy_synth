@@ -20,9 +20,9 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{Document, DragEvent};
 
-use crate::FileDialogPlugin;
+use super::FileDialogPlugin;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::WakeUpOnDrop;
+use super::WakeUpOnDrop;
 
 /// Marker trait saying that data can be loaded from dropped files.
 pub trait DropFileContents: Send + Sync + 'static {}

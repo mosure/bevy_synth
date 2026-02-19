@@ -10,9 +10,6 @@ members = [
   "crates/bevy_synth_runtime",
   "crates/bevy_synth_ui",
   "crates/burn_foreground",
-  "crates/bevy_file_dialog",
-  "crates/bevy_editor_core",
-  "crates/bevy_transform_gizmos",
   "crates/burn_synth_mcp",
 ]
 

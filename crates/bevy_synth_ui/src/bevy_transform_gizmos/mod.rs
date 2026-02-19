@@ -2,6 +2,11 @@
 //! allow you to manipulate the transforms of entities.
 #![allow(clippy::type_complexity)]
 //!
+//! NOTE: This module is an internalized copy of the standalone
+//! `bevy_transform_gizmos` crate while upstreaming/publishing is in progress.
+//! Keep behavior aligned with upstream and switch back to the published crate
+//! when available.
+//!
 //! # Usage
 //!
 //! You must add the [`TransformGizmoPlugin`] to the app.
@@ -9,14 +14,14 @@
 //! Then you can add the [`GizmoCamera`] marker component to a camera,
 //! and the [`GizmoTransformable`] marker to the entities you want to manipulate.
 //!
-//! Then, when these entities are selected via [`bevy_editor_core::selection`] the
+//! Then, when these entities are selected via [`crate::bevy_editor_core::selection`] the
 //! transform gizmo will appear and allow you to move and rotate your selection.
 
 use bevy::camera::Projection;
 use bevy::picking::prelude::{MeshPickingPlugin, Pickable};
 use bevy::picking::{backend::ray::RayMap, pointer::PointerId};
 use bevy::{prelude::*, transform::TransformSystems};
-use bevy_editor_core::selection::EditorSelection;
+use crate::bevy_editor_core::selection::EditorSelection;
 use mesh::{RotationGizmo, ViewTranslateGizmo};
 
 use normalization::*;
@@ -26,7 +31,7 @@ pub mod normalization;
 
 /// Crate prelude.
 pub mod prelude {
-    pub use crate::{GizmoCamera, GizmoMode, TransformGizmoPlugin, TransformGizmoSettings};
+    pub use super::{GizmoCamera, GizmoMode, TransformGizmoPlugin, TransformGizmoSettings};
 }
 
 /// Set enum for the systems relating to transform gizmos.

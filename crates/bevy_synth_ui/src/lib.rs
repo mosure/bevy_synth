@@ -6,9 +6,26 @@ use bevy::prelude::*;
 use bevy::render::alpha::AlphaMode;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::window::PrimaryWindow;
-use bevy_file_dialog::prelude::FileDialogExt;
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
+
+/// Internalized editor-core module.
+///
+/// TODO: switch this module to the upstream published `bevy_editor_core` crate
+/// once the external crate is finalized and versioned for this repository.
+pub mod bevy_editor_core;
+/// Internalized file-dialog module.
+///
+/// TODO: switch this module to the upstream published `bevy_file_dialog` crate
+/// once the external crate is finalized and versioned for this repository.
+pub mod bevy_file_dialog;
+/// Internalized transform-gizmos module.
+///
+/// TODO: switch this module to the upstream published `bevy_transform_gizmos` crate
+/// once the external crate is finalized and versioned for this repository.
+pub mod bevy_transform_gizmos;
+
+use crate::bevy_file_dialog::prelude::FileDialogExt;
 
 use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest, UiStatus};
 

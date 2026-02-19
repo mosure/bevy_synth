@@ -41,10 +41,10 @@ use bevy::render::settings::{Backends, WgpuSettings};
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
-use bevy_editor_core::selection::{
+use bevy_synth_ui::bevy_editor_core::selection::{
     EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
 };
-use bevy_file_dialog::prelude::{
+use bevy_synth_ui::bevy_file_dialog::prelude::{
     DialogFileDropped, DialogFileLoaded, FileDialogExt, FileDialogPlugin,
 };
 use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -55,10 +55,11 @@ use bevy_picking::hover::PickingInteraction;
 use bevy_picking::input::PointerInputPlugin;
 use bevy_picking::prelude::MeshPickingSettings;
 use bevy_picking::prelude::{MeshPickingCamera, Pickable};
-use bevy_transform_gizmos::TransformGizmoSystems;
-use bevy_transform_gizmos::prelude::GizmoCamera;
-use bevy_transform_gizmos::prelude::TransformGizmoPlugin;
-use bevy_transform_gizmos::{GizmoTransformable, TransformGizmo};
+use bevy_synth_ui::bevy_transform_gizmos;
+use bevy_synth_ui::bevy_transform_gizmos::TransformGizmoSystems;
+use bevy_synth_ui::bevy_transform_gizmos::prelude::GizmoCamera;
+use bevy_synth_ui::bevy_transform_gizmos::prelude::TransformGizmoPlugin;
+use bevy_synth_ui::bevy_transform_gizmos::{GizmoTransformable, TransformGizmo};
 use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;

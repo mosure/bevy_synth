@@ -1,6 +1,6 @@
 use std::f32::consts::TAU;
 
-use crate::{InteractionKind, InternalGizmoCamera, ScaleGizmo, TransformGizmo, TranslationGizmo};
+use super::{InteractionKind, InternalGizmoCamera, ScaleGizmo, TransformGizmo, TranslationGizmo};
 use bevy::{
     camera::{Camera3dDepthLoadOp, visibility::RenderLayers},
     light::NotShadowCaster,

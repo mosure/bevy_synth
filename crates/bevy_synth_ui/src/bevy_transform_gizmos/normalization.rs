@@ -3,7 +3,7 @@
 
 use bevy::{camera::Camera, prelude::*, transform::TransformSystems};
 
-use crate::{GizmoCamera, TransformGizmoSettings, TransformGizmoSystems};
+use super::{GizmoCamera, TransformGizmoSettings, TransformGizmoSystems};
 
 /// Plugin for normalizing the size of a 3d object in the camera's view.
 pub struct Ui3dNormalizationPlugin;

@@ -8,7 +8,7 @@ use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper, WakeUp};
 use crossbeam_channel::bounded;
 use rfd::AsyncFileDialog;
 
-use crate::{
+use super::{
     handle_dialog_result, DialogResult, FileDialog, FileDialogPlugin, StreamReceiver, StreamSender,
     WakeUpOnDrop,
 };

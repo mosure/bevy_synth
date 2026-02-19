@@ -23,7 +23,7 @@ use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
 use bevy_synth_runtime::{SynthMesh, TripoMesh};
-use bevy_transform_gizmos::GizmoTransformable;
+use bevy_synth_ui::bevy_transform_gizmos::GizmoTransformable;
 
 static TEST_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
 

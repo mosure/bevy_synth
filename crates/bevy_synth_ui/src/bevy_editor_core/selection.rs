@@ -5,7 +5,7 @@ use bevy::{
     prelude::*,
 };
 
-use crate::utils::DragCancelClick;
+use super::utils::DragCancelClick;
 
 /// Editor selection plugin.
 #[derive(Default)]
@@ -164,7 +164,7 @@ pub fn remove_entity_from_selection_if_despawned(
 pub mod common_conditions {
     use bevy::prelude::*;
 
-    use crate::prelude::EditorSelection;
+    use super::super::prelude::EditorSelection;
 
     /// True if the primary [`EditorSelection`] changed.
     pub fn primary_selection_changed(
