@@ -325,7 +325,7 @@ fn wasm_virtual_upload_path(file_name: &str, request_id: u32) -> std::path::Path
     if sanitized.is_empty() {
         sanitized.push_str("upload_image");
     }
-    std::path::PathBuf::from(format!("uploaded/{request_id:08}_{sanitized}"))
+    std::path::PathBuf::from(format!("uploaded/{request_id:03}_{sanitized}"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
