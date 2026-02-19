@@ -3,6 +3,7 @@
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use std::sync::Once;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::Instant;
 
 use burn_synth::pipeline::ModelSelection;
@@ -13,14 +14,27 @@ use burn_synth::runtime::{
     DinoBackend as RuntimeDinoBackend, InferenceBackend, MeshRequest, RuntimeConfig, SynthRuntime,
     TrellisQuality as RuntimeTrellisQuality,
 };
+use burn_synth::set_bootstrap_status_callback;
 use burn_synth::{ForegroundModel, ImageSource, SynthesisModel};
 
 use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
-use crate::state::{InferenceRequest, WorkerCommand, WorkerEvent};
+use crate::state::{
+    InferenceRequest, WASM_STATUS_LOADING_MODELS, WASM_STATUS_MODEL_LOAD_FAILED_PREFIX,
+    WASM_STATUS_MODEL_READY, WorkerCommand, WorkerEvent,
+};
 use crate::worker::WorkerWakeCallback;
 use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture, TripoMesh};
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
+
+fn send_worker_status(event_tx: &Sender<WorkerEvent>, message: impl Into<String>) {
+    let _ = event_tx.send(WorkerEvent {
+        requests: Vec::new(),
+        results: Vec::new(),
+        elapsed: Default::default(),
+        status_message: Some(message.into()),
+    });
+}
 
 pub(crate) fn validate_canonical_runtime_args(args: &AppArgs) -> Result<(), String> {
     if args.prompt.is_some() || args.text_embeds.is_some() || args.scribble_weights_root.is_some() {
@@ -44,9 +58,21 @@ pub(crate) fn worker_loop_shared_runtime(
     event_tx: Sender<WorkerEvent>,
     wake_callback: Option<WorkerWakeCallback>,
 ) {
-    let mut runtime = match build_runtime(&args) {
+    send_worker_status(&event_tx, WASM_STATUS_LOADING_MODELS);
+    let bootstrap_event_tx = event_tx.clone();
+    set_bootstrap_status_callback(Some(Arc::new(move |message| {
+        send_worker_status(&bootstrap_event_tx, message);
+    })));
+    let runtime_result = build_runtime(&args);
+    set_bootstrap_status_callback(None);
+
+    let mut runtime = match runtime_result {
         Ok(runtime) => runtime,
         Err(err) => {
+            send_worker_status(
+                &event_tx,
+                format!("{WASM_STATUS_MODEL_LOAD_FAILED_PREFIX} {err}"),
+            );
             for command in command_rx {
                 match command {
                     WorkerCommand::Warmup => {}
@@ -69,6 +95,7 @@ pub(crate) fn worker_loop_shared_runtime(
             return;
         }
     };
+    send_worker_status(&event_tx, WASM_STATUS_MODEL_READY);
 
     for command in command_rx {
         match command {

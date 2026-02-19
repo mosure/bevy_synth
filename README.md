@@ -1,10 +1,10 @@
 # bevy_synth 🕊️🔥🎛️🎹
 
-[![GitHub License](https://img.shields.io/github/license/mosure/lattice)](https://raw.githubusercontent.com/mosure/lattice/main/LICENSE-MIT)
-[![crates.io](https://img.shields.io/crates/v/lattice.svg)](https://crates.io/crates/lattice)
+[![GitHub License](https://img.shields.io/github/license/mosure/bevy_synth)](https://raw.githubusercontent.com/mosure/bevy_synth/main/LICENSE-MIT)
+[![crates.io](https://img.shields.io/crates/v/bevy_synth.svg)](https://crates.io/crates/bevy_synth)
 
 
-asset synthesis implemented in bevy and burn, view the [live demo](https://mosure.github.io/lattice/)
+asset synthesis implemented in bevy and burn, view the [live demo](https://mosure.github.io/bevy_synth/)
 
 
 ## example

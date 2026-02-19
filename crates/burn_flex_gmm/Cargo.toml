@@ -2,8 +2,14 @@
 name = "burn_flex_gmm"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
 description = "Sparse submanifold convolution kernels and FlexGMM-style gather+GEMM helpers."
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [features]
 default = []

@@ -90,6 +90,7 @@
       const startButton = document.getElementById("boot-start");
       let started = false;
       let wasm = null;
+      let warmupPollActive = false;
 
       const moduleUrl = "./out/bevy_synth.js";
       const wasmUrl = "./out/bevy_synth_bg.wasm";
@@ -109,11 +110,42 @@
           wasm = mod;
           window.__burnSynthWasm = wasm;
           window.__burnSynthWasmReady = true;
-          text.textContent = "module ready";
-          setTimeout(() => boot.remove(), 1200);
+          text.textContent = "module ready. waiting for model warmup...";
+
+          const pollWarmup = () => {
+            if (!warmupPollActive) return;
+            const state = String(window.__bevySynthWarmupState || "");
+            const message = String(window.__bevySynthWarmupMessage || "");
+            if (message) {
+              text.textContent = message;
+            } else if (state === "requested" || state === "loading") {
+              text.textContent = "loading model weights...";
+            } else if (state === "ready") {
+              text.textContent = "model warmup complete";
+            } else if (state === "failed") {
+              text.textContent = "model warmup failed (see console logs)";
+            }
+
+            if (state === "ready") {
+              warmupPollActive = false;
+              setTimeout(() => boot.remove(), 600);
+              return;
+            }
+            if (state === "failed") {
+              warmupPollActive = false;
+              startButton.disabled = false;
+              started = false;
+              return;
+            }
+            requestAnimationFrame(pollWarmup);
+          };
+
+          warmupPollActive = true;
+          requestAnimationFrame(pollWarmup);
         } catch (err) {
           console.error("failed to initialize bevy_synth wasm", err);
           text.textContent = "failed to load wasm module";
+          warmupPollActive = false;
           startButton.disabled = false;
           started = false;
         }

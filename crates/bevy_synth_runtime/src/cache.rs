@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::env;
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
@@ -239,6 +241,7 @@ impl MeshCache {
     pub fn load_default() -> CacheResult<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            migrate_legacy_native_cache_root()?;
             Self::load_from_root(default_native_cache_root())
         }
         #[cfg(target_arch = "wasm32")]
@@ -616,7 +619,43 @@ fn mesh_to_glb(mesh: &SynthMesh) -> CacheResult<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn default_native_cache_root() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".burn_synth").join("cache"))
+        .unwrap_or_else(legacy_native_cache_root)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn legacy_native_cache_root() -> PathBuf {
     PathBuf::from(".burn_synth_cache")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn migrate_legacy_native_cache_root() -> CacheResult<()> {
+    let legacy_root = legacy_native_cache_root();
+    if !legacy_root.exists() {
+        return Ok(());
+    }
+    let target_root = default_native_cache_root();
+    if target_root == legacy_root || target_root.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target_root.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CacheError::Io(format!(
+                "failed to create cache directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::rename(&legacy_root, &target_root).map_err(|err| {
+        CacheError::Io(format!(
+            "failed to migrate legacy cache {} -> {}: {err}",
+            legacy_root.display(),
+            target_root.display()
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: deploy-pages-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pages: write
@@ -32,21 +36,21 @@ jobs:
 
       - name: build web app
         env:
-          # Build-time-only vars embedded into wasm via option_env!.
-          # Canonical hosted model base URL (matches web bundle model directory structure).
-          MODEL_BASE_URL: https://aberration.technology/model
           # Optional burnpack safety cap (bytes) for browser downloads; leave empty to use default (1 GiB).
-          BURN_SYNTH_WEB_MAX_BPK_BYTES: ${{ vars.BURN_SYNTH_WEB_MAX_BPK_BYTES || secrets.BURN_SYNTH_WEB_MAX_BPK_BYTES }}
-          # Explicit hosted model roots (no vars/secrets URL indirection).
-          # Supports plain .bpk and parts manifests (*.bpk.parts.json + *.bpk.part-*).
-          TRIPOSG_WEIGHTS_ROOT: ${{ format('{0}/MIDI-3D', env.MODEL_BASE_URL) }}
-          TRIPOSG_SCRIBBLE_WEIGHTS_ROOT: ${{ format('{0}/TripoSG-scribble', env.MODEL_BASE_URL) }}
-          RMBG14_WEIGHTS_ROOT: ${{ format('{0}/RMBG-1.4', env.MODEL_BASE_URL) }}
-          RMBG2_WEIGHTS_ROOT: ${{ format('{0}/RMBG-2.0', env.MODEL_BASE_URL) }}
-          RMBG_WEIGHTS_ROOT: ${{ format('{0}/RMBG-1.4', env.MODEL_BASE_URL) }}
-          TRELLIS2_WEIGHTS_ROOT: ${{ format('{0}/TRELLIS.2-4B', env.MODEL_BASE_URL) }}
-          TRELLIS2_IMAGE_LARGE_ROOT: ${{ format('{0}/TRELLIS-image-large', env.MODEL_BASE_URL) }}
+          BURN_SYNTH_WEB_MAX_BPK_BYTES: ${{ vars.BURN_SYNTH_WEB_MAX_BPK_BYTES || secrets.BURN_SYNTH_WEB_MAX_BPK_BYTES || '' }}
         run: |
+          # Asset/model root URLs are baked into the wasm binaries.
+          # Keep workflow builds deterministic by disallowing URL/root overrides here.
+          unset MODEL_BASE_URL
+          unset TRIPOSG_WEIGHTS_ROOT
+          unset TRIPOSG_SCRIBBLE_WEIGHTS_ROOT
+          unset RMBG14_WEIGHTS_ROOT
+          unset RMBG2_WEIGHTS_ROOT
+          unset RMBG_WEIGHTS_ROOT
+          unset TRELLIS2_WEIGHTS_ROOT
+          unset TRELLIS2_IMAGE_LARGE_ROOT
+          unset BURN_SYNTH_WEB_ASSET_ROOT
+
           unset RUSTFLAGS
           unset CARGO_ENCODED_RUSTFLAGS
           unset CARGO_BUILD_RUSTFLAGS

@@ -3,7 +3,13 @@ name = "burn_trellis"
 description = "Trellis2 integration utilities and runtime scaffolding for burn_synth"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [features]
 default = []
@@ -28,9 +34,9 @@ memmap2 = { version = "0.9", optional = true }
 matrixmultiply = { version = "0.3", optional = true }
 
 burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
-burn_flex_gmm = { path = "../burn_flex_gmm", optional = true }
+burn_flex_gmm = { version = "0.1.0", path = "../burn_flex_gmm", optional = true }
 burn-store = { version = "0.19", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
-burn_synth_import = { path = "../burn_synth_import", optional = true }
+burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
 

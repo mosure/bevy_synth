@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 description = "UI plugin and catalog interactions for bevy_synth"
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [features]
 default = ["triposg"]
@@ -13,9 +19,9 @@ trellis = ["bevy_synth_runtime/trellis"]
 
 [dependencies]
 bevy = "0.17"
-bevy_editor_core = { path = "../bevy_editor_core" }
+bevy_editor_core = { version = "0.1.0", path = "../bevy_editor_core" }
 bevy_mesh = "0.17"
 bevy_picking = "0.17"
-bevy_file_dialog = { path = "../bevy_file_dialog" }
-bevy_synth_runtime = { path = "../bevy_synth_runtime", default-features = false }
+bevy_file_dialog = { version = "0.9.1", path = "../bevy_file_dialog" }
+bevy_synth_runtime = { version = "0.1.0", path = "../bevy_synth_runtime", default-features = false }
 

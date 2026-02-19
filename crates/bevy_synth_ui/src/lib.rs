@@ -10,7 +10,7 @@ use bevy_file_dialog::prelude::FileDialogExt;
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
 
-use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest};
+use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest, UiStatus};
 
 const PANEL_WIDTH: f32 = 336.0;
 const MENU_HEIGHT: f32 = 44.0;
@@ -677,6 +677,7 @@ fn setup_ui(mut commands: Commands) {
 #[allow(clippy::type_complexity)]
 fn update_queue_text(
     queue: Res<InferenceQueue>,
+    status: Option<Res<UiStatus>>,
     mut query: Query<(&mut Text, &mut TextColor), With<QueueText>>,
     mut dots: Query<&mut BackgroundColor, (With<QueueStatusDot>, Without<QueueStatusBadge>)>,
     mut badges: Query<
@@ -685,7 +686,32 @@ fn update_queue_text(
     >,
 ) {
     let (text, text_color, dot_color, badge_bg, badge_border) =
-        if let Some(active) = queue.active.as_ref() {
+        if let Some(worker_message) = status.as_ref().and_then(|state| state.worker_message.as_ref()) {
+            let is_failure = worker_message.to_ascii_lowercase().contains("failed");
+            (
+                worker_message.clone(),
+                if is_failure {
+                    Color::srgb(0.96, 0.72, 0.72)
+                } else {
+                    Color::srgb(0.76, 0.86, 0.98)
+                },
+                if is_failure {
+                    Color::srgb(0.86, 0.28, 0.28)
+                } else {
+                    STATUS_PENDING
+                },
+                if is_failure {
+                    Color::srgb(0.22, 0.1, 0.1)
+                } else {
+                    Color::srgb(0.08, 0.15, 0.2)
+                },
+                if is_failure {
+                    Color::srgb(0.58, 0.23, 0.23)
+                } else {
+                    Color::srgb(0.2, 0.4, 0.55)
+                },
+            )
+        } else if let Some(active) = queue.active.as_ref() {
             let name = if active.len() == 1 {
                 active[0]
                     .image_path

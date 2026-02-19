@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 description = "bevy media synthesis plugin"
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [features]
 default = ["wgpu", "triposg"]
@@ -22,14 +28,14 @@ bevy_panorbit_camera = "0.33.0"
 bevy_infinite_grid = "0.17"
 bevy_mesh = "0.17"
 bevy_picking = { version = "0.17", features = ["bevy_mesh_picking_backend"] }
-bevy_file_dialog = { path = "../bevy_file_dialog" }
-bevy_editor_core = { path = "../bevy_editor_core" }
-bevy_transform_gizmos = { path = "../bevy_transform_gizmos" }
+bevy_file_dialog = { version = "0.9.1", path = "../bevy_file_dialog" }
+bevy_editor_core = { version = "0.1.0", path = "../bevy_editor_core" }
+bevy_transform_gizmos = { version = "0.1.0", path = "../bevy_transform_gizmos" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bevy_synth_runtime = { path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
-bevy_synth_ui = { path = "../bevy_synth_ui" }
+bevy_synth_runtime = { version = "0.1.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
+bevy_synth_ui = { version = "0.1.0", path = "../bevy_synth_ui" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"

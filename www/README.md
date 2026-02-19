@@ -1,4 +1,4 @@
-# lattice web 🕊️🔥🎛️🎹
+# bevy_synth web 🕊️🔥🎛️🎹
 
 - build `bevy_synth` wasm with the canonical web profile:
   - `cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release --features wgpu,triposg`

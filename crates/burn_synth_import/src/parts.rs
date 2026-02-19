@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ pub struct BurnpackPartsManifest {
     pub version: u32,
     #[serde(default)]
     pub source_file: String,
+    #[serde(default)]
+    pub source_modified_unix_ms: u64,
     #[serde(default)]
     pub total_bytes: u64,
     #[serde(default)]
@@ -99,8 +102,12 @@ pub fn write_burnpack_parts_for_wasm(
     let total_bytes = fs::metadata(burnpack_path)
         .map_err(|err| format!("failed to read {} metadata: {err}", burnpack_path.display()))?
         .len();
+    let source_modified_unix_ms = file_modified_unix_ms(burnpack_path).unwrap_or(0);
     let manifest_path = burnpack_parts_manifest_path(burnpack_path);
-    if manifest_path.exists() && !overwrite && manifest_has_all_parts(&manifest_path) {
+    if manifest_path.exists()
+        && !overwrite
+        && manifest_has_all_parts(&manifest_path, Some(burnpack_path))
+    {
         let manifest = read_parts_manifest(&manifest_path)?;
         let part_paths = manifest
             .parts
@@ -198,6 +205,7 @@ pub fn write_burnpack_parts_for_wasm(
     let manifest = BurnpackPartsManifest {
         version: default_manifest_version(),
         source_file: source_file_name.to_string(),
+        source_modified_unix_ms,
         total_bytes,
         max_part_bytes,
         parts: part_entries,
@@ -240,12 +248,22 @@ where
     Init: FnMut() -> M,
     Apply: FnMut(&mut M, Vec<u8>) -> Result<(), String>,
 {
+    let any_candidate_exists = burnpack_candidates
+        .iter()
+        .any(|candidate| candidate.exists());
+
     for candidate in burnpack_candidates {
+        if any_candidate_exists && !candidate.exists() {
+            continue;
+        }
         let manifest_path = burnpack_parts_manifest_path(candidate);
         if !manifest_path.exists() {
             continue;
         }
         let manifest = read_parts_manifest(&manifest_path)?;
+        if candidate.exists() && !manifest_matches_source_file(&manifest, candidate) {
+            continue;
+        }
         if manifest.parts.is_empty() {
             return Err(format!(
                 "burnpack parts manifest {} contains no parts for {label}",
@@ -532,17 +550,68 @@ pub fn resolve_part_entry_path(manifest_path: &Path, entry_path: &str) -> Result
         .ok_or_else(|| format!("invalid manifest path '{}'", manifest_path.display()))
 }
 
-fn manifest_has_all_parts(path: &Path) -> bool {
+fn manifest_has_all_parts(path: &Path, source_burnpack_path: Option<&Path>) -> bool {
     let Ok(manifest) = read_parts_manifest(path) else {
         return false;
     };
     if manifest.parts.is_empty() {
         return false;
     }
-    manifest
-        .parts
-        .iter()
-        .all(|entry| resolve_part_entry_path(path, &entry.path).is_ok_and(|part| part.exists()))
+    if let Some(source_burnpack_path) = source_burnpack_path
+        && source_burnpack_path.exists()
+        && !manifest_matches_source_file(&manifest, source_burnpack_path)
+    {
+        return false;
+    }
+    manifest.parts.iter().all(|entry| {
+        resolve_part_entry_path(path, &entry.path).is_ok_and(|part| {
+            if !part.exists() {
+                return false;
+            }
+            if entry.bytes == 0 {
+                return true;
+            }
+            fs::metadata(&part)
+                .map(|metadata| metadata.len() == entry.bytes)
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn manifest_matches_source_file(manifest: &BurnpackPartsManifest, source_path: &Path) -> bool {
+    if !source_path.exists() {
+        return true;
+    }
+
+    let Some(source_file_name) = source_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !manifest.source_file.is_empty() && manifest.source_file != source_file_name {
+        return false;
+    }
+
+    let actual_bytes = match fs::metadata(source_path) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return false,
+    };
+    if manifest.total_bytes > 0 && manifest.total_bytes != actual_bytes {
+        return false;
+    }
+
+    if manifest.source_modified_unix_ms == 0 {
+        return false;
+    }
+    let Some(actual_modified_unix_ms) = file_modified_unix_ms(source_path) else {
+        return false;
+    };
+    manifest.source_modified_unix_ms == actual_modified_unix_ms
+}
+
+fn file_modified_unix_ms(path: &Path) -> Option<u64> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_millis().min(u64::MAX as u128) as u64)
 }
 
 fn cleanup_existing_parts(manifest_path: &Path) -> Result<(), String> {
@@ -568,7 +637,7 @@ fn cleanup_existing_parts(manifest_path: &Path) -> Result<(), String> {
 mod tests {
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -585,20 +654,33 @@ mod tests {
         env::temp_dir().join(format!("burnpack_parts_loader_test_{nanos}"))
     }
 
+    fn file_modified_unix_ms_for_test(path: &Path) -> u64 {
+        fs::metadata(path)
+            .expect("source metadata")
+            .modified()
+            .expect("source modified")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime should be after unix epoch")
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
+
     #[test]
     fn loads_parts_from_manifest_when_present() {
         let root = unique_tmp_dir();
         fs::create_dir_all(&root).expect("create temp root");
         let candidate = root.join("model.bpk");
-        fs::write(&candidate, b"placeholder").expect("write candidate");
+        fs::write(&candidate, b"abcdef").expect("write candidate");
         let part0 = root.join("model.bpk.part-00000.bpk");
         let part1 = root.join("model.bpk.part-00001.bpk");
         fs::write(&part0, b"aaa").expect("write part0");
         fs::write(&part1, b"bbb").expect("write part1");
 
+        let source_modified_unix_ms = file_modified_unix_ms_for_test(&candidate);
         let manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model.bpk".to_string(),
+            source_modified_unix_ms,
             total_bytes: 6,
             max_part_bytes: 3,
             parts: vec![
@@ -671,13 +753,15 @@ mod tests {
         let root = unique_tmp_dir();
         fs::create_dir_all(&root).expect("create temp root");
         let candidate = root.join("model.bpk");
-        fs::write(&candidate, b"placeholder").expect("write candidate");
+        fs::write(&candidate, b"abc").expect("write candidate");
         let part0 = root.join("model.bpk.part-00000.bpk");
         fs::write(&part0, b"aaa").expect("write part0");
 
+        let source_modified_unix_ms = file_modified_unix_ms_for_test(&candidate);
         let manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model.bpk".to_string(),
+            source_modified_unix_ms,
             total_bytes: 3,
             max_part_bytes: 3,
             parts: vec![BurnpackPartEntry {
@@ -707,6 +791,123 @@ mod tests {
         .expect_err("checksum should fail");
 
         assert!(err.contains("checksum mismatch"), "unexpected error: {err}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn prefers_manifest_for_existing_candidate_over_orphan_candidate_manifest() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let missing_candidate = root.join("model_f16.bpk");
+        let existing_candidate = root.join("model.bpk");
+        fs::write(&existing_candidate, b"source").expect("write existing candidate");
+
+        let bad_part = root.join("model_f16.bpk.part-00000.bpk");
+        fs::write(&bad_part, b"bad").expect("write bad part");
+        let bad_manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model_f16.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: 0,
+            max_part_bytes: 3,
+            parts: vec![BurnpackPartEntry {
+                path: "model_f16.bpk.part-00000.bpk".to_string(),
+                bytes: 3,
+                sha256: sha256_bytes(b"bad"),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&missing_candidate),
+            serde_json::to_vec(&bad_manifest).expect("serialize bad manifest"),
+        )
+        .expect("write bad manifest");
+
+        let good_part = root.join("model.bpk.part-00000.bpk");
+        fs::write(&good_part, b"good").expect("write good part");
+        let good_manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: file_modified_unix_ms_for_test(&existing_candidate),
+            total_bytes: 6,
+            max_part_bytes: 4,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: 4,
+                sha256: sha256_bytes(b"good"),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&existing_candidate),
+            serde_json::to_vec(&good_manifest).expect("serialize good manifest"),
+        )
+        .expect("write good manifest");
+
+        let loaded = load_model_from_burnpack_parts(
+            &[missing_candidate, existing_candidate],
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect("load parts")
+        .expect("parts should load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], b"good");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_manifest_is_ignored_when_candidate_exists() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let candidate = root.join("model.bpk");
+        fs::write(&candidate, b"source").expect("write candidate");
+        let part0 = root.join("model.bpk.part-00000.bpk");
+        fs::write(&part0, b"good").expect("write part");
+
+        let stale_manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: file_modified_unix_ms_for_test(&candidate).saturating_sub(1),
+            total_bytes: 6,
+            max_part_bytes: 4,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: 4,
+                sha256: sha256_bytes(b"good"),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&candidate),
+            serde_json::to_vec(&stale_manifest).expect("serialize stale manifest"),
+        )
+        .expect("write stale manifest");
+
+        let loaded = load_model_from_burnpack_parts(
+            std::slice::from_ref(&candidate),
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect("load parts");
+        assert!(
+            loaded.is_none(),
+            "stale parts manifest should be ignored when source burnpack exists"
+        );
+
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }

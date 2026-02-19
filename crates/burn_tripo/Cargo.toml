@@ -3,20 +3,13 @@ name = "burn_tripo"
 description = "TripoSG(-scribble) implemented in burn"
 version = "0.1.0"
 edition = "2024"
-authors = ["mosure <mitchell@mosure.me>"]
-license = "MIT OR Apache-2.0"
-keywords = [
-  "burn",
-  "triposg",
-  "scribble",
-  "vit",
-]
-categories = [
-  "computer-vision",
-]
-homepage = "https://github.com/mosure/burn_synth"
-repository = "https://github.com/mosure/burn_synth"
-readme = "../../README.md"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
 exclude = [
   ".devcontainer",
   ".github",
@@ -40,9 +33,9 @@ report = []
 
 [dependencies]
 burn_dino = { version = "0.6", default-features = false, features = ["backend_ndarray"] }
-burn_foreground = { path = "../burn_foreground", features = ["import"], optional = true }
+burn_foreground = { version = "0.1.0", path = "../burn_foreground", features = ["import"], optional = true }
 burn-store = { version = "0.19", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
-burn_synth_import = { path = "../burn_synth_import", optional = true }
+burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
 bevy_args = { version = "2.0", optional = true }
 bytemuck = "1.25"
 marching-cubes = "0.1.2"
@@ -114,7 +107,7 @@ criterion = { version = "0.6", features = ["html_reports"] }
 futures-intrusive = { version = "0.5.0" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = { version = "0.4.0" }
-burn_foreground = { path = "../burn_foreground", features = ["import"] }
+burn_foreground = { version = "0.1.0", path = "../burn_foreground", features = ["import"] }
 
 
 [lib]

@@ -3,6 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,10 @@ const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 45;
 const DOWNLOAD_WRITE_TIMEOUT_SECS: u64 = 45;
 const DOWNLOAD_PROGRESS_LOG_EVERY_SECS: u64 = 10;
 
+type BootstrapStatusCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
+static BOOTSTRAP_STATUS_CALLBACK: OnceLock<Mutex<Option<BootstrapStatusCallback>>> =
+    OnceLock::new();
+
 const TRIPOSG_OPTIONAL_TEXT_RELPATHS: &[&str] = &[
     "vae/config.json",
     "transformer/config.json",
@@ -44,6 +49,24 @@ const TRIPOSG_REQUIRED_PARTS_BASES: &[&str] = &[
 
 const RMBG14_OPTIONAL_TEXT_RELPATHS: &[&str] = &["config.json", "preprocessor_config.json"];
 const RMBG14_REQUIRED_PARTS_BASES: &[&str] = &["model.safetensors"];
+
+pub fn set_bootstrap_status_callback(callback: Option<BootstrapStatusCallback>) {
+    let lock = BOOTSTRAP_STATUS_CALLBACK.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = callback;
+    }
+}
+
+fn emit_status(message: impl Into<String>) {
+    let message = message.into();
+    info!("{message}");
+    let lock = BOOTSTRAP_STATUS_CALLBACK.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = lock.lock()
+        && let Some(callback) = guard.as_ref()
+    {
+        callback(message);
+    }
+}
 
 pub(crate) fn resolve_or_bootstrap_triposg_root(prefer_f16: bool) -> Result<PathBuf, String> {
     let cache_root = default_cache_models_root();
@@ -126,7 +149,10 @@ fn ensure_model_ready(
         ensure_parts_bundle(local_root, remote_root, base, prefer_f16, label)?;
     }
 
-    info!("{label} weights ready under {}", local_root.display());
+    emit_status(format!(
+        "{label} weights ready under {}",
+        local_root.display()
+    ));
     Ok(())
 }
 
@@ -167,27 +193,28 @@ fn ensure_parts_bundle(
             }
             let part_url = resolve_manifest_entry_url(&manifest_url, &part.path);
             let part_number = index + 1;
-            info!(
+            emit_status(format!(
                 "Downloading {label} part {part_number}/{part_count}: {} -> {} (expected_bytes={})",
                 part_url,
                 local_part_path.display(),
                 part.bytes
-            );
-            let downloaded = download_part_file(&part_url, &local_part_path, part).map_err(|err| {
-                format!(
-                    "failed downloading {label} part {part_number}/{part_count} ({}): {err}",
-                    part.path
-                )
-            })?;
-            info!(
+            ));
+            let downloaded =
+                download_part_file(&part_url, &local_part_path, part).map_err(|err| {
+                    format!(
+                        "failed downloading {label} part {part_number}/{part_count} ({}): {err}",
+                        part.path
+                    )
+                })?;
+            emit_status(format!(
                 "Downloaded {label} part {part_number}/{part_count}: {} bytes -> {}",
                 downloaded,
                 local_part_path.display()
-            );
+            ));
         }
 
         if manifest_is_complete(&local_manifest_path)? {
-            info!("Downloaded {label} parts manifest {}", manifest_url);
+            emit_status(format!("Downloaded {label} parts manifest {manifest_url}"));
             return Ok(());
         }
     }
@@ -246,7 +273,7 @@ fn sync_optional_text_file(
         return Ok(());
     };
     write_file_atomically(&local_path, &bytes)?;
-    info!("Downloaded model metadata {}", url);
+    emit_status(format!("Downloaded model metadata {url}"));
     Ok(())
 }
 
@@ -270,11 +297,13 @@ fn download_part_file(
                     ));
                 }
                 let delay = retry_delay(attempt);
-                warn!(
+                let retry_message = format!(
                     "Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for {}: {err}; retrying in {:.1}s",
                     destination.display(),
                     delay.as_secs_f64()
                 );
+                warn!("{retry_message}");
+                emit_status(retry_message);
                 last_error = Some(err);
                 sleep(delay);
             }
@@ -301,10 +330,12 @@ fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>, String> {
                     ));
                 }
                 let delay = retry_delay(attempt);
-                warn!(
+                let retry_message = format!(
                     "Metadata download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} failed for {url}: {err}; retrying in {:.1}s",
                     delay.as_secs_f64()
                 );
+                warn!("{retry_message}");
+                emit_status(retry_message);
                 last_error = Some(err);
                 sleep(delay);
             }
@@ -332,21 +363,32 @@ fn download_part_file_once(
 ) -> Result<u64, String> {
     let mut resume_from = if partial_path.exists() {
         fs::metadata(partial_path)
-            .map_err(|err| format!("failed to stat partial file {}: {err}", partial_path.display()))?
+            .map_err(|err| {
+                format!(
+                    "failed to stat partial file {}: {err}",
+                    partial_path.display()
+                )
+            })?
             .len()
     } else {
         0
     };
 
     if part.bytes > 0 && resume_from > part.bytes {
-        warn!(
+        let message = format!(
             "Partial file {} exceeds expected size ({} > {}); restarting this part",
             partial_path.display(),
             resume_from,
             part.bytes
         );
-        fs::remove_file(partial_path)
-            .map_err(|err| format!("failed to remove stale partial file {}: {err}", partial_path.display()))?;
+        warn!("{message}");
+        emit_status(message);
+        fs::remove_file(partial_path).map_err(|err| {
+            format!(
+                "failed to remove stale partial file {}: {err}",
+                partial_path.display()
+            )
+        })?;
         resume_from = 0;
     }
     if part.bytes > 0 && resume_from == part.bytes {
@@ -354,10 +396,12 @@ fn download_part_file_once(
         if !expected_sha.is_empty() {
             let actual_sha = sha256_file(partial_path)?;
             if !actual_sha.eq_ignore_ascii_case(expected_sha) {
-                warn!(
+                let message = format!(
                     "Checksum mismatch for completed partial file {}; restarting this part",
                     partial_path.display()
                 );
+                warn!("{message}");
+                emit_status(message);
                 fs::remove_file(partial_path).map_err(|err| {
                     format!(
                         "failed to remove mismatched partial file {}: {err}",
@@ -387,11 +431,11 @@ fn download_part_file_once(
     }
 
     if resume_from > 0 {
-        info!(
+        emit_status(format!(
             "Resuming partial download for {} from byte {}",
             destination.display(),
             resume_from
-        );
+        ));
     }
 
     let mut request = http_agent().get(url);
@@ -418,11 +462,13 @@ fn download_part_file_once(
     let status = response.status();
     let append = resume_from > 0 && status == 206;
     if resume_from > 0 && !append {
-        warn!(
+        let message = format!(
             "Server did not return 206 for resumed request (status={}): restarting {} from byte 0",
             status,
             destination.display()
         );
+        warn!("{message}");
+        emit_status(message);
         if partial_path.exists() {
             fs::remove_file(partial_path).map_err(|err| {
                 format!(
@@ -478,22 +524,23 @@ fn download_part_file_once(
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
             let throughput = (bytes_written.saturating_sub(resume_from)) as f64 / elapsed;
             if part.bytes > 0 {
-                let percent = ((bytes_written as f64 / part.bytes as f64) * 100.0).clamp(0.0, 100.0);
-                info!(
+                let percent =
+                    ((bytes_written as f64 / part.bytes as f64) * 100.0).clamp(0.0, 100.0);
+                emit_status(format!(
                     "Downloading {}: {:.1}% ({}/{}) {:.1} MiB/s",
                     destination.display(),
                     percent,
                     format_mebibytes(bytes_written),
                     format_mebibytes(part.bytes),
                     throughput / (1024.0 * 1024.0)
-                );
+                ));
             } else {
-                info!(
+                emit_status(format!(
                     "Downloading {}: {} ({:.1} MiB/s)",
                     destination.display(),
                     format_mebibytes(bytes_written),
                     throughput / (1024.0 * 1024.0)
-                );
+                ));
             }
             last_progress_log = Instant::now();
         }
@@ -762,6 +809,7 @@ mod tests {
         let manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
             total_bytes: 3,
             max_part_bytes: 3,
             parts: vec![BurnpackPartEntry {

@@ -109,20 +109,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut removed_legacy_shard_count = 0usize;
     for imported in &report.manifest.imported_blobs {
         let output_path = PathBuf::from(&imported.output);
-        if artifact_policy.wants_parts() {
-            if let Some(parts_report) =
+        if artifact_policy.wants_parts()
+            && let Some(parts_report) =
                 apply_artifact_policy(&output_path, artifact_policy, args.overwrite)?
-            {
-                parts_manifest_count += 1;
-                part_count += parts_report.part_paths.len();
-                println!(
-                    "[IMPORT] parts {} -> {} ({} parts, {:.1} MiB)",
-                    output_path.display(),
-                    parts_report.manifest_path.display(),
-                    parts_report.part_paths.len(),
-                    parts_report.total_bytes as f64 / (1024.0 * 1024.0),
-                );
-            }
+        {
+            parts_manifest_count += 1;
+            part_count += parts_report.part_paths.len();
+            println!(
+                "[IMPORT] parts {} -> {} ({} parts, {:.1} MiB)",
+                output_path.display(),
+                parts_report.manifest_path.display(),
+                parts_report.part_paths.len(),
+                parts_report.total_bytes as f64 / (1024.0 * 1024.0),
+            );
         }
         removed_legacy_shard_count += remove_legacy_shard_artifacts_for_burnpack(&output_path)?;
     }

@@ -1110,7 +1110,7 @@ pub(super) fn occupancy_to_coords(
     {
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         candidates.truncate(limit);
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.sort_by_key(|a| a.0);
     }
 
     let mut coords = Vec::with_capacity(candidates.len());

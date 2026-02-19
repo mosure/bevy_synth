@@ -845,6 +845,18 @@ fn wasm_set_warmup_state(state: &str) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn wasm_set_warmup_message(message: &str) {
+    if let Some(window) = web_sys::window() {
+        let window_js: wasm_bindgen::JsValue = window.into();
+        let _ = js_sys::Reflect::set(
+            &window_js,
+            &wasm_bindgen::JsValue::from_str("__bevySynthWarmupMessage"),
+            &wasm_bindgen::JsValue::from_str(message),
+        );
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_inference_pause_overlay(commands: &mut Commands) {
     commands
@@ -1039,6 +1051,7 @@ fn setup(
 fn setup(mut commands: Commands, args: Res<AppArgs>, mut status: ResMut<UiStatus>) {
     info!("bevy_synth args: {:?}", *args);
     wasm_set_warmup_state("idle");
+    wasm_set_warmup_message("Initializing wasm runtime...");
 
     let worker = start_worker(args.as_ref());
     commands.insert_resource(worker);
@@ -1069,6 +1082,7 @@ fn kickoff_wasm_warmup(
             status.worker_message = Some(WASM_STATUS_LOADING_MODELS.to_string());
             status.message = WASM_STATUS_LOADING_MODELS.to_string();
             wasm_set_warmup_state("requested");
+            wasm_set_warmup_message(WASM_STATUS_LOADING_MODELS);
             wasm_console_log("bevy_synth wasm warmup: requested");
         }
         Err(err) => {
@@ -1076,6 +1090,7 @@ fn kickoff_wasm_warmup(
             status.worker_message = Some(message.clone());
             status.message = message;
             wasm_set_warmup_state("failed");
+            wasm_set_warmup_message(&status.message);
             warn!("{}", status.message);
         }
     }
@@ -1791,7 +1806,10 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
                             ctx.wasm_startup.model_failed = true;
                             wasm_set_warmup_state("failed");
                             wasm_console_log("bevy_synth wasm warmup: failed");
+                        } else {
+                            wasm_set_warmup_state("loading");
                         }
+                        wasm_set_warmup_message(&message);
                     }
                     ctx.status.worker_message = Some(message.clone());
                     ctx.status.message = message;
