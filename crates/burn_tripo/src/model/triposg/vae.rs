@@ -613,16 +613,19 @@ impl<B: Backend> TripoSGDecoderBlock<B> {
 pub mod import {
     use std::path::{Path, PathBuf};
 
-    use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
     use burn::tensor::Bytes;
-    use burn::tensor::FloatDType;
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
     use burn_synth_import::parts::load_model_from_burnpack_parts;
 
-    use super::super::load_policy::{BurnpackLoadPolicy, burnpack_path, candidate_burnpack_paths};
+    use super::super::import_precision::apply_import_precision;
+    use super::super::load_policy::{
+        BpkPrecision, BurnpackLoadPolicy, burnpack_path, burnpack_path_for_precision,
+        candidate_burnpack_paths,
+    };
+    use super::super::load_postprocess::maybe_postprocess_loaded_module;
     use super::{TripoSGVae, TripoSGVaeConfig};
 
     pub fn load_triposg_vae<B: Backend>(
@@ -652,7 +655,7 @@ pub mod import {
                 })
             },
         )? {
-            return Ok(model);
+            return Ok(maybe_postprocess_loaded_module(model, policy));
         }
         let burnpack_path = burnpack_candidates
             .iter()
@@ -676,7 +679,7 @@ pub mod import {
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load TripoSG VAE burnpack: {err}"))?;
-        Ok(model)
+        Ok(maybe_postprocess_loaded_module(model, policy))
     }
 
     pub fn load_triposg_vae_from_burnpack_bytes<B: Backend>(
@@ -783,33 +786,55 @@ pub mod import {
         path: impl AsRef<Path>,
         use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let path = path.as_ref();
-        let burnpack_path = burnpack_path(path, use_f16, BurnpackLoadPolicy::default().f16_suffix);
-        let model = load_triposg_vae_from_safetensors::<B>(config, device, path)?;
-        let model = if use_f16 {
-            cast_module_float_dtype(model, FloatDType::F16)
+        let precision = if use_f16 {
+            BpkPrecision::F16
         } else {
-            model
+            BpkPrecision::F32
         };
+        import_triposg_vae_burnpack_with_precision::<B>(config, device, path, precision)
+    }
+
+    pub fn import_triposg_vae_burnpack_with_precision<B: Backend>(
+        config: &TripoSGVaeConfig,
+        device: &B::Device,
+        path: impl AsRef<Path>,
+        precision: BpkPrecision,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = path.as_ref();
+        let default_policy = BurnpackLoadPolicy::default();
+        let burnpack_path = burnpack_path_for_precision(path, precision, default_policy);
+        let model = load_triposg_vae_import_source::<B>(config, device, path, default_policy)?;
+        let model = apply_import_precision(model, precision);
         save_burnpack(&model, &burnpack_path)?;
         Ok(burnpack_path)
     }
 
-    struct FloatDTypeMapper {
-        dtype: FloatDType,
-    }
-
-    impl<B: Backend> ModuleMapper<B> for FloatDTypeMapper {
-        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
-            let (id, tensor, mapper) = param.consume();
-            let tensor = tensor.cast(self.dtype);
-            Param::from_mapped_value(id, tensor, mapper)
+    fn load_triposg_vae_import_source<B: Backend>(
+        config: &TripoSGVaeConfig,
+        device: &B::Device,
+        path: &Path,
+        policy: BurnpackLoadPolicy,
+    ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
+        if path
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("safetensors"))
+            .unwrap_or(false)
+            && path.exists()
+        {
+            return load_triposg_vae_from_safetensors::<B>(config, device, path);
         }
-    }
 
-    fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
-        let mut mapper = FloatDTypeMapper { dtype };
-        module.map(&mut mapper)
+        let f32_burnpack_path = burnpack_path(path, false, policy.f16_suffix);
+        if f32_burnpack_path.exists() {
+            return load_triposg_vae_from_burnpack_file(config, device, &f32_burnpack_path);
+        }
+
+        Err(format!(
+            "missing TripoSG VAE source weights for import at {} (expected .safetensors or {})",
+            path.display(),
+            f32_burnpack_path.display()
+        )
+        .into())
     }
 
     fn save_burnpack<B: Backend>(

@@ -2149,8 +2149,6 @@ dependencies = [
 [[package]]
 name = "burn-store"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a2a163486242fcb0c6e2cb89c5a803ab8588673652bb46ecd7af6378d06152f"
 dependencies = [
  "burn-core",
  "burn-nn",
@@ -2333,7 +2331,6 @@ dependencies = [
  "clap",
  "console_error_panic_hook",
  "criterion",
- "cubecl",
  "fast-surface-nets",
  "futures-intrusive",
  "image",

@@ -789,6 +789,8 @@ fn parse_weight_precision_override(value: &str) -> Option<WeightPrecision> {
     match value.trim().to_ascii_lowercase().as_str() {
         "f16" | "fp16" => Some(WeightPrecision::F16),
         "f32" | "fp32" => Some(WeightPrecision::F32),
+        "fp8" | "e4m3" => Some(WeightPrecision::Fp8),
+        "q4" | "q4f" => Some(WeightPrecision::Q4),
         "auto" => Some(WeightPrecision::Auto),
         _ => None,
     }

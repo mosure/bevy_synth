@@ -4,16 +4,27 @@ use serde::{Deserialize, Serialize};
 pub enum QuantizationMode {
     F32,
     F16,
+    Fp8,
+    Q4,
     Both,
+    All,
 }
 
 impl QuantizationMode {
     pub fn include_f32(self) -> bool {
-        matches!(self, Self::F32 | Self::Both)
+        matches!(self, Self::F32 | Self::Both | Self::All)
     }
 
     pub fn include_f16(self) -> bool {
-        matches!(self, Self::F16 | Self::Both)
+        matches!(self, Self::F16 | Self::Both | Self::All)
+    }
+
+    pub fn include_fp8(self) -> bool {
+        matches!(self, Self::Fp8 | Self::All)
+    }
+
+    pub fn include_q4(self) -> bool {
+        matches!(self, Self::Q4 | Self::All)
     }
 }
 

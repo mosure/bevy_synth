@@ -12,12 +12,14 @@ use burn_synth::progress::{
 };
 use burn_synth::runtime::{
     DinoBackend as RuntimeDinoBackend, InferenceBackend, MeshRequest, RuntimeConfig, SynthRuntime,
-    TrellisQuality as RuntimeTrellisQuality,
+    TrellisQuality as RuntimeTrellisQuality, WeightPrecision as RuntimeWeightPrecision,
 };
 use burn_synth::set_bootstrap_status_callback;
 use burn_synth::{ForegroundModel, ImageSource, SynthesisModel};
 
-use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
+use crate::args::{
+    AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality, WeightPrecision,
+};
 use crate::state::{
     InferenceRequest, WASM_STATUS_LOADING_MODELS, WASM_STATUS_MODEL_LOAD_FAILED_PREFIX,
     WASM_STATUS_MODEL_READY, WorkerCommand, WorkerEvent,
@@ -152,6 +154,8 @@ fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
         guidance_scale: args.guidance_scale,
         seed: args.seed.or(RuntimeConfig::default().seed),
         dino_backend: map_dino_backend(args.dino_backend),
+        triposg_weights_precision: map_weight_precision(args.weights_precision),
+        rmbg_weights_precision: map_weight_precision(args.rmbg_weights_precision),
         target_faces: args.target_faces,
         ..RuntimeConfig::default()
     };
@@ -269,6 +273,16 @@ fn map_trellis_quality(value: TrellisQuality) -> RuntimeTrellisQuality {
         TrellisQuality::Low => RuntimeTrellisQuality::Low,
         TrellisQuality::Medium => RuntimeTrellisQuality::Medium,
         TrellisQuality::High => RuntimeTrellisQuality::High,
+    }
+}
+
+fn map_weight_precision(value: WeightPrecision) -> RuntimeWeightPrecision {
+    match value {
+        WeightPrecision::Auto => RuntimeWeightPrecision::Auto,
+        WeightPrecision::F16 => RuntimeWeightPrecision::F16,
+        WeightPrecision::F32 => RuntimeWeightPrecision::F32,
+        WeightPrecision::Fp8 => RuntimeWeightPrecision::Fp8,
+        WeightPrecision::Q4 => RuntimeWeightPrecision::Q4,
     }
 }
 

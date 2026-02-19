@@ -602,26 +602,47 @@ fn max_pool2d_ceil<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
 pub mod import {
     use std::path::{Path, PathBuf};
 
-    use burn::module::{Module, ModuleMapper, Param};
+    use burn::module::{Module, ModuleMapper, Param, Quantizer};
     use burn::prelude::*;
     use burn::tensor::Bytes;
     use burn::tensor::FloatDType;
+    use burn::tensor::quantization::{
+        Calibration, QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue,
+    };
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
+    use burn_synth_import::layout::{BurnpackPrecision, burnpack_path_with_precision};
     use burn_synth_import::parts::load_model_from_burnpack_parts;
 
     use super::{BriaRmbg, RmbgConfig};
-
-    const F16_SUFFIX: &str = "_f16";
 
     pub fn load_rmbg<B: Backend>(
         device: &B::Device,
         weights_path: impl AsRef<Path>,
         config: &RmbgConfig,
     ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
+        let preferred = if prefer_f16_burnpack() {
+            BurnpackPrecision::F16
+        } else {
+            BurnpackPrecision::F32
+        };
+        load_rmbg_with_precision(device, weights_path, config, preferred, true)
+    }
+
+    pub fn load_rmbg_with_precision<B: Backend>(
+        device: &B::Device,
+        weights_path: impl AsRef<Path>,
+        config: &RmbgConfig,
+        preferred_precision: BurnpackPrecision,
+        allow_cross_precision_fallback: bool,
+    ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
-        let burnpack_candidates = candidate_burnpack_paths(weights_path);
+        let burnpack_candidates = candidate_burnpack_paths(
+            weights_path,
+            preferred_precision,
+            allow_cross_precision_fallback,
+        );
         if let Some(model) = load_model_from_burnpack_parts(
             &burnpack_candidates,
             "RMBG",
@@ -759,16 +780,50 @@ pub mod import {
         ]
     }
 
-    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
-        let default = burnpack_path(path, false);
-        let f16 = burnpack_path(path, true);
-        if f16 == default {
-            vec![default]
-        } else if prefer_f16_burnpack() {
-            vec![f16, default]
+    fn candidate_burnpack_paths(
+        path: &Path,
+        preferred_precision: BurnpackPrecision,
+        allow_cross_precision_fallback: bool,
+    ) -> Vec<PathBuf> {
+        let order = if allow_cross_precision_fallback {
+            match preferred_precision {
+                BurnpackPrecision::F16 => vec![
+                    BurnpackPrecision::F16,
+                    BurnpackPrecision::F32,
+                    BurnpackPrecision::Fp8,
+                    BurnpackPrecision::Q4,
+                ],
+                BurnpackPrecision::F32 => vec![
+                    BurnpackPrecision::F32,
+                    BurnpackPrecision::F16,
+                    BurnpackPrecision::Fp8,
+                    BurnpackPrecision::Q4,
+                ],
+                BurnpackPrecision::Fp8 => vec![
+                    BurnpackPrecision::Fp8,
+                    BurnpackPrecision::F16,
+                    BurnpackPrecision::F32,
+                    BurnpackPrecision::Q4,
+                ],
+                BurnpackPrecision::Q4 => vec![
+                    BurnpackPrecision::Q4,
+                    BurnpackPrecision::F16,
+                    BurnpackPrecision::F32,
+                    BurnpackPrecision::Fp8,
+                ],
+            }
         } else {
-            vec![default, f16]
+            vec![preferred_precision]
+        };
+
+        let mut out = Vec::new();
+        for precision in order {
+            let candidate = burnpack_path_with_precision(path, precision);
+            if !out.iter().any(|existing| existing == &candidate) {
+                out.push(candidate);
+            }
         }
+        out
     }
 
     fn prefer_f16_burnpack() -> bool {
@@ -777,42 +832,6 @@ pub mod import {
 
     fn should_validate_burnpack() -> bool {
         cfg!(all(not(target_arch = "wasm32"), debug_assertions))
-    }
-
-    fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {
-        let path = if path
-            .extension()
-            .map(|ext| ext.eq_ignore_ascii_case("bpk"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            path.with_extension("bpk")
-        };
-
-        if use_f16 {
-            with_file_stem_suffix(&path, F16_SUFFIX)
-        } else {
-            path
-        }
-    }
-
-    fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
-        let Some(stem) = path.file_stem() else {
-            return path.to_path_buf();
-        };
-        let stem = stem.to_string_lossy();
-        if stem.ends_with(suffix) {
-            return path.to_path_buf();
-        }
-
-        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        let mut file_name = format!("{stem}{suffix}");
-        if !ext.is_empty() {
-            file_name.push('.');
-            file_name.push_str(ext);
-        }
-        path.with_file_name(file_name)
     }
 
     pub fn load_rmbg_from_safetensors<B: Backend>(
@@ -834,16 +853,53 @@ pub mod import {
         config: &RmbgConfig,
         use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let weights_path = weights_path.as_ref();
-        let burnpack_path = burnpack_path(weights_path, use_f16);
-        let model = load_rmbg_from_safetensors::<B>(device, weights_path, config)?;
-        let model = if use_f16 {
-            cast_module_float_dtype(model, FloatDType::F16)
+        let precision = if use_f16 {
+            BurnpackPrecision::F16
         } else {
-            model
+            BurnpackPrecision::F32
         };
+        import_rmbg_burnpack_with_precision::<B>(device, weights_path, config, precision)
+    }
+
+    pub fn import_rmbg_burnpack_with_precision<B: Backend>(
+        device: &B::Device,
+        weights_path: impl AsRef<Path>,
+        config: &RmbgConfig,
+        precision: BurnpackPrecision,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let weights_path = weights_path.as_ref();
+        let burnpack_path = burnpack_path_with_precision(weights_path, precision);
+        let model = load_rmbg_import_source::<B>(device, weights_path, config)?;
+        let model = apply_import_precision(model, precision);
         save_burnpack(&model, &burnpack_path)?;
         Ok(burnpack_path)
+    }
+
+    fn load_rmbg_import_source<B: Backend>(
+        device: &B::Device,
+        weights_path: &Path,
+        config: &RmbgConfig,
+    ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
+        if weights_path
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("safetensors"))
+            .unwrap_or(false)
+            && weights_path.exists()
+        {
+            return load_rmbg_from_safetensors::<B>(device, weights_path, config);
+        }
+
+        let f32_burnpack_path = burnpack_path_with_precision(weights_path, BurnpackPrecision::F32);
+        if f32_burnpack_path.exists() {
+            return load_rmbg_from_burnpack_file(device, &f32_burnpack_path, config);
+        }
+
+        Err(format!(
+            "missing RMBG source weights for import at {} (expected .safetensors or {})",
+            weights_path.display(),
+            f32_burnpack_path.display()
+        )
+        .into())
     }
 
     struct FloatDTypeMapper {
@@ -861,6 +917,45 @@ pub mod import {
     fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
         let mut mapper = FloatDTypeMapper { dtype };
         module.map(&mut mapper)
+    }
+
+    fn quantize_module<B: Backend, M: Module<B>>(module: M, precision: BurnpackPrecision) -> M {
+        let mut quantizer = Quantizer {
+            calibration: Calibration::MinMax,
+            scheme: quant_scheme(precision),
+        };
+        module.quantize_weights(&mut quantizer)
+    }
+
+    fn apply_import_precision<B: Backend, M: Module<B>>(
+        module: M,
+        precision: BurnpackPrecision,
+    ) -> M {
+        match precision {
+            BurnpackPrecision::F32 => module,
+            BurnpackPrecision::F16 => cast_module_float_dtype(module, FloatDType::F16),
+            BurnpackPrecision::Fp8 | BurnpackPrecision::Q4 => {
+                quantize_module(module, precision)
+            }
+        }
+    }
+
+    fn quant_scheme(precision: BurnpackPrecision) -> QuantScheme {
+        match precision {
+            BurnpackPrecision::Fp8 => QuantScheme::default()
+                .with_value(QuantValue::Q8F)
+                .with_level(QuantLevel::Tensor)
+                .with_mode(QuantMode::Symmetric)
+                .with_param(QuantParam::F32)
+                .with_store(QuantStore::Native),
+            BurnpackPrecision::Q4 => QuantScheme::default()
+                .with_value(QuantValue::Q4F)
+                .with_level(QuantLevel::Tensor)
+                .with_mode(QuantMode::Symmetric)
+                .with_param(QuantParam::F16)
+                .with_store(QuantStore::U32),
+            BurnpackPrecision::F32 | BurnpackPrecision::F16 => QuantScheme::default(),
+        }
     }
 
     fn save_burnpack<B: Backend>(

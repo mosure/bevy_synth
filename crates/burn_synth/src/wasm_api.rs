@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use burn::backend::NdArray;
 use burn::prelude::*;
+use burn_synth_import::layout::BurnpackPrecision;
 use burn_foreground::pipeline::{
     PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data_from_bytes_async,
 };
@@ -44,7 +45,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::mesh::Mesh;
 use crate::mesh_to_glb_bytes;
 use crate::model_loader::{
-    candidate_burnpack_names, parse_parts_manifest_bytes, resolve_manifest_entry_uri,
+    candidate_burnpack_names_for_precision, parse_parts_manifest_bytes, resolve_manifest_entry_uri,
 };
 use crate::wasm::WasmInferencePreset;
 use crate::wasm_loader::{
@@ -66,8 +67,8 @@ const DINO_CONFIG_RELPATHS: [&str; 2] = [
     "image_encoder_dinov2/config.json",
     "image_encoder_2/config.json",
 ];
-const ROOT_TRIPOSG: &str = "models/MIDI-3D";
-const ROOT_RMBG14: &str = "models/RMBG-1.4";
+const ROOT_TRIPOSG: &str = "MIDI-3D";
+const ROOT_RMBG14: &str = "RMBG-1.4";
 const DEFAULT_FLASH_OCTREE_DEPTH: usize = 9;
 const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
 const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
@@ -102,10 +103,8 @@ thread_local! {
 #[derive(Clone, Copy, Debug)]
 struct TripoWasmLoadOptions {
     strict_dino_preprocess: bool,
-    strict_precision: bool,
-    prefer_f16_vae: bool,
-    prefer_f16_dit: bool,
-    prefer_f16_dino: bool,
+    preferred_precision: BurnpackPrecision,
+    allow_cross_precision_fallback: bool,
 }
 
 struct WasmLoadContext<'a, F: FnMut(String)> {
@@ -252,6 +251,10 @@ impl WasmInferOptions {
         if let Some(value) = self.weights_precision.as_ref() {
             preset.weights_precision = if value.eq_ignore_ascii_case("f16") {
                 "f16"
+            } else if value.eq_ignore_ascii_case("fp8") {
+                "fp8"
+            } else if value.eq_ignore_ascii_case("q4") {
+                "q4"
             } else if value.eq_ignore_ascii_case("auto") {
                 "auto"
             } else {
@@ -261,6 +264,10 @@ impl WasmInferOptions {
         if let Some(value) = self.rmbg_weights_precision.as_ref() {
             preset.rmbg_weights_precision = if value.eq_ignore_ascii_case("f16") {
                 "f16"
+            } else if value.eq_ignore_ascii_case("fp8") {
+                "fp8"
+            } else if value.eq_ignore_ascii_case("q4") {
+                "q4"
             } else if value.eq_ignore_ascii_case("f32") {
                 "f32"
             } else {
@@ -277,6 +284,11 @@ fn resolve_wgpu_precision_for_preset(
 ) -> Result<&'static str, String> {
     if preset.weights_precision.eq_ignore_ascii_case("f16") {
         return Ok(if shader_f16_supported { "f16" } else { "f32" });
+    }
+    if preset.weights_precision.eq_ignore_ascii_case("fp8")
+        || preset.weights_precision.eq_ignore_ascii_case("q4")
+    {
+        return Ok("f32");
     }
     if preset.weights_precision.eq_ignore_ascii_case("auto") {
         return Ok(if shader_f16_supported { "f16" } else { "f32" });
@@ -559,35 +571,56 @@ where
     let use_wgpu = is_wgpu_backend::<BTriposg>();
     let backend_is_f16 = backend_uses_f16::<BTriposg>();
     let requested_tripo_precision = if preset.weights_precision.eq_ignore_ascii_case("f16") {
-        "f16"
+        Some(BurnpackPrecision::F16)
+    } else if preset.weights_precision.eq_ignore_ascii_case("fp8") {
+        Some(BurnpackPrecision::Fp8)
+    } else if preset.weights_precision.eq_ignore_ascii_case("q4") {
+        Some(BurnpackPrecision::Q4)
     } else if preset.weights_precision.eq_ignore_ascii_case("auto") {
-        "auto"
+        None
     } else {
-        "f32"
+        Some(BurnpackPrecision::F32)
     };
     let requested_rmbg_precision = if preset.rmbg_weights_precision.eq_ignore_ascii_case("f16") {
-        "f16"
+        Some(BurnpackPrecision::F16)
+    } else if preset.rmbg_weights_precision.eq_ignore_ascii_case("fp8") {
+        Some(BurnpackPrecision::Fp8)
+    } else if preset.rmbg_weights_precision.eq_ignore_ascii_case("q4") {
+        Some(BurnpackPrecision::Q4)
     } else if preset.rmbg_weights_precision.eq_ignore_ascii_case("f32") {
-        "f32"
+        Some(BurnpackPrecision::F32)
     } else {
-        "auto"
+        None
     };
-    let auto_prefer_f16 = if use_wgpu {
-        backend_is_f16
+    let auto_precision = if use_wgpu {
+        if backend_is_f16 {
+            BurnpackPrecision::F16
+        } else {
+            BurnpackPrecision::F32
+        }
+    } else if prefer_f16_default {
+        BurnpackPrecision::F16
     } else {
-        prefer_f16_default
+        BurnpackPrecision::F32
     };
-    let effective_prefer_f16 = match requested_tripo_precision {
-        "f16" => true,
-        "f32" => false,
-        _ => auto_prefer_f16,
-    };
-    let allow_cross_precision_fallback = requested_tripo_precision == "auto";
-    let strict_precision = !allow_cross_precision_fallback;
-    let precision_reason = match requested_tripo_precision {
-        "f16" => "forced by options (f16)",
-        "f32" => "forced by options (f32)",
-        _ => {
+    let (requested_precision, allow_cross_precision_fallback, precision_reason): (
+        BurnpackPrecision,
+        bool,
+        &str,
+    ) = match requested_tripo_precision {
+        Some(precision) => (
+            precision,
+            false,
+            match precision {
+                BurnpackPrecision::F16 => "forced by options (f16)",
+                BurnpackPrecision::F32 => "forced by options (f32)",
+                BurnpackPrecision::Fp8 => "forced by options (fp8)",
+                BurnpackPrecision::Q4 => "forced by options (q4)",
+            },
+        ),
+        None => (
+            auto_precision,
+            true,
             if use_wgpu {
                 if backend_is_f16 {
                     "auto (wasm WebGPU backend-aligned fp16)"
@@ -596,27 +629,32 @@ where
                 }
             } else {
                 "auto (runtime parity profile)"
-            }
-        }
+            },
+        ),
     };
-    let precision_label = if effective_prefer_f16 { "f16" } else { "f32" };
+    let precision_label = requested_precision.label();
     on_status(format!(
         "TripoSG weight precision policy: {precision_label} ({})",
         precision_reason
     ));
-    let prefer_f16_rmbg = match requested_rmbg_precision {
-        "f16" => true,
-        "f32" => false,
-        // Favor f16 by default on wasm Bevy runtimes to reduce startup pressure
-        // while render resources are resident.
-        _ => true,
+    let (requested_rmbg_precision, allow_cross_precision_rmbg) = match requested_rmbg_precision {
+        Some(precision) => (precision, false),
+        // Favor f16 by default on wasm runtimes to reduce startup pressure while render resources
+        // are resident.
+        None => (BurnpackPrecision::F16, true),
     };
-    let allow_cross_precision_rmbg = requested_rmbg_precision == "auto";
     // CPU wasm path cannot fit full-f32 model footprints under the 4 GiB host cap.
-    // Keep CPU fallback on f16, and prefer f16 burnpacks for wasm WebGPU fp16 runtime.
-    let prefer_f16_vae = if use_wgpu { effective_prefer_f16 } else { true };
-    let prefer_f16_dit = if use_wgpu { effective_prefer_f16 } else { true };
-    let prefer_f16_dino = if use_wgpu { effective_prefer_f16 } else { true };
+    // Keep non-wgpu loads on f16.
+    let triposg_precision = if use_wgpu {
+        requested_precision
+    } else {
+        BurnpackPrecision::F16
+    };
+    let triposg_allow_cross_precision_fallback = if use_wgpu {
+        allow_cross_precision_fallback
+    } else {
+        false
+    };
 
     let triposg_device = BTriposg::Device::default();
     let rmbg_device = BRmbg::Device::default();
@@ -625,10 +663,8 @@ where
 
     let options = TripoWasmLoadOptions {
         strict_dino_preprocess: parity.strict_dino_preprocess,
-        strict_precision,
-        prefer_f16_vae,
-        prefer_f16_dit,
-        prefer_f16_dino,
+        preferred_precision: triposg_precision,
+        allow_cross_precision_fallback: triposg_allow_cross_precision_fallback,
     };
     let mut load_ctx = WasmLoadContext {
         totals: &mut totals,
@@ -638,7 +674,7 @@ where
 
     let rmbg = load_rmbg14_pipeline_wasm(
         &rmbg_device,
-        prefer_f16_rmbg,
+        requested_rmbg_precision,
         allow_cross_precision_rmbg,
         &mut load_ctx,
     )
@@ -654,7 +690,7 @@ where
 
 async fn load_rmbg14_pipeline_wasm<B: Backend, F>(
     device: &B::Device,
-    prefer_f16: bool,
+    preferred_precision: BurnpackPrecision,
     allow_cross_precision_fallback: bool,
     load_ctx: &mut WasmLoadContext<'_, F>,
 ) -> Result<RmbgPipeline<B>, String>
@@ -676,7 +712,7 @@ where
     if let Some(model) = try_load_model_from_parts_wasm(
         &base_safetensors_url,
         "RMBG",
-        prefer_f16,
+        preferred_precision,
         allow_cross_precision_fallback,
         load_ctx,
         || BriaRmbg::new(device, config.clone()),
@@ -759,8 +795,8 @@ where
     let vae = if let Some(model) = try_load_model_from_parts_wasm(
         &vae_base_safetensors_url,
         "TripoSG VAE",
-        options.prefer_f16_vae,
-        !options.strict_precision,
+        options.preferred_precision,
+        options.allow_cross_precision_fallback,
         load_ctx,
         || TripoSGVae::new_decode_only(device, vae_config.clone()),
         |model, part_bytes| {
@@ -782,8 +818,8 @@ where
     let image_encoder = if let Some(model) = try_load_model_from_parts_wasm(
         &dino_base_safetensors_url,
         "DINOv2",
-        options.prefer_f16_dino,
-        !options.strict_precision,
+        options.preferred_precision,
+        options.allow_cross_precision_fallback,
         load_ctx,
         || init_triposg_dinov2_model(device, dino_config.clone()),
         |model: &mut TripoSGImageEncoder<B>, part_bytes| {
@@ -806,8 +842,8 @@ where
         device,
         &root,
         &dit_config,
-        options.prefer_f16_dit,
-        !options.strict_precision,
+        options.preferred_precision,
+        options.allow_cross_precision_fallback,
         load_ctx,
     )
     .await?;
@@ -827,7 +863,7 @@ async fn load_triposg_dit_wasm<B: Backend, F>(
     device: &B::Device,
     root: &str,
     dit_config: &TripoSGDiTConfig,
-    prefer_f16: bool,
+    preferred_precision: BurnpackPrecision,
     allow_cross_precision_fallback: bool,
     load_ctx: &mut WasmLoadContext<'_, F>,
 ) -> Result<TripoSGDiT<B>, String>
@@ -842,7 +878,7 @@ where
         device,
         dit_config,
         &base_safetensors_url,
-        prefer_f16,
+        preferred_precision,
         allow_cross_precision_fallback,
         load_ctx,
     )
@@ -860,7 +896,7 @@ async fn try_load_triposg_dit_from_parts_wasm<B: Backend, F>(
     device: &B::Device,
     dit_config: &TripoSGDiTConfig,
     base_safetensors_url: &str,
-    prefer_f16: bool,
+    preferred_precision: BurnpackPrecision,
     allow_cross_precision_fallback: bool,
     load_ctx: &mut WasmLoadContext<'_, F>,
 ) -> Result<Option<TripoSGDiT<B>>, String>
@@ -870,7 +906,7 @@ where
     try_load_model_from_parts_wasm(
         base_safetensors_url,
         "TripoSG DiT",
-        prefer_f16,
+        preferred_precision,
         allow_cross_precision_fallback,
         load_ctx,
         || TripoSGDiT::new(device, dit_config.clone()),
@@ -885,7 +921,7 @@ where
 async fn try_load_model_from_parts_wasm<M, F, Init, Apply>(
     base_safetensors_url: &str,
     label: &str,
-    prefer_f16: bool,
+    preferred_precision: BurnpackPrecision,
     allow_cross_precision_fallback: bool,
     load_ctx: &mut WasmLoadContext<'_, F>,
     mut init_model: Init,
@@ -897,10 +933,11 @@ where
     Apply: FnMut(&mut M, Vec<u8>) -> Result<(), String>,
 {
     let max_bytes = web_max_burnpack_bytes();
-    let mut candidates = candidate_burnpack_names(base_safetensors_url, prefer_f16);
-    if !allow_cross_precision_fallback {
-        candidates.truncate(1);
-    }
+    let candidates = candidate_burnpack_names_for_precision(
+        base_safetensors_url,
+        preferred_precision,
+        allow_cross_precision_fallback,
+    );
     for candidate in candidates {
         let manifest_url = format!("{candidate}.parts.json");
         let Some(manifest_text) = fetch_optional_text(&manifest_url).await? else {

@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use burn_synth::{
     DinoBackend, ForegroundRequest, ImageSource, MeshRequest, ModelSelection, ProgressVerbosity,
-    RuntimeConfig, RuntimeProgressObserver, SynthRuntime, default_log_progress_callback,
+    RuntimeConfig, RuntimeProgressObserver, SynthRuntime, WeightPrecision,
+    default_log_progress_callback,
     write_glb_mesh,
 };
 use clap::{Parser, Subcommand, ValueEnum};
@@ -67,6 +68,14 @@ struct Cli {
     /// DINO backend (auto, cpu, gpu).
     #[arg(long, value_enum, default_value_t = CliDinoBackend::Auto)]
     dino_backend: CliDinoBackend,
+
+    /// TripoSG weight precision selection (auto, f16, f32, fp8, q4).
+    #[arg(long, value_enum, default_value_t = CliWeightPrecision::F16)]
+    weights_precision: CliWeightPrecision,
+
+    /// RMBG weight precision selection (auto, f16, f32, fp8, q4).
+    #[arg(long, value_enum, default_value_t = CliWeightPrecision::F16)]
+    rmbg_weights_precision: CliWeightPrecision,
 
     /// Target face count for mesh decimation. Use 0 to disable.
     /// Defaults to 10,000.
@@ -152,6 +161,16 @@ enum CliDinoBackend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
+enum CliWeightPrecision {
+    Auto,
+    F16,
+    F32,
+    Fp8,
+    Q4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
 enum CliTrellisQuality {
     Low,
     Medium,
@@ -227,6 +246,8 @@ fn run(cli: Cli) -> Result<(), String> {
             .unwrap_or(RuntimeConfig::default().guidance_scale),
         seed: cli.seed.or(RuntimeConfig::default().seed),
         dino_backend: cli.dino_backend.into(),
+        triposg_weights_precision: cli.weights_precision.into(),
+        rmbg_weights_precision: cli.rmbg_weights_precision.into(),
         target_faces,
         ..RuntimeConfig::default()
     };
@@ -446,6 +467,18 @@ impl From<CliDinoBackend> for DinoBackend {
             CliDinoBackend::Auto => Self::Auto,
             CliDinoBackend::Cpu => Self::Cpu,
             CliDinoBackend::Gpu => Self::Gpu,
+        }
+    }
+}
+
+impl From<CliWeightPrecision> for WeightPrecision {
+    fn from(value: CliWeightPrecision) -> Self {
+        match value {
+            CliWeightPrecision::Auto => WeightPrecision::Auto,
+            CliWeightPrecision::F16 => WeightPrecision::F16,
+            CliWeightPrecision::F32 => WeightPrecision::F32,
+            CliWeightPrecision::Fp8 => WeightPrecision::Fp8,
+            CliWeightPrecision::Q4 => WeightPrecision::Q4,
         }
     }
 }

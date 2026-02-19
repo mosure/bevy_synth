@@ -13,11 +13,16 @@ use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
 #[cfg(target_arch = "wasm32")]
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
+use burn_foreground::rmbg14::import::{
+    load_rmbg_config, load_rmbg_processor_config, load_rmbg_with_precision,
+};
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
+use burn_synth_import::layout::BurnpackPrecision as ArtifactBurnpackPrecision;
 #[cfg(feature = "trellis")]
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
+use burn_tripo::model::triposg::load_policy::{BpkPrecision, BpkPrecisionPreference};
 use burn_tripo::model::triposg::image_encoder::DinoImageProcessor;
 use burn_tripo::model::triposg::image_encoder::import::{
     load_dinov2_processor, load_triposg_dinov2_with_policy,
@@ -96,6 +101,28 @@ impl DinoBackend {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WeightPrecision {
+    Auto,
+    #[default]
+    F16,
+    F32,
+    Fp8,
+    Q4,
+}
+
+impl WeightPrecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::F16 => "f16",
+            Self::F32 => "f32",
+            Self::Fp8 => "fp8",
+            Self::Q4 => "q4",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TrellisQuality {
     Low,
     #[default]
@@ -125,6 +152,8 @@ pub struct RuntimeConfig {
     pub guidance_scale: f32,
     pub seed: Option<u64>,
     pub dino_backend: DinoBackend,
+    pub triposg_weights_precision: WeightPrecision,
+    pub rmbg_weights_precision: WeightPrecision,
     pub target_faces: Option<usize>,
     pub flash_extract: FlashExtractConfig,
     pub mesh_prepare: PrepareImageConfig,
@@ -149,6 +178,8 @@ impl Default for RuntimeConfig {
             guidance_scale: DEFAULT_GUIDANCE_SCALE,
             seed: Some(DEFAULT_SEED),
             dino_backend: DinoBackend::Auto,
+            triposg_weights_precision: WeightPrecision::F16,
+            rmbg_weights_precision: WeightPrecision::F16,
             target_faces: Some(DEFAULT_TARGET_FACES),
             flash_extract: default_flash_config(),
             mesh_prepare: PrepareImageConfig::default(),
@@ -842,8 +873,11 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
+                    self.config.rmbg_weights_precision,
                 )?;
-                let pipeline = self.foreground.ensure_rmbg14(&root)?;
+                let pipeline = self
+                    .foreground
+                    .ensure_rmbg14(&root, self.config.rmbg_weights_precision)?;
                 let prepared =
                     prepare_image_data(input_path, Some(pipeline), &self.config.foreground_prepare)
                         .map_err(|err| RuntimeError::new(format!("RMBG-1.4 failed: {err}")))?;
@@ -855,6 +889,7 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
+                    self.config.rmbg_weights_precision,
                 )?;
                 let pipeline = self.foreground.ensure_rmbg2(&root)?;
                 let prepared = pipeline
@@ -884,10 +919,13 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
+                    self.config.rmbg_weights_precision,
                 )?;
                 match backend {
                     InferenceBackend::Cpu => {
-                        let pipeline = self.foreground.ensure_rmbg14(&root)?;
+                        let pipeline = self
+                            .foreground
+                            .ensure_rmbg14(&root, self.config.rmbg_weights_precision)?;
                         prepare_image_data(input_path, Some(pipeline), &self.config.mesh_prepare)
                             .map_err(|err| {
                                 RuntimeError::new(format!("RMBG-1.4 preprocessing failed: {err}"))
@@ -896,7 +934,10 @@ impl SynthRuntime {
                     InferenceBackend::Wgpu => {
                         #[cfg(feature = "wgpu")]
                         {
-                            let pipeline = self.foreground.ensure_rmbg14_wgpu(&root)?;
+                            let pipeline = self.foreground.ensure_rmbg14_wgpu(
+                                &root,
+                                self.config.rmbg_weights_precision,
+                            )?;
                             prepare_image_data(
                                 input_path,
                                 Some(pipeline),
@@ -916,7 +957,10 @@ impl SynthRuntime {
                     InferenceBackend::Cuda => {
                         #[cfg(feature = "cuda")]
                         {
-                            let pipeline = self.foreground.ensure_rmbg14_cuda(&root)?;
+                            let pipeline = self.foreground.ensure_rmbg14_cuda(
+                                &root,
+                                self.config.rmbg_weights_precision,
+                            )?;
                             prepare_image_data(
                                 input_path,
                                 Some(pipeline),
@@ -939,6 +983,7 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
+                    self.config.rmbg_weights_precision,
                 )?;
                 let pipeline = self.foreground.ensure_rmbg2(&root)?;
                 pipeline
@@ -962,15 +1007,18 @@ struct ForegroundRuntime {
 }
 
 impl ForegroundRuntime {
-    fn ensure_rmbg14(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<NdArray<f32>>> {
+    fn ensure_rmbg14(
+        &mut self,
+        root: &Path,
+        requested_precision: WeightPrecision,
+    ) -> RuntimeResult<&RmbgPipeline<NdArray<f32>>> {
         if self.rmbg14.is_none() {
             let device = <NdArray<f32> as Backend>::Device::default();
-            let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
-                RuntimeError::new(format!(
-                    "failed to load RMBG-1.4 at {}: {err}",
-                    root.display()
-                ))
-            })?;
+            let pipeline = load_rmbg14_pipeline_with_precision::<NdArray<f32>>(
+                root,
+                &device,
+                requested_precision,
+            )?;
             self.rmbg14 = Some(pipeline);
         }
         self.rmbg14
@@ -994,15 +1042,15 @@ impl ForegroundRuntime {
     }
 
     #[cfg(feature = "wgpu")]
-    fn ensure_rmbg14_wgpu(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<WgpuBackend>> {
+    fn ensure_rmbg14_wgpu(
+        &mut self,
+        root: &Path,
+        requested_precision: WeightPrecision,
+    ) -> RuntimeResult<&RmbgPipeline<WgpuBackend>> {
         if self.rmbg14_wgpu.is_none() {
             let device = <WgpuBackend as Backend>::Device::default();
-            let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
-                RuntimeError::new(format!(
-                    "failed to load RMBG-1.4 (wgpu) at {}: {err}",
-                    root.display()
-                ))
-            })?;
+            let pipeline =
+                load_rmbg14_pipeline_with_precision::<WgpuBackend>(root, &device, requested_precision)?;
             self.rmbg14_wgpu = Some(pipeline);
         }
         self.rmbg14_wgpu
@@ -1011,15 +1059,15 @@ impl ForegroundRuntime {
     }
 
     #[cfg(feature = "cuda")]
-    fn ensure_rmbg14_cuda(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<CudaBackend>> {
+    fn ensure_rmbg14_cuda(
+        &mut self,
+        root: &Path,
+        requested_precision: WeightPrecision,
+    ) -> RuntimeResult<&RmbgPipeline<CudaBackend>> {
         if self.rmbg14_cuda.is_none() {
             let device = <CudaBackend as Backend>::Device::default();
-            let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
-                RuntimeError::new(format!(
-                    "failed to load RMBG-1.4 (cuda) at {}: {err}",
-                    root.display()
-                ))
-            })?;
+            let pipeline =
+                load_rmbg14_pipeline_with_precision::<CudaBackend>(root, &device, requested_precision)?;
             self.rmbg14_cuda = Some(pipeline);
         }
         self.rmbg14_cuda
@@ -1122,13 +1170,22 @@ fn load_backend_state<B: Backend>(
         B::seed(&device, seed);
     }
     let parity = triposg_runtime_profile(Some(config.mesh_prepare.max_dimension));
+    let (triposg_preferred_precision, allow_cross_precision_fallback) = resolve_weight_precision(
+        config.triposg_weights_precision,
+        parity.burnpack_policy.precision.preferred(),
+    );
+    let burnpack_policy = parity
+        .burnpack_policy
+        .with_precision(map_bpk_precision_to_preference(triposg_preferred_precision))
+        .with_allow_cross_precision_fallback(allow_cross_precision_fallback);
     let weights_root = resolve_triposg_runtime_weights_root(
         config.weights_root.as_deref(),
-        parity.burnpack_policy.precision.prefer_f16(),
+        triposg_preferred_precision,
+        allow_cross_precision_fallback,
     )?;
     let use_cpu_dino = should_use_cpu_dino_backend::<B>(map_dino_backend(config.dino_backend));
     let load_options = TripoSGLoadOptions {
-        burnpack_policy: parity.burnpack_policy,
+        burnpack_policy,
         load_image_encoder: !use_cpu_dino,
         strict_dino_preprocess: Some(parity.strict_dino_preprocess),
         ..TripoSGLoadOptions::default()
@@ -1146,7 +1203,7 @@ fn load_backend_state<B: Backend>(
         let encoder = load_triposg_dinov2_with_policy(
             &cpu_device,
             weights_root.join("image_encoder_dinov2/model.safetensors"),
-            parity.burnpack_policy,
+            burnpack_policy,
         )
         .map_err(|err| {
             RuntimeError::new(format!(
@@ -1178,7 +1235,8 @@ fn load_backend_state<B: Backend>(
 
 fn resolve_triposg_runtime_weights_root(
     explicit: Option<&Path>,
-    prefer_f16: bool,
+    preferred_precision: BpkPrecision,
+    allow_cross_precision_fallback: bool,
 ) -> RuntimeResult<PathBuf> {
     if let Some(path) = explicit {
         return Ok(resolve_triposg_weights_root(Some(path)));
@@ -1186,14 +1244,17 @@ fn resolve_triposg_runtime_weights_root(
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        resolve_or_bootstrap_triposg_root(prefer_f16).map_err(|err| {
-            RuntimeError::new(format!("failed to prepare TripoSG cache bootstrap: {err}"))
-        })
+        resolve_or_bootstrap_triposg_root(
+            map_bpk_precision_to_artifact_precision(preferred_precision),
+            allow_cross_precision_fallback,
+        )
+        .map_err(|err| RuntimeError::new(format!("failed to prepare TripoSG cache bootstrap: {err}")))
     }
 
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = prefer_f16;
+        let _ = preferred_precision;
+        let _ = allow_cross_precision_fallback;
         Ok(resolve_triposg_weights_root(None))
     }
 }
@@ -1204,6 +1265,67 @@ fn map_dino_backend(value: DinoBackend) -> DinoBackendChoice {
         DinoBackend::Cpu => DinoBackendChoice::Cpu,
         DinoBackend::Gpu => DinoBackendChoice::Gpu,
     }
+}
+
+fn resolve_weight_precision(
+    requested: WeightPrecision,
+    auto_default: BpkPrecision,
+) -> (BpkPrecision, bool) {
+    match requested {
+        WeightPrecision::Auto => (auto_default, true),
+        WeightPrecision::F16 => (BpkPrecision::F16, false),
+        WeightPrecision::F32 => (BpkPrecision::F32, false),
+        WeightPrecision::Fp8 => (BpkPrecision::Fp8, false),
+        WeightPrecision::Q4 => (BpkPrecision::Q4, false),
+    }
+}
+
+fn map_bpk_precision_to_preference(precision: BpkPrecision) -> BpkPrecisionPreference {
+    match precision {
+        BpkPrecision::F32 => BpkPrecisionPreference::PreferF32,
+        BpkPrecision::F16 => BpkPrecisionPreference::PreferF16,
+        BpkPrecision::Fp8 => BpkPrecisionPreference::PreferFp8,
+        BpkPrecision::Q4 => BpkPrecisionPreference::PreferQ4,
+    }
+}
+
+fn map_bpk_precision_to_artifact_precision(precision: BpkPrecision) -> ArtifactBurnpackPrecision {
+    match precision {
+        BpkPrecision::F32 => ArtifactBurnpackPrecision::F32,
+        BpkPrecision::F16 => ArtifactBurnpackPrecision::F16,
+        BpkPrecision::Fp8 => ArtifactBurnpackPrecision::Fp8,
+        BpkPrecision::Q4 => ArtifactBurnpackPrecision::Q4,
+    }
+}
+
+fn load_rmbg14_pipeline_with_precision<B: Backend>(
+    root: &Path,
+    device: &B::Device,
+    requested_precision: WeightPrecision,
+) -> RuntimeResult<RmbgPipeline<B>> {
+    let config = load_rmbg_config(root).map_err(|err| {
+        RuntimeError::new(format!("failed to load RMBG-1.4 config at {}: {err}", root.display()))
+    })?;
+    let (preferred_precision, allow_cross_precision_fallback) =
+        resolve_weight_precision(requested_precision, BpkPrecision::F16);
+    let weights_path = root.join("model.safetensors");
+    let model = load_rmbg_with_precision(
+        device,
+        &weights_path,
+        &config,
+        map_bpk_precision_to_artifact_precision(preferred_precision),
+        allow_cross_precision_fallback,
+    )
+    .map_err(|err| {
+        RuntimeError::new(format!("failed to load RMBG-1.4 at {}: {err}", root.display()))
+    })?;
+    let processor = load_rmbg_processor_config(root).map_err(|err| {
+        RuntimeError::new(format!(
+            "failed to load RMBG-1.4 processor config at {}: {err}",
+            root.display()
+        ))
+    })?;
+    Ok(RmbgPipeline::new(model, processor))
 }
 
 #[cfg(feature = "trellis")]
@@ -1474,6 +1596,7 @@ fn decimate_mesh(mut mesh: Mesh, target_faces: Option<usize>) -> Result<Mesh, St
 fn resolve_foreground_weights_root(
     explicit: Option<&Path>,
     model: ForegroundModel,
+    requested_precision: WeightPrecision,
 ) -> RuntimeResult<PathBuf> {
     if let Some(path) = explicit
         && let Some(root) = normalize_foreground_root(path, model)
@@ -1481,20 +1604,28 @@ fn resolve_foreground_weights_root(
         return Ok(root);
     }
     match model {
-        ForegroundModel::Rmbg14 => resolve_rmbg14_runtime_weights_root(),
+        ForegroundModel::Rmbg14 => resolve_rmbg14_runtime_weights_root(requested_precision),
         ForegroundModel::Rmbg2 => Ok(resolve_rmbg2_weights_root()),
     }
 }
 
-fn resolve_rmbg14_runtime_weights_root() -> RuntimeResult<PathBuf> {
+fn resolve_rmbg14_runtime_weights_root(
+    requested_precision: WeightPrecision,
+) -> RuntimeResult<PathBuf> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        resolve_or_bootstrap_rmbg14_root(true)
+        let (preferred_precision, allow_cross_precision_fallback) =
+            resolve_weight_precision(requested_precision, BpkPrecision::F16);
+        resolve_or_bootstrap_rmbg14_root(
+            map_bpk_precision_to_artifact_precision(preferred_precision),
+            allow_cross_precision_fallback,
+        )
             .map_err(|err| RuntimeError::new(format!("failed to prepare RMBG-1.4 cache: {err}")))
     }
 
     #[cfg(target_arch = "wasm32")]
     {
+        let _ = requested_precision;
         Ok(resolve_rmbg_weights_root())
     }
 }
@@ -1770,5 +1901,26 @@ mod tests {
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
         assert!(profile.burnpack_policy.precision.prefer_f16());
+    }
+
+    #[test]
+    fn weight_precision_auto_uses_runtime_default_with_fallback() {
+        let (precision, allow_fallback) =
+            resolve_weight_precision(WeightPrecision::Auto, BpkPrecision::F16);
+        assert_eq!(precision, BpkPrecision::F16);
+        assert!(allow_fallback);
+    }
+
+    #[test]
+    fn explicit_quantized_precision_is_strict() {
+        let (fp8, allow_fp8_fallback) =
+            resolve_weight_precision(WeightPrecision::Fp8, BpkPrecision::F16);
+        assert_eq!(fp8, BpkPrecision::Fp8);
+        assert!(!allow_fp8_fallback);
+
+        let (q4, allow_q4_fallback) =
+            resolve_weight_precision(WeightPrecision::Q4, BpkPrecision::F16);
+        assert_eq!(q4, BpkPrecision::Q4);
+        assert!(!allow_q4_fallback);
     }
 }

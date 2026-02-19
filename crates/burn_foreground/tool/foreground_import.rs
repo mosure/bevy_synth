@@ -11,7 +11,7 @@ mod native {
 
     use burn::backend::NdArray;
     use burn_synth_import::io::ensure_parent_dir;
-    use burn_synth_import::layout::{burnpack_path, precision_label};
+    use burn_synth_import::layout::{BurnpackPrecision, burnpack_path_with_precision};
     use burn_synth_import::parts::{
         apply_artifact_policy, remove_legacy_shard_artifacts_for_burnpack,
     };
@@ -21,7 +21,7 @@ mod native {
     use burn_foreground::rmbg2::import::{import_rmbg2_burnpack, resolve_rmbg2_weights_root};
     use burn_foreground::rmbg14::{
         RmbgConfig,
-        import::{import_rmbg_burnpack, load_rmbg_config, resolve_rmbg_weights_root},
+        import::{import_rmbg_burnpack_with_precision, load_rmbg_config, resolve_rmbg_weights_root},
     };
 
     type CpuBackend = NdArray<f32>;
@@ -32,6 +32,9 @@ mod native {
         F32,
         F16,
         Both,
+        Fp8,
+        Q4,
+        All,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -42,12 +45,20 @@ mod native {
     }
 
     impl Quantization {
-        fn include_f32(self) -> bool {
-            matches!(self, Self::F32 | Self::Both)
-        }
-
-        fn include_f16(self) -> bool {
-            matches!(self, Self::F16 | Self::Both)
+        fn selected_precisions(self) -> Vec<BurnpackPrecision> {
+            match self {
+                Self::F32 => vec![BurnpackPrecision::F32],
+                Self::F16 => vec![BurnpackPrecision::F16],
+                Self::Both => vec![BurnpackPrecision::F32, BurnpackPrecision::F16],
+                Self::Fp8 => vec![BurnpackPrecision::Fp8],
+                Self::Q4 => vec![BurnpackPrecision::Q4],
+                Self::All => vec![
+                    BurnpackPrecision::F32,
+                    BurnpackPrecision::F16,
+                    BurnpackPrecision::Fp8,
+                    BurnpackPrecision::Q4,
+                ],
+            }
         }
     }
 
@@ -110,27 +121,33 @@ mod native {
             None
         };
 
-        if args.quantization.include_f32() {
-            run_imports_with_backend::<CpuBackend>(
-                false,
-                args.overwrite,
-                rmbg14
-                    .as_ref()
-                    .map(|(weights, config)| (weights.as_path(), config)),
-                rmbg2_root.as_deref(),
-                args.artifact_policy.into_policy(args.part_size_mib),
-            )?;
-        }
-        if args.quantization.include_f16() {
-            run_imports_with_backend::<GpuBackend>(
-                true,
-                args.overwrite,
-                rmbg14
-                    .as_ref()
-                    .map(|(weights, config)| (weights.as_path(), config)),
-                rmbg2_root.as_deref(),
-                args.artifact_policy.into_policy(args.part_size_mib),
-            )?;
+        let artifact_policy = args.artifact_policy.into_policy(args.part_size_mib);
+        for precision in args.quantization.selected_precisions() {
+            if precision == BurnpackPrecision::Q4 {
+                return Err("q4 import is not supported on Burn 0.19 backends used by this repository (quantized q4 kernels/storage are incomplete for RMBG tensor layouts).".into());
+            }
+            match precision {
+                BurnpackPrecision::F16 => run_imports_with_backend::<GpuBackend>(
+                    precision,
+                    args.overwrite,
+                    rmbg14
+                        .as_ref()
+                        .map(|(weights, config)| (weights.as_path(), config)),
+                    rmbg2_root.as_deref(),
+                    artifact_policy,
+                )?,
+                BurnpackPrecision::F32 | BurnpackPrecision::Fp8 | BurnpackPrecision::Q4 => {
+                    run_imports_with_backend::<CpuBackend>(
+                        precision,
+                        args.overwrite,
+                        rmbg14
+                            .as_ref()
+                            .map(|(weights, config)| (weights.as_path(), config)),
+                        rmbg2_root.as_deref(),
+                        artifact_policy,
+                    )?
+                }
+            }
         }
 
         Ok(())
@@ -184,7 +201,7 @@ mod native {
     }
 
     fn run_imports_with_backend<B>(
-        use_f16: bool,
+        precision: BurnpackPrecision,
         overwrite: bool,
         rmbg14: Option<(&Path, &RmbgConfig)>,
         rmbg2_root: Option<&Path>,
@@ -200,10 +217,12 @@ mod native {
             import_if_needed(
                 "RMBG-1.4",
                 weights,
-                use_f16,
+                precision,
                 overwrite,
                 artifact_policy,
-                || import_rmbg_burnpack::<B>(&device, weights, config, use_f16),
+                || {
+                    import_rmbg_burnpack_with_precision::<B>(&device, weights, config, precision)
+                },
             )?;
         }
 
@@ -211,30 +230,26 @@ mod native {
             if !root.exists() {
                 return Err(format!("missing RMBG-2.0 root at {}", root.display()).into());
             }
-            let output = root.join(if use_f16 {
-                "model_f16.bpk"
-            } else {
-                "model.bpk"
-            });
-            let precision = precision_label(use_f16);
+            let output = burnpack_path_with_precision(&root.join("model.safetensors"), precision);
+            let precision_label = precision.label();
             let output = if output.exists() && !overwrite {
                 println!(
-                    "[IMPORT] RMBG-2.0 ({precision}) burnpack already exists at {}, skipping.",
+                    "[IMPORT] RMBG-2.0 ({precision_label}) burnpack already exists at {}, skipping.",
                     output.display()
                 );
                 output
             } else {
                 ensure_parent_dir(&output)?;
-                let saved = import_rmbg2_burnpack(root, use_f16)?;
+                let saved = import_rmbg2_burnpack(root, precision)?;
                 println!(
-                    "[IMPORT] RMBG-2.0 ({precision}) burnpack saved to {}",
+                    "[IMPORT] RMBG-2.0 ({precision_label}) burnpack saved to {}",
                     saved.display()
                 );
                 saved
             };
             if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
                 println!(
-                    "[IMPORT] RMBG-2.0 ({precision}) parts manifest: {} ({} parts, {:.1} MiB)",
+                    "[IMPORT] RMBG-2.0 ({precision_label}) parts manifest: {} ({} parts, {:.1} MiB)",
                     report.manifest_path.display(),
                     report.part_paths.len(),
                     report.total_bytes as f64 / (1024.0 * 1024.0),
@@ -243,7 +258,7 @@ mod native {
             let removed_legacy = remove_legacy_shard_artifacts_for_burnpack(&output)?;
             if removed_legacy > 0 {
                 println!(
-                    "[IMPORT] RMBG-2.0 ({precision}) removed {removed_legacy} legacy shard artifact(s)"
+                    "[IMPORT] RMBG-2.0 ({precision_label}) removed {removed_legacy} legacy shard artifact(s)"
                 );
             }
         }
@@ -254,7 +269,7 @@ mod native {
     fn import_if_needed<F>(
         label: &str,
         weights_path: &Path,
-        use_f16: bool,
+        precision: BurnpackPrecision,
         overwrite: bool,
         artifact_policy: ArtifactPolicy,
         import_fn: F,
@@ -266,11 +281,11 @@ mod native {
             return Err(format!("missing {label} weights at {}", weights_path.display()).into());
         }
 
-        let burnpack = burnpack_path(weights_path, use_f16);
-        let precision = precision_label(use_f16);
+        let burnpack = burnpack_path_with_precision(weights_path, precision);
+        let precision_label = precision.label();
         let output = if burnpack.exists() && !overwrite {
             println!(
-                "[IMPORT] {label} ({precision}) burnpack already exists at {}, skipping.",
+                "[IMPORT] {label} ({precision_label}) burnpack already exists at {}, skipping.",
                 burnpack.display()
             );
             burnpack
@@ -278,7 +293,7 @@ mod native {
             ensure_parent_dir(&burnpack)?;
             let output = import_fn()?;
             println!(
-                "[IMPORT] {label} ({precision}) burnpack saved to {}",
+                "[IMPORT] {label} ({precision_label}) burnpack saved to {}",
                 output.display()
             );
             output
@@ -286,7 +301,7 @@ mod native {
 
         if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
             println!(
-                "[IMPORT] {label} ({precision}) parts manifest: {} ({} parts, {:.1} MiB)",
+                "[IMPORT] {label} ({precision_label}) parts manifest: {} ({} parts, {:.1} MiB)",
                 report.manifest_path.display(),
                 report.part_paths.len(),
                 report.total_bytes as f64 / (1024.0 * 1024.0),
@@ -295,7 +310,7 @@ mod native {
         let removed_legacy = remove_legacy_shard_artifacts_for_burnpack(&output)?;
         if removed_legacy > 0 {
             println!(
-                "[IMPORT] {label} ({precision}) removed {removed_legacy} legacy shard artifact(s)"
+                "[IMPORT] {label} ({precision_label}) removed {removed_legacy} legacy shard artifact(s)"
             );
         }
 

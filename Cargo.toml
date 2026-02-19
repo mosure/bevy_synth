@@ -53,3 +53,6 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[patch.crates-io]
+burn-store = { path = "crates/vendor/burn-store" }

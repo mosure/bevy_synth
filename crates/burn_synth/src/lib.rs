@@ -39,7 +39,7 @@ pub use progress::{
 pub use runtime::{
     DinoBackend, ForegroundOutput, ForegroundRequest, InferenceBackend,
     MeshOutput as RuntimeMeshOutput, MeshRequest, RuntimeConfig, RuntimeError, SynthRuntime,
-    TrellisQuality,
+    TrellisQuality, WeightPrecision,
 };
 
 #[cfg(feature = "triposg")]

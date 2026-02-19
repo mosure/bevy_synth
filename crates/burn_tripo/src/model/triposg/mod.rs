@@ -2,6 +2,9 @@ pub mod components;
 pub mod dit;
 pub mod hooks;
 pub mod image_encoder;
+#[cfg(feature = "import")]
+pub mod import_precision;
 pub mod load_policy;
+pub mod load_postprocess;
 pub mod scheduler;
 pub mod vae;

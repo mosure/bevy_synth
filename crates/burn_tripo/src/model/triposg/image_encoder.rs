@@ -301,10 +301,8 @@ pub mod import {
         path::{Path, PathBuf},
     };
 
-    use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
     use burn::tensor::Bytes;
-    use burn::tensor::FloatDType;
     use burn::tensor::ops::InterpolateMode;
     use burn_store::{
         ApplyResult, BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter,
@@ -316,7 +314,12 @@ pub mod import {
         tensor::{SafeTensors, TensorView},
     };
 
-    use super::super::load_policy::{BurnpackLoadPolicy, burnpack_path, candidate_burnpack_paths};
+    use super::super::import_precision::apply_import_precision;
+    use super::super::load_policy::{
+        BpkPrecision, BurnpackLoadPolicy, burnpack_path, burnpack_path_for_precision,
+        candidate_burnpack_paths,
+    };
+    use super::super::load_postprocess::maybe_postprocess_loaded_module;
     use super::{DinoImageProcessor, TripoSGImageEncoder};
     use burn_dino::model::dino::DinoVisionTransformerConfig;
 
@@ -368,7 +371,7 @@ pub mod import {
                     .map_err(|err| format!("failed to apply DINOv2 burnpack part bytes: {err}"))
             },
         )? {
-            return Ok(model);
+            return Ok(maybe_postprocess_loaded_module(model, policy));
         }
         let burnpack_path = burnpack_candidates
             .iter()
@@ -394,7 +397,7 @@ pub mod import {
             .load_from(&mut store)
             .map_err(|err| format!("failed to load dinov2 burnpack: {err}"))?;
         validate_apply_result("dinov2 burnpack", &apply)?;
-
+        let model = maybe_postprocess_loaded_module(model, policy);
         Ok(TripoSGImageEncoder::new(model))
     }
 
@@ -1270,7 +1273,34 @@ pub mod import {
         weights_path: impl AsRef<Path>,
         use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let precision = if use_f16 {
+            BpkPrecision::F16
+        } else {
+            BpkPrecision::F32
+        };
+        import_triposg_dinov2_burnpack_with_precision::<B>(device, weights_path, precision)
+    }
+
+    pub fn import_triposg_dinov2_burnpack_with_precision<B: Backend>(
+        device: &B::Device,
+        weights_path: impl AsRef<Path>,
+        precision: BpkPrecision,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
+        let default_policy = BurnpackLoadPolicy::default();
+        let burnpack_path = burnpack_path_for_precision(weights_path, precision, default_policy);
+        let model = load_dinov2_import_source::<B>(device, weights_path, default_policy)?;
+        let model = apply_import_precision(model, precision);
+        save_burnpack(&model, &burnpack_path)?;
+
+        Ok(burnpack_path)
+    }
+
+    fn load_dinov2_import_source<B: Backend>(
+        device: &B::Device,
+        weights_path: &Path,
+        policy: BurnpackLoadPolicy,
+    ) -> Result<burn_dino::model::dino::DinoVisionTransformer<B>, Box<dyn std::error::Error>> {
         let mut config = load_dinov2_config(weights_path)
             .unwrap_or_else(|| DinoVisionTransformerConfig::vitl(None, None));
         if let Some(target_size) = load_dinov2_preprocess_size(weights_path) {
@@ -1280,44 +1310,42 @@ pub mod import {
                 config.positional_encoding_interpolate.output_size = Some([grid, grid]);
             }
         }
-        let burnpack_path = burnpack_path(
-            weights_path,
-            use_f16,
-            BurnpackLoadPolicy::default().f16_suffix,
-        );
-        let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
-            burn_dino::model::dino::DinoVisionTransformer::new(device, config);
 
-        let converted = convert_hf_dinov2(weights_path)?;
-        let mut store = build_store(converted)?;
-        model
-            .load_from(&mut store)
-            .map_err(|err| format!("failed to load dinov2 weights: {err}"))?;
-        let model = if use_f16 {
-            cast_module_float_dtype(model, FloatDType::F16)
-        } else {
+        if weights_path
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("safetensors"))
+            .unwrap_or(false)
+            && weights_path.exists()
+        {
+            let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
+                burn_dino::model::dino::DinoVisionTransformer::new(device, config);
+            let converted = convert_hf_dinov2(weights_path)?;
+            let mut store = build_store(converted)?;
             model
-        };
-        save_burnpack(&model, &burnpack_path)?;
-
-        Ok(burnpack_path)
-    }
-
-    struct FloatDTypeMapper {
-        dtype: FloatDType,
-    }
-
-    impl<B: Backend> ModuleMapper<B> for FloatDTypeMapper {
-        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
-            let (id, tensor, mapper) = param.consume();
-            let tensor = tensor.cast(self.dtype);
-            Param::from_mapped_value(id, tensor, mapper)
+                .load_from(&mut store)
+                .map_err(|err| format!("failed to load dinov2 weights: {err}"))?;
+            return Ok(model);
         }
-    }
 
-    fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
-        let mut mapper = FloatDTypeMapper { dtype };
-        module.map(&mut mapper)
+        let f32_burnpack_path = burnpack_path(weights_path, false, policy.f16_suffix);
+        if f32_burnpack_path.exists() {
+            let mut model: burn_dino::model::dino::DinoVisionTransformer<B> =
+                burn_dino::model::dino::DinoVisionTransformer::new(device, config);
+            let mut store =
+                BurnpackStore::from_file(&f32_burnpack_path).validate(should_validate_burnpack());
+            let apply = model
+                .load_from(&mut store)
+                .map_err(|err| format!("failed to load dinov2 burnpack source: {err}"))?;
+            validate_apply_result("dinov2 burnpack source", &apply)?;
+            return Ok(model);
+        }
+
+        Err(format!(
+            "missing DINOv2 source weights for import at {} (expected .safetensors or {})",
+            weights_path.display(),
+            f32_burnpack_path.display()
+        )
+        .into())
     }
 
     fn save_burnpack<B: Backend>(

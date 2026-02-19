@@ -8,12 +8,13 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
+use burn_synth_import::layout::BurnpackPrecision;
 use burn_synth_import::parts::{BurnpackPartEntry, read_parts_manifest, resolve_part_entry_path};
 use burn_tripo::paths::resolve_triposg_weights_root;
 use log::{info, warn};
 use sha2::{Digest, Sha256};
 
-use crate::model_loader::{candidate_burnpack_names, parse_parts_manifest_bytes};
+use crate::model_loader::{candidate_burnpack_names_for_precision, parse_parts_manifest_bytes};
 
 const DEFAULT_MODEL_BASE_URL: &str = "https://aberration.technology/model";
 const CACHE_MODELS_DIR: &str = ".burn_synth/models";
@@ -65,7 +66,10 @@ fn emit_status(message: impl Into<String>) {
     }
 }
 
-pub(crate) fn resolve_or_bootstrap_triposg_root(prefer_f16: bool) -> Result<PathBuf, String> {
+pub(crate) fn resolve_or_bootstrap_triposg_root(
+    preferred_precision: BurnpackPrecision,
+    allow_cross_precision_fallback: bool,
+) -> Result<PathBuf, String> {
     let cache_root = default_cache_models_root();
     let target_root = cache_root.join(TRIPOSG_DIR);
     let remote_root = triposg_remote_root();
@@ -73,7 +77,8 @@ pub(crate) fn resolve_or_bootstrap_triposg_root(prefer_f16: bool) -> Result<Path
     match ensure_model_ready(
         &target_root,
         &remote_root,
-        prefer_f16,
+        preferred_precision,
+        allow_cross_precision_fallback,
         TRIPOSG_OPTIONAL_TEXT_RELPATHS,
         TRIPOSG_REQUIRED_PARTS_BASES,
         "TripoSG",
@@ -97,7 +102,10 @@ pub(crate) fn resolve_or_bootstrap_triposg_root(prefer_f16: bool) -> Result<Path
     }
 }
 
-pub(crate) fn resolve_or_bootstrap_rmbg14_root(prefer_f16: bool) -> Result<PathBuf, String> {
+pub(crate) fn resolve_or_bootstrap_rmbg14_root(
+    preferred_precision: BurnpackPrecision,
+    allow_cross_precision_fallback: bool,
+) -> Result<PathBuf, String> {
     let cache_root = default_cache_models_root();
     let target_root = cache_root.join(RMBG14_DIR);
     let remote_root = rmbg14_remote_root();
@@ -105,7 +113,8 @@ pub(crate) fn resolve_or_bootstrap_rmbg14_root(prefer_f16: bool) -> Result<PathB
     match ensure_model_ready(
         &target_root,
         &remote_root,
-        prefer_f16,
+        preferred_precision,
+        allow_cross_precision_fallback,
         RMBG14_OPTIONAL_TEXT_RELPATHS,
         RMBG14_REQUIRED_PARTS_BASES,
         "RMBG-1.4",
@@ -129,7 +138,8 @@ pub(crate) fn resolve_or_bootstrap_rmbg14_root(prefer_f16: bool) -> Result<PathB
 fn ensure_model_ready(
     local_root: &Path,
     remote_root: &str,
-    prefer_f16: bool,
+    preferred_precision: BurnpackPrecision,
+    allow_cross_precision_fallback: bool,
     optional_text_relpaths: &[&str],
     required_parts_bases: &[&str],
     label: &str,
@@ -146,7 +156,14 @@ fn ensure_model_ready(
     }
 
     for base in required_parts_bases {
-        ensure_parts_bundle(local_root, remote_root, base, prefer_f16, label)?;
+        ensure_parts_bundle(
+            local_root,
+            remote_root,
+            base,
+            preferred_precision,
+            allow_cross_precision_fallback,
+            label,
+        )?;
     }
 
     emit_status(format!(
@@ -201,11 +218,16 @@ fn ensure_parts_bundle(
     local_root: &Path,
     remote_root: &str,
     base_safetensors_rel: &str,
-    prefer_f16: bool,
+    preferred_precision: BurnpackPrecision,
+    allow_cross_precision_fallback: bool,
     label: &str,
 ) -> Result<(), String> {
     let mut checked = Vec::new();
-    let candidates = candidate_burnpack_names(base_safetensors_rel, prefer_f16);
+    let candidates = candidate_burnpack_names_for_precision(
+        base_safetensors_rel,
+        preferred_precision,
+        allow_cross_precision_fallback,
+    );
     for candidate in candidates {
         let manifest_rel = format!("{candidate}.parts.json");
         let local_manifest_path = local_root.join(&manifest_rel);

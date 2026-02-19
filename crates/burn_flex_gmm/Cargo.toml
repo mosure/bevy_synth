@@ -18,7 +18,7 @@ wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
 [dependencies]
 matrixmultiply = "0.3"
 burn = { version = "0.19", default-features = false, features = ["std"], optional = true }
-burn-cubecl = { version = "0.19", optional = true }
+burn-cubecl = { version = "0.19", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
 version = "0.19"

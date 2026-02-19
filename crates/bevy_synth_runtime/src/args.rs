@@ -162,12 +162,12 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = DinoBackend::Auto)]
     pub dino_backend: DinoBackend,
 
-    /// TripoSG burnpack precision preference on web/native (auto, f16, f32).
+    /// TripoSG burnpack precision preference on web/native (auto, f16, f32, fp8, q4).
     /// Defaults to `f16` to reduce weight download/storage footprint.
     #[arg(long, value_enum, default_value_t = WeightPrecision::F16)]
     pub weights_precision: WeightPrecision,
 
-    /// RMBG burnpack precision preference (auto, f16, f32).
+    /// RMBG burnpack precision preference (auto, f16, f32, fp8, q4).
     /// On wasm, `auto` favors f16 to reduce startup memory pressure.
     #[arg(long, value_enum, default_value_t = WeightPrecision::Auto)]
     pub rmbg_weights_precision: WeightPrecision,
@@ -228,6 +228,8 @@ pub enum WeightPrecision {
     Auto,
     F16,
     F32,
+    Fp8,
+    Q4,
 }
 
 #[derive(ValueEnum, Clone, Debug)]

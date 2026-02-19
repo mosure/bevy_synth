@@ -1,4 +1,7 @@
-use burn_synth_import::layout::candidate_burnpack_names as shared_candidate_burnpack_names;
+use burn_synth_import::layout::{
+    BurnpackPrecision, candidate_burnpack_names as shared_candidate_burnpack_names,
+    candidate_burnpack_names_for_precision as shared_candidate_burnpack_names_for_precision,
+};
 use burn_synth_import::parts::BurnpackPartsManifest;
 
 /// Default artifact precision preference for generic model loader paths.
@@ -21,6 +24,18 @@ pub fn prefer_f16_burnpack() -> bool {
 
 pub fn candidate_burnpack_names(base_safetensors_path: &str, prefer_f16: bool) -> Vec<String> {
     shared_candidate_burnpack_names(base_safetensors_path, prefer_f16)
+}
+
+pub fn candidate_burnpack_names_for_precision(
+    base_safetensors_path: &str,
+    precision: BurnpackPrecision,
+    allow_cross_precision_fallback: bool,
+) -> Vec<String> {
+    shared_candidate_burnpack_names_for_precision(
+        base_safetensors_path,
+        precision,
+        allow_cross_precision_fallback,
+    )
 }
 
 pub fn parse_parts_manifest_bytes(
@@ -90,7 +105,12 @@ pub fn resolve_burnpack_asset_path_from_root_with_preference(
     base_safetensors_rel: &str,
     prefer_f16: bool,
 ) -> Result<PathBuf, String> {
-    let candidates = candidate_burnpack_names(base_safetensors_rel, prefer_f16);
+    let preferred = if prefer_f16 {
+        BurnpackPrecision::F16
+    } else {
+        BurnpackPrecision::F32
+    };
+    let candidates = candidate_burnpack_names_for_precision(base_safetensors_rel, preferred, true);
     let mut checked = Vec::new();
     for candidate in candidates {
         let candidate_path = root.join(Path::new(&candidate));

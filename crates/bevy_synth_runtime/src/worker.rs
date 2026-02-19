@@ -372,11 +372,15 @@ fn app_args_to_wasm_preset(args: &AppArgs) -> WasmInferencePreset {
         WeightPrecision::Auto => "auto",
         WeightPrecision::F16 => "f16",
         WeightPrecision::F32 => "f32",
+        WeightPrecision::Fp8 => "fp8",
+        WeightPrecision::Q4 => "q4",
     };
     let rmbg_weights_precision = match args.rmbg_weights_precision {
         WeightPrecision::Auto => "auto",
         WeightPrecision::F16 => "f16",
         WeightPrecision::F32 => "f32",
+        WeightPrecision::Fp8 => "fp8",
+        WeightPrecision::Q4 => "q4",
     };
     WasmInferencePreset {
         quality: "full",

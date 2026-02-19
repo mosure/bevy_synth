@@ -54,10 +54,11 @@ pub mod import {
 
     use burn::backend::NdArray;
     use burn::prelude::Backend;
+    use burn_synth_import::layout::BurnpackPrecision;
 
     use crate::preprocess::RmbgImageProcessor;
     use crate::rmbg14::import::{
-        import_rmbg_burnpack, load_rmbg_config, load_rmbg_processor_config,
+        import_rmbg_burnpack_with_precision, load_rmbg_config, load_rmbg_processor_config,
         load_rmbg_processor_from_json_bytes, resolve_rmbg_weights_root,
     };
     use crate::rmbg14::RmbgConfig;
@@ -79,13 +80,18 @@ pub mod import {
 
     pub fn import_rmbg2_burnpack(
         root: impl AsRef<Path>,
-        use_f16: bool,
+        precision: BurnpackPrecision,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let root = root.as_ref();
         let device = <NdArray<f32> as Backend>::Device::default();
         let config = load_rmbg_config(root).unwrap_or_else(|_| RmbgConfig::rmbg_1_4());
         let weights_path = root.join("model.safetensors");
-        import_rmbg_burnpack::<NdArray<f32>>(&device, weights_path, &config, use_f16)
+        import_rmbg_burnpack_with_precision::<NdArray<f32>>(
+            &device,
+            weights_path,
+            &config,
+            precision,
+        )
     }
 
     pub fn load_rmbg2_processor_config(
@@ -105,8 +111,12 @@ pub mod import {
             root.join("model.safetensors"),
             root.join("model.bpk"),
             root.join("model_f16.bpk"),
+            root.join("model_fp8.bpk"),
+            root.join("model_q4.bpk"),
             root.join("model.bpk.parts.json"),
             root.join("model_f16.bpk.parts.json"),
+            root.join("model_fp8.bpk.parts.json"),
+            root.join("model_q4.bpk.parts.json"),
         ];
         candidates.into_iter().any(|path| path.exists())
     }

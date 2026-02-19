@@ -4,15 +4,17 @@ use std::path::{Path, PathBuf};
 
 use burn::backend::NdArray;
 use burn_synth_import::io::ensure_parent_dir;
-use burn_synth_import::layout::{burnpack_path, precision_label};
 use burn_synth_import::parts::{apply_artifact_policy, remove_legacy_shard_artifacts_for_burnpack};
 use burn_synth_import::plan::ArtifactPolicy;
 use clap::{Parser, ValueEnum};
 
 use burn_tripo::model::triposg::{
-    dit::{TripoSGDiTConfig, import::import_triposg_dit_burnpack},
-    image_encoder::import::{import_triposg_dinov2_burnpack, resolve_triposg_weights_root},
-    vae::{TripoSGVaeConfig, import::import_triposg_vae_burnpack},
+    dit::{TripoSGDiTConfig, import::import_triposg_dit_burnpack_with_precision},
+    image_encoder::import::{
+        import_triposg_dinov2_burnpack_with_precision, resolve_triposg_weights_root,
+    },
+    load_policy::{BpkPrecision, BurnpackLoadPolicy, burnpack_path_for_precision},
+    vae::{TripoSGVaeConfig, import::import_triposg_vae_burnpack_with_precision},
 };
 
 type CpuBackend = NdArray<f32>;
@@ -23,15 +25,26 @@ enum Quantization {
     F32,
     F16,
     Both,
+    Fp8,
+    Q4,
+    All,
 }
 
 impl Quantization {
-    fn include_f32(self) -> bool {
-        matches!(self, Self::F32 | Self::Both)
-    }
-
-    fn include_f16(self) -> bool {
-        matches!(self, Self::F16 | Self::Both)
+    fn selected_precisions(self) -> Vec<BpkPrecision> {
+        match self {
+            Self::F32 => vec![BpkPrecision::F32],
+            Self::F16 => vec![BpkPrecision::F16],
+            Self::Both => vec![BpkPrecision::F32, BpkPrecision::F16],
+            Self::Fp8 => vec![BpkPrecision::Fp8],
+            Self::Q4 => vec![BpkPrecision::Q4],
+            Self::All => vec![
+                BpkPrecision::F32,
+                BpkPrecision::F16,
+                BpkPrecision::Fp8,
+                BpkPrecision::Q4,
+            ],
+        }
     }
 }
 
@@ -103,40 +116,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    if args.quantization.include_f32() {
-        run_imports_with_backend::<CpuBackend>(
-            false,
-            args.overwrite,
-            TripoSources {
-                vae: &vae_path,
-                dit: &dit_path,
-                dino: &dino_path,
-            },
-            &vae_config,
-            &dit_config,
-            args.artifact_policy.into_policy(args.part_size_mib),
-        )?;
-    }
-    if args.quantization.include_f16() {
-        run_imports_with_backend::<GpuBackend>(
-            true,
-            args.overwrite,
-            TripoSources {
-                vae: &vae_path,
-                dit: &dit_path,
-                dino: &dino_path,
-            },
-            &vae_config,
-            &dit_config,
-            args.artifact_policy.into_policy(args.part_size_mib),
-        )?;
+    let artifact_policy = args.artifact_policy.into_policy(args.part_size_mib);
+    for precision in args.quantization.selected_precisions() {
+        if precision == BpkPrecision::Q4 {
+            return Err("q4 import is not supported on Burn 0.19 backends used by this repository (quantized q4 kernels/storage are incomplete for TripoSG tensor layouts).".into());
+        }
+        match precision {
+            BpkPrecision::F16 => run_imports_with_backend::<GpuBackend>(
+                precision,
+                args.overwrite,
+                TripoSources {
+                    vae: &vae_path,
+                    dit: &dit_path,
+                    dino: &dino_path,
+                },
+                &vae_config,
+                &dit_config,
+                artifact_policy,
+            )?,
+            BpkPrecision::F32 | BpkPrecision::Fp8 | BpkPrecision::Q4 => {
+                run_imports_with_backend::<CpuBackend>(
+                    precision,
+                    args.overwrite,
+                    TripoSources {
+                        vae: &vae_path,
+                        dit: &dit_path,
+                        dino: &dino_path,
+                    },
+                    &vae_config,
+                    &dit_config,
+                    artifact_policy,
+                )?
+            }
+        }
     }
 
     Ok(())
 }
 
 fn run_imports_with_backend<B>(
-    use_f16: bool,
+    precision: BpkPrecision,
     overwrite: bool,
     sources: TripoSources<'_>,
     vae_config: &TripoSGVaeConfig,
@@ -152,28 +171,36 @@ where
     import_if_needed(
         "VAE",
         sources.vae,
-        use_f16,
+        precision,
         overwrite,
         artifact_policy,
-        || import_triposg_vae_burnpack::<B>(vae_config, &device, sources.vae, use_f16),
+        || {
+            import_triposg_vae_burnpack_with_precision::<B>(
+                vae_config, &device, sources.vae, precision,
+            )
+        },
     )?;
 
     import_if_needed(
         "DiT",
         sources.dit,
-        use_f16,
+        precision,
         overwrite,
         artifact_policy,
-        || import_triposg_dit_burnpack::<B>(dit_config, &device, sources.dit, use_f16),
+        || {
+            import_triposg_dit_burnpack_with_precision::<B>(
+                dit_config, &device, sources.dit, precision,
+            )
+        },
     )?;
 
     import_if_needed(
         "DINOv2",
         sources.dino,
-        use_f16,
+        precision,
         overwrite,
         artifact_policy,
-        || import_triposg_dinov2_burnpack::<B>(&device, sources.dino, use_f16),
+        || import_triposg_dinov2_burnpack_with_precision::<B>(&device, sources.dino, precision),
     )?;
 
     Ok(())
@@ -182,7 +209,7 @@ where
 fn import_if_needed<F>(
     label: &str,
     weights_path: &Path,
-    use_f16: bool,
+    precision: BpkPrecision,
     overwrite: bool,
     artifact_policy: ArtifactPolicy,
     import_fn: F,
@@ -190,14 +217,19 @@ fn import_if_needed<F>(
 where
     F: FnOnce() -> Result<PathBuf, Box<dyn std::error::Error>>,
 {
-    let burnpack = burnpack_path(weights_path, use_f16);
-    if !weights_path.exists() && !burnpack.exists() {
+    let burnpack = burnpack_path_for_precision(weights_path, precision, BurnpackLoadPolicy::default());
+    let source_burnpack = burnpack_path_for_precision(
+        weights_path,
+        BpkPrecision::F32,
+        BurnpackLoadPolicy::default(),
+    );
+    if !weights_path.exists() && !source_burnpack.exists() && !burnpack.exists() {
         return Err(format!("missing {label} weights at {}", weights_path.display()).into());
     }
-    let precision = precision_label(use_f16);
-    let output = if burnpack.exists() && (!overwrite || !weights_path.exists()) {
+    let precision_label = precision.label();
+    let output = if burnpack.exists() && !overwrite {
         println!(
-            "[IMPORT] {label} ({precision}) burnpack already exists at {}, skipping.",
+            "[IMPORT] {label} ({precision_label}) burnpack already exists at {}, skipping.",
             burnpack.display()
         );
         burnpack.clone()
@@ -205,7 +237,7 @@ where
         ensure_parent_dir(&burnpack)?;
         let output = import_fn()?;
         println!(
-            "[IMPORT] {label} ({precision}) burnpack saved to {}",
+            "[IMPORT] {label} ({precision_label}) burnpack saved to {}",
             output.display()
         );
         output
@@ -213,7 +245,7 @@ where
 
     if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
         println!(
-            "[IMPORT] {label} ({precision}) parts manifest: {} ({} parts, {:.1} MiB)",
+            "[IMPORT] {label} ({precision_label}) parts manifest: {} ({} parts, {:.1} MiB)",
             report.manifest_path.display(),
             report.part_paths.len(),
             report.total_bytes as f64 / (1024.0 * 1024.0),
@@ -222,7 +254,7 @@ where
     let removed_legacy = remove_legacy_shard_artifacts_for_burnpack(&output)?;
     if removed_legacy > 0 {
         println!(
-            "[IMPORT] {label} ({precision}) removed {removed_legacy} legacy shard artifact(s)"
+            "[IMPORT] {label} ({precision_label}) removed {removed_legacy} legacy shard artifact(s)"
         );
     }
     Ok(())
