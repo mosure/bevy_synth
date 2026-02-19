@@ -43,11 +43,14 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let roots = resolve_roots(args.roots);
-    let mut burnpacks = Vec::new();
     for root in &roots {
         if !root.exists() {
             return Err(format!("root does not exist: {}", root.display()).into());
         }
+        ensure_triposg_metadata_aliases(root, args.dry_run)?;
+    }
+    let mut burnpacks = Vec::new();
+    for root in &roots {
         collect_primary_burnpacks(root, &mut burnpacks)?;
     }
     burnpacks.sort();
@@ -112,6 +115,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "[ARTIFACTS] generated/validated {} parts manifest(s), {} part file(s), removed {} legacy shard artifact(s)",
         parts_manifest_count, part_file_count, removed_legacy_shard_count
+    );
+    Ok(())
+}
+
+fn ensure_triposg_metadata_aliases(
+    root: &Path,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dino_dir = root.join("image_encoder_dinov2");
+    let feature_dir = root.join("feature_extractor_dinov2");
+    let legacy_dino_2 = root.join("image_encoder_2/config.json");
+    let legacy_dino_1 = root.join("image_encoder_1/config.json");
+    let legacy_feature_2 = root.join("feature_extractor_2/preprocessor_config.json");
+    let legacy_feature_1 = root.join("feature_extractor_1/preprocessor_config.json");
+
+    ensure_alias_file(
+        root,
+        dino_dir.join("config.json"),
+        &[legacy_dino_2, legacy_dino_1],
+        dry_run,
+    )?;
+    ensure_alias_file(
+        root,
+        feature_dir.join("preprocessor_config.json"),
+        &[legacy_feature_2, legacy_feature_1],
+        dry_run,
+    )?;
+    Ok(())
+}
+
+fn ensure_alias_file(
+    root: &Path,
+    target: PathBuf,
+    candidates: &[PathBuf],
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if target.exists() {
+        return Ok(());
+    }
+    let Some(source) = candidates.iter().find(|candidate| candidate.exists()) else {
+        return Ok(());
+    };
+    if dry_run {
+        println!(
+            "[ARTIFACTS][DRY RUN] alias metadata {} <- {}",
+            target.display(),
+            source.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, &target)?;
+    println!(
+        "[ARTIFACTS] created metadata alias {} <- {} (root: {})",
+        target.display(),
+        source.display(),
+        root.display()
     );
     Ok(())
 }
@@ -213,4 +275,74 @@ fn validate_precision_pairs(burnpacks: &[PathBuf]) -> Result<(), Box<dyn std::er
         missing_pairs.join(", ")
     )
     .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_triposg_metadata_aliases;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_tmp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ensure_web_artifacts_test_{nanos}"))
+    }
+
+    #[test]
+    fn creates_dinov2_metadata_aliases_from_legacy_paths() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(root.join("image_encoder_2")).expect("create image_encoder_2");
+        fs::create_dir_all(root.join("feature_extractor_2")).expect("create feature_extractor_2");
+        fs::write(
+            root.join("image_encoder_2/config.json"),
+            br#"{"test":"image_encoder_2"}"#,
+        )
+        .expect("write legacy encoder config");
+        fs::write(
+            root.join("feature_extractor_2/preprocessor_config.json"),
+            br#"{"test":"feature_extractor_2"}"#,
+        )
+        .expect("write legacy preprocessor config");
+
+        ensure_triposg_metadata_aliases(&root, false).expect("ensure aliases");
+
+        assert!(
+            root.join("image_encoder_dinov2/config.json").exists(),
+            "expected image_encoder_dinov2/config.json alias to exist"
+        );
+        assert!(
+            root.join("feature_extractor_dinov2/preprocessor_config.json")
+                .exists(),
+            "expected feature_extractor_dinov2/preprocessor_config.json alias to exist"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn preserves_existing_dinov2_metadata_files() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(root.join("image_encoder_dinov2")).expect("create image_encoder_dinov2");
+        fs::create_dir_all(root.join("image_encoder_2")).expect("create image_encoder_2");
+        let dedicated = br#"{"test":"dedicated"}"#;
+        let legacy = br#"{"test":"legacy"}"#;
+        fs::write(root.join("image_encoder_dinov2/config.json"), dedicated)
+            .expect("write dedicated config");
+        fs::write(root.join("image_encoder_2/config.json"), legacy).expect("write legacy config");
+
+        ensure_triposg_metadata_aliases(&root, false).expect("ensure aliases");
+
+        let bytes = fs::read(root.join("image_encoder_dinov2/config.json"))
+            .expect("read dedicated config after ensure");
+        assert_eq!(
+            bytes, dedicated,
+            "expected existing dedicated config to be preserved"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }

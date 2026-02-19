@@ -81,7 +81,10 @@ pub(crate) fn resolve_or_bootstrap_triposg_root(prefer_f16: bool) -> Result<Path
         TRIPOSG_REQUIRED_PARTS_BASES,
         "TripoSG",
     ) {
-        Ok(()) => Ok(target_root),
+        Ok(()) => {
+            ensure_triposg_metadata_aliases(&target_root)?;
+            Ok(target_root)
+        }
         Err(cache_err) => {
             let fallback = resolve_triposg_weights_root(None);
             if fallback.exists() {
@@ -152,6 +155,55 @@ fn ensure_model_ready(
     emit_status(format!(
         "{label} weights ready under {}",
         local_root.display()
+    ));
+    Ok(())
+}
+
+fn ensure_triposg_metadata_aliases(local_root: &Path) -> Result<(), String> {
+    ensure_alias_text_file(
+        local_root,
+        "image_encoder_dinov2/config.json",
+        &["image_encoder_2/config.json", "image_encoder_1/config.json"],
+    )?;
+    ensure_alias_text_file(
+        local_root,
+        "feature_extractor_dinov2/preprocessor_config.json",
+        &[
+            "feature_extractor_2/preprocessor_config.json",
+            "feature_extractor_1/preprocessor_config.json",
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_alias_text_file(
+    local_root: &Path,
+    target_rel: &str,
+    source_rels: &[&str],
+) -> Result<(), String> {
+    let target_path = local_root.join(target_rel);
+    if target_path.exists() {
+        return Ok(());
+    }
+    let Some(source_rel) = source_rels
+        .iter()
+        .find(|candidate| local_root.join(candidate).exists())
+    else {
+        return Ok(());
+    };
+    let source_path = local_root.join(source_rel);
+    ensure_parent_dir(&target_path)?;
+    fs::copy(&source_path, &target_path).map_err(|err| {
+        format!(
+            "failed to create metadata alias {} <- {}: {err}",
+            target_path.display(),
+            source_path.display()
+        )
+    })?;
+    emit_status(format!(
+        "Created metadata alias {} <- {}",
+        target_path.display(),
+        source_path.display()
     ));
     Ok(())
 }
@@ -610,7 +662,7 @@ fn download_optional_bytes_once(url: &str) -> Result<Option<Vec<u8>>, String> {
                 .map_err(|err| format!("failed to read response from {url}: {err}"))?;
             Ok(Some(bytes))
         }
-        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(ureq::Error::Status(404, _)) | Err(ureq::Error::Status(403, _)) => Ok(None),
         Err(err) => Err(format_download_error(url, err)),
     }
 }
