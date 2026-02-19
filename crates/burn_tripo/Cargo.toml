@@ -59,13 +59,22 @@ features = [
   "std",
 ]
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-wgpu]
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
 version = "0.19"
 default-features = false
 features = [
   "fusion",
   "std",
   "vulkan",
+]
+
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
+version = "0.19"
+default-features = false
+features = [
+  "fusion",
+  "std",
+  "metal",
 ]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
@@ -171,5 +180,4 @@ test = false
 name = "triposg_pipeline"
 path = "benches/triposg_pipeline.rs"
 harness = false
-
 
