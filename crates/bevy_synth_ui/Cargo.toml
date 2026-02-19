@@ -1,6 +1,6 @@
 [package]
 name = "bevy_synth_ui"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 description = "UI plugin and catalog interactions for bevy_synth"
@@ -21,7 +21,7 @@ trellis = ["bevy_synth_runtime/trellis"]
 bevy = "0.17"
 bevy_mesh = "0.17"
 bevy_picking = "0.17"
-bevy_synth_runtime = { version = "0.1.1", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
+bevy_synth_runtime = { version = "0.1.2", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
 crossbeam-channel = "0.5"
 bevy_tasks = { version = "0.17", features = ["multi_threaded"] }

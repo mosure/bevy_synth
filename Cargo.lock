@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_synth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "bevy_infinite_grid",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_synth_ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "bevy_app",
