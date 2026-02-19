@@ -38,7 +38,7 @@ jobs:
           # Optional burnpack safety cap (bytes) for browser downloads; leave empty to use default (1 GiB).
           BURN_SYNTH_WEB_MAX_BPK_BYTES: ${{ vars.BURN_SYNTH_WEB_MAX_BPK_BYTES || secrets.BURN_SYNTH_WEB_MAX_BPK_BYTES }}
           # Explicit hosted model roots (no vars/secrets URL indirection).
-          # Supports plain .bpk and shard manifests (*.bpk.shards.json + *.bpk.shard-*).
+          # Supports plain .bpk and parts manifests (*.bpk.parts.json + *.bpk.part-*).
           TRIPOSG_WEIGHTS_ROOT: ${{ format('{0}/MIDI-3D', env.MODEL_BASE_URL) }}
           TRIPOSG_SCRIBBLE_WEIGHTS_ROOT: ${{ format('{0}/TripoSG-scribble', env.MODEL_BASE_URL) }}
           RMBG14_WEIGHTS_ROOT: ${{ format('{0}/RMBG-1.4', env.MODEL_BASE_URL) }}
@@ -49,8 +49,23 @@ jobs:
         run: |
           unset RUSTFLAGS
           unset CARGO_ENCODED_RUSTFLAGS
-          cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release
-          wasm-bindgen target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm --out-dir docs --target web --no-typescript
+          unset CARGO_BUILD_RUSTFLAGS
+          unset CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS
+          unset RUSTDOCFLAGS
+
+          rm -rf site
+          mkdir -p site/out
+          cp www/index.html site/index.html
+          cp www/synth_api.html site/synth_api.html
+
+          cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release --features wgpu,triposg
+          wasm-bindgen target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm --out-dir site/out --target web --no-typescript
+
+          cargo build -p burn_synth --target wasm32-unknown-unknown --profile wasm-release --features wasm-api,wasm-api-wgpu
+          wasm-bindgen target/wasm32-unknown-unknown/wasm-release/burn_synth.wasm --out-dir site/out --target web --no-typescript
+
+          test -f site/out/bevy_synth_bg.wasm
+          test -f site/out/burn_synth_bg.wasm
 
       - name: configure pages
         uses: actions/configure-pages@v5
@@ -58,7 +73,7 @@ jobs:
       - name: upload pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs
+          path: site
 
       - name: deploy to github pages
         id: deployment

@@ -1106,9 +1106,13 @@ async fn initialize_wgpu_runtime_for_wasm() -> Result<(), String> {
         return Ok(());
     }
     let device = burn_wgpu::WgpuDevice::default();
+    // Keep wasm runtime memory pressure bounded for mixed render+compute workloads
+    // (for example bevy_synth WebGL rendering + Burn WebGPU inference in one tab).
+    // RuntimeOptions::default() keeps CubeCL's default memory policy (SubSlices) which
+    // is materially lower-footprint than forced ExclusivePages on web.
     let options = burn_wgpu::RuntimeOptions {
-        tasks_max: 32,
-        memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
+        tasks_max: 8,
+        ..burn_wgpu::RuntimeOptions::default()
     };
     burn_wgpu::init_setup_async::<burn_wgpu::graphics::WebGpu>(&device, options).await;
     INIT_DONE.store(true, Ordering::Release);

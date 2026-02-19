@@ -110,10 +110,12 @@ test('bevy_synth wasm page eagerly warms models during startup', async ({ page }
     `expected RMBG parts manifest request, saw: ${modelRequests.join(' | ')}`,
   ).toBe(true);
 
-  const shardManifestRequests = modelRequests.filter((url) => url.endsWith('.bpk.shards.json'));
+  const legacyShardManifestRequests = modelRequests.filter((url) =>
+    url.endsWith('.bpk.shards.json'),
+  );
   expect(
-    shardManifestRequests,
-    `unexpected shard manifest requests in parts-first wasm loader: ${shardManifestRequests.join(' | ')}`,
+    legacyShardManifestRequests,
+    `unexpected legacy shard manifest requests in parts-first wasm loader: ${legacyShardManifestRequests.join(' | ')}`,
   ).toEqual([]);
 
   expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);

@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use burn_synth_import::parts::{burnpack_parts_manifest_path, write_burnpack_parts_for_wasm};
-use burn_synth_import::shard::{shard_manifest_path, write_shards_for_burnpack};
+use burn_synth_import::parts::{
+    burnpack_parts_manifest_path, remove_legacy_shard_artifacts_for_burnpack,
+    write_burnpack_parts_for_wasm,
+};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Ensure burnpack shard/parts artifacts exist for wasm web model bundles",
+    about = "Ensure burnpack parts artifacts exist for wasm web model bundles",
     version
 )]
 struct Args {
@@ -17,17 +19,17 @@ struct Args {
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
 
-    /// Burnpack shard size in MiB.
-    #[arg(long, default_value_t = 64)]
-    shard_size_mib: u64,
-
     /// Burnpack part size in MiB (used for wasm incremental loading).
     #[arg(long, default_value_t = 64)]
     part_size_mib: u64,
 
-    /// Overwrite existing manifests/shards/parts.
+    /// Overwrite existing manifests/parts.
     #[arg(long)]
     overwrite: bool,
+
+    /// Keep legacy shard artifacts if present (`.bpk.shards.json`, `.bpk.manifest.json`, `.bpk.shard-*`).
+    #[arg(long)]
+    keep_legacy_shards: bool,
 
     /// Print planned work without writing artifacts.
     #[arg(long)]
@@ -64,37 +66,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         validate_precision_pairs(&burnpacks)?;
     }
 
-    let shard_size_mib = args.shard_size_mib.max(1);
     let part_size_mib = args.part_size_mib.max(1);
 
-    let mut shard_manifest_count = 0usize;
-    let mut shard_file_count = 0usize;
     let mut parts_manifest_count = 0usize;
     let mut part_file_count = 0usize;
+    let mut removed_legacy_shard_count = 0usize;
     for burnpack in &burnpacks {
         if args.dry_run {
             println!("[ARTIFACTS][DRY RUN] {}", burnpack.display());
+            if !args.keep_legacy_shards {
+                println!(
+                    "[ARTIFACTS][DRY RUN] would prune legacy shard artifacts for {}",
+                    burnpack.display()
+                );
+            }
             continue;
         }
-
-        let shard_report = write_shards_for_burnpack(burnpack, shard_size_mib, args.overwrite)?;
-        shard_manifest_count += 1;
-        shard_file_count += shard_report.shard_paths.len();
 
         if let Some(parts_report) =
             write_burnpack_parts_for_wasm(burnpack, part_size_mib, args.overwrite)?
         {
             parts_manifest_count += 1;
             part_file_count += parts_report.part_paths.len();
-        }
-
-        let shard_manifest = shard_manifest_path(burnpack);
-        if !shard_manifest.exists() {
-            return Err(format!(
-                "missing shard manifest after generation: {}",
-                shard_manifest.display()
-            )
-            .into());
         }
 
         let parts_manifest = burnpack_parts_manifest_path(burnpack);
@@ -105,6 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+
+        if !args.keep_legacy_shards {
+            removed_legacy_shard_count += remove_legacy_shard_artifacts_for_burnpack(burnpack)?;
+        }
     }
 
     if args.dry_run {
@@ -113,8 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "[ARTIFACTS] generated/validated {} shard manifest(s), {} shard file(s), {} parts manifest(s), {} part file(s)",
-        shard_manifest_count, shard_file_count, parts_manifest_count, part_file_count
+        "[ARTIFACTS] generated/validated {} parts manifest(s), {} part file(s), removed {} legacy shard artifact(s)",
+        parts_manifest_count, part_file_count, removed_legacy_shard_count
     );
     Ok(())
 }

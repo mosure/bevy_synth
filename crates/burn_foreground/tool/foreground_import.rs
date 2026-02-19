@@ -12,8 +12,10 @@ mod native {
     use burn::backend::NdArray;
     use burn_synth_import::io::ensure_parent_dir;
     use burn_synth_import::layout::{burnpack_path, precision_label};
+    use burn_synth_import::parts::{
+        apply_artifact_policy, remove_legacy_shard_artifacts_for_burnpack,
+    };
     use burn_synth_import::plan::ArtifactPolicy;
-    use burn_synth_import::shard::apply_artifact_policy;
     use clap::{Parser, ValueEnum};
 
     use burn_foreground::rmbg2::import::{import_rmbg2_burnpack, resolve_rmbg2_weights_root};
@@ -52,17 +54,15 @@ mod native {
     #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
     enum ArtifactPolicyArg {
         SingleFile,
-        Sharded,
-        Both,
+        Parts,
     }
 
     impl ArtifactPolicyArg {
-        fn into_policy(self, shard_size_mib: u64) -> ArtifactPolicy {
-            let shard_size_mib = shard_size_mib.max(1);
+        fn into_policy(self, part_size_mib: u64) -> ArtifactPolicy {
+            let part_size_mib = part_size_mib.max(1);
             match self {
                 Self::SingleFile => ArtifactPolicy::SingleFile,
-                Self::Sharded => ArtifactPolicy::Sharded { shard_size_mib },
-                Self::Both => ArtifactPolicy::Both { shard_size_mib },
+                Self::Parts => ArtifactPolicy::Parts { part_size_mib },
             }
         }
     }
@@ -91,11 +91,11 @@ mod native {
         #[arg(long, value_enum, default_value_t = Quantization::F32)]
         quantization: Quantization,
 
-        #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::Both)]
+        #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::Parts)]
         artifact_policy: ArtifactPolicyArg,
 
         #[arg(long, default_value_t = 64)]
-        shard_size_mib: u64,
+        part_size_mib: u64,
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,7 +118,7 @@ mod native {
                     .as_ref()
                     .map(|(weights, config)| (weights.as_path(), config)),
                 rmbg2_root.as_deref(),
-                args.artifact_policy.into_policy(args.shard_size_mib),
+                args.artifact_policy.into_policy(args.part_size_mib),
             )?;
         }
         if args.quantization.include_f16() {
@@ -129,7 +129,7 @@ mod native {
                     .as_ref()
                     .map(|(weights, config)| (weights.as_path(), config)),
                 rmbg2_root.as_deref(),
-                args.artifact_policy.into_policy(args.shard_size_mib),
+                args.artifact_policy.into_policy(args.part_size_mib),
             )?;
         }
 
@@ -234,10 +234,16 @@ mod native {
             };
             if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
                 println!(
-                    "[IMPORT] RMBG-2.0 ({precision}) shard manifest: {} ({} shards, {:.1} MiB)",
+                    "[IMPORT] RMBG-2.0 ({precision}) parts manifest: {} ({} parts, {:.1} MiB)",
                     report.manifest_path.display(),
-                    report.shard_paths.len(),
+                    report.part_paths.len(),
                     report.total_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+            let removed_legacy = remove_legacy_shard_artifacts_for_burnpack(&output)?;
+            if removed_legacy > 0 {
+                println!(
+                    "[IMPORT] RMBG-2.0 ({precision}) removed {removed_legacy} legacy shard artifact(s)"
                 );
             }
         }
@@ -280,10 +286,16 @@ mod native {
 
         if let Some(report) = apply_artifact_policy(&output, artifact_policy, overwrite)? {
             println!(
-                "[IMPORT] {label} ({precision}) shard manifest: {} ({} shards, {:.1} MiB)",
+                "[IMPORT] {label} ({precision}) parts manifest: {} ({} parts, {:.1} MiB)",
                 report.manifest_path.display(),
-                report.shard_paths.len(),
+                report.part_paths.len(),
                 report.total_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+        let removed_legacy = remove_legacy_shard_artifacts_for_burnpack(&output)?;
+        if removed_legacy > 0 {
+            println!(
+                "[IMPORT] {label} ({precision}) removed {removed_legacy} legacy shard artifact(s)"
             );
         }
 

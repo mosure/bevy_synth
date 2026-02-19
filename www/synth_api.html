@@ -61,20 +61,28 @@
       <a id="download" style="display: none" download="burn_synth_output.glb">download glb</a>
     </div>
     <script type="module">
-      import init, * as wasm from "./out/burn_synth.js";
-
       const text = document.getElementById("boot-text");
       const startButton = document.getElementById("boot-start");
       const imageInput = document.getElementById("image-file");
       const runButton = document.getElementById("run-infer");
       const download = document.getElementById("download");
-      window.__burnSynthWasm = wasm;
+      let wasm = null;
+      const buildTag = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+      const moduleUrl = `./out/burn_synth.js?v=${encodeURIComponent(buildTag)}`;
+      const wasmUrl = `./out/burn_synth_bg.wasm?v=${encodeURIComponent(buildTag)}`;
 
       const start = async () => {
         startButton.disabled = true;
         text.textContent = "loading wasm module...";
         try {
-          await init();
+          const mod = await import(moduleUrl);
+          const wasmResponse = await fetch(wasmUrl, { cache: "no-store" });
+          if (!wasmResponse.ok) {
+            throw new Error(`failed to fetch burn_synth wasm: HTTP ${wasmResponse.status}`);
+          }
+          await mod.default(wasmResponse);
+          wasm = mod;
+          window.__burnSynthWasm = wasm;
           window.__burnSynthWasmReady = true;
           let hasWebGpu = false;
           if (typeof wasm.webgpu_available === "function") {

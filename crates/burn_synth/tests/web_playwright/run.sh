@@ -50,14 +50,13 @@ npm install --no-audit --no-fund
 npx playwright install chromium
 
 if [[ "${BURN_SYNTH_WEB_SKIP_ARTIFACT_ENSURE:-0}" != "1" ]]; then
-  echo "[web-e2e] ensure f32+f16 shard/parts artifacts for web models"
+  echo "[web-e2e] ensure f32+f16 parts artifacts for web models"
   cargo run \
     -p burn_synth_import \
     --bin ensure_web_burnpack_artifacts \
     -- \
     --root "${ROOT_DIR}/www/assets/models/MIDI-3D" \
     --root "${ROOT_DIR}/www/assets/models/RMBG-1.4" \
-    --shard-size-mib 64 \
     --part-size-mib 64
 fi
 

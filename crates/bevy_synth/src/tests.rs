@@ -16,7 +16,7 @@ use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, RmbgBackend, RmbgModel, SynthesisModel,
-    TrellisQuality,
+    TrellisQuality, WeightPrecision,
 };
 use bevy_synth_runtime::cache::MeshCache;
 use bevy_synth_runtime::state::{
@@ -65,6 +65,8 @@ fn test_args() -> AppArgs {
         backend: BackendKind::Cpu,
         rmbg_backend: RmbgBackend::Auto,
         dino_backend: DinoBackend::Auto,
+        weights_precision: WeightPrecision::Auto,
+        rmbg_weights_precision: WeightPrecision::Auto,
         pause_render_during_inference: true,
         max_batch_size: 1,
         mcp_scene_control_path: None,

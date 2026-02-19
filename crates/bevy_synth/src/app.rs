@@ -69,7 +69,9 @@ use serde::Deserialize;
 use bevy_synth_runtime::args::BackendKind;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy_synth_runtime::args::MeshMode;
-use bevy_synth_runtime::args::{AppArgs, Args, WeightPrecision, build_app_args};
+#[cfg(target_arch = "wasm32")]
+use bevy_synth_runtime::args::WeightPrecision;
+use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
@@ -492,7 +494,10 @@ pub(crate) struct InferenceContext<'w, 's> {
 
 pub(crate) fn run() {
     let args = Args::parse();
+    #[cfg(target_arch = "wasm32")]
     let mut app_args = build_app_args(args);
+    #[cfg(not(target_arch = "wasm32"))]
+    let app_args = build_app_args(args);
     #[cfg(target_arch = "wasm32")]
     apply_wasm_url_overrides(&mut app_args);
     #[cfg(not(target_arch = "wasm32"))]

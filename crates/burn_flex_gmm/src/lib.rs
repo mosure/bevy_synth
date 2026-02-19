@@ -137,11 +137,7 @@ pub fn sparse_subm_conv_forward_flex_precomputed(
             kernel.rows
         ));
     }
-    let rows = if kernel.rows == 0 {
-        0
-    } else {
-        neighbor_rows.len() / kernel.rows
-    };
+    let rows = neighbor_rows.len().checked_div(kernel.rows).unwrap_or(0);
     let expected_input = rows
         .checked_mul(config.in_channels)
         .ok_or_else(|| "sparse conv input size overflow".to_string())?;

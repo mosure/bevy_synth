@@ -99,7 +99,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   const consoleErrors = [];
   const modelRequests = [];
   const partRequests = new Set();
-  const shardManifestRequests = new Set();
+  const legacyShardManifestRequests = new Set();
   const failedModelResponses = [];
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
@@ -116,7 +116,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
         partRequests.add(url);
       }
       if (url.endsWith('.bpk.shards.json')) {
-        shardManifestRequests.add(url);
+        legacyShardManifestRequests.add(url);
       }
     }
   });
@@ -246,8 +246,8 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   expect(modelRequests.length).toBeGreaterThan(0);
   expect(partRequests.size).toBeGreaterThan(0);
   expect(
-    Array.from(shardManifestRequests),
-    `unexpected shard manifest requests in parts-first loader: ${Array.from(shardManifestRequests).join(' | ')}`,
+    Array.from(legacyShardManifestRequests),
+    `unexpected legacy shard manifest requests in parts-first loader: ${Array.from(legacyShardManifestRequests).join(' | ')}`,
   ).toEqual([]);
   expect(
     modelRequests.some((url) => url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/config.json')),

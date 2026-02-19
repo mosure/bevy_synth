@@ -61,10 +61,3 @@ pub fn candidate_burnpack_names(base_safetensors_path: &str, prefer_f16: bool) -
         vec![f32, f16]
     }
 }
-
-pub fn burnpack_manifest_candidates(candidate_burnpack_path: &str) -> [String; 2] {
-    [
-        format!("{candidate_burnpack_path}.shards.json"),
-        format!("{candidate_burnpack_path}.manifest.json"),
-    ]
-}

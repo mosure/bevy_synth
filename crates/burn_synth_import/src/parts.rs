@@ -7,6 +7,7 @@ use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::io::{ensure_parent_dir, sha256_file};
+use crate::plan::ArtifactPolicy;
 
 const ONE_MIB: u64 = 1024 * 1024;
 const HEADER_SIZE: usize = 10;
@@ -215,6 +216,74 @@ pub fn write_burnpack_parts_for_wasm(
         part_paths,
         total_bytes,
     }))
+}
+
+pub fn apply_artifact_policy(
+    burnpack_path: &Path,
+    policy: ArtifactPolicy,
+    overwrite: bool,
+) -> Result<Option<BurnpackPartsReport>, String> {
+    let Some(part_size_mib) = policy.part_size_mib() else {
+        return Ok(None);
+    };
+    write_burnpack_parts_for_wasm(burnpack_path, part_size_mib, overwrite)
+}
+
+pub fn remove_legacy_shard_artifacts_for_burnpack(burnpack_path: &Path) -> Result<usize, String> {
+    let file_name = burnpack_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid burnpack file name '{}'", burnpack_path.display()))?;
+    let parent = burnpack_path
+        .parent()
+        .ok_or_else(|| format!("invalid burnpack path '{}'", burnpack_path.display()))?;
+
+    let mut removed = 0usize;
+    for legacy_manifest in [
+        burnpack_path.with_file_name(format!("{file_name}.shards.json")),
+        burnpack_path.with_file_name(format!("{file_name}.manifest.json")),
+    ] {
+        if legacy_manifest.exists() {
+            fs::remove_file(&legacy_manifest).map_err(|err| {
+                format!(
+                    "failed to remove legacy shard manifest '{}': {err}",
+                    legacy_manifest.display()
+                )
+            })?;
+            removed += 1;
+        }
+    }
+
+    let shard_prefix = format!("{file_name}.shard-");
+    for entry in fs::read_dir(parent)
+        .map_err(|err| format!("failed to list directory '{}': {err}", parent.display()))?
+    {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read directory entry under '{}': {err}",
+                parent.display()
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&shard_prefix) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|err| {
+            format!(
+                "failed to remove legacy shard file '{}': {err}",
+                path.display()
+            )
+        })?;
+        removed += 1;
+    }
+
+    Ok(removed)
 }
 
 fn read_burnpack_metadata(

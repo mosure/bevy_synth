@@ -181,10 +181,7 @@ pub fn run_stdio_server(config: ServerConfig) -> Result<(), String> {
     let mut writer = BufWriter::new(stdout.lock());
     let mut server = McpServer::new(config);
 
-    loop {
-        let Some(message) = read_framed_json(&mut reader).map_err(|err| err.to_string())? else {
-            break;
-        };
+    while let Some(message) = read_framed_json(&mut reader).map_err(|err| err.to_string())? {
         let response = server.handle_message(message)?;
         if let Some(response) = response {
             write_framed_json(&mut writer, &response).map_err(|err| err.to_string())?;
@@ -1190,7 +1187,7 @@ impl From<InferenceBackend> for burn_synth::InferenceBackend {
     }
 }
 
-impl From<TrellisQuality> for burn_synth::trellis::TrellisQuality {
+impl From<TrellisQuality> for burn_synth::TrellisQuality {
     fn from(value: TrellisQuality) -> Self {
         match value {
             TrellisQuality::Low => Self::Low,

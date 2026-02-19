@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
+use burn_synth_import::parts::{apply_artifact_policy, remove_legacy_shard_artifacts_for_burnpack};
 use burn_synth_import::plan::ArtifactPolicy;
-use burn_synth_import::shard::apply_artifact_policy;
 use burn_trellis::import::{QuantizationMode, TrellisImportOptions, import_trellis2_assets};
 use burn_trellis::paths::{
     resolve_trellis2_weights_root, trellis2_repo_asset_root, trellis2_repo_image_large_root,
@@ -30,17 +30,15 @@ impl From<Quantization> for QuantizationMode {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum ArtifactPolicyArg {
     SingleFile,
-    Sharded,
-    Both,
+    Parts,
 }
 
 impl ArtifactPolicyArg {
-    fn into_policy(self, shard_size_mib: u64) -> ArtifactPolicy {
-        let shard_size_mib = shard_size_mib.max(1);
+    fn into_policy(self, part_size_mib: u64) -> ArtifactPolicy {
+        let part_size_mib = part_size_mib.max(1);
         match self {
             Self::SingleFile => ArtifactPolicy::SingleFile,
-            Self::Sharded => ArtifactPolicy::Sharded { shard_size_mib },
-            Self::Both => ArtifactPolicy::Both { shard_size_mib },
+            Self::Parts => ArtifactPolicy::Parts { part_size_mib },
         }
     }
 }
@@ -69,11 +67,11 @@ struct Args {
     #[arg(long)]
     overwrite: bool,
 
-    #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::Both)]
+    #[arg(long, value_enum, default_value_t = ArtifactPolicyArg::Parts)]
     artifact_policy: ArtifactPolicyArg,
 
     #[arg(long, default_value_t = 64)]
-    shard_size_mib: u64,
+    part_size_mib: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -105,26 +103,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         quantization: args.quantization.into(),
         overwrite: args.overwrite,
     })?;
-    let artifact_policy = args.artifact_policy.into_policy(args.shard_size_mib);
-    let mut shard_manifest_count = 0usize;
-    let mut shard_count = 0usize;
-    if artifact_policy.wants_shards() {
-        for imported in &report.manifest.imported_blobs {
-            let output_path = PathBuf::from(&imported.output);
-            if let Some(shard_report) =
+    let artifact_policy = args.artifact_policy.into_policy(args.part_size_mib);
+    let mut parts_manifest_count = 0usize;
+    let mut part_count = 0usize;
+    let mut removed_legacy_shard_count = 0usize;
+    for imported in &report.manifest.imported_blobs {
+        let output_path = PathBuf::from(&imported.output);
+        if artifact_policy.wants_parts() {
+            if let Some(parts_report) =
                 apply_artifact_policy(&output_path, artifact_policy, args.overwrite)?
             {
-                shard_manifest_count += 1;
-                shard_count += shard_report.shard_paths.len();
+                parts_manifest_count += 1;
+                part_count += parts_report.part_paths.len();
                 println!(
-                    "[IMPORT] sharded {} -> {} ({} shards, {:.1} MiB)",
+                    "[IMPORT] parts {} -> {} ({} parts, {:.1} MiB)",
                     output_path.display(),
-                    shard_report.manifest_path.display(),
-                    shard_report.shard_paths.len(),
-                    shard_report.total_bytes as f64 / (1024.0 * 1024.0),
+                    parts_report.manifest_path.display(),
+                    parts_report.part_paths.len(),
+                    parts_report.total_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
         }
+        removed_legacy_shard_count += remove_legacy_shard_artifacts_for_burnpack(&output_path)?;
     }
 
     println!(
@@ -140,10 +140,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.manifest.imported_blobs.len(),
         report.manifest.missing_sources.len()
     );
-    if artifact_policy.wants_shards() {
+    if artifact_policy.wants_parts() {
         println!(
-            "[IMPORT] generated shard manifests: {}, total shards: {}",
-            shard_manifest_count, shard_count
+            "[IMPORT] generated parts manifests: {}, total parts: {}, removed legacy shard artifacts: {}",
+            parts_manifest_count, part_count, removed_legacy_shard_count
+        );
+    } else if removed_legacy_shard_count > 0 {
+        println!(
+            "[IMPORT] removed legacy shard artifacts: {}",
+            removed_legacy_shard_count
         );
     }
     if !report.manifest.missing_sources.is_empty() {

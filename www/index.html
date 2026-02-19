@@ -108,20 +108,22 @@
       <button id="boot-start" type="button">Start</button>
     </div>
     <script type="module">
-      import init, * as wasm from "./out/bevy_synth.js";
-
       const boot = document.getElementById("boot");
       const text = document.getElementById("boot-text");
       const startButton = document.getElementById("boot-start");
       const precisionSelect = document.getElementById("precision");
       let started = false;
-      window.__burnSynthWasm = wasm;
+      let wasm = null;
 
       const searchParams = new URLSearchParams(window.location.search);
       const queryPrecision = (searchParams.get("weights_precision") || "").toLowerCase();
       if (queryPrecision === "f16" || queryPrecision === "f32") {
         precisionSelect.value = queryPrecision;
       }
+
+      const buildTag = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+      const moduleUrl = `./out/bevy_synth.js?v=${encodeURIComponent(buildTag)}`;
+      const wasmUrl = `./out/bevy_synth_bg.wasm?v=${encodeURIComponent(buildTag)}`;
 
       const start = async () => {
         if (started) return;
@@ -138,7 +140,14 @@
         history.replaceState(null, "", query ? `${window.location.pathname}?${query}` : window.location.pathname);
         text.textContent = "loading wasm module...";
         try {
-          await init();
+          const mod = await import(moduleUrl);
+          const wasmResponse = await fetch(wasmUrl, { cache: "no-store" });
+          if (!wasmResponse.ok) {
+            throw new Error(`failed to fetch bevy_synth wasm: HTTP ${wasmResponse.status}`);
+          }
+          await mod.default(wasmResponse);
+          wasm = mod;
+          window.__burnSynthWasm = wasm;
           window.__burnSynthWasmReady = true;
           text.textContent = "module ready";
           setTimeout(() => boot.remove(), 1200);

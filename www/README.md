@@ -1,8 +1,13 @@
 # lattice web 🕊️🔥🎛️🎹
 
-- `cargo build --release --target wasm32-unknown-unknown -p bevy_synth`
-- `wasm-bindgen --out-dir ./www/out --target web target/wasm32-unknown-unknown/release/bevy_synth.wasm`
-- run full `burn_synth` wasm integration (build + bindgen + playwright sharded inference):
+- build `bevy_synth` wasm with the canonical web profile:
+  - `cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release --features wgpu,triposg`
+  - `wasm-bindgen --out-dir ./www/out --target web --no-typescript target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm`
+- build `burn_synth` wasm api with the canonical web profile:
+  - `cargo build -p burn_synth --target wasm32-unknown-unknown --profile wasm-release --features wasm-api,wasm-api-wgpu`
+  - `wasm-bindgen --out-dir ./www/out --target web --no-typescript target/wasm32-unknown-unknown/wasm-release/burn_synth.wasm`
+- do not use `target/wasm32-unknown-unknown/release/*.wasm` for web pages; web validation and tests use `wasm-release` artifacts.
+- run full `burn_synth` wasm integration (build + bindgen + playwright parts-based inference):
   - `./crates/burn_synth/tests/web_playwright/run.sh`
 - bundle model assets into `www/assets/models`:
   - `pwsh ./scripts/bundle_web_assets.ps1`
