@@ -42,26 +42,6 @@ bevy_synth
 burn_synth_mcp
 ```
 
-MCP client config example:
-
-```json
-{
-  "mcpServers": {
-    "burn_synth": {
-      "command": "burn_synth_mcp",
-      "args": [
-        "--backend",
-        "wgpu",
-        "--synthesis-models",
-        "triposg",
-        "--rmbg-model",
-        "rmbg14"
-      ]
-    }
-  }
-}
-```
-
 
 ## features
 
