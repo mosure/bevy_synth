@@ -1,6 +1,6 @@
 [package]
 name = "burn_synth"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 description = "Shared utilities and pipeline re-exports for burn_synth"
@@ -16,7 +16,7 @@ readme = "README.md"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["wgpu"]
 triposg = ["dep:burn_tripo"]
 trellis = ["dep:burn_trellis", "burn_trellis/runtime-model"]
 trellis-wgpu = ["trellis", "burn_trellis/runtime-model-wgpu"]

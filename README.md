@@ -14,6 +14,55 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 | ![Input chair](docs/output_chair_bg_removed.png) | ![Output chair (rendered mesh)](docs/output_chair_render.png) |
 
 
+## install
+
+```bash
+# burn_synth CLI
+cargo install burn_synth
+
+# bevy_synth app
+cargo install bevy_synth
+
+# burn_synth MCP stdio server
+cargo install burn_synth_mcp
+```
+
+### usage:
+
+```bash
+# burn_synth: run image -> GLB synthesis
+burn_synth mesh \
+  --input docs/output_chair_bg_removed.png \
+  --output /tmp/chair.glb
+
+# bevy_synth: launch interactive app
+bevy_synth
+
+# burn_synth_mcp: start MCP stdio server
+burn_synth_mcp
+```
+
+MCP client config example:
+
+```json
+{
+  "mcpServers": {
+    "burn_synth": {
+      "command": "burn_synth_mcp",
+      "args": [
+        "--backend",
+        "wgpu",
+        "--synthesis-models",
+        "triposg",
+        "--rmbg-model",
+        "rmbg14"
+      ]
+    }
+  }
+}
+```
+
+
 ## features
 
 - [x] editor
@@ -48,6 +97,7 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
   - synthesis: TripoSG, Trellis2
 
 > note: pre-trained model weights have separate license
+
 
 
 ### hardware recommendation
