@@ -41,12 +41,6 @@ use bevy::render::settings::{Backends, WgpuSettings};
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
-use bevy_synth_ui::bevy_editor_core::selection::{
-    EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
-};
-use bevy_synth_ui::bevy_file_dialog::prelude::{
-    DialogFileDropped, DialogFileLoaded, FileDialogExt, FileDialogPlugin,
-};
 use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
@@ -55,6 +49,12 @@ use bevy_picking::hover::PickingInteraction;
 use bevy_picking::input::PointerInputPlugin;
 use bevy_picking::prelude::MeshPickingSettings;
 use bevy_picking::prelude::{MeshPickingCamera, Pickable};
+use bevy_synth_ui::bevy_editor_core::selection::{
+    EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
+};
+use bevy_synth_ui::bevy_file_dialog::prelude::{
+    DialogFileDropped, DialogFileLoaded, FileDialogExt, FileDialogPlugin,
+};
 use bevy_synth_ui::bevy_transform_gizmos;
 use bevy_synth_ui::bevy_transform_gizmos::TransformGizmoSystems;
 use bevy_synth_ui::bevy_transform_gizmos::prelude::GizmoCamera;
@@ -1217,10 +1217,10 @@ fn hydrate_from_cache(
     cache: &mut ResMut<MeshCacheResource>,
 ) {
     // Ensure older caches with smooth-shaded built-in cube topology are migrated to flat-shaded cube topology.
-    if let Err(err) = cache
-        .cache
-        .upsert_mesh_for_image(Path::new(BUILTIN_CUBE_SOURCE_IMAGE), &default_cube_synth_mesh())
-    {
+    if let Err(err) = cache.cache.upsert_mesh_for_image(
+        Path::new(BUILTIN_CUBE_SOURCE_IMAGE),
+        &default_cube_synth_mesh(),
+    ) {
         warn!("failed to refresh built-in cube cache entry: {err}");
     }
 
@@ -1324,10 +1324,10 @@ fn seed_default_catalog_cube(
         return;
     }
 
-    let cached_metadata = match cache
-        .cache
-        .upsert_mesh_for_image(Path::new(BUILTIN_CUBE_SOURCE_IMAGE), &default_cube_synth_mesh())
-    {
+    let cached_metadata = match cache.cache.upsert_mesh_for_image(
+        Path::new(BUILTIN_CUBE_SOURCE_IMAGE),
+        &default_cube_synth_mesh(),
+    ) {
         Ok(metadata) => Some(metadata),
         Err(err) => {
             warn!("Failed to cache built-in cube mesh: {err}");

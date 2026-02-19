@@ -75,7 +75,7 @@ use bevy_derive::Deref;
 use bevy_ecs::prelude::*;
 use bevy_tasks::prelude::*;
 use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper, WakeUp};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use rfd::AsyncFileDialog;
 
 #[cfg(not(target_arch = "wasm32"))]

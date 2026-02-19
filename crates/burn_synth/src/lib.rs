@@ -24,6 +24,8 @@ pub use io::{ImageSource, TextPrompt};
 pub use mesh::{
     Mesh, MeshLike, MeshMaterial, MeshPbrTextures, MeshStats, MeshTexture, mesh_bounds, mesh_stats,
 };
+#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+pub use native_model_bootstrap::set_bootstrap_status_callback;
 pub use pipeline::{
     ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisModel,
     sanitize_synthesis_models,
@@ -39,8 +41,6 @@ pub use runtime::{
     MeshOutput as RuntimeMeshOutput, MeshRequest, RuntimeConfig, RuntimeError, SynthRuntime,
     TrellisQuality,
 };
-#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
-pub use native_model_bootstrap::set_bootstrap_status_callback;
 
 #[cfg(feature = "triposg")]
 pub use burn_tripo as triposg;

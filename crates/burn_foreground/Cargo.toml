@@ -1,6 +1,6 @@
 [package]
 name = "burn_foreground"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 description = "Foreground extraction (RMBG-1.4 + RMBG-2.0) for burn_synth"
@@ -33,7 +33,6 @@ burn-store = { version = "0.19", optional = true, default-features = false, feat
 clap = { version = "4.5", features = ["derive"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native"] }
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
 
 [dev-dependencies]
@@ -49,5 +48,4 @@ harness = false
 name = "foreground_import"
 path = "tool/foreground_import.rs"
 required-features = ["import"]
-
 

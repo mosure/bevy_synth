@@ -271,8 +271,7 @@ impl CatalogState {
 
     pub fn has_ready_cube_entry(&self) -> bool {
         self.entries.iter().any(|entry| {
-            matches!(entry.status, CatalogStatus::Ready)
-                && entry.label.eq_ignore_ascii_case("cube")
+            matches!(entry.status, CatalogStatus::Ready) && entry.label.eq_ignore_ascii_case("cube")
         })
     }
 }
@@ -701,67 +700,69 @@ fn update_queue_text(
         (With<QueueStatusBadge>, Without<QueueStatusDot>),
     >,
 ) {
-    let (text, text_color, dot_color, badge_bg, badge_border) =
-        if let Some(worker_message) = status.as_ref().and_then(|state| state.worker_message.as_ref()) {
-            let is_failure = worker_message.to_ascii_lowercase().contains("failed");
-            (
-                worker_message.clone(),
-                if is_failure {
-                    Color::srgb(0.96, 0.72, 0.72)
-                } else {
-                    Color::srgb(0.76, 0.86, 0.98)
-                },
-                if is_failure {
-                    Color::srgb(0.86, 0.28, 0.28)
-                } else {
-                    STATUS_PENDING
-                },
-                if is_failure {
-                    Color::srgb(0.22, 0.1, 0.1)
-                } else {
-                    Color::srgb(0.08, 0.15, 0.2)
-                },
-                if is_failure {
-                    Color::srgb(0.58, 0.23, 0.23)
-                } else {
-                    Color::srgb(0.2, 0.4, 0.55)
-                },
-            )
-        } else if let Some(active) = queue.active.as_ref() {
-            let name = if active.len() == 1 {
-                active[0]
-                    .image_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("image")
-                    .to_string()
+    let (text, text_color, dot_color, badge_bg, badge_border) = if let Some(worker_message) = status
+        .as_ref()
+        .and_then(|state| state.worker_message.as_ref())
+    {
+        let is_failure = worker_message.to_ascii_lowercase().contains("failed");
+        (
+            worker_message.clone(),
+            if is_failure {
+                Color::srgb(0.96, 0.72, 0.72)
             } else {
-                format!("{} images", active.len())
-            };
-            (
-                format!("processing: {name} | queued: {}", queue.pending.len()),
-                Color::srgb(0.95, 0.89, 0.74),
-                STATUS_PROCESSING,
-                Color::srgb(0.21, 0.15, 0.08),
-                Color::srgb(0.58, 0.41, 0.18),
-            )
-        } else if !queue.pending.is_empty() {
-            (
-                format!("queued: {}", queue.pending.len()),
-                Color::srgb(0.76, 0.86, 0.98),
-                STATUS_PENDING,
-                Color::srgb(0.08, 0.15, 0.2),
-                Color::srgb(0.2, 0.4, 0.55),
-            )
+                Color::srgb(0.76, 0.86, 0.98)
+            },
+            if is_failure {
+                Color::srgb(0.86, 0.28, 0.28)
+            } else {
+                STATUS_PENDING
+            },
+            if is_failure {
+                Color::srgb(0.22, 0.1, 0.1)
+            } else {
+                Color::srgb(0.08, 0.15, 0.2)
+            },
+            if is_failure {
+                Color::srgb(0.58, 0.23, 0.23)
+            } else {
+                Color::srgb(0.2, 0.4, 0.55)
+            },
+        )
+    } else if let Some(active) = queue.active.as_ref() {
+        let name = if active.len() == 1 {
+            active[0]
+                .image_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image")
+                .to_string()
         } else {
-            (
-                "idle".to_string(),
-                Color::srgb(0.72, 0.76, 0.84),
-                STATUS_IDLE,
-                STATUS_BADGE_BG,
-                STATUS_BADGE_BORDER,
-            )
+            format!("{} images", active.len())
         };
+        (
+            format!("processing: {name} | queued: {}", queue.pending.len()),
+            Color::srgb(0.95, 0.89, 0.74),
+            STATUS_PROCESSING,
+            Color::srgb(0.21, 0.15, 0.08),
+            Color::srgb(0.58, 0.41, 0.18),
+        )
+    } else if !queue.pending.is_empty() {
+        (
+            format!("queued: {}", queue.pending.len()),
+            Color::srgb(0.76, 0.86, 0.98),
+            STATUS_PENDING,
+            Color::srgb(0.08, 0.15, 0.2),
+            Color::srgb(0.2, 0.4, 0.55),
+        )
+    } else {
+        (
+            "idle".to_string(),
+            Color::srgb(0.72, 0.76, 0.84),
+            STATUS_IDLE,
+            STATUS_BADGE_BG,
+            STATUS_BADGE_BORDER,
+        )
+    };
 
     for (mut node, mut color) in query.iter_mut() {
         if node.0 != text {

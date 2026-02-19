@@ -9,8 +9,8 @@ use crossbeam_channel::bounded;
 use rfd::AsyncFileDialog;
 
 use super::{
-    handle_dialog_result, DialogResult, FileDialog, FileDialogPlugin, StreamReceiver, StreamSender,
-    WakeUpOnDrop,
+    DialogResult, FileDialog, FileDialogPlugin, StreamReceiver, StreamSender, WakeUpOnDrop,
+    handle_dialog_result,
 };
 
 /// Event that gets sent when directory path gets selected from file system.

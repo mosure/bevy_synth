@@ -17,11 +17,11 @@
 //! Then, when these entities are selected via [`crate::bevy_editor_core::selection`] the
 //! transform gizmo will appear and allow you to move and rotate your selection.
 
+use crate::bevy_editor_core::selection::EditorSelection;
 use bevy::camera::Projection;
 use bevy::picking::prelude::{MeshPickingPlugin, Pickable};
 use bevy::picking::{backend::ray::RayMap, pointer::PointerId};
 use bevy::{prelude::*, transform::TransformSystems};
-use crate::bevy_editor_core::selection::EditorSelection;
 use mesh::{RotationGizmo, ViewTranslateGizmo};
 
 use normalization::*;

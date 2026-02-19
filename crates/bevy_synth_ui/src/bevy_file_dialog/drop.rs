@@ -9,14 +9,14 @@ use bevy_tasks::prelude::*;
 use bevy_window::FileDragAndDrop;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper, WakeUp};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 #[cfg(target_arch = "wasm32")]
 use js_sys::Uint8Array;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::{JsCast, closure::Closure};
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{Document, DragEvent};
 

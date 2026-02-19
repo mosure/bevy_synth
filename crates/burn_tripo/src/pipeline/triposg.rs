@@ -604,7 +604,10 @@ pub fn deterministic_latents_from_seed<B: Backend>(
         .saturating_mul(num_tokens)
         .saturating_mul(num_channels);
     if total == 0 {
-        return Tensor::<B, 3>::zeros([batch_size as i32, num_tokens as i32, num_channels as i32], device);
+        return Tensor::<B, 3>::zeros(
+            [batch_size as i32, num_tokens as i32, num_channels as i32],
+            device,
+        );
     }
 
     let mut state = seed;

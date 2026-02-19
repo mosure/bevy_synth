@@ -1,9 +1,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::sync::Arc;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use std::sync::Once;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 use std::time::Instant;
 
 use burn_synth::pipeline::ModelSelection;
