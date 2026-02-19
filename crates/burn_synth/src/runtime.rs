@@ -11,6 +11,7 @@ use burn_foreground::pipeline::{
 };
 use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
+#[cfg(target_arch = "wasm32")]
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 #[cfg(feature = "trellis")]
@@ -27,11 +28,17 @@ use burn_tripo::pipeline::mesh::{Mesh as TripoMesh, sdf_to_mesh_diff_dmc};
 use burn_tripo::pipeline::runtime_parity::{
     DinoBackendChoice, decimate_tripo_mesh, should_use_cpu_dino_backend, triposg_runtime_profile,
 };
-use burn_tripo::pipeline::triposg::{TripoSGLoadOptions, TripoSGPipeline, TripoSGSamplerProgress};
+use burn_tripo::pipeline::triposg::{
+    TripoSGLoadOptions, TripoSGPipeline, TripoSGSamplerProgress, deterministic_latents_from_seed,
+};
 use image::{ImageFormat, RgbaImage};
 
 use crate::io::ImageSource;
 use crate::mesh::Mesh;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::native_model_bootstrap::{
+    resolve_or_bootstrap_rmbg14_root, resolve_or_bootstrap_triposg_root,
+};
 use crate::pipeline::{ForegroundModel, ModelSelection, SynthesisModel, sanitize_synthesis_models};
 use crate::progress::{RuntimeProgressEvent, RuntimeProgressObserver};
 
@@ -835,7 +842,7 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
-                );
+                )?;
                 let pipeline = self.foreground.ensure_rmbg14(&root)?;
                 let prepared =
                     prepare_image_data(input_path, Some(pipeline), &self.config.foreground_prepare)
@@ -848,7 +855,7 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
-                );
+                )?;
                 let pipeline = self.foreground.ensure_rmbg2(&root)?;
                 let prepared = pipeline
                     .prepare_image_data(input_path, &self.config.foreground_prepare)
@@ -877,7 +884,7 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
-                );
+                )?;
                 match backend {
                     InferenceBackend::Cpu => {
                         let pipeline = self.foreground.ensure_rmbg14(&root)?;
@@ -932,7 +939,7 @@ impl SynthRuntime {
                 let root = resolve_foreground_weights_root(
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
-                );
+                )?;
                 let pipeline = self.foreground.ensure_rmbg2(&root)?;
                 pipeline
                     .prepare_image_data(input_path, &self.config.mesh_prepare)
@@ -1114,8 +1121,11 @@ fn load_backend_state<B: Backend>(
     if let Some(seed) = config.seed {
         B::seed(&device, seed);
     }
-    let weights_root = resolve_triposg_weights_root(config.weights_root.as_deref());
     let parity = triposg_runtime_profile(Some(config.mesh_prepare.max_dimension));
+    let weights_root = resolve_triposg_runtime_weights_root(
+        config.weights_root.as_deref(),
+        parity.burnpack_policy.precision.prefer_f16(),
+    )?;
     let use_cpu_dino = should_use_cpu_dino_backend::<B>(map_dino_backend(config.dino_backend));
     let load_options = TripoSGLoadOptions {
         burnpack_policy: parity.burnpack_policy,
@@ -1164,6 +1174,28 @@ fn load_backend_state<B: Backend>(
         pipeline,
         cpu_dino,
     })
+}
+
+fn resolve_triposg_runtime_weights_root(
+    explicit: Option<&Path>,
+    prefer_f16: bool,
+) -> RuntimeResult<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(resolve_triposg_weights_root(Some(path)));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        resolve_or_bootstrap_triposg_root(prefer_f16).map_err(|err| {
+            RuntimeError::new(format!("failed to prepare TripoSG cache bootstrap: {err}"))
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = prefer_f16;
+        Ok(resolve_triposg_weights_root(None))
+    }
 }
 
 fn map_dino_backend(value: DinoBackend) -> DinoBackendChoice {
@@ -1300,6 +1332,15 @@ fn run_backend_inference<B: Backend>(
         )),
     );
     let sample_start = Instant::now();
+    let latents = config.seed.map(|seed| {
+        deterministic_latents_from_seed::<B>(
+            seed,
+            batch_size,
+            config.num_tokens,
+            state.pipeline.transformer.config().in_channels,
+            &state.device,
+        )
+    });
     let output = state.pipeline.sample_from_embeds_with_progress(
         image_embeds,
         batch_size,
@@ -1307,7 +1348,7 @@ fn run_backend_inference<B: Backend>(
         config.num_tokens,
         config.guidance_scale,
         None,
-        None,
+        latents,
         |step| {
             let elapsed_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
             progress.step(
@@ -1430,15 +1471,31 @@ fn decimate_mesh(mut mesh: Mesh, target_faces: Option<usize>) -> Result<Mesh, St
     Ok(mesh)
 }
 
-fn resolve_foreground_weights_root(explicit: Option<&Path>, model: ForegroundModel) -> PathBuf {
+fn resolve_foreground_weights_root(
+    explicit: Option<&Path>,
+    model: ForegroundModel,
+) -> RuntimeResult<PathBuf> {
     if let Some(path) = explicit
         && let Some(root) = normalize_foreground_root(path, model)
     {
-        return root;
+        return Ok(root);
     }
     match model {
-        ForegroundModel::Rmbg14 => resolve_rmbg_weights_root(),
-        ForegroundModel::Rmbg2 => resolve_rmbg2_weights_root(),
+        ForegroundModel::Rmbg14 => resolve_rmbg14_runtime_weights_root(),
+        ForegroundModel::Rmbg2 => Ok(resolve_rmbg2_weights_root()),
+    }
+}
+
+fn resolve_rmbg14_runtime_weights_root() -> RuntimeResult<PathBuf> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        resolve_or_bootstrap_rmbg14_root(true)
+            .map_err(|err| RuntimeError::new(format!("failed to prepare RMBG-1.4 cache: {err}")))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(resolve_rmbg_weights_root())
     }
 }
 
@@ -1707,11 +1764,11 @@ mod tests {
     }
 
     #[test]
-    fn parity_profile_keeps_f32_preference_and_fallback_dimension() {
+    fn parity_profile_keeps_f16_preference_and_fallback_dimension() {
         let profile = triposg_runtime_profile(Some(777));
         assert!(profile.strict_dino_preprocess);
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
-        assert!(!profile.burnpack_policy.precision.prefer_f16());
+        assert!(profile.burnpack_policy.precision.prefer_f16());
     }
 }

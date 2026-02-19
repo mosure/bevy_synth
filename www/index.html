@@ -58,22 +58,6 @@
         font-size: 14px;
         letter-spacing: 0.01em;
       }
-      #precision-wrap {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        opacity: 0.9;
-      }
-      #precision {
-        border: 1px solid rgba(180, 200, 240, 0.28);
-        background: rgba(32, 64, 104, 0.28);
-        color: #d6deeb;
-        border-radius: 6px;
-        padding: 4px 6px;
-        font: inherit;
-        font-size: 12px;
-      }
       #boot-start {
         appearance: none;
         border: 1px solid rgba(180, 200, 240, 0.28);
@@ -98,50 +82,26 @@
     <div id="boot">
       <div id="dot"></div>
       <div id="boot-text">click start to initialize wasm</div>
-      <label id="precision-wrap" for="precision"
-        >weights
-        <select id="precision">
-          <option value="f32" selected>f32</option>
-          <option value="f16">f16</option>
-        </select>
-      </label>
       <button id="boot-start" type="button">Start</button>
     </div>
     <script type="module">
       const boot = document.getElementById("boot");
       const text = document.getElementById("boot-text");
       const startButton = document.getElementById("boot-start");
-      const precisionSelect = document.getElementById("precision");
       let started = false;
       let wasm = null;
 
-      const searchParams = new URLSearchParams(window.location.search);
-      const queryPrecision = (searchParams.get("weights_precision") || "").toLowerCase();
-      if (queryPrecision === "f16" || queryPrecision === "f32") {
-        precisionSelect.value = queryPrecision;
-      }
-
-      const buildTag = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
-      const moduleUrl = `./out/bevy_synth.js?v=${encodeURIComponent(buildTag)}`;
-      const wasmUrl = `./out/bevy_synth_bg.wasm?v=${encodeURIComponent(buildTag)}`;
+      const moduleUrl = "./out/bevy_synth.js";
+      const wasmUrl = "./out/bevy_synth_bg.wasm";
 
       const start = async () => {
         if (started) return;
         started = true;
         startButton.disabled = true;
-        precisionSelect.disabled = true;
-        const precision = precisionSelect.value === "f16" ? "f16" : "f32";
-        const params = new URLSearchParams(window.location.search);
-        params.set("weights_precision", precision);
-        if (!params.has("rmbg_weights_precision")) {
-          params.set("rmbg_weights_precision", "auto");
-        }
-        const query = params.toString();
-        history.replaceState(null, "", query ? `${window.location.pathname}?${query}` : window.location.pathname);
         text.textContent = "loading wasm module...";
         try {
           const mod = await import(moduleUrl);
-          const wasmResponse = await fetch(wasmUrl, { cache: "no-store" });
+          const wasmResponse = await fetch(wasmUrl);
           if (!wasmResponse.ok) {
             throw new Error(`failed to fetch bevy_synth wasm: HTTP ${wasmResponse.status}`);
           }
@@ -155,7 +115,6 @@
           console.error("failed to initialize bevy_synth wasm", err);
           text.textContent = "failed to load wasm module";
           startButton.disabled = false;
-          precisionSelect.disabled = false;
           started = false;
         }
       };

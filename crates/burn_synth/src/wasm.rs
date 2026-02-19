@@ -30,7 +30,7 @@ impl Default for WasmInferencePreset {
             backend: "wgpu",
             rmbg_backend: "auto",
             dino_backend: "auto",
-            weights_precision: "f32",
+            weights_precision: "f16",
             rmbg_weights_precision: "auto",
         }
     }
@@ -99,7 +99,7 @@ mod tests {
                 "--dino-backend",
                 "auto",
                 "--weights-precision",
-                "f32",
+                "f16",
                 "--rmbg-weights-precision",
                 "auto",
             ]

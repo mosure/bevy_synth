@@ -163,8 +163,8 @@ pub struct Args {
     pub dino_backend: DinoBackend,
 
     /// TripoSG burnpack precision preference on web/native (auto, f16, f32).
-    /// `f32` is correctness-first and the default.
-    #[arg(long, value_enum, default_value_t = WeightPrecision::F32)]
+    /// Defaults to `f16` to reduce weight download/storage footprint.
+    #[arg(long, value_enum, default_value_t = WeightPrecision::F16)]
     pub weights_precision: WeightPrecision,
 
     /// RMBG burnpack precision preference (auto, f16, f32).
@@ -525,9 +525,9 @@ mod tests {
     }
 
     #[test]
-    fn weight_precision_defaults_to_f32_with_rmbg_auto() {
+    fn weight_precision_defaults_to_f16_with_rmbg_auto() {
         let app_args = build_app_args(Args::parse_from(["bevy_synth"]));
-        assert_eq!(app_args.weights_precision, WeightPrecision::F32);
+        assert_eq!(app_args.weights_precision, WeightPrecision::F16);
         assert_eq!(app_args.rmbg_weights_precision, WeightPrecision::Auto);
     }
 

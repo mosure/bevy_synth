@@ -3,6 +3,8 @@
 pub mod io;
 pub mod mesh;
 pub mod model_loader;
+#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+mod native_model_bootstrap;
 pub mod pipeline;
 #[cfg(feature = "runtime")]
 pub mod progress;

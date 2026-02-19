@@ -6,6 +6,9 @@ TEST_DIR="${ROOT_DIR}/crates/burn_synth/tests/web_playwright"
 OUT_DIR="${ROOT_DIR}/www/out"
 TMP_DIR="${TEST_DIR}/tmp"
 NATIVE_REF_GLB="${TMP_DIR}/native_reference.glb"
+LOCK_DIR="${ROOT_DIR}/target/.webgpu-test.lockdir"
+LOCK_TIMEOUT_SEC="${BURN_SYNTH_WEBGPU_LOCK_TIMEOUT_SEC:-7200}"
+LOCK_WAIT_SEC=2
 
 unset RUSTFLAGS
 unset CARGO_ENCODED_RUSTFLAGS
@@ -15,6 +18,26 @@ unset RUSTDOCFLAGS
 
 mkdir -p "${OUT_DIR}"
 mkdir -p "${TMP_DIR}"
+mkdir -p "${ROOT_DIR}/target"
+
+LOCK_FALLBACK_HELD=0
+cleanup_webgpu_lock() {
+  if [[ "${LOCK_FALLBACK_HELD}" == "1" ]]; then
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
+  fi
+}
+trap cleanup_webgpu_lock EXIT
+
+echo "[web-e2e] acquire exclusive WebGPU test lock"
+lock_deadline=$((SECONDS + LOCK_TIMEOUT_SEC))
+until mkdir "${LOCK_DIR}" 2>/dev/null; do
+  if (( SECONDS >= lock_deadline )); then
+    echo "[web-e2e] timed out waiting for WebGPU lock after ${LOCK_TIMEOUT_SEC}s: ${LOCK_DIR}" >&2
+    exit 1
+  fi
+  sleep "${LOCK_WAIT_SEC}"
+done
+LOCK_FALLBACK_HELD=1
 
 echo "[web-e2e] build burn_synth wasm (wasm-api + wasm-api-wgpu)"
 cargo build \
@@ -82,6 +105,7 @@ else
 fi
 
 echo "[web-e2e] run web integration tests"
+BURN_SYNTH_WEBGPU_LOCK_HELD=1 \
 BURN_SYNTH_NATIVE_REF_GLB="${NATIVE_REF_GLB}" \
   BURN_SYNTH_WEB_TMP_DIR="${TMP_DIR}" \
   npx playwright test --config playwright.config.mjs --workers=1 --reporter=list

@@ -68,7 +68,7 @@ pub fn triposg_runtime_profile(
 ) -> TripoSGRuntimeParityProfile {
     let max_image_dim = fallback_max_image_dim.filter(|value| *value > 0 && *value != usize::MAX);
     let burnpack_policy =
-        BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF32);
+        BurnpackLoadPolicy::default().with_precision(BpkPrecisionPreference::PreferF16);
 
     TripoSGRuntimeParityProfile {
         strict_dino_preprocess: true,
@@ -180,13 +180,13 @@ mod tests {
         assert!(profile.strict_dino_preprocess);
         assert!(profile.strict_rmbg_interp);
         assert_eq!(profile.max_image_dim, Some(777));
-        assert!(!profile.burnpack_policy.precision.prefer_f16());
+        assert!(profile.burnpack_policy.precision.prefer_f16());
     }
 
     #[test]
-    fn default_profile_prefers_f32_weights() {
+    fn default_profile_prefers_f16_weights() {
         let profile = triposg_runtime_profile(None);
-        assert!(!should_prefer_f16_triposg_weights(profile));
+        assert!(should_prefer_f16_triposg_weights(profile));
     }
 
     #[test]

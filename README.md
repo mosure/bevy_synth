@@ -45,6 +45,8 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
   - foreground: RMBG-1.4, RMBG-2.0
   - synthesis: TripoSG, Trellis2
 
+> note: pre-trained model weights have separate license
+
 
 ## references
 
@@ -54,4 +56,3 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 - [midi](https://huanngzh.github.io/MIDI-Page/)
 - [trellis](https://github.com/microsoft/TRELLIS.2)
 - [triposg](https://yg256li.github.io/TripoSG-Page/)
-

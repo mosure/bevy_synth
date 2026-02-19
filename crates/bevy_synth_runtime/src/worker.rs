@@ -35,7 +35,7 @@ use crate::state::{InferenceWorker, WorkerCommand, WorkerEvent};
 use burn_synth::wasm::WasmInferencePreset;
 #[cfg(target_arch = "wasm32")]
 use burn_synth::wasm_api::{
-    infer_glb_from_image_bytes_with_preset_cached, warmup_pipeline_for_preset,
+    infer_glb_from_image_bytes_with_preset_cached, warmup_pipeline_for_preset_with_status,
 };
 #[cfg(target_arch = "wasm32")]
 use gloo_timers::future::TimeoutFuture;
@@ -401,7 +401,15 @@ async fn ensure_wasm_pipeline_state_via_burn_synth(
 ) {
     if warmup.is_none() {
         send_worker_status(event_tx, WASM_STATUS_LOADING_MODELS);
-        let loaded = warmup_pipeline_for_preset(preset).await;
+        let mut last_status: Option<String> = None;
+        let loaded = warmup_pipeline_for_preset_with_status(preset, |message| {
+            if last_status.as_ref().is_some_and(|prev| prev == &message) {
+                return;
+            }
+            last_status = Some(message.clone());
+            send_worker_status(event_tx, message);
+        })
+        .await;
         if let Err(err) = loaded.as_ref() {
             warn!("Inference worker failed to initialize: {err}");
             send_worker_status(

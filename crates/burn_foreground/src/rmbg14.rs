@@ -612,6 +612,7 @@ pub mod import {
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
+    use burn_synth_import::parts::load_model_from_burnpack_parts;
 
     use super::{BriaRmbg, RmbgConfig};
 
@@ -624,6 +625,18 @@ pub mod import {
     ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
         let burnpack_candidates = candidate_burnpack_paths(weights_path);
+        if let Some(model) = load_model_from_burnpack_parts(
+            &burnpack_candidates,
+            "RMBG",
+            should_validate_burnpack(),
+            || BriaRmbg::new(device, config.clone()),
+            |model, part_bytes| {
+                apply_rmbg_burnpack_part_bytes(model, part_bytes)
+                    .map_err(|err| format!("failed to apply RMBG burnpack part bytes: {err}"))
+            },
+        )? {
+            return Ok(model);
+        }
         let burnpack_path = burnpack_candidates
             .iter()
             .find(|candidate| candidate.exists())

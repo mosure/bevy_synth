@@ -25,6 +25,7 @@ runtime = [
   "dep:gltf",
   "dep:image",
   "dep:log",
+  "dep:ureq",
 ]
 wgpu = ["runtime", "dep:burn-wgpu"]
 cuda = ["runtime", "dep:burn-cuda"]
@@ -52,6 +53,7 @@ burn_synth_import = { path = "../burn_synth_import" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+ureq = { version = "2.12", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "webgpu"] }
@@ -77,4 +79,3 @@ sysinfo = "0.36"
 name = "burn_synth"
 path = "src/main.rs"
 required-features = ["runtime"]
-

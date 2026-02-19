@@ -310,6 +310,7 @@ pub mod import {
         ApplyResult, BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter,
         SafetensorsStore,
     };
+    use burn_synth_import::parts::load_model_from_burnpack_parts;
     use safetensors::{
         Dtype, serialize,
         tensor::{SafeTensors, TensorView},
@@ -353,6 +354,22 @@ pub mod import {
             }
         }
         let burnpack_candidates = candidate_burnpack_paths(weights_path, policy);
+        if let Some(model) = load_model_from_burnpack_parts(
+            &burnpack_candidates,
+            "DINOv2",
+            should_validate_burnpack(),
+            || {
+                let dino =
+                    burn_dino::model::dino::DinoVisionTransformer::new(device, config.clone());
+                TripoSGImageEncoder::new(dino)
+            },
+            |model, part_bytes| {
+                apply_triposg_dinov2_burnpack_part_bytes(model, part_bytes)
+                    .map_err(|err| format!("failed to apply DINOv2 burnpack part bytes: {err}"))
+            },
+        )? {
+            return Ok(model);
+        }
         let burnpack_path = burnpack_candidates
             .iter()
             .find(|candidate| candidate.exists())

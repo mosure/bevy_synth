@@ -576,6 +576,57 @@ fn dense_grid_index_to_xyz(index: usize, resolution: usize) -> (usize, usize, us
     (x, y, z)
 }
 
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn splitmix64_unit_f32(state: &mut u64) -> f32 {
+    // Use top 24 bits for an exact f32 mantissa-scale uniform in [0, 1).
+    let value = (splitmix64_next(state) >> 40) as u32;
+    (value as f32) / ((1u32 << 24) as f32)
+}
+
+/// Build deterministic standard-normal latents from an explicit seed.
+///
+/// This avoids backend-specific RNG divergence between native and wasm GPU backends.
+pub fn deterministic_latents_from_seed<B: Backend>(
+    seed: u64,
+    batch_size: usize,
+    num_tokens: usize,
+    num_channels: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    let total = batch_size
+        .saturating_mul(num_tokens)
+        .saturating_mul(num_channels);
+    if total == 0 {
+        return Tensor::<B, 3>::zeros([batch_size as i32, num_tokens as i32, num_channels as i32], device);
+    }
+
+    let mut state = seed;
+    let mut values = Vec::with_capacity(total);
+    while values.len() < total {
+        let u1 = splitmix64_unit_f32(&mut state).max(f32::MIN_POSITIVE);
+        let u2 = splitmix64_unit_f32(&mut state);
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        values.push(radius * theta.cos());
+        if values.len() < total {
+            values.push(radius * theta.sin());
+        }
+    }
+
+    Tensor::<B, 1>::from_floats(values.as_slice(), device).reshape([
+        batch_size as i32,
+        num_tokens as i32,
+        num_channels as i32,
+    ])
+}
+
 pub(crate) fn decode_grid_values<B: Backend>(
     latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,

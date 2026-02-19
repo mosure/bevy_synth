@@ -620,6 +620,7 @@ pub mod import {
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
     };
+    use burn_synth_import::parts::load_model_from_burnpack_parts;
 
     use super::super::load_policy::{BurnpackLoadPolicy, burnpack_path, candidate_burnpack_paths};
     use super::{TripoSGVae, TripoSGVaeConfig};
@@ -640,6 +641,19 @@ pub mod import {
     ) -> Result<TripoSGVae<B>, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         let burnpack_candidates = candidate_burnpack_paths(path, policy);
+        if let Some(model) = load_model_from_burnpack_parts(
+            &burnpack_candidates,
+            "TripoSG VAE",
+            should_validate_burnpack(),
+            || TripoSGVae::new(device, config.clone()),
+            |model, part_bytes| {
+                apply_triposg_vae_decoder_burnpack_part_bytes(model, part_bytes).map_err(|err| {
+                    format!("failed to apply TripoSG VAE decoder burnpack part bytes: {err}")
+                })
+            },
+        )? {
+            return Ok(model);
+        }
         let burnpack_path = burnpack_candidates
             .iter()
             .find(|candidate| candidate.exists())

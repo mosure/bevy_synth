@@ -9,6 +9,9 @@
 - do not use `target/wasm32-unknown-unknown/release/*.wasm` for web pages; web validation and tests use `wasm-release` artifacts.
 - run full `burn_synth` wasm integration (build + bindgen + playwright parts-based inference):
   - `./crates/burn_synth/tests/web_playwright/run.sh`
+  - this runner acquires an exclusive WebGPU lock so only one web GPU test job runs at a time.
+  - direct `npx playwright test` runs also use the same lock via Playwright global setup.
+  - override lock wait (seconds) with `BURN_SYNTH_WEBGPU_LOCK_TIMEOUT_SEC`.
 - bundle model assets into `www/assets/models`:
   - `pwsh ./scripts/bundle_web_assets.ps1`
 - preview the bundle plan without copying files:

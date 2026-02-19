@@ -32,7 +32,7 @@ use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
 use burn_tripo::pipeline::runtime_parity::{
     decimate_tripo_mesh, should_prefer_f16_triposg_weights, triposg_runtime_profile,
 };
-use burn_tripo::pipeline::triposg::TripoSGPipeline;
+use burn_tripo::pipeline::triposg::{TripoSGPipeline, deterministic_latents_from_seed};
 use js_sys::Uint8Array;
 #[cfg(feature = "wasm-api-wgpu")]
 use js_sys::{Function, Promise, Reflect};
@@ -281,12 +281,7 @@ fn resolve_wgpu_precision_for_preset(
     shader_f16_supported: bool,
 ) -> Result<&'static str, String> {
     if preset.weights_precision.eq_ignore_ascii_case("f16") {
-        if shader_f16_supported {
-            return Ok("f16");
-        }
-        return Err(
-            "requested f16 weights but this WebGPU adapter lacks shader-f16 support".to_string(),
-        );
+        return Ok(if shader_f16_supported { "f16" } else { "f32" });
     }
     if preset.weights_precision.eq_ignore_ascii_case("auto") {
         return Ok(if shader_f16_supported { "f16" } else { "f32" });
@@ -296,6 +291,20 @@ fn resolve_wgpu_precision_for_preset(
 
 #[cfg(feature = "wasm-api-wgpu")]
 pub async fn warmup_pipeline_for_preset(preset: &WasmInferencePreset) -> Result<(), String> {
+    warmup_pipeline_for_preset_with_status(preset, |message| {
+        web_sys::console::log_1(&message.into());
+    })
+    .await
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+pub async fn warmup_pipeline_for_preset_with_status<F>(
+    preset: &WasmInferencePreset,
+    mut on_status: F,
+) -> Result<(), String>
+where
+    F: FnMut(String),
+{
     if !preset.backend.eq_ignore_ascii_case("wgpu") {
         return Err("wasm TripoSG supports backend=wgpu only".to_string());
     }
@@ -308,6 +317,12 @@ pub async fn warmup_pipeline_for_preset(preset: &WasmInferencePreset) -> Result<
     initialize_wgpu_runtime_for_wasm().await?;
     let shader_f16_supported = wasm_webgpu_shader_f16_supported().await;
     let precision = resolve_wgpu_precision_for_preset(preset, shader_f16_supported)?;
+    if preset.weights_precision.eq_ignore_ascii_case("f16") && !shader_f16_supported {
+        on_status(
+            "WebGPU adapter lacks shader-f16; running TripoSG on f32 backend while preferring f16 model weights."
+                .to_string(),
+        );
+    }
 
     let cache_hit = CACHED_WASM_PIPELINE.with(|cache| {
         let guard = cache.borrow();
@@ -318,17 +333,26 @@ pub async fn warmup_pipeline_for_preset(preset: &WasmInferencePreset) -> Result<
         }
     });
     if cache_hit {
+        on_status("Model weights already loaded (cache hit).".to_string());
         return Ok(());
     }
 
     let loaded = match precision {
         "f16" => CachedWasmPipeline::WgpuF16 {
             preset: preset.clone(),
-            state: load_pipeline_state::<WgpuBackendF16, WgpuRmbgBackend>(preset).await?,
+            state: load_pipeline_state::<WgpuBackendF16, WgpuRmbgBackend, _>(
+                preset,
+                &mut on_status,
+            )
+            .await?,
         },
         _ => CachedWasmPipeline::WgpuF32 {
             preset: preset.clone(),
-            state: load_pipeline_state::<WgpuBackendF32, WgpuRmbgBackend>(preset).await?,
+            state: load_pipeline_state::<WgpuBackendF32, WgpuRmbgBackend, _>(
+                preset,
+                &mut on_status,
+            )
+            .await?,
         },
     };
 
@@ -340,6 +364,20 @@ pub async fn warmup_pipeline_for_preset(preset: &WasmInferencePreset) -> Result<
 
 #[cfg(not(feature = "wasm-api-wgpu"))]
 pub async fn warmup_pipeline_for_preset(_preset: &WasmInferencePreset) -> Result<(), String> {
+    Err(
+        "this build does not include wasm WebGPU support (`wasm-api-wgpu` feature missing)."
+            .to_string(),
+    )
+}
+
+#[cfg(not(feature = "wasm-api-wgpu"))]
+pub async fn warmup_pipeline_for_preset_with_status<F>(
+    _preset: &WasmInferencePreset,
+    _on_status: F,
+) -> Result<(), String>
+where
+    F: FnMut(String),
+{
     Err(
         "this build does not include wasm WebGPU support (`wasm-api-wgpu` feature missing)."
             .to_string(),
@@ -429,6 +467,7 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
     image_bytes: &[u8],
     preset: &WasmInferencePreset,
 ) -> Result<Vec<u8>, String> {
+    web_sys::console::log_1(&"burn_synth wasm infer: prepare_image_data start".into());
     let prepared = prepare_image_data_from_bytes_async::<BRmbg>(
         image_bytes,
         Some(&state.rmbg),
@@ -436,8 +475,20 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
     )
     .await
     .map_err(|err| format!("failed to prepare image tensor: {err}"))?;
+    web_sys::console::log_1(&"burn_synth wasm infer: prepare_image_data done".into());
+
     BTriposg::seed(&state.triposg_device, preset.seed);
+    web_sys::console::log_1(&"burn_synth wasm infer: encode_image_embeds start".into());
     let image_embeds = encode_image_embeds_for_wasm(state, &prepared)?;
+    web_sys::console::log_1(&"burn_synth wasm infer: encode_image_embeds done".into());
+    let batch_size = image_embeds.shape().dims::<3>()[0];
+    let latents = Some(deterministic_latents_from_seed::<BTriposg>(
+        preset.seed,
+        batch_size,
+        preset.num_tokens.max(64),
+        state.triposg.transformer.config().in_channels,
+        &state.triposg_device,
+    ));
 
     let flash = FlashExtractConfig {
         bounds: DEFAULT_BOUNDS,
@@ -447,6 +498,16 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
         min_resolution: preset.resolution.max(2),
         mini_grid_num: DEFAULT_FLASH_MINI_GRID_NUM,
     };
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm infer: flash_extract start (steps={} tokens={} min_resolution={} faces={})",
+            preset.num_steps.max(1),
+            preset.num_tokens.max(64),
+            flash.min_resolution,
+            preset.faces
+        )
+        .into(),
+    );
     let flash_output = state
         .triposg
         .sample_mesh_flash_from_embeds_async_wasm(
@@ -455,27 +516,48 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
             preset.num_tokens.max(64),
             DEFAULT_GUIDANCE_SCALE,
             &flash,
-            None,
+            latents,
         )
         .await
         .map_err(|err| format!("TripoSG flash geometry extraction failed: {err}"))?;
+    web_sys::console::log_1(&"burn_synth wasm infer: flash_extract done".into());
 
     let mut mesh = flash_output
         .mesh
         .ok_or_else(|| "TripoSG mesh extraction returned an empty mesh".to_string())?;
 
     if preset.faces > 0 && mesh.faces.len() > preset.faces {
+        web_sys::console::log_1(
+            &format!(
+                "burn_synth wasm infer: decimate start (from_faces={} target_faces={})",
+                mesh.faces.len(),
+                preset.faces
+            )
+            .into(),
+        );
         mesh = decimate_tripo_mesh(&mesh, preset.faces)
             .map_err(|err| format!("mesh decimation failed: {err}"))?;
+        web_sys::console::log_1(
+            &format!(
+                "burn_synth wasm infer: decimate done (to_faces={})",
+                mesh.faces.len()
+            )
+            .into(),
+        );
     }
 
     let mesh = tripo_mesh_to_mesh(mesh);
+    web_sys::console::log_1(&"burn_synth wasm infer: serialize_glb start".into());
     mesh_to_glb_bytes(&mesh).map_err(|err| format!("failed to serialize GLB: {err}"))
 }
 
-async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
+async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend, F>(
     preset: &WasmInferencePreset,
-) -> Result<WasmPipelineState<BTriposg, BRmbg>, String> {
+    on_status: &mut F,
+) -> Result<WasmPipelineState<BTriposg, BRmbg>, String>
+where
+    F: FnMut(String),
+{
     let parity = triposg_runtime_profile(Some(preset.resolution));
     set_rmbg_strict_interp_override(Some(parity.strict_rmbg_interp));
     let prefer_f16_default = should_prefer_f16_triposg_weights(parity);
@@ -523,13 +605,10 @@ async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
         }
     };
     let precision_label = if effective_prefer_f16 { "f16" } else { "f32" };
-    web_sys::console::log_1(
-        &format!(
-            "TripoSG weight precision policy: {precision_label} ({})",
-            precision_reason
-        )
-        .into(),
-    );
+    on_status(format!(
+        "TripoSG weight precision policy: {precision_label} ({})",
+        precision_reason
+    ));
     let prefer_f16_rmbg = match requested_rmbg_precision {
         "f16" => true,
         "f32" => false,
@@ -548,7 +627,6 @@ async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
     let rmbg_device = BRmbg::Device::default();
     let mut totals = DownloadTotals::default();
     let mut host_ram_budget = WasmHostMemoryBudget::new(web_max_host_ram_bytes());
-    let mut emit_status = |message: String| web_sys::console::log_1(&message.into());
 
     let options = TripoWasmLoadOptions {
         strict_dino_preprocess: parity.strict_dino_preprocess,
@@ -560,7 +638,7 @@ async fn load_pipeline_state<BTriposg: Backend, BRmbg: Backend>(
     let mut load_ctx = WasmLoadContext {
         totals: &mut totals,
         host_ram_budget: &mut host_ram_budget,
-        on_status: &mut emit_status,
+        on_status,
     };
 
     let rmbg = load_rmbg14_pipeline_wasm(

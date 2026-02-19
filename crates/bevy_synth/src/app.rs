@@ -30,11 +30,15 @@ use bevy::pbr::{MeshMaterial3d, StandardMaterial};
 use bevy::prelude::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy::render::RenderApp;
+#[cfg(target_arch = "wasm32")]
+use bevy::render::RenderPlugin;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy::render::renderer::{
     RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue,
 };
+#[cfg(target_arch = "wasm32")]
+use bevy::render::settings::{Backends, WgpuSettings};
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
@@ -742,11 +746,22 @@ fn add_default_plugins(app: &mut App) {
         unapproved_path_mode: UnapprovedPathMode::Allow,
         ..default()
     };
+    let webgpu_render_plugin = RenderPlugin {
+        // Force browser WebGPU backend for Bevy rendering on wasm.
+        // This prevents silent fallback to WebGL2 and keeps renderer/inference backend parity.
+        render_creation: WgpuSettings {
+            backends: Some(Backends::BROWSER_WEBGPU),
+            ..default()
+        }
+        .into(),
+        ..default()
+    };
     app.add_plugins(
         DefaultPlugins
             .set(WebAssetPlugin {
                 silence_startup_warning: true,
             })
+            .set(webgpu_render_plugin)
             .set(asset_plugin),
     );
 }

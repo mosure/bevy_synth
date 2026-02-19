@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::io::{ensure_parent_dir, sha256_file};
+use crate::io::{ensure_parent_dir, sha256_bytes, sha256_file};
 use crate::plan::ArtifactPolicy;
 
 const ONE_MIB: u64 = 1024 * 1024;
@@ -229,6 +229,73 @@ pub fn apply_artifact_policy(
     write_burnpack_parts_for_wasm(burnpack_path, part_size_mib, overwrite)
 }
 
+pub fn load_model_from_burnpack_parts<M, Init, Apply>(
+    burnpack_candidates: &[PathBuf],
+    label: &str,
+    verify_checksums: bool,
+    mut init_model: Init,
+    mut apply_part: Apply,
+) -> Result<Option<M>, String>
+where
+    Init: FnMut() -> M,
+    Apply: FnMut(&mut M, Vec<u8>) -> Result<(), String>,
+{
+    for candidate in burnpack_candidates {
+        let manifest_path = burnpack_parts_manifest_path(candidate);
+        if !manifest_path.exists() {
+            continue;
+        }
+        let manifest = read_parts_manifest(&manifest_path)?;
+        if manifest.parts.is_empty() {
+            return Err(format!(
+                "burnpack parts manifest {} contains no parts for {label}",
+                manifest_path.display()
+            ));
+        }
+
+        let mut model = init_model();
+        for (index, part) in manifest.parts.iter().enumerate() {
+            let part_path = resolve_part_entry_path(&manifest_path, &part.path)?;
+            let bytes = fs::read(&part_path).map_err(|err| {
+                format!(
+                    "failed to read {} part {}: {err}",
+                    label,
+                    part_path.display()
+                )
+            })?;
+            if part.bytes > 0 && bytes.len() as u64 != part.bytes {
+                return Err(format!(
+                    "{label} part {} expected {} bytes but found {}",
+                    part_path.display(),
+                    part.bytes,
+                    bytes.len()
+                ));
+            }
+            if verify_checksums && !part.sha256.trim().is_empty() {
+                let actual_sha = sha256_bytes(&bytes);
+                if !actual_sha.eq_ignore_ascii_case(part.sha256.trim()) {
+                    return Err(format!(
+                        "{label} part {} checksum mismatch: expected {}, got {}",
+                        part_path.display(),
+                        part.sha256.trim(),
+                        actual_sha
+                    ));
+                }
+            }
+            apply_part(&mut model, bytes).map_err(|err| {
+                format!(
+                    "failed to apply {label} part {}/{} ({}): {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_path.display()
+                )
+            })?;
+        }
+        return Ok(Some(model));
+    }
+    Ok(None)
+}
+
 pub fn remove_legacy_shard_artifacts_for_burnpack(burnpack_path: &Path) -> Result<usize, String> {
     let file_name = burnpack_path
         .file_name()
@@ -439,7 +506,7 @@ fn write_burnpack_part(
     Ok(())
 }
 
-fn read_parts_manifest(path: &Path) -> Result<BurnpackPartsManifest, String> {
+pub fn read_parts_manifest(path: &Path) -> Result<BurnpackPartsManifest, String> {
     let bytes = fs::read(path).map_err(|err| {
         format!(
             "failed to read burnpack parts manifest {}: {err}",
@@ -454,7 +521,7 @@ fn read_parts_manifest(path: &Path) -> Result<BurnpackPartsManifest, String> {
     })
 }
 
-fn resolve_part_entry_path(manifest_path: &Path, entry_path: &str) -> Result<PathBuf, String> {
+pub fn resolve_part_entry_path(manifest_path: &Path, entry_path: &str) -> Result<PathBuf, String> {
     let entry_path = Path::new(entry_path);
     if entry_path.is_absolute() {
         return Ok(entry_path.to_path_buf());
@@ -495,4 +562,151 @@ fn cleanup_existing_parts(manifest_path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        BurnpackPartEntry, BurnpackPartsManifest, burnpack_parts_manifest_path,
+        load_model_from_burnpack_parts,
+    };
+    use crate::io::sha256_bytes;
+
+    fn unique_tmp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("burnpack_parts_loader_test_{nanos}"))
+    }
+
+    #[test]
+    fn loads_parts_from_manifest_when_present() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let candidate = root.join("model.bpk");
+        fs::write(&candidate, b"placeholder").expect("write candidate");
+        let part0 = root.join("model.bpk.part-00000.bpk");
+        let part1 = root.join("model.bpk.part-00001.bpk");
+        fs::write(&part0, b"aaa").expect("write part0");
+        fs::write(&part1, b"bbb").expect("write part1");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            total_bytes: 6,
+            max_part_bytes: 3,
+            parts: vec![
+                BurnpackPartEntry {
+                    path: "model.bpk.part-00000.bpk".to_string(),
+                    bytes: 3,
+                    sha256: sha256_bytes(b"aaa"),
+                    tensors: 1,
+                },
+                BurnpackPartEntry {
+                    path: "model.bpk.part-00001.bpk".to_string(),
+                    bytes: 3,
+                    sha256: sha256_bytes(b"bbb"),
+                    tensors: 1,
+                },
+            ],
+        };
+        let manifest_path = burnpack_parts_manifest_path(&candidate);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let loaded = load_model_from_burnpack_parts(
+            std::slice::from_ref(&candidate),
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect("load parts")
+        .expect("manifest should be used");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0], b"aaa");
+        assert_eq!(loaded[1], b"bbb");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn returns_none_without_manifest() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let candidate = root.join("model.bpk");
+        fs::write(&candidate, b"placeholder").expect("write candidate");
+
+        let loaded = load_model_from_burnpack_parts(
+            std::slice::from_ref(&candidate),
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect("load parts");
+
+        assert!(loaded.is_none());
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn errors_on_checksum_mismatch() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let candidate = root.join("model.bpk");
+        fs::write(&candidate, b"placeholder").expect("write candidate");
+        let part0 = root.join("model.bpk.part-00000.bpk");
+        fs::write(&part0, b"aaa").expect("write part0");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            total_bytes: 3,
+            max_part_bytes: 3,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: 3,
+                sha256: "deadbeef".to_string(),
+                tensors: 1,
+            }],
+        };
+        let manifest_path = burnpack_parts_manifest_path(&candidate);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let err = load_model_from_burnpack_parts(
+            std::slice::from_ref(&candidate),
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect_err("checksum should fail");
+
+        assert!(err.contains("checksum mismatch"), "unexpected error: {err}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
 }

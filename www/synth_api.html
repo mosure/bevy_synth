@@ -67,16 +67,15 @@
       const runButton = document.getElementById("run-infer");
       const download = document.getElementById("download");
       let wasm = null;
-      const buildTag = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
-      const moduleUrl = `./out/burn_synth.js?v=${encodeURIComponent(buildTag)}`;
-      const wasmUrl = `./out/burn_synth_bg.wasm?v=${encodeURIComponent(buildTag)}`;
+      const moduleUrl = "./out/burn_synth.js";
+      const wasmUrl = "./out/burn_synth_bg.wasm";
 
       const start = async () => {
         startButton.disabled = true;
         text.textContent = "loading wasm module...";
         try {
           const mod = await import(moduleUrl);
-          const wasmResponse = await fetch(wasmUrl, { cache: "no-store" });
+          const wasmResponse = await fetch(wasmUrl);
           if (!wasmResponse.ok) {
             throw new Error(`failed to fetch burn_synth wasm: HTTP ${wasmResponse.status}`);
           }
