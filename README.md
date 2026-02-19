@@ -14,34 +14,6 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 | ![Input chair](docs/output_chair_bg_removed.png) | ![Output chair (rendered mesh)](docs/output_chair_render.png) |
 
 
-## install
-
-```bash
-# burn_synth CLI
-cargo install burn_synth
-
-# bevy_synth app
-cargo install bevy_synth
-
-# burn_synth MCP stdio server
-cargo install burn_synth_mcp
-```
-
-### usage:
-
-```bash
-# burn_synth: run image -> GLB synthesis
-burn_synth mesh \
-  --input docs/output_chair_bg_removed.png \
-  --output /tmp/chair.glb
-
-# bevy_synth: launch interactive app
-bevy_synth
-
-# burn_synth_mcp: start MCP stdio server
-burn_synth_mcp
-```
-
 
 ## features
 
@@ -70,6 +42,39 @@ burn_synth_mcp
 
 
 ## setup
+
+
+### install
+
+```bash
+# burn_synth CLI
+cargo install burn_synth
+
+# bevy_synth app
+cargo install bevy_synth
+
+# burn_synth MCP stdio server
+cargo install burn_synth_mcp
+```
+
+#### usage:
+
+```bash
+# burn_synth: run image -> GLB synthesis
+burn_synth mesh \
+  --input docs/output_chair_bg_removed.png \
+  --output /tmp/chair.glb
+
+# bevy_synth: launch interactive app
+bevy_synth
+
+# burn_synth_mcp: start MCP stdio server
+burn_synth_mcp
+```
+
+
+
+### upstream
 
 - see `docs/SETUP.md` for full setup and model import/runtime details
 - supported models:
