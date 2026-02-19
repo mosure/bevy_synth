@@ -86,6 +86,39 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 7. New public wrapper features should be thin pass-throughs to canonical pipeline methods, not new parallel implementations.
 8. Refactors must reduce total duplicated stage code over time; adding new duplication requires explicit justification in PR notes.
 
+## Packaging and Installability Rules
+
+1. Published binaries must work with plain install commands:
+   - `cargo install burn_synth`
+   - `cargo install bevy_synth`
+   - `cargo install burn_synth_mcp`
+2. Default crate features for published binaries must include a fully functional primary runtime path (no required extra feature flags for baseline usage).
+3. README examples must include install plus one runnable command for each published binary.
+4. Workspace inter-crate versions must be coherent before release (no local semver skew that breaks `cargo check` / `cargo install --path`).
+5. Prefer upstream crates over vendored/patch forks before publish unless there is an actively documented blocker.
+
+## Wrapper Boundary Strictness
+
+1. `bevy_synth_runtime` must treat `burn_synth` as the canonical inference/runtime owner.
+2. Direct dependencies on lower-level model crates in wrapper/runtime crates are only allowed for narrow adaptation needs (for example mesh type bridging), and must be minimized over time.
+3. Path/model-root resolution should be centralized in canonical runtime layers where possible; avoid parallel resolver logic in wrappers.
+4. Delete legacy or dormant compatibility branches once canonical paths exist; do not keep dual implementations alive.
+
+## Model Loading Parity Rules
+
+1. Single-file `.bpk` and multi-part `.bpk.parts.json` loading must be numerically equivalent for the same model/precision.
+2. Add loader parity tests that compare outputs across load strategies for each supported model component.
+3. Loader fallback decisions (precision, source, fallback path) must be explicit in logs with reason.
+4. Download/bootstrap logic must tolerate partial files and recover cleanly (resume/retry/replace), never leaving silent corrupted artifacts.
+5. Prefer one canonical artifact partitioning scheme per model family; avoid mixed conventions that increase operator confusion.
+
+## Web/Wasm Operational Rules
+
+1. Web wrappers must call the same canonical pipeline and model-loading behavior as `burn_synth` wasm APIs.
+2. Wasm startup/model init must expose deterministic user-visible progress (stage and part counts) to avoid "frozen" ambiguity.
+3. Run WebGPU-heavy integration tests serially to avoid self-induced GPU contention during validation.
+4. Browser-specific workarounds must be explicitly temporary, feature-gated where practical, and easy to remove when upstream fixes land.
+
 ## Testing and Quality Gates
 
 1. Add/maintain tests that reflect real workload behavior.
