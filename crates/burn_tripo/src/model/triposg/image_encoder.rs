@@ -491,6 +491,10 @@ pub mod import {
     pub fn load_dinov2_processor(
         weights_root: impl AsRef<Path>,
     ) -> Result<DinoImageProcessor, Box<dyn std::error::Error>> {
+        if !allow_legacy_dinov2_preprocessor() {
+            return Ok(canonical_dinov2_processor());
+        }
+
         let root = weights_root.as_ref();
         let fallback_size = load_dinov2_image_size(root);
         let mut legacy_processor = None;
@@ -635,6 +639,10 @@ pub mod import {
     }
 
     fn load_dinov2_preprocess_size(weights_path: &Path) -> Option<usize> {
+        if !allow_legacy_dinov2_preprocessor() {
+            return Some(CANONICAL_DINO_CROP);
+        }
+
         let weights_root = weights_path.parent()?.parent()?;
         let mut legacy_size = None;
         for (kind, path) in dinov2_preprocessor_config_paths(weights_root) {
@@ -802,9 +810,9 @@ pub mod import {
 
             let processor = load_dinov2_processor(&root).expect("load processor");
             assert!(processor.do_resize);
-            assert_eq!(processor.size_shortest_edge, Some(512));
+            assert_eq!(processor.size_shortest_edge, Some(256));
             assert!(processor.do_center_crop);
-            assert_eq!(processor.crop_size, Some([512, 512]));
+            assert_eq!(processor.crop_size, Some([224, 224]));
 
             let _ = fs::remove_dir_all(root);
         }
@@ -816,7 +824,6 @@ pub mod import {
             let dino_dir = root.join("image_encoder_dinov2");
             fs::create_dir_all(&legacy).expect("create legacy preprocessor dir");
             fs::create_dir_all(&dino_dir).expect("create dino dir");
-            fs::write(dino_dir.join("model.bpk"), b"stub").expect("write dino marker");
             fs::write(
                 legacy.join("preprocessor_config.json"),
                 r#"{
@@ -834,7 +841,6 @@ pub mod import {
             assert_eq!(processor.crop_size, Some([224, 224]));
 
             let weights_path = dino_dir.join("model.safetensors");
-            fs::write(&weights_path, b"stub").expect("write weights marker");
             let preprocess_size = load_dinov2_preprocess_size(&weights_path);
             assert_eq!(preprocess_size, Some(224));
 
@@ -870,9 +876,9 @@ pub mod import {
 
             let processor = load_dinov2_processor(&root).expect("load default processor");
             assert!(processor.do_resize);
-            assert_eq!(processor.size_shortest_edge, Some(518));
+            assert_eq!(processor.size_shortest_edge, Some(256));
             assert!(processor.do_center_crop);
-            assert_eq!(processor.crop_size, Some([518, 518]));
+            assert_eq!(processor.crop_size, Some([224, 224]));
             assert_eq!(processor.mean, [0.485, 0.456, 0.406]);
             assert_eq!(processor.std, [0.229, 0.224, 0.225]);
 

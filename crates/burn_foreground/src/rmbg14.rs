@@ -600,10 +600,7 @@ fn max_pool2d_ceil<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
 
 #[cfg(feature = "import")]
 pub mod import {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
+    use std::path::{Path, PathBuf};
 
     use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
@@ -724,14 +721,9 @@ pub mod import {
     }
 
     pub fn load_rmbg_processor_config(
-        root: impl AsRef<Path>,
+        _root: impl AsRef<Path>,
     ) -> Result<super::super::preprocess::RmbgImageProcessor, Box<dyn std::error::Error>> {
-        let path = root.as_ref().join("preprocessor_config.json");
-        if !path.exists() {
-            return Ok(super::super::preprocess::RmbgImageProcessor::default());
-        }
-        let bytes = fs::read(path)?;
-        load_rmbg_processor_from_json_bytes(&bytes)
+        Ok(super::super::preprocess::RmbgImageProcessor::default())
     }
 
     pub fn load_rmbg_processor_from_json_bytes(

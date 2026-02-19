@@ -49,12 +49,18 @@ pub fn normalize(
 ) {
     // TODO: can be improved by manually specifying the active camera to normalize against. The
     // majority of cases will only use a single camera for this viewer, so this is sufficient.
-    let (camera_position, camera) = if let Ok((camera_position, camera)) = query.p0().single() {
-        (camera_position.to_owned(), camera.to_owned())
-    } else {
-        error!("More than one picking camera");
+    //
+    // Note: during wasm warmup the scene camera may not exist yet; treat that as a no-op.
+    let gizmo_camera_query = query.p0();
+    let mut gizmo_cameras = gizmo_camera_query.iter();
+    let Some((camera_position, camera)) = gizmo_cameras.next() else {
         return;
     };
+    if gizmo_cameras.next().is_some() {
+        error!("More than one gizmo camera");
+        return;
+    }
+    let (camera_position, camera) = (camera_position.to_owned(), camera.to_owned());
     let view = camera_position.to_matrix().inverse();
 
     for (mut transform, mut global_transform, normalize) in query.p1().iter_mut() {

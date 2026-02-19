@@ -251,10 +251,6 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     modelRequests.some((url) => url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/config.json')),
     'expected dedicated DINOv2 config request',
   ).toBe(true);
-  expect(
-    modelRequests.some((url) => url.includes('/assets/models/MIDI-3D/feature_extractor_dinov2/preprocessor_config.json')),
-    'expected dedicated DINOv2 preprocessor request',
-  ).toBe(true);
   const missingDedicatedDinoConfig = failedModelResponses.some(
     (entry) =>
       (entry.includes('404 ') || entry.includes('403 ')) &&
@@ -264,22 +260,9 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     missingDedicatedDinoConfig,
     'dedicated DINOv2 config must be bundled and fetchable',
   ).toBe(false);
-  const missingDedicatedDinoPreprocessorConfig = failedModelResponses.some(
-    (entry) =>
-      (entry.includes('404 ') || entry.includes('403 ')) &&
-      entry.includes('/assets/models/MIDI-3D/feature_extractor_dinov2/preprocessor_config.json'),
-  );
-  expect(
-    missingDedicatedDinoPreprocessorConfig,
-    'dedicated DINOv2 preprocessor config must be bundled and fetchable',
-  ).toBe(false);
   expect(
     modelRequests.some((url) => url.includes('/assets/models/MIDI-3D/image_encoder_2/config.json')),
     'legacy image_encoder_2 config should not be used when dedicated DINOv2 config exists',
-  ).toBe(false);
-  expect(
-    modelRequests.some((url) => url.includes('/assets/models/MIDI-3D/feature_extractor_2/preprocessor_config.json')),
-    'legacy feature_extractor_2 preprocessor should not be used when dedicated DINOv2 preprocessor exists',
   ).toBe(false);
   const requestedDinoF16 = modelRequests.some((url) =>
     url.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model_f16.bpk.parts.json'),
@@ -334,8 +317,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
           entry.includes('/assets/models/MIDI-3D/image_encoder_dinov2/model.bpk') ||
           entry.includes('/assets/models/RMBG-1.4/model.bpk') ||
           entry.includes('/assets/models/RMBG-1.4/model_f16.bpk') ||
-          entry.includes('/assets/models/MIDI-3D/image_encoder_dinov2/config.json') ||
-          entry.includes('/assets/models/MIDI-3D/feature_extractor_dinov2/preprocessor_config.json')
+          entry.includes('/assets/models/MIDI-3D/image_encoder_dinov2/config.json')
         )
       ),
   );

@@ -13,14 +13,12 @@ use burn_foreground::pipeline::{
 use burn_foreground::rmbg14::BriaRmbg;
 use burn_foreground::rmbg14::import::{
     apply_rmbg_burnpack_part_bytes, load_rmbg_config_from_json_bytes,
-    load_rmbg_processor_from_json_bytes,
 };
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 use burn_tripo::model::triposg::dit::import::apply_triposg_dit_burnpack_part_bytes;
 use burn_tripo::model::triposg::dit::{TripoSGDiT, TripoSGDiTConfig};
 use burn_tripo::model::triposg::image_encoder::import::{
     apply_triposg_dinov2_burnpack_part_bytes, default_dinov2_config, init_triposg_dinov2_model,
-    load_dinov2_processor_from_json_bytes,
 };
 use burn_tripo::model::triposg::image_encoder::{DinoImageProcessor, TripoSGImageEncoder};
 use burn_tripo::model::triposg::scheduler::RectifiedFlowSchedulerConfig;
@@ -68,16 +66,13 @@ const DINO_CONFIG_RELPATHS: [&str; 2] = [
     "image_encoder_dinov2/config.json",
     "image_encoder_2/config.json",
 ];
-const DINO_PREPROCESSOR_RELPATHS: [&str; 3] = [
-    "feature_extractor_dinov2/preprocessor_config.json",
-    "feature_extractor_2/preprocessor_config.json",
-    "feature_extractor_1/preprocessor_config.json",
-];
 const ROOT_TRIPOSG: &str = "models/MIDI-3D";
 const ROOT_RMBG14: &str = "models/RMBG-1.4";
 const DEFAULT_FLASH_OCTREE_DEPTH: usize = 9;
 const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
 const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
+const CANONICAL_DINO_SHORT_EDGE: usize = 256;
+const CANONICAL_DINO_CROP: usize = 224;
 
 static PANIC_HOOK_ONCE: Once = Once::new();
 
@@ -669,8 +664,6 @@ where
     let rmbg_root = wasm_model_root(ROOT_RMBG14);
     let base_safetensors_url = join_web_path(&rmbg_root, "model.safetensors");
     let config_json = fetch_optional_text(&join_web_path(&rmbg_root, "config.json")).await?;
-    let processor_json =
-        fetch_optional_text(&join_web_path(&rmbg_root, "preprocessor_config.json")).await?;
 
     let config = if let Some(json) = config_json.as_ref() {
         load_rmbg_config_from_json_bytes(json.as_bytes())
@@ -678,12 +671,7 @@ where
     } else {
         burn_foreground::rmbg14::RmbgConfig::rmbg_1_4()
     };
-    let processor = if let Some(json) = processor_json.as_ref() {
-        load_rmbg_processor_from_json_bytes(json.as_bytes())
-            .map_err(|err| format!("failed to parse RMBG preprocessor config: {err}"))?
-    } else {
-        burn_foreground::preprocess::RmbgImageProcessor::default()
-    };
+    let processor = burn_foreground::preprocess::RmbgImageProcessor::default();
 
     if let Some(model) = try_load_model_from_parts_wasm(
         &base_safetensors_url,
@@ -727,11 +715,6 @@ where
         .map(|rel| join_web_path(&root, rel))
         .collect::<Vec<_>>();
     let dino_config_json = fetch_optional_text_candidates(&dino_config_candidates).await?;
-    let dino_preproc_candidates = DINO_PREPROCESSOR_RELPATHS
-        .iter()
-        .map(|rel| join_web_path(&root, rel))
-        .collect::<Vec<_>>();
-    let dino_preproc_json = fetch_optional_text_candidates(&dino_preproc_candidates).await?;
 
     let vae_config = if let Some(json) = vae_config_json.as_ref() {
         TripoSGVaeConfig::from_config_bytes(json.as_bytes())
@@ -757,21 +740,13 @@ where
             json.as_bytes(),
         )
     });
-    let dino_fallback_size = parsed_dino_config
-        .as_ref()
-        .map(|cfg| cfg.image_size)
-        .unwrap_or(518);
     let mut dino_config = parsed_dino_config
         .clone()
         .unwrap_or_else(default_dinov2_config);
-    let dino_processor = if let Some(json) = dino_preproc_json.as_ref() {
-        load_dinov2_processor_from_json_bytes(json.as_bytes(), Some(dino_fallback_size))
-            .map_err(|err| format!("failed to parse DINO preprocessor config: {err}"))?
-    } else {
-        default_wasm_dino_processor(dino_fallback_size)
-    }
-    .with_strict_preprocess(options.strict_dino_preprocess);
-    if let Some(target_size) = dino_processor_target_size(&dino_processor, Some(dino_fallback_size))
+    let dino_processor =
+        default_wasm_dino_processor().with_strict_preprocess(options.strict_dino_preprocess);
+    if let Some(target_size) =
+        dino_processor_target_size(&dino_processor, Some(CANONICAL_DINO_CROP))
     {
         let patch = dino_config.patch_size.max(1);
         let grid = target_size / patch;
@@ -1077,12 +1052,12 @@ fn dino_processor_target_size(
         .filter(|size| *size > 0)
 }
 
-fn default_wasm_dino_processor(target_size: usize) -> DinoImageProcessor {
+fn default_wasm_dino_processor() -> DinoImageProcessor {
     DinoImageProcessor {
         do_resize: true,
-        size_shortest_edge: Some(target_size),
+        size_shortest_edge: Some(CANONICAL_DINO_SHORT_EDGE),
         do_center_crop: true,
-        crop_size: Some([target_size, target_size]),
+        crop_size: Some([CANONICAL_DINO_CROP, CANONICAL_DINO_CROP]),
         ..DinoImageProcessor::default()
     }
 }

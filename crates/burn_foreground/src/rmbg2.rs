@@ -235,10 +235,10 @@ impl Rmbg2Pipeline {
 
 #[cfg(feature = "import")]
 pub mod import {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
+    use std::path::{Path, PathBuf};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::fs;
 
     #[cfg(not(target_arch = "wasm32"))]
     use burn::module::{Param, ParamId};
@@ -555,14 +555,9 @@ pub mod import {
     }
 
     pub fn load_rmbg2_processor_config(
-        root: impl AsRef<Path>,
+        _root: impl AsRef<Path>,
     ) -> Result<RmbgImageProcessor, Box<dyn std::error::Error>> {
-        let path = root.as_ref().join("preprocessor_config.json");
-        if !path.exists() {
-            return Ok(default_rmbg2_processor());
-        }
-        let bytes = fs::read(path)?;
-        load_rmbg2_processor_from_json_bytes(&bytes)
+        Ok(default_rmbg2_processor())
     }
 
     pub fn load_rmbg2_processor_from_json_bytes(

@@ -16,14 +16,13 @@ use bevy::asset::RenderAssetUsages;
 use bevy::asset::io::web::WebAssetPlugin;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::{AssetMetaCheck, AssetMode, AssetPlugin, UnapprovedPathMode};
-#[cfg(not(target_arch = "wasm32"))]
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
 use bevy::light::{
     AmbientLight, CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap,
-    light_consts::lux,
+    PointLight,
 };
 use bevy::math::primitives::Cuboid;
 use bevy::pbr::{MeshMaterial3d, StandardMaterial};
@@ -51,18 +50,13 @@ use bevy_file_dialog::prelude::{
 use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
-#[cfg(not(target_arch = "wasm32"))]
 use bevy_picking::DefaultPickingPlugins;
 use bevy_picking::hover::PickingInteraction;
-#[cfg(not(target_arch = "wasm32"))]
 use bevy_picking::input::PointerInputPlugin;
-#[cfg(not(target_arch = "wasm32"))]
 use bevy_picking::prelude::MeshPickingSettings;
 use bevy_picking::prelude::{MeshPickingCamera, Pickable};
-#[cfg(not(target_arch = "wasm32"))]
 use bevy_transform_gizmos::TransformGizmoSystems;
 use bevy_transform_gizmos::prelude::GizmoCamera;
-#[cfg(not(target_arch = "wasm32"))]
 use bevy_transform_gizmos::prelude::TransformGizmoPlugin;
 use bevy_transform_gizmos::{GizmoTransformable, TransformGizmo};
 use clap::Parser;
@@ -95,12 +89,14 @@ use bevy_synth_runtime::worker::{
 };
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "wgpu")))]
 use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
-use bevy_synth_runtime::{SynthMesh, SynthMeshTexture};
+use bevy_synth_runtime::{SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnRequest, CatalogState, CatalogStatus,
     CatalogUiState, DragState, MainCamera, preview_light_layers,
 };
+
+const BUILTIN_CUBE_SOURCE_IMAGE: &str = "builtin/cube";
 
 #[derive(Component, Clone, Debug)]
 pub(crate) struct CachedMeshInstance {
@@ -134,9 +130,16 @@ struct WorldCachePersistence {
 
 impl Default for WorldCachePersistence {
     fn default() -> Self {
+        let flush_delay_seconds = if cfg!(target_arch = "wasm32") {
+            // On web, users often refresh immediately after scene edits.
+            // Persist world placements on the same frame to avoid losing them.
+            0.0
+        } else {
+            0.35
+        };
         Self {
             dirty: false,
-            timer: Timer::from_seconds(0.35, TimerMode::Once),
+            timer: Timer::from_seconds(flush_delay_seconds, TimerMode::Once),
         }
     }
 }
@@ -546,11 +549,9 @@ pub(crate) fn run() {
     add_default_plugins(&mut app);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
     app.add_plugins(SharedWgpuInferenceDevicePlugin);
-    #[cfg(not(target_arch = "wasm32"))]
     if !app.is_plugin_added::<PointerInputPlugin>() {
         app.add_plugins(DefaultPickingPlugins);
     }
-    #[cfg(not(target_arch = "wasm32"))]
     app.add_plugins(TransformGizmoPlugin);
     app.add_plugins(PanOrbitCameraPlugin);
     app.add_plugins(InfiniteGridPlugin);
@@ -604,8 +605,14 @@ pub(crate) fn run() {
 
     #[cfg(target_arch = "wasm32")]
     {
-        app.add_systems(Startup, setup);
-        app.add_systems(PostUpdate, remove_entity_from_selection_if_despawned);
+        app.add_systems(Startup, (setup, configure_mesh_picking).chain());
+        app.add_systems(
+            PostUpdate,
+            (
+                remove_entity_from_selection_if_despawned,
+                update_selection_from_primary_click.after(TransformGizmoSystems::Main),
+            ),
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -724,7 +731,6 @@ fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<Synt
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn configure_mesh_picking(mut settings: ResMut<MeshPickingSettings>) {
     // Avoid ambiguous multi-camera rays by limiting picking to explicitly marked cameras/targets.
     settings.require_markers = true;
@@ -961,7 +967,7 @@ fn initialize_interactive_scene(
     ));
 
     hydrate_from_cache(commands, meshes, images, materials, queue, catalog, cache);
-    seed_default_catalog_cube(meshes, materials, queue, catalog);
+    seed_default_catalog_cube(meshes, materials, queue, catalog, cache);
     world_cache.dirty = false;
     world_cache.timer.reset();
 
@@ -1138,22 +1144,25 @@ fn finish_wasm_startup_when_models_ready(
 }
 
 fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLight) {
-    ambient_light.color = Color::srgb(0.84, 0.88, 0.95);
-    ambient_light.brightness = 220.0;
+    // Keep a modest ambient base and drive shape with a single sun + soft point fills.
+    // Web targets commonly support only one directional light in forward mode.
+    ambient_light.color = Color::srgb(0.86, 0.9, 0.96);
+    ambient_light.brightness = 260.0;
 
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.97, 0.93),
-            illuminance: lux::AMBIENT_DAYLIGHT,
+            color: Color::srgb(1.0, 0.98, 0.95),
+            illuminance: 24_000.0,
             shadows_enabled: true,
-            shadow_depth_bias: 0.12,
-            shadow_normal_bias: 0.8,
+            // Slightly higher bias to reduce self-shadow acne on simple hard-edge meshes (e.g. cube).
+            shadow_depth_bias: 0.24,
+            shadow_normal_bias: 1.8,
             ..default()
         },
-        Transform::from_xyz(9.0, 12.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(7.5, 11.0, 8.5).looking_at(Vec3::new(0.0, 0.4, 0.0), Vec3::Y),
         CascadeShadowConfigBuilder {
             first_cascade_far_bound: 12.0,
-            maximum_distance: 72.0,
+            maximum_distance: 56.0,
             ..default()
         }
         .build(),
@@ -1161,24 +1170,38 @@ fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLi
     ));
 
     commands.spawn((
-        DirectionalLight {
-            color: Color::srgb(0.72, 0.82, 1.0),
-            illuminance: 14_000.0,
-            shadows_enabled: false,
+        PointLight {
+            color: Color::srgb(0.76, 0.86, 1.0),
+            intensity: 90_000.0,
+            range: 34.0,
+            radius: 0.45,
             ..default()
         },
-        Transform::from_xyz(-10.0, 6.0, -8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(-9.0, 5.5, -7.0),
         preview_light_layers(),
     ));
 
     commands.spawn((
-        DirectionalLight {
-            color: Color::srgb(1.0, 0.92, 0.84),
-            illuminance: 8_000.0,
-            shadows_enabled: false,
+        PointLight {
+            color: Color::srgb(1.0, 0.94, 0.87),
+            intensity: 65_000.0,
+            range: 30.0,
+            radius: 0.4,
             ..default()
         },
-        Transform::from_xyz(0.0, 9.5, -12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(8.5, 4.5, -6.5),
+        preview_light_layers(),
+    ));
+
+    commands.spawn((
+        PointLight {
+            color: Color::srgb(0.94, 0.97, 1.0),
+            intensity: 38_000.0,
+            range: 22.0,
+            radius: 0.35,
+            ..default()
+        },
+        Transform::from_xyz(0.0, 9.0, 0.0),
         preview_light_layers(),
     ));
 }
@@ -1192,6 +1215,14 @@ fn hydrate_from_cache(
     catalog: &mut ResMut<CatalogState>,
     cache: &mut ResMut<MeshCacheResource>,
 ) {
+    // Ensure older caches with smooth-shaded built-in cube topology are migrated to flat-shaded cube topology.
+    if let Err(err) = cache
+        .cache
+        .upsert_mesh_for_image(Path::new(BUILTIN_CUBE_SOURCE_IMAGE), &default_cube_synth_mesh())
+    {
+        warn!("failed to refresh built-in cube cache entry: {err}");
+    }
+
     let mesh_entries = cache.cache.mesh_entries().to_vec();
     let world_items = cache.cache.world_items().to_vec();
     if mesh_entries.is_empty() && world_items.is_empty() {
@@ -1223,7 +1254,11 @@ fn hydrate_from_cache(
         };
 
         let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
-        let material = materials.add(standard_material_for_inference(&mesh, images.as_mut()));
+        let material = if metadata.source_image_path == BUILTIN_CUBE_SOURCE_IMAGE {
+            materials.add(default_cube_material())
+        } else {
+            materials.add(standard_material_for_inference(&mesh, images.as_mut()))
+        };
         handles_by_key.insert(
             metadata.cache_key.clone(),
             (mesh_handle.clone(), material.clone()),
@@ -1282,21 +1317,98 @@ fn seed_default_catalog_cube(
     materials: &mut ResMut<Assets<StandardMaterial>>,
     queue: &mut ResMut<InferenceQueue>,
     catalog: &mut ResMut<CatalogState>,
+    cache: &mut ResMut<MeshCacheResource>,
 ) {
     if catalog.has_ready_cube_entry() {
         return;
     }
 
+    let cached_metadata = match cache
+        .cache
+        .upsert_mesh_for_image(Path::new(BUILTIN_CUBE_SOURCE_IMAGE), &default_cube_synth_mesh())
+    {
+        Ok(metadata) => Some(metadata),
+        Err(err) => {
+            warn!("Failed to cache built-in cube mesh: {err}");
+            None
+        }
+    };
+
     let mesh = meshes.add(BevyMesh::from(Cuboid::from_size(Vec3::ONE)));
-    let material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.8, 0.84, 0.9),
-        perceptual_roughness: 0.58,
-        cull_mode: None,
-        ..default()
-    });
+    let material = materials.add(default_cube_material());
     let id = queue.counter;
     queue.counter = queue.counter.wrapping_add(1);
-    catalog.add_ready(id, "cube".to_string(), mesh, material, None, None);
+    catalog.add_ready(
+        id,
+        "cube".to_string(),
+        mesh,
+        material,
+        cached_metadata
+            .as_ref()
+            .map(|metadata| metadata.source_image_path.clone()),
+        cached_metadata
+            .as_ref()
+            .map(|metadata| metadata.cache_key.clone()),
+    );
+}
+
+fn default_cube_synth_mesh() -> SynthMesh {
+    SynthMesh::from(TripoMesh {
+        vertices: vec![
+            // -Z face
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            // +Z face
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+            // -X face
+            [-0.5, -0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            [-0.5, 0.5, 0.5],
+            [-0.5, -0.5, 0.5],
+            // +X face
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            // -Y face
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, -0.5, 0.5],
+            [-0.5, -0.5, 0.5],
+            // +Y face
+            [-0.5, 0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+        ],
+        faces: vec![
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [8, 10, 9],
+            [8, 11, 10],
+            [12, 13, 14],
+            [12, 14, 15],
+            [16, 17, 18],
+            [16, 18, 19],
+            [20, 22, 21],
+            [20, 23, 22],
+        ],
+    })
+}
+
+fn default_cube_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgb(0.8, 0.84, 0.9),
+        perceptual_roughness: 0.58,
+        ..default()
+    }
 }
 
 fn transform_from_cached_world_item(item: &CachedWorldItem) -> Option<Transform> {
@@ -2393,6 +2505,7 @@ pub(crate) fn spawn_mesh_instance(
 }
 
 #[allow(clippy::type_complexity)]
+#[cfg(not(target_arch = "wasm32"))]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
     changed: Query<
@@ -2412,6 +2525,26 @@ fn mark_world_cache_dirty(
     mut removed: RemovedComponents<CachedMeshInstance>,
 ) {
     if changed.is_empty() && changed_camera.is_empty() && removed.read().next().is_none() {
+        return;
+    }
+    persistence.dirty = true;
+    persistence.timer.reset();
+}
+
+#[allow(clippy::type_complexity)]
+#[cfg(target_arch = "wasm32")]
+fn mark_world_cache_dirty(
+    mut persistence: ResMut<WorldCachePersistence>,
+    changed: Query<
+        (),
+        (
+            With<CachedMeshInstance>,
+            Or<(Added<CachedMeshInstance>, Changed<Transform>)>,
+        ),
+    >,
+    mut removed: RemovedComponents<CachedMeshInstance>,
+) {
+    if changed.is_empty() && removed.read().next().is_none() {
         return;
     }
     persistence.dirty = true;
@@ -2565,7 +2698,6 @@ fn delete_selected_meshes(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(not(target_arch = "wasm32"))]
 fn update_selection_from_primary_click(
     buttons: Res<ButtonInput<MouseButton>>,
     keyboard_input: Res<ButtonInput<KeyCode>>,
@@ -2672,7 +2804,6 @@ fn update_selection_from_primary_click(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn world_aabb(
     local_center: Vec3,
     local_half_extents: Vec3,
@@ -2695,7 +2826,6 @@ fn world_aabb(
     (world_min, world_max)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn ray_aabb_intersection(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let mut t_min: f32 = 0.0;
     let mut t_max: f32 = f32::INFINITY;

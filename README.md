@@ -19,14 +19,16 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
 - [x] editor
 - [x] native mcp server
 - [x] wasm demo
+- [ ] quantize-aware kernels
 
 
 ### media
 
 |         | input   | output       |
 | ------  | ------- | ------------ |
-| ✅      | image   | foreground   |
 | ✅      | image   | 3d           |
+| ✅      | image   | foreground   |
+| ✅      | image   | pbr          |
 | ✅      | text    | 3d           |
 | ⬜      | text    | image        |
 | ⬜      | image   | composite-3d |
@@ -46,6 +48,11 @@ asset synthesis implemented in bevy and burn, view the [live demo](https://mosur
   - synthesis: TripoSG, Trellis2
 
 > note: pre-trained model weights have separate license
+
+
+### hardware recommendation
+
+- 24GB VRAM
 
 
 ## references

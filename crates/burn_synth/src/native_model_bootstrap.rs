@@ -36,9 +36,6 @@ const TRIPOSG_OPTIONAL_TEXT_RELPATHS: &[&str] = &[
     "scheduler/scheduler_config.json",
     "image_encoder_dinov2/config.json",
     "image_encoder_2/config.json",
-    "feature_extractor_dinov2/preprocessor_config.json",
-    "feature_extractor_2/preprocessor_config.json",
-    "feature_extractor_1/preprocessor_config.json",
 ];
 
 const TRIPOSG_REQUIRED_PARTS_BASES: &[&str] = &[
@@ -47,7 +44,7 @@ const TRIPOSG_REQUIRED_PARTS_BASES: &[&str] = &[
     "image_encoder_dinov2/model.safetensors",
 ];
 
-const RMBG14_OPTIONAL_TEXT_RELPATHS: &[&str] = &["config.json", "preprocessor_config.json"];
+const RMBG14_OPTIONAL_TEXT_RELPATHS: &[&str] = &["config.json"];
 const RMBG14_REQUIRED_PARTS_BASES: &[&str] = &["model.safetensors"];
 
 pub fn set_bootstrap_status_callback(callback: Option<BootstrapStatusCallback>) {
@@ -164,14 +161,6 @@ fn ensure_triposg_metadata_aliases(local_root: &Path) -> Result<(), String> {
         local_root,
         "image_encoder_dinov2/config.json",
         &["image_encoder_2/config.json", "image_encoder_1/config.json"],
-    )?;
-    ensure_alias_text_file(
-        local_root,
-        "feature_extractor_dinov2/preprocessor_config.json",
-        &[
-            "feature_extractor_2/preprocessor_config.json",
-            "feature_extractor_1/preprocessor_config.json",
-        ],
     )?;
     Ok(())
 }

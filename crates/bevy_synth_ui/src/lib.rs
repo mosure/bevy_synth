@@ -255,7 +255,6 @@ impl CatalogState {
     pub fn has_ready_cube_entry(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(entry.status, CatalogStatus::Ready)
-                && entry.cache_key.is_none()
                 && entry.label.eq_ignore_ascii_case("cube")
         })
     }
@@ -1650,5 +1649,21 @@ mod tests {
             .collect();
         assert_eq!(pickables.len(), 1, "expected exactly one UI root node");
         assert_eq!(pickables[0], Pickable::IGNORE);
+    }
+
+    #[test]
+    fn ready_cube_detection_allows_cached_cube_entries() {
+        let mut catalog = CatalogState::default();
+        assert!(!catalog.has_ready_cube_entry());
+
+        catalog.add_ready(
+            1,
+            "cube".to_string(),
+            Handle::default(),
+            Handle::default(),
+            Some("builtin/cube".to_string()),
+            Some("builtin-cube-cache-key".to_string()),
+        );
+        assert!(catalog.has_ready_cube_entry());
     }
 }
