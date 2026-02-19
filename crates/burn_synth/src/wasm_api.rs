@@ -49,8 +49,7 @@ use crate::model_loader::{
 use crate::wasm::WasmInferencePreset;
 use crate::wasm_loader::{
     DownloadTotals, WasmHostMemoryBudget, download_binary_with_status, fetch_optional_text,
-    fetch_optional_text_candidates, join_web_path, normalize_web_path, web_max_burnpack_bytes,
-    web_max_host_ram_bytes,
+    fetch_optional_text_candidates, join_web_path, web_max_burnpack_bytes, web_max_host_ram_bytes,
 };
 
 #[cfg(feature = "wasm-api-wgpu")]
@@ -62,6 +61,7 @@ type WgpuRmbgBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
 const DEFAULT_GUIDANCE_SCALE: f32 = 7.0;
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
+const DEFAULT_MODEL_BASE_URL: &str = "https://aberration.technology/model";
 const DINO_CONFIG_RELPATHS: [&str; 2] = [
     "image_encoder_dinov2/config.json",
     "image_encoder_2/config.json",
@@ -1085,8 +1085,16 @@ fn backend_uses_f16<B: Backend>() -> bool {
 }
 
 fn wasm_model_root(rel_root: &str) -> String {
-    let root = option_env!("BURN_SYNTH_WEB_ASSET_ROOT").unwrap_or("assets");
-    normalize_web_path(&std::path::Path::new(root).join(rel_root))
+    let root = option_env!("MODEL_BASE_URL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            option_env!("BURN_SYNTH_WEB_ASSET_ROOT")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or(DEFAULT_MODEL_BASE_URL);
+    join_web_path(root, rel_root)
 }
 
 #[cfg(feature = "wasm-api-wgpu")]
