@@ -32,7 +32,7 @@ report = []
 
 
 [dependencies]
-burn_dino = { version = "0.6", default-features = false, features = ["backend_ndarray"] }
+burn_dino = { version = "0.7", default-features = false, features = ["backend_ndarray"] }
 burn_foreground = { version = "0.1.0", path = "../burn_foreground", features = ["import"], optional = true }
 burn-store = { version = "0.19", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
