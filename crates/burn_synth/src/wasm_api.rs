@@ -66,8 +66,8 @@ const DINO_CONFIG_RELPATHS: [&str; 2] = [
     "image_encoder_dinov2/config.json",
     "image_encoder_2/config.json",
 ];
-const ROOT_TRIPOSG: &str = "models/MIDI-3D";
-const ROOT_RMBG14: &str = "models/RMBG-1.4";
+const ROOT_TRIPOSG: &str = "MIDI-3D";
+const ROOT_RMBG14: &str = "RMBG-1.4";
 const DEFAULT_FLASH_OCTREE_DEPTH: usize = 9;
 const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
 const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
