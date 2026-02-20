@@ -68,9 +68,9 @@ use serde::Deserialize;
 use bevy_synth_runtime::args::BackendKind;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy_synth_runtime::args::MeshMode;
-#[cfg(target_arch = "wasm32")]
-use bevy_synth_runtime::args::WeightPrecision;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
+#[cfg(target_arch = "wasm32")]
+use bevy_synth_runtime::args::{QualityPreset, WeightPrecision};
 use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
@@ -795,6 +795,35 @@ fn parse_weight_precision_override(value: &str) -> Option<WeightPrecision> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn parse_quality_override(value: &str) -> Option<QualityPreset> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fast" => Some(QualityPreset::Fast),
+        "balanced" | "balance" => Some(QualityPreset::Balanced),
+        "full" => Some(QualityPreset::Full),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn apply_quality_override(args: &mut AppArgs, quality: QualityPreset) {
+    let defaults = quality.defaults();
+    args.quality = quality;
+    args.num_steps = defaults.num_steps;
+    args.num_tokens = defaults.num_tokens;
+    args.guidance_scale = defaults.guidance_scale;
+    args.resolution = defaults.resolution;
+    args.chunk_size = defaults.chunk_size;
+    args.dense_octree_depth = defaults.dense_octree_depth;
+    args.hierarchical_octree_depth = defaults.hierarchical_octree_depth;
+    args.band_threshold = defaults.band_threshold;
+    args.flash_octree_depth = defaults.flash_octree_depth;
+    args.flash_min_resolution = defaults.flash_min_resolution;
+    args.flash_mini_grid_num = defaults.flash_mini_grid_num;
+    args.flash_num_chunks = defaults.flash_num_chunks;
+    args.flash_mc_level = defaults.flash_mc_level;
+}
+
+#[cfg(target_arch = "wasm32")]
 fn apply_wasm_url_overrides(args: &mut AppArgs) {
     let Some(window) = web_sys::window() else {
         return;
@@ -806,6 +835,7 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
         return;
     }
 
+    let mut quality_override: Option<QualityPreset> = None;
     for pair in search.trim_start_matches('?').split('&') {
         if pair.is_empty() {
             continue;
@@ -816,6 +846,13 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
         };
         let value = parts.next().unwrap_or_default();
         let key = key.trim().to_ascii_lowercase();
+
+        if key == "quality" {
+            if let Some(quality) = parse_quality_override(value) {
+                quality_override = Some(quality);
+            }
+            continue;
+        }
 
         if matches!(
             key.as_str(),
@@ -832,6 +869,10 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
         {
             args.rmbg_weights_precision = precision;
         }
+    }
+
+    if let Some(quality) = quality_override {
+        apply_quality_override(args, quality);
     }
 }
 

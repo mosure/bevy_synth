@@ -140,19 +140,19 @@ Get-ChildItem crates/burn_trellis/assets/models/TRELLIS-image-large/ckpts -Filte
 ### TripoSG + RMBG-2.0
 
 ```powershell
-cargo run -p bevy_synth --release -- --synthesis-models triposg --rmbg-model rmbg2
+cargo run -p bevy_synth --release -- --quality balanced --synthesis-models triposg --rmbg-model rmbg2
 ```
 
 ### TripoSG + RMBG-1.4
 
 ```powershell
-cargo run -p bevy_synth --release -- --synthesis-models triposg --rmbg-model rmbg14
+cargo run -p bevy_synth --release -- --quality balanced --synthesis-models triposg --rmbg-model rmbg14
 ```
 
 ### Enable both synthesis backends (Trellis preferred, TripoSG fallback)
 
 ```powershell
-cargo run -p bevy_synth --release -- --synthesis-models trellis,triposg --rmbg-model rmbg2 --trellis-quality medium
+cargo run -p bevy_synth --release -- --quality balanced --synthesis-models trellis,triposg --rmbg-model rmbg2 --trellis-quality medium
 ```
 
 ## burn_synth CLI Progress Logging
@@ -164,7 +164,7 @@ cargo run -p bevy_synth --release -- --synthesis-models trellis,triposg --rmbg-m
 - Example:
 
 ```powershell
-cargo run -p burn_synth --features runtime,wgpu -- mesh --input docs/output_chair_bg_removed.png --progress steps --progress-every 5
+cargo run -p burn_synth --features runtime,wgpu -- --quality balanced mesh --input docs/output_chair_bg_removed.png --progress steps --progress-every 5
 ```
 
 - Log lines include:

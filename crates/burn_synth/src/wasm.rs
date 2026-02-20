@@ -1,6 +1,6 @@
 /// Canonical wasm inference preset for JS-facing API entry points.
 ///
-/// Defaults mirror native TripoSG "full" quality settings so web and native runs
+/// Defaults mirror the CLI "balanced" quality preset so web and native runs
 /// are configured consistently unless callers override fields explicitly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WasmInferencePreset {
@@ -9,6 +9,9 @@ pub struct WasmInferencePreset {
     pub num_tokens: usize,
     pub resolution: usize,
     pub faces: usize,
+    pub flash_octree_depth: usize,
+    pub flash_num_chunks: usize,
+    pub flash_mini_grid_num: usize,
     pub seed: u64,
     pub backend: &'static str,
     pub rmbg_backend: &'static str,
@@ -20,12 +23,15 @@ pub struct WasmInferencePreset {
 impl Default for WasmInferencePreset {
     fn default() -> Self {
         Self {
-            quality: "full",
-            num_steps: 50,
-            num_tokens: 2048,
+            quality: "balanced",
+            num_steps: 20,
+            num_tokens: 1024,
             // On wasm this maps to flash extraction min_resolution.
-            resolution: 63,
+            resolution: 31,
             faces: 10_000,
+            flash_octree_depth: 8,
+            flash_num_chunks: 8192,
+            flash_mini_grid_num: 4,
             seed: 42,
             backend: "wgpu",
             rmbg_backend: "auto",
@@ -51,6 +57,12 @@ impl WasmInferencePreset {
             self.resolution.to_string(),
             "--faces".to_string(),
             self.faces.to_string(),
+            "--flash-octree-depth".to_string(),
+            self.flash_octree_depth.to_string(),
+            "--flash-num-chunks".to_string(),
+            self.flash_num_chunks.to_string(),
+            "--flash-mini-grid-num".to_string(),
+            self.flash_mini_grid_num.to_string(),
             "--seed".to_string(),
             self.seed.to_string(),
             "--backend".to_string(),
@@ -81,15 +93,21 @@ mod tests {
             vec![
                 "bevy_synth",
                 "--quality",
-                "full",
+                "balanced",
                 "--num-steps",
-                "50",
+                "20",
                 "--num-tokens",
-                "2048",
+                "1024",
                 "--resolution",
-                "63",
+                "31",
                 "--faces",
                 "10000",
+                "--flash-octree-depth",
+                "8",
+                "--flash-num-chunks",
+                "8192",
+                "--flash-mini-grid-num",
+                "4",
                 "--seed",
                 "42",
                 "--backend",
@@ -108,13 +126,17 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn preset_matches_runtime_triposg_defaults() {
+    fn preset_defaults_to_balanced_quality_values() {
         let preset = WasmInferencePreset::default();
         let runtime = RuntimeConfig::default();
 
-        assert_eq!(preset.num_steps, runtime.num_steps);
-        assert_eq!(preset.num_tokens, runtime.num_tokens);
-        assert_eq!(preset.resolution, runtime.flash_extract.min_resolution);
+        assert_eq!(preset.quality, "balanced");
+        assert_eq!(preset.num_steps, 20);
+        assert_eq!(preset.num_tokens, 1024);
+        assert_eq!(preset.resolution, 31);
+        assert_eq!(preset.flash_octree_depth, 8);
+        assert_eq!(preset.flash_num_chunks, 8192);
+        assert_eq!(preset.flash_mini_grid_num, 4);
         assert_eq!(preset.faces, runtime.target_faces.unwrap_or_default());
         assert_eq!(Some(preset.seed), runtime.seed);
     }

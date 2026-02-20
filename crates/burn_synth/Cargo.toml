@@ -1,6 +1,6 @@
 [package]
 name = "burn_synth"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 
 description = "Shared utilities and pipeline re-exports for burn_synth"

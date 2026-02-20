@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_synth"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bevy",
  "bevy_infinite_grid",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_synth_runtime"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bevy",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_synth_ui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bevy",
  "bevy_app",
@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "burn_synth"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "burn",
  "burn-cuda",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "burn_synth_mcp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "burn_synth",
  "clap",

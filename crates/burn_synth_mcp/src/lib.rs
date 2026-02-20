@@ -14,9 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
-const DEFAULT_NUM_STEPS: usize = 50;
-const DEFAULT_NUM_TOKENS: usize = 2048;
-const DEFAULT_GUIDANCE_SCALE: f32 = 7.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +43,59 @@ pub enum TrellisQuality {
     Low,
     Medium,
     High,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QualityPreset {
+    Fast,
+    Balanced,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QualityDefaults {
+    num_steps: usize,
+    num_tokens: usize,
+    guidance_scale: f32,
+    flash_octree_depth: usize,
+    flash_min_resolution: usize,
+    flash_mini_grid_num: usize,
+    flash_num_chunks: usize,
+}
+
+impl QualityPreset {
+    fn defaults(self) -> QualityDefaults {
+        match self {
+            Self::Fast => QualityDefaults {
+                num_steps: 12,
+                num_tokens: 512,
+                guidance_scale: 7.0,
+                flash_octree_depth: 7,
+                flash_min_resolution: 31,
+                flash_mini_grid_num: 2,
+                flash_num_chunks: 4096,
+            },
+            Self::Balanced => QualityDefaults {
+                num_steps: 20,
+                num_tokens: 1024,
+                guidance_scale: 7.0,
+                flash_octree_depth: 8,
+                flash_min_resolution: 31,
+                flash_mini_grid_num: 4,
+                flash_num_chunks: 8192,
+            },
+            Self::Full => QualityDefaults {
+                num_steps: 50,
+                num_tokens: 2048,
+                guidance_scale: 7.0,
+                flash_octree_depth: 9,
+                flash_min_resolution: 63,
+                flash_mini_grid_num: 4,
+                flash_num_chunks: 10_000,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -96,6 +146,10 @@ pub struct ServerArgs {
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     pub trellis_quality: TrellisQuality,
 
+    /// Quality preset (fast, balanced, full). Individual flags override this preset.
+    #[arg(long, value_enum, default_value_t = QualityPreset::Balanced)]
+    pub quality: QualityPreset,
+
     #[arg(long)]
     pub bg_weights_root: Option<PathBuf>,
 
@@ -120,14 +174,21 @@ pub struct ServerConfig {
     pub trellis_python_bin: Option<PathBuf>,
     pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
+    pub quality: QualityPreset,
     pub bg_weights_root: Option<PathBuf>,
     pub num_steps: usize,
     pub num_tokens: usize,
     pub guidance_scale: f32,
+    pub flash_octree_depth: usize,
+    pub flash_min_resolution: usize,
+    pub flash_mini_grid_num: usize,
+    pub flash_num_chunks: usize,
 }
 
 impl ServerConfig {
     pub fn from_args(args: ServerArgs) -> Self {
+        let quality = args.quality;
+        let defaults = quality.defaults();
         Self {
             default_rmbg_model: args.rmbg_model,
             default_synthesis_models: sanitize_synthesis_models(args.synthesis_models),
@@ -138,15 +199,20 @@ impl ServerConfig {
             trellis_python_bin: args.trellis_python_bin,
             trellis_bridge_script: args.trellis_bridge_script,
             trellis_quality: args.trellis_quality,
+            quality,
             bg_weights_root: args.bg_weights_root,
-            num_steps: args.num_steps.unwrap_or(DEFAULT_NUM_STEPS),
-            num_tokens: args.num_tokens.unwrap_or(DEFAULT_NUM_TOKENS),
-            guidance_scale: args.guidance_scale.unwrap_or(DEFAULT_GUIDANCE_SCALE),
+            num_steps: args.num_steps.unwrap_or(defaults.num_steps),
+            num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),
+            guidance_scale: args.guidance_scale.unwrap_or(defaults.guidance_scale),
+            flash_octree_depth: defaults.flash_octree_depth,
+            flash_min_resolution: defaults.flash_min_resolution,
+            flash_mini_grid_num: defaults.flash_mini_grid_num,
+            flash_num_chunks: defaults.flash_num_chunks,
         }
     }
 
     fn runtime_config(&self) -> RuntimeConfig {
-        RuntimeConfig {
+        let mut config = RuntimeConfig {
             model_selection: ModelSelection::new(
                 self.default_synthesis_models
                     .iter()
@@ -166,7 +232,12 @@ impl ServerConfig {
             num_tokens: self.num_tokens,
             guidance_scale: self.guidance_scale,
             ..RuntimeConfig::default()
-        }
+        };
+        config.flash_extract.octree_depth = self.flash_octree_depth;
+        config.flash_extract.min_resolution = self.flash_min_resolution;
+        config.flash_extract.mini_grid_num = self.flash_mini_grid_num;
+        config.flash_extract.num_chunks = self.flash_num_chunks;
+        config
     }
 }
 
@@ -1200,6 +1271,7 @@ impl From<TrellisQuality> for burn_synth::TrellisQuality {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn test_texture(width: u32, height: u32, rgba: [u8; 4]) -> burn_synth::MeshTexture {
         let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
@@ -1254,5 +1326,50 @@ mod tests {
                 .as_array()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+
+    #[test]
+    fn server_args_default_to_balanced_quality_defaults() {
+        let args = ServerArgs::parse_from(["burn_synth_mcp"]);
+        let config = ServerConfig::from_args(args);
+        assert_eq!(config.quality, QualityPreset::Balanced);
+        assert_eq!(config.num_steps, 20);
+        assert_eq!(config.num_tokens, 1024);
+        assert_eq!(config.guidance_scale, 7.0);
+        assert_eq!(config.flash_octree_depth, 8);
+        assert_eq!(config.flash_min_resolution, 31);
+        assert_eq!(config.flash_mini_grid_num, 4);
+        assert_eq!(config.flash_num_chunks, 8192);
+    }
+
+    #[test]
+    fn server_args_quality_and_explicit_overrides_map_to_runtime_config() {
+        let args = ServerArgs::parse_from([
+            "burn_synth_mcp",
+            "--quality",
+            "fast",
+            "--num-steps",
+            "18",
+            "--guidance-scale",
+            "6.5",
+        ]);
+        let config = ServerConfig::from_args(args);
+        assert_eq!(config.quality, QualityPreset::Fast);
+        assert_eq!(config.num_steps, 18);
+        assert_eq!(config.num_tokens, 512);
+        assert_eq!(config.guidance_scale, 6.5);
+        assert_eq!(config.flash_octree_depth, 7);
+        assert_eq!(config.flash_min_resolution, 31);
+        assert_eq!(config.flash_mini_grid_num, 2);
+        assert_eq!(config.flash_num_chunks, 4096);
+
+        let runtime = config.runtime_config();
+        assert_eq!(runtime.num_steps, 18);
+        assert_eq!(runtime.num_tokens, 512);
+        assert_eq!(runtime.guidance_scale, 6.5);
+        assert_eq!(runtime.flash_extract.octree_depth, 7);
+        assert_eq!(runtime.flash_extract.min_resolution, 31);
+        assert_eq!(runtime.flash_extract.mini_grid_num, 2);
+        assert_eq!(runtime.flash_extract.num_chunks, 4096);
     }
 }

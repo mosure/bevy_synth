@@ -1,6 +1,6 @@
 [package]
 name = "bevy_synth_runtime"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 
 description = "Runtime services for the bevy_synth app (worker, args, cache, IO)"
@@ -45,14 +45,14 @@ burn_trellis = { version = "0.1.0", path = "../burn_trellis", optional = true, f
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies]
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
-burn_synth = { version = "0.1.1", path = "../burn_synth", default-features = false }
+burn_synth = { version = "0.2.0", path = "../burn_synth", default-features = false }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies]
 burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
-burn_synth = { version = "0.1.1", path = "../burn_synth", default-features = false }
+burn_synth = { version = "0.2.0", path = "../burn_synth", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-burn_synth = { version = "0.1.1", path = "../burn_synth", default-features = false, features = ["wasm-api", "wasm-api-wgpu"] }
+burn_synth = { version = "0.2.0", path = "../burn_synth", default-features = false, features = ["wasm-api", "wasm-api-wgpu"] }
 web-sys = { version = "0.3", features = [
   "Storage",
   "Window",

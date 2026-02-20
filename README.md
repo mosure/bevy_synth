@@ -62,11 +62,12 @@ cargo install burn_synth_mcp
 ```bash
 # burn_synth: run image -> GLB synthesis
 burn_synth mesh \
+  --quality balanced \
   --input docs/output_chair_bg_removed.png \
   --output /tmp/chair.glb
 
 # bevy_synth: launch interactive app
-bevy_synth
+bevy_synth --quality balanced
 
 # burn_synth_mcp: start MCP stdio server
 burn_synth_mcp

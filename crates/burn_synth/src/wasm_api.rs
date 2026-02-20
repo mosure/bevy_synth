@@ -68,9 +68,6 @@ const DINO_CONFIG_RELPATHS: [&str; 2] = [
 ];
 const ROOT_TRIPOSG: &str = "MIDI-3D";
 const ROOT_RMBG14: &str = "RMBG-1.4";
-const DEFAULT_FLASH_OCTREE_DEPTH: usize = 9;
-const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
-const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
 const CANONICAL_DINO_SHORT_EDGE: usize = 256;
 const CANONICAL_DINO_CROP: usize = 224;
 
@@ -487,18 +484,21 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
 
     let flash = FlashExtractConfig {
         bounds: DEFAULT_BOUNDS,
-        octree_depth: DEFAULT_FLASH_OCTREE_DEPTH,
-        num_chunks: DEFAULT_FLASH_NUM_CHUNKS,
+        octree_depth: preset.flash_octree_depth.max(1),
+        num_chunks: preset.flash_num_chunks.max(1),
         mc_level: 0.0,
         min_resolution: preset.resolution.max(2),
-        mini_grid_num: DEFAULT_FLASH_MINI_GRID_NUM,
+        mini_grid_num: preset.flash_mini_grid_num.max(1),
     };
     web_sys::console::log_1(
         &format!(
-            "burn_synth wasm infer: flash_extract start (steps={} tokens={} min_resolution={} faces={})",
+            "burn_synth wasm infer: flash_extract start (steps={} tokens={} octree_depth={} min_resolution={} mini_grid_num={} num_chunks={} faces={})",
             preset.num_steps.max(1),
             preset.num_tokens.max(64),
+            flash.octree_depth,
             flash.min_resolution,
+            flash.mini_grid_num,
+            flash.num_chunks,
             preset.faces
         )
         .into(),

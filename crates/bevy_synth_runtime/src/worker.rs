@@ -19,7 +19,7 @@ use bevy::render::renderer::{
 use crate::SynthMesh;
 use crate::args::AppArgs;
 #[cfg(target_arch = "wasm32")]
-use crate::args::{BackendKind, DinoBackend, RmbgBackend, WeightPrecision};
+use crate::args::{BackendKind, DinoBackend, QualityPreset, RmbgBackend, WeightPrecision};
 #[cfg(target_arch = "wasm32")]
 use crate::io::{mesh_from_glb_bytes, mesh_to_glb_bytes};
 #[cfg(target_arch = "wasm32")]
@@ -353,6 +353,11 @@ fn send_worker_status(event_tx: &Sender<WorkerEvent>, message: impl Into<String>
 
 #[cfg(target_arch = "wasm32")]
 fn app_args_to_wasm_preset(args: &AppArgs) -> WasmInferencePreset {
+    let quality = match args.quality {
+        QualityPreset::Fast => "fast",
+        QualityPreset::Balanced => "balanced",
+        QualityPreset::Full => "full",
+    };
     let backend = match args.backend {
         BackendKind::Cpu => "cpu",
         BackendKind::Wgpu => "wgpu",
@@ -379,11 +384,14 @@ fn app_args_to_wasm_preset(args: &AppArgs) -> WasmInferencePreset {
         WeightPrecision::F32 => "f32",
     };
     WasmInferencePreset {
-        quality: "full",
+        quality,
         num_steps: args.num_steps,
         num_tokens: args.num_tokens,
         resolution: args.flash_min_resolution.max(2),
         faces: args.target_faces.unwrap_or(0),
+        flash_octree_depth: args.flash_octree_depth.max(1),
+        flash_num_chunks: args.flash_num_chunks.max(1),
+        flash_mini_grid_num: args.flash_mini_grid_num.max(1),
         seed: args.seed.unwrap_or(42),
         backend,
         rmbg_backend,

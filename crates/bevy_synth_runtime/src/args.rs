@@ -51,7 +51,7 @@ pub struct Args {
     pub scribble_weights_root: Option<PathBuf>,
 
     /// Quality preset (fast, balanced, full). Individual flags override this preset.
-    #[arg(long, value_enum, default_value_t = QualityPreset::Full)]
+    #[arg(long, value_enum, default_value_t = QualityPreset::Balanced)]
     pub quality: QualityPreset,
 
     /// Number of diffusion steps (overrides --quality).
@@ -237,7 +237,7 @@ pub enum BackendKind {
     Cuda,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualityPreset {
     Fast,
     Balanced,
@@ -336,6 +336,7 @@ pub struct AppArgs {
     pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
     pub scribble_weights_root: Option<PathBuf>,
+    pub quality: QualityPreset,
     pub num_steps: usize,
     pub num_tokens: usize,
     pub guidance_scale: f32,
@@ -369,7 +370,8 @@ pub struct AppArgs {
 }
 
 pub fn build_app_args(args: Args) -> AppArgs {
-    let defaults = args.quality.defaults();
+    let quality = args.quality;
+    let defaults = quality.defaults();
     let seed = args.seed.or(Some(DEFAULT_SEED));
     let target_faces = match args.faces {
         Some(0) => None,
@@ -388,6 +390,7 @@ pub fn build_app_args(args: Args) -> AppArgs {
         trellis_bridge_script: args.trellis_bridge_script,
         trellis_quality: args.trellis_quality,
         scribble_weights_root: args.scribble_weights_root,
+        quality,
         num_steps: args.num_steps.unwrap_or(defaults.num_steps),
         num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),
         guidance_scale: args.guidance_scale.unwrap_or(defaults.guidance_scale),
@@ -449,8 +452,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, RmbgModel, SynthesisModel, WeightPrecision,
-        build_app_args,
+        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, QualityPreset, RmbgModel, SynthesisModel,
+        WeightPrecision, build_app_args,
     };
 
     #[test]
@@ -509,6 +512,16 @@ mod tests {
         let balanced = build_app_args(Args::parse_from(["bevy_synth", "--quality", "balanced"]));
         assert_eq!(fast.chunk_size, DEFAULT_CHUNK_SIZE);
         assert_eq!(balanced.chunk_size, DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn quality_defaults_to_balanced() {
+        let defaults = build_app_args(Args::parse_from(["bevy_synth"]));
+        assert_eq!(defaults.quality, QualityPreset::Balanced);
+        assert_eq!(defaults.num_steps, 20);
+        assert_eq!(defaults.num_tokens, 1024);
+        assert_eq!(defaults.flash_octree_depth, 8);
+        assert_eq!(defaults.flash_min_resolution, 31);
     }
 
     #[test]

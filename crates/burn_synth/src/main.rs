@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliTrellisQuality::Medium)]
     trellis_quality: CliTrellisQuality,
 
+    /// Quality preset (fast, balanced, full). Individual flags override this preset.
+    #[arg(long, value_enum, default_value_t = CliQuality::Balanced)]
+    quality: CliQuality,
+
     #[arg(long)]
     bg_weights_root: Option<PathBuf>,
 
@@ -160,6 +164,59 @@ enum CliTrellisQuality {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
+enum CliQuality {
+    Fast,
+    Balanced,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CliQualityDefaults {
+    num_steps: usize,
+    num_tokens: usize,
+    guidance_scale: f32,
+    flash_octree_depth: usize,
+    flash_num_chunks: usize,
+    flash_min_resolution: usize,
+    flash_mini_grid_num: usize,
+}
+
+impl CliQuality {
+    fn defaults(self) -> CliQualityDefaults {
+        match self {
+            Self::Fast => CliQualityDefaults {
+                num_steps: 12,
+                num_tokens: 512,
+                guidance_scale: 7.0,
+                flash_octree_depth: 7,
+                flash_num_chunks: 4096,
+                flash_min_resolution: 31,
+                flash_mini_grid_num: 2,
+            },
+            Self::Balanced => CliQualityDefaults {
+                num_steps: 20,
+                num_tokens: 1024,
+                guidance_scale: 7.0,
+                flash_octree_depth: 8,
+                flash_num_chunks: 8192,
+                flash_min_resolution: 31,
+                flash_mini_grid_num: 4,
+            },
+            Self::Full => CliQualityDefaults {
+                num_steps: 50,
+                num_tokens: 2048,
+                guidance_scale: 7.0,
+                flash_octree_depth: 9,
+                flash_num_chunks: 10_000,
+                flash_min_resolution: 63,
+                flash_mini_grid_num: 4,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "lower")]
 enum CliProgress {
     Off,
     Stages,
@@ -198,6 +255,7 @@ fn run_with_large_stack(cli: Cli) -> Result<(), String> {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    let quality_defaults = cli.quality.defaults();
     let synthesis_models = sanitize_synthesis_models(cli.synthesis_models);
     ensure_requested_models_supported(&synthesis_models)?;
     let target_faces = match cli.faces {
@@ -218,30 +276,28 @@ fn run(cli: Cli) -> Result<(), String> {
         trellis_bridge_script: cli.trellis_bridge_script,
         trellis_quality: cli.trellis_quality.into(),
         bg_weights_root: cli.bg_weights_root,
-        num_steps: cli.num_steps.unwrap_or(RuntimeConfig::default().num_steps),
-        num_tokens: cli
-            .num_tokens
-            .unwrap_or(RuntimeConfig::default().num_tokens),
+        num_steps: cli.num_steps.unwrap_or(quality_defaults.num_steps),
+        num_tokens: cli.num_tokens.unwrap_or(quality_defaults.num_tokens),
         guidance_scale: cli
             .guidance_scale
-            .unwrap_or(RuntimeConfig::default().guidance_scale),
+            .unwrap_or(quality_defaults.guidance_scale),
         seed: cli.seed.or(RuntimeConfig::default().seed),
         dino_backend: cli.dino_backend.into(),
         target_faces,
         ..RuntimeConfig::default()
     };
-    if let Some(value) = cli.flash_octree_depth {
-        runtime_config.flash_extract.octree_depth = value;
-    }
-    if let Some(value) = cli.flash_num_chunks {
-        runtime_config.flash_extract.num_chunks = value;
-    }
-    if let Some(value) = cli.flash_min_resolution {
-        runtime_config.flash_extract.min_resolution = value;
-    }
-    if let Some(value) = cli.flash_mini_grid_num {
-        runtime_config.flash_extract.mini_grid_num = value;
-    }
+    runtime_config.flash_extract.octree_depth = cli
+        .flash_octree_depth
+        .unwrap_or(quality_defaults.flash_octree_depth);
+    runtime_config.flash_extract.num_chunks = cli
+        .flash_num_chunks
+        .unwrap_or(quality_defaults.flash_num_chunks);
+    runtime_config.flash_extract.min_resolution = cli
+        .flash_min_resolution
+        .unwrap_or(quality_defaults.flash_min_resolution);
+    runtime_config.flash_extract.mini_grid_num = cli
+        .flash_mini_grid_num
+        .unwrap_or(quality_defaults.flash_mini_grid_num);
     if !matches!(cli.progress, CliProgress::Off) {
         runtime_config.progress = RuntimeProgressObserver::with_callback(
             cli.progress.into(),
@@ -467,5 +523,47 @@ impl From<CliProgress> for ProgressVerbosity {
             CliProgress::Stages => Self::Stages,
             CliProgress::Steps => Self::Steps,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_quality_defaults_match_legacy_runtime_defaults() {
+        let defaults = CliQuality::Full.defaults();
+        assert_eq!(defaults.num_steps, 50);
+        assert_eq!(defaults.num_tokens, 2048);
+        assert_eq!(defaults.guidance_scale, 7.0);
+        assert_eq!(defaults.flash_octree_depth, 9);
+        assert_eq!(defaults.flash_num_chunks, 10_000);
+        assert_eq!(defaults.flash_min_resolution, 63);
+        assert_eq!(defaults.flash_mini_grid_num, 4);
+    }
+
+    #[test]
+    fn cli_quality_defaults_to_balanced_for_mesh_subcommand() {
+        let cli = Cli::parse_from(["burn_synth", "mesh", "--input", "input.png"]);
+        assert_eq!(cli.quality, CliQuality::Balanced);
+    }
+
+    #[test]
+    fn explicit_flags_override_quality_preset_inputs() {
+        let cli = Cli::parse_from([
+            "burn_synth",
+            "--quality",
+            "fast",
+            "--num-steps",
+            "18",
+            "--flash-min-resolution",
+            "47",
+            "mesh",
+            "--input",
+            "input.png",
+        ]);
+        assert_eq!(cli.quality, CliQuality::Fast);
+        assert_eq!(cli.num_steps, Some(18));
+        assert_eq!(cli.flash_min_resolution, Some(47));
     }
 }
