@@ -70,6 +70,10 @@
       const moduleUrl = "./out/burn_synth.js";
       const wasmUrl = "./out/burn_synth_bg.wasm";
       let serviceWorkerReadyPromise = null;
+      // Model source override query params (optional):
+      // - `?model_source=local` (bundled `assets/models`)
+      // - `?model_source=cdn`   (`https://aberration.technology/model`)
+      // - `?model_base_url=<custom-root>`
 
       const serviceWorkerCandidates = () => {
         const pageUrl = new URL(window.location.href);

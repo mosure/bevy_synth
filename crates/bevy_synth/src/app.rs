@@ -39,6 +39,8 @@ use bevy::render::renderer::{
 #[cfg(target_arch = "wasm32")]
 use bevy::render::settings::{Backends, WgpuSettings};
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
+#[cfg(target_arch = "wasm32")]
+use bevy::window::{Window, WindowPlugin};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
 use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -765,6 +767,13 @@ fn add_default_plugins(app: &mut App) {
     };
     app.add_plugins(
         DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    fit_canvas_to_parent: true,
+                    ..default()
+                }),
+                ..default()
+            })
             .set(WebAssetPlugin {
                 silence_startup_warning: true,
             })

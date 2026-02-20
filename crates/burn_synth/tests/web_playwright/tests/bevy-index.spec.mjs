@@ -8,8 +8,15 @@ test('bevy_synth wasm page eagerly warms models during startup', async ({ page }
   const eagerModelLoadLogs = [];
   const modelRequests = [];
   let warmupState = 'unknown';
-  const normalizeModelUrl = (url) =>
-    url.includes('/www/assets/') ? url.replace('/www/assets/', '/assets/models/') : url;
+  const normalizeModelUrl = (url) => {
+    if (url.includes('/www/assets/models/')) {
+      return url.replace('/www/assets/models/', '/assets/models/');
+    }
+    if (url.includes('/www/assets/')) {
+      return url.replace('/www/assets/', '/assets/models/');
+    }
+    return url;
+  };
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   page.on('requestfinished', (request) => {

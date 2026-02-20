@@ -40,7 +40,7 @@ done
 LOCK_FALLBACK_HELD=1
 
 echo "[web-e2e] build burn_synth wasm (wasm-api + wasm-api-wgpu)"
-MODEL_BASE_URL=assets \
+MODEL_BASE_URL=assets/models \
 cargo build \
   -p burn_synth \
   --lib \
@@ -57,7 +57,7 @@ wasm-bindgen \
   --no-typescript
 
 echo "[web-e2e] build bevy_synth wasm"
-MODEL_BASE_URL=assets \
+MODEL_BASE_URL=assets/models \
 cargo build \
   -p bevy_synth \
   --target wasm32-unknown-unknown \

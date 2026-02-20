@@ -6,9 +6,9 @@ use std::thread;
 use std::time::Instant;
 
 use burn::backend::NdArray;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
-use burn_foreground::pipeline::{prepare_image_data, PrepareImageConfig, RmbgPipeline};
+use burn_foreground::pipeline::{PrepareImageConfig, RmbgPipeline, prepare_image_data};
 use burn_foreground::rmbg2::Rmbg2Pipeline;
 
 const FALLBACK_INPUT_IMAGE: &str = r"F:\repos\TRELLIS\assets\nano_banana\chair\chair_0.jpg";

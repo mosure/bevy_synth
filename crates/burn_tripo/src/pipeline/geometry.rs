@@ -154,6 +154,20 @@ struct FlashGpuExtractState<B: Backend> {
     octree_depth: usize,
 }
 
+struct FlashRefinementLevelSetup<B: Backend> {
+    next_size: usize,
+    step: [f32; 3],
+    next_logits: Tensor<B, 1>,
+    curr_mask: Tensor<B, 3, Bool>,
+    dilation_iters: usize,
+}
+
+struct FlashRefinementCoords<B: Backend> {
+    curr_count: usize,
+    next_coords: Tensor<B, 2, Int>,
+    flat_indices: Tensor<B, 1, Int>,
+}
+
 fn build_flash_runtime_plan(config: &FlashExtractConfig) -> Result<FlashRuntimePlan, String> {
     let bounds = config.bounds;
     let octree_depth = config.octree_depth.max(1);
@@ -170,6 +184,56 @@ fn build_flash_runtime_plan(config: &FlashExtractConfig) -> Result<FlashRuntimeP
         num_chunks,
         resolutions,
     })
+}
+
+fn flash_refinement_expand_num(level_idx: usize, levels_len: usize) -> usize {
+    if level_idx + 1 == levels_len { 0 } else { 1 }
+}
+
+fn build_flash_refinement_curr_mask_gpu<B: Backend>(
+    grid_logits: &Tensor<B, 3>,
+    mc_level: f32,
+    expand_num: usize,
+) -> Tensor<B, 3, Bool> {
+    let mut curr_mask = extract_near_surface_mask_gpu(grid_logits, mc_level);
+    let near_mask = grid_logits.clone().abs().lower_elem(0.95);
+    curr_mask = curr_mask.bool_or(near_mask);
+    for _ in 0..expand_num {
+        curr_mask = dilate_mask_gpu(curr_mask);
+        curr_mask = dilate_mask_gpu(curr_mask);
+    }
+    curr_mask
+}
+
+fn prepare_flash_refinement_level_gpu<B: Backend>(
+    grid_logits: &Tensor<B, 3>,
+    plan: &FlashRuntimePlan,
+    config: &FlashExtractConfig,
+    level_idx: usize,
+    res: usize,
+) -> FlashRefinementLevelSetup<B> {
+    let next_size = res + 1;
+    let step = [
+        (plan.bounds[3] - plan.bounds[0]) / res as f32,
+        (plan.bounds[4] - plan.bounds[1]) / res as f32,
+        (plan.bounds[5] - plan.bounds[2]) / res as f32,
+    ];
+    let device = grid_logits.device();
+    let next_logits = Tensor::<B, 1>::full(
+        [next_size * next_size * next_size],
+        FLASH_INVALID_SENTINEL,
+        &device,
+    );
+    let expand_num = flash_refinement_expand_num(level_idx, plan.resolutions.len());
+    let curr_mask = build_flash_refinement_curr_mask_gpu(grid_logits, config.mc_level, expand_num);
+
+    FlashRefinementLevelSetup {
+        next_size,
+        step,
+        next_logits,
+        curr_mask,
+        dilation_iters: 2 - expand_num,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -306,31 +370,28 @@ async fn flash_extract_geometry_gpu_shared_async_wasm<B: Backend>(
     let mut shared_kv_cache = initial_kv_cache;
 
     for (level_idx, &res) in plan.resolutions.iter().enumerate().skip(1) {
-        let next_size = res + 1;
-        let step_x = (plan.bounds[3] - plan.bounds[0]) / res as f32;
-        let step_y = (plan.bounds[4] - plan.bounds[1]) / res as f32;
-        let step_z = (plan.bounds[5] - plan.bounds[2]) / res as f32;
-
+        let FlashRefinementLevelSetup {
+            next_size,
+            step,
+            mut next_logits,
+            curr_mask,
+            dilation_iters,
+        } = prepare_flash_refinement_level_gpu(&grid_logits, &plan, config, level_idx, res);
         let device = grid_logits.device();
-        let next_total = next_size * next_size * next_size;
-        let mut next_logits = Tensor::<B, 1>::full([next_total], FLASH_INVALID_SENTINEL, &device);
 
-        let mut curr_mask = extract_near_surface_mask_gpu(&grid_logits, config.mc_level);
-        let near_mask = grid_logits.clone().abs().lower_elem(0.95);
-        curr_mask = curr_mask.bool_or(near_mask);
-
-        let expand_num = if level_idx == plan.resolutions.len() - 1 {
-            0
-        } else {
-            1
-        };
-        for _ in 0..expand_num {
-            curr_mask = dilate_mask_gpu(curr_mask);
-            curr_mask = dilate_mask_gpu(curr_mask);
-        }
-
-        let curr_coords = curr_mask.argwhere_async().await;
-        let curr_count = curr_coords.shape().dims::<2>()[0];
+        let FlashRefinementCoords {
+            curr_count,
+            next_coords,
+            flat_indices,
+        } = build_flash_refinement_coords_from_mask_async_wasm(
+            curr_mask,
+            grid_size,
+            next_size,
+            dilation_iters,
+            &device,
+        )
+        .await
+        .map_err(std::io::Error::other)?;
         web_sys::console::log_1(
             &format!(
                 "burn_synth wasm flash: level={} curr_count={} grid_size={} next_res={}",
@@ -341,23 +402,6 @@ async fn flash_extract_geometry_gpu_shared_async_wasm<B: Backend>(
         if curr_count == 0 {
             break;
         }
-
-        let doubled = curr_coords.clone().mul_scalar(2);
-        let doubled_indices = coords_to_linear_indices_2(&doubled, next_size);
-        drop(doubled);
-        drop(curr_coords);
-        let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], &device);
-        let mut next_index = Tensor::<B, 1>::zeros([next_total], &device);
-        next_index = next_index.scatter(0, doubled_indices, ones);
-        let mut next_index = next_index
-            .reshape([next_size as i32, next_size as i32, next_size as i32])
-            .greater_elem(0.0);
-
-        for _ in 0..(2 - expand_num) {
-            next_index = dilate_mask_gpu(next_index);
-        }
-
-        let next_coords = next_index.argwhere_async().await;
         let next_count = next_coords.shape().dims::<2>()[0];
         web_sys::console::log_1(
             &format!(
@@ -370,8 +414,7 @@ async fn flash_extract_geometry_gpu_shared_async_wasm<B: Backend>(
             break;
         }
 
-        let flat_indices = coords_to_linear_indices_2(&next_coords, next_size);
-        let world_coords = coords_to_world_2(&next_coords, plan.bounds, [step_x, step_y, step_z]);
+        let world_coords = coords_to_world_2(&next_coords, plan.bounds, step);
         drop(next_coords);
 
         decode_flash_points_gpu(
@@ -415,16 +458,176 @@ async fn tensor_to_vec_f32_async_wasm<B: Backend, const D: usize>(
         .map_err(|err| format!("failed to read tensor data: {err:?}"))
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn build_flash_refinement_coords_from_mask_async_wasm<B: Backend>(
+    curr_mask: Tensor<B, 3, Bool>,
+    grid_size: usize,
+    next_size: usize,
+    dilation_iters: usize,
+    device: &B::Device,
+) -> Result<FlashRefinementCoords<B>, String> {
+    let curr_mask_values = curr_mask
+        .into_data_async()
+        .await
+        .convert::<bool>()
+        .to_vec::<bool>()
+        .map_err(|err| format!("failed to read refinement mask: {err:?}"))?;
+    let (curr_count, flat_indices_host, next_coords_host) = build_flash_refinement_compact_host(
+        curr_mask_values.as_slice(),
+        grid_size,
+        next_size,
+        dilation_iters,
+    )?;
+
+    let next_count = flat_indices_host.len();
+    let flat_indices =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(flat_indices_host, [next_count]), device);
+    let next_coords =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(next_coords_host, [next_count * 3]), device)
+            .reshape([next_count, 3]);
+
+    Ok(FlashRefinementCoords {
+        curr_count,
+        next_coords,
+        flat_indices,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_flash_refinement_coords_from_mask_gpu<B: Backend>(
+    curr_mask: Tensor<B, 3, Bool>,
+    next_total: usize,
+    next_size: usize,
+    dilation_iters: usize,
+    device: &B::Device,
+) -> FlashRefinementCoords<B> {
+    let curr_coords = curr_mask.argwhere();
+    let curr_count = curr_coords.shape().dims::<2>()[0];
+    let doubled = curr_coords.mul_scalar(2);
+    let doubled_indices = coords_to_linear_indices_2(&doubled, next_size);
+    drop(doubled);
+    let mut next_index = flash_refinement_next_index_mask_from_doubled_indices(
+        doubled_indices,
+        next_total,
+        next_size,
+        device,
+    );
+    for _ in 0..dilation_iters {
+        next_index = dilate_mask_gpu(next_index);
+    }
+    let next_coords = next_index.argwhere();
+    let flat_indices = coords_to_linear_indices_2(&next_coords, next_size);
+    FlashRefinementCoords {
+        curr_count,
+        next_coords,
+        flat_indices,
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn build_flash_refinement_compact_host(
+    curr_mask: &[bool],
+    grid_size: usize,
+    next_size: usize,
+    dilation_iters: usize,
+) -> Result<(usize, Vec<i32>, Vec<i32>), String> {
+    let grid_plane = grid_size
+        .checked_mul(grid_size)
+        .ok_or_else(|| "refinement grid plane size overflow".to_string())?;
+    let grid_total = grid_plane
+        .checked_mul(grid_size)
+        .ok_or_else(|| "refinement grid size overflow".to_string())?;
+    if curr_mask.len() != grid_total {
+        return Err(format!(
+            "refinement mask size mismatch: got {}, expected {} (grid_size={grid_size})",
+            curr_mask.len(),
+            grid_total
+        ));
+    }
+    let next_plane = next_size
+        .checked_mul(next_size)
+        .ok_or_else(|| "refinement next-grid plane size overflow".to_string())?;
+    let next_total = next_plane
+        .checked_mul(next_size)
+        .ok_or_else(|| "refinement next-grid size overflow".to_string())?;
+    let next_max = next_size as isize - 1;
+    let radius = dilation_iters as isize;
+
+    let mut curr_count = 0usize;
+    let mut next_mask = vec![0u8; next_total];
+
+    for (idx, &active) in curr_mask.iter().enumerate() {
+        if !active {
+            continue;
+        }
+        curr_count += 1;
+        let z = idx / grid_plane;
+        let rem = idx - z * grid_plane;
+        let y = rem / grid_size;
+        let x = rem - y * grid_size;
+
+        let base_x = (x * 2) as isize;
+        let base_y = (y * 2) as isize;
+        let base_z = (z * 2) as isize;
+
+        for dz in -radius..=radius {
+            let nz = (base_z + dz).clamp(0, next_max) as usize;
+            let z_off = nz * next_plane;
+            for dy in -radius..=radius {
+                let ny = (base_y + dy).clamp(0, next_max) as usize;
+                let yz_off = z_off + ny * next_size;
+                for dx in -radius..=radius {
+                    let nx = (base_x + dx).clamp(0, next_max) as usize;
+                    next_mask[yz_off + nx] = 1;
+                }
+            }
+        }
+    }
+
+    let mut flat_indices = Vec::new();
+    let mut coords = Vec::new();
+    for (linear, &active) in next_mask.iter().enumerate() {
+        if active == 0 {
+            continue;
+        }
+        let linear_i32 =
+            i32::try_from(linear).map_err(|_| "refinement index exceeds i32::MAX".to_string())?;
+        let z = linear / next_plane;
+        let rem = linear - z * next_plane;
+        let y = rem / next_size;
+        let x = rem - y * next_size;
+        let x_i32 =
+            i32::try_from(x).map_err(|_| "refinement x coordinate exceeds i32::MAX".to_string())?;
+        let y_i32 =
+            i32::try_from(y).map_err(|_| "refinement y coordinate exceeds i32::MAX".to_string())?;
+        let z_i32 =
+            i32::try_from(z).map_err(|_| "refinement z coordinate exceeds i32::MAX".to_string())?;
+        flat_indices.push(linear_i32);
+        coords.extend_from_slice(&[x_i32, y_i32, z_i32]);
+    }
+
+    Ok((curr_count, flat_indices, coords))
+}
+
 fn flash_max_points<B: Backend>() -> usize {
-    let backend_name = std::any::type_name::<B>().to_ascii_lowercase();
-    if backend_name.contains("wgpu") {
+    if is_wgpu_backend::<B>() {
         return FLASH_WGPU_MAX_POINTS;
     }
     usize::MAX
 }
 
+fn is_wgpu_backend<B: Backend>() -> bool {
+    std::any::type_name::<B>()
+        .to_ascii_lowercase()
+        .contains("wgpu")
+}
+
+fn needs_wasm_f16_alignment_workaround<B: Backend>() -> bool {
+    cfg!(target_arch = "wasm32") && std::mem::size_of::<B::FloatElem>() == 2
+}
+
 fn flash_blocks_per_batch<B: Backend>(num_chunks: usize, points_per_block: usize) -> usize {
-    let requested = (num_chunks / points_per_block).max(1);
+    let requested = num_chunks.div_ceil(points_per_block).max(1);
     let max_points = flash_max_points::<B>();
     if FLASH_DEBUG {
         eprintln!(
@@ -433,6 +636,21 @@ fn flash_blocks_per_batch<B: Backend>(num_chunks: usize, points_per_block: usize
     }
     let max_blocks = (max_points / points_per_block).max(1);
     requested.min(max_blocks)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn flash_refinement_next_index_mask_from_doubled_indices<B: Backend>(
+    doubled_indices: Tensor<B, 1, Int>,
+    next_total: usize,
+    next_size: usize,
+    device: &B::Device,
+) -> Tensor<B, 3, Bool> {
+    let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], device);
+    let mut next_index = Tensor::<B, 1>::zeros([next_total], device);
+    next_index = next_index.scatter(0, doubled_indices, ones);
+    next_index
+        .reshape([next_size as i32, next_size as i32, next_size as i32])
+        .greater_elem(0.0)
 }
 
 fn flash_base_blocks(mini_grid_num: usize) -> Vec<[usize; 3]> {
@@ -595,31 +813,26 @@ fn flash_extract_geometry_gpu_shared<B: Backend>(
     log_flash_stats("base", &grid_logits, grid_size);
     let mut shared_kv_cache = initial_kv_cache;
     for (level_idx, &res) in plan.resolutions.iter().enumerate().skip(1) {
-        let next_size = res + 1;
-        let step_x = (plan.bounds[3] - plan.bounds[0]) / res as f32;
-        let step_y = (plan.bounds[4] - plan.bounds[1]) / res as f32;
-        let step_z = (plan.bounds[5] - plan.bounds[2]) / res as f32;
-
-        let device = grid_logits.device();
+        let FlashRefinementLevelSetup {
+            next_size,
+            step,
+            mut next_logits,
+            curr_mask,
+            dilation_iters,
+        } = prepare_flash_refinement_level_gpu(&grid_logits, &plan, config, level_idx, res);
         let next_total = next_size * next_size * next_size;
-        let mut next_logits = Tensor::<B, 1>::full([next_total], FLASH_INVALID_SENTINEL, &device);
-
-        let mut curr_mask = extract_near_surface_mask_gpu(&grid_logits, config.mc_level);
-        let near_mask = grid_logits.clone().abs().lower_elem(0.95);
-        curr_mask = curr_mask.bool_or(near_mask);
-
-        let expand_num = if level_idx == plan.resolutions.len() - 1 {
-            0
-        } else {
-            1
-        };
-        for _ in 0..expand_num {
-            curr_mask = dilate_mask_gpu(curr_mask);
-            curr_mask = dilate_mask_gpu(curr_mask);
-        }
-
-        let curr_coords = curr_mask.argwhere();
-        let curr_count = curr_coords.shape().dims::<2>()[0];
+        let device = grid_logits.device();
+        let FlashRefinementCoords {
+            curr_count,
+            next_coords,
+            flat_indices,
+        } = build_flash_refinement_coords_from_mask_gpu(
+            curr_mask,
+            next_total,
+            next_size,
+            dilation_iters,
+            &device,
+        );
         if FLASH_DEBUG {
             eprintln!(
                 "flash_extract_geometry[level={level_idx}] curr_count={curr_count} grid_size={grid_size} next_size={next_size}"
@@ -631,22 +844,6 @@ fn flash_extract_geometry_gpu_shared<B: Backend>(
             break;
         }
 
-        let doubled = curr_coords.clone().mul_scalar(2);
-        let doubled_indices = coords_to_linear_indices_2(&doubled, next_size);
-        drop(doubled);
-        drop(curr_coords);
-        let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], &device);
-        let mut next_index = Tensor::<B, 1>::zeros([next_total], &device);
-        next_index = next_index.scatter(0, doubled_indices, ones);
-        let mut next_index = next_index
-            .reshape([next_size as i32, next_size as i32, next_size as i32])
-            .greater_elem(0.0);
-
-        for _ in 0..(2 - expand_num) {
-            next_index = dilate_mask_gpu(next_index);
-        }
-
-        let next_coords = next_index.argwhere();
         let next_count = next_coords.shape().dims::<2>()[0];
         if FLASH_DEBUG {
             eprintln!(
@@ -659,8 +856,7 @@ fn flash_extract_geometry_gpu_shared<B: Backend>(
             break;
         }
 
-        let flat_indices = coords_to_linear_indices_2(&next_coords, next_size);
-        let world_coords = coords_to_world_2(&next_coords, plan.bounds, [step_x, step_y, step_z]);
+        let world_coords = coords_to_world_2(&next_coords, plan.bounds, step);
         drop(next_coords);
 
         decode_flash_points_gpu(
@@ -845,12 +1041,27 @@ fn decode_flash_points_gpu<B: Backend>(
     let mut out = output.clone();
     let max_points = flash_max_points::<B>().max(1);
     let chunk_points = num_chunks.max(1).min(max_points);
+    let align_f16_chunks = needs_wasm_f16_alignment_workaround::<B>();
     let mut start = 0usize;
     while start < total {
         let end = (start + chunk_points).min(total);
-        let coords_chunk = coords.clone().slice([start..end, 0..3]).unsqueeze_dim(0);
+        let valid_points = end - start;
+        let mut coords_chunk = coords.clone().slice([start..end, 0..3]).unsqueeze_dim(0);
         #[allow(clippy::single_range_in_vec_init)]
-        let indices_chunk = indices.clone().slice([start..end]);
+        let mut indices_chunk = indices.clone().slice([start..end]);
+        let needs_padding = align_f16_chunks && !valid_points.is_multiple_of(2);
+        let decode_points = valid_points + usize::from(needs_padding);
+        if needs_padding {
+            let pad = coords_chunk
+                .clone()
+                .slice([0..1, (valid_points - 1)..valid_points, 0..3]);
+            coords_chunk = Tensor::cat(vec![coords_chunk, pad], 1);
+            #[allow(clippy::single_range_in_vec_init)]
+            let pad_index = indices_chunk
+                .clone()
+                .slice([(valid_points - 1)..valid_points]);
+            indices_chunk = Tensor::cat(vec![indices_chunk, pad_index], 0);
+        }
 
         let (decoded, cache) = vae.decode_with_latent_projection(
             coords_chunk,
@@ -859,16 +1070,33 @@ fn decode_flash_points_gpu<B: Backend>(
             None,
         );
         *kv_cache = Some(cache);
-        let values = decoded.reshape([end - start]);
-        // Burn scatter uses sum reduction. Flash indices are unique per decode pass,
-        // so subtracting the sentinel converts additive scatter into overwrite semantics.
-        let delta = values.add_scalar(-FLASH_INVALID_SENTINEL);
+        let values = decoded.reshape([decode_points]);
+        let mut delta = values.add_scalar(-FLASH_INVALID_SENTINEL);
+        if needs_padding {
+            delta = zero_padded_flash_delta_tail(delta, valid_points);
+        }
+        // Burn scatter uses sum reduction. Flash indices are unique per decode pass.
+        // For padded fp16 wasm chunks we append one extra index and zero out its delta.
         out = out.scatter(0, indices_chunk, delta);
         start = end;
     }
 
     *output = out;
     Ok(())
+}
+
+fn zero_padded_flash_delta_tail<B: Backend>(
+    delta: Tensor<B, 1>,
+    valid_points: usize,
+) -> Tensor<B, 1> {
+    let len = delta.shape().dims::<1>()[0];
+    if valid_points >= len {
+        return delta;
+    }
+    let keep =
+        Tensor::<B, 1, Int>::arange(0..len as i64, &delta.device()).lower_elem(valid_points as i64);
+    let zeros = Tensor::<B, 1>::zeros([1], &delta.device());
+    delta.mask_where(keep.bool_not(), zeros)
 }
 
 type FlashCoords<B> = (Tensor<B, 2>, Tensor<B, 1, Int>);
@@ -1050,7 +1278,7 @@ fn flash_extract_geometry_cpu<B: Backend>(
             config.mc_level,
         );
         decode_flash_points(
-            &latents,
+            latents,
             vae,
             &coords,
             next_size,
@@ -1594,6 +1822,7 @@ fn coord_to_world(coord: usize, size: usize, min: f32, max: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::backend::NdArray;
 
     fn sigmoid(x: f32) -> f32 {
         1.0 / (1.0 + (-x).exp())
@@ -1676,5 +1905,124 @@ mod tests {
             indices,
             vec![(3 * size + 2) * size + 1, (6 * size + 5) * size + 4,]
         );
+    }
+
+    #[test]
+    fn flash_blocks_per_batch_rounds_up_partial_block() {
+        let points_per_block = 512usize;
+        let num_chunks = points_per_block + 1;
+        let blocks = flash_blocks_per_batch::<NdArray<f32>>(num_chunks, points_per_block);
+        assert_eq!(blocks, 2);
+    }
+
+    #[test]
+    fn zero_padded_flash_delta_tail_masks_only_padding() {
+        type B = NdArray<f32>;
+        let device = <B as Backend>::Device::default();
+        let delta = Tensor::<B, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device);
+        let masked = zero_padded_flash_delta_tail(delta, 3);
+        let values = masked
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("tensor data to vec");
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 0.0]);
+    }
+
+    fn build_next_mask_reference(
+        curr_mask: &[bool],
+        grid_size: usize,
+        next_size: usize,
+        dilation_iters: usize,
+    ) -> Vec<u8> {
+        let mut next_mask = vec![0u8; next_size * next_size * next_size];
+        for z in 0..grid_size {
+            for y in 0..grid_size {
+                for x in 0..grid_size {
+                    let idx = (z * grid_size + y) * grid_size + x;
+                    if !curr_mask[idx] {
+                        continue;
+                    }
+                    let nx = x * 2;
+                    let ny = y * 2;
+                    let nz = z * 2;
+                    if nx < next_size && ny < next_size && nz < next_size {
+                        let nidx = (nz * next_size + ny) * next_size + nx;
+                        next_mask[nidx] = 1;
+                    }
+                }
+            }
+        }
+        for _ in 0..dilation_iters {
+            next_mask = dilate_mask(&next_mask, next_size);
+        }
+        next_mask
+    }
+
+    #[test]
+    fn flash_refinement_compact_host_matches_reference_expansion() {
+        let grid_size = 5usize;
+        let next_size = 9usize;
+        let mut curr_mask = vec![false; grid_size * grid_size * grid_size];
+        for [x, y, z] in [
+            [0usize, 0usize, 0usize],
+            [1, 2, 3],
+            [4, 4, 4],
+            [2, 0, 4],
+            [3, 4, 1],
+        ] {
+            let idx = (z * grid_size + y) * grid_size + x;
+            curr_mask[idx] = true;
+        }
+
+        for dilation_iters in [1usize, 2usize] {
+            let (curr_count, flat_indices, coords) = build_flash_refinement_compact_host(
+                curr_mask.as_slice(),
+                grid_size,
+                next_size,
+                dilation_iters,
+            )
+            .expect("compact refinement");
+            assert_eq!(curr_count, 5);
+
+            let ref_mask = build_next_mask_reference(
+                curr_mask.as_slice(),
+                grid_size,
+                next_size,
+                dilation_iters,
+            );
+            let ref_indices: Vec<i32> = ref_mask
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &active)| if active > 0 { Some(idx as i32) } else { None })
+                .collect();
+            assert_eq!(flat_indices, ref_indices, "dilation_iters={dilation_iters}");
+            assert_eq!(coords.len(), flat_indices.len() * 3);
+
+            let next_plane = next_size * next_size;
+            for (point_idx, &linear) in flat_indices.iter().enumerate() {
+                let linear = linear as usize;
+                let z = linear / next_plane;
+                let rem = linear - z * next_plane;
+                let y = rem / next_size;
+                let x = rem - y * next_size;
+                assert_eq!(coords[point_idx * 3], x as i32);
+                assert_eq!(coords[point_idx * 3 + 1], y as i32);
+                assert_eq!(coords[point_idx * 3 + 2], z as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn flash_refinement_compact_host_empty_mask_returns_empty_outputs() {
+        let grid_size = 4usize;
+        let next_size = 7usize;
+        let curr_mask = vec![false; grid_size * grid_size * grid_size];
+        let (curr_count, flat_indices, coords) =
+            build_flash_refinement_compact_host(curr_mask.as_slice(), grid_size, next_size, 2)
+                .expect("compact refinement");
+        assert_eq!(curr_count, 0);
+        assert!(flat_indices.is_empty());
+        assert!(coords.is_empty());
     }
 }

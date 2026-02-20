@@ -26,3 +26,10 @@
 - deploy workflow copies `www/burn_synth_bpk_sw.js` to site root as `burn_synth_bpk_sw.js` so root pages are in scope on GitHub Pages.
 - the service worker caches `*.bpk`, `*.bpk.parts.json`, and `*.bpk.part-*` responses via Cache Storage for faster repeat warmups.
 - cache interception supports same-origin bundled assets and cross-origin model pulls from `https://aberration.technology/model/...`.
+- wasm model root selection defaults:
+  - local dev hosts (`localhost`, `127.0.0.1`, `0.0.0.0`, `.localhost`) -> local bundled `assets/models`
+  - non-local hosts (for example GitHub Pages) -> CDN `https://aberration.technology/model`
+- runtime overrides are supported through URL query params:
+  - `?model_source=local` to force local bundled models
+  - `?model_source=cdn` to force CDN models
+  - `?model_base_url=<custom-root>` to force any custom model root URL/path

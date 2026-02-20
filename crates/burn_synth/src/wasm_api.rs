@@ -31,9 +31,9 @@ use burn_tripo::pipeline::runtime_parity::{
     decimate_tripo_mesh, should_prefer_f16_triposg_weights, triposg_runtime_profile,
 };
 use burn_tripo::pipeline::triposg::{TripoSGPipeline, deterministic_latents_from_seed};
-use js_sys::Uint8Array;
 #[cfg(feature = "wasm-api-wgpu")]
-use js_sys::{Function, Promise, Reflect};
+use js_sys::{Function, Promise};
+use js_sys::{Reflect, Uint8Array};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "wasm-api-wgpu")]
 use wasm_bindgen::JsCast;
@@ -46,7 +46,7 @@ use crate::mesh_to_glb_bytes;
 use crate::model_loader::{
     candidate_burnpack_names, parse_parts_manifest_bytes, resolve_manifest_entry_uri,
 };
-use crate::wasm::WasmInferencePreset;
+use crate::wasm::{DEFAULT_WASM_FLASH_NUM_CHUNKS, WasmInferencePreset};
 use crate::wasm_loader::{
     DownloadTotals, WasmHostMemoryBudget, download_binary_with_status, fetch_optional_text,
     fetch_optional_text_candidates, join_web_path, web_max_burnpack_bytes, web_max_host_ram_bytes,
@@ -62,6 +62,7 @@ type WgpuRmbgBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 const DEFAULT_GUIDANCE_SCALE: f32 = 7.0;
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
 const DEFAULT_MODEL_BASE_URL: &str = "https://aberration.technology/model";
+const DEFAULT_LOCAL_MODEL_BASE_URL: &str = "assets/models";
 const DINO_CONFIG_RELPATHS: [&str; 2] = [
     "image_encoder_dinov2/config.json",
     "image_encoder_2/config.json",
@@ -115,6 +116,12 @@ impl<F: FnMut(String)> WasmLoadContext<'_, F> {
     fn status(&mut self, message: String) {
         (self.on_status)(message);
     }
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+#[derive(Clone, Debug, Default)]
+struct WebGpuAdapterProfile {
+    shader_f16_supported: bool,
 }
 
 #[wasm_bindgen]
@@ -271,14 +278,13 @@ impl WasmInferOptions {
 fn resolve_wgpu_precision_for_preset(
     preset: &WasmInferencePreset,
     shader_f16_supported: bool,
-) -> Result<&'static str, String> {
-    if preset.weights_precision.eq_ignore_ascii_case("f16") {
-        return Ok(if shader_f16_supported { "f16" } else { "f32" });
+) -> &'static str {
+    if preset.weights_precision.eq_ignore_ascii_case("f16")
+        || preset.weights_precision.eq_ignore_ascii_case("auto")
+    {
+        return if shader_f16_supported { "f16" } else { "f32" };
     }
-    if preset.weights_precision.eq_ignore_ascii_case("auto") {
-        return Ok(if shader_f16_supported { "f16" } else { "f32" });
-    }
-    Ok("f32")
+    "f32"
 }
 
 #[cfg(feature = "wasm-api-wgpu")]
@@ -300,16 +306,16 @@ where
     if !preset.backend.eq_ignore_ascii_case("wgpu") {
         return Err("wasm TripoSG supports backend=wgpu only".to_string());
     }
-    if !wasm_webgpu_available().await {
+    let Some(adapter_profile) = wasm_webgpu_adapter_profile().await else {
         return Err(
             "WebGPU is unavailable in this browser/runtime; CPU fallback is disabled for TripoSG wasm."
                 .to_string(),
         );
-    }
+    };
     initialize_wgpu_runtime_for_wasm().await?;
-    let shader_f16_supported = wasm_webgpu_shader_f16_supported().await;
-    let precision = resolve_wgpu_precision_for_preset(preset, shader_f16_supported)?;
-    if preset.weights_precision.eq_ignore_ascii_case("f16") && !shader_f16_supported {
+    let precision = resolve_wgpu_precision_for_preset(preset, adapter_profile.shader_f16_supported);
+    if preset.weights_precision.eq_ignore_ascii_case("f16") && !adapter_profile.shader_f16_supported
+    {
         on_status(
             "WebGPU adapter lacks shader-f16; running TripoSG on f32 backend while preferring f16 model weights."
                 .to_string(),
@@ -384,25 +390,63 @@ pub async fn infer_glb_from_image_bytes_with_preset_cached(
     if image_bytes.is_empty() {
         return Err("image bytes are empty".to_string());
     }
-    warmup_pipeline_for_preset(preset).await?;
+    let mut active_preset = preset.clone();
+    let mut attempted_f32_fallback = false;
 
-    let mut cached = CACHED_WASM_PIPELINE.with(|cache| cache.borrow_mut().take());
-    let result = match cached.as_mut() {
-        Some(CachedWasmPipeline::WgpuF32 {
-            preset: cached_preset,
-            state,
-        }) if cached_preset == preset => run_inference_once(state, image_bytes, preset).await,
-        Some(CachedWasmPipeline::WgpuF16 {
-            preset: cached_preset,
-            state,
-        }) if cached_preset == preset => run_inference_once(state, image_bytes, preset).await,
-        Some(_) => Err("cached wasm pipeline preset mismatch".to_string()),
-        None => Err("cached wasm pipeline unavailable after warmup".to_string()),
-    };
-    CACHED_WASM_PIPELINE.with(|cache| {
-        *cache.borrow_mut() = cached;
-    });
-    result
+    loop {
+        warmup_pipeline_for_preset(&active_preset).await?;
+
+        let mut cached = CACHED_WASM_PIPELINE.with(|cache| cache.borrow_mut().take());
+        let (result, used_fp16_backend) = match cached.as_mut() {
+            Some(CachedWasmPipeline::WgpuF32 {
+                preset: cached_preset,
+                state,
+            }) if cached_preset == &active_preset => (
+                run_inference_once(state, image_bytes, &active_preset).await,
+                false,
+            ),
+            Some(CachedWasmPipeline::WgpuF16 {
+                preset: cached_preset,
+                state,
+            }) if cached_preset == &active_preset => (
+                run_inference_once(state, image_bytes, &active_preset).await,
+                true,
+            ),
+            Some(_) => (
+                Err("cached wasm pipeline preset mismatch".to_string()),
+                false,
+            ),
+            None => (
+                Err("cached wasm pipeline unavailable after warmup".to_string()),
+                false,
+            ),
+        };
+        CACHED_WASM_PIPELINE.with(|cache| {
+            *cache.borrow_mut() = cached;
+        });
+
+        match result {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                if !attempted_f32_fallback
+                    && used_fp16_backend
+                    && !active_preset.weights_precision.eq_ignore_ascii_case("f32")
+                    && should_retry_with_f32_for_alignment_error(&err)
+                {
+                    attempted_f32_fallback = true;
+                    active_preset.weights_precision = "f32";
+                    web_sys::console::warn_1(
+                        &format!(
+                            "burn_synth wasm infer: fp16 WebGPU alignment failure detected; retrying with f32 backend ({err})"
+                        )
+                        .into(),
+                    );
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "wasm-api-wgpu"))]
@@ -454,6 +498,14 @@ pub async fn webgpu_available() -> bool {
     }
 }
 
+#[cfg(feature = "wasm-api-wgpu")]
+fn should_retry_with_f32_for_alignment_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("multiple of 4")
+        || (message.contains("binding") && message.contains("alignment"))
+        || (message.contains("binding") && message.contains("size 514"))
+}
+
 async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
     state: &mut WasmPipelineState<BTriposg, BRmbg>,
     image_bytes: &[u8],
@@ -482,10 +534,26 @@ async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
         &state.triposg_device,
     ));
 
+    let requested_flash_chunks = preset.flash_num_chunks.max(1);
+    let effective_flash_chunks = if backend_uses_f16::<BTriposg>() {
+        requested_flash_chunks.min(DEFAULT_WASM_FLASH_NUM_CHUNKS)
+    } else {
+        requested_flash_chunks
+    };
+    if effective_flash_chunks != requested_flash_chunks {
+        web_sys::console::log_1(
+            &format!(
+                "burn_synth wasm infer: capping flash_num_chunks from {} to {} for fp16 WebGPU portability",
+                requested_flash_chunks, effective_flash_chunks
+            )
+            .into(),
+        );
+    }
+
     let flash = FlashExtractConfig {
         bounds: DEFAULT_BOUNDS,
         octree_depth: preset.flash_octree_depth.max(1),
-        num_chunks: preset.flash_num_chunks.max(1),
+        num_chunks: effective_flash_chunks,
         mc_level: 0.0,
         min_resolution: preset.resolution.max(2),
         mini_grid_num: preset.flash_mini_grid_num.max(1),
@@ -603,6 +671,10 @@ where
     on_status(format!(
         "TripoSG weight precision policy: {precision_label} ({})",
         precision_reason
+    ));
+    on_status(format!(
+        "WASM model asset root: {}",
+        resolve_wasm_model_base_url()
     ));
     let prefer_f16_rmbg = match requested_rmbg_precision {
         "f16" => true,
@@ -1085,7 +1157,34 @@ fn backend_uses_f16<B: Backend>() -> bool {
 }
 
 fn wasm_model_root(rel_root: &str) -> String {
-    let root = option_env!("MODEL_BASE_URL")
+    join_web_path(&resolve_wasm_model_base_url(), rel_root)
+}
+
+fn resolve_wasm_model_base_url() -> String {
+    if let Some(value) = wasm_query_param_value("model_base_url")
+        .or_else(|| wasm_query_param_value("model_base"))
+        .or_else(|| wasm_query_param_value("model_root"))
+        .or_else(|| wasm_query_param_value("model_url"))
+    {
+        return value;
+    }
+
+    if let Some(value) = wasm_query_param_value("model_source")
+        .or_else(|| wasm_query_param_value("models"))
+        .or_else(|| wasm_query_param_value("model_origin"))
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" | "assets" | "bundle" | "bundled" => {
+                return DEFAULT_LOCAL_MODEL_BASE_URL.to_string();
+            }
+            "cdn" | "cloud" | "remote" => {
+                return DEFAULT_MODEL_BASE_URL.to_string();
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(value) = option_env!("MODEL_BASE_URL")
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| {
@@ -1093,21 +1192,102 @@ fn wasm_model_root(rel_root: &str) -> String {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or(DEFAULT_MODEL_BASE_URL);
-    join_web_path(root, rel_root)
+    {
+        return value.to_string();
+    }
+
+    let (protocol, hostname) = wasm_location_protocol_and_hostname();
+    if is_local_dev_host(protocol.as_deref(), hostname.as_deref()) {
+        return DEFAULT_LOCAL_MODEL_BASE_URL.to_string();
+    }
+
+    DEFAULT_MODEL_BASE_URL.to_string()
+}
+
+fn wasm_query_param_value(key: &str) -> Option<String> {
+    let search = wasm_location_search()?;
+    query_param_value(&search, key)
+}
+
+fn query_param_value(search: &str, key: &str) -> Option<String> {
+    for pair in search.trim_start_matches('?').split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut parts = pair.splitn(2, '=');
+        let Some(raw_key) = parts.next() else {
+            continue;
+        };
+        if !raw_key.eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let value = parts.next().unwrap_or_default().trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn wasm_location_search() -> Option<String> {
+    wasm_window_location_field("search")
+}
+
+fn wasm_location_protocol_and_hostname() -> (Option<String>, Option<String>) {
+    (
+        wasm_window_location_field("protocol"),
+        wasm_window_location_field("hostname"),
+    )
+}
+
+fn wasm_window_location_field(field: &str) -> Option<String> {
+    let window = web_sys::window()?;
+    let window_js: wasm_bindgen::JsValue = window.into();
+    let location = Reflect::get(&window_js, &wasm_bindgen::JsValue::from_str("location")).ok()?;
+    let value = Reflect::get(&location, &wasm_bindgen::JsValue::from_str(field)).ok()?;
+    value.as_string()
+}
+
+fn is_local_dev_host(protocol: Option<&str>, hostname: Option<&str>) -> bool {
+    let protocol = protocol.unwrap_or_default().trim().to_ascii_lowercase();
+    let host = hostname.unwrap_or_default().trim().to_ascii_lowercase();
+    if protocol == "file:" {
+        return true;
+    }
+    if host.is_empty() {
+        return false;
+    }
+    if matches!(
+        host.as_str(),
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]"
+    ) {
+        return true;
+    }
+    host.ends_with(".localhost") || host.ends_with(".local")
 }
 
 #[cfg(feature = "wasm-api-wgpu")]
 async fn wasm_webgpu_available() -> bool {
-    wasm_webgpu_request_adapter().await.is_some()
+    wasm_webgpu_adapter_profile().await.is_some()
 }
 
 #[cfg(feature = "wasm-api-wgpu")]
-async fn wasm_webgpu_shader_f16_supported() -> bool {
-    let Some(adapter) = wasm_webgpu_request_adapter().await else {
-        return false;
-    };
-    let features = match Reflect::get(&adapter, &wasm_bindgen::JsValue::from_str("features")) {
+async fn wasm_webgpu_adapter_profile() -> Option<WebGpuAdapterProfile> {
+    let adapter = wasm_webgpu_request_adapter().await?;
+    Some(webgpu_adapter_profile_from_value(adapter))
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+fn webgpu_adapter_profile_from_value(adapter: wasm_bindgen::JsValue) -> WebGpuAdapterProfile {
+    let shader_f16_supported = webgpu_adapter_supports_feature(&adapter, "shader-f16");
+    WebGpuAdapterProfile {
+        shader_f16_supported,
+    }
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+fn webgpu_adapter_supports_feature(adapter: &wasm_bindgen::JsValue, feature_name: &str) -> bool {
+    let features = match Reflect::get(adapter, &wasm_bindgen::JsValue::from_str("features")) {
         Ok(value) if !value.is_null() && !value.is_undefined() => value,
         _ => return false,
     };
@@ -1119,7 +1299,7 @@ async fn wasm_webgpu_shader_f16_supported() -> bool {
         Ok(func) => func,
         Err(_) => return false,
     };
-    match has_method.call1(&features, &wasm_bindgen::JsValue::from_str("shader-f16")) {
+    match has_method.call1(&features, &wasm_bindgen::JsValue::from_str(feature_name)) {
         Ok(value) => value.as_bool().unwrap_or(false),
         Err(_) => false,
     }

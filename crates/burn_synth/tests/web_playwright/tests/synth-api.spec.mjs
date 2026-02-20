@@ -101,8 +101,15 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   const partRequests = new Set();
   const legacyShardManifestRequests = new Set();
   const failedModelResponses = [];
-  const normalizeModelUrl = (url) =>
-    url.includes('/www/assets/') ? url.replace('/www/assets/', '/assets/models/') : url;
+  const normalizeModelUrl = (url) => {
+    if (url.includes('/www/assets/models/')) {
+      return url.replace('/www/assets/models/', '/assets/models/');
+    }
+    if (url.includes('/www/assets/')) {
+      return url.replace('/www/assets/', '/assets/models/');
+    }
+    return url;
+  };
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   page.on('console', (msg) => {

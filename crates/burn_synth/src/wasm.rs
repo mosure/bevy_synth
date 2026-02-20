@@ -2,6 +2,8 @@
 ///
 /// Defaults mirror the CLI "balanced" quality preset so web and native runs
 /// are configured consistently unless callers override fields explicitly.
+pub const DEFAULT_WASM_FLASH_NUM_CHUNKS: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WasmInferencePreset {
     pub quality: &'static str,
@@ -30,7 +32,9 @@ impl Default for WasmInferencePreset {
             resolution: 31,
             faces: 10_000,
             flash_octree_depth: 8,
-            flash_num_chunks: 8192,
+            // Keep wasm flash chunking conservative for broader WebGPU portability
+            // (notably Metal/f16 adapters) while preserving output parity.
+            flash_num_chunks: DEFAULT_WASM_FLASH_NUM_CHUNKS,
             flash_mini_grid_num: 4,
             seed: 42,
             backend: "wgpu",
@@ -81,7 +85,7 @@ impl WasmInferencePreset {
 
 #[cfg(test)]
 mod tests {
-    use super::WasmInferencePreset;
+    use super::{DEFAULT_WASM_FLASH_NUM_CHUNKS, WasmInferencePreset};
     #[cfg(feature = "runtime")]
     use crate::RuntimeConfig;
 
@@ -105,7 +109,7 @@ mod tests {
                 "--flash-octree-depth",
                 "8",
                 "--flash-num-chunks",
-                "8192",
+                "4096",
                 "--flash-mini-grid-num",
                 "4",
                 "--seed",
@@ -135,7 +139,7 @@ mod tests {
         assert_eq!(preset.num_tokens, 1024);
         assert_eq!(preset.resolution, 31);
         assert_eq!(preset.flash_octree_depth, 8);
-        assert_eq!(preset.flash_num_chunks, 8192);
+        assert_eq!(preset.flash_num_chunks, DEFAULT_WASM_FLASH_NUM_CHUNKS);
         assert_eq!(preset.flash_mini_grid_num, 4);
         assert_eq!(preset.faces, runtime.target_faces.unwrap_or_default());
         assert_eq!(Some(preset.seed), runtime.seed);

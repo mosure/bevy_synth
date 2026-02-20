@@ -5,7 +5,7 @@ use burn::backend::NdArray;
 use burn::prelude::Backend;
 
 use crate::pipeline::{
-    prepare_image_data, PrepareImageConfig, PrepareImageError, PreparedImageData, RmbgPipeline,
+    PrepareImageConfig, PrepareImageError, PreparedImageData, RmbgPipeline, prepare_image_data,
 };
 
 /// Burn-only RMBG-2.0 compatibility pipeline.
@@ -56,11 +56,11 @@ pub mod import {
     use burn::prelude::Backend;
 
     use crate::preprocess::RmbgImageProcessor;
+    use crate::rmbg14::RmbgConfig;
     use crate::rmbg14::import::{
         import_rmbg_burnpack, load_rmbg_config, load_rmbg_processor_config,
         load_rmbg_processor_from_json_bytes, resolve_rmbg_weights_root,
     };
-    use crate::rmbg14::RmbgConfig;
 
     pub fn resolve_rmbg2_weights_root() -> PathBuf {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
