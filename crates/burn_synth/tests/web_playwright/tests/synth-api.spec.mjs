@@ -101,6 +101,8 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   const partRequests = new Set();
   const legacyShardManifestRequests = new Set();
   const failedModelResponses = [];
+  const normalizeModelUrl = (url) =>
+    url.includes('/www/assets/') ? url.replace('/www/assets/', '/assets/models/') : url;
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   page.on('console', (msg) => {
@@ -109,7 +111,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     }
   });
   page.on('request', (request) => {
-    const url = request.url();
+    const url = normalizeModelUrl(request.url());
     if (url.includes('/assets/models/')) {
       modelRequests.push(url);
       if (url.endsWith('.bpk.parts.json') || url.includes('.bpk.part-')) {
@@ -121,7 +123,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     }
   });
   page.on('response', (response) => {
-    const url = response.url();
+    const url = normalizeModelUrl(response.url());
     if (url.includes('/assets/models/') && response.status() >= 400) {
       failedModelResponses.push(`${response.status()} ${url}`);
     }
@@ -215,6 +217,33 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   expect(wasmStats.vertexCount).toBeGreaterThan(0);
   expect(wasmStats.faceCount).toBeGreaterThan(0);
 
+  const cacheSummary = await page.evaluate(async () => {
+    const cacheNames = await caches.keys();
+    const cacheName = cacheNames.find((name) => name.startsWith('burn-synth-bpk-')) ?? null;
+    if (!cacheName) {
+      return {
+        cacheName: null,
+        cachedModelEntries: 0,
+      };
+    }
+    const cache = await caches.open(cacheName);
+    const requests = await cache.keys();
+    const cachedModelEntries = requests.filter((request) => {
+      const pathname = new URL(request.url).pathname;
+      return (
+        pathname.endsWith('.bpk') ||
+        pathname.endsWith('.bpk.parts.json') ||
+        pathname.includes('.bpk.part-')
+      );
+    }).length;
+    return { cacheName, cachedModelEntries };
+  });
+  expect(cacheSummary.cacheName, 'expected burn_synth model cache storage to be created').not.toBeNull();
+  expect(
+    cacheSummary.cachedModelEntries,
+    'expected cached .bpk model entries after wasm inference',
+  ).toBeGreaterThan(0);
+
   const nativeRefGlb = process.env.BURN_SYNTH_NATIVE_REF_GLB;
   if (nativeRefGlb && fs.existsSync(nativeRefGlb)) {
     const nativeStats = parseGlbStats(fs.readFileSync(nativeRefGlb));
@@ -277,16 +306,22 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   const requestedTransformerF32PartsManifest = modelRequests.some((url) =>
     url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model.bpk.parts.json'),
   );
+  const requestedTransformerF16PartsManifest = modelRequests.some((url) =>
+    url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model_f16.bpk.parts.json'),
+  );
   expect(
-    requestedTransformerF32PartsManifest,
-    'expected fp32 transformer parts manifest request for wasm fp32 runtime',
+    requestedTransformerF32PartsManifest || requestedTransformerF16PartsManifest,
+    'expected transformer parts manifest request (f32 or f16)',
   ).toBe(true);
   const requestedVaeF32PartsManifest = modelRequests.some((url) =>
     url.includes('/assets/models/MIDI-3D/vae/diffusion_pytorch_model.bpk.parts.json'),
   );
+  const requestedVaeF16PartsManifest = modelRequests.some((url) =>
+    url.includes('/assets/models/MIDI-3D/vae/diffusion_pytorch_model_f16.bpk.parts.json'),
+  );
   expect(
-    requestedVaeF32PartsManifest,
-    'expected fp32 VAE parts manifest request for wasm fp32 runtime',
+    requestedVaeF32PartsManifest || requestedVaeF16PartsManifest,
+    'expected VAE parts manifest request (f32 or f16)',
   ).toBe(true);
   const requestedRmbgPartsManifest = modelRequests.some((url) =>
     url.includes('/assets/models/RMBG-1.4/model_f16.bpk.parts.json') ||
@@ -296,15 +331,6 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     requestedRmbgPartsManifest,
     'expected RMBG parts manifest request for wasm runtime',
   ).toBe(true);
-  const requestedTransformerF16Parts = modelRequests.some(
-    (url) =>
-      url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model_f16.bpk.parts.json') ||
-      url.includes('/assets/models/MIDI-3D/transformer/diffusion_pytorch_model_f16.bpk.part-'),
-  );
-  expect(
-    requestedTransformerF16Parts,
-    'unexpected fp16 transformer parts requests in wasm fp32 run',
-  ).toBe(false);
   const nonBenignFailedModelResponses = failedModelResponses.filter(
     (entry) =>
       !(

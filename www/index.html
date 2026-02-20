@@ -128,6 +128,43 @@
 
       const moduleUrl = "./out/bevy_synth.js";
       const wasmUrl = "./out/bevy_synth_bg.wasm";
+      let serviceWorkerReadyPromise = null;
+
+      const serviceWorkerCandidates = () => {
+        const pageUrl = new URL(window.location.href);
+        // Try same-directory first:
+        // - local dev/test page `/www/index.html` -> `/www/burn_synth_bpk_sw.js`
+        // - deployed page `/index.html`         -> `/burn_synth_bpk_sw.js`
+        //
+        // Fallback to parent-directory for compatibility with alternate layouts.
+        return [
+          new URL("burn_synth_bpk_sw.js", pageUrl),
+          new URL("../burn_synth_bpk_sw.js", pageUrl),
+        ];
+      };
+
+      const ensureModelCacheServiceWorker = async () => {
+        if (!("serviceWorker" in navigator)) {
+          return false;
+        }
+        if (serviceWorkerReadyPromise) {
+          return serviceWorkerReadyPromise;
+        }
+        serviceWorkerReadyPromise = (async () => {
+          for (const candidate of serviceWorkerCandidates()) {
+            try {
+              await navigator.serviceWorker.register(candidate);
+              await navigator.serviceWorker.ready;
+              return true;
+            } catch (_err) {
+              // Keep trying candidates to support both local `/www/*` and deployed root/subpath pages.
+            }
+          }
+          console.warn("failed to register burn_synth model cache service worker");
+          return false;
+        })();
+        return serviceWorkerReadyPromise;
+      };
 
       const normalizeQuality = (value) => {
         const normalized = String(value || "").trim().toLowerCase();
@@ -160,6 +197,8 @@
         startButton.disabled = true;
         qualitySelect.disabled = true;
         qualitySelect.value = setQualityQueryParam(qualitySelect.value);
+        text.textContent = "initializing model cache...";
+        await ensureModelCacheServiceWorker();
         text.textContent = "loading wasm module...";
         try {
           const mod = await import(moduleUrl);

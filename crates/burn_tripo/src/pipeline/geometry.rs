@@ -36,7 +36,7 @@ impl HierarchicalExtractConfig {
 }
 
 pub fn hierarchical_extract_geometry<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &HierarchicalExtractConfig,
 ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
@@ -50,7 +50,7 @@ pub fn hierarchical_extract_geometry<B: Backend>(
     let ys = linspace(bounds[1], bounds[4], size);
     let zs = linspace(bounds[2], bounds[5], size);
 
-    let mut grid_values = eval_grid(&latents, vae, &xs, &ys, &zs, chunk_size)?;
+    let mut grid_values = eval_grid(latents, vae, &xs, &ys, &zs, chunk_size)?;
 
     for depth in (dense_depth + 1)..=config.hierarchical_octree_depth {
         let next_size = pow2(depth);
@@ -61,7 +61,7 @@ pub fn hierarchical_extract_geometry<B: Backend>(
             let expanded = expand_edge_region(&edge_coords, size, next_size);
             if !expanded.is_empty() {
                 update_grid_from_coords(
-                    &latents,
+                    latents,
                     vae,
                     &expanded,
                     next_size,
@@ -108,7 +108,7 @@ impl FlashExtractConfig {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn flash_extract_geometry<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
@@ -120,11 +120,11 @@ pub fn flash_extract_geometry<B: Backend>(
 
 #[cfg(target_arch = "wasm32")]
 pub fn flash_extract_geometry<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
-    let _ = (&latents, vae, config);
+    let _ = (latents, vae, config);
     Err(
         "flash_extract_geometry sync path is unsupported on wasm; use async wasm flash extraction"
             .into(),
@@ -255,7 +255,7 @@ fn finalize_flash_logits_tensor<B: Backend>(
 
 #[cfg(target_arch = "wasm32")]
 pub async fn flash_extract_geometry_async_wasm<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<DenseGrid, String> {
@@ -276,7 +276,7 @@ pub async fn flash_extract_geometry_async_wasm<B: Backend>(
 
 #[cfg(target_arch = "wasm32")]
 async fn flash_extract_geometry_gpu_shared_async_wasm<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<FlashGpuExtractState<B>, Box<dyn std::error::Error>> {
@@ -343,7 +343,9 @@ async fn flash_extract_geometry_gpu_shared_async_wasm<B: Backend>(
         }
 
         let doubled = curr_coords.clone().mul_scalar(2);
-        let doubled_indices = coords_to_linear_indices_2(doubled, next_size);
+        let doubled_indices = coords_to_linear_indices_2(&doubled, next_size);
+        drop(doubled);
+        drop(curr_coords);
         let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], &device);
         let mut next_index = Tensor::<B, 1>::zeros([next_total], &device);
         next_index = next_index.scatter(0, doubled_indices, ones);
@@ -368,8 +370,9 @@ async fn flash_extract_geometry_gpu_shared_async_wasm<B: Backend>(
             break;
         }
 
-        let flat_indices = coords_to_linear_indices_2(next_coords.clone(), next_size);
-        let world_coords = coords_to_world_2(next_coords, plan.bounds, [step_x, step_y, step_z]);
+        let flat_indices = coords_to_linear_indices_2(&next_coords, next_size);
+        let world_coords = coords_to_world_2(&next_coords, plan.bounds, [step_x, step_y, step_z]);
+        drop(next_coords);
 
         decode_flash_points_gpu(
             vae,
@@ -532,7 +535,7 @@ fn decode_flash_base_batch<B: Backend>(
         3,
     ]);
     let latents_batch = latents.clone().repeat_dim(0, blocks_in_batch);
-    vae.decode(coords_tensor, latents_batch, None)
+    vae.decode(coords_tensor, &latents_batch, None)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -544,12 +547,12 @@ fn decode_flash_refinement_batch<B: Backend>(
     points: usize,
 ) -> Tensor<B, 3> {
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device).reshape([1, points as i32, 3]);
-    vae.decode(coords_tensor, latents.clone(), None)
+    vae.decode(coords_tensor, latents, None)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn flash_extract_geometry_gpu<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
@@ -567,7 +570,7 @@ fn flash_extract_geometry_gpu<B: Backend>(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn flash_extract_geometry_gpu_shared<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<FlashGpuExtractState<B>, Box<dyn std::error::Error>> {
@@ -629,7 +632,9 @@ fn flash_extract_geometry_gpu_shared<B: Backend>(
         }
 
         let doubled = curr_coords.clone().mul_scalar(2);
-        let doubled_indices = coords_to_linear_indices_2(doubled, next_size);
+        let doubled_indices = coords_to_linear_indices_2(&doubled, next_size);
+        drop(doubled);
+        drop(curr_coords);
         let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], &device);
         let mut next_index = Tensor::<B, 1>::zeros([next_total], &device);
         next_index = next_index.scatter(0, doubled_indices, ones);
@@ -654,8 +659,9 @@ fn flash_extract_geometry_gpu_shared<B: Backend>(
             break;
         }
 
-        let flat_indices = coords_to_linear_indices_2(next_coords.clone(), next_size);
-        let world_coords = coords_to_world_2(next_coords, plan.bounds, [step_x, step_y, step_z]);
+        let flat_indices = coords_to_linear_indices_2(&next_coords, next_size);
+        let world_coords = coords_to_world_2(&next_coords, plan.bounds, [step_x, step_y, step_z]);
+        drop(next_coords);
 
         decode_flash_points_gpu(
             vae,
@@ -774,8 +780,8 @@ fn eval_flash_base_grid_gpu<B: Backend>(
         let offsets = Tensor::<B, 2, Int>::from_ints(offsets, &device).unsqueeze_dim::<3>(1);
         let coords_idx = offsets + local_grid.clone();
         let coords_idx = coords_idx.reshape([batch_blocks.len() * points_per_block, 3]);
-        let coords_world = coords_to_world_2(coords_idx.clone(), bounds, step);
-        let indices = coords_to_linear_indices_2(coords_idx, grid_size);
+        let coords_world = coords_to_world_2(&coords_idx, bounds, step);
+        let indices = coords_to_linear_indices_2(&coords_idx, grid_size);
 
         decode_flash_points_gpu(
             vae,
@@ -792,7 +798,7 @@ fn eval_flash_base_grid_gpu<B: Backend>(
 }
 
 fn coords_to_linear_indices_2<B: Backend>(
-    coords: Tensor<B, 2, Int>,
+    coords: &Tensor<B, 2, Int>,
     size: usize,
 ) -> Tensor<B, 1, Int> {
     let device = coords.device();
@@ -802,7 +808,7 @@ fn coords_to_linear_indices_2<B: Backend>(
 
     let x = coords.clone().select(1, idx0).squeeze_dim(1);
     let y = coords.clone().select(1, idx1).squeeze_dim(1);
-    let z = coords.select(1, idx2).squeeze_dim(1);
+    let z = coords.clone().select(1, idx2).squeeze_dim(1);
 
     let stride_z = (size * size) as i32;
     let stride_y = size as i32;
@@ -810,7 +816,7 @@ fn coords_to_linear_indices_2<B: Backend>(
 }
 
 fn coords_to_world_2<B: Backend>(
-    coords: Tensor<B, 2, Int>,
+    coords: &Tensor<B, 2, Int>,
     bounds: [f32; 6],
     step: [f32; 3],
 ) -> Tensor<B, 2> {
@@ -818,7 +824,7 @@ fn coords_to_world_2<B: Backend>(
     let step_tensor = Tensor::<B, 1>::from_floats(step, &device).reshape([1, 3]);
     let min_tensor =
         Tensor::<B, 1>::from_floats([bounds[0], bounds[1], bounds[2]], &device).reshape([1, 3]);
-    coords.float().mul(step_tensor).add(min_tensor)
+    coords.clone().float().mul(step_tensor).add(min_tensor)
 }
 
 fn decode_flash_points_gpu<B: Backend>(
@@ -880,39 +886,28 @@ fn extract_near_surface_mask_gpu<B: Backend>(
 ) -> Tensor<B, 3, Bool> {
     let val = values.clone().add_scalar(alpha);
     let valid_mask = val.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-
-    let left = shift_with_replicate(&val, 0, 1);
-    let right = shift_with_replicate(&val, 0, -1);
-    let back = shift_with_replicate(&val, 1, 1);
-    let front = shift_with_replicate(&val, 1, -1);
-    let down = shift_with_replicate(&val, 2, 1);
-    let up = shift_with_replicate(&val, 2, -1);
-
-    let left_valid = left.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-    let right_valid = right.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-    let back_valid = back.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-    let front_valid = front.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-    let down_valid = down.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-    let up_valid = up.clone().greater_elem(FLASH_INVALID_THRESHOLD);
-
-    let left = left.mask_where(left_valid.bool_not(), val.clone());
-    let right = right.mask_where(right_valid.bool_not(), val.clone());
-    let back = back.mask_where(back_valid.bool_not(), val.clone());
-    let front = front.mask_where(front_valid.bool_not(), val.clone());
-    let down = down.mask_where(down_valid.bool_not(), val.clone());
-    let up = up.mask_where(up_valid.bool_not(), val.clone());
-
     let sign = val.clone().sign();
-    let same_sign = left
-        .sign()
-        .equal(sign.clone())
-        .bool_and(right.sign().equal(sign.clone()))
-        .bool_and(back.sign().equal(sign.clone()))
-        .bool_and(front.sign().equal(sign.clone()))
-        .bool_and(down.sign().equal(sign.clone()))
-        .bool_and(up.sign().equal(sign));
+
+    let mut same_sign = neighbor_sign_matches(&val, &sign, 0, 1);
+    same_sign = same_sign.bool_and(neighbor_sign_matches(&val, &sign, 0, -1));
+    same_sign = same_sign.bool_and(neighbor_sign_matches(&val, &sign, 1, 1));
+    same_sign = same_sign.bool_and(neighbor_sign_matches(&val, &sign, 1, -1));
+    same_sign = same_sign.bool_and(neighbor_sign_matches(&val, &sign, 2, 1));
+    same_sign = same_sign.bool_and(neighbor_sign_matches(&val, &sign, 2, -1));
 
     same_sign.bool_not().bool_and(valid_mask)
+}
+
+fn neighbor_sign_matches<B: Backend>(
+    values: &Tensor<B, 3>,
+    center_sign: &Tensor<B, 3>,
+    axis: usize,
+    shift: isize,
+) -> Tensor<B, 3, Bool> {
+    let shifted = shift_with_replicate(values, axis, shift);
+    let shifted_valid = shifted.clone().greater_elem(FLASH_INVALID_THRESHOLD);
+    let shifted = shifted.mask_where(shifted_valid.bool_not(), values.clone());
+    shifted.sign().equal(center_sign.clone())
 }
 
 fn dilate_mask_gpu<B: Backend>(mask: Tensor<B, 3, Bool>) -> Tensor<B, 3, Bool> {
@@ -1020,7 +1015,7 @@ fn slice_axis<B: Backend>(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn flash_extract_geometry_cpu<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     config: &FlashExtractConfig,
 ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
@@ -1034,7 +1029,7 @@ fn flash_extract_geometry_cpu<B: Backend>(
     );
 
     let mut grid_logits = eval_flash_base_grid(
-        latents.clone(),
+        latents,
         vae,
         &xs,
         &ys,
@@ -1106,7 +1101,7 @@ fn build_flash_resolutions(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn eval_flash_base_grid<B: Backend>(
-    latents: Tensor<B, 3>,
+    latents: &Tensor<B, 3>,
     vae: &TripoSGVae<B>,
     xs: &[f32],
     ys: &[f32],
@@ -1143,7 +1138,7 @@ fn eval_flash_base_grid<B: Backend>(
             &mut indices,
         );
         let decoded = decode_flash_base_batch(
-            &latents,
+            latents,
             vae,
             &device,
             coords.as_slice(),
@@ -1380,7 +1375,7 @@ fn write_decoded_contiguous<B: Backend>(
         return Ok(());
     }
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device).reshape([1, count as i32, 3]);
-    let decoded = vae.decode(coords_tensor, latents.clone(), None);
+    let decoded = vae.decode(coords_tensor, latents, None);
     let data =
         tensor_to_vec_f32(decoded).map_err(|err| format!("failed to decode grid values: {err}"))?;
     output_slice.copy_from_slice(&data[..output_slice.len()]);
@@ -1400,7 +1395,7 @@ fn write_decoded<B: Backend>(
         return Ok(());
     }
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device).reshape([1, count as i32, 3]);
-    let decoded = vae.decode(coords_tensor, latents.clone(), None);
+    let decoded = vae.decode(coords_tensor, latents, None);
     let data =
         tensor_to_vec_f32(decoded).map_err(|err| format!("failed to decode grid values: {err}"))?;
     for (i, &dst) in indices.iter().enumerate() {

@@ -258,7 +258,7 @@ fn decode_grid_values_device_cat<B: Backend>(
         let coords_tensor = Tensor::<B, 1>::from_floats(coords.as_slice(), device)
             .reshape([count as i32, 3])
             .unsqueeze_dim(0);
-        chunks.push(vae.decode(coords_tensor, latents.clone(), None));
+        chunks.push(vae.decode(coords_tensor, latents, None));
         coords.clear();
     }
 
@@ -267,7 +267,7 @@ fn decode_grid_values_device_cat<B: Backend>(
         let coords_tensor = Tensor::<B, 1>::from_floats(coords.as_slice(), device)
             .reshape([count as i32, 3])
             .unsqueeze_dim(0);
-        chunks.push(vae.decode(coords_tensor, latents.clone(), None));
+        chunks.push(vae.decode(coords_tensor, latents, None));
     }
 
     if chunks.is_empty() {
@@ -376,7 +376,7 @@ fn write_host_chunk<B: Backend>(
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
         .reshape([count as i32, 3])
         .unsqueeze_dim(0);
-    let decoded = vae.decode(coords_tensor, latents.clone(), None);
+    let decoded = vae.decode(coords_tensor, latents, None);
     let data = decoded
         .into_data()
         .convert::<f32>()

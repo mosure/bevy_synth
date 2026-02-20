@@ -61,6 +61,9 @@ jobs:
           mkdir -p site/out
           cp www/index.html site/index.html
           cp www/synth_api.html site/synth_api.html
+          # Service worker source lives under `www/`, but we deploy it at site root so
+          # root pages are in scope (GitHub Pages cannot set Service-Worker-Allowed headers).
+          cp www/burn_synth_bpk_sw.js site/burn_synth_bpk_sw.js
 
           cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release --features wgpu,triposg
           wasm-bindgen target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm --out-dir site/out --target web --no-typescript
@@ -70,6 +73,7 @@ jobs:
 
           test -f site/out/bevy_synth_bg.wasm
           test -f site/out/burn_synth_bg.wasm
+          test -f site/burn_synth_bpk_sw.js
 
       - name: configure pages
         uses: actions/configure-pages@v5

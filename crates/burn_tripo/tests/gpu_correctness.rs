@@ -289,8 +289,8 @@ fn gpu_vae_decode_matches_cpu_small() -> Result<(), Box<dyn std::error::Error>> 
         &gpu_device,
     );
 
-    let cpu_out = cpu_model.decode(coords, latents, None);
-    let gpu_out = gpu_model.decode(coords_gpu, latents_gpu, None);
+    let cpu_out = cpu_model.decode(coords, &latents, None);
+    let gpu_out = gpu_model.decode(coords_gpu, &latents_gpu, None);
 
     let cpu_vec = tensor_to_vec(cpu_out, "vae.output.cpu")?;
     let gpu_vec = tensor_to_vec(gpu_out, "vae.output.gpu")?;
@@ -352,8 +352,8 @@ fn gpu_flash_extract_matches_cpu_small() -> Result<(), Box<dyn std::error::Error
 
     let _guard_cpu = EnvVarGuard::unset("TRIPOSG_FLASH_CPU");
     let _guard_no_fallback = EnvVarGuard::set("TRIPOSG_FLASH_NO_FALLBACK", "1");
-    let cpu_grid = flash_extract_geometry(latents, &cpu_model, &flash)?;
-    let gpu_grid = flash_extract_geometry(latents_gpu, &gpu_model, &flash)?;
+    let cpu_grid = flash_extract_geometry(&latents, &cpu_model, &flash)?;
+    let gpu_grid = flash_extract_geometry(&latents_gpu, &gpu_model, &flash)?;
 
     assert!(
         cpu_grid.values.iter().any(|value| value.is_finite()),

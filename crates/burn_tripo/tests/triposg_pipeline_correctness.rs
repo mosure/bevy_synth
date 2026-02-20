@@ -239,7 +239,7 @@ fn triposg_pipeline_matches_reference() -> Result<(), Box<dyn std::error::Error>
         .into());
     }
 
-    let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
+    let grid = pipeline.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
 
     let stats = compute_stats(&grid.values, &output_grid.data);
     if stats.max_abs > GRID_MAX_ABS || stats.mean_abs > GRID_MEAN_ABS || stats.mse > GRID_MSE {

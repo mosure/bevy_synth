@@ -22,3 +22,7 @@
   - `*.bpk` burnpacks for all selected models
   - runtime JSON configs used by wasm loaders (RMBG + TripoSG + Trellis)
   - excludes raw `*.safetensors` and `*.bpk.meta.json`
+- service worker source lives at `www/burn_synth_bpk_sw.js`; pages register `burn_synth_bpk_sw.js` (same-dir first, parent fallback) so local `/www/*` hosting and deployed root/subpath pages both work.
+- deploy workflow copies `www/burn_synth_bpk_sw.js` to site root as `burn_synth_bpk_sw.js` so root pages are in scope on GitHub Pages.
+- the service worker caches `*.bpk`, `*.bpk.parts.json`, and `*.bpk.part-*` responses via Cache Storage for faster repeat warmups.
+- cache interception supports same-origin bundled assets and cross-origin model pulls from `https://aberration.technology/model/...`.

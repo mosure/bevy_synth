@@ -267,20 +267,20 @@ impl<B: Backend> TripoSGPipeline<B> {
             });
         }
 
-        let decoded = query_coords.map(|coords| self.vae.decode(coords, latents.clone(), None));
+        let decoded = query_coords.map(|coords| self.vae.decode(coords, &latents, None));
         TripoSGPipelineOutput { latents, decoded }
     }
 
     pub fn decode_grid(
         &self,
-        latents: Tensor<B, 3>,
+        latents: &Tensor<B, 3>,
         bounds: [f32; 6],
         resolution: usize,
         chunk_size: usize,
     ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
         let resolution = resolution.max(2);
         let chunk_size = chunk_size.max(1);
-        let values = decode_grid_values(&latents, &self.vae, bounds, resolution, chunk_size)?;
+        let values = decode_grid_values(latents, &self.vae, bounds, resolution, chunk_size)?;
 
         Ok(DenseGrid {
             values,
@@ -309,7 +309,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             None,
             latents,
         );
-        let grid = self.decode_grid(output.latents.clone(), bounds, resolution, chunk_size)?;
+        let grid = self.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
         let mesh = grid_to_mesh(&grid, 0.0);
         Ok(TripoSGMeshOutput {
             latents: output.latents,
@@ -341,7 +341,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             None,
             latents,
         );
-        let grid = self.decode_grid(output.latents.clone(), bounds, resolution, chunk_size)?;
+        let grid = self.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
         let mesh = grid_to_mesh(&grid, 0.0);
         Ok(TripoSGMeshOutput {
             latents: output.latents,
@@ -368,7 +368,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             None,
             latents,
         );
-        let grid = hierarchical_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let grid = hierarchical_extract_geometry(&output.latents, &self.vae, config)?;
         let mesh = grid_to_mesh(&grid, 0.0);
         Ok(TripoSGMeshOutput {
             latents: output.latents,
@@ -398,7 +398,7 @@ impl<B: Backend> TripoSGPipeline<B> {
             None,
             latents,
         );
-        let grid = hierarchical_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let grid = hierarchical_extract_geometry(&output.latents, &self.vae, config)?;
         let mesh = grid_to_mesh(&grid, 0.0);
         Ok(TripoSGMeshOutput {
             latents: output.latents,
@@ -507,7 +507,7 @@ impl<B: Backend> TripoSGPipeline<B> {
     /// Extract flash geometry/mesh from sampled latents using the canonical native path.
     pub fn extract_flash_grid_from_latents(
         &self,
-        latents: Tensor<B, 3>,
+        latents: &Tensor<B, 3>,
         config: &FlashExtractConfig,
     ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
         flash_extract_geometry(latents, &self.vae, config)
@@ -519,7 +519,7 @@ impl<B: Backend> TripoSGPipeline<B> {
         latents: Tensor<B, 3>,
         config: &FlashExtractConfig,
     ) -> Result<TripoSGMeshOutput<B>, Box<dyn std::error::Error>> {
-        let grid = self.extract_flash_grid_from_latents(latents.clone(), config)?;
+        let grid = self.extract_flash_grid_from_latents(&latents, config)?;
         let mesh = sdf_to_mesh_diff_dmc(&grid);
         Ok(TripoSGMeshOutput {
             latents,
@@ -532,7 +532,7 @@ impl<B: Backend> TripoSGPipeline<B> {
     #[cfg(target_arch = "wasm32")]
     pub async fn extract_flash_grid_from_latents_async_wasm(
         &self,
-        latents: Tensor<B, 3>,
+        latents: &Tensor<B, 3>,
         config: &FlashExtractConfig,
     ) -> Result<DenseGrid, String> {
         flash_extract_geometry_async_wasm(latents, &self.vae, config)
@@ -548,7 +548,7 @@ impl<B: Backend> TripoSGPipeline<B> {
         config: &FlashExtractConfig,
     ) -> Result<TripoSGMeshOutput<B>, String> {
         let grid = self
-            .extract_flash_grid_from_latents_async_wasm(latents.clone(), config)
+            .extract_flash_grid_from_latents_async_wasm(&latents, config)
             .await?;
         let mesh = sdf_to_mesh_diff_dmc(&grid);
         Ok(TripoSGMeshOutput {
@@ -671,7 +671,7 @@ pub(crate) fn decode_grid_values_device_accumulate<B: Backend>(
     let step_z = dense_grid_step(bounds[2], bounds[5], resolution);
 
     let mut coords = Vec::with_capacity(chunk_size * 3);
-    let mut chunks = Vec::<Tensor<B, 3>>::new();
+    let mut values = Vec::<f32>::with_capacity(total);
     for idx in 0..total {
         let (x, y, z) = dense_grid_index_to_xyz(idx, resolution);
         coords.push(bounds[0] + step_x * x as f32);
@@ -681,28 +681,33 @@ pub(crate) fn decode_grid_values_device_accumulate<B: Backend>(
         if count < chunk_size {
             continue;
         }
-        chunks.push(decoded_chunk_tensor(latents, vae, &coords, device)?);
+        append_decoded_chunk(latents, vae, &coords, device, &mut values)?;
         coords.clear();
     }
 
     if !coords.is_empty() {
-        chunks.push(decoded_chunk_tensor(latents, vae, &coords, device)?);
+        append_decoded_chunk(latents, vae, &coords, device, &mut values)?;
     }
 
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let decoded = if chunks.len() == 1 {
-        chunks.pop().expect("single chunk exists")
-    } else {
-        Tensor::cat(chunks, 1)
-    };
-
-    let mut values = tensor_to_vec_f32(decoded)
-        .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
     values.truncate(total);
     Ok(values)
+}
+
+fn append_decoded_chunk<B: Backend>(
+    latents: &Tensor<B, 3>,
+    vae: &TripoSGVae<B>,
+    coords: &[f32],
+    device: &B::Device,
+    values: &mut Vec<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if coords.is_empty() {
+        return Ok(());
+    }
+    let decoded = decoded_chunk_tensor(latents, vae, coords, device)?;
+    let mut decoded_values = tensor_to_vec_f32(decoded)
+        .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
+    values.append(&mut decoded_values);
+    Ok(())
 }
 
 fn decode_grid_values_chunked_host<B: Backend>(
@@ -771,7 +776,7 @@ fn decoded_chunk_tensor<B: Backend>(
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
         .reshape([count as i32, 3])
         .unsqueeze_dim(0);
-    Ok(vae.decode(coords_tensor, latents.clone(), None))
+    Ok(vae.decode(coords_tensor, latents, None))
 }
 
 fn write_decoded_chunk_contiguous<B: Backend>(
@@ -788,7 +793,7 @@ fn write_decoded_chunk_contiguous<B: Backend>(
     let coords_tensor = Tensor::<B, 1>::from_floats(coords, device)
         .reshape([count as i32, 3])
         .unsqueeze_dim(0);
-    let decoded = vae.decode(coords_tensor, latents.clone(), None);
+    let decoded = vae.decode(coords_tensor, latents, None);
     let data = tensor_to_vec_f32(decoded)
         .map_err(|err| format!("failed to convert decoded grid: {err}"))?;
     output_slice.copy_from_slice(&data[..output_slice.len()]);

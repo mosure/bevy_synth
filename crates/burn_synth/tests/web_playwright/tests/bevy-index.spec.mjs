@@ -8,10 +8,12 @@ test('bevy_synth wasm page eagerly warms models during startup', async ({ page }
   const eagerModelLoadLogs = [];
   const modelRequests = [];
   let warmupState = 'unknown';
+  const normalizeModelUrl = (url) =>
+    url.includes('/www/assets/') ? url.replace('/www/assets/', '/assets/models/') : url;
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   page.on('requestfinished', (request) => {
-    const url = request.url();
+    const url = normalizeModelUrl(request.url());
     if (url.includes('/assets/models/')) {
       modelRequests.push(url);
     }
@@ -57,6 +59,33 @@ test('bevy_synth wasm page eagerly warms models during startup', async ({ page }
       },
     )
     .toBe('ready');
+
+  const cacheSummary = await page.evaluate(async () => {
+    const cacheNames = await caches.keys();
+    const cacheName = cacheNames.find((name) => name.startsWith('burn-synth-bpk-')) ?? null;
+    if (!cacheName) {
+      return {
+        cacheName: null,
+        cachedModelEntries: 0,
+      };
+    }
+    const cache = await caches.open(cacheName);
+    const requests = await cache.keys();
+    const cachedModelEntries = requests.filter((request) => {
+      const pathname = new URL(request.url).pathname;
+      return (
+        pathname.endsWith('.bpk') ||
+        pathname.endsWith('.bpk.parts.json') ||
+        pathname.includes('.bpk.part-')
+      );
+    }).length;
+    return { cacheName, cachedModelEntries };
+  });
+  expect(cacheSummary.cacheName, 'expected burn_synth model cache storage to be created').not.toBeNull();
+  expect(
+    cacheSummary.cachedModelEntries,
+    'expected cached .bpk model entries after warmup',
+  ).toBeGreaterThan(0);
 
   const ready = await page.evaluate(() => window.__burnSynthWasmReady === true);
   expect(ready).toBe(true);

@@ -235,10 +235,10 @@ impl<B: Backend> TripoSGVae<B> {
 
     pub fn prepare_latent_projection(
         &self,
-        latents: Tensor<B, 3>,
+        latents: &Tensor<B, 3>,
         mut hook: Option<&mut HookRecorder>,
     ) -> Tensor<B, 3> {
-        let latent_proj = self.post_quant.forward(latents);
+        let latent_proj = self.post_quant.forward(latents.clone());
         record_tensor(&mut hook, "decoder.post_quant", &latent_proj);
         latent_proj
     }
@@ -269,7 +269,7 @@ impl<B: Backend> TripoSGVae<B> {
     pub fn decode(
         &self,
         query_coords: Tensor<B, 3>,
-        latents: Tensor<B, 3>,
+        latents: &Tensor<B, 3>,
         mut hook: Option<&mut HookRecorder>,
     ) -> Tensor<B, 3> {
         let latent_proj = self.prepare_latent_projection(latents, hook.as_deref_mut());
@@ -295,7 +295,7 @@ impl<B: Backend> TripoSGVae<B> {
         };
         record_tensor(&mut hook, "latent.sample", &latent);
 
-        let decoded = self.decode(query_coords, latent.clone(), hook);
+        let decoded = self.decode(query_coords, &latent, hook);
 
         TripoSGVaeOutput {
             mean,

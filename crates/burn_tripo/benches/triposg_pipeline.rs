@@ -220,7 +220,7 @@ fn bench_with_backend<B: Backend>(c: &mut Criterion) {
                 b.iter(|| {
                     let grid = pipeline
                         .decode_grid(
-                            latents.clone(),
+                            &latents,
                             [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
                             bench_resolution,
                             bench_chunk,
@@ -253,9 +253,8 @@ fn bench_with_backend<B: Backend>(c: &mut Criterion) {
             BenchmarkId::new("vae_decode_hier", backend_name::<B>()),
             |b| {
                 b.iter(|| {
-                    let grid =
-                        hierarchical_extract_geometry(latents.clone(), &pipeline.vae, &config)
-                            .expect("hierarchical grid");
+                    let grid = hierarchical_extract_geometry(&latents, &pipeline.vae, &config)
+                        .expect("hierarchical grid");
                     std::hint::black_box(grid)
                 })
             },
@@ -264,12 +263,7 @@ fn bench_with_backend<B: Backend>(c: &mut Criterion) {
 
     if run_mesh {
         let grid = pipeline
-            .decode_grid(
-                latents.clone(),
-                [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
-                64,
-                bench_chunk,
-            )
+            .decode_grid(&latents, [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], 64, bench_chunk)
             .expect("decode grid");
         group.bench_function(BenchmarkId::new("mesh", backend_name::<B>()), |b| {
             b.iter(|| {
@@ -284,16 +278,15 @@ fn bench_with_backend<B: Backend>(c: &mut Criterion) {
             BenchmarkId::new("flash_extract", backend_name::<B>()),
             |b| {
                 b.iter(|| {
-                    let grid =
-                        flash_extract_geometry(latents.clone(), &pipeline.vae, &flash_config)
-                            .expect("flash grid");
+                    let grid = flash_extract_geometry(&latents, &pipeline.vae, &flash_config)
+                        .expect("flash grid");
                     std::hint::black_box(grid)
                 })
             },
         );
 
-        let flash_grid = flash_extract_geometry(latents.clone(), &pipeline.vae, &flash_config)
-            .expect("flash grid");
+        let flash_grid =
+            flash_extract_geometry(&latents, &pipeline.vae, &flash_config).expect("flash grid");
         group.bench_function(BenchmarkId::new("flash_mesh", backend_name::<B>()), |b| {
             b.iter(|| {
                 let mesh = sdf_to_mesh_surface_nets(&flash_grid);

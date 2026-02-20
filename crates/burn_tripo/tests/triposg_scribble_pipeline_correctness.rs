@@ -234,7 +234,7 @@ fn triposg_scribble_pipeline_matches_reference() -> Result<(), Box<dyn std::erro
         .into());
     }
 
-    let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
+    let grid = pipeline.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
 
     let stats = compute_stats(&grid.values, &output_grid.data);
     if stats.max_abs > GRID_MAX_ABS || stats.mean_abs > MEAN_ABS || stats.mse > MSE {

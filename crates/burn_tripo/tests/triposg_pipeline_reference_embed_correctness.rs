@@ -127,7 +127,7 @@ fn triposg_pipeline_from_reference_embeds_matches_reference_strictly()
         LATENT_MSE,
     )?;
 
-    let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
+    let grid = pipeline.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
     let stats = compute_stats(&grid.values, &output_grid.data);
     println!(
         "decoder.grid_logits.from_reference_embeds mean_abs={:.6} max_abs={:.6} mse={:.6}",
@@ -137,7 +137,7 @@ fn triposg_pipeline_from_reference_embeds_matches_reference_strictly()
     let output_latents_tensor =
         tensor_from_data_3d::<burn::backend::NdArray<f32>>(&output_latents, &device)?;
     let grid_from_reference_latents =
-        pipeline.decode_grid(output_latents_tensor, bounds, resolution, chunk_size)?;
+        pipeline.decode_grid(&output_latents_tensor, bounds, resolution, chunk_size)?;
     let stats_from_reference_latents =
         compute_stats(&grid_from_reference_latents.values, &output_grid.data);
     println!(

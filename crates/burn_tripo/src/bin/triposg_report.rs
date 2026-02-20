@@ -428,7 +428,7 @@ fn run_with_backend<B: Backend>(
             let output_grid = output_grid
                 .as_ref()
                 .expect("output.grid_logits checked above");
-            let grid = pipeline.decode_grid(output_ref.latents, bounds, resolution, chunk_size)?;
+            let grid = pipeline.decode_grid(&output_ref.latents, bounds, resolution, chunk_size)?;
             let stats = compute_stats(&grid.values, &output_grid.data);
             print_stats("decoder.grid_logits.from_reference_embeds", &stats);
         }
@@ -476,7 +476,7 @@ fn run_with_backend<B: Backend>(
             let output_grid = output_grid
                 .as_ref()
                 .expect("output.grid_logits checked above");
-            let grid = pipeline.decode_grid(output_cpu.latents, bounds, resolution, chunk_size)?;
+            let grid = pipeline.decode_grid(&output_cpu.latents, bounds, resolution, chunk_size)?;
             let stats = compute_stats(&grid.values, &output_grid.data);
             print_stats("decoder.grid_logits.from_cpu_dino", &stats);
         }
@@ -501,7 +501,7 @@ fn run_with_backend<B: Backend>(
     let output_grid = output_grid
         .as_ref()
         .expect("output.grid_logits checked above");
-    let grid = pipeline.decode_grid(output.latents, bounds, resolution, chunk_size)?;
+    let grid = pipeline.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
     let stats = compute_stats(&grid.values, &output_grid.data);
     print_stats("decoder.grid_logits", &stats);
 

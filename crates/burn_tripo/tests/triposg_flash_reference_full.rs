@@ -96,7 +96,7 @@ fn triposg_flash_full_reference_matches() -> Result<(), Box<dyn std::error::Erro
     unsafe {
         std::env::set_var("TRIPOSG_FLASH_NO_FALLBACK", "1");
     }
-    let grid = flash_extract_geometry(latents_tensor, &vae, &flash)?;
+    let grid = flash_extract_geometry(&latents_tensor, &vae, &flash)?;
 
     assert_eq!(
         grid.size,
@@ -181,14 +181,14 @@ fn triposg_flash_samples_match_reference() -> Result<(), Box<dyn std::error::Err
         &device,
     );
 
-    let decoded = vae.decode(coords_tensor.clone(), latents_tensor.clone(), None);
+    let decoded = vae.decode(coords_tensor.clone(), &latents_tensor, None);
     let decoded_values = decoded
         .into_data()
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|_| "failed to read decoded flash samples")?;
 
-    let latent_proj = vae.prepare_latent_projection(latents_tensor, None);
+    let latent_proj = vae.prepare_latent_projection(&latents_tensor, None);
     let kv_cache = vae.build_kv_cache(latent_proj.clone(), None);
     let (decoded_cached, _) =
         vae.decode_with_latent_projection(coords_tensor, latent_proj, Some(kv_cache), None);

@@ -165,22 +165,21 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             latents = self.scheduler.step(noise_pred, t, latents);
         }
 
-        let decoded = query_coords.map(|coords| self.vae.decode(coords, latents.clone(), None));
+        let decoded = query_coords.map(|coords| self.vae.decode(coords, &latents, None));
         TripoSGPipelineOutput { latents, decoded }
     }
 
     pub fn decode_grid(
         &self,
-        latents: Tensor<B, 3>,
+        latents: &Tensor<B, 3>,
         bounds: [f32; 6],
         resolution: usize,
         chunk_size: usize,
     ) -> Result<DenseGrid, Box<dyn std::error::Error>> {
         let resolution = resolution.max(2);
         let chunk_size = chunk_size.max(1);
-        let values = super::triposg::decode_grid_values(
-            &latents, &self.vae, bounds, resolution, chunk_size,
-        )?;
+        let values =
+            super::triposg::decode_grid_values(latents, &self.vae, bounds, resolution, chunk_size)?;
 
         Ok(DenseGrid {
             values,
@@ -211,7 +210,7 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             None,
             latents,
         );
-        let grid = self.decode_grid(output.latents.clone(), bounds, resolution, chunk_size)?;
+        let grid = self.decode_grid(&output.latents, bounds, resolution, chunk_size)?;
         let mesh = grid_to_mesh(&grid, 0.0);
         Ok(TripoSGScribbleMeshOutput {
             latents: output.latents,
@@ -240,7 +239,7 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             None,
             latents,
         );
-        let grid = hierarchical_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let grid = hierarchical_extract_geometry(&output.latents, &self.vae, config)?;
         let mesh = grid_to_mesh(&grid, 0.0);
         Ok(TripoSGScribbleMeshOutput {
             latents: output.latents,
@@ -269,7 +268,7 @@ impl<B: Backend> TripoSGScribblePipeline<B> {
             None,
             latents,
         );
-        let grid = flash_extract_geometry(output.latents.clone(), &self.vae, config)?;
+        let grid = flash_extract_geometry(&output.latents, &self.vae, config)?;
         let mesh = sdf_to_mesh_diff_dmc(&grid);
         Ok(TripoSGScribbleMeshOutput {
             latents: output.latents,

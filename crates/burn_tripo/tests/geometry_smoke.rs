@@ -21,7 +21,7 @@ fn hierarchical_extract_smoke() {
         band_threshold: 1.0,
     };
 
-    let grid = hierarchical_extract_geometry(latents, &vae, &config)
+    let grid = hierarchical_extract_geometry(&latents, &vae, &config)
         .expect("hierarchical extraction failed");
     assert_eq!(grid.size, [4, 4, 4]);
     assert_eq!(grid.values.len(), 4 * 4 * 4);

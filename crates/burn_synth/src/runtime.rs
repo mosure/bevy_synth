@@ -1386,8 +1386,9 @@ fn run_backend_inference<B: Backend>(
     let extract_start = Instant::now();
     let grid = state
         .pipeline
-        .extract_flash_grid_from_latents(output.latents.clone(), &config.flash_extract)
+        .extract_flash_grid_from_latents(&output.latents, &config.flash_extract)
         .map_err(|err| RuntimeError::new(format!("TripoSG geometry extraction failed: {err}")))?;
+    drop(output);
     progress.stage_completed(
         "triposg.flash_extract",
         None,

@@ -123,7 +123,7 @@ fn profile_with_backend<B: Backend>() {
     let t0 = Instant::now();
     let grid = pipeline
         .decode_grid(
-            output.latents.clone(),
+            &output.latents,
             [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
             resolution,
             chunk_size,
@@ -140,8 +140,8 @@ fn profile_with_backend<B: Backend>() {
         band_threshold: 1.0,
     };
     let t0 = Instant::now();
-    let _hier_grid = hierarchical_extract_geometry(output.latents.clone(), &pipeline.vae, &config)
-        .expect("hier grid");
+    let _hier_grid =
+        hierarchical_extract_geometry(&output.latents, &pipeline.vae, &config).expect("hier grid");
     B::sync(&device);
     let hier_ms = elapsed_ms(t0);
 

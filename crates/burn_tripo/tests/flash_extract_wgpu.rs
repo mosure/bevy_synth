@@ -35,7 +35,7 @@ fn flash_extract_wgpu_smoke() {
             std::env::set_var("TRIPOSG_FLASH_NO_FALLBACK", "1");
         }
         let grid =
-            flash_extract_geometry(latents, &vae, &config).expect("flash_extract_geometry failed");
+            flash_extract_geometry(&latents, &vae, &config).expect("flash_extract_geometry failed");
 
         assert!(
             grid.values.iter().any(|value| value.is_finite()),

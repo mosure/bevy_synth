@@ -88,7 +88,7 @@ burn_synth_mcp
 
 ### hardware recommendation
 
-- 24GB VRAM
+- 16GB VRAM
 
 
 ## references
