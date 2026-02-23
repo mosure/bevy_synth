@@ -18,7 +18,9 @@ pub mod import;
 pub mod runtime_model;
 
 pub use config::{TrellisQuality, TrellisQualitySettings};
-pub use mesh::{Mesh, MeshMaterial, MeshPbrTextures, MeshTexture, load_obj_mesh, write_obj_mesh};
+pub use mesh::{
+    Mesh, MeshMaterial, MeshPbrTextures, MeshTexture, load_obj_mesh, write_glb_mesh, write_obj_mesh,
+};
 pub use pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions, TrellisRuntimeError,
 };

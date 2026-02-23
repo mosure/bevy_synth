@@ -202,24 +202,24 @@ fn xstart_to_pred(x_t: &[f32], t: f32, x0: &[f32], sigma_min: f32) -> Vec<f32> {
 }
 
 fn stddev(values: &[f32]) -> f32 {
-    if values.is_empty() {
+    if values.len() < 2 {
         return 0.0;
     }
     let mean = values.iter().sum::<f32>() / values.len() as f32;
-    let var = values
+    let var_sum = values
         .iter()
         .map(|value| {
             let d = *value - mean;
             d * d
         })
-        .sum::<f32>()
-        / values.len() as f32;
-    var.sqrt()
+        .sum::<f32>();
+    let denom = (values.len() - 1) as f32;
+    (var_sum / denom).sqrt()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig};
+    use super::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig, stddev};
 
     #[test]
     fn converges_to_target_for_identity_velocity() {
@@ -256,5 +256,16 @@ mod tests {
             }
         });
         assert!(out.iter().all(|v| v.abs() < 0.5));
+    }
+
+    #[test]
+    fn stddev_matches_unbiased_reference() {
+        let values = [0.0f32, 1.0, 2.0, 3.0];
+        let got = stddev(&values);
+        let expected = (5.0f32 / 3.0).sqrt();
+        assert!(
+            (got - expected).abs() <= 1.0e-6,
+            "unexpected stddev: got={got} expected={expected}"
+        );
     }
 }

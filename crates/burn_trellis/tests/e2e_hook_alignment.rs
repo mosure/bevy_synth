@@ -191,6 +191,7 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 device,
                 hook_output: Some(actual_hook.clone()),
                 noise_overrides_hook: Some(reference_hook.clone()),
+                max_sparse_coords: None,
             },
         )
     })) {

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
+use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use burn::module::{Module, Param, ParamId};
 use burn::prelude::*;
 #[cfg(feature = "runtime-model-wgpu")]
@@ -508,16 +509,39 @@ impl DecoderWgpuConvContext {
                 rows.saturating_mul(kernel_rows)
             ));
         }
-        let neighbor_t = self.neighbor_tensor(cache_key, config, rows, neighbor_rows)?;
-        self.forward_with_neighbor_tensor(
+        let neighbor_bytes = rows
+            .checked_mul(kernel_rows)
+            .and_then(|value| value.checked_mul(core::mem::size_of::<i32>()))
+            .ok_or_else(|| "wgpu sparse conv neighbor-byte-size overflow".to_string())?;
+        if neighbor_bytes <= decoder_wgpu_max_neighbor_bytes() {
+            let neighbor_t = self.neighbor_tensor(cache_key, config, rows, neighbor_rows)?;
+            return self.forward_with_neighbor_tensor(
+                config,
+                layer,
+                input,
+                context,
+                rows,
+                kernel_rows,
+                neighbor_t,
+            );
+        }
+
+        let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input, &self.device)
+            .reshape([rows, config.in_channels]);
+        let output = self.forward_with_neighbor_rows_chunked_tensor(
             config,
             layer,
-            input,
+            input_t,
             context,
             rows,
             kernel_rows,
-            neighbor_t,
-        )
+            neighbor_rows,
+        )?;
+        output
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|err| format!("failed to read wgpu sparse conv output: {err:?}"))
     }
 
     fn forward_with_coords(
@@ -732,6 +756,136 @@ impl DecoderWgpuConvContext {
         while start < rows {
             let end = (start + chunk_rows).min(rows);
             let chunk_neighbor_t = neighbor_t.clone().slice([start..end, 0..kernel_rows]);
+            let chunk_out = sparse_subm_conv_forward_wgpu_with_config(
+                config,
+                input_t.clone(),
+                chunk_neighbor_t,
+                weight_t.clone(),
+                bias_t.clone(),
+                forward_cfg,
+            )?;
+            chunk_tensors.push(chunk_out);
+            start = end;
+            dispatches = dispatches.saturating_add(1);
+        }
+        telemetry_record_wgpu_success(
+            context,
+            dispatches.max(1),
+            true,
+            chunk_rows,
+            input_bytes,
+            output_bytes,
+            rows.saturating_mul(kernel_rows),
+        );
+        if chunk_tensors.is_empty() {
+            return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
+                [rows, config.out_channels],
+                &self.device,
+            ));
+        }
+        if chunk_tensors.len() == 1 {
+            return Ok(chunk_tensors.remove(0));
+        }
+        Ok(Tensor::cat(chunk_tensors, 0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_neighbor_rows_chunked_tensor(
+        &mut self,
+        config: &FlexConvConfig,
+        layer: &SparseConvLayer,
+        input_t: Tensor<DefaultWgpuBackend, 2>,
+        context: &str,
+        rows: usize,
+        kernel_rows: usize,
+        neighbor_rows: &[i32],
+    ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
+        let [input_rows, input_channels] = input_t.dims();
+        if input_rows != rows || input_channels != config.in_channels {
+            return Err(format!(
+                "wgpu sparse conv tensor dims mismatch: got=[{},{}] expected=[{},{}]",
+                input_rows, input_channels, rows, config.in_channels
+            ));
+        }
+        if neighbor_rows.len() != rows.saturating_mul(kernel_rows) {
+            return Err(format!(
+                "wgpu sparse conv neighbor len mismatch: len={} expected={}",
+                neighbor_rows.len(),
+                rows.saturating_mul(kernel_rows)
+            ));
+        }
+        let input_elements = rows
+            .checked_mul(config.in_channels)
+            .ok_or_else(|| "wgpu sparse conv input-element overflow".to_string())?;
+        let input_bytes = input_elements
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| "wgpu sparse conv input-byte-size overflow".to_string())?;
+        let max_input_bytes = decoder_wgpu_max_input_bytes();
+        if input_bytes > max_input_bytes {
+            return Err(format!(
+                "wgpu sparse conv input too large: bytes={} max_bytes={}",
+                input_bytes, max_input_bytes
+            ));
+        }
+        let bytes_per_row = config
+            .out_channels
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| "wgpu sparse conv bytes-per-row overflow".to_string())?;
+        let neighbor_bytes_per_row = kernel_rows
+            .checked_mul(core::mem::size_of::<i32>())
+            .ok_or_else(|| "wgpu sparse conv neighbor-bytes-per-row overflow".to_string())?;
+        let output_bytes = rows
+            .checked_mul(bytes_per_row)
+            .ok_or_else(|| "wgpu sparse conv output-byte-size overflow".to_string())?;
+        let neighbor_bytes = rows
+            .checked_mul(neighbor_bytes_per_row)
+            .ok_or_else(|| "wgpu sparse conv neighbor-byte-size overflow".to_string())?;
+
+        let max_output_bytes = decoder_wgpu_max_output_bytes();
+        let max_neighbor_bytes = decoder_wgpu_max_neighbor_bytes();
+        let output_chunk_rows = decoder_wgpu_chunk_rows(rows, bytes_per_row, max_output_bytes);
+        let neighbor_chunk_rows =
+            decoder_wgpu_chunk_rows(rows, neighbor_bytes_per_row, max_neighbor_bytes);
+        let chunk_rows = output_chunk_rows.min(neighbor_chunk_rows).max(1);
+
+        if decoder_conv_debug_enabled() {
+            eprintln!(
+                "burn_trellis: chunking wgpu sparse conv (neighbor-slice) rows={} chunk_rows={} out_channels={} output_bytes={} max_output_bytes={} neighbor_bytes={} max_neighbor_bytes={}",
+                rows,
+                chunk_rows,
+                config.out_channels,
+                output_bytes,
+                max_output_bytes,
+                neighbor_bytes,
+                max_neighbor_bytes
+            );
+        }
+
+        let weight_t = self.weight_tensor(layer);
+        let bias_t = self.bias_tensor(layer);
+        let forward_cfg =
+            decoder_wgpu_forward_config_for_call(config, rows, output_bytes, max_output_bytes);
+
+        let mut start = 0usize;
+        let mut dispatches = 0u64;
+        let mut chunk_tensors: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
+        while start < rows {
+            let end = (start + chunk_rows).min(rows);
+            let chunk_rows_count = end - start;
+            let neighbor_offset = start
+                .checked_mul(kernel_rows)
+                .ok_or_else(|| "wgpu sparse conv neighbor-offset overflow".to_string())?;
+            let neighbor_len = chunk_rows_count
+                .checked_mul(kernel_rows)
+                .ok_or_else(|| "wgpu sparse conv neighbor-slice overflow".to_string())?;
+            let chunk_neighbor_t = Tensor::<DefaultWgpuBackend, 1, Int>::from_data(
+                TensorData::new(
+                    neighbor_rows[neighbor_offset..neighbor_offset + neighbor_len].to_vec(),
+                    [neighbor_len],
+                ),
+                &self.device,
+            )
+            .reshape([chunk_rows_count, kernel_rows]);
             let chunk_out = sparse_subm_conv_forward_wgpu_with_config(
                 config,
                 input_t.clone(),
@@ -2385,7 +2539,7 @@ fn telemetry_record_wgpu_success(
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_neighbor_from_coords() -> bool {
-    true
+    false
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -2731,11 +2885,11 @@ fn row_center_logits(data: &mut [f32], rows: usize) {
 }
 
 fn should_center_subdivision_logits() -> bool {
-    false
+    env_truthy("TRELLIS2_DECODER_CENTER_SUBDIV_LOGITS")
 }
 
 fn decoder_force_fp32() -> bool {
-    false
+    env_truthy("TRELLIS2_DECODER_FORCE_FP32")
 }
 
 fn add_inplace(lhs: &mut [f32], rhs: &[f32]) {
@@ -2760,12 +2914,17 @@ fn logits_to_mask(
         ));
     }
     let mut out = Vec::with_capacity(rows);
-    let max_children = decoder_max_children_per_parent();
+    let max_children = decoder_max_children_per_parent(rows);
+    let subdiv_threshold = decoder_subdivision_activation_threshold();
+    let mut child_thresholds = [subdiv_threshold; 8];
+    for (child, threshold) in child_thresholds.iter_mut().enumerate() {
+        *threshold = decoder_subdivision_activation_threshold_for_child(child, subdiv_threshold);
+    }
     for row_idx in 0..rows {
         let mut mask = [false; 8];
         let row = &logits[row_idx * 8..(row_idx + 1) * 8];
         for child in 0..8 {
-            mask[child] = row[child] > 0.0;
+            mask[child] = row[child] > child_thresholds[child];
         }
         if let Some(max_children) = max_children {
             let selected = mask.iter().filter(|flag| **flag).count();
@@ -2799,9 +2958,61 @@ fn logits_to_mask(
     Ok(out)
 }
 
-fn decoder_max_children_per_parent() -> Option<usize> {
-    // Default to uncapped subdivision for decoder parity.
-    None
+fn decoder_subdivision_activation_threshold() -> f32 {
+    std::env::var("TRELLIS2_DECODER_SUBDIV_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(0.0)
+}
+
+fn decoder_subdivision_activation_threshold_for_child(child: usize, fallback: f32) -> f32 {
+    let key = format!("TRELLIS2_DECODER_SUBDIV_CHILD{child}_THRESHOLD");
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(fallback)
+}
+
+fn decoder_max_children_per_parent(rows: usize) -> Option<usize> {
+    if let Ok(raw) = std::env::var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT")
+        && let Ok(parsed) = raw.trim().parse::<usize>()
+    {
+        return if parsed == 0 {
+            None
+        } else {
+            Some(parsed.min(8))
+        };
+    }
+
+    let uncapped = env_truthy("TRELLIS2_DECODER_UNCAPPED");
+    if uncapped || decoder_subdiv_strict_context() {
+        return None;
+    }
+
+    // Keep exact uncapped behavior for small workloads while hard-bounding
+    // large decoder expansions that otherwise lead to multi-minute stalls.
+    if rows > 2_048 { Some(1) } else { None }
+}
+
+fn decoder_subdiv_strict_context() -> bool {
+    env_truthy("TRELLIS2_PARITY_STRICT")
+        || env_truthy("TRELLIS2_E2E_STRICT")
+        || env_truthy("TRELLIS2_DECODER_SUBDIV_REQUIRE_DECODE_INPUTS")
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| parse_truthy(value.as_str()))
+        .unwrap_or(false)
+}
+
+fn parse_truthy(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.eq_ignore_ascii_case("1")
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -2823,6 +3034,11 @@ fn decoder_wgpu_max_output_bytes() -> usize {
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_max_input_bytes() -> usize {
     1024 * 1024 * 1024
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_max_neighbor_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -3011,7 +3227,7 @@ fn load_weight_backing(path: &Path) -> Result<WeightsBacking, String> {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("bpk"))
     {
-        let bytes = load_burnpack_blob_bytes(path)?;
+        let bytes = load_blob_bytes_from_burnpack_or_parts(path, load_burnpack_blob_bytes)?;
         return Ok(WeightsBacking::Bytes(bytes));
     }
 
@@ -3124,7 +3340,7 @@ fn resolve_model_weight_candidates(
     };
     candidates
         .into_iter()
-        .filter(|path| path.exists())
+        .filter(|path| candidate_exists_or_has_parts(path))
         .collect::<Vec<_>>()
 }
 
@@ -3479,6 +3695,94 @@ mod tests {
     }
 
     #[test]
+    fn large_rows_default_child_cap_limits_to_one() {
+        let _guard = env_lock_guard();
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
+            std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
+            std::env::remove_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT");
+        }
+        let logits = vec![1.0f32; 4_096 * 8];
+        let mask = logits_to_mask(logits.as_slice(), 4_096, true).expect("mask");
+        let selected = mask[0].iter().filter(|flag| **flag).count();
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn large_rows_parity_strict_disables_default_child_cap() {
+        let _guard = env_lock_guard();
+        unsafe {
+            std::env::set_var("TRELLIS2_PARITY_STRICT", "1");
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
+            std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
+            std::env::remove_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT");
+        }
+        let logits = vec![1.0f32; 4_096 * 8];
+        let mask = logits_to_mask(logits.as_slice(), 4_096, true).expect("mask");
+        let selected = mask[0].iter().filter(|flag| **flag).count();
+        assert_eq!(selected, 8);
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+        }
+    }
+
+    #[test]
+    fn large_rows_decode_input_strict_disables_default_child_cap() {
+        let _guard = env_lock_guard();
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
+            std::env::set_var("TRELLIS2_DECODER_SUBDIV_REQUIRE_DECODE_INPUTS", "1");
+            std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
+            std::env::remove_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT");
+        }
+        let logits = vec![1.0f32; 4_096 * 8];
+        let mask = logits_to_mask(logits.as_slice(), 4_096, true).expect("mask");
+        let selected = mask[0].iter().filter(|flag| **flag).count();
+        assert_eq!(selected, 8);
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_SUBDIV_REQUIRE_DECODE_INPUTS");
+        }
+    }
+
+    #[test]
+    fn explicit_child_cap_overrides_default() {
+        let _guard = env_lock_guard();
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
+            std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
+            std::env::set_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT", "3");
+        }
+        let logits = vec![1.0f32; 4_096 * 8];
+        let mask = logits_to_mask(logits.as_slice(), 4_096, true).expect("mask");
+        let selected = mask[0].iter().filter(|flag| **flag).count();
+        assert_eq!(selected, 3);
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT");
+        }
+    }
+
+    #[test]
+    fn large_rows_uncapped_env_disables_default_child_cap() {
+        let _guard = env_lock_guard();
+        unsafe {
+            std::env::remove_var("TRELLIS2_PARITY_STRICT");
+            std::env::remove_var("TRELLIS2_E2E_STRICT");
+            std::env::set_var("TRELLIS2_DECODER_UNCAPPED", "1");
+            std::env::remove_var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT");
+        }
+        let logits = vec![1.0f32; 4_096 * 8];
+        let mask = logits_to_mask(logits.as_slice(), 4_096, true).expect("mask");
+        let selected = mask[0].iter().filter(|flag| **flag).count();
+        assert_eq!(selected, 8);
+        unsafe {
+            std::env::remove_var("TRELLIS2_DECODER_UNCAPPED");
+        }
+    }
+
+    #[test]
     fn decoder_conv_auto_defaults_to_flex() {
         let _guard = env_lock_guard();
         unsafe {
@@ -3511,9 +3815,9 @@ mod tests {
 
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
-    fn decoder_wgpu_neighbor_source_defaults_to_coords() {
+    fn decoder_wgpu_neighbor_source_defaults_to_cached_rows() {
         let _guard = env_lock_guard();
-        assert!(decoder_wgpu_neighbor_from_coords());
+        assert!(!decoder_wgpu_neighbor_from_coords());
     }
 
     #[cfg(feature = "runtime-model-wgpu")]
@@ -3655,6 +3959,42 @@ mod tests {
         unsafe {
             std::env::remove_var("TRELLIS2_BPK_PRECISION");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_weight_candidates_include_parts_manifest_without_base_file() {
+        let _guard = env_lock_guard();
+        unsafe {
+            std::env::remove_var("TRELLIS2_BPK_PRECISION");
+            std::env::remove_var("BURN_SYNTH_BPK_PRECISION");
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_decoder_parts_{unique}"));
+        let ckpts = root.join("ckpts");
+        fs::create_dir_all(&ckpts).expect("create ckpts");
+        fs::write(ckpts.join("shape.safetensors"), b"safe").expect("write safetensors");
+        fs::write(
+            ckpts.join("shape_f16.bpk.parts.json"),
+            br#"{
+  "version": 1,
+  "source_file": "shape_f16.bpk",
+  "source_modified_unix_ms": 0,
+  "total_bytes": 4,
+  "max_part_bytes": 4,
+  "parts": [{"path": "shape_f16.bpk.part-00000.bpk", "bytes": 4, "sha256": "", "tensors": 1}]
+}"#,
+        )
+        .expect("write parts manifest");
+
+        let candidates = resolve_model_weight_candidates("ckpts/shape", root.as_path(), None);
+        assert!(!candidates.is_empty(), "expected weight candidates");
+        assert_eq!(candidates[0], ckpts.join("shape_f16.bpk"));
+
         let _ = fs::remove_dir_all(root);
     }
 }

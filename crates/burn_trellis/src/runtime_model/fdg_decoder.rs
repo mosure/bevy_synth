@@ -9,6 +9,7 @@ pub(crate) struct FdgDecodedOutput {
     pub coords: Vec<[u32; 4]>,
     pub vertices: Vec<[f32; 3]>,
     pub intersected: Vec<[bool; 3]>,
+    pub intersection_logits: Vec<[f32; 3]>,
     pub quad_lerp: Vec<f32>,
     pub subdivisions: Vec<SparseSubdivisionLogits>,
 }
@@ -87,6 +88,7 @@ fn decode_fdg_outputs(
 
     let mut vertices = Vec::with_capacity(row_count);
     let mut intersected = Vec::with_capacity(row_count);
+    let mut intersection_logits = Vec::with_capacity(row_count);
     let mut quad_lerp = Vec::with_capacity(row_count);
     for row_idx in 0..row_count {
         let row =
@@ -95,7 +97,9 @@ fn decode_fdg_outputs(
         let vy = (1.0 + 2.0 * voxel_margin) * sigmoid(row[1]) - voxel_margin;
         let vz = (1.0 + 2.0 * voxel_margin) * sigmoid(row[2]) - voxel_margin;
         vertices.push([vx, vy, vz]);
-        intersected.push([row[3] > 0.0, row[4] > 0.0, row[5] > 0.0]);
+        let logits = [row[3], row[4], row[5]];
+        intersected.push([logits[0] > 0.0, logits[1] > 0.0, logits[2] > 0.0]);
+        intersection_logits.push(logits);
         quad_lerp.push(softplus(row[6]));
     }
 
@@ -103,6 +107,7 @@ fn decode_fdg_outputs(
         coords: decoded.coords.clone(),
         vertices,
         intersected,
+        intersection_logits,
         quad_lerp,
         subdivisions: decoded.subdivisions.clone(),
     })

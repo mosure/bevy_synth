@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use burn_trellis::TrellisQuality;
 use burn_trellis::pipeline::{
@@ -8,11 +8,16 @@ use clap::Parser;
 use serde_json::json;
 
 #[derive(Parser, Debug)]
-#[command(about = "Run burn_trellis pipeline and optionally emit OBJ + safetensors hook")]
+#[command(about = "Run burn_trellis pipeline and optionally emit OBJ/GLB + safetensors hook")]
 struct Args {
     /// Input image path.
-    #[arg(long)]
-    input_image: PathBuf,
+    #[arg(long = "input", alias = "input-image")]
+    input: PathBuf,
+
+    /// Optional GLB output path. If omitted, no GLB is written.
+    /// If the path has no extension (or is a directory), `<input>_mesh.glb` is used.
+    #[arg(long = "output", alias = "output-glb")]
+    output: Option<PathBuf>,
 
     /// Optional OBJ output path.
     #[arg(long)]
@@ -27,20 +32,20 @@ struct Args {
     noise_overrides_hook: Option<PathBuf>,
 
     /// Optional Trellis2 weights root (defaults to env/probed root).
-    #[arg(long)]
+    #[arg(long = "weights-root", alias = "trellis-weights-root")]
     weights_root: Option<PathBuf>,
 
     /// Optional TRELLIS-image-large root.
-    #[arg(long)]
+    #[arg(long = "image-large-root", alias = "trellis-image-large-root")]
     image_large_root: Option<PathBuf>,
 
     /// Runtime quality preset.
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     quality: TrellisQuality,
 
-    /// Runtime device target.
-    #[arg(long, value_enum, default_value_t = TrellisDevice::Auto)]
-    device: TrellisDevice,
+    /// Runtime backend target.
+    #[arg(long = "backend", alias = "device", value_enum, default_value_t = TrellisDevice::Auto)]
+    backend: TrellisDevice,
 
     /// Optional deterministic seed.
     #[arg(long)]
@@ -57,17 +62,25 @@ struct Args {
     /// Number of repeated in-process runs (reuses the loaded runtime cache).
     #[arg(long, default_value_t = 1)]
     repeat: usize,
+
+    /// Optional cap on sparse coords before decode. Use lower values for short strict passes.
+    #[arg(long)]
+    max_sparse_coords: Option<usize>,
 }
 
 fn run() -> Result<(), String> {
     let args = Args::parse();
+    let output_glb = args
+        .output
+        .as_ref()
+        .map(|path| resolve_glb_output_path(path.as_path(), args.input.as_path()));
 
     let mut config = Trellis2PipelineConfig::default();
-    if let Some(path) = args.weights_root {
-        config.weights_root = path;
+    if let Some(path) = args.weights_root.as_ref() {
+        config.weights_root = path.clone();
     }
-    if let Some(path) = args.image_large_root {
-        config.image_large_root = Some(path);
+    if let Some(path) = args.image_large_root.as_ref() {
+        config.image_large_root = Some(path.clone());
     }
 
     let pipeline = Trellis2Pipeline::new(config).map_err(|err| err.to_string())?;
@@ -78,7 +91,7 @@ fn run() -> Result<(), String> {
     for run_idx in 0..repeat {
         let options = TrellisRunOptions {
             quality: args.quality,
-            device: args.device,
+            device: args.backend,
             seed: args.seed,
             hook_output: if run_idx + 1 == repeat {
                 args.hook_output.clone()
@@ -86,9 +99,10 @@ fn run() -> Result<(), String> {
                 None
             },
             noise_overrides_hook: args.noise_overrides_hook.clone(),
+            max_sparse_coords: args.max_sparse_coords,
         };
         let profiled = pipeline
-            .infer_mesh_profile(&args.input_image, &options)
+            .infer_mesh_profile(&args.input, &options)
             .map_err(|err| err.to_string())?;
         if args.require_runtime_model && profiled.sparse_source.as_str() == "synthetic" {
             return Err(
@@ -101,11 +115,29 @@ fn run() -> Result<(), String> {
                     "strict benchmark failed: sparse stage used synthetic fallback".to_string(),
                 );
             }
+            if matches!(args.backend, TrellisDevice::Wgpu)
+                && profiled.sparse_source.as_str() != "runtime_model_wgpu"
+            {
+                return Err(format!(
+                    "strict benchmark failed: requested wgpu but sparse stage source was '{}'",
+                    profiled.sparse_source.as_str()
+                ));
+            }
             if profiled.decode_source.is_fallback() {
                 return Err(format!(
                     "strict benchmark failed: decode stage used fallback source '{}'",
                     profiled.decode_source.as_str()
                 ));
+            }
+            if matches!(args.backend, TrellisDevice::Wgpu)
+                && profiled.timings.decode_shape_wgpu_dispatches == 0
+                && profiled.timings.decode_tex_wgpu_dispatches == 0
+                && profiled.decode_source.as_str() != "runtime_hook_override"
+            {
+                return Err(
+                    "strict benchmark failed: requested wgpu but decode emitted zero wgpu dispatches"
+                        .to_string(),
+                );
             }
         }
         runs.push(profiled);
@@ -116,12 +148,18 @@ fn run() -> Result<(), String> {
     if let Some(obj_path) = args.output_obj.as_ref() {
         burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
+    if let Some(glb_path) = output_glb.as_ref() {
+        burn_trellis::write_glb_mesh(glb_path, &profiled.mesh).map_err(|err| err.to_string())?;
+    }
 
     let timings_json = |profiled: &burn_trellis::pipeline::TrellisInferenceProfile| {
         json!({
             "preprocess": profiled.timings.preprocess_ms,
             "runtime_setup": profiled.timings.runtime_setup_ms,
             "sparse": profiled.timings.sparse_ms,
+            "sparse_cond": profiled.timings.sparse_cond_ms,
+            "sparse_sample": profiled.timings.sparse_sample_ms,
+            "sparse_post": profiled.timings.sparse_post_ms,
             "shape_slat": profiled.timings.shape_slat_ms,
             "tex_slat": profiled.timings.tex_slat_ms,
             "decode": profiled.timings.decode_ms,
@@ -157,10 +195,12 @@ fn run() -> Result<(), String> {
                 "vertices": profiled.mesh.vertices.len(),
                 "faces": profiled.mesh.faces.len(),
                 "elapsed_ms": profiled.timings.total_ms,
-                "device": args.device.as_str(),
+                "backend": args.backend.as_str(),
+                "device": args.backend.as_str(),
                 "quality": args.quality.as_str(),
                 "strict_benchmark": args.strict_benchmark,
                 "repeat": repeat,
+                "max_sparse_coords": args.max_sparse_coords,
                 "sparse_source": profiled.sparse_source.as_str(),
                 "decode_source": profiled.decode_source.as_str(),
                 "fallbacks": {
@@ -171,6 +211,7 @@ fn run() -> Result<(), String> {
                 "hook_output": args.hook_output,
                 "noise_overrides_hook": args.noise_overrides_hook,
                 "output_obj": args.output_obj,
+                "output_glb": output_glb,
             })
         );
     } else {
@@ -201,10 +242,12 @@ fn run() -> Result<(), String> {
             "{}",
             json!({
                 "status": "ok",
-                "device": args.device.as_str(),
+                "backend": args.backend.as_str(),
+                "device": args.backend.as_str(),
                 "quality": args.quality.as_str(),
                 "strict_benchmark": args.strict_benchmark,
                 "repeat": repeat,
+                "max_sparse_coords": args.max_sparse_coords,
                 "summary": {
                     "runtime_setup_mean_ms": setup_mean,
                     "total_mean_ms": total_mean,
@@ -221,10 +264,31 @@ fn run() -> Result<(), String> {
                 "hook_output": args.hook_output,
                 "noise_overrides_hook": args.noise_overrides_hook,
                 "output_obj": args.output_obj,
+                "output_glb": output_glb,
             })
         );
     }
     Ok(())
+}
+
+fn resolve_glb_output_path(output: &Path, input: &Path) -> PathBuf {
+    if output.extension().is_none() || output.is_dir() {
+        let stem = input
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mesh");
+        return output.join(format!("{stem}_mesh.glb"));
+    }
+    if output
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("glb"))
+        .unwrap_or(false)
+    {
+        output.to_path_buf()
+    } else {
+        output.with_extension("glb")
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -244,5 +308,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             Err(message.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_burn_synth_style_aliases() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--output",
+            "out_mesh",
+            "--backend",
+            "wgpu",
+            "--weights-root",
+            "weights",
+            "--image-large-root",
+            "image_large",
+        ]);
+        assert_eq!(args.input, PathBuf::from("input.png"));
+        assert_eq!(args.output, Some(PathBuf::from("out_mesh")));
+        assert!(matches!(args.backend, TrellisDevice::Wgpu));
+        assert_eq!(args.weights_root, Some(PathBuf::from("weights")));
+        assert_eq!(args.image_large_root, Some(PathBuf::from("image_large")));
+    }
+
+    #[test]
+    fn accepts_legacy_trellis2_run_aliases() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input-image",
+            "input.png",
+            "--output-glb",
+            "mesh_out",
+            "--device",
+            "cpu",
+            "--trellis-weights-root",
+            "weights",
+            "--trellis-image-large-root",
+            "image_large",
+        ]);
+        assert_eq!(args.input, PathBuf::from("input.png"));
+        assert_eq!(args.output, Some(PathBuf::from("mesh_out")));
+        assert!(matches!(args.backend, TrellisDevice::Cpu));
+        assert_eq!(args.weights_root, Some(PathBuf::from("weights")));
+        assert_eq!(args.image_large_root, Some(PathBuf::from("image_large")));
+    }
+
+    #[test]
+    fn output_path_resolution_matches_burn_synth_behavior() {
+        let input = Path::new("chair.png");
+        assert_eq!(
+            resolve_glb_output_path(Path::new("tmp/out"), input),
+            PathBuf::from("tmp/out/chair_mesh.glb")
+        );
+        assert_eq!(
+            resolve_glb_output_path(Path::new("tmp/out.obj"), input),
+            PathBuf::from("tmp/out.glb")
+        );
+        assert_eq!(
+            resolve_glb_output_path(Path::new("tmp/out.glb"), input),
+            PathBuf::from("tmp/out.glb")
+        );
     }
 }

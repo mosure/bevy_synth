@@ -1,7 +1,11 @@
 use super::*;
 use std::collections::VecDeque;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "uv-xatlas",
+    not(target_arch = "wasm32"),
+    target_os = "windows"
+))]
 use xatlas_rs::{ChartOptions, IndexFormat, MeshDecl, PackOptions, Xatlas};
 
 // Internal helpers for TRELLIS staged decode, mesh extraction, and PBR baking.
@@ -481,14 +485,23 @@ fn build_uv_raster_domain(
     faces: &[[u32; 3]],
     texture_size: usize,
 ) -> UvRasterDomain {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(not(all(
+        feature = "uv-xatlas",
+        not(target_arch = "wasm32"),
+        target_os = "windows"
+    )))]
     let _ = texture_size;
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(
+        feature = "uv-xatlas",
+        not(target_arch = "wasm32"),
+        target_os = "windows"
+    ))]
     if let Some(domain) = build_uv_raster_domain_xatlas(vertices, faces, texture_size) {
         return domain;
     }
 
+    // Portable default path when xatlas is unavailable/disabled.
     let output_uvs = box_uv_unwrap(vertices, faces);
     UvRasterDomain {
         output_uvs: output_uvs.clone(),
@@ -498,7 +511,11 @@ fn build_uv_raster_domain(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "uv-xatlas",
+    not(target_arch = "wasm32"),
+    target_os = "windows"
+))]
 fn build_uv_raster_domain_xatlas(
     vertices: &[[f32; 3]],
     faces: &[[u32; 3]],
@@ -604,7 +621,11 @@ fn build_uv_raster_domain_xatlas(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "uv-xatlas",
+    not(target_arch = "wasm32"),
+    target_os = "windows"
+))]
 fn as_byte_slice<T>(slice: &[T]) -> &[u8] {
     let len = std::mem::size_of_val(slice);
     let ptr = slice.as_ptr() as *const u8;
@@ -1166,7 +1187,9 @@ pub(super) fn sparse_resolution_for_pipeline(pipeline_type: &str) -> usize {
     match pipeline_type {
         "512" | "512_base" => 32,
         "1024" | "1024_single" => 64,
-        "1024_cascade" => 32,
+        // Until canonical two-pass cascade is implemented, keep single-pass
+        // 1024_cascade on a 64³ sparse lattice to avoid collapsing detail.
+        "1024_cascade" => 64,
         "1536_cascade" => 32,
         _ => 32,
     }

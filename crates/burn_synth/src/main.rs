@@ -46,6 +46,12 @@ struct Cli {
     #[arg(long)]
     trellis_bridge_script: Option<PathBuf>,
 
+    #[arg(long)]
+    trellis_noise_overrides_hook: Option<PathBuf>,
+
+    #[arg(long)]
+    trellis_max_sparse_coords: Option<usize>,
+
     #[arg(long, value_enum, default_value_t = CliTrellisQuality::Medium)]
     trellis_quality: CliTrellisQuality,
 
@@ -274,6 +280,8 @@ fn run(cli: Cli) -> Result<(), String> {
         trellis_image_large_root: cli.trellis_image_large_root,
         trellis_python_bin: cli.trellis_python_bin,
         trellis_bridge_script: cli.trellis_bridge_script,
+        trellis_noise_overrides_hook: cli.trellis_noise_overrides_hook,
+        trellis_max_sparse_coords: cli.trellis_max_sparse_coords,
         trellis_quality: cli.trellis_quality.into(),
         bg_weights_root: cli.bg_weights_root,
         num_steps: cli.num_steps.unwrap_or(quality_defaults.num_steps),

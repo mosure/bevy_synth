@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshMaterial {
@@ -204,11 +205,165 @@ pub fn write_obj_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
     Ok(())
 }
 
+pub fn write_glb_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
+    if mesh.vertices.is_empty() || mesh.faces.is_empty() {
+        return Err("cannot export empty mesh".to_string());
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
+    }
+
+    let mut positions = Vec::with_capacity(mesh.vertices.len() * 12);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for vertex in &mesh.vertices {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex[axis]);
+            max[axis] = max[axis].max(vertex[axis]);
+        }
+        positions.extend_from_slice(&vertex[0].to_le_bytes());
+        positions.extend_from_slice(&vertex[1].to_le_bytes());
+        positions.extend_from_slice(&vertex[2].to_le_bytes());
+    }
+
+    let mut indices = Vec::with_capacity(mesh.faces.len() * 12);
+    for face in &mesh.faces {
+        indices.extend_from_slice(&face[0].to_le_bytes());
+        indices.extend_from_slice(&face[1].to_le_bytes());
+        indices.extend_from_slice(&face[2].to_le_bytes());
+    }
+
+    let mut bin = Vec::with_capacity(positions.len() + indices.len() + 8);
+    let position_offset = 0usize;
+    bin.extend_from_slice(positions.as_slice());
+    pad_buffer_to_4_bytes(&mut bin, 0);
+    let position_len = positions.len();
+    let index_offset = bin.len();
+    bin.extend_from_slice(indices.as_slice());
+    let index_len = indices.len();
+    pad_buffer_to_4_bytes(&mut bin, 0);
+
+    let mut primitive = serde_json::Map::new();
+    primitive.insert("attributes".to_string(), json!({ "POSITION": 0 }));
+    primitive.insert("indices".to_string(), json!(1));
+    primitive.insert("mode".to_string(), json!(4));
+
+    if let Some(material) = mesh.material {
+        primitive.insert("material".to_string(), json!(0));
+        let json_value = json!({
+            "asset": { "version": "2.0", "generator": "burn_trellis" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [primitive] }],
+            "materials": [{
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [material.base_color[0], material.base_color[1], material.base_color[2], material.alpha],
+                    "metallicFactor": material.metallic,
+                    "roughnessFactor": material.roughness
+                }
+            }],
+            "buffers": [{ "byteLength": bin.len() }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": position_offset, "byteLength": position_len, "target": 34962 },
+                { "buffer": 0, "byteOffset": index_offset, "byteLength": index_len, "target": 34963 }
+            ],
+            "accessors": [
+                {
+                    "bufferView": 0,
+                    "componentType": 5126,
+                    "count": mesh.vertices.len(),
+                    "type": "VEC3",
+                    "min": [min[0], min[1], min[2]],
+                    "max": [max[0], max[1], max[2]]
+                },
+                {
+                    "bufferView": 1,
+                    "componentType": 5125,
+                    "count": mesh.faces.len() * 3,
+                    "type": "SCALAR"
+                }
+            ]
+        });
+        return write_glb_bytes(path, json_value, bin);
+    }
+
+    let json_value = json!({
+        "asset": { "version": "2.0", "generator": "burn_trellis" },
+        "scene": 0,
+        "scenes": [{ "nodes": [0] }],
+        "nodes": [{ "mesh": 0 }],
+        "meshes": [{ "primitives": [primitive] }],
+        "buffers": [{ "byteLength": bin.len() }],
+        "bufferViews": [
+            { "buffer": 0, "byteOffset": position_offset, "byteLength": position_len, "target": 34962 },
+            { "buffer": 0, "byteOffset": index_offset, "byteLength": index_len, "target": 34963 }
+        ],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": mesh.vertices.len(),
+                "type": "VEC3",
+                "min": [min[0], min[1], min[2]],
+                "max": [max[0], max[1], max[2]]
+            },
+            {
+                "bufferView": 1,
+                "componentType": 5125,
+                "count": mesh.faces.len() * 3,
+                "type": "SCALAR"
+            }
+        ]
+    });
+    write_glb_bytes(path, json_value, bin)
+}
+
+fn write_glb_bytes(
+    path: &Path,
+    json_value: serde_json::Value,
+    mut bin: Vec<u8>,
+) -> Result<(), String> {
+    let mut json_bytes = serde_json::to_vec(&json_value)
+        .map_err(|err| format!("failed to serialize glb json: {err}"))?;
+    pad_buffer_to_4_bytes(&mut json_bytes, 0x20);
+    pad_buffer_to_4_bytes(&mut bin, 0);
+
+    let json_chunk_len = json_bytes.len() as u32;
+    let bin_chunk_len = bin.len() as u32;
+    let total_len = 12u32 + 8 + json_chunk_len + 8 + bin_chunk_len;
+
+    let mut glb = Vec::with_capacity(total_len as usize);
+    glb.extend_from_slice(&0x4654_6C67u32.to_le_bytes());
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&total_len.to_le_bytes());
+    glb.extend_from_slice(&json_chunk_len.to_le_bytes());
+    glb.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+    glb.extend_from_slice(json_bytes.as_slice());
+    glb.extend_from_slice(&bin_chunk_len.to_le_bytes());
+    glb.extend_from_slice(&0x004E_4942u32.to_le_bytes());
+    glb.extend_from_slice(bin.as_slice());
+
+    fs::write(path, glb).map_err(|err| format!("failed to write '{}': {err}", path.display()))
+}
+
+fn pad_buffer_to_4_bytes(buffer: &mut Vec<u8>, byte: u8) {
+    let remainder = buffer.len() % 4;
+    if remainder == 0 {
+        return;
+    }
+    let pad = 4 - remainder;
+    buffer.extend(std::iter::repeat_n(byte, pad));
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Mesh, load_obj_mesh, write_obj_mesh};
+    use super::{Mesh, load_obj_mesh, write_glb_mesh, write_obj_mesh};
 
     #[test]
     fn obj_roundtrip_works() {
@@ -227,6 +382,27 @@ mod tests {
         write_obj_mesh(&path, &mesh).expect("failed to write obj");
         let loaded = load_obj_mesh(&path).expect("failed to read obj");
         assert_eq!(loaded, mesh);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn glb_writer_emits_glb_header() {
+        let mesh = Mesh {
+            vertices: vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]],
+            faces: vec![[0, 1, 2]],
+            uvs: Vec::new(),
+            material: None,
+            pbr_textures: None,
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("burn_trellis_mesh_{unique}.glb"));
+        write_glb_mesh(&path, &mesh).expect("failed to write glb");
+        let bytes = std::fs::read(&path).expect("failed to read glb");
+        assert!(bytes.len() >= 12, "glb must contain header");
+        assert_eq!(&bytes[0..4], b"glTF");
         let _ = std::fs::remove_file(path);
     }
 }

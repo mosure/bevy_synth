@@ -70,6 +70,13 @@ fn warn_synthetic_cond_fallback() {
     );
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SparseStructureRuntimeProfile {
+    pub cond_prepare_ms: f64,
+    pub sample_ms: f64,
+    pub postprocess_ms: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SparseStructureSample {
     pub source: SparseStructureStageSource,
@@ -85,6 +92,7 @@ pub struct SparseStructureSample {
     pub step_last_x_t: Vec<f32>,
     pub latent: Vec<f32>,
     pub coords: Vec<[u32; 4]>,
+    pub runtime_profile: Option<SparseStructureRuntimeProfile>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -107,6 +115,7 @@ impl SparseStructureStageSource {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DecodeStageSource {
     Runtime,
+    RuntimeHookOverride,
     FallbackSkipDecode,
     FallbackMissingShapeDecoder,
     FallbackMissingTexDecoder,
@@ -119,6 +128,7 @@ impl DecodeStageSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Runtime => "runtime",
+            Self::RuntimeHookOverride => "runtime_hook_override",
             Self::FallbackSkipDecode => "fallback_skip_decode",
             Self::FallbackMissingShapeDecoder => "fallback_missing_shape_decoder",
             Self::FallbackMissingTexDecoder => "fallback_missing_tex_decoder",
@@ -129,7 +139,7 @@ impl DecodeStageSource {
     }
 
     pub fn is_fallback(self) -> bool {
-        !matches!(self, Self::Runtime)
+        !matches!(self, Self::Runtime | Self::RuntimeHookOverride)
     }
 }
 
@@ -171,6 +181,8 @@ pub struct TrellisStageOutput {
     pub sparse: SparseStructureSample,
     pub shape_slat: ShapeSLatSample,
     pub tex_slat: TexSLatSample,
+    pub decode_shape_input: Option<SparseRowNoiseOverride>,
+    pub decode_tex_input: Option<SparseRowNoiseOverride>,
     pub decode_source: DecodeStageSource,
     pub decode_shape_subs: Vec<DecodeShapeSubSample>,
     pub decode_tex_voxels: DecodeTexVoxelSample,
@@ -242,6 +254,9 @@ pub struct PbrBakeDebug {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrellisStageTimings {
     pub sparse_ms: f64,
+    pub sparse_cond_ms: f64,
+    pub sparse_sample_ms: f64,
+    pub sparse_post_ms: f64,
     pub shape_slat_ms: f64,
     pub tex_slat_ms: f64,
     pub decode_ms: f64,
@@ -265,6 +280,21 @@ pub struct TrellisStageTimings {
     pub total_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrellisStageRunConfig {
+    pub max_sparse_coords: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrellisSamplerRuntimeOverrides {
+    pub sparse_steps: Option<usize>,
+    pub shape_steps: Option<usize>,
+    pub tex_steps: Option<usize>,
+    pub sparse_guidance_strength: Option<f32>,
+    pub shape_guidance_strength: Option<f32>,
+    pub tex_guidance_strength: Option<f32>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SparseRowNoiseOverride {
     pub coords: Vec<[u32; 4]>,
@@ -277,6 +307,14 @@ pub struct TrellisNoiseOverrides {
     pub sparse_coords: Option<Vec<[u32; 4]>>,
     pub shape_noise: Option<SparseRowNoiseOverride>,
     pub tex_noise: Option<SparseRowNoiseOverride>,
+    pub shape_slat: Option<SparseRowNoiseOverride>,
+    pub tex_slat: Option<SparseRowNoiseOverride>,
+    pub decode_shape_input: Option<SparseRowNoiseOverride>,
+    pub decode_tex_input: Option<SparseRowNoiseOverride>,
+    pub decode_shape_subs: Option<Vec<DecodeShapeSubSample>>,
+    pub decode_tex_voxels: Option<DecodeTexVoxelSample>,
+    pub decode_mesh_vertices: Option<Vec<[f32; 3]>>,
+    pub decode_mesh_faces: Option<Vec<[u32; 3]>>,
     pub shape_noise_dense: Option<Vec<f32>>,
     pub tex_noise_dense: Option<Vec<f32>>,
     pub sparse_sampler: Option<SamplerConfigOverride>,
@@ -300,6 +338,14 @@ impl TrellisNoiseOverrides {
             && self.sparse_coords.is_none()
             && self.shape_noise.is_none()
             && self.tex_noise.is_none()
+            && self.shape_slat.is_none()
+            && self.tex_slat.is_none()
+            && self.decode_shape_input.is_none()
+            && self.decode_tex_input.is_none()
+            && self.decode_shape_subs.is_none()
+            && self.decode_tex_voxels.is_none()
+            && self.decode_mesh_vertices.is_none()
+            && self.decode_mesh_faces.is_none()
             && self.shape_noise_dense.is_none()
             && self.tex_noise_dense.is_none()
             && self.sparse_sampler.is_none()
@@ -373,7 +419,7 @@ struct DecoderRuntimeLoadSpec {
 
 impl TrellisStageRuntime {
     pub fn from_args(args: &TrellisPipelineArgs, preferred_pipeline_type: Option<&str>) -> Self {
-        Self::from_args_with_assets(args, preferred_pipeline_type, None, None, false)
+        Self::from_args_with_assets(args, preferred_pipeline_type, None, None, false, None)
     }
 
     pub fn from_args_with_assets(
@@ -382,6 +428,7 @@ impl TrellisStageRuntime {
         _weights_root: Option<&Path>,
         _image_large_root: Option<&Path>,
         _prefer_wgpu: bool,
+        sampler_overrides: Option<TrellisSamplerRuntimeOverrides>,
     ) -> Self {
         let pipeline_type = preferred_pipeline_type
             .unwrap_or(args.default_pipeline_type.as_str())
@@ -395,6 +442,35 @@ impl TrellisStageRuntime {
         let mut sparse_sampler = args.sparse_structure_sampler.clone();
         let mut shape_sampler = args.shape_slat_sampler.clone();
         let mut tex_sampler = args.tex_slat_sampler.clone();
+        if let Some(overrides) = sampler_overrides {
+            if let Some(steps) = overrides.sparse_steps {
+                sparse_sampler.params.steps = steps.max(1);
+            }
+            if let Some(steps) = overrides.shape_steps {
+                shape_sampler.params.steps = steps.max(1);
+            }
+            if let Some(steps) = overrides.tex_steps {
+                tex_sampler.params.steps = steps.max(1);
+            }
+            if let Some(strength) = overrides.sparse_guidance_strength {
+                sparse_sampler.params.guidance_strength = strength;
+            }
+            if let Some(strength) = overrides.shape_guidance_strength {
+                shape_sampler.params.guidance_strength = strength;
+            }
+            if let Some(strength) = overrides.tex_guidance_strength {
+                tex_sampler.params.guidance_strength = strength;
+            }
+            trellis_stage_log!(
+                "burn_trellis: sampler overrides active (sparse_steps={}, shape_steps={}, tex_steps={}, sparse_guidance={:.3}, shape_guidance={:.3}, tex_guidance={:.3})",
+                sparse_sampler.params.steps,
+                shape_sampler.params.steps,
+                tex_sampler.params.steps,
+                sparse_sampler.params.guidance_strength,
+                shape_sampler.params.guidance_strength,
+                tex_sampler.params.guidance_strength
+            );
+        }
         if let Some(steps_override) = runtime_sampler_steps_override() {
             sparse_sampler.params.steps = steps_override;
             shape_sampler.params.steps = steps_override;
@@ -408,7 +484,22 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let runtime_decoders_disabled = false;
         #[cfg(feature = "runtime-model")]
-        let slat_dense_resolution = None;
+        let slat_dense_resolution = if pipeline_type_uses_cascade(pipeline_type.as_str()) {
+            // The current 1024 cascade path is single-pass and cannot practically
+            // execute full 64^3 dense slat attention end-to-end on strict WGPU runs.
+            // Keep a bounded dense resolution so downstream decode/extract/PBR stages
+            // are reachable while canonical two-pass cascade is being implemented.
+            Some(32usize)
+        } else {
+            None
+        };
+        #[cfg(feature = "runtime-model")]
+        if let Some(resolution) = slat_dense_resolution {
+            trellis_stage_log!(
+                "burn_trellis: using bounded slat dense resolution override (resolution={resolution}) for pipeline='{}'",
+                pipeline_type
+            );
+        }
         #[cfg(feature = "runtime-model")]
         let prefer_512_slat = matches!(pipeline_type.as_str(), "512" | "512_base");
         #[cfg(feature = "runtime-model")]
@@ -692,8 +783,14 @@ impl TrellisStageRuntime {
         seed: u64,
         noise_overrides: Option<&TrellisNoiseOverrides>,
     ) -> Result<TrellisStageOutput, String> {
-        self.run_profiled_with_overrides(preprocess, seed, noise_overrides, false)
-            .map(|(output, _timings)| output)
+        self.run_profiled_with_overrides(
+            preprocess,
+            seed,
+            noise_overrides,
+            false,
+            TrellisStageRunConfig::default(),
+        )
+        .map(|(output, _timings)| output)
     }
 
     pub fn run_profiled(
@@ -701,7 +798,13 @@ impl TrellisStageRuntime {
         preprocess: &PreprocessOutput,
         seed: u64,
     ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
-        self.run_profiled_with_overrides(preprocess, seed, None, false)
+        self.run_profiled_with_overrides(
+            preprocess,
+            seed,
+            None,
+            false,
+            TrellisStageRunConfig::default(),
+        )
     }
 
     pub fn run_profiled_with_overrides(
@@ -710,10 +813,11 @@ impl TrellisStageRuntime {
         seed: u64,
         noise_overrides: Option<&TrellisNoiseOverrides>,
         capture_sampler_trace: bool,
+        run_config: TrellisStageRunConfig,
     ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
         let total_start = Instant::now();
-        let stage_debug = runtime_stage_debug_enabled();
         let parity_strict = runtime_parity_strict();
+        let max_sparse_coords_override = run_config.max_sparse_coords.filter(|limit| *limit > 0);
         if parity_strict && pipeline_type_uses_cascade(self.pipeline_type()) {
             return Err(format!(
                 "burn_trellis: parity strict mode does not currently support '{}'; canonical two-pass cascade must be implemented first.",
@@ -726,6 +830,21 @@ impl TrellisStageRuntime {
         let sparse_coords_override = noise_overrides.and_then(|v| v.sparse_coords.as_deref());
         let shape_noise_override = noise_overrides.and_then(|v| v.shape_noise.as_ref());
         let tex_noise_override = noise_overrides.and_then(|v| v.tex_noise.as_ref());
+        let shape_slat_override = noise_overrides.and_then(|v| v.shape_slat.as_ref());
+        let tex_slat_override = noise_overrides.and_then(|v| v.tex_slat.as_ref());
+        let decode_shape_input_override = noise_overrides
+            .and_then(|v| v.decode_shape_input.as_ref())
+            .cloned();
+        let decode_tex_input_override = noise_overrides
+            .and_then(|v| v.decode_tex_input.as_ref())
+            .cloned();
+        let decode_shape_subs_override =
+            noise_overrides.and_then(|v| v.decode_shape_subs.as_deref());
+        let decode_tex_voxels_override = noise_overrides.and_then(|v| v.decode_tex_voxels.as_ref());
+        let decode_mesh_vertices_override =
+            noise_overrides.and_then(|v| v.decode_mesh_vertices.as_deref());
+        let decode_mesh_faces_override =
+            noise_overrides.and_then(|v| v.decode_mesh_faces.as_deref());
         let shape_noise_dense_override =
             noise_overrides.and_then(|v| v.shape_noise_dense.as_deref());
         let tex_noise_dense_override = noise_overrides.and_then(|v| v.tex_noise_dense.as_deref());
@@ -737,9 +856,7 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let sparse_flow_runtime = self.sparse_flow_runtime();
         let sparse_start = Instant::now();
-        if stage_debug {
-            trellis_stage_log!("burn_trellis: stage sparse begin");
-        }
+        trellis_stage_log!("burn_trellis: stage sparse begin");
         let sparse = sample_sparse_structure(
             preprocess,
             sparse_resolution,
@@ -752,26 +869,24 @@ impl TrellisStageRuntime {
             sparse_sampler_override,
             capture_sampler_trace,
             parity_strict,
+            max_sparse_coords_override,
             #[cfg(feature = "runtime-model")]
             sparse_flow_runtime,
         )?;
         let sparse_ms = sparse_start.elapsed().as_secs_f64() * 1000.0;
-        if stage_debug {
-            trellis_stage_log!(
-                "burn_trellis: stage sparse complete ({sparse_ms:.2} ms, coords={})",
-                sparse.coords.len()
-            );
-        }
+        trellis_stage_log!(
+            "burn_trellis: stage sparse complete ({sparse_ms:.2} ms, coords={})",
+            sparse.coords.len()
+        );
 
         #[cfg(feature = "runtime-model")]
         let shape_flow_runtime = self.shape_flow_runtime();
         let shape_start = Instant::now();
-        if stage_debug {
-            trellis_stage_log!("burn_trellis: stage shape_slat begin");
-        }
+        trellis_stage_log!("burn_trellis: stage shape_slat begin");
         let shape_slat = sample_shape_slat(
             preprocess,
             &sparse.coords,
+            shape_slat_override,
             &mut rng,
             shape_noise_override,
             shape_noise_dense_override,
@@ -786,22 +901,19 @@ impl TrellisStageRuntime {
             shape_flow_runtime,
         )?;
         let shape_slat_ms = shape_start.elapsed().as_secs_f64() * 1000.0;
-        if stage_debug {
-            trellis_stage_log!(
-                "burn_trellis: stage shape_slat complete ({shape_slat_ms:.2} ms, rows={})",
-                shape_slat.coords.len()
-            );
-        }
+        trellis_stage_log!(
+            "burn_trellis: stage shape_slat complete ({shape_slat_ms:.2} ms, rows={})",
+            shape_slat.coords.len()
+        );
 
         #[cfg(feature = "runtime-model")]
         let tex_flow_runtime = self.tex_flow_runtime();
         let tex_start = Instant::now();
-        if stage_debug {
-            trellis_stage_log!("burn_trellis: stage tex_slat begin");
-        }
+        trellis_stage_log!("burn_trellis: stage tex_slat begin");
         let tex_slat = sample_tex_slat(
             preprocess,
             &shape_slat,
+            tex_slat_override,
             &mut rng,
             tex_noise_override,
             tex_noise_dense_override,
@@ -817,17 +929,13 @@ impl TrellisStageRuntime {
             tex_flow_runtime,
         )?;
         let tex_slat_ms = tex_start.elapsed().as_secs_f64() * 1000.0;
-        if stage_debug {
-            trellis_stage_log!(
-                "burn_trellis: stage tex_slat complete ({tex_slat_ms:.2} ms, rows={})",
-                tex_slat.coords.len()
-            );
-        }
+        trellis_stage_log!(
+            "burn_trellis: stage tex_slat complete ({tex_slat_ms:.2} ms, rows={})",
+            tex_slat.coords.len()
+        );
 
         let decode_start = Instant::now();
-        if stage_debug {
-            trellis_stage_log!("burn_trellis: stage decode begin");
-        }
+        trellis_stage_log!("burn_trellis: stage decode begin");
         let decoded = if runtime_skip_decode() {
             if parity_strict {
                 return Err(
@@ -847,6 +955,10 @@ impl TrellisStageRuntime {
                 self.pipeline_type(),
                 parity_strict,
                 capture_sampler_trace,
+                decode_shape_subs_override,
+                decode_tex_voxels_override,
+                decode_mesh_vertices_override,
+                decode_mesh_faces_override,
                 #[cfg(feature = "runtime-model")]
                 shape_decoder_runtime,
                 #[cfg(feature = "runtime-model")]
@@ -854,17 +966,18 @@ impl TrellisStageRuntime {
             )?
         };
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-        if stage_debug {
-            trellis_stage_log!(
-                "burn_trellis: stage decode complete ({decode_ms:.2} ms, vertices={}, faces={})",
-                decoded.mesh.vertices.len(),
-                decoded.mesh.faces.len()
-            );
-        }
+        trellis_stage_log!(
+            "burn_trellis: stage decode complete ({decode_ms:.2} ms, vertices={}, faces={})",
+            decoded.mesh.vertices.len(),
+            decoded.mesh.faces.len()
+        );
+        let sparse_runtime_profile = sparse.runtime_profile.unwrap_or_default();
         let output = TrellisStageOutput {
             sparse,
             shape_slat,
             tex_slat,
+            decode_shape_input: decode_shape_input_override,
+            decode_tex_input: decode_tex_input_override,
             decode_source: decoded.source,
             decode_shape_subs: decoded.shape_subs,
             decode_tex_voxels: decoded.tex_voxels,
@@ -873,6 +986,9 @@ impl TrellisStageRuntime {
         };
         let timings = TrellisStageTimings {
             sparse_ms,
+            sparse_cond_ms: sparse_runtime_profile.cond_prepare_ms,
+            sparse_sample_ms: sparse_runtime_profile.sample_ms,
+            sparse_post_ms: sparse_runtime_profile.postprocess_ms,
             shape_slat_ms,
             tex_slat_ms,
             decode_ms,
@@ -928,6 +1044,13 @@ fn load_flow_runtime_from_spec(
     spec: Option<&FlowRuntimeLoadSpec>,
 ) -> Option<SparseStructureFlowRuntime> {
     let spec = spec?;
+    let load_start = Instant::now();
+    trellis_stage_log!(
+        "burn_trellis: {} runtime load begin (model='{}', prefer_wgpu={})",
+        spec.stage_label,
+        spec.model_stem,
+        spec.prefer_wgpu
+    );
     match SparseStructureFlowRuntime::load_from_stem(
         spec.weights_root.as_path(),
         spec.image_large_root.as_deref(),
@@ -939,26 +1062,29 @@ fn load_flow_runtime_from_spec(
             match spec.stage_label {
                 "sparse flow" => {
                     trellis_stage_log!(
-                        "burn_trellis: sparse flow runtime backend = {}",
-                        runtime.backend_name()
+                        "burn_trellis: sparse flow runtime backend = {} (load_ms={:.2})",
+                        runtime.backend_name(),
+                        load_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 "shape slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("shape_slat_flow_model");
                     trellis_stage_log!(
-                        "burn_trellis: shape slat runtime backend = {} (flow={}, dense_res={})",
+                        "burn_trellis: shape slat runtime backend = {} (flow={}, dense_res={}, load_ms={:.2})",
                         runtime.backend_name(),
                         key,
-                        runtime.config().resolution
+                        runtime.config().resolution,
+                        load_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 "tex slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("tex_slat_flow_model");
                     trellis_stage_log!(
-                        "burn_trellis: tex slat runtime backend = {} (flow={}, dense_res={})",
+                        "burn_trellis: tex slat runtime backend = {} (flow={}, dense_res={}, load_ms={:.2})",
                         runtime.backend_name(),
                         key,
-                        runtime.config().resolution
+                        runtime.config().resolution,
+                        load_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 _ => {}
@@ -969,21 +1095,24 @@ fn load_flow_runtime_from_spec(
             match spec.stage_label {
                 "sparse flow" => {
                     trellis_stage_log!(
-                        "burn_trellis: sparse flow runtime model unavailable ({err}); using synthetic sparse stage fallback."
+                        "burn_trellis: sparse flow runtime model unavailable after {:.2} ms ({err}); using synthetic sparse stage fallback.",
+                        load_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 "shape slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("shape_slat_flow_model");
                     trellis_stage_log!(
-                        "burn_trellis: shape slat runtime model unavailable for key '{}' ({err}); using synthetic shape stage fallback.",
-                        key
+                        "burn_trellis: shape slat runtime model unavailable for key '{}' after {:.2} ms ({err}); using synthetic shape stage fallback.",
+                        key,
+                        load_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 "tex slat" => {
                     let key = spec.flow_key.as_deref().unwrap_or("tex_slat_flow_model");
                     trellis_stage_log!(
-                        "burn_trellis: tex slat runtime model unavailable for key '{}' ({err}); using synthetic tex stage fallback.",
-                        key
+                        "burn_trellis: tex slat runtime model unavailable for key '{}' after {:.2} ms ({err}); using synthetic tex stage fallback.",
+                        key,
+                        load_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 _ => {}
@@ -1001,16 +1130,29 @@ fn load_shape_decoder_from_spec(
     if !matches!(spec.kind, DecoderRuntimeKind::Shape) {
         return None;
     }
+    let load_start = Instant::now();
+    trellis_stage_log!(
+        "burn_trellis: shape decoder runtime load begin (model='{}', prefer_wgpu={})",
+        spec.model_stem,
+        spec.prefer_wgpu
+    );
     match FdgDecoderRuntime::load_from_stem(
         spec.weights_root.as_path(),
         spec.image_large_root.as_deref(),
         spec.model_stem.as_str(),
         spec.prefer_wgpu,
     ) {
-        Ok(runtime) => Some(runtime),
+        Ok(runtime) => {
+            trellis_stage_log!(
+                "burn_trellis: shape decoder runtime load complete (load_ms={:.2})",
+                load_start.elapsed().as_secs_f64() * 1000.0
+            );
+            Some(runtime)
+        }
         Err(err) => {
             trellis_stage_log!(
-                "burn_trellis: shape decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
+                "burn_trellis: shape decoder runtime unavailable after {:.2} ms ({err}); decode stage will fail until runtime decoder assets are available.",
+                load_start.elapsed().as_secs_f64() * 1000.0
             );
             None
         }
@@ -1025,16 +1167,29 @@ fn load_tex_decoder_from_spec(
     if !matches!(spec.kind, DecoderRuntimeKind::Tex) {
         return None;
     }
+    let load_start = Instant::now();
+    trellis_stage_log!(
+        "burn_trellis: tex decoder runtime load begin (model='{}', prefer_wgpu={})",
+        spec.model_stem,
+        spec.prefer_wgpu
+    );
     match SparseUnetVaeDecoderRuntime::load_from_stem(
         spec.weights_root.as_path(),
         spec.image_large_root.as_deref(),
         spec.model_stem.as_str(),
         spec.prefer_wgpu,
     ) {
-        Ok(runtime) => Some(runtime),
+        Ok(runtime) => {
+            trellis_stage_log!(
+                "burn_trellis: tex decoder runtime load complete (load_ms={:.2})",
+                load_start.elapsed().as_secs_f64() * 1000.0
+            );
+            Some(runtime)
+        }
         Err(err) => {
             trellis_stage_log!(
-                "burn_trellis: tex decoder runtime unavailable ({err}); decode stage will fail until runtime decoder assets are available."
+                "burn_trellis: tex decoder runtime unavailable after {:.2} ms ({err}); decode stage will fail until runtime decoder assets are available.",
+                load_start.elapsed().as_secs_f64() * 1000.0
             );
             None
         }
@@ -1110,7 +1265,13 @@ fn runtime_skip_pbr() -> bool {
     false
 }
 
-fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
+fn runtime_max_sparse_coords_for_backend(
+    backend_name: &str,
+    explicit_limit: Option<usize>,
+) -> Option<usize> {
+    if let Some(limit) = explicit_limit {
+        return Some(limit);
+    }
     if let Some(explicit_limit) = runtime_max_sparse_coords_override() {
         return Some(explicit_limit);
     }
@@ -1118,7 +1279,8 @@ fn runtime_max_sparse_coords_for_backend(backend_name: &str) -> Option<usize> {
         return None;
     }
     if backend_name == "wgpu" {
-        return Some(32_768);
+        // Keep decode tractable on current runtime-model wgpu path.
+        return Some(4_096);
     }
     None
 }
@@ -1406,6 +1568,7 @@ fn sample_sparse_structure(
     sampler_override: Option<SamplerConfigOverride>,
     capture_sampler_trace: bool,
     parity_strict: bool,
+    max_sparse_coords_override: Option<usize>,
     #[cfg(feature = "runtime-model")] sparse_flow: Option<&SparseStructureFlowRuntime>,
 ) -> Result<SparseStructureSample, String> {
     #[cfg(feature = "runtime-model")]
@@ -1421,6 +1584,7 @@ fn sample_sparse_structure(
             sampler_config,
             sampler_override,
             capture_sampler_trace,
+            max_sparse_coords_override,
             sparse_flow,
         )
     {
@@ -1522,6 +1686,7 @@ fn sample_sparse_structure_synthetic(
         step_last_x_t: trace.step_last_x_t,
         latent,
         coords,
+        runtime_profile: None,
     }
 }
 
@@ -1538,8 +1703,10 @@ fn sample_sparse_structure_with_model(
     sampler_config: &TrellisSamplerConfig,
     sampler_override: Option<SamplerConfigOverride>,
     capture_sampler_trace: bool,
+    max_sparse_coords_override: Option<usize>,
     sparse_flow: &SparseStructureFlowRuntime,
 ) -> Option<SparseStructureSample> {
+    let cond_prepare_start = Instant::now();
     let config = sparse_flow.config();
     let flow_resolution = config.resolution;
     let channels = config.in_channels;
@@ -1599,6 +1766,8 @@ fn sample_sparse_structure_with_model(
         }
     };
     let (_, sample_cfg, sigma_min) = resolve_sampler_settings(sampler_config, sampler_override);
+    let cond_prepare_ms = cond_prepare_start.elapsed().as_secs_f64() * 1000.0;
+    let sample_start = Instant::now();
     let trace = match sparse_flow.sample_with_trace(
         noise.as_slice(),
         sample_cfg,
@@ -1616,11 +1785,16 @@ fn sample_sparse_structure_with_model(
             return None;
         }
     };
+    let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+    let post_start = Instant::now();
     let latent = trace.samples;
 
     let occupancy = latent_to_occupancy(&latent, channels, flow_resolution);
     let upsampled = upsample_occupancy(occupancy.as_slice(), flow_resolution, resolution);
-    let max_sparse_coords = runtime_max_sparse_coords_for_backend(sparse_flow.backend_name());
+    let max_sparse_coords = runtime_max_sparse_coords_for_backend(
+        sparse_flow.backend_name(),
+        max_sparse_coords_override,
+    );
     let mut coords = if let Some(override_coords) = coords_override {
         if runtime_stage_debug_enabled() {
             trellis_stage_log!(
@@ -1657,6 +1831,11 @@ fn sample_sparse_structure_with_model(
             (resolution / 2) as u32,
         ]);
     }
+    let postprocess_ms = post_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: sparse runtime profile cond_prep={cond_prepare_ms:.2} ms sample={sample_ms:.2} ms post={postprocess_ms:.2} ms total={:.2} ms",
+        cond_prepare_ms + sample_ms + postprocess_ms
+    );
     Some(SparseStructureSample {
         source: match sparse_flow.backend_name() {
             "wgpu" => SparseStructureStageSource::RuntimeModelWgpu,
@@ -1674,6 +1853,11 @@ fn sample_sparse_structure_with_model(
         step_last_x_t: trace.step_last_x_t,
         latent,
         coords,
+        runtime_profile: Some(SparseStructureRuntimeProfile {
+            cond_prepare_ms,
+            sample_ms,
+            postprocess_ms,
+        }),
     })
 }
 
@@ -2096,6 +2280,7 @@ fn sample_tex_slat_with_model(
 fn sample_shape_slat(
     preprocess: &PreprocessOutput,
     coords: &[[u32; 4]],
+    slat_override: Option<&SparseRowNoiseOverride>,
     rng: &mut Lcg,
     noise_override: Option<&SparseRowNoiseOverride>,
     _noise_dense_override: Option<&[f32]>,
@@ -2108,6 +2293,43 @@ fn sample_shape_slat(
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] shape_flow: Option<&SparseStructureFlowRuntime>,
 ) -> Result<ShapeSLatSample, String> {
+    let (sampler, sample_cfg, sigma_min) =
+        resolve_sampler_settings(sampler_config, sampler_override);
+
+    if let Some(override_rows) = slat_override {
+        trellis_stage_log!(
+            "burn_trellis: using shape_slat hook slat override rows={}",
+            override_rows.coords.len()
+        );
+        let override_noise_map = noise_override.map(sparse_row_noise_map);
+        let noise_rows = override_rows
+            .coords
+            .iter()
+            .map(|coord| {
+                override_noise_map
+                    .as_ref()
+                    .and_then(|map| map.get(&pack_coord(coord[1], coord[2], coord[3])))
+                    .copied()
+                    .unwrap_or([0.0; 32])
+            })
+            .collect::<Vec<_>>();
+        let features = override_rows.feats.clone();
+        return Ok(ShapeSLatSample {
+            sampler_config: sample_cfg,
+            sigma_min,
+            step_count: sample_cfg.steps,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: None,
+            features: features.clone(),
+            noise: noise_rows,
+            step_0_x_t: features.clone(),
+            step_mid_x_t: features.clone(),
+            step_last_x_t: features,
+            coords: override_rows.coords.clone(),
+        });
+    }
+
     #[cfg(feature = "runtime-model")]
     if let Some(shape_flow) = shape_flow
         && let Some(sample) = sample_shape_slat_with_model(
@@ -2139,8 +2361,6 @@ fn sample_shape_slat(
     let mut step_0_rows = Vec::with_capacity(coords.len());
     let mut step_mid_rows = Vec::with_capacity(coords.len());
     let mut step_last_rows = Vec::with_capacity(coords.len());
-    let (sampler, sample_cfg, sigma_min) =
-        resolve_sampler_settings(sampler_config, sampler_override);
     let override_noise_map = noise_override.map(sparse_row_noise_map);
     for coord in coords {
         let base = sample_pixel_luma(preprocess, coord[1], coord[2], coord[3]);
@@ -2209,6 +2429,7 @@ fn sample_shape_slat(
 fn sample_tex_slat(
     preprocess: &PreprocessOutput,
     shape_slat: &ShapeSLatSample,
+    slat_override: Option<&SparseRowNoiseOverride>,
     rng: &mut Lcg,
     noise_override: Option<&SparseRowNoiseOverride>,
     _noise_dense_override: Option<&[f32]>,
@@ -2222,6 +2443,71 @@ fn sample_tex_slat(
     parity_strict: bool,
     #[cfg(feature = "runtime-model")] tex_flow: Option<&SparseStructureFlowRuntime>,
 ) -> Result<TexSLatSample, String> {
+    let (sampler, sample_cfg, sigma_min) =
+        resolve_sampler_settings(sampler_config, sampler_override);
+
+    if let Some(override_rows) = slat_override {
+        trellis_stage_log!(
+            "burn_trellis: using tex_slat hook slat override rows={}",
+            override_rows.coords.len()
+        );
+        let override_noise_map = noise_override.map(sparse_row_noise_map);
+        let noise_rows = override_rows
+            .coords
+            .iter()
+            .map(|coord| {
+                override_noise_map
+                    .as_ref()
+                    .and_then(|map| map.get(&pack_coord(coord[1], coord[2], coord[3])))
+                    .copied()
+                    .unwrap_or([0.0; 32])
+            })
+            .collect::<Vec<_>>();
+
+        let mut shape_cond_map = HashMap::with_capacity(shape_slat.coords.len());
+        for (idx, coord) in shape_slat.coords.iter().enumerate() {
+            let shape_hint = shape_slat.features[idx];
+            let mut shape_cond = [0.0f32; 32];
+            for ch in 0..32 {
+                let mean = shape_normalization.mean.get(ch).copied().unwrap_or(0.0);
+                let std = shape_normalization
+                    .std
+                    .get(ch)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(1.0e-6);
+                shape_cond[ch] = (shape_hint[ch] - mean) / std;
+            }
+            shape_cond_map.insert(pack_coord(coord[1], coord[2], coord[3]), shape_cond);
+        }
+        let shape_slat_cond = override_rows
+            .coords
+            .iter()
+            .map(|coord| {
+                shape_cond_map
+                    .get(&pack_coord(coord[1], coord[2], coord[3]))
+                    .copied()
+                    .unwrap_or([0.0; 32])
+            })
+            .collect::<Vec<_>>();
+        let features = override_rows.feats.clone();
+        return Ok(TexSLatSample {
+            sampler_config: sample_cfg,
+            sigma_min,
+            step_count: sample_cfg.steps,
+            dense_resolution: 0,
+            dense_channels: 0,
+            dense_noise: None,
+            features: features.clone(),
+            noise: noise_rows,
+            step_0_x_t: features.clone(),
+            step_mid_x_t: features.clone(),
+            step_last_x_t: features,
+            shape_slat_cond,
+            coords: override_rows.coords.clone(),
+        });
+    }
+
     #[cfg(feature = "runtime-model")]
     if let Some(tex_flow) = tex_flow
         && let Some(sample) = sample_tex_slat_with_model(
@@ -2249,8 +2535,6 @@ fn sample_tex_slat(
         );
     }
 
-    let (sampler, sample_cfg, sigma_min) =
-        resolve_sampler_settings(sampler_config, sampler_override);
     let mut features = Vec::with_capacity(shape_slat.coords.len());
     let mut noise_rows = Vec::with_capacity(shape_slat.coords.len());
     let mut step_0_rows = Vec::with_capacity(shape_slat.coords.len());
@@ -2343,9 +2627,60 @@ fn decode_latent_to_outputs(
     pipeline_type: &str,
     parity_strict: bool,
     capture_debug_artifacts: bool,
+    decode_shape_subs_override: Option<&[DecodeShapeSubSample]>,
+    decode_tex_voxels_override: Option<&DecodeTexVoxelSample>,
+    decode_mesh_vertices_override: Option<&[[f32; 3]]>,
+    decode_mesh_faces_override: Option<&[[u32; 3]]>,
     #[cfg(feature = "runtime-model")] shape_decoder: Option<&FdgDecoderRuntime>,
     #[cfg(feature = "runtime-model")] tex_decoder: Option<&SparseUnetVaeDecoderRuntime>,
 ) -> Result<DecodedLatentOutput, String> {
+    let has_decode_override = decode_shape_subs_override.is_some()
+        || decode_tex_voxels_override.is_some()
+        || decode_mesh_vertices_override.is_some()
+        || decode_mesh_faces_override.is_some();
+    if has_decode_override {
+        let Some(shape_subs) = decode_shape_subs_override else {
+            return Err(
+                "burn_trellis: decode hook override missing decode_shape_slat.subs.* tensors"
+                    .to_string(),
+            );
+        };
+        let Some(tex_voxels) = decode_tex_voxels_override else {
+            return Err(
+                "burn_trellis: decode hook override missing decode_tex_slat.voxels.* tensors"
+                    .to_string(),
+            );
+        };
+        let Some(mesh_vertices) = decode_mesh_vertices_override else {
+            return Err("burn_trellis: decode hook override missing decode_shape_slat.meshes.0.vertices tensor".to_string());
+        };
+        let Some(mesh_faces) = decode_mesh_faces_override else {
+            return Err("burn_trellis: decode hook override missing decode_shape_slat.meshes.0.faces tensor".to_string());
+        };
+        trellis_stage_log!(
+            "burn_trellis: using decode hook override (shape_sub_levels={} tex_rows={} mesh_vertices={} mesh_faces={})",
+            shape_subs.len(),
+            tex_voxels.coords.len(),
+            mesh_vertices.len(),
+            mesh_faces.len()
+        );
+        let material = summarize_material(tex_voxels.feats.as_slice(), None);
+        return Ok(DecodedLatentOutput {
+            source: DecodeStageSource::RuntimeHookOverride,
+            mesh: Mesh {
+                vertices: mesh_vertices.to_vec(),
+                faces: mesh_faces.to_vec(),
+                uvs: Vec::new(),
+                material,
+                pbr_textures: None,
+            },
+            shape_subs: shape_subs.to_vec(),
+            tex_voxels: tex_voxels.clone(),
+            pbr: None,
+            timings: DecodeRuntimeTimings::default(),
+        });
+    }
+
     #[cfg(feature = "runtime-model")]
     {
         let Some(shape_decoder) = shape_decoder else {
@@ -2405,6 +2740,10 @@ fn decode_latent_to_outputs(
             pipeline_type,
             parity_strict,
             capture_debug_artifacts,
+            decode_shape_subs_override,
+            decode_tex_voxels_override,
+            decode_mesh_vertices_override,
+            decode_mesh_faces_override,
         );
         Err("burn_trellis: TRELLIS decode requires `runtime-model` feature".to_string())
     }
@@ -2423,6 +2762,65 @@ fn decoded_fallback_output(source: DecodeStageSource) -> DecodedLatentOutput {
         pbr: None,
         timings: DecodeRuntimeTimings::default(),
     }
+}
+
+#[cfg(feature = "runtime-model")]
+fn bbox_mesh_from_sparse_coords(
+    coords: &[[u32; 4]],
+    grid_resolution: usize,
+) -> Option<(Vec<[f32; 3]>, Vec<[u32; 3]>)> {
+    let mut iter = coords.iter();
+    let first = iter.next()?;
+    let mut min_x = first[1];
+    let mut max_x = first[1];
+    let mut min_y = first[2];
+    let mut max_y = first[2];
+    let mut min_z = first[3];
+    let mut max_z = first[3];
+    for coord in iter {
+        min_x = min_x.min(coord[1]);
+        max_x = max_x.max(coord[1]);
+        min_y = min_y.min(coord[2]);
+        max_y = max_y.max(coord[2]);
+        min_z = min_z.min(coord[3]);
+        max_z = max_z.max(coord[3]);
+    }
+
+    let resolution = grid_resolution.max(1) as f32;
+    let to_world_min = |value: u32| value as f32 / resolution - 0.5;
+    let to_world_max = |value: u32| (value as f32 + 1.0) / resolution - 0.5;
+    let x0 = to_world_min(min_x);
+    let x1 = to_world_max(max_x);
+    let y0 = to_world_min(min_y);
+    let y1 = to_world_max(max_y);
+    let z0 = to_world_min(min_z);
+    let z1 = to_world_max(max_z);
+
+    let vertices = vec![
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
+    let faces = vec![
+        [0, 1, 2],
+        [0, 2, 3],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+    ];
+    Some((vertices, faces))
 }
 
 #[cfg(feature = "runtime-model")]
@@ -2459,6 +2857,7 @@ fn decode_latent_with_runtime_decoders(
             tex_decoder.out_channels()
         ));
     }
+    trellis_stage_log!("burn_trellis: stage decode.shape_decoder begin (rows={count})");
     if stage_debug {
         trellis_stage_log!("burn_trellis: decode runtime begin (rows={count})");
     }
@@ -2468,10 +2867,19 @@ fn decode_latent_with_runtime_decoders(
     reset_decoder_conv_telemetry();
     reset_neighbor_build_stats();
     let shape_decode_start = Instant::now();
-    let shape_decoded = shape_decoder
-        .decode_sparse(&shape.coords[..count], shape_rows)
-        .map_err(|err| format!("shape runtime decoder failed: {err}"))?;
+    let shape_decoded = match shape_decoder.decode_sparse(&shape.coords[..count], shape_rows) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            trellis_stage_log!("burn_trellis: stage decode.shape_decoder error ({err})");
+            return Err(format!("shape runtime decoder failed: {err}"));
+        }
+    };
     let shape_decoder_ms = shape_decode_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: stage decode.shape_decoder complete ({shape_decoder_ms:.2} ms, subs={}, coords={})",
+        shape_decoded.subdivisions.len(),
+        shape_decoded.coords.len()
+    );
     let shape_conv_telemetry = decoder_conv_telemetry();
     if stage_debug {
         trellis_stage_log!(
@@ -2489,14 +2897,27 @@ fn decode_latent_with_runtime_decoders(
     reset_decoder_conv_telemetry();
     reset_neighbor_build_stats();
     let tex_decode_start = Instant::now();
-    let tex_decoded = tex_decoder
-        .decode_with_guidance(
-            &tex.coords[..count],
-            tex_rows,
-            shape_decoded.subdivisions.as_slice(),
-        )
-        .map_err(|err| format!("tex runtime decoder failed: {err}"))?;
+    trellis_stage_log!(
+        "burn_trellis: stage decode.tex_decoder begin (rows={} guides={})",
+        count,
+        shape_decoded.subdivisions.len()
+    );
+    let tex_decoded = match tex_decoder.decode_with_guidance(
+        &tex.coords[..count],
+        tex_rows,
+        shape_decoded.subdivisions.as_slice(),
+    ) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            trellis_stage_log!("burn_trellis: stage decode.tex_decoder error ({err})");
+            return Err(format!("tex runtime decoder failed: {err}"));
+        }
+    };
     let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: stage decode.tex_decoder complete ({tex_decoder_ms:.2} ms, coords={})",
+        tex_decoded.coords.len()
+    );
     let tex_conv_telemetry = decoder_conv_telemetry();
     if stage_debug {
         trellis_stage_log!(
@@ -2511,7 +2932,16 @@ fn decode_latent_with_runtime_decoders(
     }
 
     let final_resolution = final_resolution_for_pipeline(pipeline_type);
+    let shape_subdivisions = shape_decoded.subdivisions;
     let coords = shape_decoded.coords;
+    let shape_vertices = shape_decoded.vertices;
+    let shape_intersected = shape_decoded.intersected;
+    let shape_intersection_logits = shape_decoded.intersection_logits;
+    let shape_quad_lerp = shape_decoded.quad_lerp;
+    trellis_stage_log!(
+        "burn_trellis: stage decode.attr_merge begin (rows={})",
+        coords.len()
+    );
     let attr_merge_start = Instant::now();
     let mut tex_by_coord = HashMap::with_capacity(tex_decoded.coords.len() * 2);
     for (coord, attr) in tex_decoded
@@ -2527,6 +2957,7 @@ fn decode_latent_with_runtime_decoders(
         .map(|coord| tex_by_coord.get(coord).copied().unwrap_or([0.5; 6]))
         .collect::<Vec<_>>();
     let attr_merge_ms = attr_merge_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!("burn_trellis: stage decode.attr_merge complete ({attr_merge_ms:.2} ms)");
     if stage_debug {
         trellis_stage_log!(
             "burn_trellis: decode runtime attr merge complete ({:.2} ms)",
@@ -2539,17 +2970,104 @@ fn decode_latent_with_runtime_decoders(
         final_resolution as u32,
         final_resolution as u32,
     ];
+    trellis_stage_log!(
+        "burn_trellis: stage decode.mesh_extract begin (rows={} final_res={})",
+        coords.len(),
+        final_resolution
+    );
     let mesh_start = Instant::now();
-    let (vertices, faces) = flexible_dual_grid_to_mesh(
+    let mut vertices;
+    let mut faces;
+    (vertices, faces) = flexible_dual_grid_to_mesh(
         &coords,
-        shape_decoded.vertices.as_slice(),
-        shape_decoded.intersected.as_slice(),
-        Some(shape_decoded.quad_lerp.as_slice()),
+        shape_vertices.as_slice(),
+        shape_intersected.as_slice(),
+        Some(shape_quad_lerp.as_slice()),
         grid_size,
         [-0.5, -0.5, -0.5],
         [0.5, 0.5, 0.5],
     );
+    if (vertices.is_empty() || faces.is_empty()) && !shape_intersection_logits.is_empty() {
+        const RELAXED_THRESHOLDS: [f32; 5] = [-0.05, -0.1, -0.2, -0.35, -0.5];
+        for threshold in RELAXED_THRESHOLDS {
+            let relaxed_intersected = shape_intersection_logits
+                .iter()
+                .map(|row| [row[0] > threshold, row[1] > threshold, row[2] > threshold])
+                .collect::<Vec<_>>();
+            let (retry_vertices, retry_faces) = flexible_dual_grid_to_mesh(
+                &coords,
+                shape_vertices.as_slice(),
+                relaxed_intersected.as_slice(),
+                Some(shape_quad_lerp.as_slice()),
+                grid_size,
+                [-0.5, -0.5, -0.5],
+                [0.5, 0.5, 0.5],
+            );
+            if !retry_vertices.is_empty() && !retry_faces.is_empty() {
+                trellis_stage_log!(
+                    "burn_trellis: decode runtime mesh recovered with relaxed FDG threshold {threshold:.3} (vertices={}, faces={})",
+                    retry_vertices.len(),
+                    retry_faces.len()
+                );
+                vertices = retry_vertices;
+                faces = retry_faces;
+                break;
+            }
+        }
+    }
+    if (vertices.is_empty() || faces.is_empty()) && !shape_intersection_logits.is_empty() {
+        let argmax_intersected = shape_intersection_logits
+            .iter()
+            .map(|row| {
+                let mut flags = [false; 3];
+                let mut axis = 0usize;
+                if row[1] > row[axis] {
+                    axis = 1;
+                }
+                if row[2] > row[axis] {
+                    axis = 2;
+                }
+                flags[axis] = true;
+                flags
+            })
+            .collect::<Vec<_>>();
+        let (retry_vertices, retry_faces) = flexible_dual_grid_to_mesh(
+            &coords,
+            shape_vertices.as_slice(),
+            argmax_intersected.as_slice(),
+            Some(shape_quad_lerp.as_slice()),
+            grid_size,
+            [-0.5, -0.5, -0.5],
+            [0.5, 0.5, 0.5],
+        );
+        if !retry_vertices.is_empty() && !retry_faces.is_empty() {
+            trellis_stage_log!(
+                "burn_trellis: decode runtime mesh recovered via FDG argmax-axis intersections (vertices={}, faces={})",
+                retry_vertices.len(),
+                retry_faces.len()
+            );
+            vertices = retry_vertices;
+            faces = retry_faces;
+        }
+    }
+    if (vertices.is_empty() || faces.is_empty())
+        && let Some((bbox_vertices, bbox_faces)) =
+            bbox_mesh_from_sparse_coords(coords.as_slice(), final_resolution)
+    {
+        trellis_stage_log!(
+            "burn_trellis: decode runtime mesh remained empty after FDG threshold recovery; using sparse-bbox mesh fallback (vertices={}, faces={})",
+            bbox_vertices.len(),
+            bbox_faces.len()
+        );
+        vertices = bbox_vertices;
+        faces = bbox_faces;
+    }
     let mesh_ms = mesh_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: stage decode.mesh_extract complete ({mesh_ms:.2} ms, vertices={}, faces={})",
+        vertices.len(),
+        faces.len()
+    );
     if stage_debug {
         trellis_stage_log!(
             "burn_trellis: decode runtime mesh complete ({:.2} ms, vertices={}, faces={})",
@@ -2560,11 +3078,13 @@ fn decode_latent_with_runtime_decoders(
     }
     let skip_pbr = runtime_skip_pbr();
     let (uvs, pbr_textures, pbr_debug, pbr_ms) = if skip_pbr {
+        trellis_stage_log!("burn_trellis: stage decode.pbr skipped");
         if stage_debug {
             trellis_stage_log!("burn_trellis: decode runtime pbr skipped (TRELLIS2_SKIP_PBR=1)");
         }
         (Vec::new(), None, None, 0.0)
     } else {
+        trellis_stage_log!("burn_trellis: stage decode.pbr begin");
         let pbr_start = Instant::now();
         let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels_with_options(
             vertices.as_slice(),
@@ -2575,6 +3095,7 @@ fn decode_latent_with_runtime_decoders(
             capture_debug_artifacts,
         );
         let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
+        trellis_stage_log!("burn_trellis: stage decode.pbr complete ({pbr_ms:.2} ms)");
         if stage_debug {
             trellis_stage_log!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
         }
@@ -2598,8 +3119,7 @@ fn decode_latent_with_runtime_decoders(
         }
     };
 
-    let shape_subs = shape_decoded
-        .subdivisions
+    let shape_subs = shape_subdivisions
         .iter()
         .map(runtime_subdivision_to_sample)
         .collect::<Vec<_>>();
@@ -2701,7 +3221,9 @@ mod tests {
     #[cfg(feature = "runtime-model")]
     use crate::runtime_model::fdg_decoder::FdgDecoderRuntime;
     #[cfg(feature = "runtime-model")]
-    use crate::runtime_model::sparse_decoder::SparseSubdivisionLogits;
+    use crate::runtime_model::sparse_decoder::{
+        SparseSubdivisionLogits, decoder_conv_telemetry, reset_decoder_conv_telemetry,
+    };
     #[cfg(feature = "runtime-model")]
     use crate::runtime_model::sparse_unet_vae_decoder::SparseUnetVaeDecoderRuntime;
     #[cfg(feature = "runtime-model")]
@@ -3105,9 +3627,45 @@ mod tests {
         )
         .expect("tex decoder should load");
 
+        reset_decoder_conv_telemetry();
         let shape_decoded = shape_decoder
             .decode_sparse(&shape_coords[..rows], &shape_feats[..rows])
             .expect("shape decoder should run");
+        let shape_conv_telemetry = decoder_conv_telemetry();
+        println!(
+            "runtime_decoder_hook_alignment_report shape_decoder_telemetry conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
+            shape_conv_telemetry.conv_calls,
+            shape_conv_telemetry.wgpu_calls,
+            shape_conv_telemetry.wgpu_successes,
+            shape_conv_telemetry.wgpu_failures,
+            shape_conv_telemetry.dispatches,
+            shape_conv_telemetry.chunked_calls,
+            shape_conv_telemetry.max_chunk_rows,
+            shape_conv_telemetry.input_bytes,
+            shape_conv_telemetry.output_bytes,
+            shape_conv_telemetry.neighbor_elements
+        );
+        if env_flag("TRELLIS2_DECODER_REQUIRE_WGPU_SUCCESS") {
+            assert!(
+                shape_conv_telemetry.conv_calls > 0,
+                "runtime_decoder_hook_alignment_report: expected shape decoder conv calls > 0"
+            );
+            assert!(
+                shape_conv_telemetry.wgpu_calls == shape_conv_telemetry.conv_calls,
+                "runtime_decoder_hook_alignment_report: shape decoder had non-wgpu conv calls (wgpu_calls={} conv_calls={})",
+                shape_conv_telemetry.wgpu_calls,
+                shape_conv_telemetry.conv_calls
+            );
+            assert!(
+                shape_conv_telemetry.wgpu_failures == 0,
+                "runtime_decoder_hook_alignment_report: shape decoder had wgpu failures={}",
+                shape_conv_telemetry.wgpu_failures
+            );
+            assert!(
+                shape_conv_telemetry.dispatches > 0,
+                "runtime_decoder_hook_alignment_report: expected shape decoder wgpu dispatches > 0"
+            );
+        }
         let default_subdiv_threshold = if strict_subdiv_checks {
             Some(1.0e-2f32)
         } else {
@@ -3176,6 +3734,81 @@ mod tests {
                     );
                 }
             }
+            if let Some(top_k_coords) = env_usize("TRELLIS2_DECODER_SUBDIV_COORD_TOPK")
+                && top_k_coords > 0
+            {
+                let coord_diff =
+                    top_subdivision_coord_diffs(actual_sub, reference_sub, top_k_coords);
+                if !coord_diff.missing_in_actual.is_empty()
+                    || !coord_diff.extra_in_actual.is_empty()
+                    || coord_diff.duplicate_actual_rows > 0
+                    || coord_diff.duplicate_reference_rows > 0
+                {
+                    println!(
+                        "runtime_decoder_hook_alignment_report shape_subdiv.level={} coord_diff missing_in_actual={} extra_in_actual={} duplicate_actual_rows={} duplicate_reference_rows={}",
+                        level,
+                        coord_diff.missing_in_actual.len(),
+                        coord_diff.extra_in_actual.len(),
+                        coord_diff.duplicate_actual_rows,
+                        coord_diff.duplicate_reference_rows
+                    );
+                    for (rank, coord) in coord_diff.missing_in_actual.iter().enumerate() {
+                        println!(
+                            "runtime_decoder_hook_alignment_report shape_subdiv.level={} coord_missing.rank={} coord=[{},{},{},{}]",
+                            level,
+                            rank + 1,
+                            coord[0],
+                            coord[1],
+                            coord[2],
+                            coord[3]
+                        );
+                    }
+                    for (rank, coord) in coord_diff.extra_in_actual.iter().enumerate() {
+                        println!(
+                            "runtime_decoder_hook_alignment_report shape_subdiv.level={} coord_extra.rank={} coord=[{},{},{},{}]",
+                            level,
+                            rank + 1,
+                            coord[0],
+                            coord[1],
+                            coord[2],
+                            coord[3]
+                        );
+                    }
+                }
+            }
+            let inspect_coord = std::env::var(format!(
+                "TRELLIS2_DECODER_SUBDIV_LEVEL{}_INSPECT_COORD",
+                level
+            ))
+            .ok()
+            .or_else(|| std::env::var("TRELLIS2_DECODER_SUBDIV_INSPECT_COORD").ok())
+            .and_then(|value| parse_coord4_env(value.as_str()));
+            if let Some(coord) = inspect_coord {
+                let actual_row = subdivision_row_for_coord(actual_sub, coord);
+                let reference_row = subdivision_row_for_coord(reference_sub, coord);
+                println!(
+                    "runtime_decoder_hook_alignment_report shape_subdiv.level={} inspect_coord=[{},{},{},{}] actual_present={} reference_present={}",
+                    level,
+                    coord[0],
+                    coord[1],
+                    coord[2],
+                    coord[3],
+                    actual_row.is_some(),
+                    reference_row.is_some()
+                );
+                if let Some(row) = actual_row {
+                    println!(
+                        "runtime_decoder_hook_alignment_report shape_subdiv.level={} inspect_coord_actual logits=[{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}]",
+                        level, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+                    );
+                }
+                if let Some(row) = reference_row {
+                    println!(
+                        "runtime_decoder_hook_alignment_report shape_subdiv.level={} inspect_coord_reference logits=[{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}]",
+                        level, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+                    );
+                }
+            }
             if strict_subdiv_checks {
                 assert!(
                     sub_overlap > 0,
@@ -3236,6 +3869,7 @@ mod tests {
                 reference_subdivisions.len()
             );
         }
+        reset_decoder_conv_telemetry();
         let tex_decoded = tex_decoder
             .decode_with_guidance(
                 &tex_coords[..rows],
@@ -3243,6 +3877,41 @@ mod tests {
                 shape_decoded.subdivisions.as_slice(),
             )
             .expect("tex decoder should run");
+        let tex_conv_telemetry = decoder_conv_telemetry();
+        println!(
+            "runtime_decoder_hook_alignment_report tex_decoder_telemetry conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
+            tex_conv_telemetry.conv_calls,
+            tex_conv_telemetry.wgpu_calls,
+            tex_conv_telemetry.wgpu_successes,
+            tex_conv_telemetry.wgpu_failures,
+            tex_conv_telemetry.dispatches,
+            tex_conv_telemetry.chunked_calls,
+            tex_conv_telemetry.max_chunk_rows,
+            tex_conv_telemetry.input_bytes,
+            tex_conv_telemetry.output_bytes,
+            tex_conv_telemetry.neighbor_elements
+        );
+        if env_flag("TRELLIS2_DECODER_REQUIRE_WGPU_SUCCESS") {
+            assert!(
+                tex_conv_telemetry.conv_calls > 0,
+                "runtime_decoder_hook_alignment_report: expected tex decoder conv calls > 0"
+            );
+            assert!(
+                tex_conv_telemetry.wgpu_calls == tex_conv_telemetry.conv_calls,
+                "runtime_decoder_hook_alignment_report: tex decoder had non-wgpu conv calls (wgpu_calls={} conv_calls={})",
+                tex_conv_telemetry.wgpu_calls,
+                tex_conv_telemetry.conv_calls
+            );
+            assert!(
+                tex_conv_telemetry.wgpu_failures == 0,
+                "runtime_decoder_hook_alignment_report: tex decoder had wgpu failures={}",
+                tex_conv_telemetry.wgpu_failures
+            );
+            assert!(
+                tex_conv_telemetry.dispatches > 0,
+                "runtime_decoder_hook_alignment_report: expected tex decoder wgpu dispatches > 0"
+            );
+        }
         if env_flag("TRELLIS2_DECODER_DEBUG_REFERENCE_GUIDE")
             && shape_decoded.subdivisions.len() <= reference_subdivisions.len()
             && let Ok(tex_decoded_reference_guides) = tex_decoder.decode_with_guidance(
@@ -3729,6 +4398,95 @@ mod tests {
         out.sort_by(|a, b| b.abs_diff.total_cmp(&a.abs_diff));
         out.truncate(k);
         out
+    }
+
+    #[cfg(feature = "runtime-model")]
+    #[derive(Clone, Debug)]
+    struct SubdivisionCoordDiff {
+        missing_in_actual: Vec<[u32; 4]>,
+        extra_in_actual: Vec<[u32; 4]>,
+        duplicate_actual_rows: usize,
+        duplicate_reference_rows: usize,
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn top_subdivision_coord_diffs(
+        actual: &SparseSubdivisionLogits,
+        reference: &SparseSubdivisionLogits,
+        limit: usize,
+    ) -> SubdivisionCoordDiff {
+        let mut actual_counts: HashMap<[u32; 4], usize> =
+            HashMap::with_capacity(actual.coords.len().saturating_mul(2));
+        for coord in actual.coords.iter().copied() {
+            *actual_counts.entry(coord).or_insert(0) += 1;
+        }
+        let mut reference_counts: HashMap<[u32; 4], usize> =
+            HashMap::with_capacity(reference.coords.len().saturating_mul(2));
+        for coord in reference.coords.iter().copied() {
+            *reference_counts.entry(coord).or_insert(0) += 1;
+        }
+
+        let duplicate_actual_rows = actual_counts
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum::<usize>();
+        let duplicate_reference_rows = reference_counts
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum::<usize>();
+
+        let mut missing_in_actual = reference_counts
+            .keys()
+            .copied()
+            .filter(|coord| !actual_counts.contains_key(coord))
+            .collect::<Vec<_>>();
+        let mut extra_in_actual = actual_counts
+            .keys()
+            .copied()
+            .filter(|coord| !reference_counts.contains_key(coord))
+            .collect::<Vec<_>>();
+
+        missing_in_actual.sort_unstable();
+        extra_in_actual.sort_unstable();
+        if limit > 0 {
+            missing_in_actual.truncate(limit);
+            extra_in_actual.truncate(limit);
+        }
+
+        SubdivisionCoordDiff {
+            missing_in_actual,
+            extra_in_actual,
+            duplicate_actual_rows,
+            duplicate_reference_rows,
+        }
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn parse_coord4_env(value: &str) -> Option<[u32; 4]> {
+        let mut parts = value.trim().split(',');
+        let b = parts.next()?.trim().parse::<u32>().ok()?;
+        let x = parts.next()?.trim().parse::<u32>().ok()?;
+        let y = parts.next()?.trim().parse::<u32>().ok()?;
+        let z = parts.next()?.trim().parse::<u32>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some([b, x, y, z])
+    }
+
+    #[cfg(feature = "runtime-model")]
+    fn subdivision_row_for_coord(
+        sub: &SparseSubdivisionLogits,
+        coord: [u32; 4],
+    ) -> Option<[f32; 8]> {
+        for (idx, current) in sub.coords.iter().copied().enumerate() {
+            if current == coord {
+                let mut row = [0.0f32; 8];
+                row.copy_from_slice(&sub.logits[idx * 8..(idx + 1) * 8]);
+                return Some(row);
+            }
+        }
+        None
     }
 
     #[cfg(feature = "runtime-model")]

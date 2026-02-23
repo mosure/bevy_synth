@@ -27,9 +27,9 @@ impl TrellisQuality {
             // 512 base path favors speed over detail.
             Self::Low => TrellisQualitySettings {
                 pipeline_type: "512_base",
-                sparse_steps: 8,
-                shape_steps: 8,
-                texture_steps: 8,
+                sparse_steps: 1,
+                shape_steps: 1,
+                texture_steps: 1,
                 guidance_strength_sparse: 6.0,
                 guidance_strength_shape: 6.0,
                 guidance_strength_texture: 1.0,

@@ -117,6 +117,10 @@ pub struct RuntimeConfig {
     pub trellis_python_bin: Option<PathBuf>,
     /// Legacy field retained for CLI compatibility; ignored by Trellis2 Rust runtime.
     pub trellis_bridge_script: Option<PathBuf>,
+    /// Optional hook with stage-noise/coord overrides for Trellis runtime parity/debug.
+    pub trellis_noise_overrides_hook: Option<PathBuf>,
+    /// Optional explicit sparse-coordinate cap for Trellis decode.
+    pub trellis_max_sparse_coords: Option<usize>,
     /// Trellis high-level quality selection.
     pub trellis_quality: TrellisQuality,
     pub bg_weights_root: Option<PathBuf>,
@@ -142,6 +146,8 @@ impl Default for RuntimeConfig {
             trellis_image_large_root: None,
             trellis_python_bin: None,
             trellis_bridge_script: None,
+            trellis_noise_overrides_hook: None,
+            trellis_max_sparse_coords: None,
             trellis_quality: TrellisQuality::Medium,
             bg_weights_root: None,
             num_steps: DEFAULT_NUM_STEPS,
@@ -751,7 +757,8 @@ impl SynthRuntime {
             device: trellis_device,
             seed: self.config.seed,
             hook_output: None,
-            noise_overrides_hook: None,
+            noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
+            max_sparse_coords: self.config.trellis_max_sparse_coords,
         };
         progress.stage_started(
             "trellis.infer",

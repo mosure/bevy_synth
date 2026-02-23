@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
+use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use burn::module::{Ignored, Module, Param, ParamId};
 use burn::nn;
 use burn::prelude::Backend;
@@ -64,6 +66,10 @@ pub fn host_transfer_stats() -> HostTransferStats {
 fn record_host_readback(elements: usize) {
     HOST_READBACK_COUNT.fetch_add(1, Ordering::Relaxed);
     HOST_READBACK_ELEMENTS.fetch_add(elements as u64, Ordering::Relaxed);
+}
+
+fn runtime_sample_progress_interval(steps: usize) -> usize {
+    if steps <= 16 { 1 } else { (steps / 8).max(1) }
 }
 
 #[derive(Clone, Debug)]
@@ -251,7 +257,7 @@ impl<B: Backend> MultiHeadRmsNorm<B> {
         let rms = x
             .clone()
             .powf_scalar(2.0)
-            .mean_dim(3)
+            .sum_dim(3)
             .add_scalar(RMS_NORM_EPS)
             .sqrt();
         let x = x.mul(rms.recip()).mul_scalar(self.scale);
@@ -460,34 +466,23 @@ impl<B: Backend> SelfAttention<B> {
 
     fn forward_chunked_stream(&self, x: Tensor<B, 3>, resolution: usize) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
-        let mut kv_chunk_tokens = sparse_flow_self_attn_kv_chunk_tokens(tokens);
+        let kv_chunk_tokens = sparse_flow_self_attn_kv_chunk_tokens(tokens);
         let reuse_qkv = sparse_flow_stream_reuse_qkv_enabled(tokens, channels);
-        let mut query_chunk_tokens = if reuse_qkv {
+        let query_chunk_tokens = if reuse_qkv {
             kv_chunk_tokens
         } else {
             sparse_flow_self_attn_query_chunk_tokens(tokens)
         };
         let logits_budget = sparse_flow_attn_logits_budget_bytes();
-        let bytes_per_logit = batch
-            .saturating_mul(self.num_heads)
-            .saturating_mul(core::mem::size_of::<f32>())
-            .max(1);
-        if reuse_qkv {
-            let max_square = integer_sqrt(logits_budget / bytes_per_logit).max(1);
-            kv_chunk_tokens = kv_chunk_tokens.min(max_square).max(1);
-            query_chunk_tokens = kv_chunk_tokens;
-        } else {
-            let max_query = (logits_budget / bytes_per_logit)
-                .checked_div(kv_chunk_tokens.max(1))
-                .unwrap_or(1)
-                .max(1);
-            query_chunk_tokens = query_chunk_tokens.min(max_query).max(1);
-            let max_kv = (logits_budget / bytes_per_logit)
-                .checked_div(query_chunk_tokens.max(1))
-                .unwrap_or(1)
-                .max(1);
-            kv_chunk_tokens = kv_chunk_tokens.min(max_kv).max(1);
-        }
+        let (query_chunk_tokens, kv_chunk_tokens) = sparse_flow_stream_chunk_plan(
+            batch,
+            self.num_heads,
+            tokens,
+            query_chunk_tokens,
+            kv_chunk_tokens,
+            reuse_qkv,
+            logits_budget,
+        );
 
         let mut k_chunks: Vec<Tensor<B, 4>> = Vec::new();
         let mut v_chunks: Vec<Tensor<B, 4>> = Vec::new();
@@ -1112,7 +1107,19 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
         let mut step_last_x_t: Option<Tensor<B, 5>> = None;
         let mid_step = mid_snapshot_step(sample_cfg.steps);
         let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
+        let sample_start = Instant::now();
+        let progress_interval = runtime_sample_progress_interval(sample_cfg.steps);
+        let stage_label = if concat_cond.is_some() {
+            "flow.sample_with_trace.concat"
+        } else {
+            "flow.sample_with_trace.sparse"
+        };
+        eprintln!(
+            "burn_trellis: {stage_label} begin (steps={}, resolution={}, state_channels={}, concat_channels={})",
+            sample_cfg.steps, self.config.resolution, state_channels, concat_channels
+        );
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
+            let step_start = Instant::now();
             let pred = self.predict_with_cfg_tensor(
                 x_t.clone(),
                 t,
@@ -1133,7 +1140,20 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             if capture_snapshots && step_idx + 1 == sample_cfg.steps {
                 step_last_x_t = Some(x_t.clone());
             }
+            let step_done = step_idx + 1;
+            if step_done % progress_interval == 0 || step_done == sample_cfg.steps {
+                eprintln!(
+                    "burn_trellis: {stage_label} step {step_done}/{} complete ({:.2} ms, elapsed={:.2} ms)",
+                    sample_cfg.steps,
+                    step_start.elapsed().as_secs_f64() * 1000.0,
+                    sample_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
+        eprintln!(
+            "burn_trellis: {stage_label} complete ({:.2} ms)",
+            sample_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let state_len = state_channels.saturating_mul(voxel);
         let (samples, step_0_x_t, step_mid_x_t, step_last_x_t) = if capture_snapshots {
@@ -1309,7 +1329,22 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
         let mut step_last_rows: Option<Tensor<B, 1>> = None;
         let mid_step = mid_snapshot_step(sample_cfg.steps);
         let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
+        let sample_start = Instant::now();
+        let progress_interval = runtime_sample_progress_interval(sample_cfg.steps);
+        let stage_label = if concat_cond.is_some() {
+            "flow.sample_rows_with_trace.tex_slat"
+        } else {
+            "flow.sample_rows_with_trace.shape_slat"
+        };
+        eprintln!(
+            "burn_trellis: {stage_label} begin (steps={}, resolution={}, rows={}, row_channels={})",
+            sample_cfg.steps,
+            self.config.resolution,
+            dense_indices.len(),
+            row_channels.min(state_channels)
+        );
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
+            let step_start = Instant::now();
             let pred = self.predict_with_cfg_tensor(
                 x_t.clone(),
                 t,
@@ -1339,7 +1374,20 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             {
                 step_last_rows = Some(self.gather_rows_tensor(x_t.clone(), plan)?);
             }
+            let step_done = step_idx + 1;
+            if step_done % progress_interval == 0 || step_done == sample_cfg.steps {
+                eprintln!(
+                    "burn_trellis: {stage_label} step {step_done}/{} complete ({:.2} ms, elapsed={:.2} ms)",
+                    sample_cfg.steps,
+                    step_start.elapsed().as_secs_f64() * 1000.0,
+                    sample_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
+        eprintln!(
+            "burn_trellis: {stage_label} complete ({:.2} ms)",
+            sample_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let (samples, step_0_x_t, step_mid_x_t, step_last_x_t) = if let Some(plan) =
             gather_plan.as_ref()
@@ -1407,11 +1455,12 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B> {
             return Ok(pred);
         }
 
+        let [batch, _, _, _, _] = x_t.dims();
         let x0_pos = pred_to_xstart_tensor(x_t.clone(), timestep, pos, sigma_min);
         let x0_cfg = pred_to_xstart_tensor(x_t.clone(), timestep, pred, sigma_min);
         let std_pos = tensor_std_tensor(x0_pos);
         let std_cfg = tensor_std_tensor(x0_cfg.clone()).add_scalar(1.0e-12);
-        let scale = std_pos.div(std_cfg).reshape([1, 1, 1, 1, 1]);
+        let scale = std_pos.div(std_cfg).reshape([batch, 1, 1, 1, 1]);
         let x0 = x0_cfg
             .clone()
             .mul(scale)
@@ -1486,46 +1535,48 @@ impl SparseStructureFlowRuntime {
         weights_root: &Path,
         image_large_root: Option<&Path>,
         model_stem: &str,
-        _prefer_wgpu: bool,
+        prefer_wgpu: bool,
         resolution_override: Option<usize>,
     ) -> Result<Self, String> {
         #[cfg(feature = "runtime-model-wgpu")]
-        if _prefer_wgpu {
-            match SparseStructureFlowRuntimeImpl::<WgpuRuntimeBackend>::load_from_stem(
+        if prefer_wgpu {
+            let runtime = SparseStructureFlowRuntimeImpl::<WgpuRuntimeBackend>::load_from_stem(
                 weights_root,
                 image_large_root,
                 model_stem,
                 resolution_override,
-            ) {
-                Ok(runtime) => {
-                    let cfg = runtime.config();
-                    let tokens = cfg
-                        .resolution
-                        .saturating_mul(cfg.resolution)
-                        .saturating_mul(cfg.resolution);
-                    if sparse_flow_wgpu_may_overflow(cfg)
-                        && !sparse_flow_chunked_forward_enabled(tokens)
-                    {
-                        eprintln!(
-                            "burn_trellis: sparse flow wgpu disabled for model '{}' due estimated peak tensor bytes (resolution={}, model_channels={}); falling back to cpu.",
-                            model_stem, cfg.resolution, cfg.model_channels
-                        );
-                    } else {
-                        if sparse_flow_wgpu_may_overflow(cfg) {
-                            eprintln!(
-                                "burn_trellis: sparse flow wgpu keeping model '{}' on device with chunked-forward path (resolution={}, model_channels={}).",
-                                model_stem, cfg.resolution, cfg.model_channels
-                            );
-                        }
-                        return Ok(Self::Wgpu(runtime));
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "burn_trellis: failed to load sparse flow runtime on wgpu ({err}); falling back to cpu."
-                    );
-                }
+            )
+            .map_err(|err| {
+                format!(
+                    "burn_trellis: failed to load sparse flow runtime on wgpu ({err}); refusing cpu fallback for model '{model_stem}'"
+                )
+            })?;
+            let cfg = runtime.config();
+            let tokens = cfg
+                .resolution
+                .saturating_mul(cfg.resolution)
+                .saturating_mul(cfg.resolution);
+            if sparse_flow_wgpu_may_overflow(cfg) && !sparse_flow_chunked_forward_enabled(tokens) {
+                return Err(format!(
+                    "burn_trellis: sparse flow wgpu estimated peak exceeds safe budget for model '{}' (resolution={}, model_channels={}); refusing cpu fallback",
+                    model_stem, cfg.resolution, cfg.model_channels
+                ));
             }
+            if sparse_flow_wgpu_may_overflow(cfg) {
+                eprintln!(
+                    "burn_trellis: sparse flow wgpu keeping model '{}' on device with chunked-forward path (resolution={}, model_channels={}).",
+                    model_stem, cfg.resolution, cfg.model_channels
+                );
+            }
+            return Ok(Self::Wgpu(runtime));
+        }
+
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        if prefer_wgpu {
+            return Err(format!(
+                "burn_trellis: sparse flow runtime requested wgpu for model '{}' but crate was built without runtime-model-wgpu",
+                model_stem
+            ));
         }
         let runtime = SparseStructureFlowRuntimeImpl::<CpuRuntimeBackend>::load_from_stem(
             weights_root,
@@ -1753,15 +1804,17 @@ fn xstart_to_pred_tensor<B: Backend>(
 
 fn tensor_std_tensor<B: Backend>(tensor: Tensor<B, 5>) -> Tensor<B, 1> {
     let [b, c, x, y, z] = tensor.dims();
-    let numel = b
-        .saturating_mul(c)
-        .saturating_mul(x)
-        .saturating_mul(y)
-        .saturating_mul(z)
-        .max(1);
-    let flat = tensor.reshape([numel]);
-    let mean = flat.clone().mean_dim(0);
-    flat.sub(mean).powf_scalar(2.0).mean_dim(0).sqrt()
+    let features = c.saturating_mul(x).saturating_mul(y).saturating_mul(z);
+    let flat = tensor.reshape([b, features.max(1)]);
+    let mean = flat.clone().mean_dim(1).reshape([b, 1]);
+    let centered = flat.sub(mean);
+    let denom = features.saturating_sub(1).max(1) as f32;
+    centered
+        .powf_scalar(2.0)
+        .sum_dim(1)
+        .reshape([b])
+        .div_scalar(denom)
+        .sqrt()
 }
 
 fn tensor_to_vec<B: Backend>(tensor: Tensor<B, 5>) -> Result<Vec<f32>, String> {
@@ -1921,7 +1974,63 @@ fn sparse_flow_linear_chunk_tokens(tokens: usize) -> usize {
 }
 
 fn sparse_flow_attn_logits_budget_bytes() -> usize {
-    2_147_483_648
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        // Keep attention logits under conservative WGPU per-buffer limits.
+        128 * 1024 * 1024
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        2_147_483_648
+    }
+}
+
+fn sparse_flow_stream_chunk_plan(
+    batch: usize,
+    heads: usize,
+    tokens: usize,
+    query_chunk_tokens: usize,
+    kv_chunk_tokens: usize,
+    reuse_qkv: bool,
+    logits_budget: usize,
+) -> (usize, usize) {
+    let tokens = tokens.max(1);
+    let mut query_chunk_tokens = query_chunk_tokens.max(1).min(tokens);
+    let mut kv_chunk_tokens = kv_chunk_tokens.max(1).min(tokens);
+    let bytes_per_logit = batch
+        .saturating_mul(heads)
+        .saturating_mul(core::mem::size_of::<f32>())
+        .max(1);
+    let budget_logits = logits_budget / bytes_per_logit;
+
+    if reuse_qkv {
+        let max_square = integer_sqrt(budget_logits).max(1).min(tokens);
+        let chunk_tokens = kv_chunk_tokens.min(max_square).max(1);
+        (chunk_tokens, chunk_tokens)
+    } else {
+        let max_query = budget_logits
+            .checked_div(kv_chunk_tokens.max(1))
+            .unwrap_or(1)
+            .max(1);
+        query_chunk_tokens = query_chunk_tokens.min(max_query).max(1);
+        let max_kv = budget_logits
+            .checked_div(query_chunk_tokens.max(1))
+            .unwrap_or(1)
+            .max(1);
+        kv_chunk_tokens = kv_chunk_tokens.min(max_kv).max(1);
+        (query_chunk_tokens, kv_chunk_tokens)
+    }
+}
+
+#[cfg(test)]
+fn sparse_flow_attention_logits_within_budget(
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    logits_budget: usize,
+) -> bool {
+    attention_logits_bytes(batch, heads, query_tokens, key_tokens) <= logits_budget
 }
 
 fn integer_sqrt(value: usize) -> usize {
@@ -2408,26 +2517,36 @@ fn load_sparse_model_weights<B: Backend>(
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("bpk"))
     {
-        let mut store = BurnpackStore::from_file(path).validate(true);
-        match model.load_from(&mut store) {
-            Ok(_) => Ok(()),
-            Err(module_err) => {
-                let blob_bytes = load_burnpack_blob_bytes(path).map_err(|blob_err| {
-                    format!(
-                        "failed to load sparse flow burnpack '{}' as module ({module_err}) or blob ({blob_err})",
-                        path.display()
-                    )
-                })?;
+        // Canonical sparse-flow checkpoints are stored as raw safetensors blobs in burnpacks.
+        // Prefer blob/parts loading first, then fall back to legacy module-layout burnpacks.
+        match load_blob_bytes_from_burnpack_or_parts(path, load_burnpack_blob_bytes) {
+            Ok(blob_bytes) => {
                 let mut safetensor_store = build_safetensor_store_from_bytes(blob_bytes)?;
                 model
                     .load_from(&mut safetensor_store)
                     .map(|_| ())
                     .map_err(|safetensor_err| {
                         format!(
-                            "failed to load sparse flow burnpack '{}' as safetensors blob after module load error ({module_err}): {safetensor_err}",
+                            "failed to load sparse flow burnpack '{}' as safetensors blob: {safetensor_err}",
                             path.display()
                         )
                     })
+            }
+            Err(blob_err) => {
+                if !path.exists() {
+                    return Err(format!(
+                        "failed to load sparse flow burnpack '{}' as blob/parts ({blob_err})",
+                        path.display()
+                    ));
+                }
+
+                let mut store = BurnpackStore::from_file(path).validate(true);
+                model.load_from(&mut store).map(|_| ()).map_err(|module_err| {
+                    format!(
+                        "failed to load sparse flow burnpack '{}' as blob/parts ({blob_err}) and legacy module layout ({module_err})",
+                        path.display()
+                    )
+                })
             }
         }
     } else {
@@ -2585,12 +2704,14 @@ fn resolve_model_weight_candidates(
     };
     candidates
         .into_iter()
-        .filter(|path| path.exists())
+        .filter(|path| candidate_exists_or_has_parts(path))
         .collect::<Vec<_>>()
 }
 
 fn prefer_f16_burnpack() -> bool {
-    true
+    // Correctness-first default: keep sparse-flow aligned with canonical bf16
+    // checkpoint behavior before opting into lossy f16 burnpacks.
+    false
 }
 
 fn resolve_model_source_path(
@@ -2646,7 +2767,9 @@ mod tests {
         BinaryBlob, BlobMetadata, CpuRuntimeBackend, SelfAttention, SparseStructureFlowConfig,
         SparseStructureFlowModel, SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl,
         host_transfer_stats, metadata_path, reset_host_transfer_stats,
-        scaled_dot_product_attention_dense, scaled_dot_product_attention_stream,
+        resolve_model_weight_candidates, scaled_dot_product_attention_dense,
+        scaled_dot_product_attention_stream, sparse_flow_attention_logits_within_budget,
+        sparse_flow_stream_chunk_plan,
     };
 
     static HOST_STATS_LOCK: Mutex<()> = Mutex::new(());
@@ -2838,6 +2961,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn runtime_loads_blob_burnpack_from_parts_manifest_when_base_file_missing() {
+        type BlobBackend = burn::backend::NdArray<f32, u8>;
+        type TestBackend = burn::backend::NdArray<f32>;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_sparse_flow_parts_{unique}"));
+        let ckpts = root.join("ckpts");
+        std::fs::create_dir_all(&ckpts).expect("create ckpt dir");
+
+        let config = SparseStructureFlowConfig {
+            resolution: 2,
+            in_channels: 2,
+            out_channels: 2,
+            model_channels: 8,
+            cond_channels: 4,
+            num_blocks: 1,
+            num_heads: Some(2),
+            num_head_channels: 4,
+            mlp_ratio: 2.0,
+            pe_mode: "rope".to_string(),
+            rope_freq: [1.0, 10_000.0],
+            share_mod: true,
+            qk_rms_norm: true,
+            qk_rms_norm_cross: true,
+            frequency_embedding_size: 8,
+        };
+
+        let config_json = serde_json::json!({
+            "name": "SparseStructureFlowModel",
+            "args": {
+                "resolution": config.resolution,
+                "in_channels": config.in_channels,
+                "out_channels": config.out_channels,
+                "model_channels": config.model_channels,
+                "cond_channels": config.cond_channels,
+                "num_blocks": config.num_blocks,
+                "num_heads": config.num_heads,
+                "num_head_channels": config.num_head_channels,
+                "mlp_ratio": config.mlp_ratio,
+                "pe_mode": config.pe_mode,
+                "rope_freq": config.rope_freq,
+                "share_mod": config.share_mod,
+                "qk_rms_norm": config.qk_rms_norm,
+                "qk_rms_norm_cross": config.qk_rms_norm_cross,
+                "frequency_embedding_size": config.frequency_embedding_size
+            }
+        });
+        std::fs::write(
+            ckpts.join("flow_model.json"),
+            serde_json::to_vec_pretty(&config_json).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let source_path = ckpts.join("flow_model.safetensors");
+        let device = <TestBackend as Backend>::Device::default();
+        let model = SparseStructureFlowModel::<TestBackend>::new(&device, config.clone());
+        let mut source_store =
+            SafetensorsStore::from_file(&source_path).with_to_adapter(BurnToPyTorchAdapter);
+        model
+            .save_into(&mut source_store)
+            .expect("save source safetensors");
+        let source_bytes = std::fs::read(&source_path).expect("read source safetensors");
+
+        let burnpack_path = ckpts.join("flow_model.bpk");
+        let blob_device = <BlobBackend as Backend>::Device::default();
+        let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
+            TensorData::new(source_bytes.clone(), [source_bytes.len()]),
+            &blob_device,
+        );
+        let blob = BinaryBlob {
+            bytes: Param::initialized(ParamId::new(), tensor),
+        };
+        let mut burnpack_store = BurnpackStore::from_file(&burnpack_path).overwrite(true);
+        blob.save_into(&mut burnpack_store)
+            .expect("save blob burnpack");
+        let metadata = BlobMetadata {
+            bytes_len: source_bytes.len(),
+        };
+        std::fs::write(
+            metadata_path(&burnpack_path),
+            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        let part_path = ckpts.join("flow_model.bpk.part-00000.bpk");
+        let part_meta_path = metadata_path(&part_path);
+        std::fs::rename(&burnpack_path, &part_path).expect("move burnpack into part");
+        std::fs::rename(metadata_path(&burnpack_path), &part_meta_path)
+            .expect("move part metadata");
+        let manifest_path = ckpts.join("flow_model.bpk.parts.json");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "{{\n  \"version\": 1,\n  \"source_file\": \"flow_model.bpk\",\n  \"source_modified_unix_ms\": 0,\n  \"total_bytes\": {},\n  \"max_part_bytes\": {},\n  \"parts\": [{{\"path\": \"{}\", \"bytes\": {}, \"sha256\": \"\", \"tensors\": 1}}]\n}}",
+                source_bytes.len(),
+                source_bytes.len(),
+                part_path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .expect("part file name"),
+                source_bytes.len()
+            ),
+        )
+        .expect("write parts manifest");
+        std::fs::remove_file(&source_path).expect("remove source safetensors");
+
+        let runtime = SparseStructureFlowRuntime::load_from_stem(
+            root.as_path(),
+            None,
+            "ckpts/flow_model",
+            false,
+            None,
+        )
+        .expect("runtime should load from parts manifest");
+        let cfg = runtime.config();
+        let voxels = cfg.resolution * cfg.resolution * cfg.resolution;
+        let sample = vec![0.0f32; cfg.in_channels * voxels];
+        let cond_tokens = 4;
+        let cond = vec![0.0f32; cond_tokens * cfg.cond_channels];
+        let prepared = runtime
+            .prepare_condition(cond.as_slice(), cond_tokens)
+            .expect("prepare cond");
+        let out = runtime
+            .predict_velocity_with_condition(sample.as_slice(), 1.0, &prepared, None)
+            .expect("forward");
+        assert_eq!(out.len(), sample.len());
+
+        let candidates = resolve_model_weight_candidates("ckpts/flow_model", root.as_path(), None);
+        assert_eq!(
+            candidates.first(),
+            Some(&ckpts.join("flow_model.bpk")),
+            "parts manifest path should be treated as a valid burnpack candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn run_tiny_forward<B: Backend>(device: &B::Device) {
         let config = SparseStructureFlowConfig {
             resolution: 2,
@@ -2931,6 +3195,53 @@ mod tests {
             .convert::<f32>()
             .to_vec::<f32>()
             .expect("tensor should be readable")
+    }
+
+    fn sample_std(values: &[f32]) -> f32 {
+        if values.len() < 2 {
+            return 0.0;
+        }
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        let var_sum = values
+            .iter()
+            .map(|value| {
+                let diff = *value - mean;
+                diff * diff
+            })
+            .sum::<f32>();
+        (var_sum / (values.len() - 1) as f32).sqrt()
+    }
+
+    #[test]
+    fn tensor_std_matches_batchwise_unbiased_reference() {
+        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let values = [
+            0.0f32, 1.0, 2.0, 3.0, // batch 0
+            2.0, 2.0, 2.0, 2.0, // batch 1
+        ];
+        let tensor = Tensor::<CpuRuntimeBackend, 1>::from_floats(values.as_slice(), &device)
+            .reshape([2, 1, 1, 1, 4]);
+        let std = super::tensor_std_tensor(tensor)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("std tensor should be readable");
+        assert_eq!(std.len(), 2, "expected one std value per batch item");
+
+        let expected0 = sample_std(&values[0..4]);
+        let expected1 = sample_std(&values[4..8]);
+        assert!(
+            (std[0] - expected0).abs() <= 1.0e-6,
+            "batch 0 std mismatch: got={} expected={}",
+            std[0],
+            expected0
+        );
+        assert!(
+            (std[1] - expected1).abs() <= 1.0e-6,
+            "batch 1 std mismatch: got={} expected={}",
+            std[1],
+            expected1
+        );
     }
 
     #[test]
@@ -3091,6 +3402,50 @@ mod tests {
             std::env::remove_var("TRELLIS2_SPARSE_FLOW_ATTN_QUERY_CHUNK");
             std::env::remove_var("TRELLIS2_SPARSE_FLOW_ATTN_KV_CHUNK");
         }
+    }
+
+    #[test]
+    fn sparse_flow_chunk_plan_reuse_qkv_respects_logits_budget() {
+        let logits_budget = 128 * 1024 * 1024;
+        let (query_chunk_tokens, kv_chunk_tokens) =
+            sparse_flow_stream_chunk_plan(1, 16, 6_144, 8_192, 8_192, true, logits_budget);
+        assert_eq!(
+            query_chunk_tokens, kv_chunk_tokens,
+            "reuse-qkv path must keep query/kv chunks aligned"
+        );
+        assert!(
+            sparse_flow_attention_logits_within_budget(
+                1,
+                16,
+                query_chunk_tokens,
+                kv_chunk_tokens,
+                logits_budget
+            ),
+            "chunk plan exceeded logits budget in reuse-qkv mode: q={} kv={} budget={}",
+            query_chunk_tokens,
+            kv_chunk_tokens,
+            logits_budget
+        );
+    }
+
+    #[test]
+    fn sparse_flow_chunk_plan_non_reuse_respects_logits_budget() {
+        let logits_budget = 128 * 1024 * 1024;
+        let (query_chunk_tokens, kv_chunk_tokens) =
+            sparse_flow_stream_chunk_plan(1, 16, 8_192, 2_048, 8_192, false, logits_budget);
+        assert!(
+            sparse_flow_attention_logits_within_budget(
+                1,
+                16,
+                query_chunk_tokens,
+                kv_chunk_tokens,
+                logits_budget
+            ),
+            "chunk plan exceeded logits budget in non-reuse mode: q={} kv={} budget={}",
+            query_chunk_tokens,
+            kv_chunk_tokens,
+            logits_budget
+        );
     }
 
     #[test]

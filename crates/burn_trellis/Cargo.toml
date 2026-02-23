@@ -22,6 +22,7 @@ runtime-model = [
 ]
 runtime-model-wgpu = ["runtime-model", "dep:burn-wgpu", "burn_flex_gmm/wgpu-kernel"]
 import = ["runtime-model", "dep:sha2", "dep:hex", "dep:burn_synth_import"]
+uv-xatlas = ["dep:xatlas-rs"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -52,8 +53,8 @@ optional = true
 default-features = false
 features = ["std", "metal"]
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-xatlas-rs = "0.1.3"
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "windows"))'.dependencies]
+xatlas-rs = { version = "0.1.3", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
 version = "0.19"
