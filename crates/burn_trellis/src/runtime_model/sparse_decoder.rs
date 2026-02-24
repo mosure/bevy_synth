@@ -36,7 +36,7 @@ const LAYER_NORM32_EPS: f32 = 1.0e-6;
 const F_LAYER_NORM_EPS: f32 = 1.0e-5;
 const DECODER_NEIGHBOR_CACHE_MAX: usize = 128;
 #[cfg(feature = "runtime-model-wgpu")]
-const DECODER_WGPU_TENSOR_CACHE_MAX: usize = 64;
+const DECODER_WGPU_TENSOR_CACHE_MAX: usize = 128;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecoderConvBlockTelemetry {
@@ -4265,7 +4265,7 @@ mod tests {
     fn decoder_wgpu_cache_controls_have_expected_defaults() {
         let _guard = env_lock_guard();
         assert!(!decoder_wgpu_clear_cache_after_decode());
-        assert_eq!(decoder_wgpu_tensor_cache_max(), 64);
+        assert_eq!(decoder_wgpu_tensor_cache_max(), 128);
         assert!(decoder_wgpu_use_tensor_cache());
         // Runtime behavior is canonical and should not drift based on environment toggles.
         unsafe {
@@ -4273,7 +4273,7 @@ mod tests {
             std::env::set_var("TRELLIS2_DECODER_WGPU_TENSOR_CACHE_MAX", "8");
         }
         assert!(!decoder_wgpu_clear_cache_after_decode());
-        assert_eq!(decoder_wgpu_tensor_cache_max(), 64);
+        assert_eq!(decoder_wgpu_tensor_cache_max(), 128);
         assert!(decoder_wgpu_use_tensor_cache());
         unsafe {
             std::env::remove_var("TRELLIS2_DECODER_WGPU_CLEAR_CACHE_AFTER_DECODE");
