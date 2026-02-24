@@ -1237,23 +1237,42 @@ impl SparseUnetDecoderRuntime {
                     )
                     .reshape([row_count, stage_channels])
                 };
-                match convnext_blocks_forward_wgpu_tensor(
-                    context_gpu,
-                    state_coords.as_slice(),
-                    state_t,
-                    stage_idx,
-                    stage_channels,
-                    stage.convnext_blocks.as_slice(),
-                ) {
-                    Ok(next_state_feats) => {
+                let convnext_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        convnext_blocks_forward_wgpu_tensor(
+                            context_gpu,
+                            state_coords.as_slice(),
+                            state_t,
+                            stage_idx,
+                            stage_channels,
+                            stage.convnext_blocks.as_slice(),
+                        )
+                    },
+                ));
+                match convnext_result {
+                    Ok(Ok(next_state_feats)) => {
                         state_feats_wgpu = Some(next_state_feats);
                         convnext_device_complete = true;
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
+                        if err.contains("BufferTooBig") {
+                            context_gpu.wgpu_failed = true;
+                        }
                         state_feats_wgpu = None;
                         if decoder_conv_debug_enabled() {
                             eprintln!(
                                 "burn_trellis: wgpu convnext stage fallback to cpu stage={} reason={err}",
+                                stage_idx
+                            );
+                        }
+                    }
+                    Err(payload) => {
+                        context_gpu.wgpu_failed = true;
+                        state_feats_wgpu = None;
+                        if decoder_conv_debug_enabled() {
+                            let panic_message = panic_payload_to_string(payload);
+                            eprintln!(
+                                "burn_trellis: wgpu convnext stage panicked, fallback to cpu stage={} panic={panic_message}",
                                 stage_idx
                             );
                         }
@@ -1339,7 +1358,11 @@ impl SparseUnetDecoderRuntime {
                     continue;
                 }
 
-                let subdiv_logits = if let Some(to_subdiv) = up.to_subdiv.as_ref() {
+                let subdiv_logits = if let Some(guide) =
+                    guide_subdivisions.and_then(|levels| levels.get(stage_idx))
+                {
+                    map_guide_subdivision_logits(parent_coords.as_slice(), guide)?
+                } else if let Some(to_subdiv) = up.to_subdiv.as_ref() {
                     let mut logits = linear_forward(
                         parent_feats.as_slice(),
                         parent_rows,
@@ -1354,14 +1377,9 @@ impl SparseUnetDecoderRuntime {
                     }
                     logits
                 } else {
-                    let guide = guide_subdivisions
-                        .and_then(|levels| levels.get(stage_idx))
-                        .ok_or_else(|| {
-                            format!(
-                                "decoder stage {stage_idx} requires guide_subdivisions but none were provided"
-                            )
-                        })?;
-                    map_guide_subdivision_logits(parent_coords.as_slice(), guide)?
+                    return Err(format!(
+                        "decoder stage {stage_idx} requires guide_subdivisions but none were provided"
+                    ));
                 };
 
                 let subdivision_mask =
@@ -1447,30 +1465,35 @@ impl SparseUnetDecoderRuntime {
                     && child_rows > 0
                     && let Some(context_gpu) = wgpu_context.as_deref_mut()
                 {
-                    let h_up_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(
-                        h_up.as_slice(),
-                        &context_gpu.device,
-                    )
-                    .reshape([child_rows, up.out_channels]);
-                    let h_up_t = layer_norm_wgpu(
-                        context_gpu,
-                        h_up_t,
-                        child_rows,
-                        up.out_channels,
-                        None,
-                        None,
-                        LAYER_NORM32_EPS,
-                    )?;
-                    let h_up_t = silu_wgpu(h_up_t);
-                    let config = flex_config_for_layer(&up.conv2);
-                    match context_gpu.forward_with_coords_tensor(
-                        &config,
-                        &up.conv2,
-                        h_up_t,
-                        format!("stage {stage_idx} up conv2(wgpu_math)").as_str(),
-                        child_coords.as_slice(),
-                    ) {
-                        Ok(h_t) => {
+                    let wgpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || {
+                            let h_up_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(
+                                h_up.as_slice(),
+                                &context_gpu.device,
+                            )
+                            .reshape([child_rows, up.out_channels]);
+                            let h_up_t = layer_norm_wgpu(
+                                context_gpu,
+                                h_up_t,
+                                child_rows,
+                                up.out_channels,
+                                None,
+                                None,
+                                LAYER_NORM32_EPS,
+                            )?;
+                            let h_up_t = silu_wgpu(h_up_t);
+                            let config = flex_config_for_layer(&up.conv2);
+                            context_gpu.forward_with_coords_tensor(
+                                &config,
+                                &up.conv2,
+                                h_up_t,
+                                format!("stage {stage_idx} up conv2(wgpu_math)").as_str(),
+                                child_coords.as_slice(),
+                            )
+                        },
+                    ));
+                    match wgpu_result {
+                        Ok(Ok(h_t)) => {
                             let skip_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(
                                 skip.as_slice(),
                                 &context_gpu.device,
@@ -1479,7 +1502,10 @@ impl SparseUnetDecoderRuntime {
                             state_feats_wgpu = Some(h_t.add(skip_t));
                             upsample_device_complete = true;
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
+                            if err.contains("BufferTooBig") {
+                                context_gpu.wgpu_failed = true;
+                            }
                             state_feats_wgpu = None;
                             if decoder_conv_debug_enabled() {
                                 eprintln!(
@@ -1488,9 +1514,20 @@ impl SparseUnetDecoderRuntime {
                                 );
                             }
                         }
+                        Err(payload) => {
+                            context_gpu.wgpu_failed = true;
+                            state_feats_wgpu = None;
+                            if decoder_conv_debug_enabled() {
+                                let panic_message = panic_payload_to_string(payload);
+                                eprintln!(
+                                    "burn_trellis: wgpu upsample conv2 panicked, fallback to cpu stage={} panic={panic_message}",
+                                    stage_idx
+                                );
+                            }
+                        }
                     }
                 }
-
+                
                 if !upsample_device_complete {
                     layer_norm_inplace(
                         h_up.as_mut_slice(),
@@ -1548,22 +1585,80 @@ impl SparseUnetDecoderRuntime {
                         && (!self.compute_fp16 || decoder_wgpu_device_math_allow_fp16())
                     {
                         if let Some(context_gpu) = wgpu_context.as_deref_mut() {
-                            let state_t = layer_norm_wgpu(
-                                context_gpu,
-                                state_t,
-                                rows_final,
-                                final_channels,
-                                None,
-                                None,
-                                F_LAYER_NORM_EPS,
-                            )?;
-                            let state_t = linear_forward_wgpu(
-                                context_gpu,
-                                state_t,
-                                &self.output_layer,
-                                "output_layer(wgpu_math)",
-                            )?;
-                            tensor_to_vec_f32(state_t, "output_layer(wgpu_math)")?
+                            let wgpu_result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    let state_t = layer_norm_wgpu(
+                                        context_gpu,
+                                        state_t.clone(),
+                                        rows_final,
+                                        final_channels,
+                                        None,
+                                        None,
+                                        F_LAYER_NORM_EPS,
+                                    )?;
+                                    let state_t = linear_forward_wgpu(
+                                        context_gpu,
+                                        state_t,
+                                        &self.output_layer,
+                                        "output_layer(wgpu_math)",
+                                    )?;
+                                    tensor_to_vec_f32(state_t, "output_layer(wgpu_math)")
+                                }),
+                            );
+                            match wgpu_result {
+                                Ok(Ok(output)) => output,
+                                Ok(Err(err)) => {
+                                    if err.contains("BufferTooBig") {
+                                        context_gpu.wgpu_failed = true;
+                                    }
+                                    if decoder_conv_debug_enabled() {
+                                        eprintln!(
+                                            "burn_trellis: wgpu output layer fallback to cpu reason={err}"
+                                        );
+                                    }
+                                    let mut state_feats =
+                                        tensor_to_vec_f32(state_t, "output_layer state readback")?;
+                                    layer_norm_inplace(
+                                        state_feats.as_mut_slice(),
+                                        rows_final,
+                                        final_channels,
+                                        None,
+                                        None,
+                                        F_LAYER_NORM_EPS,
+                                    )?;
+                                    linear_forward(
+                                        state_feats.as_slice(),
+                                        rows_final,
+                                        &self.output_layer,
+                                        "output_layer",
+                                    )?
+                                }
+                                Err(payload) => {
+                                    context_gpu.wgpu_failed = true;
+                                    if decoder_conv_debug_enabled() {
+                                        let panic_message = panic_payload_to_string(payload);
+                                        eprintln!(
+                                            "burn_trellis: wgpu output layer panicked, fallback to cpu panic={panic_message}"
+                                        );
+                                    }
+                                    let mut state_feats =
+                                        tensor_to_vec_f32(state_t, "output_layer state readback")?;
+                                    layer_norm_inplace(
+                                        state_feats.as_mut_slice(),
+                                        rows_final,
+                                        final_channels,
+                                        None,
+                                        None,
+                                        F_LAYER_NORM_EPS,
+                                    )?;
+                                    linear_forward(
+                                        state_feats.as_slice(),
+                                        rows_final,
+                                        &self.output_layer,
+                                        "output_layer",
+                                    )?
+                                }
+                            }
                         } else {
                             let mut state_feats =
                                 tensor_to_vec_f32(state_t, "output_layer state readback")?;
@@ -1735,23 +1830,39 @@ impl SparseUnetDecoderRuntime {
                 )
                 .reshape([row_count, stage_channels])
             };
-            match convnext_blocks_forward_wgpu_tensor(
-                context_gpu,
-                state_coords.as_slice(),
-                state_t,
-                0,
-                stage_channels,
-                stage.convnext_blocks.as_slice(),
-            ) {
-                Ok(next_state_feats) => {
+            let convnext_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                convnext_blocks_forward_wgpu_tensor(
+                    context_gpu,
+                    state_coords.as_slice(),
+                    state_t,
+                    0,
+                    stage_channels,
+                    stage.convnext_blocks.as_slice(),
+                )
+            }));
+            match convnext_result {
+                Ok(Ok(next_state_feats)) => {
                     state_feats_wgpu = Some(next_state_feats);
                     convnext_device_complete = true;
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
+                    if err.contains("BufferTooBig") {
+                        context_gpu.wgpu_failed = true;
+                    }
                     state_feats_wgpu = None;
                     if decoder_conv_debug_enabled() {
                         eprintln!(
                             "burn_trellis: wgpu stage0 convnext fallback to cpu reason={err}"
+                        );
+                    }
+                }
+                Err(payload) => {
+                    context_gpu.wgpu_failed = true;
+                    state_feats_wgpu = None;
+                    if decoder_conv_debug_enabled() {
+                        let panic_message = panic_payload_to_string(payload);
+                        eprintln!(
+                            "burn_trellis: wgpu stage0 convnext panicked, fallback to cpu panic={panic_message}"
                         );
                     }
                 }
@@ -1830,13 +1941,55 @@ impl SparseUnetDecoderRuntime {
                         && (!self.compute_fp16 || decoder_wgpu_device_math_allow_fp16())
                     {
                         if let Some(context_gpu) = wgpu_context.as_deref_mut() {
-                            let logits_t = linear_forward_wgpu(
-                                context_gpu,
-                                state_t,
-                                to_subdiv,
-                                "stage0 to_subdiv(wgpu_math)",
-                            )?;
-                            tensor_to_vec_f32(logits_t, "stage0 to_subdiv(wgpu_math)")?
+                            let wgpu_result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    let logits_t = linear_forward_wgpu(
+                                        context_gpu,
+                                        state_t.clone(),
+                                        to_subdiv,
+                                        "stage0 to_subdiv(wgpu_math)",
+                                    )?;
+                                    tensor_to_vec_f32(logits_t, "stage0 to_subdiv(wgpu_math)")
+                                }),
+                            );
+                            match wgpu_result {
+                                Ok(Ok(logits)) => logits,
+                                Ok(Err(err)) => {
+                                    if err.contains("BufferTooBig") {
+                                        context_gpu.wgpu_failed = true;
+                                    }
+                                    if decoder_conv_debug_enabled() {
+                                        eprintln!(
+                                            "burn_trellis: wgpu stage0 to_subdiv fallback to cpu reason={err}"
+                                        );
+                                    }
+                                    let host =
+                                        tensor_to_vec_f32(state_t, "stage0 to_subdiv readback")?;
+                                    linear_forward(
+                                        host.as_slice(),
+                                        state_coords.len(),
+                                        to_subdiv,
+                                        "stage0 to_subdiv",
+                                    )?
+                                }
+                                Err(payload) => {
+                                    context_gpu.wgpu_failed = true;
+                                    if decoder_conv_debug_enabled() {
+                                        let panic_message = panic_payload_to_string(payload);
+                                        eprintln!(
+                                            "burn_trellis: wgpu stage0 to_subdiv panicked, fallback to cpu panic={panic_message}"
+                                        );
+                                    }
+                                    let host =
+                                        tensor_to_vec_f32(state_t, "stage0 to_subdiv readback")?;
+                                    linear_forward(
+                                        host.as_slice(),
+                                        state_coords.len(),
+                                        to_subdiv,
+                                        "stage0 to_subdiv",
+                                    )?
+                                }
+                            }
                         } else {
                             let host = tensor_to_vec_f32(state_t, "stage0 to_subdiv readback")?;
                             linear_forward(
@@ -2334,6 +2487,139 @@ fn silu_wgpu(input: Tensor<DefaultWgpuBackend, 2>) -> Tensor<DefaultWgpuBackend,
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
+fn tensor_bytes_f32(rows: usize, channels: usize, context: &str) -> Result<usize, String> {
+    rows.checked_mul(channels)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| {
+            format!(
+                "{context}: tensor byte size overflow (rows={rows}, channels={channels})"
+            )
+        })
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn convnext_block_mlp_forward_wgpu(
+    context_gpu: &mut DecoderWgpuConvContext,
+    input_t: Tensor<DefaultWgpuBackend, 2>,
+    block: &ConvNeXtBlock,
+    stage_idx: usize,
+    block_idx: usize,
+) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
+    let [rows, channels] = input_t.dims();
+    if rows == 0 {
+        return Ok(input_t);
+    }
+    if channels != block.mlp_0.in_channels {
+        return Err(format!(
+            "decoder stage {stage_idx} block {block_idx} mlp_0 input mismatch: channels={} expected={}",
+            channels, block.mlp_0.in_channels
+        ));
+    }
+    if block.mlp_0.out_channels != block.mlp_2.in_channels {
+        return Err(format!(
+            "decoder stage {stage_idx} block {block_idx} mlp hidden mismatch: mlp_0.out_channels={} mlp_2.in_channels={}",
+            block.mlp_0.out_channels, block.mlp_2.in_channels
+        ));
+    }
+
+    let max_output_bytes = decoder_wgpu_max_output_bytes();
+    let hidden_bytes = tensor_bytes_f32(
+        rows,
+        block.mlp_0.out_channels,
+        format!("decoder stage {stage_idx} block {block_idx} mlp_0").as_str(),
+    )?;
+    if hidden_bytes <= max_output_bytes {
+        let state_t = linear_forward_wgpu(
+            context_gpu,
+            input_t,
+            &block.mlp_0,
+            format!("stage {stage_idx} block {block_idx} mlp_0(wgpu_math)").as_str(),
+        )?;
+        let state_t = silu_wgpu(state_t);
+        return linear_forward_wgpu(
+            context_gpu,
+            state_t,
+            &block.mlp_2,
+            format!("stage {stage_idx} block {block_idx} mlp_2(wgpu_math)").as_str(),
+        );
+    }
+
+    let hidden_bytes_per_row = block
+        .mlp_0
+        .out_channels
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            format!(
+                "decoder stage {stage_idx} block {block_idx} hidden row bytes overflow"
+            )
+        })?;
+    let output_bytes_per_row = block
+        .mlp_2
+        .out_channels
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            format!(
+                "decoder stage {stage_idx} block {block_idx} output row bytes overflow"
+            )
+        })?;
+    let chunk_rows = decoder_wgpu_chunk_rows(rows, hidden_bytes_per_row, max_output_bytes)
+        .min(decoder_wgpu_chunk_rows(
+            rows,
+            output_bytes_per_row,
+            max_output_bytes,
+        ))
+        .max(1);
+
+    if decoder_conv_debug_enabled() {
+        eprintln!(
+            "burn_trellis: chunking wgpu convnext mlp stage={} block={} rows={} chunk_rows={} hidden_channels={} output_channels={} hidden_bytes={}",
+            stage_idx,
+            block_idx,
+            rows,
+            chunk_rows,
+            block.mlp_0.out_channels,
+            block.mlp_2.out_channels,
+            hidden_bytes
+        );
+    }
+
+    let mut chunk_tensors: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
+    let mut start = 0usize;
+    while start < rows {
+        let end = (start + chunk_rows).min(rows);
+        let input_chunk = input_t.clone().slice([start..end, 0..channels]);
+        let hidden_chunk = linear_forward_wgpu(
+            context_gpu,
+            input_chunk,
+            &block.mlp_0,
+            format!("stage {stage_idx} block {block_idx} mlp_0(wgpu_math chunk[{start}:{end}])")
+                .as_str(),
+        )?;
+        let hidden_chunk = silu_wgpu(hidden_chunk);
+        let output_chunk = linear_forward_wgpu(
+            context_gpu,
+            hidden_chunk,
+            &block.mlp_2,
+            format!("stage {stage_idx} block {block_idx} mlp_2(wgpu_math chunk[{start}:{end}])")
+                .as_str(),
+        )?;
+        chunk_tensors.push(output_chunk);
+        start = end;
+    }
+
+    if chunk_tensors.is_empty() {
+        return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
+            [0, block.mlp_2.out_channels],
+            &context_gpu.device,
+        ));
+    }
+    if chunk_tensors.len() == 1 {
+        return Ok(chunk_tensors.remove(0));
+    }
+    Ok(Tensor::cat(chunk_tensors, 0))
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
 fn tensor_to_vec_f32(
     tensor: Tensor<DefaultWgpuBackend, 2>,
     context: &str,
@@ -2381,19 +2667,8 @@ fn convnext_blocks_forward_wgpu_tensor(
             Some(block.norm_bias.as_slice()),
             LAYER_NORM32_EPS,
         )?;
-        state_t = linear_forward_wgpu(
-            context_gpu,
-            state_t,
-            &block.mlp_0,
-            format!("stage {stage_idx} block {block_idx} mlp_0(wgpu_math)").as_str(),
-        )?;
-        state_t = silu_wgpu(state_t);
-        state_t = linear_forward_wgpu(
-            context_gpu,
-            state_t,
-            &block.mlp_2,
-            format!("stage {stage_idx} block {block_idx} mlp_2(wgpu_math)").as_str(),
-        )?;
+        state_t =
+            convnext_block_mlp_forward_wgpu(context_gpu, state_t, block, stage_idx, block_idx)?;
         state_t = state_t.add(residual);
     }
     Ok(state_t)
@@ -2973,7 +3248,7 @@ fn decoder_subdivision_activation_threshold_for_child(child: usize, fallback: f3
         .unwrap_or(fallback)
 }
 
-fn decoder_max_children_per_parent(rows: usize) -> Option<usize> {
+fn decoder_max_children_per_parent(_rows: usize) -> Option<usize> {
     if let Ok(raw) = std::env::var("TRELLIS2_DECODER_MAX_CHILDREN_PER_PARENT")
         && let Ok(parsed) = raw.trim().parse::<usize>()
     {
@@ -2988,10 +3263,7 @@ fn decoder_max_children_per_parent(rows: usize) -> Option<usize> {
     if uncapped || decoder_subdiv_strict_context() {
         return None;
     }
-
-    // Keep exact uncapped behavior for small workloads while hard-bounding
-    // large decoder expansions that otherwise lead to multi-minute stalls.
-    if rows > 2_048 { Some(1) } else { None }
+    None
 }
 
 fn decoder_subdiv_strict_context() -> bool {
@@ -3185,7 +3457,7 @@ fn map_guide_subdivision_logits(
     }
 
     let mut out = Vec::with_capacity(coords.len() * 8);
-    let strict = false;
+    let strict = decoder_subdiv_strict_context();
     for coord in coords {
         if let Some(row) = map.get(coord) {
             out.extend_from_slice(row);
@@ -3695,7 +3967,7 @@ mod tests {
     }
 
     #[test]
-    fn large_rows_default_child_cap_limits_to_one() {
+    fn large_rows_default_child_cap_is_uncapped() {
         let _guard = env_lock_guard();
         unsafe {
             std::env::remove_var("TRELLIS2_PARITY_STRICT");
@@ -3706,7 +3978,7 @@ mod tests {
         let logits = vec![1.0f32; 4_096 * 8];
         let mask = logits_to_mask(logits.as_slice(), 4_096, true).expect("mask");
         let selected = mask[0].iter().filter(|flag| **flag).count();
-        assert_eq!(selected, 1);
+        assert_eq!(selected, 8);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use burn_trellis::TrellisQuality;
 use burn_trellis::pipeline::{
@@ -66,6 +67,38 @@ struct Args {
     /// Optional cap on sparse coords before decode. Use lower values for short strict passes.
     #[arg(long)]
     max_sparse_coords: Option<usize>,
+
+    /// Export GLB via canonical o_voxel postprocess using hook tensors.
+    #[arg(long, default_value_t = false)]
+    ovoxel_postprocess_from_hook: bool,
+
+    /// Python executable used for o_voxel postprocess export.
+    #[arg(long, default_value = "python3")]
+    ovoxel_python_bin: String,
+
+    /// Optional override path for the o_voxel postprocess helper script.
+    #[arg(long)]
+    ovoxel_postprocess_script: Option<PathBuf>,
+
+    /// o_voxel decimation target passed to postprocess export.
+    #[arg(long, default_value_t = 1_000_000)]
+    ovoxel_decimation_target: usize,
+
+    /// o_voxel texture size passed to postprocess export.
+    #[arg(long, default_value_t = 4096)]
+    ovoxel_texture_size: usize,
+
+    /// o_voxel remesh band passed to postprocess export.
+    #[arg(long, default_value_t = 1.0)]
+    ovoxel_remesh_band: f32,
+
+    /// o_voxel remesh projection passed to postprocess export.
+    #[arg(long, default_value_t = 0.0)]
+    ovoxel_remesh_project: f32,
+
+    /// Export GLB with WEBP extension textures (disabled by default for broader metric tooling compatibility).
+    #[arg(long, default_value_t = false)]
+    ovoxel_extension_webp: bool,
 }
 
 fn run() -> Result<(), String> {
@@ -74,6 +107,14 @@ fn run() -> Result<(), String> {
         .output
         .as_ref()
         .map(|path| resolve_glb_output_path(path.as_path(), args.input.as_path()));
+    if args.ovoxel_postprocess_from_hook && output_glb.is_none() {
+        return Err(
+            "ovoxel postprocess export requires --output/--output-glb to be provided".to_string(),
+        );
+    }
+    if args.ovoxel_postprocess_from_hook && args.hook_output.is_none() {
+        return Err("ovoxel postprocess export requires --hook-output".to_string());
+    }
 
     let mut config = Trellis2PipelineConfig::default();
     if let Some(path) = args.weights_root.as_ref() {
@@ -149,7 +190,15 @@ fn run() -> Result<(), String> {
         burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
     if let Some(glb_path) = output_glb.as_ref() {
-        burn_trellis::write_glb_mesh(glb_path, &profiled.mesh).map_err(|err| err.to_string())?;
+        if args.ovoxel_postprocess_from_hook {
+            let hook_path = args
+                .hook_output
+                .as_ref()
+                .ok_or_else(|| "ovoxel postprocess requires --hook-output".to_string())?;
+            run_ovoxel_postprocess(&args, hook_path.as_path(), glb_path.as_path())?;
+        } else {
+            burn_trellis::write_glb_mesh(glb_path, &profiled.mesh).map_err(|err| err.to_string())?;
+        }
     }
 
     let timings_json = |profiled: &burn_trellis::pipeline::TrellisInferenceProfile| {
@@ -201,6 +250,7 @@ fn run() -> Result<(), String> {
                 "strict_benchmark": args.strict_benchmark,
                 "repeat": repeat,
                 "max_sparse_coords": args.max_sparse_coords,
+                "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
                 "sparse_source": profiled.sparse_source.as_str(),
                 "decode_source": profiled.decode_source.as_str(),
                 "fallbacks": {
@@ -248,6 +298,7 @@ fn run() -> Result<(), String> {
                 "strict_benchmark": args.strict_benchmark,
                 "repeat": repeat,
                 "max_sparse_coords": args.max_sparse_coords,
+                "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
                 "summary": {
                     "runtime_setup_mean_ms": setup_mean,
                     "total_mean_ms": total_mean,
@@ -269,6 +320,64 @@ fn run() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn run_ovoxel_postprocess(args: &Args, hook_path: &Path, output_glb: &Path) -> Result<(), String> {
+    if !hook_path.exists() {
+        return Err(format!(
+            "ovoxel postprocess input hook missing: {}",
+            hook_path.display()
+        ));
+    }
+    let script = args
+        .ovoxel_postprocess_script
+        .clone()
+        .unwrap_or_else(|| default_ovoxel_postprocess_script_path());
+    if !script.exists() {
+        return Err(format!(
+            "ovoxel postprocess script missing: {}",
+            script.display()
+        ));
+    }
+    let mut cmd = Command::new(&args.ovoxel_python_bin);
+    cmd.arg(script.as_path())
+        .arg("--hook")
+        .arg(hook_path)
+        .arg("--output")
+        .arg(output_glb)
+        .arg("--decimation-target")
+        .arg(args.ovoxel_decimation_target.to_string())
+        .arg("--texture-size")
+        .arg(args.ovoxel_texture_size.to_string())
+        .arg("--remesh-band")
+        .arg(args.ovoxel_remesh_band.to_string())
+        .arg("--remesh-project")
+        .arg(args.ovoxel_remesh_project.to_string());
+    if args.ovoxel_extension_webp {
+        cmd.arg("--extension-webp");
+    }
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to run o_voxel postprocess command: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(output.stderr.as_slice()).trim().to_string();
+        let stdout = String::from_utf8_lossy(output.stdout.as_slice()).trim().to_string();
+        return Err(format!(
+            "o_voxel postprocess failed (status={}): stderr='{}' stdout='{}'",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated_by_signal".to_string()),
+            stderr,
+            stdout
+        ));
+    }
+    Ok(())
+}
+
+fn default_ovoxel_postprocess_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tool/trellis2_postprocess_from_hook.py")
 }
 
 fn resolve_glb_output_path(output: &Path, input: &Path) -> PathBuf {
@@ -374,5 +483,35 @@ mod tests {
             resolve_glb_output_path(Path::new("tmp/out.glb"), input),
             PathBuf::from("tmp/out.glb")
         );
+    }
+
+    #[test]
+    fn accepts_ovoxel_postprocess_flags() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--output",
+            "out.glb",
+            "--hook-output",
+            "out_hook.safetensors",
+            "--ovoxel-postprocess-from-hook",
+            "--ovoxel-python-bin",
+            "python3",
+            "--ovoxel-decimation-target",
+            "1000000",
+            "--ovoxel-texture-size",
+            "4096",
+            "--ovoxel-remesh-band",
+            "1.0",
+            "--ovoxel-remesh-project",
+            "0.0",
+        ]);
+        assert!(args.ovoxel_postprocess_from_hook);
+        assert_eq!(args.ovoxel_python_bin, "python3");
+        assert_eq!(args.ovoxel_decimation_target, 1_000_000);
+        assert_eq!(args.ovoxel_texture_size, 4096);
+        assert_eq!(args.ovoxel_remesh_band, 1.0);
+        assert_eq!(args.ovoxel_remesh_project, 0.0);
     }
 }
