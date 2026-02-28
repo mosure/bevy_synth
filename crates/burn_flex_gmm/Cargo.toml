@@ -17,26 +17,26 @@ wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
 
 [dependencies]
 matrixmultiply = "0.3"
-burn = { version = "0.19", default-features = false, features = ["std"], optional = true }
-burn-cubecl = { version = "0.19", optional = true }
+burn = { version = "0.21.0-pre.1", default-features = false, features = ["std"], optional = true }
+burn-cubecl = { version = "0.21.0-pre.1", optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
-version = "0.19"
+version = "0.21.0-pre.1"
 optional = true
 default-features = false
-features = ["std", "vulkan"]
+features = ["fusion", "std", "vulkan"]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
-version = "0.19"
+version = "0.21.0-pre.1"
 optional = true
 default-features = false
-features = ["std", "metal"]
+features = ["fusion", "std", "metal"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
-version = "0.19"
+version = "0.21.0-pre.1"
 optional = true
 default-features = false
-features = ["std", "webgpu"]
+features = ["fusion", "std", "webgpu"]
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
@@ -44,3 +44,13 @@ criterion = { version = "0.6", features = ["html_reports"] }
 [[bench]]
 name = "sparse_subm_conv"
 harness = false
+
+[[bin]]
+name = "neighbor_stage_bench"
+path = "tool/neighbor_stage_bench.rs"
+required-features = ["wgpu-kernel"]
+
+[[bin]]
+name = "sparse_conv_stage_bench"
+path = "tool/sparse_conv_stage_bench.rs"
+required-features = ["wgpu-kernel"]

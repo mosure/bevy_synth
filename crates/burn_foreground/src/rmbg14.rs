@@ -65,7 +65,7 @@ impl<B: Backend> RebnConv<B> {
         let conv = Conv2dConfig::new([in_ch, out_ch], [3, 3])
             .with_stride([stride, stride])
             .with_dilation([dirate, dirate])
-            .with_padding(PaddingConfig2d::Explicit(dirate, dirate))
+            .with_padding(PaddingConfig2d::Explicit(dirate, dirate, dirate, dirate))
             .init(device);
         let bn = nn::BatchNormConfig::new(out_ch).init(device);
         let relu = nn::Relu::new();
@@ -379,7 +379,7 @@ impl<B: Backend> BriaRmbg<B> {
     pub fn new(device: &B::Device, config: RmbgConfig) -> Self {
         let conv_in = Conv2dConfig::new([config.in_ch, 64], [3, 3])
             .with_stride([2, 2])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         let stage1 = Rsu7::new(device, 64, 32, 64);
@@ -396,22 +396,22 @@ impl<B: Backend> BriaRmbg<B> {
         let stage1d = Rsu7::new(device, 128, 16, 64);
 
         let side1 = Conv2dConfig::new([64, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side2 = Conv2dConfig::new([64, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side3 = Conv2dConfig::new([128, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side4 = Conv2dConfig::new([256, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side5 = Conv2dConfig::new([512, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side6 = Conv2dConfig::new([512, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         Self {
@@ -595,7 +595,7 @@ fn max_pool2d_ceil<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
         x = x.pad((0, pad_w, 0, pad_h), f32::NEG_INFINITY);
     }
 
-    max_pool2d(x, [kernel, kernel], [stride, stride], [0, 0], [1, 1])
+    max_pool2d(x, [kernel, kernel], [stride, stride], [0, 0], [1, 1], false)
 }
 
 #[cfg(feature = "import")]

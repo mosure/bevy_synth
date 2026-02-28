@@ -133,6 +133,12 @@ mod tests {
 
         let f32_first = candidate_burnpack_names("model.safetensors", false);
         assert_eq!(f32_first, vec!["model.bpk", "model_f16.bpk"]);
+
+        let low_precision = candidate_burnpack_names("ckpts/shape_bf16.safetensors", true);
+        assert_eq!(
+            low_precision,
+            vec!["ckpts/shape_bf16.bpk", "ckpts/shape_bf16_f16.bpk"]
+        );
     }
 
     #[test]

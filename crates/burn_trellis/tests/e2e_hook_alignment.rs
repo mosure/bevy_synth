@@ -105,6 +105,84 @@ fn coords_set(
     Ok(out)
 }
 
+fn mesh_axis_balance(snapshot: &HookSnapshot, key: &str) -> Result<[f32; 3], String> {
+    let tensor = snapshot
+        .tensors
+        .get(key)
+        .ok_or_else(|| format!("missing mesh vertices key '{key}'"))?;
+    if tensor.shape.len() != 2 || tensor.shape[1] != 3 {
+        return Err(format!(
+            "mesh vertices key '{key}' has invalid shape {:?}; expected [N,3]",
+            tensor.shape
+        ));
+    }
+    if tensor.data.len() != tensor.shape[0] * tensor.shape[1] {
+        return Err(format!(
+            "mesh vertices key '{key}' has invalid element count {} for shape {:?}",
+            tensor.data.len(),
+            tensor.shape
+        ));
+    }
+    let mut pos = [0u64; 3];
+    let mut neg = [0u64; 3];
+    for row in tensor.data.chunks_exact(3) {
+        for axis in 0..3usize {
+            let value = row[axis];
+            if value > 1.0e-6 {
+                pos[axis] += 1;
+            } else if value < -1.0e-6 {
+                neg[axis] += 1;
+            }
+        }
+    }
+    let mut balance = [0.0f32; 3];
+    for axis in 0..3usize {
+        let total = pos[axis] + neg[axis];
+        if total == 0 {
+            balance[axis] = 0.0;
+        } else {
+            balance[axis] = (pos[axis] as f32 - neg[axis] as f32) / total as f32;
+        }
+    }
+    Ok(balance)
+}
+
+fn assert_orientation_balance(
+    key: &str,
+    reference: [f32; 3],
+    actual: [f32; 3],
+) -> Result<(), String> {
+    const AXIS_NAMES: [&str; 3] = ["x", "y", "z"];
+    const SIGNAL_MIN: f32 = 1.0e-2;
+    const DELTA_MAX: f32 = 8.0e-2;
+    for axis in 0..3usize {
+        let ref_value = reference[axis];
+        let actual_value = actual[axis];
+        let delta = (actual_value - ref_value).abs();
+        if delta > DELTA_MAX {
+            return Err(format!(
+                "strict orientation mismatch for '{key}' axis='{}': reference_balance={:.6e} actual_balance={:.6e} delta={:.6e} (limit={:.6e})",
+                AXIS_NAMES[axis], ref_value, actual_value, delta, DELTA_MAX
+            ));
+        }
+        if ref_value.abs() >= SIGNAL_MIN {
+            if actual_value.abs() < SIGNAL_MIN {
+                return Err(format!(
+                    "strict orientation mismatch for '{key}' axis='{}': reference_balance={:.6e} but actual balance lost directional signal ({:.6e})",
+                    AXIS_NAMES[axis], ref_value, actual_value
+                ));
+            }
+            if ref_value.signum() != actual_value.signum() {
+                return Err(format!(
+                    "strict orientation mismatch for '{key}' axis='{}': reference_balance={:.6e} actual_balance={:.6e}",
+                    AXIS_NAMES[axis], ref_value, actual_value
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::error::Error>> {
     if !cfg!(feature = "runtime-model") {
@@ -192,6 +270,9 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 hook_output: Some(actual_hook.clone()),
                 noise_overrides_hook: Some(reference_hook.clone()),
                 max_sparse_coords: None,
+                runtime_stage_debug: false,
+                runtime_attention_debug: false,
+                runtime_decoder_conv_telemetry: false,
             },
         )
     })) {
@@ -219,18 +300,39 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
             return Err(format!("panic during infer_mesh_profile: {message}").into());
         }
     };
-    if strict && profile.sparse_source.as_str() == "synthetic" {
-        return Err("strict mode requires non-synthetic sparse stage source".into());
-    }
-    if strict
-        && matches!(device, TrellisDevice::Wgpu)
-        && profile.sparse_source.as_str() != "runtime_model_wgpu"
-    {
-        return Err(format!(
-            "strict mode requested WGPU but sparse stage source was '{}'",
-            profile.sparse_source.as_str()
-        )
-        .into());
+    if strict {
+        let sparse_source = profile.sparse_source.as_str();
+        let decode_source = profile.decode_source.as_str();
+        if !matches!(sparse_source, "runtime_model_cpu" | "runtime_model_wgpu") {
+            return Err(format!(
+                "strict mode requires runtime-model sparse source, got '{}'",
+                sparse_source
+            )
+            .into());
+        }
+        if matches!(device, TrellisDevice::Wgpu) && sparse_source != "runtime_model_wgpu" {
+            return Err(format!(
+                "strict mode requested WGPU but sparse stage source was '{}'",
+                sparse_source
+            )
+            .into());
+        }
+        if decode_source != "runtime" {
+            return Err(format!(
+                "strict mode requires runtime decode source, got '{}'",
+                decode_source
+            )
+            .into());
+        }
+        if matches!(device, TrellisDevice::Wgpu)
+            && (profile.timings.decode_shape_wgpu_dispatches == 0
+                || profile.timings.decode_tex_wgpu_dispatches == 0)
+        {
+            return Err(
+                "strict mode requested WGPU but runtime decode emitted zero dispatches for shape and/or tex decoder"
+                    .into(),
+            );
+        }
     }
     for (label, value) in [
         ("preprocess_ms", profile.timings.preprocess_ms),
@@ -432,6 +534,14 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 )
                 .into());
             }
+        }
+        for key in [
+            "decode_latent.mesh.0.vertices",
+            "decode_shape_slat.meshes.0.vertices",
+        ] {
+            let reference_balance = mesh_axis_balance(&reference, key)?;
+            let actual_balance = mesh_axis_balance(&actual, key)?;
+            assert_orientation_balance(key, reference_balance, actual_balance)?;
         }
 
         let strict_limit = 1.0e-3f32;

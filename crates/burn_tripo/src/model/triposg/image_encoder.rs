@@ -967,7 +967,7 @@ pub mod import {
                 .missing
                 .iter()
                 .take(8)
-                .cloned()
+                .map(|item| format!("{item:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             parts.push(format!(
@@ -986,7 +986,7 @@ pub mod import {
                 .skipped
                 .iter()
                 .take(8)
-                .cloned()
+                .map(|item| format!("{item:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             parts.push(format!(
@@ -1005,7 +1005,7 @@ pub mod import {
                 .unused
                 .iter()
                 .take(8)
-                .cloned()
+                .map(|item| format!("{item:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             parts.push(format!(

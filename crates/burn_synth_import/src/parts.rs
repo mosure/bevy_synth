@@ -151,7 +151,7 @@ pub fn write_burnpack_parts_for_wasm(
         ));
     }
     tensor_records.sort_by_key(|record| record.descriptor.data_offsets.0);
-    let groups = split_tensor_records(tensor_records, max_part_bytes);
+    let groups = split_tensor_records(tensor_records, max_part_bytes, &metadata.metadata);
 
     let source_file_name = burnpack_path
         .file_name()
@@ -411,31 +411,61 @@ fn read_burnpack_metadata(
     Ok((version, metadata_size, metadata))
 }
 
-fn split_tensor_records(records: Vec<TensorRecord>, max_part_bytes: u64) -> Vec<Vec<TensorRecord>> {
+fn split_tensor_records(
+    records: Vec<TensorRecord>,
+    max_part_bytes: u64,
+    source_metadata: &BTreeMap<String, String>,
+) -> Vec<Vec<TensorRecord>> {
     let mut groups = Vec::new();
     let mut current_group = Vec::new();
-    let mut current_bytes = 0u64;
 
+    for record in records {
+        let mut candidate_group = current_group.clone();
+        candidate_group.push(record.clone());
+
+        let candidate_bytes =
+            estimate_part_total_bytes(candidate_group.as_slice(), source_metadata)
+                .unwrap_or(u64::MAX);
+        let would_exceed = !current_group.is_empty() && candidate_bytes > max_part_bytes;
+        if would_exceed {
+            groups.push(current_group);
+            current_group = vec![record];
+        } else {
+            current_group = candidate_group;
+        }
+    }
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+    groups
+}
+
+fn estimate_part_total_bytes(
+    records: &[TensorRecord],
+    source_metadata: &BTreeMap<String, String>,
+) -> Result<u64, String> {
+    let mut tensors = BTreeMap::new();
+    let mut payload_bytes = 0u64;
     for record in records {
         let tensor_bytes = record
             .descriptor
             .data_offsets
             .1
             .saturating_sub(record.descriptor.data_offsets.0);
-        let would_exceed = !current_group.is_empty()
-            && current_bytes.saturating_add(tensor_bytes) > max_part_bytes;
-        if would_exceed {
-            groups.push(current_group);
-            current_group = Vec::new();
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes.saturating_add(tensor_bytes);
-        current_group.push(record);
+        let mut descriptor = record.descriptor.clone();
+        descriptor.data_offsets = (payload_bytes, payload_bytes.saturating_add(tensor_bytes));
+        payload_bytes = descriptor.data_offsets.1;
+        tensors.insert(record.name.clone(), descriptor);
     }
-    if !current_group.is_empty() {
-        groups.push(current_group);
-    }
-    groups
+
+    let metadata = RawBurnpackMetadata {
+        tensors,
+        metadata: source_metadata.clone(),
+    };
+    let mut metadata_bytes = Vec::new();
+    ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
+        .map_err(|err| format!("failed to estimate burnpack part metadata size: {err}"))?;
+    Ok(HEADER_SIZE as u64 + metadata_bytes.len() as u64 + payload_bytes)
 }
 
 fn write_burnpack_part(

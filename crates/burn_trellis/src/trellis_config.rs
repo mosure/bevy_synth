@@ -13,6 +13,8 @@ pub struct TrellisPipelineConfig {
 pub struct TrellisPipelineArgs {
     #[serde(default)]
     pub models: BTreeMap<String, String>,
+    #[serde(default)]
+    pub image_cond_model: Option<TrellisImageCondModelConfig>,
     #[serde(default = "default_sparse_sampler")]
     pub sparse_structure_sampler: TrellisSamplerConfig,
     #[serde(default = "default_shape_sampler")]
@@ -25,6 +27,20 @@ pub struct TrellisPipelineArgs {
     pub tex_slat_normalization: TrellisNormalization,
     #[serde(default = "default_pipeline_type")]
     pub default_pipeline_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrellisImageCondModelConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub args: TrellisImageCondModelArgs,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TrellisImageCondModelArgs {
+    #[serde(default)]
+    pub model_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -194,6 +210,10 @@ mod tests {
             "name": "Trellis2ImageTo3DPipeline",
             "args": {
                 "models": { "shape": "ckpts/shape" },
+                "image_cond_model": {
+                    "name": "DinoV3FeatureExtractor",
+                    "args": { "model_name": "facebook/dinov3-vitl16-pretrain-lvd1689m" }
+                },
                 "sparse_structure_sampler": {
                     "name": "FlowEulerGuidanceIntervalSampler",
                     "args": { "sigma_min": 1e-5 },
@@ -237,5 +257,14 @@ mod tests {
         assert_eq!(parsed.args.default_pipeline_type, "1024_cascade");
         assert_eq!(parsed.args.sparse_structure_sampler.params.steps, 12);
         assert!(parsed.args.models.contains_key("shape"));
+        let image_cond = parsed
+            .args
+            .image_cond_model
+            .expect("image_cond_model should parse");
+        assert_eq!(image_cond.name, "DinoV3FeatureExtractor");
+        assert_eq!(
+            image_cond.args.model_name,
+            "facebook/dinov3-vitl16-pretrain-lvd1689m"
+        );
     }
 }

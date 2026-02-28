@@ -39,6 +39,10 @@ jobs:
         components: rustfmt, clippy
         enable-sccache: "false"
 
+    - name: canonical runtime guards
+      shell: bash
+      run: ./scripts/guard_canonical_runtime.sh
+
     - name: test (default)
       run: cargo test
 
@@ -48,3 +52,25 @@ jobs:
     - name: test (trellis strict optional)
       if: ${{ env.TRELLIS2_E2E_STRICT == '1' && env.TRELLIS2_WEIGHTS_ROOT != '' }}
       run: cargo test -p burn_trellis --features runtime-model-wgpu --test e2e_hook_alignment -- --nocapture
+
+    - name: guard (trellis strict benchmark invariants optional)
+      if: ${{ env.TRELLIS2_E2E_STRICT == '1' && env.TRELLIS2_WEIGHTS_ROOT != '' && env.TRELLIS2_E2E_DEVICE == 'wgpu' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        run_id="$(date -u +%Y%m%dT%H%M%SZ)_trellis2_ci_strict_benchmark"
+        run_dir="tmp/runs/${run_id}"
+        mkdir -p "${run_dir}"
+        strict_log="${run_dir}/01_run.log"
+        cargo run -p burn_trellis --features runtime-model-wgpu --bin trellis2_run -- \
+          --input docs/input_chair.jpg \
+          --quality low \
+          --backend wgpu \
+          --strict-benchmark \
+          --require-runtime-model \
+          --repeat 2 \
+          >"${strict_log}" 2>&1
+        TRELLIS2_STRICT_BENCH_LOG="${strict_log}" \
+        TRELLIS2_STRICT_BENCH_MIN_SHAPE_DISPATCHES=1 \
+        TRELLIS2_STRICT_BENCH_MIN_TEX_DISPATCHES=1 \
+        ./scripts/guard_canonical_runtime.sh

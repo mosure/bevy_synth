@@ -78,8 +78,20 @@ where
     }
 
     let mut merged = Vec::new();
+    let mut all_part_sizes_match_file_sizes = true;
+    let mut all_part_sizes_match_payload_sizes = true;
+    let mut file_size_total = 0u64;
     for (index, part) in manifest.parts.iter().enumerate() {
         let part_path = resolve_manifest_part_path(&manifest_path, part.path.as_str())?;
+        let part_file_size = fs::metadata(&part_path)
+            .map_err(|err| {
+                format!(
+                    "failed to stat burnpack part '{}': {err}",
+                    part_path.display()
+                )
+            })?
+            .len();
+        file_size_total = file_size_total.saturating_add(part_file_size);
         let bytes = load_blob_from_burnpack(&part_path).map_err(|err| {
             format!(
                 "failed to load burnpack part {}/{} '{}' for '{}': {err}",
@@ -89,24 +101,49 @@ where
                 burnpack_path.display()
             )
         })?;
-        if part.bytes > 0 && bytes.len() as u64 != part.bytes {
-            return Err(format!(
-                "burnpack part '{}' size mismatch: manifest={} loaded={}",
-                part_path.display(),
-                part.bytes,
-                bytes.len()
-            ));
+        if part.bytes > 0 {
+            let payload_bytes = bytes.len() as u64;
+            let matches_file_size = part_file_size == part.bytes;
+            let matches_payload_size = payload_bytes == part.bytes;
+            if !matches_file_size && !matches_payload_size {
+                return Err(format!(
+                    "burnpack part '{}' size mismatch: manifest={} file={} payload={}",
+                    part_path.display(),
+                    part.bytes,
+                    part_file_size,
+                    payload_bytes
+                ));
+            }
+            all_part_sizes_match_file_sizes &= matches_file_size;
+            all_part_sizes_match_payload_sizes &= matches_payload_size;
+        } else {
+            all_part_sizes_match_file_sizes = false;
+            all_part_sizes_match_payload_sizes = false;
         }
         merged.extend_from_slice(bytes.as_slice());
     }
 
-    if manifest.total_bytes > 0 && merged.len() as u64 != manifest.total_bytes {
-        return Err(format!(
-            "assembled burnpack parts for '{}' produced {} bytes, expected {}",
-            burnpack_path.display(),
-            merged.len(),
-            manifest.total_bytes
-        ));
+    if manifest.total_bytes > 0 {
+        if all_part_sizes_match_file_sizes {
+            if file_size_total != manifest.total_bytes {
+                return Err(format!(
+                    "assembled burnpack part file sizes for '{}' produced {} bytes, expected {}",
+                    burnpack_path.display(),
+                    file_size_total,
+                    manifest.total_bytes
+                ));
+            }
+        } else if all_part_sizes_match_payload_sizes || merged.len() as u64 != manifest.total_bytes
+        {
+            if merged.len() as u64 != manifest.total_bytes {
+                return Err(format!(
+                    "assembled burnpack parts for '{}' produced {} payload bytes, expected {}",
+                    burnpack_path.display(),
+                    merged.len(),
+                    manifest.total_bytes
+                ));
+            }
+        }
     }
 
     Ok(merged)

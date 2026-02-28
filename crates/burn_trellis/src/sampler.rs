@@ -2,7 +2,7 @@ use crate::trellis_config::TrellisSamplerParams;
 
 #[derive(Debug, Clone)]
 pub struct FlowEulerGuidanceIntervalSampler {
-    sigma_min: f32,
+    _sigma_min: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +25,9 @@ pub struct FlowEulerSampleTrace {
 
 impl FlowEulerGuidanceIntervalSampler {
     pub fn new(sigma_min: f32) -> Self {
-        Self { sigma_min }
+        Self {
+            _sigma_min: sigma_min,
+        }
     }
 
     pub fn from_params(
@@ -136,25 +138,9 @@ impl FlowEulerGuidanceIntervalSampler {
         let neg = predict_v(x_t, t, false);
         let mut pred = vec![0.0f32; pos.len()];
         for idx in 0..pred.len() {
-            pred[idx] = w * pos[idx] + (1.0 - w) * neg[idx];
+            pred[idx] = (1.0 + w) * pos[idx] - w * neg[idx];
         }
-
-        if config.guidance_rescale <= 0.0 {
-            return pred;
-        }
-
-        let x0_pos = pred_to_xstart(x_t, t, &pos, self.sigma_min);
-        let x0_cfg = pred_to_xstart(x_t, t, &pred, self.sigma_min);
-        let std_pos = stddev(&x0_pos);
-        let std_cfg = stddev(&x0_cfg).max(1.0e-12);
-        let scale = std_pos / std_cfg;
-        let mut x0 = vec![0.0f32; x0_cfg.len()];
-        for idx in 0..x0.len() {
-            let x0_rescaled = x0_cfg[idx] * scale;
-            x0[idx] = config.guidance_rescale * x0_rescaled
-                + (1.0 - config.guidance_rescale) * x0_cfg[idx];
-        }
-        xstart_to_pred(x_t, t, &x0, self.sigma_min)
+        pred
     }
 }
 
@@ -181,45 +167,9 @@ fn rescaled_t(t: f32, rescale_t: f32) -> f32 {
     rescale_t * t / (1.0 + (rescale_t - 1.0) * t)
 }
 
-fn pred_to_xstart(x_t: &[f32], t: f32, pred: &[f32], sigma_min: f32) -> Vec<f32> {
-    let factor = sigma_min + (1.0 - sigma_min) * t;
-    let keep = 1.0 - sigma_min;
-    let mut out = vec![0.0f32; x_t.len()];
-    for idx in 0..out.len() {
-        out[idx] = keep * x_t[idx] - factor * pred[idx];
-    }
-    out
-}
-
-fn xstart_to_pred(x_t: &[f32], t: f32, x0: &[f32], sigma_min: f32) -> Vec<f32> {
-    let factor = sigma_min + (1.0 - sigma_min) * t;
-    let keep = 1.0 - sigma_min;
-    let mut out = vec![0.0f32; x_t.len()];
-    for idx in 0..out.len() {
-        out[idx] = (keep * x_t[idx] - x0[idx]) / factor;
-    }
-    out
-}
-
-fn stddev(values: &[f32]) -> f32 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    let mean = values.iter().sum::<f32>() / values.len() as f32;
-    let var_sum = values
-        .iter()
-        .map(|value| {
-            let d = *value - mean;
-            d * d
-        })
-        .sum::<f32>();
-    let denom = (values.len() - 1) as f32;
-    (var_sum / denom).sqrt()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig, stddev};
+    use super::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig};
 
     #[test]
     fn converges_to_target_for_identity_velocity() {
@@ -256,16 +206,5 @@ mod tests {
             }
         });
         assert!(out.iter().all(|v| v.abs() < 0.5));
-    }
-
-    #[test]
-    fn stddev_matches_unbiased_reference() {
-        let values = [0.0f32, 1.0, 2.0, 3.0];
-        let got = stddev(&values);
-        let expected = (5.0f32 / 3.0).sqrt();
-        assert!(
-            (got - expected).abs() <= 1.0e-6,
-            "unexpected stddev: got={got} expected={expected}"
-        );
     }
 }

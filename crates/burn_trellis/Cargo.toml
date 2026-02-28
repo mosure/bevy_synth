@@ -15,12 +15,20 @@ readme = "README.md"
 default = []
 runtime-model = [
     "dep:burn",
+    "dep:burn_dino",
     "dep:burn_flex_gmm",
     "dep:burn-store",
+    "dep:ciborium",
     "dep:memmap2",
     "dep:matrixmultiply",
 ]
-runtime-model-wgpu = ["runtime-model", "dep:burn-wgpu", "burn_flex_gmm/wgpu-kernel"]
+# Includes `runtime-model`; no need to enable both on the CLI.
+runtime-model-wgpu = [
+    "runtime-model",
+    "dep:burn-wgpu",
+    "burn_flex_gmm/wgpu-kernel",
+    "burn_dino/backend_wgpu",
+]
 import = ["runtime-model", "dep:sha2", "dep:hex", "dep:burn_synth_import"]
 uv-xatlas = ["dep:xatlas-rs"]
 
@@ -33,34 +41,37 @@ half = "2.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 memmap2 = { version = "0.9", optional = true }
 matrixmultiply = { version = "0.3", optional = true }
+ciborium = { version = "0.2", optional = true }
+rustc-hash = "2.1"
 
-burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
+burn = { version = "0.21.0-pre.1", default-features = false, features = ["ndarray", "std"], optional = true }
+burn_dino = { version = "0.7", default-features = false, features = ["backend_ndarray"], optional = true }
 burn_flex_gmm = { version = "0.1.0", path = "../burn_flex_gmm", optional = true }
-burn-store = { version = "0.19", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
+burn-store = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
-version = "0.19"
+version = "0.21.0-pre.1"
 optional = true
 default-features = false
-features = ["std", "vulkan"]
+features = ["fusion", "std", "vulkan"]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
-version = "0.19"
+version = "0.21.0-pre.1"
 optional = true
 default-features = false
-features = ["std", "metal"]
+features = ["fusion", "std", "metal"]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "windows"))'.dependencies]
 xatlas-rs = { version = "0.1.3", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
-version = "0.19"
+version = "0.21.0-pre.1"
 optional = true
 default-features = false
-features = ["std", "webgpu"]
+features = ["fusion", "std", "webgpu"]
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
@@ -78,6 +89,11 @@ path = "tool/trellis2_hook_diff.rs"
 [[bin]]
 name = "trellis2_run"
 path = "tool/trellis2_run.rs"
+
+[[bin]]
+name = "trellis2_cond_probe"
+path = "tool/trellis2_cond_probe.rs"
+required-features = ["runtime-model"]
 
 [[bench]]
 name = "trellis2_pipeline"

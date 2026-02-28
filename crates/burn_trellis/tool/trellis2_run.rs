@@ -8,6 +8,8 @@ use burn_trellis::pipeline::{
 use clap::Parser;
 use serde_json::json;
 
+const OVOXEL_MIN_SOURCE_VERTICES: usize = 1_000_000;
+
 #[derive(Parser, Debug)]
 #[command(about = "Run burn_trellis pipeline and optionally emit OBJ/GLB + safetensors hook")]
 struct Args {
@@ -52,11 +54,11 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Fail if sparse-structure stage falls back to synthetic mode.
+    /// Fail unless sparse-structure stage runs through runtime model path.
     #[arg(long, default_value_t = false)]
     require_runtime_model: bool,
 
-    /// Fail if any pipeline stage uses fallback behavior (benchmark strict mode).
+    /// Enforce strict runtime kernel-path invariants (benchmark strict mode).
     #[arg(long, default_value_t = false)]
     strict_benchmark: bool,
 
@@ -67,6 +69,18 @@ struct Args {
     /// Optional cap on sparse coords before decode. Use lower values for short strict passes.
     #[arg(long)]
     max_sparse_coords: Option<usize>,
+
+    /// Enable runtime stage-level debug logs from canonical runtime-model path.
+    #[arg(long, default_value_t = false)]
+    runtime_stage_debug: bool,
+
+    /// Enable runtime attention debug logs from canonical runtime-model path.
+    #[arg(long, default_value_t = false)]
+    runtime_attention_debug: bool,
+
+    /// Emit decoder sparse-conv telemetry (variant/split/dispatch counters).
+    #[arg(long, default_value_t = false)]
+    runtime_decoder_conv_telemetry: bool,
 
     /// Export GLB via canonical o_voxel postprocess using hook tensors.
     #[arg(long, default_value_t = false)]
@@ -141,42 +155,49 @@ fn run() -> Result<(), String> {
             },
             noise_overrides_hook: args.noise_overrides_hook.clone(),
             max_sparse_coords: args.max_sparse_coords,
+            runtime_stage_debug: args.runtime_stage_debug,
+            runtime_attention_debug: args.runtime_attention_debug,
+            runtime_decoder_conv_telemetry: args.runtime_decoder_conv_telemetry,
         };
         let profiled = pipeline
             .infer_mesh_profile(&args.input, &options)
             .map_err(|err| err.to_string())?;
-        if args.require_runtime_model && profiled.sparse_source.as_str() == "synthetic" {
-            return Err(
-                "runtime-model required but sparse stage used synthetic fallback".to_string(),
-            );
+        let sparse_source = profiled.sparse_source.as_str();
+        let decode_source = profiled.decode_source.as_str();
+        let sparse_is_runtime_model =
+            matches!(sparse_source, "runtime_model_cpu" | "runtime_model_wgpu");
+        if args.require_runtime_model && !sparse_is_runtime_model {
+            return Err(format!(
+                "runtime-model required but sparse stage source was '{}'",
+                sparse_source
+            ));
         }
         if args.strict_benchmark {
-            if profiled.sparse_source.as_str() == "synthetic" {
-                return Err(
-                    "strict benchmark failed: sparse stage used synthetic fallback".to_string(),
-                );
+            if !sparse_is_runtime_model {
+                return Err(format!(
+                    "strict benchmark failed: sparse stage source was '{}'",
+                    sparse_source
+                ));
             }
-            if matches!(args.backend, TrellisDevice::Wgpu)
-                && profiled.sparse_source.as_str() != "runtime_model_wgpu"
+            if decode_source != "runtime" {
+                return Err(format!(
+                    "strict benchmark failed: decode stage source was '{}' (expected 'runtime')",
+                    decode_source
+                ));
+            }
+            if matches!(args.backend, TrellisDevice::Wgpu) && sparse_source != "runtime_model_wgpu"
             {
                 return Err(format!(
                     "strict benchmark failed: requested wgpu but sparse stage source was '{}'",
-                    profiled.sparse_source.as_str()
-                ));
-            }
-            if profiled.decode_source.is_fallback() {
-                return Err(format!(
-                    "strict benchmark failed: decode stage used fallback source '{}'",
-                    profiled.decode_source.as_str()
+                    sparse_source
                 ));
             }
             if matches!(args.backend, TrellisDevice::Wgpu)
-                && profiled.timings.decode_shape_wgpu_dispatches == 0
-                && profiled.timings.decode_tex_wgpu_dispatches == 0
-                && profiled.decode_source.as_str() != "runtime_hook_override"
+                && (profiled.timings.decode_shape_wgpu_dispatches == 0
+                    || profiled.timings.decode_tex_wgpu_dispatches == 0)
             {
                 return Err(
-                    "strict benchmark failed: requested wgpu but decode emitted zero wgpu dispatches"
+                    "strict benchmark failed: requested wgpu but runtime decode emitted zero dispatches for shape and/or tex decoder"
                         .to_string(),
                 );
             }
@@ -186,18 +207,29 @@ fn run() -> Result<(), String> {
     let profiled = runs
         .last()
         .ok_or_else(|| "no inference runs were produced".to_string())?;
+    let mut ovoxel_postprocess_applied = false;
+    let mut ovoxel_postprocess_skipped_reason: Option<String> = None;
     if let Some(obj_path) = args.output_obj.as_ref() {
         burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
     if let Some(glb_path) = output_glb.as_ref() {
         if args.ovoxel_postprocess_from_hook {
-            let hook_path = args
-                .hook_output
-                .as_ref()
-                .ok_or_else(|| "ovoxel postprocess requires --hook-output".to_string())?;
-            run_ovoxel_postprocess(&args, hook_path.as_path(), glb_path.as_path())?;
+            if let Some(reason) = ovoxel_skip_reason(profiled.mesh.vertices.len()) {
+                eprintln!("burn_trellis: {reason}; writing runtime GLB output instead.");
+                burn_trellis::write_glb_mesh(glb_path, &profiled.mesh)
+                    .map_err(|err| err.to_string())?;
+                ovoxel_postprocess_skipped_reason = Some(reason);
+            } else {
+                let hook_path = args
+                    .hook_output
+                    .as_ref()
+                    .ok_or_else(|| "ovoxel postprocess requires --hook-output".to_string())?;
+                run_ovoxel_postprocess(&args, hook_path.as_path(), glb_path.as_path())?;
+                ovoxel_postprocess_applied = true;
+            }
         } else {
-            burn_trellis::write_glb_mesh(glb_path, &profiled.mesh).map_err(|err| err.to_string())?;
+            burn_trellis::write_glb_mesh(glb_path, &profiled.mesh)
+                .map_err(|err| err.to_string())?;
         }
     }
 
@@ -251,11 +283,15 @@ fn run() -> Result<(), String> {
                 "repeat": repeat,
                 "max_sparse_coords": args.max_sparse_coords,
                 "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
+                "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
+                "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
                 "sparse_source": profiled.sparse_source.as_str(),
                 "decode_source": profiled.decode_source.as_str(),
-                "fallbacks": {
-                    "sparse": profiled.sparse_source.as_str() == "synthetic",
-                    "decode": profiled.decode_source.is_fallback(),
+                "kernel_invariants": {
+                    "sparse_runtime_model": matches!(profiled.sparse_source.as_str(), "runtime_model_cpu" | "runtime_model_wgpu"),
+                    "decode_runtime": profiled.decode_source.as_str() == "runtime",
+                    "wgpu_shape_dispatches": profiled.timings.decode_shape_wgpu_dispatches,
+                    "wgpu_tex_dispatches": profiled.timings.decode_tex_wgpu_dispatches,
                 },
                 "timings_ms": timings_json(profiled),
                 "hook_output": args.hook_output,
@@ -299,6 +335,8 @@ fn run() -> Result<(), String> {
                 "repeat": repeat,
                 "max_sparse_coords": args.max_sparse_coords,
                 "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
+                "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
+                "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
                 "summary": {
                     "runtime_setup_mean_ms": setup_mean,
                     "total_mean_ms": total_mean,
@@ -322,6 +360,16 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn ovoxel_skip_reason(source_vertices: usize) -> Option<String> {
+    if source_vertices < OVOXEL_MIN_SOURCE_VERTICES {
+        return Some(format!(
+            "o_voxel postprocess skipped for low-detail runtime mesh (source_vertices={} < {}), because this regime is prone to chair regressions (monochrome PBR + high boundary-hole ratio)",
+            source_vertices, OVOXEL_MIN_SOURCE_VERTICES
+        ));
+    }
+    None
+}
+
 fn run_ovoxel_postprocess(args: &Args, hook_path: &Path, output_glb: &Path) -> Result<(), String> {
     if !hook_path.exists() {
         return Err(format!(
@@ -332,7 +380,7 @@ fn run_ovoxel_postprocess(args: &Args, hook_path: &Path, output_glb: &Path) -> R
     let script = args
         .ovoxel_postprocess_script
         .clone()
-        .unwrap_or_else(|| default_ovoxel_postprocess_script_path());
+        .unwrap_or_else(default_ovoxel_postprocess_script_path);
     if !script.exists() {
         return Err(format!(
             "ovoxel postprocess script missing: {}",
@@ -360,8 +408,12 @@ fn run_ovoxel_postprocess(args: &Args, hook_path: &Path, output_glb: &Path) -> R
         .output()
         .map_err(|err| format!("failed to run o_voxel postprocess command: {err}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(output.stderr.as_slice()).trim().to_string();
-        let stdout = String::from_utf8_lossy(output.stdout.as_slice()).trim().to_string();
+        let stderr = String::from_utf8_lossy(output.stderr.as_slice())
+            .trim()
+            .to_string();
+        let stdout = String::from_utf8_lossy(output.stdout.as_slice())
+            .trim()
+            .to_string();
         return Err(format!(
             "o_voxel postprocess failed (status={}): stderr='{}' stdout='{}'",
             output
@@ -513,5 +565,38 @@ mod tests {
         assert_eq!(args.ovoxel_texture_size, 4096);
         assert_eq!(args.ovoxel_remesh_band, 1.0);
         assert_eq!(args.ovoxel_remesh_project, 0.0);
+    }
+
+    #[test]
+    fn accepts_runtime_debug_and_telemetry_flags() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--runtime-stage-debug",
+            "--runtime-attention-debug",
+            "--runtime-decoder-conv-telemetry",
+        ]);
+        assert!(args.runtime_stage_debug);
+        assert!(args.runtime_attention_debug);
+        assert!(args.runtime_decoder_conv_telemetry);
+    }
+
+    #[test]
+    fn ovoxel_skip_reason_rejects_low_detail_meshes() {
+        let reason = ovoxel_skip_reason(907_499)
+            .expect("low-detail source mesh should skip o_voxel postprocess");
+        assert!(
+            reason.contains("source_vertices=907499"),
+            "unexpected skip reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn ovoxel_skip_reason_allows_dense_meshes() {
+        assert!(
+            ovoxel_skip_reason(4_497_407).is_none(),
+            "dense source mesh should allow o_voxel postprocess"
+        );
     }
 }

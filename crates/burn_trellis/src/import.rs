@@ -1,17 +1,30 @@
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use burn::module::{Module, Param, ParamId};
-use burn::prelude::*;
-use burn_store::{BurnpackStore, ModuleSnapshot};
+#[cfg(test)]
+use burn::module::{Module, Param};
+#[cfg(test)]
+use burn::prelude::Backend;
+#[cfg(test)]
+use burn::tensor::{Int, Tensor};
+use burn_synth_import::layout::stem_has_low_precision_marker;
+use burn_synth_import::parts::{
+    burnpack_parts_manifest_path, read_parts_manifest, resolve_part_entry_path,
+};
 use half::{bf16, f16};
 use safetensors::tensor::{Dtype, SafeTensors, View, serialize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::blob_burnpack::{
+    DEFAULT_BLOB_CHUNK_BYTES, load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack,
+    save_blob_bytes_to_burnpack,
+};
 use crate::paths::{
     resolve_trellis2_weights_root, trellis2_repo_asset_root, trellis2_repo_image_large_root,
 };
@@ -82,6 +95,7 @@ pub struct TrellisImportReport {
     pub manifest: TrellisImportManifest,
 }
 
+#[cfg(test)]
 #[derive(Module, Debug)]
 struct BinaryBlob<B: Backend> {
     bytes: Param<Tensor<B, 1, Int>>,
@@ -99,6 +113,16 @@ struct BlobMetadata {
     source_path: String,
     sha256: String,
     precision: String,
+    #[serde(default)]
+    chunk_sizes: Vec<usize>,
+    #[serde(default)]
+    chunk_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ImageConditioningSourceAssets {
+    model_weights: PathBuf,
+    config_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,7 +222,18 @@ pub fn import_trellis2_assets(
             continue;
         }
 
-        if options.quantization.include_f32() {
+        let source_low_precision = source_is_native_low_precision(source_safetensors.as_path());
+        if source_low_precision {
+            let redundant_suffix = with_file_stem_suffix(&output_bpk, F16_SUFFIX);
+            if redundant_suffix != output_bpk {
+                remove_burnpack_family_if_present(&redundant_suffix)?;
+            }
+        }
+        let emit_f32 = options.quantization.include_f32() && !source_low_precision;
+        let emit_f16 = options.quantization.include_f16()
+            || (source_low_precision && options.quantization.include_f32());
+
+        if emit_f32 {
             let info = import_model_file(
                 &source_json,
                 &source_safetensors,
@@ -209,8 +244,12 @@ pub fn import_trellis2_assets(
             )?;
             imported_blobs.push(info);
         }
-        if options.quantization.include_f16() {
-            let output_bpk_f16 = with_file_stem_suffix(&output_bpk, F16_SUFFIX);
+        if emit_f16 {
+            let output_bpk_f16 = if source_low_precision {
+                output_bpk.clone()
+            } else {
+                with_file_stem_suffix(&output_bpk, F16_SUFFIX)
+            };
             let info = import_model_file(
                 &source_json,
                 &source_safetensors,
@@ -220,6 +259,52 @@ pub fn import_trellis2_assets(
                 options.overwrite,
             )?;
             imported_blobs.push(info);
+        }
+    }
+
+    if let Some(model_name) = collect_image_conditioning_model_name(&pipeline_json) {
+        match resolve_image_conditioning_source_assets(
+            &weights_root,
+            image_large_root.as_deref(),
+            model_name.as_str(),
+        ) {
+            Some(source_assets) => {
+                let output_model_dir = output_root.join(model_name.as_str());
+                fs::create_dir_all(&output_model_dir)?;
+
+                if let Some(source_config) = source_assets.config_json.as_ref() {
+                    let output_config = output_model_dir.join("config.json");
+                    copy_if_needed(source_config, &output_config, options.overwrite)?;
+                    copied_json_files.push(output_config.display().to_string());
+                }
+
+                let output_bpk = output_model_dir.join("model.bpk");
+                if options.quantization.include_f32() {
+                    let info = import_blob_file(
+                        source_assets.model_weights.as_path(),
+                        &output_bpk,
+                        "f32",
+                        options.overwrite,
+                    )?;
+                    imported_blobs.push(info);
+                }
+                if options.quantization.include_f16() {
+                    let output_bpk_f16 = with_file_stem_suffix(&output_bpk, F16_SUFFIX);
+                    let info = import_blob_file(
+                        source_assets.model_weights.as_path(),
+                        &output_bpk_f16,
+                        "f16",
+                        options.overwrite,
+                    )?;
+                    imported_blobs.push(info);
+                }
+            }
+            None => {
+                missing_sources.push(format!(
+                    "image conditioning weights for '{}' (expected model.safetensors under explicit/local paths or Hugging Face cache snapshots)",
+                    model_name
+                ));
+            }
         }
     }
 
@@ -244,26 +329,33 @@ pub fn load_burnpack_blob_bytes(
     burnpack_path: impl AsRef<Path>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let burnpack_path = burnpack_path.as_ref();
-    let metadata_path = metadata_path(burnpack_path);
-    let metadata: BlobMetadata = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+    let metadata = if metadata_path(burnpack_path).exists() {
+        Some(serde_json::from_slice::<BlobMetadata>(
+            fs::read(metadata_path(burnpack_path))?.as_slice(),
+        )?)
+    } else {
+        None
+    };
 
-    match load_blob_bytes_with_backend::<burn::backend::NdArray<f32, u8>>(
-        burnpack_path,
-        metadata.bytes_len,
-    ) {
-        Ok(bytes) => Ok(bytes),
-        Err(u8_err) => load_blob_bytes_with_backend::<burn::backend::NdArray<f32, i64>>(
-            burnpack_path,
-            metadata.bytes_len,
+    let bytes = load_blob_bytes_from_blob_burnpack(burnpack_path).map_err(|err| {
+        format!(
+            "failed to load blob burnpack '{}': {err}",
+            burnpack_path.display()
         )
-        .map_err(|i64_err| {
-            format!(
-                "failed to load blob burnpack '{}' (u8 backend: {u8_err}; i64 fallback: {i64_err})",
-                burnpack_path.display()
-            )
-            .into()
-        }),
+    })?;
+    if let Some(metadata) = metadata
+        && metadata.bytes_len > 0
+        && bytes.len() != metadata.bytes_len
+    {
+        return Err(format!(
+            "burnpack byte length mismatch for '{}': expected {}, got {}",
+            burnpack_path.display(),
+            metadata.bytes_len,
+            bytes.len()
+        )
+        .into());
     }
+    Ok(bytes)
 }
 
 fn import_model_file(
@@ -315,13 +407,15 @@ fn import_blob_file(
 
     let source_bytes = fs::read(source_path)?;
     let bytes = prepare_blob_payload(source_bytes.as_slice(), precision);
-    save_blob_to_burnpack(burnpack_path, bytes.as_slice())?;
+    let chunk_sizes = save_blob_to_burnpack(burnpack_path, bytes.as_slice())?;
     let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
     let metadata = BlobMetadata {
         bytes_len: bytes.len(),
         source_path: source_path.display().to_string(),
         sha256: sha256.clone(),
         precision: precision.to_string(),
+        chunk_bytes: chunk_sizes.iter().copied().max().unwrap_or(0),
+        chunk_sizes,
     };
     fs::write(
         metadata_path(burnpack_path),
@@ -453,24 +547,15 @@ fn bf16_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
 fn save_blob_to_burnpack(
     burnpack_path: &Path,
     bytes: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    type BlobBackend = burn::backend::NdArray<f32, u8>;
-    let device = <BlobBackend as Backend>::Device::default();
-    let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
-        TensorData::new(bytes.to_vec(), [bytes.len()]),
-        &device,
-    );
-    let blob = BinaryBlob {
-        bytes: Param::initialized(ParamId::new(), tensor),
-    };
-    let mut store = BurnpackStore::from_file(burnpack_path).overwrite(true);
-    blob.save_into(&mut store).map_err(|err| {
+) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let chunk_sizes = save_blob_bytes_to_burnpack(burnpack_path, bytes, DEFAULT_BLOB_CHUNK_BYTES)
+        .map_err(|err| {
         format!(
             "failed to write burnpack '{}': {err}",
             burnpack_path.display()
         )
     })?;
-    Ok(())
+    Ok(chunk_sizes)
 }
 
 fn import_sparse_flow_module_file(
@@ -504,45 +589,36 @@ fn model_import_kind(source_config_path: &Path) -> ModelImportKind {
     }
 }
 
-fn load_blob_bytes_with_backend<B: Backend>(
+fn source_is_native_low_precision(source_path: &Path) -> bool {
+    source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(stem_has_low_precision_marker)
+}
+
+fn remove_burnpack_family_if_present(
     burnpack_path: &Path,
-    bytes_len: usize,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>>
-where
-    B::Device: Default,
-{
-    let device = <B as Backend>::Device::default();
-    let zeros = Tensor::<B, 1, Int>::zeros([bytes_len], &device);
-    let mut blob = BinaryBlob {
-        bytes: Param::initialized(ParamId::new(), zeros),
-    };
-
-    let mut store = BurnpackStore::from_file(burnpack_path).validate(true);
-    blob.load_from(&mut store).map_err(|err| {
-        format!(
-            "failed to load burnpack '{}': {err}",
-            burnpack_path.display()
-        )
-    })?;
-
-    let bytes = blob
-        .bytes
-        .val()
-        .into_data()
-        .convert::<u8>()
-        .to_vec::<u8>()
-        .map_err(|err| format!("failed to materialize burnpack bytes: {err:?}"))?;
-
-    if bytes.len() != bytes_len {
-        return Err(format!(
-            "burnpack byte length mismatch for '{}': expected {}, got {}",
-            burnpack_path.display(),
-            bytes_len,
-            bytes.len()
-        )
-        .into());
+) -> Result<(), Box<dyn std::error::Error>> {
+    if burnpack_path.exists() {
+        fs::remove_file(burnpack_path)?;
     }
-    Ok(bytes)
+    let meta = metadata_path(burnpack_path);
+    if meta.exists() {
+        fs::remove_file(meta)?;
+    }
+    let parts_manifest = burnpack_parts_manifest_path(burnpack_path);
+    if parts_manifest.exists() {
+        if let Ok(manifest) = read_parts_manifest(&parts_manifest) {
+            for entry in manifest.parts {
+                let part_path = resolve_part_entry_path(&parts_manifest, &entry.path)?;
+                if part_path.exists() {
+                    fs::remove_file(part_path)?;
+                }
+            }
+        }
+        fs::remove_file(parts_manifest)?;
+    }
+    Ok(())
 }
 
 fn collect_model_stems(pipeline_json: &Value) -> Vec<String> {
@@ -559,6 +635,197 @@ fn collect_model_stems(pipeline_json: &Value) -> Vec<String> {
         }
     }
     stems.into_iter().collect()
+}
+
+fn collect_image_conditioning_model_name(pipeline_json: &Value) -> Option<String> {
+    pipeline_json
+        .get("args")
+        .and_then(|value| value.get("image_cond_model"))
+        .and_then(|value| value.get("args"))
+        .and_then(|value| value.get("model_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_image_conditioning_source_assets(
+    weights_root: &Path,
+    image_large_root: Option<&Path>,
+    model_name: &str,
+) -> Option<ImageConditioningSourceAssets> {
+    let mut candidates = Vec::new();
+    candidates.push(PathBuf::from(model_name));
+    candidates.push(weights_root.join(model_name));
+    if let Some(root) = image_large_root {
+        candidates.push(root.join(model_name));
+    }
+
+    for candidate in candidates {
+        if let Some(assets) = image_conditioning_assets_from_candidate_path(candidate.as_path()) {
+            return Some(assets);
+        }
+    }
+
+    resolve_hf_hub_snapshot_weights(model_name).map(|model_weights| ImageConditioningSourceAssets {
+        config_json: model_weights.parent().map(|path| path.join("config.json")),
+        model_weights,
+    })
+}
+
+fn image_conditioning_assets_from_candidate_path(
+    candidate: &Path,
+) -> Option<ImageConditioningSourceAssets> {
+    if !candidate.exists() {
+        return None;
+    }
+
+    if candidate.is_file() {
+        let extension = candidate.extension().and_then(|value| value.to_str())?;
+        if !extension.eq_ignore_ascii_case("safetensors") {
+            return None;
+        }
+        return Some(ImageConditioningSourceAssets {
+            model_weights: candidate.to_path_buf(),
+            config_json: candidate.parent().map(|path| path.join("config.json")),
+        });
+    }
+
+    let weights = candidate.join("model.safetensors");
+    if !weights.exists() {
+        return None;
+    }
+
+    Some(ImageConditioningSourceAssets {
+        model_weights: weights,
+        config_json: Some(candidate.join("config.json")),
+    })
+}
+
+fn resolve_hf_hub_snapshot_weights(model_name: &str) -> Option<PathBuf> {
+    let mut matches = Vec::new();
+    let suffix = model_name.rsplit('/').next().unwrap_or(model_name);
+
+    for hub_root in huggingface_hub_roots() {
+        let exact_repo = hub_root.join(format!("models--{}", model_name.replace('/', "--")));
+        if let Some(path) = resolve_snapshot_weights_from_repo(exact_repo.as_path()) {
+            let modified = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            matches.push((modified, path));
+        }
+
+        let Ok(entries) = fs::read_dir(&hub_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if !file_name.starts_with("models--") {
+                continue;
+            }
+            if !file_name.ends_with(&format!("--{suffix}")) {
+                continue;
+            }
+            if let Some(path) = resolve_snapshot_weights_from_repo(entry.path().as_path()) {
+                let modified = path
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                matches.push((modified, path));
+            }
+        }
+    }
+
+    matches.sort_by_key(|entry| Reverse(entry.0));
+    matches.into_iter().next().map(|(_, path)| path)
+}
+
+fn resolve_snapshot_weights_from_repo(repo_root: &Path) -> Option<PathBuf> {
+    if !repo_root.is_dir() {
+        return None;
+    }
+
+    let refs_main = repo_root.join("refs/main");
+    if let Ok(revision) = fs::read_to_string(refs_main.as_path()) {
+        let revision = revision.trim();
+        if !revision.is_empty() {
+            let snapshot = repo_root.join("snapshots").join(revision);
+            let weights = snapshot.join("model.safetensors");
+            if weights.exists() {
+                return Some(weights);
+            }
+        }
+    }
+
+    let snapshots = repo_root.join("snapshots");
+    let mut candidates = Vec::new();
+    let entries = fs::read_dir(snapshots).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let weights = path.join("model.safetensors");
+        if !weights.exists() {
+            continue;
+        }
+        let modified = weights
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, weights));
+    }
+    candidates.sort_by_key(|entry| Reverse(entry.0));
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
+fn huggingface_hub_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(path) = std::env::var_os("HF_HUB_CACHE") {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("HF_HOME") {
+        push_unique_path(&mut roots, PathBuf::from(path).join("hub"));
+    }
+    if let Some(path) = std::env::var_os("HUGGINGFACE_HOME") {
+        push_unique_path(&mut roots, PathBuf::from(path).join("hub"));
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        push_unique_path(
+            &mut roots,
+            PathBuf::from(path).join("huggingface").join("hub"),
+        );
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        push_unique_path(
+            &mut roots,
+            PathBuf::from(path)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+
+    for base in ["/media", "/mnt"] {
+        let Ok(entries) = fs::read_dir(base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("models").join("huggingface").join("hub");
+            push_unique_path(&mut roots, candidate);
+        }
+    }
+
+    roots.into_iter().filter(|path| path.is_dir()).collect()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|existing| existing == &candidate) {
+        paths.push(candidate);
+    }
 }
 
 fn resolve_model_source_path(
@@ -655,12 +922,21 @@ mod tests {
     use half::{bf16, f16};
     use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize};
     use std::io::Write;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         BinaryBlob, BlobMetadata, QuantizationMode, TrellisImportOptions, import_trellis2_assets,
         load_burnpack_blob_bytes, metadata_path, prepare_blob_payload,
     };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn imports_pipeline_assets_and_roundtrips_blob_bytes() {
@@ -712,6 +988,170 @@ mod tests {
     }
 
     #[test]
+    fn low_precision_sources_do_not_emit_redundant_f32_or_f16_suffixed_names() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_import_low_precision_{unique}"));
+        let output = root.join("out");
+        let ckpts = root.join("ckpts");
+        std::fs::create_dir_all(&ckpts).expect("failed to create ckpt dir");
+
+        let pipeline = root.join("pipeline.json");
+        let pipeline_json = r#"{
+            "args": {
+                "models": {
+                    "shape": "ckpts/shape_bf16"
+                }
+            }
+        }"#;
+        std::fs::write(&pipeline, pipeline_json).expect("failed to write pipeline");
+        std::fs::write(ckpts.join("shape_bf16.json"), "{}").expect("failed to write model json");
+        std::fs::write(
+            ckpts.join("shape_bf16.safetensors"),
+            b"fake_safetensor_bytes",
+        )
+        .expect("failed to write source");
+
+        let report = import_trellis2_assets(&TrellisImportOptions {
+            weights_root: root.clone(),
+            image_large_root: None,
+            output_root: output.clone(),
+            image_large_output_root: None,
+            quantization: QuantizationMode::Both,
+            overwrite: true,
+        })
+        .expect("import should succeed");
+        assert!(report.manifest.missing_sources.is_empty());
+
+        let canonical = output.join("ckpts/shape_bf16.bpk");
+        let redundant_suffix = output.join("ckpts/shape_bf16_f16.bpk");
+        assert!(
+            canonical.exists(),
+            "expected canonical low-precision burnpack"
+        );
+        assert!(
+            !redundant_suffix.exists(),
+            "redundant *_f16 low-precision burnpack should not be emitted"
+        );
+        assert_eq!(
+            report
+                .manifest
+                .imported_blobs
+                .iter()
+                .filter(|entry| entry.output.ends_with("shape_bf16.bpk"))
+                .count(),
+            1,
+            "expected only one low-precision artifact record"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imports_image_conditioning_model_into_f32_and_f16_burnpacks() {
+        let _guard = env_lock_guard();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("burn_trellis_import_dino_{unique}"));
+        let output = root.join("out");
+        let ckpts = root.join("ckpts");
+        let hf_root = root.join("hf").join("hub");
+        std::fs::create_dir_all(&ckpts).expect("create ckpts");
+        std::fs::create_dir_all(&hf_root).expect("create hf root");
+
+        let model_name = format!("facebook/dinov3-unit-test-{unique}");
+        let pipeline = serde_json::json!({
+            "args": {
+                "models": {
+                    "shape": "ckpts/shape"
+                },
+                "image_cond_model": {
+                    "name": "DinoV3FeatureExtractor",
+                    "args": {
+                        "model_name": model_name
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            root.join("pipeline.json"),
+            serde_json::to_vec_pretty(&pipeline).expect("serialize pipeline"),
+        )
+        .expect("write pipeline");
+        std::fs::write(ckpts.join("shape.json"), "{}").expect("write shape json");
+        std::fs::write(ckpts.join("shape.safetensors"), b"shape_bytes")
+            .expect("write shape safetensors");
+
+        let repo_dir = hf_root.join(format!("models--{}", model_name.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots").join("rev1");
+        std::fs::create_dir_all(&snapshot).expect("create dino snapshot");
+        std::fs::create_dir_all(repo_dir.join("refs")).expect("create refs");
+        std::fs::write(repo_dir.join("refs/main"), b"rev1").expect("write refs/main");
+        std::fs::write(snapshot.join("config.json"), b"{}").expect("write dino config");
+        let dino_bytes = [1.0f32, -2.0f32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let view =
+            TensorView::new(Dtype::F32, vec![2], dino_bytes.as_slice()).expect("tensor view");
+        let source =
+            serialize(vec![("dummy".to_string(), view)], None).expect("serialize dino safetensors");
+        std::fs::write(snapshot.join("model.safetensors"), source).expect("write dino weights");
+
+        let prev_hf_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        unsafe {
+            std::env::set_var("HF_HUB_CACHE", &hf_root);
+        }
+
+        let report = import_trellis2_assets(&TrellisImportOptions {
+            weights_root: root.clone(),
+            image_large_root: None,
+            output_root: output.clone(),
+            image_large_output_root: None,
+            quantization: QuantizationMode::Both,
+            overwrite: true,
+        })
+        .expect("import should succeed");
+
+        match prev_hf_hub_cache {
+            Some(value) => unsafe {
+                std::env::set_var("HF_HUB_CACHE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HF_HUB_CACHE");
+            },
+        }
+
+        assert!(
+            report.manifest.missing_sources.is_empty(),
+            "missing sources: {:?}",
+            report.manifest.missing_sources
+        );
+
+        let output_model_dir = output.join(model_name);
+        let dino_f32 = output_model_dir.join("model.bpk");
+        let dino_f16 = output_model_dir.join("model_f16.bpk");
+        assert!(dino_f32.exists(), "missing image-cond f32 burnpack");
+        assert!(dino_f16.exists(), "missing image-cond f16 burnpack");
+        assert!(
+            output_model_dir.join("config.json").exists(),
+            "missing image-cond config copy"
+        );
+
+        let bytes_f32 = load_burnpack_blob_bytes(&dino_f32).expect("read image-cond f32 burnpack");
+        let bytes_f16 = load_burnpack_blob_bytes(&dino_f16).expect("read image-cond f16 burnpack");
+        assert!(!bytes_f32.is_empty());
+        assert!(!bytes_f16.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn loads_legacy_i64_blob_burnpack() {
         type LegacyBlobBackend = burn::backend::NdArray<f32, i64>;
 
@@ -741,6 +1181,8 @@ mod tests {
             source_path: "legacy".to_string(),
             sha256: "legacy".to_string(),
             precision: "f32".to_string(),
+            chunk_sizes: Vec::new(),
+            chunk_bytes: 0,
         };
         std::fs::write(
             metadata_path(&burnpack),

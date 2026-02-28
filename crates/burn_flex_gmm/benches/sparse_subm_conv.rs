@@ -9,8 +9,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use burn::tensor::Tensor;
 #[cfg(feature = "wgpu-kernel")]
 use burn_flex_gmm::wgpu::{
-    DefaultWgpuBackend, clear_neighbor_rows_tensor_cache, neighbor_rows_tensor_from_coords,
-    sparse_subm_conv_forward_wgpu,
+    DefaultWgpuBackend, NeighborDeviceAlgoPreference, SparseWgpuForwardConfig,
+    SparseWgpuKernelVariant, clear_neighbor_rows_tensor_cache, neighbor_rows_tensor_from_coords,
+    neighbor_rows_tensor_from_coords_with_algo, sparse_subm_conv_forward_wgpu_with_config,
 };
 
 #[derive(Clone)]
@@ -122,80 +123,45 @@ fn bench_sparse_subm_conv(c: &mut Criterion) {
         let bias_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(bias.as_slice(), &device);
         let neighbor_t = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
             .expect("neighbor row tensor");
-
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "host");
-        }
-        group.bench_function("wgpu_neighbor_host_uncached", |b| {
-            b.iter(|| {
-                clear_neighbor_rows_tensor_cache();
-                let tensor = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
-                    .expect("host neighbor tensor");
-                let _ = tensor.to_data();
-            })
-        });
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND", "device");
-        }
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO", "scan");
-        }
         group.bench_function("wgpu_neighbor_device_scan_uncached", |b| {
             b.iter(|| {
                 clear_neighbor_rows_tensor_cache();
-                let tensor = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
-                    .expect("device scan neighbor tensor");
+                let tensor = neighbor_rows_tensor_from_coords_with_algo(
+                    &cfg,
+                    coords.as_slice(),
+                    &device,
+                    NeighborDeviceAlgoPreference::Scan,
+                )
+                .expect("device scan neighbor tensor");
                 let _ = tensor.to_data();
             })
         });
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO", "hash");
-        }
-        unsafe {
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
-        }
-        group.bench_function("wgpu_neighbor_device_hash_auto_uncached", |b| {
+        group.bench_function("wgpu_neighbor_device_sorted_hash_uncached", |b| {
             b.iter(|| {
                 clear_neighbor_rows_tensor_cache();
-                let tensor = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
-                    .expect("device hash neighbor tensor");
+                let tensor = neighbor_rows_tensor_from_coords_with_algo(
+                    &cfg,
+                    coords.as_slice(),
+                    &device,
+                    NeighborDeviceAlgoPreference::SortedHash,
+                )
+                .expect("device hash neighbor tensor");
                 let _ = tensor.to_data();
             })
         });
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD", "host");
-        }
-        group.bench_function("wgpu_neighbor_device_hash_host_table_uncached", |b| {
+        group.bench_function("wgpu_neighbor_device_hash_table_serial_uncached", |b| {
             b.iter(|| {
                 clear_neighbor_rows_tensor_cache();
-                let tensor = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
-                    .expect("device hash (host table) neighbor tensor");
+                let tensor = neighbor_rows_tensor_from_coords_with_algo(
+                    &cfg,
+                    coords.as_slice(),
+                    &device,
+                    NeighborDeviceAlgoPreference::HashTableSerial,
+                )
+                .expect("device hash-table serial neighbor tensor");
                 let _ = tensor.to_data();
             })
         });
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD", "wgsl");
-        }
-        clear_neighbor_rows_tensor_cache();
-        match neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device) {
-            Ok(_) => {
-                group.bench_function("wgpu_neighbor_device_hash_wgsl_table_uncached", |b| {
-                    b.iter(|| {
-                        clear_neighbor_rows_tensor_cache();
-                        let tensor =
-                            neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
-                                .expect("device hash (wgsl table) neighbor tensor");
-                        let _ = tensor.to_data();
-                    })
-                });
-            }
-            Err(err) => {
-                eprintln!("Skipping bench wgpu_neighbor_device_hash_wgsl_table_uncached: {err}");
-            }
-        }
-        unsafe {
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
-        }
         clear_neighbor_rows_tensor_cache();
         let _ = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
             .expect("cached warmup");
@@ -206,63 +172,71 @@ fn bench_sparse_subm_conv(c: &mut Criterion) {
                 let _ = tensor.to_data();
             })
         });
-
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_KERNEL", "baseline");
-        }
-        group.bench_function("wgpu_kernel_baseline", |b| {
+        group.bench_function("wgpu_kernel_auto", |b| {
             b.iter(|| {
-                let out = sparse_subm_conv_forward_wgpu(
+                let out = sparse_subm_conv_forward_wgpu_with_config(
                     &cfg,
                     input_t.clone(),
                     neighbor_t.clone(),
                     weight_t.clone(),
                     bias_t.clone(),
+                    SparseWgpuForwardConfig::default(),
                 )
                 .expect("wgpu kernel");
                 let _ = out.to_data();
             })
         });
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_KERNEL", "fused_oc4");
-        }
-        group.bench_function("wgpu_kernel_fused_oc4", |b| {
+        group.bench_function("wgpu_kernel_baseline_split1", |b| {
             b.iter(|| {
-                let out = sparse_subm_conv_forward_wgpu(
+                let out = sparse_subm_conv_forward_wgpu_with_config(
                     &cfg,
                     input_t.clone(),
                     neighbor_t.clone(),
                     weight_t.clone(),
                     bias_t.clone(),
+                    SparseWgpuForwardConfig {
+                        kernel_variant: SparseWgpuKernelVariant::Baseline,
+                        split_k: Some(1),
+                    },
                 )
-                .expect("wgpu fused-oc4 kernel");
+                .expect("wgpu baseline split1 kernel");
                 let _ = out.to_data();
             })
         });
-        unsafe {
-            std::env::set_var("BURN_FLEX_GMM_WGPU_KERNEL", "baseline");
-            std::env::set_var("BURN_FLEX_GMM_WGPU_SPLIT_K", "4");
-        }
-        group.bench_function("wgpu_kernel_splitk", |b| {
+        group.bench_function("wgpu_kernel_baseline_split4", |b| {
             b.iter(|| {
-                let out = sparse_subm_conv_forward_wgpu(
+                let out = sparse_subm_conv_forward_wgpu_with_config(
                     &cfg,
                     input_t.clone(),
                     neighbor_t.clone(),
                     weight_t.clone(),
                     bias_t.clone(),
+                    SparseWgpuForwardConfig {
+                        kernel_variant: SparseWgpuKernelVariant::Baseline,
+                        split_k: Some(4),
+                    },
                 )
-                .expect("wgpu split-k kernel");
+                .expect("wgpu baseline split4 kernel");
                 let _ = out.to_data();
             })
         });
-        unsafe {
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_SPLIT_K");
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_KERNEL");
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_BACKEND");
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_DEVICE_ALGO");
-            std::env::remove_var("BURN_FLEX_GMM_WGPU_NEIGHBOR_HASH_BUILD");
-        }
+        group.bench_function("wgpu_kernel_fused_oc4_split4", |b| {
+            b.iter(|| {
+                let out = sparse_subm_conv_forward_wgpu_with_config(
+                    &cfg,
+                    input_t.clone(),
+                    neighbor_t.clone(),
+                    weight_t.clone(),
+                    bias_t.clone(),
+                    SparseWgpuForwardConfig {
+                        kernel_variant: SparseWgpuKernelVariant::FusedOc4,
+                        split_k: Some(4),
+                    },
+                )
+                .expect("wgpu fused-oc4 split4 kernel");
+                let _ = out.to_data();
+            })
+        });
         clear_neighbor_rows_tensor_cache();
     }
     group.finish();

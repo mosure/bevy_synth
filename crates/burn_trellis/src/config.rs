@@ -34,19 +34,19 @@ impl TrellisQuality {
                 guidance_strength_shape: 6.0,
                 guidance_strength_texture: 1.0,
             },
-            // 1024 single keeps memory usage lower while preserving quality.
+            // Medium keeps the canonical 1024 single-pass path with fewer sampler steps.
             Self::Medium => TrellisQualitySettings {
                 pipeline_type: "1024_single",
-                sparse_steps: 12,
-                shape_steps: 12,
-                texture_steps: 12,
+                sparse_steps: 6,
+                shape_steps: 6,
+                texture_steps: 6,
                 guidance_strength_sparse: 7.5,
                 guidance_strength_shape: 7.5,
                 guidance_strength_texture: 1.0,
             },
-            // 1024 cascade is the highest quality default path.
+            // High keeps the same canonical 1024 single-pass pipeline with full step budget.
             Self::High => TrellisQualitySettings {
-                pipeline_type: "1024_cascade",
+                pipeline_type: "1024_single",
                 sparse_steps: 12,
                 shape_steps: 12,
                 texture_steps: 12,
@@ -77,9 +77,19 @@ mod tests {
             TrellisQuality::Medium.settings().pipeline_type,
             "1024_single"
         );
-        assert_eq!(
-            TrellisQuality::High.settings().pipeline_type,
-            "1024_cascade"
-        );
+        assert_eq!(TrellisQuality::High.settings().pipeline_type, "1024_single");
+    }
+
+    #[test]
+    fn quality_step_budgets_are_ordered() {
+        let low = TrellisQuality::Low.settings();
+        let medium = TrellisQuality::Medium.settings();
+        let high = TrellisQuality::High.settings();
+        assert!(low.sparse_steps < medium.sparse_steps);
+        assert!(medium.sparse_steps < high.sparse_steps);
+        assert!(low.shape_steps < medium.shape_steps);
+        assert!(medium.shape_steps < high.shape_steps);
+        assert!(low.texture_steps < medium.texture_steps);
+        assert!(medium.texture_steps < high.texture_steps);
     }
 }

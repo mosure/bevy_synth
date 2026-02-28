@@ -1,5 +1,5 @@
 use burn::prelude::*;
-use burn::tensor::TensorData;
+use burn::tensor::{IndexingUpdateOp, TensorData};
 
 use crate::model::triposg::vae::TripoSGVae;
 use crate::pipeline::mesh::DenseGrid;
@@ -647,7 +647,7 @@ fn flash_refinement_next_index_mask_from_doubled_indices<B: Backend>(
 ) -> Tensor<B, 3, Bool> {
     let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], device);
     let mut next_index = Tensor::<B, 1>::zeros([next_total], device);
-    next_index = next_index.scatter(0, doubled_indices, ones);
+    next_index = next_index.scatter(0, doubled_indices, ones, IndexingUpdateOp::Add);
     next_index
         .reshape([next_size as i32, next_size as i32, next_size as i32])
         .greater_elem(0.0)
@@ -1077,7 +1077,7 @@ fn decode_flash_points_gpu<B: Backend>(
         }
         // Burn scatter uses sum reduction. Flash indices are unique per decode pass.
         // For padded fp16 wasm chunks we append one extra index and zero out its delta.
-        out = out.scatter(0, indices_chunk, delta);
+        out = out.scatter(0, indices_chunk, delta, IndexingUpdateOp::Add);
         start = end;
     }
 

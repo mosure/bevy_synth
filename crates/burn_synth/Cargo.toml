@@ -43,7 +43,7 @@ import = [
 ]
 
 [dependencies]
-burn = { version = "0.19", default-features = false, features = ["ndarray", "std"], optional = true }
+burn = { version = "0.21.0-pre.1", default-features = false, features = ["ndarray", "std"], optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 gltf = { version = "1.4", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
@@ -52,21 +52,21 @@ env_logger = { version = "0.11", optional = true }
 burn_tripo = { version = "0.1.1", path = "../burn_tripo", optional = true, default-features = false }
 burn_trellis = { version = "0.1.0", path = "../burn_trellis", optional = true }
 burn_foreground = { version = "0.1.1", path = "../burn_foreground", optional = true, default-features = false }
-burn-cuda = { version = "0.19", optional = true }
+burn-cuda = { version = "0.21.0-pre.1", optional = true }
 serde_json = "1.0"
 sha2 = "0.10"
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import" }
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies]
-burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
+burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
 ureq = { version = "2.12", optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies]
-burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
 ureq = { version = "2.12", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-burn-wgpu = { version = "0.19", optional = true, default-features = false, features = ["fusion", "std", "webgpu"] }
+burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "webgpu"] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 js-sys = "0.3"

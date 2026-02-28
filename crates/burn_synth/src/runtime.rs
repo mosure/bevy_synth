@@ -15,6 +15,8 @@ use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 #[cfg(feature = "trellis")]
+use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
+#[cfg(feature = "trellis")]
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
@@ -35,6 +37,8 @@ use image::{ImageFormat, RgbaImage};
 
 use crate::io::ImageSource;
 use crate::mesh::Mesh;
+#[cfg(all(not(target_arch = "wasm32"), feature = "trellis"))]
+use crate::native_model_bootstrap::resolve_or_bootstrap_trellis_roots;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::native_model_bootstrap::{
     resolve_or_bootstrap_rmbg14_root, resolve_or_bootstrap_triposg_root,
@@ -759,6 +763,9 @@ impl SynthRuntime {
             hook_output: None,
             noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
             max_sparse_coords: self.config.trellis_max_sparse_coords,
+            runtime_stage_debug: false,
+            runtime_attention_debug: false,
+            runtime_decoder_conv_telemetry: false,
         };
         progress.stage_started(
             "trellis.infer",
@@ -773,6 +780,15 @@ impl SynthRuntime {
         let profiled = pipeline
             .infer_mesh_profile(&temp_input, &options)
             .map_err(|err| RuntimeError::new(format!("Trellis2 inference failed: {err}")))?;
+        if let Err(err) = validate_trellis_runtime_sources(
+            trellis_device,
+            profiled.sparse_source.as_str(),
+            profiled.decode_source.as_str(),
+            profiled.decode_source.is_fallback(),
+        ) {
+            let _ = std::fs::remove_file(&temp_input);
+            return Err(err);
+        }
         progress.stage_completed(
             "trellis.infer",
             None,
@@ -1075,12 +1091,12 @@ impl SynthesisRuntime {
     fn ensure_trellis(&mut self, config: &RuntimeConfig) -> RuntimeResult<&mut Trellis2Pipeline> {
         if self.trellis.is_none() {
             let mut trellis_config = Trellis2PipelineConfig::default();
-            if let Some(root) = config.trellis_weights_root.as_ref() {
-                trellis_config.weights_root = root.clone();
-            }
-            if let Some(root) = config.trellis_image_large_root.as_ref() {
-                trellis_config.image_large_root = Some(root.clone());
-            }
+            let (weights_root, image_large_root) = resolve_trellis_runtime_roots(
+                config.trellis_weights_root.as_deref(),
+                config.trellis_image_large_root.as_deref(),
+            )?;
+            trellis_config.weights_root = weights_root;
+            trellis_config.image_large_root = image_large_root;
             let pipeline = Trellis2Pipeline::new(trellis_config).map_err(|err| {
                 RuntimeError::new(format!("failed to initialize Trellis2: {err}"))
             })?;
@@ -1205,6 +1221,47 @@ fn resolve_triposg_runtime_weights_root(
     }
 }
 
+#[cfg(feature = "trellis")]
+fn resolve_trellis_runtime_roots(
+    explicit_weights: Option<&Path>,
+    explicit_image_large: Option<&Path>,
+) -> RuntimeResult<(PathBuf, Option<PathBuf>)> {
+    let resolved_explicit_weights =
+        explicit_weights.map(|path| resolve_trellis2_weights_root(Some(path)));
+    let resolved_explicit_image_large =
+        explicit_image_large.map(|path| resolve_trellis2_image_large_root(Some(path)));
+
+    if resolved_explicit_weights.is_some() || resolved_explicit_image_large.is_some() {
+        let weights_root = resolved_explicit_weights.unwrap_or_else(|| {
+            if let Some(path) = explicit_weights {
+                path.to_path_buf()
+            } else {
+                resolve_trellis2_weights_root(None)
+            }
+        });
+        let image_large_root = resolved_explicit_image_large.or_else(|| {
+            let resolved = resolve_trellis2_image_large_root(None);
+            resolved.exists().then_some(resolved)
+        });
+        return Ok((weights_root, image_large_root));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        return resolve_or_bootstrap_trellis_roots(true).map_err(|err| {
+            RuntimeError::new(format!("failed to prepare Trellis2 cache bootstrap: {err}"))
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let weights_root = resolve_trellis2_weights_root(None);
+        let image_large_root = resolve_trellis2_image_large_root(None);
+        let image_large_root = image_large_root.exists().then_some(image_large_root);
+        Ok((weights_root, image_large_root))
+    }
+}
+
 fn map_dino_backend(value: DinoBackend) -> DinoBackendChoice {
     match value {
         DinoBackend::Auto => DinoBackendChoice::Auto,
@@ -1220,6 +1277,41 @@ fn map_trellis_quality(value: TrellisQuality) -> burn_trellis::TrellisQuality {
         TrellisQuality::Medium => burn_trellis::TrellisQuality::Medium,
         TrellisQuality::High => burn_trellis::TrellisQuality::High,
     }
+}
+
+#[cfg(feature = "trellis")]
+fn validate_trellis_runtime_sources(
+    requested_device: TrellisDevice,
+    sparse_source: &str,
+    decode_source: &str,
+    decode_fallback: bool,
+) -> RuntimeResult<()> {
+    if sparse_source == "synthetic" {
+        return Err(RuntimeError::new(format!(
+            "Trellis2 runtime entered synthetic sparse fallback (requested_device={}, sparse_source={}, decode_source={}); refusing degraded output.",
+            requested_device.as_str(),
+            sparse_source,
+            decode_source
+        )));
+    }
+
+    if matches!(requested_device, TrellisDevice::Wgpu) && sparse_source != "runtime_model_wgpu" {
+        return Err(RuntimeError::new(format!(
+            "Trellis2 runtime sparse source mismatch for WGPU request (requested_device=wgpu, sparse_source={}, decode_source={}); refusing silent fallback.",
+            sparse_source, decode_source
+        )));
+    }
+
+    if decode_fallback {
+        return Err(RuntimeError::new(format!(
+            "Trellis2 runtime entered decode fallback path (requested_device={}, sparse_source={}, decode_source={}); refusing degraded output.",
+            requested_device.as_str(),
+            sparse_source,
+            decode_source
+        )));
+    }
+
+    Ok(())
 }
 
 fn foreground_model_label(model: ForegroundModel) -> &'static str {
@@ -1729,6 +1821,46 @@ mod tests {
             err.to_string().contains("feature `trellis`"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(feature = "trellis")]
+    #[test]
+    fn trellis_runtime_source_validation_rejects_synthetic_sparse() {
+        let err =
+            validate_trellis_runtime_sources(TrellisDevice::Wgpu, "synthetic", "runtime", false)
+                .expect_err("synthetic sparse source must fail fast");
+        assert!(
+            err.to_string().contains("synthetic sparse fallback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "trellis")]
+    #[test]
+    fn trellis_runtime_source_validation_rejects_decode_fallback() {
+        let err = validate_trellis_runtime_sources(
+            TrellisDevice::Wgpu,
+            "runtime_model_wgpu",
+            "fallback_runtime_error",
+            true,
+        )
+        .expect_err("decode fallback source must fail fast");
+        assert!(
+            err.to_string().contains("decode fallback path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "trellis")]
+    #[test]
+    fn trellis_runtime_source_validation_accepts_runtime_wgpu() {
+        validate_trellis_runtime_sources(
+            TrellisDevice::Wgpu,
+            "runtime_model_wgpu",
+            "runtime",
+            false,
+        )
+        .expect("runtime wgpu sources should be accepted");
     }
 
     #[test]

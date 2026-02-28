@@ -1,6 +1,14 @@
 use super::*;
-use std::collections::VecDeque;
+use std::collections::HashMap;
+use std::hash::{BuildHasher, BuildHasherDefault};
 
+#[cfg(feature = "runtime-model-wgpu")]
+use burn::tensor::{Int, Tensor, TensorData};
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_flex_gmm::wgpu::{DefaultWgpuBackend, dense_trilinear_sample_attrs_wgpu};
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_wgpu::WgpuDevice;
+use rustc_hash::FxHasher;
 #[cfg(all(
     feature = "uv-xatlas",
     not(target_arch = "wasm32"),
@@ -19,35 +27,128 @@ struct UvRasterDomain {
     raster_faces: Vec<[u32; 3]>,
 }
 
-#[cfg(feature = "runtime-model")]
-pub(super) fn runtime_subdivision_to_sample(sub: &SparseSubdivisionLogits) -> DecodeShapeSubSample {
-    let mut feats = Vec::with_capacity(sub.coords.len());
-    for row_idx in 0..sub.coords.len() {
-        let mut row = [0.0f32; 8];
-        let base = row_idx * 8;
-        if base + 8 <= sub.logits.len() {
-            row.copy_from_slice(&sub.logits[base..base + 8]);
+type VoxelAttrFastHasher = BuildHasherDefault<FxHasher>;
+type VoxelAttrMap = HashMap<u64, [f32; 6], VoxelAttrFastHasher>;
+// Keep dense lookup bounded to avoid excessive host memory use when sparse
+// coords span large volumes; large cases stay on sparse hash lookup.
+const DENSE_VOXEL_LOOKUP_MAX_CELLS: usize = 2_500_000;
+#[cfg(feature = "runtime-model-wgpu")]
+const DENSE_VOXEL_WGPU_SAMPLE_MIN_POSITIONS: usize = 2_048;
+#[cfg(feature = "runtime-model-wgpu")]
+const DENSE_VOXEL_WGPU_SAMPLE_BATCH: usize = 65_536;
+
+pub(super) enum VoxelAttrLookup {
+    Dense {
+        spatial: [u32; 3],
+        occupancy: Vec<u8>,
+        attrs: Vec<[f32; 6]>,
+    },
+    Sparse {
+        spatial: [u32; 3],
+        map: VoxelAttrMap,
+    },
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+struct DenseVoxelWgpuSampler {
+    device: WgpuDevice,
+    occupancy_t: Tensor<DefaultWgpuBackend, 1, Int>,
+    attrs_t: Tensor<DefaultWgpuBackend, 2>,
+    spatial: [usize; 3],
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl DenseVoxelWgpuSampler {
+    fn new(occupancy: &[u8], attrs: &[[f32; 6]], spatial: [u32; 3]) -> Result<Self, String> {
+        if occupancy.is_empty() || attrs.is_empty() {
+            return Err("decode pbr sample requires non-empty voxel map".to_string());
         }
-        feats.push(row);
-    }
-    DecodeShapeSubSample {
-        coords: sub.coords.clone(),
-        feats,
-        spatial_shape: sub.spatial_shape,
+        if occupancy.len() != attrs.len() {
+            return Err(format!(
+                "decode pbr dense lookup mismatch: occupancy={} attrs={}",
+                occupancy.len(),
+                attrs.len()
+            ));
+        }
+        let spatial_cells = (spatial[0] as usize)
+            .checked_mul(spatial[1] as usize)
+            .and_then(|value| value.checked_mul(spatial[2] as usize))
+            .ok_or_else(|| {
+                format!(
+                    "decode pbr dense lookup volume overflow: spatial=[{},{},{}]",
+                    spatial[0], spatial[1], spatial[2]
+                )
+            })?;
+        if spatial_cells != occupancy.len() {
+            return Err(format!(
+                "decode pbr dense lookup length mismatch: expected_cells={} occupancy={} attrs={}",
+                spatial_cells,
+                occupancy.len(),
+                attrs.len()
+            ));
+        }
+
+        let spatial_usize = [
+            usize::try_from(spatial[0])
+                .map_err(|_| format!("decode pbr spatial x={} exceeds usize range", spatial[0]))?,
+            usize::try_from(spatial[1])
+                .map_err(|_| format!("decode pbr spatial y={} exceeds usize range", spatial[1]))?,
+            usize::try_from(spatial[2])
+                .map_err(|_| format!("decode pbr spatial z={} exceeds usize range", spatial[2]))?,
+        ];
+
+        let device = WgpuDevice::default();
+        let mut attrs_flat = Vec::with_capacity(attrs.len().saturating_mul(6));
+        for row in attrs {
+            attrs_flat.extend_from_slice(row);
+        }
+        let occupancy_i32 = occupancy
+            .iter()
+            .map(|value| i32::from(*value > 0))
+            .collect::<Vec<_>>();
+        let attrs_t = Tensor::<DefaultWgpuBackend, 2>::from_data(
+            TensorData::new(attrs_flat, [attrs.len(), 6]),
+            &device,
+        );
+        let occupancy_t = Tensor::<DefaultWgpuBackend, 1, Int>::from_data(
+            TensorData::new(occupancy_i32, [occupancy.len()]),
+            &device,
+        );
+
+        Ok(Self {
+            device,
+            occupancy_t,
+            attrs_t,
+            spatial: spatial_usize,
+        })
     }
 }
 
 #[cfg(feature = "runtime-model")]
-pub(super) fn sample_subdivision_to_runtime(sub: &DecodeShapeSubSample) -> SparseSubdivisionLogits {
-    let mut logits = Vec::with_capacity(sub.feats.len() * 8);
-    for row in &sub.feats {
-        logits.extend_from_slice(row);
+pub(super) fn runtime_subdivision_to_sample(
+    sub: &SparseSubdivisionLogits,
+) -> Result<DecodeShapeSubSample, String> {
+    let coords = sub.coords_host("decode runtime subdivision coord materialization")?;
+    let logits = sub.logits_host("decode runtime subdivision logits materialization")?;
+    if logits.len() != coords.len().saturating_mul(8) {
+        return Err(format!(
+            "decode runtime subdivision tensor mismatch: coords_rows={} logits={}",
+            coords.len(),
+            logits.len()
+        ));
     }
-    SparseSubdivisionLogits {
+    let mut feats = Vec::with_capacity(coords.len());
+    for row_idx in 0..coords.len() {
+        let mut row = [0.0f32; 8];
+        let base = row_idx * 8;
+        row.copy_from_slice(&logits[base..base + 8]);
+        feats.push(row);
+    }
+    Ok(DecodeShapeSubSample {
+        coords,
+        feats,
         spatial_shape: sub.spatial_shape,
-        coords: sub.coords.clone(),
-        logits,
-    }
+    })
 }
 
 #[cfg(feature = "runtime-model")]
@@ -279,7 +380,7 @@ pub(super) fn bake_pbr_from_voxels(
     voxel_coords: &[[u32; 4]],
     voxel_attrs: &[[f32; 6]],
     fallback_spatial_resolution: u32,
-) -> (Vec<[f32; 2]>, Option<MeshPbrTextures>, PbrBakeDebug) {
+) -> Result<(Vec<[f32; 2]>, Option<MeshPbrTextures>, PbrBakeDebug), String> {
     let (uvs, textures, debug) = bake_pbr_from_voxels_with_options(
         vertices,
         faces,
@@ -287,8 +388,9 @@ pub(super) fn bake_pbr_from_voxels(
         voxel_attrs,
         fallback_spatial_resolution,
         true,
-    );
-    (uvs, textures, debug.unwrap_or_else(empty_pbr_bake_debug))
+        false,
+    )?;
+    Ok((uvs, textures, debug.unwrap_or_else(empty_pbr_bake_debug)))
 }
 
 fn empty_pbr_bake_debug() -> PbrBakeDebug {
@@ -308,6 +410,81 @@ fn empty_pbr_bake_debug() -> PbrBakeDebug {
     }
 }
 
+fn dense_voxel_linear_index(x: u32, y: u32, z: u32, spatial: [u32; 3]) -> usize {
+    let sx = spatial[0] as usize;
+    let sy = spatial[1] as usize;
+    let x = x as usize;
+    let y = y as usize;
+    let z = z as usize;
+    (z * sy + y) * sx + x
+}
+
+pub(super) fn build_voxel_attr_lookup(
+    voxel_coords: &[[u32; 4]],
+    voxel_attrs: &[[f32; 6]],
+    spatial: [u32; 3],
+) -> Result<VoxelAttrLookup, String> {
+    if voxel_coords.len() != voxel_attrs.len() {
+        return Err(format!(
+            "decode pbr voxel tensor mismatch: coords={} attrs={}",
+            voxel_coords.len(),
+            voxel_attrs.len()
+        ));
+    }
+
+    let spatial_x = spatial[0] as usize;
+    let spatial_y = spatial[1] as usize;
+    let spatial_z = spatial[2] as usize;
+    let spatial_cells = spatial_x
+        .checked_mul(spatial_y)
+        .and_then(|value| value.checked_mul(spatial_z))
+        .ok_or_else(|| {
+            format!(
+                "decode pbr spatial volume overflow: spatial=[{},{},{}]",
+                spatial[0], spatial[1], spatial[2]
+            )
+        })?;
+
+    if spatial_cells <= DENSE_VOXEL_LOOKUP_MAX_CELLS {
+        let mut occupancy = vec![0u8; spatial_cells];
+        let mut attrs = vec![[0.0f32; 6]; spatial_cells];
+        for (coord, value) in voxel_coords.iter().zip(voxel_attrs.iter()) {
+            let idx = dense_voxel_linear_index(coord[1], coord[2], coord[3], spatial);
+            occupancy[idx] = 255;
+            attrs[idx] = *value;
+        }
+        Ok(VoxelAttrLookup::Dense {
+            spatial,
+            occupancy,
+            attrs,
+        })
+    } else {
+        // Sparse lookup remains the canonical path for large coordinate volumes.
+        let mut map: VoxelAttrMap = HashMap::with_capacity_and_hasher(
+            voxel_coords.len().saturating_mul(2),
+            VoxelAttrFastHasher::default(),
+        );
+        for (coord, value) in voxel_coords.iter().zip(voxel_attrs.iter()) {
+            map.insert(pack_coord(coord[1], coord[2], coord[3]), *value);
+        }
+        Ok(VoxelAttrLookup::Sparse { spatial, map })
+    }
+}
+
+fn sample_voxel_attr_from_lookup(
+    position: [f32; 3],
+    lookup: &VoxelAttrLookup,
+) -> Result<Option<[f32; 6]>, String> {
+    match lookup {
+        VoxelAttrLookup::Dense {
+            spatial,
+            occupancy,
+            attrs,
+        } => sample_voxel_attr_dense(position, occupancy.as_slice(), attrs.as_slice(), *spatial),
+        VoxelAttrLookup::Sparse { spatial, map } => sample_voxel_attr(position, map, *spatial),
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(super) fn bake_pbr_from_voxels_with_options(
     vertices: &[[f32; 3]],
@@ -316,9 +493,10 @@ pub(super) fn bake_pbr_from_voxels_with_options(
     voxel_attrs: &[[f32; 6]],
     fallback_spatial_resolution: u32,
     capture_debug: bool,
-) -> (Vec<[f32; 2]>, Option<MeshPbrTextures>, Option<PbrBakeDebug>) {
+    prefer_wgpu_sampling: bool,
+) -> Result<(Vec<[f32; 2]>, Option<MeshPbrTextures>, Option<PbrBakeDebug>), String> {
     if vertices.is_empty() || faces.is_empty() {
-        return (
+        return Ok((
             Vec::new(),
             None,
             if capture_debug {
@@ -326,7 +504,17 @@ pub(super) fn bake_pbr_from_voxels_with_options(
             } else {
                 None
             },
-        );
+        ));
+    }
+    if voxel_coords.len() != voxel_attrs.len() {
+        return Err(format!(
+            "decode pbr voxel tensor mismatch: coords={} attrs={}",
+            voxel_coords.len(),
+            voxel_attrs.len()
+        ));
+    }
+    if voxel_coords.is_empty() {
+        return Err("decode pbr requires non-empty voxel coordinates".to_string());
     }
 
     let texture_size = runtime_pbr_texture_size();
@@ -348,24 +536,37 @@ pub(super) fn bake_pbr_from_voxels_with_options(
         Vec::new()
     };
 
-    let mut voxel_map = HashMap::with_capacity(voxel_coords.len().saturating_mul(2));
     let mut spatial = [
         fallback_spatial_resolution.max(1),
         fallback_spatial_resolution.max(1),
         fallback_spatial_resolution.max(1),
     ];
-    for (idx, coord) in voxel_coords.iter().enumerate() {
-        let attrs = voxel_attrs
-            .get(idx)
-            .copied()
-            .unwrap_or([0.5, 0.5, 0.5, 0.0, 1.0, 1.0]);
-        voxel_map.insert(pack_coord(coord[1], coord[2], coord[3]), attrs);
+    for coord in voxel_coords {
         spatial[0] = spatial[0].max(coord[1].saturating_add(1));
         spatial[1] = spatial[1].max(coord[2].saturating_add(1));
         spatial[2] = spatial[2].max(coord[3].saturating_add(1));
     }
-    let fallback_attr = summarize_voxel_attr(voxel_attrs);
+    let voxel_lookup = build_voxel_attr_lookup(voxel_coords, voxel_attrs, spatial)?;
+    #[cfg(feature = "runtime-model-wgpu")]
+    // This path is intentionally opt-in and large-workload-gated: the staged decode
+    // pipeline still rasterizes triangles on host, so we only offload dense trilinear
+    // sampling when there is enough work to amortize tensor upload/dispatch overhead.
+    let use_wgpu_dense_sampling = prefer_wgpu_sampling
+        && !capture_debug
+        && texel_count >= DENSE_VOXEL_WGPU_SAMPLE_MIN_POSITIONS
+        && matches!(voxel_lookup, VoxelAttrLookup::Dense { .. });
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let _ = prefer_wgpu_sampling;
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let use_wgpu_dense_sampling = false;
+    let mut deferred_texel_indices = Vec::<usize>::new();
+    let mut deferred_positions = Vec::<[f32; 3]>::new();
+    if use_wgpu_dense_sampling {
+        deferred_texel_indices.reserve(texel_count / 2);
+        deferred_positions.reserve(texel_count / 2);
+    }
 
+    let mut sample_error: Option<String> = None;
     for face in uv_domain.raster_faces.iter().copied() {
         let i0 = face[0] as usize;
         let i1 = face[1] as usize;
@@ -389,6 +590,9 @@ pub(super) fn bake_pbr_from_voxels_with_options(
         let uv1 = uv_domain.raster_uvs[i1];
         let uv2 = uv_domain.raster_uvs[i2];
         rasterize_triangle(texture_size, [uv0, uv1, uv2], |x, y, bary| {
+            if sample_error.is_some() {
+                return;
+            }
             let idx = y * texture_size + x;
             if !capture_debug && raster_mask[idx] != 0 {
                 return;
@@ -399,8 +603,22 @@ pub(super) fn bake_pbr_from_voxels_with_options(
                 p0[1] * bary[0] + p1[1] * bary[1] + p2[1] * bary[2],
                 p0[2] * bary[0] + p1[2] * bary[1] + p2[2] * bary[2],
             ];
-            let attrs =
-                sample_voxel_attr(position, &voxel_map, fallback_attr, spatial, voxel_coords);
+            if use_wgpu_dense_sampling {
+                deferred_texel_indices.push(idx);
+                deferred_positions.push(position);
+                return;
+            }
+            let attrs = match sample_voxel_attr_from_lookup(position, &voxel_lookup) {
+                Ok(Some(attrs)) => attrs,
+                Ok(None) => {
+                    // Canonical strict behavior: sparse holes are allowed; leave texel uncovered.
+                    return;
+                }
+                Err(err) => {
+                    sample_error = Some(err);
+                    return;
+                }
+            };
             if raster_mask[idx] == 0 {
                 base_color_float[idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
                 metallic_float[idx] = attrs[3];
@@ -414,6 +632,46 @@ pub(super) fn bake_pbr_from_voxels_with_options(
             }
         });
     }
+    if let Some(err) = sample_error {
+        return Err(err);
+    }
+    if use_wgpu_dense_sampling {
+        let wgpu_sampler = match &voxel_lookup {
+            VoxelAttrLookup::Dense {
+                spatial,
+                occupancy,
+                attrs,
+            } => DenseVoxelWgpuSampler::new(occupancy.as_slice(), attrs.as_slice(), *spatial)?,
+            VoxelAttrLookup::Sparse { .. } => {
+                return Err(
+                    "decode pbr internal error: deferred wgpu sampler requires dense lookup"
+                        .to_string(),
+                );
+            }
+        };
+        let mut start = 0usize;
+        while start < deferred_positions.len() {
+            let end = (start + DENSE_VOXEL_WGPU_SAMPLE_BATCH).min(deferred_positions.len());
+            let batch_positions = &deferred_positions[start..end];
+            let sampled = sample_voxel_attr_dense_wgpu_batch(batch_positions, &wgpu_sampler)?;
+            for (local_idx, sampled_attrs) in sampled.into_iter().enumerate() {
+                let stream_idx = start + local_idx;
+                let texel_idx = deferred_texel_indices[stream_idx];
+                if raster_mask[texel_idx] != 0 {
+                    continue;
+                }
+                let Some(attrs) = sampled_attrs else {
+                    continue;
+                };
+                base_color_float[texel_idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
+                metallic_float[texel_idx] = attrs[3];
+                roughness_float[texel_idx] = attrs[4];
+                alpha_float[texel_idx] = attrs[5];
+                raster_mask[texel_idx] = 255;
+            }
+            start = end;
+        }
+    }
 
     inpaint_texture_channels(
         texture_size,
@@ -422,8 +680,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
         metallic_float.as_mut_slice(),
         roughness_float.as_mut_slice(),
         alpha_float.as_mut_slice(),
-        fallback_attr,
-    );
+    )?;
 
     let mut base_color_rgba_u8 = vec![0u8; texel_count * 4];
     let mut metallic_roughness_u8 = vec![0u8; texel_count * 4];
@@ -490,7 +747,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
         None
     };
 
-    (uv_domain.output_uvs, Some(pbr_textures), debug)
+    Ok((uv_domain.output_uvs, Some(pbr_textures), debug))
 }
 
 fn build_uv_raster_domain(
@@ -716,32 +973,13 @@ pub(super) fn box_uv_unwrap(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<[f
         .collect()
 }
 
-pub(super) fn summarize_voxel_attr(voxel_attrs: &[[f32; 6]]) -> [f32; 6] {
-    if voxel_attrs.is_empty() {
-        return [0.7, 0.7, 0.7, 0.0, 0.8, 1.0];
-    }
-    let mut accum = [0.0f32; 6];
-    for attrs in voxel_attrs {
-        for idx in 0..6 {
-            accum[idx] += attrs[idx];
-        }
-    }
-    let inv = 1.0 / voxel_attrs.len() as f32;
-    for value in &mut accum {
-        *value *= inv;
-    }
-    accum
-}
-
 pub(super) fn sample_voxel_attr(
     position: [f32; 3],
-    voxel_map: &HashMap<u64, [f32; 6]>,
-    fallback: [f32; 6],
+    voxel_map: &HashMap<u64, [f32; 6], impl BuildHasher>,
     spatial: [u32; 3],
-    voxel_coords: &[[u32; 4]],
-) -> [f32; 6] {
+) -> Result<Option<[f32; 6]>, String> {
     if voxel_map.is_empty() {
-        return fallback;
+        return Err("decode pbr sample requires non-empty voxel map".to_string());
     }
     let map_axis = |value: f32, dim: u32| -> f32 {
         let dim = dim.max(1) as f32;
@@ -765,104 +1003,205 @@ pub(super) fn sample_voxel_attr(
         coord[2] - base[2] as f32,
     ];
 
+    let max_x = spatial[0].saturating_sub(1) as i32;
+    let max_y = spatial[1].saturating_sub(1) as i32;
+    let max_z = spatial[2].saturating_sub(1) as i32;
+    let x0 = base[0].clamp(0, max_x) as u32;
+    let y0 = base[1].clamp(0, max_y) as u32;
+    let z0 = base[2].clamp(0, max_z) as u32;
+    let x1 = (base[0] + 1).clamp(0, max_x) as u32;
+    let y1 = (base[1] + 1).clamp(0, max_y) as u32;
+    let z1 = (base[2] + 1).clamp(0, max_z) as u32;
+
+    let wx0 = 1.0 - frac[0];
+    let wy0 = 1.0 - frac[1];
+    let wz0 = 1.0 - frac[2];
+    let wx1 = frac[0];
+    let wy1 = frac[1];
+    let wz1 = frac[2];
+
     let mut accum = [0.0f32; 6];
     let mut weight_sum = 0.0f32;
-    for dz in 0..=1 {
-        for dy in 0..=1 {
-            for dx in 0..=1 {
-                let x = base[0] + dx;
-                let y = base[1] + dy;
-                let z = base[2] + dz;
-                if x < 0 || y < 0 || z < 0 {
-                    continue;
-                }
-                let x = x.min(spatial[0] as i32 - 1) as u32;
-                let y = y.min(spatial[1] as i32 - 1) as u32;
-                let z = z.min(spatial[2] as i32 - 1) as u32;
-                let wx = if dx == 0 { 1.0 - frac[0] } else { frac[0] };
-                let wy = if dy == 0 { 1.0 - frac[1] } else { frac[1] };
-                let wz = if dz == 0 { 1.0 - frac[2] } else { frac[2] };
-                let weight = wx * wy * wz;
-                let key = pack_coord(x, y, z);
-                if let Some(attrs) = voxel_map.get(&key) {
-                    for ch in 0..6 {
-                        accum[ch] += attrs[ch] * weight;
-                    }
-                    weight_sum += weight;
-                }
-            }
+    let mut accumulate_corner = |x: u32, y: u32, z: u32, weight: f32| {
+        if weight <= 0.0 {
+            return;
         }
-    }
+        let key = pack_coord(x, y, z);
+        if let Some(attrs) = voxel_map.get(&key) {
+            for ch in 0..6 {
+                accum[ch] += attrs[ch] * weight;
+            }
+            weight_sum += weight;
+        }
+    };
+    accumulate_corner(x0, y0, z0, wx0 * wy0 * wz0);
+    accumulate_corner(x1, y0, z0, wx1 * wy0 * wz0);
+    accumulate_corner(x0, y1, z0, wx0 * wy1 * wz0);
+    accumulate_corner(x1, y1, z0, wx1 * wy1 * wz0);
+    accumulate_corner(x0, y0, z1, wx0 * wy0 * wz1);
+    accumulate_corner(x1, y0, z1, wx1 * wy0 * wz1);
+    accumulate_corner(x0, y1, z1, wx0 * wy1 * wz1);
+    accumulate_corner(x1, y1, z1, wx1 * wy1 * wz1);
+
     if weight_sum > 1.0e-8 {
         let inv = 1.0 / weight_sum;
         for value in &mut accum {
             *value *= inv;
         }
-        return accum;
+        return Ok(Some(accum));
+    }
+    Ok(None)
+}
+
+pub(super) fn sample_voxel_attr_dense(
+    position: [f32; 3],
+    occupancy: &[u8],
+    attrs: &[[f32; 6]],
+    spatial: [u32; 3],
+) -> Result<Option<[f32; 6]>, String> {
+    if occupancy.is_empty() || attrs.is_empty() {
+        return Err("decode pbr sample requires non-empty voxel map".to_string());
+    }
+    if occupancy.len() != attrs.len() {
+        return Err(format!(
+            "decode pbr dense lookup mismatch: occupancy={} attrs={}",
+            occupancy.len(),
+            attrs.len()
+        ));
     }
 
-    let nearest = [
-        coord[0].round() as i32,
-        coord[1].round() as i32,
-        coord[2].round() as i32,
+    let map_axis = |value: f32, dim: u32| -> f32 {
+        let dim = dim.max(1) as f32;
+        ((value + 0.5) * dim).clamp(0.0, dim - 1.0)
+    };
+    let coord = [
+        map_axis(position[0], spatial[0]),
+        map_axis(position[1], spatial[1]),
+        map_axis(position[2], spatial[2]),
     ];
-    let key = pack_coord(
-        nearest[0].clamp(0, spatial[0] as i32 - 1) as u32,
-        nearest[1].clamp(0, spatial[1] as i32 - 1) as u32,
-        nearest[2].clamp(0, spatial[2] as i32 - 1) as u32,
-    );
-    if let Some(attrs) = voxel_map.get(&key) {
-        return *attrs;
+    let base = [
+        coord[0].floor() as i32,
+        coord[1].floor() as i32,
+        coord[2].floor() as i32,
+    ];
+    let frac = [
+        coord[0] - base[0] as f32,
+        coord[1] - base[1] as f32,
+        coord[2] - base[2] as f32,
+    ];
+
+    let max_x = spatial[0].saturating_sub(1) as i32;
+    let max_y = spatial[1].saturating_sub(1) as i32;
+    let max_z = spatial[2].saturating_sub(1) as i32;
+    let x0 = base[0].clamp(0, max_x) as u32;
+    let y0 = base[1].clamp(0, max_y) as u32;
+    let z0 = base[2].clamp(0, max_z) as u32;
+    let x1 = (base[0] + 1).clamp(0, max_x) as u32;
+    let y1 = (base[1] + 1).clamp(0, max_y) as u32;
+    let z1 = (base[2] + 1).clamp(0, max_z) as u32;
+
+    let wx0 = 1.0 - frac[0];
+    let wy0 = 1.0 - frac[1];
+    let wz0 = 1.0 - frac[2];
+    let wx1 = frac[0];
+    let wy1 = frac[1];
+    let wz1 = frac[2];
+
+    let mut accum = [0.0f32; 6];
+    let mut weight_sum = 0.0f32;
+    let mut accumulate_corner = |x: u32, y: u32, z: u32, weight: f32| {
+        if weight <= 0.0 {
+            return;
+        }
+        let idx = dense_voxel_linear_index(x, y, z, spatial);
+        if occupancy[idx] == 0 {
+            return;
+        }
+        let cell = attrs[idx];
+        for ch in 0..6 {
+            accum[ch] += cell[ch] * weight;
+        }
+        weight_sum += weight;
+    };
+    accumulate_corner(x0, y0, z0, wx0 * wy0 * wz0);
+    accumulate_corner(x1, y0, z0, wx1 * wy0 * wz0);
+    accumulate_corner(x0, y1, z0, wx0 * wy1 * wz0);
+    accumulate_corner(x1, y1, z0, wx1 * wy1 * wz0);
+    accumulate_corner(x0, y0, z1, wx0 * wy0 * wz1);
+    accumulate_corner(x1, y0, z1, wx1 * wy0 * wz1);
+    accumulate_corner(x0, y1, z1, wx0 * wy1 * wz1);
+    accumulate_corner(x1, y1, z1, wx1 * wy1 * wz1);
+
+    if weight_sum > 1.0e-8 {
+        let inv = 1.0 / weight_sum;
+        for value in &mut accum {
+            *value *= inv;
+        }
+        return Ok(Some(accum));
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sample_voxel_attr_dense_wgpu_batch(
+    positions: &[[f32; 3]],
+    sampler: &DenseVoxelWgpuSampler,
+) -> Result<Vec<Option<[f32; 6]>>, String> {
+    if positions.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let mut best = None;
-    let mut best_dist = f32::INFINITY;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let x = nearest[0] + dx;
-                let y = nearest[1] + dy;
-                let z = nearest[2] + dz;
-                if x < 0 || y < 0 || z < 0 {
-                    continue;
-                }
-                let key = pack_coord(x as u32, y as u32, z as u32);
-                if let Some(attrs) = voxel_map.get(&key) {
-                    let dist = (dx * dx + dy * dy + dz * dz) as f32;
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best = Some(*attrs);
-                    }
-                }
-            }
-        }
+    let rows = positions.len();
+    let mut positions_flat = Vec::with_capacity(rows.saturating_mul(3));
+    for position in positions {
+        positions_flat.extend_from_slice(position);
     }
-    if let Some(attrs) = best {
-        return attrs;
+    let positions_t = Tensor::<DefaultWgpuBackend, 2>::from_data(
+        TensorData::new(positions_flat, [rows, 3]),
+        &sampler.device,
+    );
+    let sampled_t = dense_trilinear_sample_attrs_wgpu(
+        positions_t,
+        sampler.occupancy_t.clone(),
+        sampler.attrs_t.clone(),
+        sampler.spatial,
+    )
+    .map_err(|err| format!("decode pbr dense wgpu kernel sample failed: {err}"))?;
+    let [sample_rows, sample_cols] = sampled_t.dims();
+    if sample_rows != rows || sample_cols != 7 {
+        return Err(format!(
+            "decode pbr dense wgpu sample output dims mismatch: got=[{},{}] expected=[{},7]",
+            sample_rows, sample_cols, rows
+        ));
     }
-    if !voxel_coords.is_empty() {
-        // Last-resort stable fallback for sparse misses: nearest known coordinate.
-        let mut nearest_idx = 0usize;
-        let mut nearest_dist = f32::INFINITY;
-        for (idx, coord) in voxel_coords.iter().enumerate() {
-            let dx = coord[1] as f32 - base[0] as f32;
-            let dy = coord[2] as f32 - base[1] as f32;
-            let dz = coord[3] as f32 - base[2] as f32;
-            let dist = dx * dx + dy * dy + dz * dz;
-            if dist < nearest_dist {
-                nearest_dist = dist;
-                nearest_idx = idx;
-            }
-        }
-        if let Some(attrs) = voxel_map.get(&pack_coord(
-            voxel_coords[nearest_idx][1],
-            voxel_coords[nearest_idx][2],
-            voxel_coords[nearest_idx][3],
-        )) {
-            return *attrs;
-        }
+    let sampled_flat = sampled_t
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("decode pbr dense wgpu sample extraction failed: {err:?}"))?;
+    if sampled_flat.len() != rows.saturating_mul(7) {
+        return Err(format!(
+            "decode pbr dense wgpu sample output len mismatch: got={} expected={}",
+            sampled_flat.len(),
+            rows.saturating_mul(7)
+        ));
     }
-    fallback
+
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row.saturating_mul(7);
+        let support = sampled_flat[base + 6];
+        if support <= 1.0e-8 {
+            out.push(None);
+            continue;
+        }
+        let mut attrs_out = [0.0f32; 6];
+        for channel in 0..6 {
+            attrs_out[channel] = sampled_flat[base + channel];
+        }
+        out.push(Some(attrs_out));
+    }
+    Ok(out)
 }
 
 pub(super) fn rasterize_triangle(
@@ -936,125 +1275,46 @@ pub(super) fn inpaint_texture_channels(
     metallic_float: &mut [f32],
     roughness_float: &mut [f32],
     alpha_float: &mut [f32],
-    fallback: [f32; 6],
-) {
+) -> Result<(), String> {
     let texels = texture_size * texture_size;
     if mask.len() != texels {
-        return;
+        return Err(format!(
+            "decode pbr inpaint mask length mismatch: mask={} texels={}",
+            mask.len(),
+            texels
+        ));
     }
-    let neighbors = [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)];
-    let mut nearest = vec![usize::MAX; texels];
-    let mut queue = VecDeque::with_capacity(texels);
-    for idx in 0..texels {
-        if mask[idx] != 0 {
-            nearest[idx] = idx;
-            queue.push_back(idx);
-        }
+    if base_color_float.len() != texels
+        || metallic_float.len() != texels
+        || roughness_float.len() != texels
+        || alpha_float.len() != texels
+    {
+        return Err(format!(
+            "decode pbr inpaint tensor length mismatch: base={} metallic={} roughness={} alpha={} texels={}",
+            base_color_float.len(),
+            metallic_float.len(),
+            roughness_float.len(),
+            alpha_float.len(),
+            texels
+        ));
     }
-
-    while let Some(idx) = queue.pop_front() {
-        let seed = nearest[idx];
-        let x = idx % texture_size;
-        let y = idx / texture_size;
-        for (dx, dy) in neighbors {
-            let nx = x as isize + dx;
-            let ny = y as isize + dy;
-            if nx < 0 || ny < 0 || nx >= texture_size as isize || ny >= texture_size as isize {
-                continue;
-            }
-            let nidx = ny as usize * texture_size + nx as usize;
-            if nearest[nidx] == usize::MAX {
-                nearest[nidx] = seed;
-                queue.push_back(nidx);
-            }
-        }
+    if texels == 0 {
+        return Err("decode pbr requires non-zero texture size".to_string());
     }
-
-    for idx in 0..texels {
-        if mask[idx] != 0 {
-            continue;
-        }
-        let source = nearest[idx];
-        if source != usize::MAX {
-            base_color_float[idx] = base_color_float[source];
-            metallic_float[idx] = metallic_float[source];
-            roughness_float[idx] = roughness_float[source];
-            alpha_float[idx] = alpha_float[source];
-        } else {
-            base_color_float[idx] = [fallback[0], fallback[1], fallback[2], fallback[5]];
-            metallic_float[idx] = fallback[3];
-            roughness_float[idx] = fallback[4];
-            alpha_float[idx] = fallback[5];
-        }
-        mask[idx] = 255;
+    if mask.iter().all(|value| *value == 0) {
+        return Err("decode pbr requires at least one covered texel".to_string());
     }
+    // Canonical strict behavior: do not perform nearest-neighbor rescue/inpaint for uncovered texels.
+    // Leave untouched texels as-is (alpha stays 0 from initialization), and keep mask for observability.
+    Ok(())
 }
 
 pub(super) fn quantize_unorm8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-pub(super) fn occupancy_target(preprocess: &PreprocessOutput, resolution: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; resolution * resolution * resolution];
-    for z in 0..resolution {
-        let z_norm = z as f32 / (resolution.saturating_sub(1).max(1) as f32);
-        for y in 0..resolution {
-            for x in 0..resolution {
-                let idx = (z * resolution + y) * resolution + x;
-                let luma = sample_pixel_luma(preprocess, x as u32, y as u32, z as u32);
-                let depth_bias = 1.0 - (z_norm - 0.5).abs() * 1.6;
-                out[idx] = (luma * depth_bias).clamp(0.0, 1.0);
-            }
-        }
-    }
-    out
-}
-
-pub(super) fn latent_to_occupancy(latent: &[f32], channels: usize, resolution: usize) -> Vec<f32> {
-    let voxels = resolution * resolution * resolution;
-    let mut occupancy = vec![0.0f32; voxels];
-    for idx in 0..voxels {
-        let mut sum = 0.0f32;
-        for ch in 0..channels {
-            sum += latent[ch * voxels + idx];
-        }
-        occupancy[idx] = sum / channels.max(1) as f32;
-    }
-    // Map to [0, 1] using per-sample dynamic normalization.
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for value in &occupancy {
-        min = min.min(*value);
-        max = max.max(*value);
-    }
-    let denom = (max - min).max(1.0e-6);
-    for value in &mut occupancy {
-        *value = (*value - min) / denom;
-    }
-    occupancy
-}
-
-pub(super) fn upsample_occupancy(input: &[f32], input_res: usize, output_res: usize) -> Vec<f32> {
-    if input_res == output_res {
-        return input.to_vec();
-    }
-    let mut out = vec![0.0f32; output_res * output_res * output_res];
-    for z in 0..output_res {
-        let src_z = z * input_res / output_res;
-        for y in 0..output_res {
-            let src_y = y * input_res / output_res;
-            for x in 0..output_res {
-                let src_x = x * input_res / output_res;
-                let src_idx = (src_z * input_res + src_y) * input_res + src_x;
-                let dst_idx = (z * output_res + y) * output_res + x;
-                out[dst_idx] = input[src_idx];
-            }
-        }
-    }
-    out
-}
-
 #[cfg(feature = "runtime-model")]
+#[allow(dead_code)]
 pub(super) fn occupancy_to_coords(
     occupancy: &[f32],
     resolution: usize,
@@ -1094,11 +1354,6 @@ pub(super) fn occupancy_to_coords(
 }
 
 #[cfg(feature = "runtime-model")]
-pub(super) fn runtime_max_sparse_coords() -> Option<usize> {
-    None
-}
-
-#[cfg(feature = "runtime-model")]
 pub(super) fn map_coord_to_dense_flat(
     coord: [u32; 4],
     sparse_resolution: usize,
@@ -1119,26 +1374,11 @@ pub(super) fn map_coord_to_dense_flat(
     (z * dense_resolution + y) * dense_resolution + x
 }
 
-pub(super) fn sample_pixel_luma(preprocess: &PreprocessOutput, x: u32, y: u32, z: u32) -> f32 {
-    let width = preprocess.width.max(1);
-    let height = preprocess.height.max(1);
-    let xx = (x as usize * width as usize / 32).min(width as usize - 1);
-    let yy = (y as usize * height as usize / 32).min(height as usize - 1);
-    let offset = (yy * width as usize + xx) * 3;
-    let r = preprocess.rgb[offset] as f32 / 255.0;
-    let g = preprocess.rgb[offset + 1] as f32 / 255.0;
-    let b = preprocess.rgb[offset + 2] as f32 / 255.0;
-    let z_mod = 0.9 + 0.2 * ((z as f32 / 31.0) - 0.5);
-    (0.2126 * r + 0.7152 * g + 0.0722 * b) * z_mod
-}
-
 pub(super) fn sparse_resolution_for_pipeline(pipeline_type: &str) -> usize {
     match pipeline_type {
         "512" | "512_base" => 32,
         "1024" | "1024_single" => 64,
-        // Until canonical two-pass cascade is implemented, keep single-pass
-        // 1024_cascade on a 64³ sparse lattice to avoid collapsing detail.
-        "1024_cascade" => 64,
+        "1024_cascade" => 32,
         "1536_cascade" => 32,
         _ => 32,
     }
@@ -1150,39 +1390,5 @@ pub(super) fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
         "1024" | "1024_single" | "1024_cascade" => 1024,
         "1536_cascade" => 1536,
         _ => 512,
-    }
-}
-
-pub(super) fn canonical_cube() -> Mesh {
-    let vertices = vec![
-        [-0.5, -0.5, -0.5],
-        [0.5, -0.5, -0.5],
-        [0.5, 0.5, -0.5],
-        [-0.5, 0.5, -0.5],
-        [-0.5, -0.5, 0.5],
-        [0.5, -0.5, 0.5],
-        [0.5, 0.5, 0.5],
-        [-0.5, 0.5, 0.5],
-    ];
-    let faces = vec![
-        [0, 1, 2],
-        [0, 2, 3],
-        [4, 6, 5],
-        [4, 7, 6],
-        [0, 4, 5],
-        [0, 5, 1],
-        [1, 5, 6],
-        [1, 6, 2],
-        [2, 6, 7],
-        [2, 7, 3],
-        [3, 7, 4],
-        [3, 4, 0],
-    ];
-    Mesh {
-        vertices,
-        faces,
-        uvs: Vec::new(),
-        material: None,
-        pbr_textures: None,
     }
 }

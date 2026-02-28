@@ -15,6 +15,9 @@ pub mod trellis_config;
 pub mod import;
 
 #[cfg(feature = "runtime-model")]
+pub(crate) mod blob_burnpack;
+
+#[cfg(feature = "runtime-model")]
 pub mod runtime_model;
 
 pub use config::{TrellisQuality, TrellisQualitySettings};

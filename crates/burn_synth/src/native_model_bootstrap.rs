@@ -9,8 +9,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
 use burn_synth_import::parts::{BurnpackPartEntry, read_parts_manifest, resolve_part_entry_path};
+#[cfg(feature = "trellis")]
+use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use burn_tripo::paths::resolve_triposg_weights_root;
 use log::{info, warn};
+#[cfg(feature = "trellis")]
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::model_loader::{candidate_burnpack_names, parse_parts_manifest_bytes};
@@ -19,6 +23,10 @@ const DEFAULT_MODEL_BASE_URL: &str = "https://aberration.technology/model";
 const CACHE_MODELS_DIR: &str = ".burn_synth/models";
 const TRIPOSG_DIR: &str = "MIDI-3D";
 const RMBG14_DIR: &str = "RMBG-1.4";
+#[cfg(feature = "trellis")]
+const TRELLIS2_DIR: &str = "TRELLIS.2-4B";
+#[cfg(feature = "trellis")]
+const TRELLIS2_IMAGE_LARGE_DIR: &str = "TRELLIS-image-large";
 const DOWNLOAD_MAX_ATTEMPTS: u32 = 6;
 const DOWNLOAD_RETRY_BASE_DELAY_MS: u64 = 800;
 const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 20;
@@ -46,6 +54,8 @@ const TRIPOSG_REQUIRED_PARTS_BASES: &[&str] = &[
 
 const RMBG14_OPTIONAL_TEXT_RELPATHS: &[&str] = &["config.json"];
 const RMBG14_REQUIRED_PARTS_BASES: &[&str] = &["model.safetensors"];
+#[cfg(feature = "trellis")]
+const TRELLIS2_REQUIRED_TEXT_RELPATHS: &[&str] = &["pipeline.json"];
 
 pub fn set_bootstrap_status_callback(callback: Option<BootstrapStatusCallback>) {
     let lock = BOOTSTRAP_STATUS_CALLBACK.get_or_init(|| Mutex::new(None));
@@ -126,6 +136,131 @@ pub(crate) fn resolve_or_bootstrap_rmbg14_root(prefer_f16: bool) -> Result<PathB
     }
 }
 
+#[cfg(feature = "trellis")]
+pub(crate) fn resolve_or_bootstrap_trellis_roots(
+    prefer_f16: bool,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let cache_root = default_cache_models_root();
+    let weights_root = cache_root.join(TRELLIS2_DIR);
+    let image_large_root = cache_root.join(TRELLIS2_IMAGE_LARGE_DIR);
+    let remote_weights_root = trellis2_remote_root();
+    let remote_image_large_root = trellis2_image_large_remote_root();
+
+    match ensure_trellis_model_ready(
+        &weights_root,
+        &image_large_root,
+        &remote_weights_root,
+        &remote_image_large_root,
+        prefer_f16,
+    ) {
+        Ok(()) => Ok((weights_root, Some(image_large_root))),
+        Err(cache_err) => {
+            let fallback_weights = resolve_trellis2_weights_root(None);
+            let fallback_image_large = resolve_trellis2_image_large_root(None);
+            if fallback_weights.exists() {
+                let fallback_image_large = if fallback_image_large.exists() {
+                    Some(fallback_image_large)
+                } else {
+                    None
+                };
+                warn!(
+                    "Trellis2 cache bootstrap failed ({cache_err}); falling back to {}",
+                    fallback_weights.display()
+                );
+                Ok((fallback_weights, fallback_image_large))
+            } else {
+                Err(cache_err)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "trellis")]
+fn ensure_trellis_model_ready(
+    local_weights_root: &Path,
+    local_image_large_root: &Path,
+    remote_weights_root: &str,
+    remote_image_large_root: &str,
+    prefer_f16: bool,
+) -> Result<(), String> {
+    fs::create_dir_all(local_weights_root).map_err(|err| {
+        format!(
+            "failed to create Trellis2 cache directory {}: {err}",
+            local_weights_root.display()
+        )
+    })?;
+    fs::create_dir_all(local_image_large_root).map_err(|err| {
+        format!(
+            "failed to create Trellis2 image-large cache directory {}: {err}",
+            local_image_large_root.display()
+        )
+    })?;
+
+    for rel in TRELLIS2_REQUIRED_TEXT_RELPATHS {
+        sync_required_text_file(local_weights_root, remote_weights_root, rel, "Trellis2")?;
+    }
+
+    let pipeline_path = local_weights_root.join("pipeline.json");
+    let pipeline_bytes = fs::read(&pipeline_path).map_err(|err| {
+        format!(
+            "failed reading Trellis2 pipeline config {}: {err}",
+            pipeline_path.display()
+        )
+    })?;
+    let requirements =
+        parse_trellis_requirements(&pipeline_bytes).map_err(|err| format!("Trellis2: {err}"))?;
+
+    for rel in &requirements.weights_required_text_relpaths {
+        sync_required_text_file(
+            local_weights_root,
+            remote_weights_root,
+            rel,
+            "Trellis2 model metadata",
+        )?;
+    }
+    for rel in &requirements.image_large_required_text_relpaths {
+        sync_required_text_file(
+            local_image_large_root,
+            remote_image_large_root,
+            rel,
+            "Trellis2 image-large metadata",
+        )?;
+    }
+    for rel in &requirements.weights_optional_text_relpaths {
+        sync_optional_text_file(local_weights_root, remote_weights_root, rel)?;
+    }
+
+    for base in &requirements.weights_required_parts_bases {
+        ensure_parts_bundle(
+            local_weights_root,
+            remote_weights_root,
+            base,
+            prefer_f16,
+            "Trellis2",
+        )?;
+    }
+    for base in &requirements.image_large_required_parts_bases {
+        ensure_parts_bundle(
+            local_image_large_root,
+            remote_image_large_root,
+            base,
+            prefer_f16,
+            "Trellis2-image-large",
+        )?;
+    }
+
+    emit_status(format!(
+        "Trellis2 weights ready under {}",
+        local_weights_root.display()
+    ));
+    emit_status(format!(
+        "Trellis2 image-large weights ready under {}",
+        local_image_large_root.display()
+    ));
+
+    Ok(())
+}
+
 fn ensure_model_ready(
     local_root: &Path,
     remote_root: &str,
@@ -154,6 +289,96 @@ fn ensure_model_ready(
         local_root.display()
     ));
     Ok(())
+}
+
+#[cfg(feature = "trellis")]
+#[derive(Debug, Default)]
+struct TrellisBootstrapRequirements {
+    weights_required_text_relpaths: Vec<String>,
+    weights_optional_text_relpaths: Vec<String>,
+    weights_required_parts_bases: Vec<String>,
+    image_large_required_text_relpaths: Vec<String>,
+    image_large_required_parts_bases: Vec<String>,
+}
+
+#[cfg(feature = "trellis")]
+fn parse_trellis_requirements(
+    pipeline_json_bytes: &[u8],
+) -> Result<TrellisBootstrapRequirements, String> {
+    let pipeline_json: Value = serde_json::from_slice(pipeline_json_bytes)
+        .map_err(|err| format!("failed to parse Trellis2 pipeline.json: {err}"))?;
+    let models = pipeline_json
+        .get("args")
+        .and_then(|value| value.get("models"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "pipeline.json missing args.models".to_string())?;
+
+    let mut requirements = TrellisBootstrapRequirements::default();
+    for value in models.values() {
+        let Some(stem) = value.as_str() else {
+            continue;
+        };
+        if stem.starts_with("ckpts/") {
+            requirements
+                .weights_required_text_relpaths
+                .push(format!("{stem}.json"));
+            requirements
+                .weights_required_parts_bases
+                .push(format!("{stem}.safetensors"));
+            continue;
+        }
+        if let Some((_, suffix)) = stem.split_once("/ckpts/") {
+            let image_large_stem = format!("ckpts/{suffix}");
+            requirements
+                .image_large_required_text_relpaths
+                .push(format!("{image_large_stem}.json"));
+            requirements
+                .image_large_required_parts_bases
+                .push(format!("{image_large_stem}.safetensors"));
+            continue;
+        }
+        requirements
+            .weights_required_text_relpaths
+            .push(format!("{stem}.json"));
+        requirements
+            .weights_required_parts_bases
+            .push(format!("{stem}.safetensors"));
+    }
+
+    if let Some(model_name) = pipeline_json
+        .get("args")
+        .and_then(|value| value.get("image_cond_model"))
+        .and_then(|value| value.get("args"))
+        .and_then(|value| value.get("model_name"))
+        .and_then(Value::as_str)
+    {
+        let model_name = model_name.trim();
+        if !model_name.is_empty() {
+            requirements
+                .weights_optional_text_relpaths
+                .push(format!("{model_name}/config.json"));
+            requirements
+                .weights_required_parts_bases
+                .push(format!("{model_name}/model.safetensors"));
+        }
+    }
+
+    if requirements.weights_required_parts_bases.is_empty() {
+        return Err("pipeline.json has no models in args.models".to_string());
+    }
+
+    sort_dedup(&mut requirements.weights_required_text_relpaths);
+    sort_dedup(&mut requirements.weights_optional_text_relpaths);
+    sort_dedup(&mut requirements.weights_required_parts_bases);
+    sort_dedup(&mut requirements.image_large_required_text_relpaths);
+    sort_dedup(&mut requirements.image_large_required_parts_bases);
+    Ok(requirements)
+}
+
+#[cfg(feature = "trellis")]
+fn sort_dedup(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
 }
 
 fn ensure_triposg_metadata_aliases(local_root: &Path) -> Result<(), String> {
@@ -315,6 +540,29 @@ fn sync_optional_text_file(
     };
     write_file_atomically(&local_path, &bytes)?;
     emit_status(format!("Downloaded model metadata {url}"));
+    Ok(())
+}
+
+#[cfg(feature = "trellis")]
+fn sync_required_text_file(
+    local_root: &Path,
+    remote_root: &str,
+    rel_path: &str,
+    label: &str,
+) -> Result<(), String> {
+    let local_path = local_root.join(rel_path);
+    if local_path.exists() {
+        return Ok(());
+    }
+
+    let url = join_url(remote_root, rel_path);
+    let Some(bytes) = download_optional_bytes(&url)? else {
+        return Err(format!(
+            "required {label} file is missing from remote root: {url}"
+        ));
+    };
+    write_file_atomically(&local_path, &bytes)?;
+    emit_status(format!("Downloaded required model metadata {url}"));
     Ok(())
 }
 
@@ -771,6 +1019,23 @@ fn rmbg14_remote_root() -> String {
         .unwrap_or_else(|| format!("{}/{}", model_base_url(), RMBG14_DIR))
 }
 
+#[cfg(feature = "trellis")]
+fn trellis2_remote_root() -> String {
+    option_env!("TRELLIS2_WEIGHTS_REMOTE_ROOT")
+        .or(option_env!("TRELLIS2_REMOTE_ROOT"))
+        .or(option_env!("TRELLIS2_WEIGHTS_ROOT"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}/{}", model_base_url(), TRELLIS2_DIR))
+}
+
+#[cfg(feature = "trellis")]
+fn trellis2_image_large_remote_root() -> String {
+    option_env!("TRELLIS2_IMAGE_LARGE_REMOTE_ROOT")
+        .or(option_env!("TRELLIS2_IMAGE_LARGE_ROOT"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}/{}", model_base_url(), TRELLIS2_IMAGE_LARGE_DIR))
+}
+
 fn model_base_url() -> String {
     option_env!("MODEL_BASE_URL")
         .unwrap_or(DEFAULT_MODEL_BASE_URL)
@@ -816,6 +1081,8 @@ mod tests {
 
     use burn_synth_import::parts::{BurnpackPartEntry, BurnpackPartsManifest};
 
+    #[cfg(feature = "trellis")]
+    use super::parse_trellis_requirements;
     use super::{manifest_is_complete, resolve_manifest_entry_url};
 
     fn unique_tmp_dir() -> PathBuf {
@@ -877,5 +1144,60 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[cfg(feature = "trellis")]
+    #[test]
+    fn parse_trellis_requirements_routes_stems_and_image_cond() {
+        let pipeline = serde_json::json!({
+            "args": {
+                "models": {
+                    "sparse": "ckpts/ss_flow_img_dit_1_3B_64_bf16",
+                    "shape_decoder": "TRELLIS-image-large/ckpts/shape_dec_next_dc_f16c32_fp16",
+                    "texture_decoder": "TRELLIS-image-large/ckpts/tex_dec_next_dc_f16c32_fp16"
+                },
+                "image_cond_model": {
+                    "args": {
+                        "model_name": "facebook/dinov3-vitl16-pretrain-lvd1689m"
+                    }
+                }
+            }
+        });
+
+        let requirements = parse_trellis_requirements(
+            serde_json::to_vec(&pipeline).expect("serialize").as_slice(),
+        )
+        .expect("parse requirements");
+
+        assert!(
+            requirements
+                .weights_required_parts_bases
+                .contains(&"ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors".to_string()),
+            "expected sparse flow to resolve under TRELLIS.2-4B"
+        );
+        assert!(
+            requirements
+                .image_large_required_parts_bases
+                .contains(&"ckpts/shape_dec_next_dc_f16c32_fp16.safetensors".to_string()),
+            "expected shape decoder to resolve under TRELLIS-image-large"
+        );
+        assert!(
+            requirements
+                .image_large_required_parts_bases
+                .contains(&"ckpts/tex_dec_next_dc_f16c32_fp16.safetensors".to_string()),
+            "expected texture decoder to resolve under TRELLIS-image-large"
+        );
+        assert!(
+            requirements.weights_required_parts_bases.contains(
+                &"facebook/dinov3-vitl16-pretrain-lvd1689m/model.safetensors".to_string()
+            ),
+            "expected image-conditioning DINO weights to be required under TRELLIS.2-4B"
+        );
+        assert!(
+            requirements
+                .weights_optional_text_relpaths
+                .contains(&"facebook/dinov3-vitl16-pretrain-lvd1689m/config.json".to_string()),
+            "expected image-conditioning config metadata to be tracked"
+        );
     }
 }

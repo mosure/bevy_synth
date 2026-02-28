@@ -95,6 +95,9 @@ pub struct TrellisRunOptions {
     pub hook_output: Option<PathBuf>,
     pub noise_overrides_hook: Option<PathBuf>,
     pub max_sparse_coords: Option<usize>,
+    pub runtime_stage_debug: bool,
+    pub runtime_attention_debug: bool,
+    pub runtime_decoder_conv_telemetry: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -358,6 +361,10 @@ impl Trellis2Pipeline {
                 options.hook_output.is_some(),
                 TrellisStageRunConfig {
                     max_sparse_coords: options.max_sparse_coords,
+                    max_num_tokens: None,
+                    runtime_stage_debug: options.runtime_stage_debug,
+                    runtime_attention_debug: options.runtime_attention_debug,
+                    runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
                 },
             )
             .map_err(|err| {
@@ -444,6 +451,10 @@ impl Trellis2Pipeline {
                 options.hook_output.is_some(),
                 TrellisStageRunConfig {
                     max_sparse_coords: options.max_sparse_coords,
+                    max_num_tokens: None,
+                    runtime_stage_debug: options.runtime_stage_debug,
+                    runtime_attention_debug: options.runtime_attention_debug,
+                    runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
                 },
             )
             .map_err(|err| {
@@ -730,26 +741,54 @@ impl Trellis2Pipeline {
 
             let cond_channels = 1024usize;
             let cond_512_tokens = 32usize * 32usize + 5usize;
-            let cond = build_synthetic_cond_trace(preprocess, cond_512_tokens, cond_channels);
+            let cond_512_expected = cond_512_tokens * cond_channels;
+            if stage_output.conditioning.cond_512.len() != cond_512_expected {
+                return Err(TrellisRuntimeError::new(format!(
+                    "runtime conditioning 'get_cond_512.out.cond' has {} values, expected {}",
+                    stage_output.conditioning.cond_512.len(),
+                    cond_512_expected
+                )));
+            }
             let (cond_shape, cond_values) = sample_dense_f32_for_hook(
                 &[1usize, cond_512_tokens, cond_channels],
-                cond.as_slice(),
+                stage_output.conditioning.cond_512.as_slice(),
             );
             trace
                 .insert_f32("get_cond_512.out.cond", cond_shape.clone(), cond_values)
                 .map_err(TrellisRuntimeError::new)?;
-            let neg_cond = vec![0.0f32; cond_512_tokens * cond_channels];
+            if stage_output.conditioning.neg_cond_512.len() != cond_512_expected {
+                return Err(TrellisRuntimeError::new(format!(
+                    "runtime conditioning 'get_cond_512.out.neg_cond' has {} values, expected {}",
+                    stage_output.conditioning.neg_cond_512.len(),
+                    cond_512_expected
+                )));
+            }
             let (neg_cond_shape, neg_cond_values) = sample_dense_f32_for_hook(
                 &[1usize, cond_512_tokens, cond_channels],
-                neg_cond.as_slice(),
+                stage_output.conditioning.neg_cond_512.as_slice(),
             );
             trace
                 .insert_f32("get_cond_512.out.neg_cond", neg_cond_shape, neg_cond_values)
                 .map_err(TrellisRuntimeError::new)?;
             if pipeline_type != "512" && pipeline_type != "512_base" {
                 let cond_1024_tokens = 64usize * 64usize + 5usize;
-                let cond_1024 =
-                    build_synthetic_cond_trace(preprocess, cond_1024_tokens, cond_channels);
+                let cond_1024_expected = cond_1024_tokens * cond_channels;
+                let cond_1024 = stage_output
+                    .conditioning
+                    .cond_1024
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TrellisRuntimeError::new(
+                            "runtime conditioning missing 'get_cond_1024.out.cond'".to_string(),
+                        )
+                    })?;
+                if cond_1024.len() != cond_1024_expected {
+                    return Err(TrellisRuntimeError::new(format!(
+                        "runtime conditioning 'get_cond_1024.out.cond' has {} values, expected {}",
+                        cond_1024.len(),
+                        cond_1024_expected
+                    )));
+                }
                 let (cond_1024_shape, cond_1024_values) = sample_dense_f32_for_hook(
                     &[1usize, cond_1024_tokens, cond_channels],
                     cond_1024.as_slice(),
@@ -761,7 +800,22 @@ impl Trellis2Pipeline {
                         cond_1024_values,
                     )
                     .map_err(TrellisRuntimeError::new)?;
-                let neg_cond_1024 = vec![0.0f32; cond_1024_tokens * cond_channels];
+                let neg_cond_1024 = stage_output
+                    .conditioning
+                    .neg_cond_1024
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TrellisRuntimeError::new(
+                            "runtime conditioning missing 'get_cond_1024.out.neg_cond'".to_string(),
+                        )
+                    })?;
+                if neg_cond_1024.len() != cond_1024_expected {
+                    return Err(TrellisRuntimeError::new(format!(
+                        "runtime conditioning 'get_cond_1024.out.neg_cond' has {} values, expected {}",
+                        neg_cond_1024.len(),
+                        cond_1024_expected
+                    )));
+                }
                 let (neg_cond_1024_shape, neg_cond_1024_values) = sample_dense_f32_for_hook(
                     &[1usize, cond_1024_tokens, cond_channels],
                     neg_cond_1024.as_slice(),
@@ -1709,72 +1763,6 @@ fn remap_mesh_to_python_glb_frame(mesh: &mut Mesh) {
         let [x, y, z] = *vertex;
         *vertex = [x, z, -y];
     }
-}
-
-fn build_synthetic_cond_trace(
-    preprocess: &PreprocessOutput,
-    tokens: usize,
-    cond_channels: usize,
-) -> Vec<f32> {
-    if preprocess.rgb.is_empty() {
-        return vec![0.0; tokens * cond_channels];
-    }
-    let patch_side = (tokens as f32).sqrt().floor().max(1.0) as usize;
-    let patch_tokens = (patch_side * patch_side).min(tokens);
-    let extra_tokens = tokens.saturating_sub(patch_tokens);
-    let width = preprocess.width.max(1) as usize;
-    let height = preprocess.height.max(1) as usize;
-    let mut out = Vec::with_capacity(tokens * cond_channels);
-    for token_idx in 0..tokens {
-        let (x, y, extra_scale) = if token_idx < patch_tokens {
-            let x = token_idx % patch_side;
-            let y = token_idx / patch_side;
-            (x, y, 0.0f32)
-        } else {
-            let extra_idx = token_idx - patch_tokens;
-            let x = width / 2;
-            let y = height / 2;
-            let scale = if extra_tokens > 0 {
-                extra_idx as f32 / extra_tokens as f32
-            } else {
-                0.0
-            };
-            (x, y, scale)
-        };
-        let xx = if token_idx < patch_tokens {
-            (x * width / patch_side).min(width - 1)
-        } else {
-            x.min(width - 1)
-        };
-        let yy = if token_idx < patch_tokens {
-            (y * height / patch_side).min(height - 1)
-        } else {
-            y.min(height - 1)
-        };
-        let offset = (yy * width + xx) * 3;
-        let r = preprocess.rgb[offset] as f32 / 255.0;
-        let g = preprocess.rgb[offset + 1] as f32 / 255.0;
-        let b = preprocess.rgb[offset + 2] as f32 / 255.0;
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let nx = if patch_side > 1 {
-            x as f32 / (patch_side as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let ny = if patch_side > 1 {
-            y as f32 / (patch_side as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let basis = [r, g, b, luma, nx, ny, extra_scale];
-        for channel in 0..cond_channels {
-            let base = basis[channel % basis.len()];
-            let gain = 1.0 + ((channel / basis.len()) % 17) as f32 / 17.0;
-            let phase = ((token_idx + channel + 1) as f32 * 0.013).sin();
-            out.push((base * gain + 0.1 * phase).clamp(-1.0, 1.0));
-        }
-    }
-    out
 }
 
 fn insert_sampler_hook_config(
