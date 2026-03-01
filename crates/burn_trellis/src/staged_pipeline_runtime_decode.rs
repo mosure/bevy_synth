@@ -214,6 +214,10 @@ fn decode_latent_with_runtime_decoders(
         shape_features_wgpu.is_some(),
         tex_features_wgpu.is_some(),
     );
+    #[cfg(feature = "runtime-model-wgpu")]
+    let decode_stage_fenced = !using_device_decode_inputs || runtime_stage_fence_enabled();
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let decode_stage_fenced = true;
     let shape_coord_rows = if !shape.coords.is_empty() {
         shape.coords.len()
     } else {
@@ -404,7 +408,10 @@ fn decode_latent_with_runtime_decoders(
         }
     };
     #[cfg(feature = "runtime-model-wgpu")]
-    runtime_decode_stage_boundary_sync("shape_decoder", using_device_decode_inputs)?;
+    runtime_decode_stage_boundary_sync(
+        "shape_decoder",
+        using_device_decode_inputs && decode_stage_fenced,
+    )?;
     let shape_decoder_ms = shape_decode_start.elapsed().as_secs_f64() * 1000.0;
     trellis_stage_log!(
         "burn_trellis: stage decode.shape_decoder complete ({shape_decoder_ms:.2} ms, subs={}, coords={})",
@@ -542,7 +549,10 @@ fn decode_latent_with_runtime_decoders(
         }
     };
     #[cfg(feature = "runtime-model-wgpu")]
-    runtime_decode_stage_boundary_sync("tex_decoder", using_device_decode_inputs)?;
+    runtime_decode_stage_boundary_sync(
+        "tex_decoder",
+        using_device_decode_inputs && decode_stage_fenced,
+    )?;
     let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
     trellis_stage_log!(
         "burn_trellis: stage decode.tex_decoder complete ({tex_decoder_ms:.2} ms, coords={})",
@@ -743,6 +753,7 @@ fn decode_latent_with_runtime_decoders(
         },
         pbr: pbr_debug,
         timings: DecodeRuntimeTimings {
+            stage_fenced: decode_stage_fenced,
             shape_decoder_ms,
             tex_decoder_ms,
             attr_merge_ms,

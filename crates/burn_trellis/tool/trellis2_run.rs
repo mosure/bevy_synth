@@ -158,6 +158,7 @@ fn run() -> Result<(), String> {
             runtime_stage_debug: args.runtime_stage_debug,
             runtime_attention_debug: args.runtime_attention_debug,
             runtime_decoder_conv_telemetry: args.runtime_decoder_conv_telemetry,
+            runtime_stage_fence: args.strict_benchmark,
         };
         let profiled = pipeline
             .infer_mesh_profile(&args.input, &options)
@@ -244,6 +245,7 @@ fn run() -> Result<(), String> {
             "shape_slat": profiled.timings.shape_slat_ms,
             "tex_slat": profiled.timings.tex_slat_ms,
             "decode": profiled.timings.decode_ms,
+            "decode_stage_fenced": profiled.timings.decode_stage_fenced,
             "decode_shape_decoder": profiled.timings.decode_shape_decoder_ms,
             "decode_tex_decoder": profiled.timings.decode_tex_decoder_ms,
             "decode_attr_merge": profiled.timings.decode_attr_merge_ms,

@@ -98,6 +98,7 @@ pub struct TrellisRunOptions {
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
+    pub runtime_stage_fence: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +118,7 @@ pub struct TrellisPipelineTimings {
     pub shape_slat_ms: f64,
     pub tex_slat_ms: f64,
     pub decode_ms: f64,
+    pub decode_stage_fenced: bool,
     pub decode_shape_decoder_ms: f64,
     pub decode_tex_decoder_ms: f64,
     pub decode_attr_merge_ms: f64,
@@ -365,6 +367,7 @@ impl Trellis2Pipeline {
                     runtime_stage_debug: options.runtime_stage_debug,
                     runtime_attention_debug: options.runtime_attention_debug,
                     runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
+                    runtime_stage_fence: options.runtime_stage_fence,
                 },
             )
             .map_err(|err| {
@@ -390,6 +393,7 @@ impl Trellis2Pipeline {
             shape_slat_ms: stage_timings.shape_slat_ms,
             tex_slat_ms: stage_timings.tex_slat_ms,
             decode_ms: stage_timings.decode_ms,
+            decode_stage_fenced: stage_timings.decode_stage_fenced,
             decode_shape_decoder_ms: stage_timings.decode_shape_decoder_ms,
             decode_tex_decoder_ms: stage_timings.decode_tex_decoder_ms,
             decode_attr_merge_ms: stage_timings.decode_attr_merge_ms,
@@ -455,6 +459,7 @@ impl Trellis2Pipeline {
                     runtime_stage_debug: options.runtime_stage_debug,
                     runtime_attention_debug: options.runtime_attention_debug,
                     runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
+                    runtime_stage_fence: options.runtime_stage_fence,
                 },
             )
             .map_err(|err| {

@@ -982,7 +982,6 @@ impl<B: Backend> MultiHeadRmsNorm<B> {
         };
         x.mul(gamma)
     }
-
 }
 
 #[derive(Module, Debug)]
@@ -1127,7 +1126,6 @@ impl<B: Backend> FeedForwardNet<B> {
         }
         Tensor::cat(chunks, 0).reshape([batch, tokens, channels])
     }
-
 }
 
 #[derive(Module, Debug)]
@@ -1752,7 +1750,6 @@ where
 
         Tensor::cat(out_chunks, 1)
     }
-
 }
 
 impl<B: Backend> CrossAttention<B> {
@@ -1975,7 +1972,6 @@ impl<B: Backend> CrossAttention<B> {
 
         Tensor::cat(out_chunks, 1)
     }
-
 }
 
 impl<B: Backend> ModulatedTransformerCrossBlock<B>
@@ -2130,7 +2126,6 @@ where
         let h = h.mul(gate_mlp);
         x.add(h)
     }
-
 }
 
 impl<B: Backend> SparseStructureFlowModel<B>

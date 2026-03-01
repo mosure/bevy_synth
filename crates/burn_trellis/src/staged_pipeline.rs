@@ -64,6 +64,7 @@ use staged_pipeline_decode::*;
 static STAGE_LOG_EPOCH: OnceLock<Instant> = OnceLock::new();
 static RUNTIME_STAGE_DEBUG: AtomicBool = AtomicBool::new(false);
 static RUNTIME_DECODER_CONV_TELEMETRY: AtomicBool = AtomicBool::new(false);
+static RUNTIME_STAGE_FENCE: AtomicBool = AtomicBool::new(false);
 
 fn stage_log_timestamp() -> String {
     let elapsed = STAGE_LOG_EPOCH
@@ -81,10 +82,16 @@ fn set_runtime_debug_toggles(run_config: TrellisStageRunConfig) {
     RUNTIME_STAGE_DEBUG.store(run_config.runtime_stage_debug, Ordering::Relaxed);
     RUNTIME_DECODER_CONV_TELEMETRY
         .store(run_config.runtime_decoder_conv_telemetry, Ordering::Relaxed);
+    RUNTIME_STAGE_FENCE.store(run_config.runtime_stage_fence, Ordering::Relaxed);
 }
 
 fn runtime_stage_debug_enabled() -> bool {
     RUNTIME_STAGE_DEBUG.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "runtime-model")]
+fn runtime_stage_fence_enabled() -> bool {
+    RUNTIME_STAGE_FENCE.load(Ordering::Relaxed)
 }
 
 #[cfg(feature = "runtime-model")]
@@ -284,6 +291,7 @@ struct DecodedLatentOutput {
 
 #[derive(Debug, Clone, Default)]
 struct DecodeRuntimeTimings {
+    stage_fenced: bool,
     shape_decoder_ms: f64,
     tex_decoder_ms: f64,
     attr_merge_ms: f64,
@@ -328,6 +336,7 @@ pub struct TrellisStageTimings {
     pub shape_slat_ms: f64,
     pub tex_slat_ms: f64,
     pub decode_ms: f64,
+    pub decode_stage_fenced: bool,
     pub decode_shape_decoder_ms: f64,
     pub decode_tex_decoder_ms: f64,
     pub decode_attr_merge_ms: f64,
@@ -355,6 +364,7 @@ pub struct TrellisStageRunConfig {
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
+    pub runtime_stage_fence: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1562,7 +1572,14 @@ impl TrellisStageRuntime {
             decoded.timings.shape_wgpu_dispatches > 0 || decoded.timings.tex_wgpu_dispatches > 0;
         #[cfg(not(feature = "runtime-model-wgpu"))]
         let decode_uses_wgpu_dispatch = false;
-        runtime_pipeline_stage_boundary_sync("decode_complete", decode_uses_wgpu_dispatch)?;
+        #[cfg(feature = "runtime-model")]
+        let decode_stage_fence_enabled = runtime_stage_fence_enabled();
+        #[cfg(not(feature = "runtime-model"))]
+        let decode_stage_fence_enabled = false;
+        runtime_pipeline_stage_boundary_sync(
+            "decode_complete",
+            decode_uses_wgpu_dispatch && decode_stage_fence_enabled,
+        )?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         trellis_stage_log!(
             "burn_trellis: stage decode complete ({decode_ms:.2} ms, vertices={}, faces={})",
@@ -1591,6 +1608,7 @@ impl TrellisStageRuntime {
             shape_slat_ms,
             tex_slat_ms,
             decode_ms,
+            decode_stage_fenced: decoded.timings.stage_fenced,
             decode_shape_decoder_ms: decoded.timings.shape_decoder_ms,
             decode_tex_decoder_ms: decoded.timings.tex_decoder_ms,
             decode_attr_merge_ms: decoded.timings.attr_merge_ms,

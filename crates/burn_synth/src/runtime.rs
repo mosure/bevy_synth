@@ -766,6 +766,7 @@ impl SynthRuntime {
             runtime_stage_debug: false,
             runtime_attention_debug: false,
             runtime_decoder_conv_telemetry: false,
+            runtime_stage_fence: false,
         };
         progress.stage_started(
             "trellis.infer",

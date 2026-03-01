@@ -273,6 +273,7 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 runtime_stage_debug: false,
                 runtime_attention_debug: false,
                 runtime_decoder_conv_telemetry: false,
+                runtime_stage_fence: strict,
             },
         )
     })) {
