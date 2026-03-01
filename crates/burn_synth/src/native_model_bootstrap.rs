@@ -521,7 +521,15 @@ fn part_matches_cache(path: &Path, part: &BurnpackPartEntry) -> Result<bool, Str
     let bytes = fs::metadata(path)
         .map_err(|err| format!("failed to read part metadata {}: {err}", path.display()))?
         .len();
-    Ok(bytes == part.bytes)
+    if bytes != part.bytes {
+        return Ok(false);
+    }
+    let expected_sha = part.sha256.trim();
+    if expected_sha.is_empty() {
+        return Ok(true);
+    }
+    let actual_sha = sha256_file(path)?;
+    Ok(actual_sha.eq_ignore_ascii_case(expected_sha))
 }
 
 fn sync_optional_text_file(

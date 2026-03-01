@@ -632,33 +632,6 @@ impl NeighborTensorConfigKey {
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
-fn repeat_interleave_channels_wgpu(
-    feats_t: Tensor<DefaultWgpuBackend, 2>,
-    repeat_factor: usize,
-) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
-    if repeat_factor == 0 {
-        return Err("repeat_factor must be > 0".to_string());
-    }
-    if repeat_factor == 1 {
-        return Ok(feats_t);
-    }
-    let [rows, in_channels] = feats_t.dims();
-    let out_channels = in_channels
-        .checked_mul(repeat_factor)
-        .ok_or_else(|| "repeat_interleave channel count overflow".to_string())?;
-    if rows == 0 || in_channels == 0 {
-        return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
-            [rows, out_channels],
-            &feats_t.device(),
-        ));
-    }
-    Ok(feats_t
-        .unsqueeze_dim::<3>(2)
-        .expand([rows as i64, in_channels as i64, repeat_factor as i64])
-        .reshape([rows, out_channels]))
-}
-
-#[cfg(feature = "runtime-model-wgpu")]
 fn quantize_f16_tensor_wgpu(
     tensor: Tensor<DefaultWgpuBackend, 2>,
 ) -> Tensor<DefaultWgpuBackend, 2> {
@@ -974,7 +947,9 @@ fn decoder_wgpu_device_math_allow_fp16() -> bool {
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_device_math_max_state_bytes() -> usize {
-    512 * 1024 * 1024
+    // Canonical WGPU decoder path is bounded by tensor addressability; per-dispatch
+    // limits are enforced by sparse-conv chunking (`decoder_wgpu_max_output_bytes`).
+    decoder_wgpu_max_tensor_bytes()
 }
 
 fn flex_config_for_layer(layer: &SparseConvLayer) -> FlexConvConfig {
@@ -1414,7 +1389,10 @@ fn decoder_wgpu_max_tensor_bytes() -> usize {
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_wgpu_max_input_bytes() -> usize {
-    1024 * 1024 * 1024
+    // Input tensors use the same addressability constraints as outputs on the
+    // canonical WGPU path; a lower fixed cap causes false-positive aborts in
+    // high-row decode stages that are otherwise chunk-safe.
+    decoder_wgpu_max_tensor_bytes()
 }
 
 #[cfg(feature = "runtime-model-wgpu")]

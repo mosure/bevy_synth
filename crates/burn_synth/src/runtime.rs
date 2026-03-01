@@ -11,7 +11,6 @@ use burn_foreground::pipeline::{
 };
 use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
-#[cfg(target_arch = "wasm32")]
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 #[cfg(feature = "trellis")]
@@ -763,6 +762,7 @@ impl SynthRuntime {
             hook_output: None,
             noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
             max_sparse_coords: self.config.trellis_max_sparse_coords,
+            target_faces: self.config.target_faces,
             runtime_stage_debug: false,
             runtime_attention_debug: false,
             runtime_decoder_conv_telemetry: false,
@@ -785,7 +785,6 @@ impl SynthRuntime {
             trellis_device,
             profiled.sparse_source.as_str(),
             profiled.decode_source.as_str(),
-            profiled.decode_source.is_fallback(),
         ) {
             let _ = std::fs::remove_file(&temp_input);
             return Err(err);
@@ -867,13 +866,62 @@ impl SynthRuntime {
                     self.config.bg_weights_root.as_deref(),
                     selected_model,
                 )?;
-                let pipeline = self.foreground.ensure_rmbg14(&root)?;
-                let prepared =
-                    prepare_image_data(input_path, Some(pipeline), &self.config.foreground_prepare)
+                match self.config.backend {
+                    InferenceBackend::Cpu => {
+                        let pipeline = self.foreground.ensure_rmbg14(&root)?;
+                        let prepared = prepare_image_data(
+                            input_path,
+                            Some(pipeline),
+                            &self.config.foreground_prepare,
+                        )
                         .map_err(|err| RuntimeError::new(format!("RMBG-1.4 failed: {err}")))?;
-                prepared
-                    .alpha_mask
-                    .ok_or_else(|| RuntimeError::new("RMBG-1.4 did not produce an alpha mask"))
+                        prepared.alpha_mask.ok_or_else(|| {
+                            RuntimeError::new("RMBG-1.4 did not produce an alpha mask")
+                        })
+                    }
+                    InferenceBackend::Wgpu => {
+                        #[cfg(feature = "wgpu")]
+                        {
+                            let pipeline = self.foreground.ensure_rmbg14_wgpu(&root)?;
+                            let prepared = prepare_image_data(
+                                input_path,
+                                Some(pipeline),
+                                &self.config.foreground_prepare,
+                            )
+                            .map_err(|err| RuntimeError::new(format!("RMBG-1.4 failed: {err}")))?;
+                            prepared.alpha_mask.ok_or_else(|| {
+                                RuntimeError::new("RMBG-1.4 did not produce an alpha mask")
+                            })
+                        }
+                        #[cfg(not(feature = "wgpu"))]
+                        {
+                            Err(RuntimeError::new(
+                                "wgpu backend not enabled; build with burn_synth feature `wgpu`",
+                            ))
+                        }
+                    }
+                    InferenceBackend::Cuda => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            let pipeline = self.foreground.ensure_rmbg14_cuda(&root)?;
+                            let prepared = prepare_image_data(
+                                input_path,
+                                Some(pipeline),
+                                &self.config.foreground_prepare,
+                            )
+                            .map_err(|err| RuntimeError::new(format!("RMBG-1.4 failed: {err}")))?;
+                            prepared.alpha_mask.ok_or_else(|| {
+                                RuntimeError::new("RMBG-1.4 did not produce an alpha mask")
+                            })
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            Err(RuntimeError::new(
+                                "cuda backend not enabled; build with burn_synth feature `cuda`",
+                            ))
+                        }
+                    }
+                }
             }
             ForegroundModel::Rmbg2 => {
                 let root = resolve_foreground_weights_root(
@@ -1285,7 +1333,6 @@ fn validate_trellis_runtime_sources(
     requested_device: TrellisDevice,
     sparse_source: &str,
     decode_source: &str,
-    decode_fallback: bool,
 ) -> RuntimeResult<()> {
     if sparse_source == "synthetic" {
         return Err(RuntimeError::new(format!(
@@ -1303,7 +1350,7 @@ fn validate_trellis_runtime_sources(
         )));
     }
 
-    if decode_fallback {
+    if decode_source != "runtime" {
         return Err(RuntimeError::new(format!(
             "Trellis2 runtime entered decode fallback path (requested_device={}, sparse_source={}, decode_source={}); refusing degraded output.",
             requested_device.as_str(),
@@ -1590,14 +1637,29 @@ fn resolve_foreground_weights_root(
 fn resolve_rmbg14_runtime_weights_root() -> RuntimeResult<PathBuf> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        resolve_or_bootstrap_rmbg14_root(true)
-            .map_err(|err| RuntimeError::new(format!("failed to prepare RMBG-1.4 cache: {err}")))
+        // Keep RMBG-1.4 bootstrap on f32 artifacts for runtime stability: current
+        // burn foreground inference paths use f32 backends and can fail or diverge
+        // with cache roots that only contain f16 part shards.
+        let cache_root = resolve_or_bootstrap_rmbg14_root(false)
+            .map_err(|err| RuntimeError::new(format!("failed to prepare RMBG-1.4 cache: {err}")))?;
+        if rmbg14_root_has_full_burnpack(cache_root.as_path()) {
+            return Ok(cache_root);
+        }
+        let fallback = resolve_rmbg_weights_root();
+        if rmbg14_root_has_full_burnpack(fallback.as_path()) {
+            return Ok(fallback);
+        }
+        Ok(cache_root)
     }
 
     #[cfg(target_arch = "wasm32")]
     {
         Ok(resolve_rmbg_weights_root())
     }
+}
+
+fn rmbg14_root_has_full_burnpack(root: &Path) -> bool {
+    root.join("model.bpk").exists() || root.join("model_f16.bpk").exists()
 }
 
 fn normalize_foreground_root(path: &Path, model: ForegroundModel) -> Option<PathBuf> {
@@ -1827,9 +1889,8 @@ mod tests {
     #[cfg(feature = "trellis")]
     #[test]
     fn trellis_runtime_source_validation_rejects_synthetic_sparse() {
-        let err =
-            validate_trellis_runtime_sources(TrellisDevice::Wgpu, "synthetic", "runtime", false)
-                .expect_err("synthetic sparse source must fail fast");
+        let err = validate_trellis_runtime_sources(TrellisDevice::Wgpu, "synthetic", "runtime")
+            .expect_err("synthetic sparse source must fail fast");
         assert!(
             err.to_string().contains("synthetic sparse fallback"),
             "unexpected error: {err}"
@@ -1843,7 +1904,6 @@ mod tests {
             TrellisDevice::Wgpu,
             "runtime_model_wgpu",
             "fallback_runtime_error",
-            true,
         )
         .expect_err("decode fallback source must fail fast");
         assert!(
@@ -1855,13 +1915,8 @@ mod tests {
     #[cfg(feature = "trellis")]
     #[test]
     fn trellis_runtime_source_validation_accepts_runtime_wgpu() {
-        validate_trellis_runtime_sources(
-            TrellisDevice::Wgpu,
-            "runtime_model_wgpu",
-            "runtime",
-            false,
-        )
-        .expect("runtime wgpu sources should be accepted");
+        validate_trellis_runtime_sources(TrellisDevice::Wgpu, "runtime_model_wgpu", "runtime")
+            .expect("runtime wgpu sources should be accepted");
     }
 
     #[test]

@@ -18,6 +18,7 @@ fn decode_latent_to_outputs(
     tex: &TexSLatSample,
     pipeline_type: &str,
     final_resolution_override: Option<usize>,
+    target_faces: Option<usize>,
     parity_strict: bool,
     capture_debug_artifacts: bool,
     decode_overrides: DecodeHookOverrides<'_>,
@@ -55,6 +56,7 @@ fn decode_latent_to_outputs(
                 pipeline_type,
                 final_resolution: final_resolution_override
                     .unwrap_or_else(|| final_resolution_for_pipeline(pipeline_type)),
+                target_faces,
                 parity_strict,
                 capture_debug_artifacts,
                 shape_decoder,
@@ -74,6 +76,7 @@ fn decode_latent_to_outputs(
             tex,
             pipeline_type,
             final_resolution_override,
+            target_faces,
             parity_strict,
             capture_debug_artifacts,
             decode_overrides,
@@ -169,10 +172,90 @@ fn sanitize_mesh_geometry(vertices: MeshVertices, faces: MeshFaces) -> MeshSanit
     )
 }
 
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn decimate_mesh_for_face_budget(
+    vertices: &mut Vec<[f32; 3]>,
+    faces: &mut Vec<[u32; 3]>,
+    target_faces: usize,
+) -> Result<(), String> {
+    if target_faces == 0 || faces.len() <= target_faces || faces.is_empty() || vertices.is_empty() {
+        return Ok(());
+    }
+
+    let mut indices = Vec::with_capacity(faces.len() * 3);
+    for face in faces.iter() {
+        indices.push(face[0]);
+        indices.push(face[1]);
+        indices.push(face[2]);
+    }
+    let target_index_count = (target_faces.saturating_mul(3)).min(indices.len());
+    if target_index_count < 3 {
+        return Err("target face count too small for runtime decimation".to_string());
+    }
+
+    let vertices_bytes = meshopt::typed_to_bytes(vertices.as_slice());
+    let adapter = meshopt::VertexDataAdapter::new(
+        vertices_bytes,
+        std::mem::size_of::<[f32; 3]>(),
+        0,
+    )
+    .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
+
+    let mut result_error = 0.0f32;
+    let mut simplified = Vec::<u32>::new();
+    for error_limit in [0.02f32, 0.05, 0.1, 0.25, 0.5, 1.0] {
+        let mut stage_error = 0.0f32;
+        let candidate = meshopt::simplify(
+            &indices,
+            &adapter,
+            target_index_count,
+            error_limit,
+            meshopt::SimplifyOptions::None,
+            Some(&mut stage_error),
+        );
+        if candidate.len() < 3 {
+            continue;
+        }
+        result_error = stage_error;
+        simplified = candidate;
+        if simplified.len() <= target_index_count {
+            break;
+        }
+    }
+    if simplified.len() > target_index_count {
+        simplified = meshopt::simplify_sloppy(
+            &indices,
+            &adapter,
+            target_index_count,
+            result_error.max(0.25),
+            None,
+        );
+    }
+    if simplified.len() < 3 {
+        return Err("meshopt simplification produced empty mesh".to_string());
+    }
+
+    let (vertex_count, remap) = meshopt::generate_vertex_remap(vertices.as_slice(), Some(&simplified));
+    let remapped_vertices = meshopt::remap_vertex_buffer(vertices.as_slice(), vertex_count, &remap);
+    let remapped_indices = meshopt::remap_index_buffer(Some(&simplified), vertex_count, &remap);
+    if remapped_indices.len() < 3 {
+        return Err("meshopt remap produced empty mesh".to_string());
+    }
+    let remapped_faces = remapped_indices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        .collect::<Vec<[u32; 3]>>();
+
+    *vertices = remapped_vertices;
+    *faces = remapped_faces;
+    Ok(())
+}
+
 #[cfg(feature = "runtime-model")]
 struct RuntimeDecodeRequest<'a> {
     pipeline_type: &'a str,
     final_resolution: usize,
+    target_faces: Option<usize>,
     parity_strict: bool,
     capture_debug_artifacts: bool,
     shape_decoder: &'a FdgDecoderRuntime,
@@ -189,6 +272,7 @@ fn decode_latent_with_runtime_decoders(
     let RuntimeDecodeRequest {
         pipeline_type,
         final_resolution,
+        target_faces,
         parity_strict,
         capture_debug_artifacts,
         shape_decoder,
@@ -691,6 +775,32 @@ fn decode_latent_with_runtime_decoders(
     if vertices.is_empty() || faces.is_empty() {
         return Err("runtime decode produced empty mesh".to_string());
     }
+    if let Some(target_faces) = target_faces.filter(|limit| *limit > 0) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if faces.len() > target_faces {
+            let before_faces = faces.len();
+            decimate_mesh_for_face_budget(&mut vertices, &mut faces, target_faces)?;
+            trellis_stage_log!(
+                "burn_trellis: runtime decode pre-pbr decimation complete (target_faces={} from_faces={} to_faces={})",
+                target_faces,
+                before_faces,
+                faces.len()
+            );
+            if vertices.is_empty() || faces.is_empty() {
+                return Err(
+                    "runtime decode pre-pbr decimation produced empty mesh".to_string(),
+                );
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        if faces.len() > target_faces {
+            return Err(format!(
+                "runtime decode target face budget is unsupported on wasm (target_faces={} faces={})",
+                target_faces,
+                faces.len()
+            ));
+        }
+    }
     trellis_stage_log!("burn_trellis: stage decode.pbr begin");
     let pbr_start = Instant::now();
     #[cfg(feature = "runtime-model-wgpu")]
@@ -799,6 +909,8 @@ fn runtime_decode_stage_boundary_sync(stage: &str, enabled: bool) -> Result<(), 
 #[cfg(all(test, feature = "runtime-model"))]
 mod runtime_decode_tests {
     use super::sanitize_mesh_geometry;
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::decimate_mesh_for_face_budget;
 
     #[cfg(feature = "runtime-model-wgpu")]
     use super::runtime_decode_uses_device_inputs;
@@ -831,6 +943,37 @@ mod runtime_decode_tests {
         assert_eq!(dropped_invalid_faces, 0);
         assert_eq!(dropped_degenerate_faces, 1);
         assert_eq!(faces, vec![[0, 1, 2]]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_decode_pre_pbr_decimation_respects_face_budget() {
+        let side = 32usize;
+        let mut vertices = Vec::with_capacity((side + 1) * (side + 1));
+        for y in 0..=side {
+            for x in 0..=side {
+                vertices.push([x as f32, y as f32, 0.0]);
+            }
+        }
+        let idx = |x: usize, y: usize| -> u32 { (y * (side + 1) + x) as u32 };
+        let mut faces = Vec::with_capacity(side * side * 2);
+        for y in 0..side {
+            for x in 0..side {
+                let i0 = idx(x, y);
+                let i1 = idx(x + 1, y);
+                let i2 = idx(x, y + 1);
+                let i3 = idx(x + 1, y + 1);
+                faces.push([i0, i1, i3]);
+                faces.push([i0, i3, i2]);
+            }
+        }
+        let original_faces = faces.len();
+        decimate_mesh_for_face_budget(&mut vertices, &mut faces, 200)
+            .expect("runtime decode pre-pbr decimation should succeed");
+        assert!(faces.len() <= 200, "faces={} > 200", faces.len());
+        assert!(!faces.is_empty());
+        assert!(faces.len() < original_faces);
+        assert!(!vertices.is_empty());
     }
 
     #[cfg(feature = "runtime-model-wgpu")]

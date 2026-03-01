@@ -36,6 +36,8 @@ const DENSE_VOXEL_LOOKUP_MAX_CELLS: usize = 2_500_000;
 const DENSE_VOXEL_WGPU_SAMPLE_MIN_POSITIONS: usize = 2_048;
 #[cfg(feature = "runtime-model-wgpu")]
 const DENSE_VOXEL_WGPU_SAMPLE_BATCH: usize = 65_536;
+#[cfg(feature = "runtime-model-wgpu")]
+const DENSE_VOXEL_WGPU_MAX_CANDIDATES_PER_TEXEL: usize = 8;
 
 pub(super) enum VoxelAttrLookup {
     Dense {
@@ -559,11 +561,14 @@ pub(super) fn bake_pbr_from_voxels_with_options(
     let _ = prefer_wgpu_sampling;
     #[cfg(not(feature = "runtime-model-wgpu"))]
     let use_wgpu_dense_sampling = false;
-    let mut deferred_texel_indices = Vec::<usize>::new();
     let mut deferred_positions = Vec::<[f32; 3]>::new();
+    let mut deferred_next = Vec::<i32>::new();
+    let mut deferred_head = vec![-1i32; texel_count];
+    let mut deferred_tail = vec![-1i32; texel_count];
+    let mut deferred_candidate_counts = vec![0u8; texel_count];
     if use_wgpu_dense_sampling {
-        deferred_texel_indices.reserve(texel_count / 2);
         deferred_positions.reserve(texel_count / 2);
+        deferred_next.reserve(texel_count / 2);
     }
 
     let mut sample_error: Option<String> = None;
@@ -604,8 +609,22 @@ pub(super) fn bake_pbr_from_voxels_with_options(
                 p0[2] * bary[0] + p1[2] * bary[1] + p2[2] * bary[2],
             ];
             if use_wgpu_dense_sampling {
-                deferred_texel_indices.push(idx);
+                if deferred_candidate_counts[idx] as usize
+                    >= DENSE_VOXEL_WGPU_MAX_CANDIDATES_PER_TEXEL
+                {
+                    return;
+                }
+                let entry = deferred_positions.len();
                 deferred_positions.push(position);
+                deferred_next.push(-1);
+                if deferred_head[idx] < 0 {
+                    deferred_head[idx] = entry as i32;
+                } else {
+                    let tail = deferred_tail[idx] as usize;
+                    deferred_next[tail] = entry as i32;
+                }
+                deferred_tail[idx] = entry as i32;
+                deferred_candidate_counts[idx] = deferred_candidate_counts[idx].saturating_add(1);
                 return;
             }
             let attrs = match sample_voxel_attr_from_lookup(position, &voxel_lookup) {
@@ -649,27 +668,57 @@ pub(super) fn bake_pbr_from_voxels_with_options(
                 );
             }
         };
-        let mut start = 0usize;
-        while start < deferred_positions.len() {
-            let end = (start + DENSE_VOXEL_WGPU_SAMPLE_BATCH).min(deferred_positions.len());
-            let batch_positions = &deferred_positions[start..end];
-            let sampled = sample_voxel_attr_dense_wgpu_batch(batch_positions, &wgpu_sampler)?;
-            for (local_idx, sampled_attrs) in sampled.into_iter().enumerate() {
-                let stream_idx = start + local_idx;
-                let texel_idx = deferred_texel_indices[stream_idx];
-                if raster_mask[texel_idx] != 0 {
-                    continue;
+        // Resolve texels by trying candidates in first-hit order per texel until one
+        // samples successfully; this preserves canonical behavior while avoiding
+        // sampling duplicate candidates after a texel is already resolved.
+        let mut cursor = deferred_head;
+        let mut active_texels = cursor
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, head)| (*head >= 0).then_some(idx))
+            .collect::<Vec<_>>();
+        while !active_texels.is_empty() {
+            let mut next_active_texels = Vec::new();
+            let mut start = 0usize;
+            while start < active_texels.len() {
+                let end = (start + DENSE_VOXEL_WGPU_SAMPLE_BATCH).min(active_texels.len());
+                let batch_texels = &active_texels[start..end];
+                let mut batch_positions = Vec::with_capacity(batch_texels.len());
+                let mut batch_meta = Vec::with_capacity(batch_texels.len());
+                for &texel_idx in batch_texels {
+                    let entry = cursor[texel_idx];
+                    if entry < 0 {
+                        continue;
+                    }
+                    let entry = entry as usize;
+                    batch_positions.push(deferred_positions[entry]);
+                    batch_meta.push((texel_idx, entry));
                 }
-                let Some(attrs) = sampled_attrs else {
-                    continue;
-                };
-                base_color_float[texel_idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
-                metallic_float[texel_idx] = attrs[3];
-                roughness_float[texel_idx] = attrs[4];
-                alpha_float[texel_idx] = attrs[5];
-                raster_mask[texel_idx] = 255;
+                let sampled =
+                    sample_voxel_attr_dense_wgpu_batch(batch_positions.as_slice(), &wgpu_sampler)?;
+                for (sampled_attrs, (texel_idx, entry)) in
+                    sampled.into_iter().zip(batch_meta.into_iter())
+                {
+                    if raster_mask[texel_idx] != 0 {
+                        continue;
+                    }
+                    if let Some(attrs) = sampled_attrs {
+                        base_color_float[texel_idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
+                        metallic_float[texel_idx] = attrs[3];
+                        roughness_float[texel_idx] = attrs[4];
+                        alpha_float[texel_idx] = attrs[5];
+                        raster_mask[texel_idx] = 255;
+                    } else {
+                        let next = deferred_next[entry];
+                        cursor[texel_idx] = next;
+                        if next >= 0 {
+                            next_active_texels.push(texel_idx);
+                        }
+                    }
+                }
+                start = end;
             }
-            start = end;
+            active_texels = next_active_texels;
         }
     }
 

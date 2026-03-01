@@ -13,6 +13,7 @@ pub enum TrellisQuality {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrellisQualitySettings {
     pub pipeline_type: &'static str,
+    pub max_num_tokens: Option<usize>,
     pub sparse_steps: usize,
     pub shape_steps: usize,
     pub texture_steps: usize,
@@ -27,6 +28,7 @@ impl TrellisQuality {
             // 512 base path favors speed over detail.
             Self::Low => TrellisQualitySettings {
                 pipeline_type: "512_base",
+                max_num_tokens: None,
                 sparse_steps: 1,
                 shape_steps: 1,
                 texture_steps: 1,
@@ -34,19 +36,21 @@ impl TrellisQuality {
                 guidance_strength_shape: 6.0,
                 guidance_strength_texture: 1.0,
             },
-            // Medium keeps the canonical 1024 single-pass path with fewer sampler steps.
+            // Medium tracks TRELLIS.2 canonical 1024 cascade defaults.
             Self::Medium => TrellisQualitySettings {
-                pipeline_type: "1024_single",
-                sparse_steps: 6,
-                shape_steps: 6,
-                texture_steps: 6,
+                pipeline_type: "1024_cascade",
+                max_num_tokens: Some(49_152),
+                sparse_steps: 12,
+                shape_steps: 12,
+                texture_steps: 12,
                 guidance_strength_sparse: 7.5,
                 guidance_strength_shape: 7.5,
                 guidance_strength_texture: 1.0,
             },
-            // High keeps the same canonical 1024 single-pass pipeline with full step budget.
+            // High uses TRELLIS.2 canonical 1024 cascade path with full step budget.
             Self::High => TrellisQualitySettings {
-                pipeline_type: "1024_single",
+                pipeline_type: "1024_cascade",
+                max_num_tokens: Some(49_152),
                 sparse_steps: 12,
                 shape_steps: 12,
                 texture_steps: 12,
@@ -75,9 +79,9 @@ mod tests {
         assert_eq!(TrellisQuality::Low.settings().pipeline_type, "512_base");
         assert_eq!(
             TrellisQuality::Medium.settings().pipeline_type,
-            "1024_single"
+            "1024_cascade"
         );
-        assert_eq!(TrellisQuality::High.settings().pipeline_type, "1024_single");
+        assert_eq!(TrellisQuality::High.settings().pipeline_type, "1024_cascade");
     }
 
     #[test]
@@ -86,10 +90,20 @@ mod tests {
         let medium = TrellisQuality::Medium.settings();
         let high = TrellisQuality::High.settings();
         assert!(low.sparse_steps < medium.sparse_steps);
-        assert!(medium.sparse_steps < high.sparse_steps);
+        assert!(medium.sparse_steps <= high.sparse_steps);
         assert!(low.shape_steps < medium.shape_steps);
-        assert!(medium.shape_steps < high.shape_steps);
+        assert!(medium.shape_steps <= high.shape_steps);
         assert!(low.texture_steps < medium.texture_steps);
-        assert!(medium.texture_steps < high.texture_steps);
+        assert!(medium.texture_steps <= high.texture_steps);
+    }
+
+    #[test]
+    fn quality_token_caps_are_stable() {
+        let low = TrellisQuality::Low.settings();
+        let medium = TrellisQuality::Medium.settings();
+        let high = TrellisQuality::High.settings();
+        assert_eq!(low.max_num_tokens, None);
+        assert_eq!(medium.max_num_tokens, Some(49_152));
+        assert_eq!(high.max_num_tokens, Some(49_152));
     }
 }

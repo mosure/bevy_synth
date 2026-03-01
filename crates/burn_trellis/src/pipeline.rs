@@ -95,6 +95,7 @@ pub struct TrellisRunOptions {
     pub hook_output: Option<PathBuf>,
     pub noise_overrides_hook: Option<PathBuf>,
     pub max_sparse_coords: Option<usize>,
+    pub target_faces: Option<usize>,
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
@@ -363,7 +364,8 @@ impl Trellis2Pipeline {
                 options.hook_output.is_some(),
                 TrellisStageRunConfig {
                     max_sparse_coords: options.max_sparse_coords,
-                    max_num_tokens: None,
+                    max_num_tokens: options.quality.settings().max_num_tokens,
+                    target_faces: options.target_faces.filter(|limit| *limit > 0),
                     runtime_stage_debug: options.runtime_stage_debug,
                     runtime_attention_debug: options.runtime_attention_debug,
                     runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
@@ -455,7 +457,8 @@ impl Trellis2Pipeline {
                 options.hook_output.is_some(),
                 TrellisStageRunConfig {
                     max_sparse_coords: options.max_sparse_coords,
-                    max_num_tokens: None,
+                    max_num_tokens: options.quality.settings().max_num_tokens,
+                    target_faces: options.target_faces.filter(|limit| *limit > 0),
                     runtime_stage_debug: options.runtime_stage_debug,
                     runtime_attention_debug: options.runtime_attention_debug,
                     runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,

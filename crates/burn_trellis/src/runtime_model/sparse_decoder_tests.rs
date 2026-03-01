@@ -714,7 +714,7 @@ fn decoder_wgpu_device_math_control_defaults_enabled() {
     assert!(decoder_wgpu_device_math_allow_fp16());
     assert_eq!(
         decoder_wgpu_device_math_max_state_bytes(),
-        512 * 1024 * 1024
+        decoder_wgpu_max_tensor_bytes()
     );
     unsafe {
         std::env::set_var("TRELLIS2_DECODER_WGPU_DEVICE_MATH", "0");

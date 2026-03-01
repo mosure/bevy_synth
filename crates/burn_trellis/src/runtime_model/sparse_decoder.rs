@@ -973,17 +973,9 @@ impl DecoderWgpuConvContext {
             ));
         }
         let call_start = Instant::now();
-        let output_bytes = rows
-            .checked_mul(config.out_channels)
-            .and_then(|value| value.checked_mul(core::mem::size_of::<f32>()))
-            .ok_or_else(|| "wgpu sparse conv output-byte-size overflow".to_string())?;
-        let max_output_bytes = decoder_wgpu_max_output_bytes();
-        if output_bytes > max_output_bytes {
-            return Err(format!(
-                "wgpu sparse conv tensor output exceeds per-dispatch guard: bytes={} max_bytes={}",
-                output_bytes, max_output_bytes
-            ));
-        }
+        // Do not reject large outputs here: `forward_with_neighbor_tensor_tensor` owns the
+        // canonical chunked-dispatch path and will split oversized dispatches by row count.
+        // Early-aborting here prevents valid chunked execution during decode upsample stages.
         let kernel_rows = kernel_rows(config)?;
         let neighbor_start = Instant::now();
         let neighbor_t = neighbor_rows_tensor_from_coords_tensor(config, coords_t)?;

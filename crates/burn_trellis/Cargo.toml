@@ -52,6 +52,9 @@ burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+meshopt = "0.6.2"
+
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
 version = "0.21.0-pre.1"
 optional = true

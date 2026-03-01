@@ -361,6 +361,7 @@ pub struct TrellisStageTimings {
 pub struct TrellisStageRunConfig {
     pub max_sparse_coords: Option<usize>,
     pub max_num_tokens: Option<usize>,
+    pub target_faces: Option<usize>,
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
@@ -1558,6 +1559,7 @@ impl TrellisStageRuntime {
             &tex_slat,
             self.pipeline_type(),
             Some(shape_slat_decode_resolution),
+            run_config.target_faces,
             parity_strict,
             capture_sampler_trace,
             decode_overrides,

@@ -155,6 +155,7 @@ fn run() -> Result<(), String> {
             },
             noise_overrides_hook: args.noise_overrides_hook.clone(),
             max_sparse_coords: args.max_sparse_coords,
+            target_faces: None,
             runtime_stage_debug: args.runtime_stage_debug,
             runtime_attention_debug: args.runtime_attention_debug,
             runtime_decoder_conv_telemetry: args.runtime_decoder_conv_telemetry,
