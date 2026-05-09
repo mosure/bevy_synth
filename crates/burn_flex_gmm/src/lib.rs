@@ -22,6 +22,25 @@ pub struct SparseSubmConvWeights<'a> {
     pub bias: &'a [f32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparsePatchify3dConfig {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub tubelet_size: usize,
+    pub patch_h: usize,
+    pub patch_w: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SparsePatchify3dWeights<'a> {
+    /// Dense 3D patch projection weights in `[out_channels, in_channels, tubelet, patch_h, patch_w]`.
+    pub weight: &'a [f32],
+    pub bias: &'a [f32],
+}
+
 #[derive(Clone, Debug)]
 struct KernelLayout {
     offsets: Vec<[i32; 3]>,
@@ -29,7 +48,9 @@ struct KernelLayout {
 }
 
 #[cfg(feature = "wgpu-kernel")]
-pub mod wgpu;
+pub mod wgpu_patchify;
+#[cfg(feature = "wgpu-kernel")]
+pub use wgpu_patchify as wgpu;
 
 pub fn kernel_rows(config: &SparseSubmConvConfig) -> Result<usize, String> {
     validate_config(config)?;
@@ -103,6 +124,116 @@ pub fn sparse_subm_conv_forward_flex(
         neighbor_rows.as_slice(),
         None,
     )
+}
+
+pub fn sparse_patchify3d_forward_flex(
+    config: &SparsePatchify3dConfig,
+    weights: SparsePatchify3dWeights<'_>,
+    coords: &[[u32; 4]],
+    input: &[f32],
+) -> Result<Vec<f32>, String> {
+    let batch_count = validate_sparse_patchify3d_shapes(config, weights, input)?;
+    let rows = coords.len();
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    validate_sparse_patchify3d_coords(config, coords, batch_count)?;
+
+    let k = sparse_patchify3d_inner_len(config)?;
+    let packed_weight = pack_sparse_patchify3d_weight(config, weights.weight)?;
+    let mut gathered = vec![0.0f32; rows * k];
+    let mut output = vec![0.0f32; rows * config.out_channels];
+
+    for row in 0..rows {
+        let out_base = row * config.out_channels;
+        output[out_base..out_base + config.out_channels].copy_from_slice(weights.bias);
+
+        let [batch, tubelet, patch_row, patch_col] = coords[row];
+        let batch = batch as usize;
+        let t0 = tubelet as usize * config.tubelet_size;
+        let y0 = patch_row as usize * config.patch_h;
+        let x0 = patch_col as usize * config.patch_w;
+        let row_base = row * k;
+        let mut dst = row_base;
+        for c in 0..config.in_channels {
+            for dt in 0..config.tubelet_size {
+                let t = t0 + dt;
+                for py in 0..config.patch_h {
+                    let y = y0 + py;
+                    for px in 0..config.patch_w {
+                        let x = x0 + px;
+                        let src = (((batch * config.in_channels + c) * config.frames + t)
+                            * config.height
+                            + y)
+                            * config.width
+                            + x;
+                        gathered[dst] = input[src];
+                        dst += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // output[rows, out_channels] += gathered[rows, k] @ packed_weight[k, out_channels]
+    unsafe {
+        matrixmultiply::sgemm(
+            rows,
+            k,
+            config.out_channels,
+            1.0,
+            gathered.as_ptr(),
+            k as isize,
+            1,
+            packed_weight.as_ptr(),
+            config.out_channels as isize,
+            1,
+            1.0,
+            output.as_mut_ptr(),
+            config.out_channels as isize,
+            1,
+        );
+    }
+
+    Ok(output)
+}
+
+pub fn pack_sparse_patchify3d_weight(
+    config: &SparsePatchify3dConfig,
+    weight: &[f32],
+) -> Result<Vec<f32>, String> {
+    validate_sparse_patchify3d_config(config)?;
+    let expected_weight = expected_sparse_patchify3d_weight_len(config)?;
+    if weight.len() != expected_weight {
+        return Err(format!(
+            "sparse patchify weight len mismatch: got {} expected {}",
+            weight.len(),
+            expected_weight
+        ));
+    }
+
+    let k = sparse_patchify3d_inner_len(config)?;
+    let mut packed = vec![0.0f32; k * config.out_channels];
+    for out_channel in 0..config.out_channels {
+        let mut k_idx = 0usize;
+        for c in 0..config.in_channels {
+            for dt in 0..config.tubelet_size {
+                for py in 0..config.patch_h {
+                    for px in 0..config.patch_w {
+                        let src =
+                            ((((out_channel * config.in_channels + c) * config.tubelet_size + dt)
+                                * config.patch_h
+                                + py)
+                                * config.patch_w)
+                                + px;
+                        packed[k_idx * config.out_channels + out_channel] = weight[src];
+                        k_idx += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(packed)
 }
 
 pub fn sparse_subm_conv_forward_flex_precomputed(
@@ -424,6 +555,146 @@ fn expected_weight_len(config: &SparseSubmConvConfig) -> Result<usize, String> {
         .ok_or_else(|| "sparse conv weight size overflow".to_string())
 }
 
+fn validate_sparse_patchify3d_shapes(
+    config: &SparsePatchify3dConfig,
+    weights: SparsePatchify3dWeights<'_>,
+    input: &[f32],
+) -> Result<usize, String> {
+    validate_sparse_patchify3d_config(config)?;
+    if weights.bias.len() != config.out_channels {
+        return Err(format!(
+            "sparse patchify bias len mismatch: got {} expected {}",
+            weights.bias.len(),
+            config.out_channels
+        ));
+    }
+    let expected_weight = expected_sparse_patchify3d_weight_len(config)?;
+    if weights.weight.len() != expected_weight {
+        return Err(format!(
+            "sparse patchify weight len mismatch: got {} expected {}",
+            weights.weight.len(),
+            expected_weight
+        ));
+    }
+    let per_batch = sparse_patchify3d_input_len_per_batch(config)?;
+    if !input.len().is_multiple_of(per_batch) {
+        return Err(format!(
+            "sparse patchify input len mismatch: got {} expected a multiple of {}",
+            input.len(),
+            per_batch
+        ));
+    }
+    Ok(input.len() / per_batch)
+}
+
+pub(crate) fn validate_sparse_patchify3d_config(
+    config: &SparsePatchify3dConfig,
+) -> Result<(), String> {
+    if config.in_channels == 0 || config.out_channels == 0 {
+        return Err("sparse patchify channel dimensions must be non-zero".to_string());
+    }
+    if config.frames == 0 || config.height == 0 || config.width == 0 {
+        return Err("sparse patchify input dimensions must be non-zero".to_string());
+    }
+    if config.tubelet_size == 0 || config.patch_h == 0 || config.patch_w == 0 {
+        return Err("sparse patchify patch dimensions must be non-zero".to_string());
+    }
+    if !config.frames.is_multiple_of(config.tubelet_size) {
+        return Err(format!(
+            "sparse patchify frames must be divisible by tubelet_size: {} % {} != 0",
+            config.frames, config.tubelet_size
+        ));
+    }
+    if !config.height.is_multiple_of(config.patch_h) {
+        return Err(format!(
+            "sparse patchify height must be divisible by patch_h: {} % {} != 0",
+            config.height, config.patch_h
+        ));
+    }
+    if !config.width.is_multiple_of(config.patch_w) {
+        return Err(format!(
+            "sparse patchify width must be divisible by patch_w: {} % {} != 0",
+            config.width, config.patch_w
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn sparse_patchify3d_grid(
+    config: &SparsePatchify3dConfig,
+) -> Result<[usize; 3], String> {
+    validate_sparse_patchify3d_config(config)?;
+    Ok([
+        config.frames / config.tubelet_size,
+        config.height / config.patch_h,
+        config.width / config.patch_w,
+    ])
+}
+
+fn validate_sparse_patchify3d_coords(
+    config: &SparsePatchify3dConfig,
+    coords: &[[u32; 4]],
+    batch_count: usize,
+) -> Result<(), String> {
+    let [grid_t, grid_h, grid_w] = sparse_patchify3d_grid(config)?;
+    for (idx, [batch, tubelet, patch_row, patch_col]) in coords.iter().copied().enumerate() {
+        let batch = batch as usize;
+        let tubelet = tubelet as usize;
+        let patch_row = patch_row as usize;
+        let patch_col = patch_col as usize;
+        if batch >= batch_count {
+            return Err(format!(
+                "sparse patchify coord row {idx} batch out of bounds: {batch} >= {batch_count}"
+            ));
+        }
+        if tubelet >= grid_t {
+            return Err(format!(
+                "sparse patchify coord row {idx} tubelet out of bounds: {tubelet} >= {grid_t}"
+            ));
+        }
+        if patch_row >= grid_h {
+            return Err(format!(
+                "sparse patchify coord row {idx} patch_row out of bounds: {patch_row} >= {grid_h}"
+            ));
+        }
+        if patch_col >= grid_w {
+            return Err(format!(
+                "sparse patchify coord row {idx} patch_col out of bounds: {patch_col} >= {grid_w}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn sparse_patchify3d_inner_len(
+    config: &SparsePatchify3dConfig,
+) -> Result<usize, String> {
+    validate_sparse_patchify3d_config(config)?;
+    config
+        .in_channels
+        .checked_mul(config.tubelet_size)
+        .and_then(|v| v.checked_mul(config.patch_h))
+        .and_then(|v| v.checked_mul(config.patch_w))
+        .ok_or_else(|| "sparse patchify inner dimension overflow".to_string())
+}
+
+fn sparse_patchify3d_input_len_per_batch(config: &SparsePatchify3dConfig) -> Result<usize, String> {
+    validate_sparse_patchify3d_config(config)?;
+    config
+        .in_channels
+        .checked_mul(config.frames)
+        .and_then(|v| v.checked_mul(config.height))
+        .and_then(|v| v.checked_mul(config.width))
+        .ok_or_else(|| "sparse patchify input size overflow".to_string())
+}
+
+fn expected_sparse_patchify3d_weight_len(config: &SparsePatchify3dConfig) -> Result<usize, String> {
+    config
+        .out_channels
+        .checked_mul(sparse_patchify3d_inner_len(config)?)
+        .ok_or_else(|| "sparse patchify weight size overflow".to_string())
+}
+
 fn validate_config(config: &SparseSubmConvConfig) -> Result<(), String> {
     if config.in_channels == 0 || config.out_channels == 0 {
         return Err("sparse conv channel dimensions must be non-zero".to_string());
@@ -483,7 +754,9 @@ fn kernel_layout(config: &SparseSubmConvConfig) -> KernelLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        SparseSubmConvConfig, SparseSubmConvWeights, build_neighbor_rows, pack_flex_weight,
+        SparsePatchify3dConfig, SparsePatchify3dWeights, SparseSubmConvConfig,
+        SparseSubmConvWeights, build_neighbor_rows, pack_flex_weight,
+        pack_sparse_patchify3d_weight, sparse_patchify3d_forward_flex,
         sparse_subm_conv_forward_flex, sparse_subm_conv_forward_flex_precomputed,
         sparse_subm_conv_forward_legacy,
     };
@@ -693,6 +966,162 @@ mod tests {
                         diff <= 2.0e-5,
                         "axis_order={axis_order:?} axis_sign={axis_sign:?} mismatch at idx={idx}: lhs={lhs} rhs={rhs} diff={diff}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_patchify3d_matches_dense_patch_reference() {
+        let cfg = SparsePatchify3dConfig {
+            in_channels: 3,
+            out_channels: 5,
+            frames: 4,
+            height: 6,
+            width: 8,
+            tubelet_size: 2,
+            patch_h: 3,
+            patch_w: 4,
+        };
+        let coords = vec![[0, 0, 0, 0], [0, 1, 1, 1], [1, 0, 1, 0], [1, 1, 0, 1]];
+        let mut rng = Lcg::new(20260509);
+        let per_batch = cfg.in_channels * cfg.frames * cfg.height * cfg.width;
+        let input: Vec<f32> = (0..2 * per_batch).map(|_| rng.next_f32()).collect();
+        let weight_len =
+            cfg.out_channels * cfg.in_channels * cfg.tubelet_size * cfg.patch_h * cfg.patch_w;
+        let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
+        let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
+        let weights = SparsePatchify3dWeights {
+            weight: &weight,
+            bias: &bias,
+        };
+
+        let sparse = sparse_patchify3d_forward_flex(&cfg, weights, &coords, &input).unwrap();
+        let mut dense_ref = Vec::with_capacity(coords.len() * cfg.out_channels);
+        for [batch, tubelet, patch_row, patch_col] in coords.iter().copied() {
+            let batch = batch as usize;
+            let t0 = tubelet as usize * cfg.tubelet_size;
+            let y0 = patch_row as usize * cfg.patch_h;
+            let x0 = patch_col as usize * cfg.patch_w;
+            for out_channel in 0..cfg.out_channels {
+                let mut acc = bias[out_channel];
+                for c in 0..cfg.in_channels {
+                    for dt in 0..cfg.tubelet_size {
+                        let t = t0 + dt;
+                        for py in 0..cfg.patch_h {
+                            let y = y0 + py;
+                            for px in 0..cfg.patch_w {
+                                let x = x0 + px;
+                                let input_idx = (((batch * cfg.in_channels + c) * cfg.frames + t)
+                                    * cfg.height
+                                    + y)
+                                    * cfg.width
+                                    + x;
+                                let weight_idx = ((((out_channel * cfg.in_channels + c)
+                                    * cfg.tubelet_size
+                                    + dt)
+                                    * cfg.patch_h
+                                    + py)
+                                    * cfg.patch_w)
+                                    + px;
+                                acc += input[input_idx] * weight[weight_idx];
+                            }
+                        }
+                    }
+                }
+                dense_ref.push(acc);
+            }
+        }
+
+        assert_eq!(dense_ref.len(), sparse.len());
+        for (idx, (lhs, rhs)) in dense_ref.iter().zip(sparse.iter()).enumerate() {
+            let diff = (lhs - rhs).abs();
+            assert!(
+                diff <= 2.5e-5,
+                "patchify mismatch at idx={idx}: dense={lhs} sparse={rhs} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_patchify3d_handles_empty_coords() {
+        let cfg = SparsePatchify3dConfig {
+            in_channels: 1,
+            out_channels: 2,
+            frames: 2,
+            height: 4,
+            width: 4,
+            tubelet_size: 2,
+            patch_h: 2,
+            patch_w: 2,
+        };
+        let weights = SparsePatchify3dWeights {
+            weight: &[1.0; 16],
+            bias: &[0.0, 1.0],
+        };
+        let out = sparse_patchify3d_forward_flex(&cfg, weights, &[], &[0.0; 32]).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn sparse_patchify3d_rejects_out_of_bounds_coord() {
+        let cfg = SparsePatchify3dConfig {
+            in_channels: 1,
+            out_channels: 1,
+            frames: 2,
+            height: 4,
+            width: 4,
+            tubelet_size: 2,
+            patch_h: 2,
+            patch_w: 2,
+        };
+        let weights = SparsePatchify3dWeights {
+            weight: &[1.0; 8],
+            bias: &[0.0],
+        };
+        let err =
+            sparse_patchify3d_forward_flex(&cfg, weights, &[[0, 0, 2, 0]], &[0.0; 32]).unwrap_err();
+        assert!(
+            err.contains("patch_row out of bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sparse_patchify3d_weight_pack_uses_patch_order() {
+        let cfg = SparsePatchify3dConfig {
+            in_channels: 2,
+            out_channels: 3,
+            frames: 2,
+            height: 2,
+            width: 2,
+            tubelet_size: 2,
+            patch_h: 1,
+            patch_w: 2,
+        };
+        let weight: Vec<f32> =
+            (0..cfg.out_channels * cfg.in_channels * cfg.tubelet_size * cfg.patch_h * cfg.patch_w)
+                .map(|idx| idx as f32)
+                .collect();
+        let packed = pack_sparse_patchify3d_weight(&cfg, &weight).unwrap();
+        let inner = cfg.in_channels * cfg.tubelet_size * cfg.patch_h * cfg.patch_w;
+        assert_eq!(packed.len(), inner * cfg.out_channels);
+        for out_channel in 0..cfg.out_channels {
+            let mut k_idx = 0usize;
+            for c in 0..cfg.in_channels {
+                for dt in 0..cfg.tubelet_size {
+                    for py in 0..cfg.patch_h {
+                        for px in 0..cfg.patch_w {
+                            let src = ((((out_channel * cfg.in_channels + c) * cfg.tubelet_size
+                                + dt)
+                                * cfg.patch_h
+                                + py)
+                                * cfg.patch_w)
+                                + px;
+                            assert_eq!(packed[k_idx * cfg.out_channels + out_channel], weight[src]);
+                            k_idx += 1;
+                        }
+                    }
                 }
             }
         }

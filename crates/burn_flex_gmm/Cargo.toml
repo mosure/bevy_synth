@@ -1,6 +1,6 @@
 [package]
 name = "burn_flex_gmm"
-version = "0.1.0"
+version = "0.21.0"
 edition = "2024"
 description = "Sparse submanifold convolution kernels and FlexGMM-style gather+GEMM helpers."
 authors.workspace = true
@@ -13,27 +13,34 @@ readme = "README.md"
 
 [features]
 default = []
+# The pre-0.21 sparse-conv WGPU stage tools are kept out of the 0.21
+# patchify feature path until those kernels are ported to the current CubeCL
+# launch API.
+legacy-wgpu-kernel = []
 wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
 
 [dependencies]
 matrixmultiply = "0.3"
-burn = { version = "0.21.0-pre.1", default-features = false, features = ["std"], optional = true }
-burn-cubecl = { version = "0.21.0-pre.1", optional = true }
+burn = { version = "0.21.0", default-features = false, features = ["std"], optional = true }
+# Keep CubeCL deterministic on the canonical WGPU path: avoid default
+# `autotune` so runtime doesn't select vecmat kernels that require
+# unavailable plane-wide ops on some adapters.
+burn-cubecl = { version = "0.21.0", optional = true, default-features = false, features = ["std", "fusion"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
-version = "0.21.0-pre.1"
+version = "0.21.0"
 optional = true
 default-features = false
 features = ["fusion", "std", "vulkan"]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
-version = "0.21.0-pre.1"
+version = "0.21.0"
 optional = true
 default-features = false
 features = ["fusion", "std", "metal"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
-version = "0.21.0-pre.1"
+version = "0.21.0"
 optional = true
 default-features = false
 features = ["fusion", "std", "webgpu"]
@@ -45,12 +52,16 @@ criterion = { version = "0.6", features = ["html_reports"] }
 name = "sparse_subm_conv"
 harness = false
 
+[[bench]]
+name = "sparse_patchify"
+harness = false
+
 [[bin]]
 name = "neighbor_stage_bench"
 path = "tool/neighbor_stage_bench.rs"
-required-features = ["wgpu-kernel"]
+required-features = ["wgpu-kernel", "legacy-wgpu-kernel"]
 
 [[bin]]
 name = "sparse_conv_stage_bench"
 path = "tool/sparse_conv_stage_bench.rs"
-required-features = ["wgpu-kernel"]
+required-features = ["wgpu-kernel", "legacy-wgpu-kernel"]
