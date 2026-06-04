@@ -299,6 +299,16 @@ fn load_weight_backing(path: &Path) -> Result<WeightsBacking, String> {
         return Ok(WeightsBacking::Bytes(bytes));
     }
 
+    if crate::virtual_fs::has_virtual_file(path) {
+        let bytes = crate::virtual_fs::read(path).map_err(|err| {
+            format!(
+                "failed to read virtual sparse decoder weights '{}': {err}",
+                path.display()
+            )
+        })?;
+        return Ok(WeightsBacking::Bytes(bytes));
+    }
+
     let file = File::open(path).map_err(|err| {
         format!(
             "failed to open sparse decoder weights '{}': {err}",

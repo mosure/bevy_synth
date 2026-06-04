@@ -13,6 +13,7 @@ use crate::plan::ArtifactPolicy;
 const ONE_MIB: u64 = 1024 * 1024;
 const HEADER_SIZE: usize = 10;
 const MAGIC_NUMBER: u32 = 0x4255_524E;
+const TENSOR_ALIGNMENT: u64 = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BurnpackPartsManifest {
@@ -134,7 +135,7 @@ pub fn write_burnpack_parts_for_wasm(
     let mut source = fs::File::open(burnpack_path)
         .map_err(|err| format!("failed to open burnpack {}: {err}", burnpack_path.display()))?;
     let (version, metadata_size, metadata) = read_burnpack_metadata(&mut source, burnpack_path)?;
-    let data_start = HEADER_SIZE as u64 + metadata_size as u64;
+    let data_start = aligned_data_section_start(metadata_size as usize);
 
     let mut tensor_records = metadata
         .tensors
@@ -176,6 +177,7 @@ pub fn write_burnpack_parts_for_wasm(
             &part_path,
             version,
             data_start,
+            total_bytes,
             &metadata.metadata,
             group,
         )?;
@@ -251,6 +253,7 @@ where
     let any_candidate_exists = burnpack_candidates
         .iter()
         .any(|candidate| candidate.exists());
+    let mut candidate_errors = Vec::new();
 
     for candidate in burnpack_candidates {
         if any_candidate_exists && !candidate.exists() {
@@ -260,58 +263,93 @@ where
         if !manifest_path.exists() {
             continue;
         }
-        let manifest = read_parts_manifest(&manifest_path)?;
-        if candidate.exists() && !manifest_matches_source_file(&manifest, candidate) {
-            continue;
-        }
-        if manifest.parts.is_empty() {
-            return Err(format!(
-                "burnpack parts manifest {} contains no parts for {label}",
-                manifest_path.display()
-            ));
-        }
-
-        let mut model = init_model();
-        for (index, part) in manifest.parts.iter().enumerate() {
-            let part_path = resolve_part_entry_path(&manifest_path, &part.path)?;
-            let bytes = fs::read(&part_path).map_err(|err| {
-                format!(
-                    "failed to read {} part {}: {err}",
-                    label,
-                    part_path.display()
-                )
-            })?;
-            if part.bytes > 0 && bytes.len() as u64 != part.bytes {
-                return Err(format!(
-                    "{label} part {} expected {} bytes but found {}",
-                    part_path.display(),
-                    part.bytes,
-                    bytes.len()
-                ));
+        match load_model_from_burnpack_parts_candidate(
+            candidate,
+            &manifest_path,
+            label,
+            verify_checksums,
+            &mut init_model,
+            &mut apply_part,
+        ) {
+            Ok(Some(model)) => return Ok(Some(model)),
+            Ok(None) => continue,
+            Err(err) => {
+                candidate_errors.push(format!("{}: {err}", manifest_path.display()));
+                continue;
             }
-            if verify_checksums && !part.sha256.trim().is_empty() {
-                let actual_sha = sha256_bytes(&bytes);
-                if !actual_sha.eq_ignore_ascii_case(part.sha256.trim()) {
-                    return Err(format!(
-                        "{label} part {} checksum mismatch: expected {}, got {}",
-                        part_path.display(),
-                        part.sha256.trim(),
-                        actual_sha
-                    ));
-                }
-            }
-            apply_part(&mut model, bytes).map_err(|err| {
-                format!(
-                    "failed to apply {label} part {}/{} ({}): {err}",
-                    index + 1,
-                    manifest.parts.len(),
-                    part_path.display()
-                )
-            })?;
         }
-        return Ok(Some(model));
+    }
+    if !candidate_errors.is_empty() {
+        return Err(format!(
+            "failed to load {label} from burnpack parts candidates: {}",
+            candidate_errors.join("; ")
+        ));
     }
     Ok(None)
+}
+
+fn load_model_from_burnpack_parts_candidate<M, Init, Apply>(
+    candidate: &Path,
+    manifest_path: &Path,
+    label: &str,
+    verify_checksums: bool,
+    init_model: &mut Init,
+    apply_part: &mut Apply,
+) -> Result<Option<M>, String>
+where
+    Init: FnMut() -> M,
+    Apply: FnMut(&mut M, Vec<u8>) -> Result<(), String>,
+{
+    let manifest = read_parts_manifest(manifest_path)?;
+    if candidate.exists() && !manifest_matches_source_file(&manifest, candidate) {
+        return Ok(None);
+    }
+    if manifest.parts.is_empty() {
+        return Err(format!(
+            "burnpack parts manifest {} contains no parts for {label}",
+            manifest_path.display()
+        ));
+    }
+
+    let mut model = init_model();
+    for (index, part) in manifest.parts.iter().enumerate() {
+        let part_path = resolve_part_entry_path(manifest_path, &part.path)?;
+        let bytes = fs::read(&part_path).map_err(|err| {
+            format!(
+                "failed to read {} part {}: {err}",
+                label,
+                part_path.display()
+            )
+        })?;
+        if part.bytes > 0 && bytes.len() as u64 != part.bytes {
+            return Err(format!(
+                "{label} part {} expected {} bytes but found {}",
+                part_path.display(),
+                part.bytes,
+                bytes.len()
+            ));
+        }
+        if verify_checksums && !part.sha256.trim().is_empty() {
+            let actual_sha = sha256_bytes(&bytes);
+            if !actual_sha.eq_ignore_ascii_case(part.sha256.trim()) {
+                return Err(format!(
+                    "{label} part {} checksum mismatch: expected {}, got {}",
+                    part_path.display(),
+                    part.sha256.trim(),
+                    actual_sha
+                ));
+            }
+        }
+        apply_part(&mut model, bytes).map_err(|err| {
+            format!(
+                "failed to apply {label} part {}/{} ({}): {err}",
+                index + 1,
+                manifest.parts.len(),
+                part_path.display()
+            )
+        })?;
+    }
+    Ok(Some(model))
 }
 
 pub fn remove_legacy_shard_artifacts_for_burnpack(burnpack_path: &Path) -> Result<usize, String> {
@@ -453,7 +491,8 @@ fn estimate_part_total_bytes(
             .1
             .saturating_sub(record.descriptor.data_offsets.0);
         let mut descriptor = record.descriptor.clone();
-        descriptor.data_offsets = (payload_bytes, payload_bytes.saturating_add(tensor_bytes));
+        let aligned_start = align_offset(payload_bytes, TENSOR_ALIGNMENT);
+        descriptor.data_offsets = (aligned_start, aligned_start.saturating_add(tensor_bytes));
         payload_bytes = descriptor.data_offsets.1;
         tensors.insert(record.name.clone(), descriptor);
     }
@@ -465,7 +504,7 @@ fn estimate_part_total_bytes(
     let mut metadata_bytes = Vec::new();
     ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
         .map_err(|err| format!("failed to estimate burnpack part metadata size: {err}"))?;
-    Ok(HEADER_SIZE as u64 + metadata_bytes.len() as u64 + payload_bytes)
+    Ok(aligned_data_section_start(metadata_bytes.len()) + payload_bytes)
 }
 
 fn write_burnpack_part(
@@ -473,10 +512,12 @@ fn write_burnpack_part(
     destination: &Path,
     version: u16,
     data_start: u64,
+    source_len: u64,
     source_metadata: &BTreeMap<String, String>,
     records: &[TensorRecord],
 ) -> Result<(), String> {
     let mut tensors = BTreeMap::new();
+    let mut planned_records = Vec::with_capacity(records.len());
     let mut next_offset = 0u64;
     for record in records {
         let tensor_bytes = record
@@ -485,8 +526,10 @@ fn write_burnpack_part(
             .1
             .saturating_sub(record.descriptor.data_offsets.0);
         let mut descriptor = record.descriptor.clone();
-        descriptor.data_offsets = (next_offset, next_offset.saturating_add(tensor_bytes));
+        let aligned_start = align_offset(next_offset, TENSOR_ALIGNMENT);
+        descriptor.data_offsets = (aligned_start, aligned_start.saturating_add(tensor_bytes));
         next_offset = descriptor.data_offsets.1;
+        planned_records.push((record, descriptor.clone()));
         tensors.insert(record.name.clone(), descriptor);
     }
 
@@ -526,14 +569,42 @@ fn write_burnpack_part(
             destination.display()
         )
     })?;
+    let data_section_start = aligned_data_section_start(metadata_bytes.len());
+    let data_section_padding =
+        data_section_start.saturating_sub(HEADER_SIZE as u64 + metadata_bytes.len() as u64);
+    write_zero_padding(&mut out, data_section_padding, destination)?;
 
     let mut copy_buffer = vec![0u8; 1024 * 1024];
-    for record in records {
-        let start = record.descriptor.data_offsets.0;
-        let end = record.descriptor.data_offsets.1;
-        let mut remaining = end.saturating_sub(start);
+    let mut data_offset = 0u64;
+    for (record, descriptor) in planned_records {
+        if descriptor.data_offsets.0 > data_offset {
+            let padding = descriptor.data_offsets.0 - data_offset;
+            write_zero_padding(&mut out, padding, destination)?;
+            data_offset = descriptor.data_offsets.0;
+        }
+        let start = data_start
+            .checked_add(record.descriptor.data_offsets.0)
+            .ok_or_else(|| "source burnpack tensor start offset overflow".to_string())?;
+        let end = data_start
+            .checked_add(record.descriptor.data_offsets.1)
+            .ok_or_else(|| "source burnpack tensor end offset overflow".to_string())?;
+        if start > source_len {
+            let source_gap = start - source_len;
+            let tensor_bytes = end.saturating_sub(start);
+            let total_shortfall = source_gap.saturating_add(tensor_bytes);
+            if total_shortfall > TENSOR_ALIGNMENT {
+                return Err(format!(
+                    "source burnpack tensor range starts past end of file by {source_gap} bytes with {tensor_bytes} missing tensor bytes, exceeding {TENSOR_ALIGNMENT}-byte alignment tolerance"
+                ));
+            }
+            write_zero_padding(&mut out, tensor_bytes, destination)?;
+            data_offset += tensor_bytes;
+            continue;
+        }
+        let available_end = end.min(source_len);
+        let mut remaining = available_end.saturating_sub(start);
         source
-            .seek(SeekFrom::Start(data_start.saturating_add(start)))
+            .seek(SeekFrom::Start(start))
             .map_err(|err| format!("failed to seek source burnpack: {err}"))?;
         while remaining > 0 {
             let chunk = remaining.min(copy_buffer.len() as u64) as usize;
@@ -543,6 +614,17 @@ fn write_burnpack_part(
             out.write_all(&copy_buffer[..chunk])
                 .map_err(|err| format!("failed to write burnpack part tensor bytes: {err}"))?;
             remaining -= chunk as u64;
+            data_offset += chunk as u64;
+        }
+        if end > source_len {
+            let missing = end - source_len;
+            if missing > TENSOR_ALIGNMENT {
+                return Err(format!(
+                    "source burnpack tensor bytes are truncated by {missing} bytes, exceeding {TENSOR_ALIGNMENT}-byte alignment tolerance"
+                ));
+            }
+            write_zero_padding(&mut out, missing, destination)?;
+            data_offset += missing;
         }
     }
     out.flush().map_err(|err| {
@@ -551,6 +633,39 @@ fn write_burnpack_part(
             destination.display()
         )
     })?;
+    Ok(())
+}
+
+fn align_offset(offset: u64, alignment: u64) -> u64 {
+    if alignment == 0 {
+        return offset;
+    }
+    offset.div_ceil(alignment) * alignment
+}
+
+fn aligned_data_section_start(metadata_size: usize) -> u64 {
+    align_offset(HEADER_SIZE as u64 + metadata_size as u64, TENSOR_ALIGNMENT)
+}
+
+fn write_zero_padding(
+    out: &mut fs::File,
+    mut bytes: u64,
+    destination: &Path,
+) -> Result<(), String> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let zeros = vec![0u8; 8192];
+    while bytes > 0 {
+        let chunk = bytes.min(zeros.len() as u64) as usize;
+        out.write_all(&zeros[..chunk]).map_err(|err| {
+            format!(
+                "failed to write burnpack part padding {}: {err}",
+                destination.display()
+            )
+        })?;
+        bytes -= chunk as u64;
+    }
     Ok(())
 }
 
@@ -671,8 +786,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BurnpackPartEntry, BurnpackPartsManifest, burnpack_parts_manifest_path,
-        load_model_from_burnpack_parts,
+        BurnpackPartEntry, BurnpackPartsManifest, MAGIC_NUMBER, RawBurnpackMetadata,
+        RawTensorDescriptor, Value, aligned_data_section_start, burnpack_parts_manifest_path,
+        load_model_from_burnpack_parts, read_burnpack_metadata, write_burnpack_parts_for_wasm,
     };
     use crate::io::sha256_bytes;
 
@@ -693,6 +809,100 @@ mod tests {
             .expect("mtime should be after unix epoch")
             .as_millis()
             .min(u64::MAX as u128) as u64
+    }
+
+    fn tiny_burnpack_with_tensor_offsets(
+        data_offsets: (u64, u64),
+        shape: Vec<u64>,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut tensors = std::collections::BTreeMap::new();
+        tensors.insert(
+            "tensor".to_string(),
+            RawTensorDescriptor {
+                dtype: Value::Text("F32".to_string()),
+                shape,
+                data_offsets,
+                param_id: None,
+            },
+        );
+        let metadata = RawBurnpackMetadata {
+            tensors,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let mut metadata_bytes = Vec::new();
+        ciborium::ser::into_writer(&metadata, &mut metadata_bytes).expect("serialize metadata");
+        let metadata_size = u32::try_from(metadata_bytes.len()).expect("metadata size");
+        let data_start = aligned_data_section_start(metadata_bytes.len()) as usize;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&metadata_size.to_le_bytes());
+        bytes.extend_from_slice(&metadata_bytes);
+        bytes.resize(data_start, 0);
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    fn tiny_burnpack_with_trailing_shortfall(declared_data_len: u64, data: &[u8]) -> Vec<u8> {
+        tiny_burnpack_with_tensor_offsets((0, declared_data_len), vec![declared_data_len / 4], data)
+    }
+
+    fn burnpack_required_len(path: &Path) -> u64 {
+        let mut file = fs::File::open(path).expect("open burnpack");
+        let (_, metadata_size, metadata) =
+            read_burnpack_metadata(&mut file, path).expect("read burnpack metadata");
+        let max_data_end = metadata
+            .tensors
+            .values()
+            .map(|descriptor| descriptor.data_offsets.1)
+            .max()
+            .expect("tensor descriptor");
+        aligned_data_section_start(metadata_size as usize) + max_data_end
+    }
+
+    #[test]
+    fn writer_pads_small_trailing_source_shortfall() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let source = root.join("model.bpk");
+        fs::write(&source, tiny_burnpack_with_trailing_shortfall(4, &[1, 2]))
+            .expect("write source");
+
+        let report = write_burnpack_parts_for_wasm(&source, 1, true)
+            .expect("write parts")
+            .expect("parts report");
+        assert_eq!(report.part_paths.len(), 1);
+        let part_path = &report.part_paths[0];
+        let required = burnpack_required_len(part_path);
+        let actual = fs::metadata(part_path).expect("part metadata").len();
+        assert_eq!(actual, required);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn writer_pads_small_tensor_range_starting_just_past_source_end() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let source = root.join("model.bpk");
+        fs::write(
+            &source,
+            tiny_burnpack_with_tensor_offsets((128, 132), vec![1], &[]),
+        )
+        .expect("write source");
+
+        let report = write_burnpack_parts_for_wasm(&source, 1, true)
+            .expect("write parts")
+            .expect("parts report");
+        assert_eq!(report.part_paths.len(), 1);
+        let part_path = &report.part_paths[0];
+        let required = burnpack_required_len(part_path);
+        let actual = fs::metadata(part_path).expect("part metadata").len();
+        assert_eq!(actual, required);
+
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
@@ -821,6 +1031,76 @@ mod tests {
         .expect_err("checksum should fail");
 
         assert!(err.contains("checksum mismatch"), "unexpected error: {err}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn falls_back_to_next_candidate_when_preferred_parts_fail_to_apply() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let bad_candidate = root.join("model_f16.bpk");
+        let good_candidate = root.join("model.bpk");
+        let bad_part = root.join("model_f16.bpk.part-00000.bpk");
+        let good_part = root.join("model.bpk.part-00000.bpk");
+        fs::write(&bad_part, b"bad").expect("write bad part");
+        fs::write(&good_part, b"good").expect("write good part");
+
+        let bad_manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model_f16.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: 3,
+            max_part_bytes: 3,
+            parts: vec![BurnpackPartEntry {
+                path: "model_f16.bpk.part-00000.bpk".to_string(),
+                bytes: 3,
+                sha256: sha256_bytes(b"bad"),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&bad_candidate),
+            serde_json::to_vec(&bad_manifest).expect("serialize bad manifest"),
+        )
+        .expect("write bad manifest");
+
+        let good_manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: 4,
+            max_part_bytes: 4,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: 4,
+                sha256: sha256_bytes(b"good"),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&good_candidate),
+            serde_json::to_vec(&good_manifest).expect("serialize good manifest"),
+        )
+        .expect("write good manifest");
+
+        let loaded = load_model_from_burnpack_parts(
+            &[bad_candidate, good_candidate],
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                if bytes == b"bad" {
+                    return Err("synthetic preferred candidate failure".to_string());
+                }
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect("fallback candidate should load")
+        .expect("parts should load");
+
+        assert_eq!(loaded, vec![b"good".to_vec()]);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

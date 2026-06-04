@@ -1,5 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use std::sync::Once;
@@ -11,21 +13,26 @@ use burn_synth::progress::{
     ProgressVerbosity, RuntimeProgressObserver, default_log_progress_callback,
 };
 use burn_synth::runtime::{
-    DinoBackend as RuntimeDinoBackend, InferenceBackend, MeshRequest, RuntimeConfig, SynthRuntime,
+    AssetRequest, DinoBackend as RuntimeDinoBackend, InferenceBackend, RuntimeConfig, SynthRuntime,
     TrellisQuality as RuntimeTrellisQuality,
 };
 use burn_synth::set_bootstrap_status_callback;
-use burn_synth::{ForegroundModel, ImageSource, SynthesisModel};
+use burn_synth::{
+    ForegroundModel, ImageSource, SynthesisAsset as RuntimeSynthesisAsset, SynthesisModel,
+};
 
 use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
 use crate::state::{
     InferenceRequest, WASM_STATUS_LOADING_MODELS, WASM_STATUS_MODEL_LOAD_FAILED_PREFIX,
     WASM_STATUS_MODEL_READY, WorkerCommand, WorkerEvent,
 };
-use crate::worker::WorkerWakeCallback;
-use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture, TripoMesh};
+use crate::worker::{SharedWgpuDevice, WorkerWakeCallback};
+use crate::{
+    SynthAsset, SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture, TripoMesh,
+};
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
+const WORKER_PANIC_PREFIX: &str = "synthesis worker panicked";
 
 fn send_worker_status(event_tx: &Sender<WorkerEvent>, message: impl Into<String>) {
     let _ = event_tx.send(WorkerEvent {
@@ -56,6 +63,7 @@ pub(crate) fn worker_loop_shared_runtime(
     args: AppArgs,
     command_rx: Receiver<WorkerCommand>,
     event_tx: Sender<WorkerEvent>,
+    shared_wgpu_device: Option<SharedWgpuDevice>,
     wake_callback: Option<WorkerWakeCallback>,
 ) {
     send_worker_status(&event_tx, WASM_STATUS_LOADING_MODELS);
@@ -63,7 +71,9 @@ pub(crate) fn worker_loop_shared_runtime(
     set_bootstrap_status_callback(Some(Arc::new(move |message| {
         send_worker_status(&bootstrap_event_tx, message);
     })));
-    let runtime_result = build_runtime(&args);
+    let runtime_result = catch_worker_unwind("while initializing canonical runtime", || {
+        build_runtime(&args, shared_wgpu_device)
+    });
     set_bootstrap_status_callback(None);
 
     let mut runtime = match runtime_result {
@@ -97,6 +107,7 @@ pub(crate) fn worker_loop_shared_runtime(
     };
     send_worker_status(&event_tx, WASM_STATUS_MODEL_READY);
 
+    let mut terminal_worker_error: Option<String> = None;
     for command in command_rx {
         match command {
             WorkerCommand::Warmup => {}
@@ -104,7 +115,22 @@ pub(crate) fn worker_loop_shared_runtime(
                 let started = Instant::now();
                 let mut results = Vec::with_capacity(requests.len());
                 for request in requests.iter() {
-                    let result = infer_one_request(&mut runtime, &args, request).map(Some);
+                    if let Some(err) = terminal_worker_error.as_ref() {
+                        results.push(Err(format!(
+                            "synthesis worker stopped after prior panic; restart the app before retrying: {err}"
+                        )));
+                        continue;
+                    }
+                    let context = format!("while processing {}", request.image_path.display());
+                    let result = catch_worker_unwind(&context, || {
+                        infer_one_request(&mut runtime, &args, request)
+                    });
+                    if let Err(err) = &result
+                        && err.starts_with(WORKER_PANIC_PREFIX)
+                    {
+                        terminal_worker_error = Some(err.clone());
+                    }
+                    let result = result.map(Some);
                     results.push(result);
                 }
                 let sent = event_tx.send(WorkerEvent {
@@ -124,12 +150,46 @@ pub(crate) fn worker_loop_shared_runtime(
     }
 }
 
-fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
+fn catch_worker_unwind<T, F>(context: &str, operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "{WORKER_PANIC_PREFIX} {context}: {}",
+            panic_payload_message(payload.as_ref())
+        )),
+    }
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    "panic payload was not a string".to_string()
+}
+
+fn build_runtime(
+    args: &AppArgs,
+    shared_wgpu_device: Option<SharedWgpuDevice>,
+) -> Result<SynthRuntime, String> {
     validate_canonical_runtime_args(args)?;
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-    if matches!(args.backend, BackendKind::Wgpu) {
+    if matches!(args.backend, BackendKind::Wgpu) && shared_wgpu_device.is_none() {
         configure_wgpu_runtime_memory_profile();
     }
+    let config = runtime_config_from_args(args, shared_wgpu_device)?;
+    Ok(SynthRuntime::new(config))
+}
+
+fn runtime_config_from_args(
+    args: &AppArgs,
+    shared_wgpu_device: Option<SharedWgpuDevice>,
+) -> Result<RuntimeConfig, String> {
     let model_selection = ModelSelection::new(
         args.synthesis_models
             .iter()
@@ -142,6 +202,7 @@ fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
         backend: map_backend(&args.backend),
         weights_root: args.weights_root.clone(),
         trellis_weights_root: args.trellis_weights_root.clone(),
+        triposplat_weights_root: args.triposplat_weights_root.clone(),
         trellis_image_large_root: args.trellis_image_large_root.clone(),
         trellis_python_bin: args.trellis_python_bin.clone(),
         trellis_bridge_script: args.trellis_bridge_script.clone(),
@@ -150,6 +211,9 @@ fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
         num_steps: args.num_steps,
         num_tokens: args.num_tokens,
         guidance_scale: args.guidance_scale,
+        triposplat_shift: args.triposplat_shift,
+        triposplat_num_gaussians: args.triposplat_num_gaussians,
+        triposplat_erode_radius: args.triposplat_erode_radius,
         seed: args.seed.or(RuntimeConfig::default().seed),
         dino_backend: map_dino_backend(args.dino_backend),
         target_faces: args.target_faces,
@@ -168,26 +232,45 @@ fn build_runtime(args: &AppArgs) -> Result<SynthRuntime, String> {
     config.flash_extract.mini_grid_num = args.flash_mini_grid_num;
     config.flash_extract.num_chunks = args.flash_num_chunks;
     config.flash_extract.mc_level = args.flash_mc_level;
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    {
+        config.wgpu_device = shared_wgpu_device;
+    }
+    #[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
+    let _ = shared_wgpu_device;
 
-    Ok(SynthRuntime::new(config))
+    Ok(config)
 }
 
 fn infer_one_request(
     runtime: &mut SynthRuntime,
     args: &AppArgs,
     request: &InferenceRequest,
-) -> Result<SynthMesh, String> {
+) -> Result<SynthAsset, String> {
+    {
+        let config = runtime.config_mut();
+        config.num_steps = request.settings.num_steps;
+        config.guidance_scale = request.settings.guidance_scale;
+        config.triposplat_num_gaussians = request.settings.triposplat_num_gaussians;
+    }
+
     let image = request
         .image_contents
         .as_ref()
         .map(|bytes| ImageSource::from_bytes(bytes.clone()))
         .unwrap_or_else(|| ImageSource::from_path(request.image_path.clone()));
 
-    let request = MeshRequest {
+    let synthesis_models = if request.synthesis_models.is_empty() {
+        args.synthesis_models.clone()
+    } else {
+        request.synthesis_models.clone()
+    };
+
+    let request = AssetRequest {
         image,
         foreground_model: Some(map_foreground_model(args.rmbg_model)),
         synthesis_models: Some(
-            args.synthesis_models
+            synthesis_models
                 .iter()
                 .copied()
                 .map(map_synthesis_model)
@@ -198,9 +281,16 @@ fn infer_one_request(
     };
 
     let output = runtime
-        .synthesize_mesh(request)
+        .synthesize_asset(request)
         .map_err(|err| format!("synthesis inference failed: {err}"))?;
-    Ok(runtime_mesh_to_synth_mesh(output.mesh))
+    Ok(runtime_asset_to_synth_asset(output.asset))
+}
+
+fn runtime_asset_to_synth_asset(asset: RuntimeSynthesisAsset) -> SynthAsset {
+    match asset {
+        RuntimeSynthesisAsset::Mesh(mesh) => SynthAsset::Mesh(runtime_mesh_to_synth_mesh(mesh)),
+        RuntimeSynthesisAsset::GaussianSplat(splats) => SynthAsset::GaussianSplat(splats),
+    }
 }
 
 fn runtime_mesh_to_synth_mesh(mesh: burn_synth::mesh::Mesh) -> SynthMesh {
@@ -245,6 +335,7 @@ fn map_synthesis_model(value: crate::args::SynthesisModel) -> SynthesisModel {
     match value {
         crate::args::SynthesisModel::Triposg => SynthesisModel::Triposg,
         crate::args::SynthesisModel::Trellis => SynthesisModel::Trellis,
+        crate::args::SynthesisModel::Triposplat => SynthesisModel::Triposplat,
     }
 }
 
@@ -308,8 +399,11 @@ fn parse_bounds(raw: &[f32]) -> Result<[f32; 6], String> {
 mod tests {
     use clap::Parser;
 
-    use super::{parse_bounds, validate_canonical_runtime_args};
-    use crate::args::{Args, MeshMode, SynthesisModel, build_app_args};
+    use super::{
+        WORKER_PANIC_PREFIX, catch_worker_unwind, parse_bounds, runtime_config_from_args,
+        validate_canonical_runtime_args,
+    };
+    use crate::args::{Args, BackendKind, MeshMode, SynthesisModel, build_app_args};
 
     #[test]
     fn validates_canonical_runtime_for_trellis_flash_pipeline() {
@@ -344,8 +438,48 @@ mod tests {
     }
 
     #[test]
+    fn canonical_runtime_accepts_triposplat_asset_requests() {
+        let args = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposplat",
+        ]));
+        validate_canonical_runtime_args(&args)
+            .expect("triposplat splat output should pass through the worker asset surface");
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn runtime_config_preserves_shared_wgpu_device() {
+        let mut args = build_app_args(Args::parse_from(["bevy_synth", "--backend", "wgpu"]));
+        args.backend = BackendKind::Wgpu;
+        let shared_device = burn_wgpu::WgpuDevice::Existing(7);
+        let config = runtime_config_from_args(&args, Some(shared_device.clone()))
+            .expect("runtime config should build without loading weights");
+
+        assert_eq!(config.wgpu_device, Some(shared_device));
+    }
+
+    #[test]
     fn parse_bounds_rejects_invalid_ranges() {
         let err = parse_bounds(&[1.0, 0.0, 0.0, 0.5, 1.0, 1.0]).expect_err("invalid bounds");
         assert!(err.contains("strictly less"));
+    }
+
+    #[test]
+    fn worker_unwind_guard_reports_panic_as_error() {
+        let err = catch_worker_unwind::<(), _>("while testing panic conversion", || {
+            panic!("backend compiler failed")
+        })
+        .expect_err("panic should be converted into a worker error");
+
+        assert!(
+            err.starts_with(WORKER_PANIC_PREFIX),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("backend compiler failed"),
+            "unexpected error: {err}"
+        );
     }
 }

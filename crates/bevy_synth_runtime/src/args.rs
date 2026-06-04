@@ -1,6 +1,11 @@
 use std::path::PathBuf;
 
 use bevy::prelude::Resource;
+use burn_triposplat::{
+    MAX_NUM_GAUSSIANS, MIN_NUM_GAUSSIANS, TRIPOSPLAT_GAUSSIANS_PER_POINT,
+    TripoSplatProfile as CoreTripoSplatProfile, TripoSplatProfileSettings, normalize_num_gaussians,
+    triposplat_profile_for_settings,
+};
 use clap::{ArgAction, Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -30,6 +35,10 @@ pub struct Args {
     #[arg(long)]
     pub trellis_weights_root: Option<PathBuf>,
 
+    /// Optional weights root for TripoSplat pipeline.
+    #[arg(long)]
+    pub triposplat_weights_root: Option<PathBuf>,
+
     /// Optional weights root for TRELLIS-image-large assets.
     #[arg(long)]
     pub trellis_image_large_root: Option<PathBuf>,
@@ -54,6 +63,10 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = QualityPreset::Balanced)]
     pub quality: QualityPreset,
 
+    /// TripoSplat profile (low, balanced, high). Individual TripoSplat flags override this preset.
+    #[arg(long, value_enum, default_value_t = TripoSplatProfile::Balanced)]
+    pub triposplat_profile: TripoSplatProfile,
+
     /// Number of diffusion steps (overrides --quality).
     #[arg(long)]
     pub num_steps: Option<usize>,
@@ -65,6 +78,18 @@ pub struct Args {
     /// Guidance scale (overrides --quality).
     #[arg(long)]
     pub guidance_scale: Option<f32>,
+
+    /// Flow timestep schedule shift for TripoSplat.
+    #[arg(long)]
+    pub triposplat_shift: Option<f32>,
+
+    /// Target Gaussian count for TripoSplat.
+    #[arg(long, value_parser = parse_triposplat_gaussians)]
+    pub gaussians: Option<usize>,
+
+    /// Alpha matte erosion radius for TripoSplat preprocessing.
+    #[arg(long)]
+    pub triposplat_erode_radius: Option<usize>,
 
     /// Optional RNG seed for deterministic sampling.
     #[arg(long)]
@@ -207,6 +232,7 @@ pub enum RmbgModel {
 pub enum SynthesisModel {
     Triposg,
     Trellis,
+    Triposplat,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +270,43 @@ pub enum QualityPreset {
     Full,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TripoSplatProfile {
+    Low,
+    #[default]
+    Balanced,
+    High,
+    Custom,
+}
+
+impl TripoSplatProfile {
+    pub fn settings(self) -> TripoSplatProfileSettings {
+        CoreTripoSplatProfile::from(self).settings()
+    }
+}
+
+impl From<TripoSplatProfile> for CoreTripoSplatProfile {
+    fn from(value: TripoSplatProfile) -> Self {
+        match value {
+            TripoSplatProfile::Low => Self::Low,
+            TripoSplatProfile::Balanced => Self::Balanced,
+            TripoSplatProfile::High => Self::High,
+            TripoSplatProfile::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<CoreTripoSplatProfile> for TripoSplatProfile {
+    fn from(value: CoreTripoSplatProfile) -> Self {
+        match value {
+            CoreTripoSplatProfile::Low => Self::Low,
+            CoreTripoSplatProfile::Balanced => Self::Balanced,
+            CoreTripoSplatProfile::High => Self::High,
+            CoreTripoSplatProfile::Custom => Self::Custom,
+        }
+    }
+}
+
 #[derive(ValueEnum, Clone, Debug)]
 pub enum MeshMode {
     Dense,
@@ -253,6 +316,9 @@ pub enum MeshMode {
 
 pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
 pub const DEFAULT_SEED: u64 = 42;
+pub const TRIPOSPLAT_MIN_NUM_GAUSSIANS: usize = MIN_NUM_GAUSSIANS;
+pub const TRIPOSPLAT_MAX_NUM_GAUSSIANS: usize = MAX_NUM_GAUSSIANS;
+pub const TRIPOSPLAT_GAUSSIAN_STEP: usize = TRIPOSPLAT_GAUSSIANS_PER_POINT * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct QualityDefaults {
@@ -331,15 +397,20 @@ pub struct AppArgs {
     pub text_embeds_key: String,
     pub weights_root: Option<PathBuf>,
     pub trellis_weights_root: Option<PathBuf>,
+    pub triposplat_weights_root: Option<PathBuf>,
     pub trellis_image_large_root: Option<PathBuf>,
     pub trellis_python_bin: Option<PathBuf>,
     pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
     pub scribble_weights_root: Option<PathBuf>,
     pub quality: QualityPreset,
+    pub triposplat_profile: TripoSplatProfile,
     pub num_steps: usize,
     pub num_tokens: usize,
     pub guidance_scale: f32,
+    pub triposplat_shift: f32,
+    pub triposplat_num_gaussians: usize,
+    pub triposplat_erode_radius: usize,
     pub seed: Option<u64>,
     pub resolution: usize,
     pub chunk_size: usize,
@@ -372,6 +443,12 @@ pub struct AppArgs {
 pub fn build_app_args(args: Args) -> AppArgs {
     let quality = args.quality;
     let defaults = quality.defaults();
+    let synthesis_models = sanitize_synthesis_models(args.synthesis_models);
+    let triposplat_selected = synthesis_models
+        .first()
+        .is_some_and(|model| matches!(model, SynthesisModel::Triposplat));
+    let triposplat_profile = args.triposplat_profile;
+    let triposplat_defaults = triposplat_profile.settings();
     let seed = args.seed.or(Some(DEFAULT_SEED));
     let target_faces = match args.faces {
         Some(0) => None,
@@ -385,15 +462,28 @@ pub fn build_app_args(args: Args) -> AppArgs {
         text_embeds_key: args.text_embeds_key,
         weights_root: args.weights_root,
         trellis_weights_root: args.trellis_weights_root,
+        triposplat_weights_root: args.triposplat_weights_root,
         trellis_image_large_root: args.trellis_image_large_root,
         trellis_python_bin: args.trellis_python_bin,
         trellis_bridge_script: args.trellis_bridge_script,
         trellis_quality: args.trellis_quality,
         scribble_weights_root: args.scribble_weights_root,
         quality,
-        num_steps: args.num_steps.unwrap_or(defaults.num_steps),
+        triposplat_profile,
+        num_steps: args.num_steps.unwrap_or(if triposplat_selected {
+            triposplat_defaults.steps
+        } else {
+            defaults.num_steps
+        }),
         num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),
-        guidance_scale: args.guidance_scale.unwrap_or(defaults.guidance_scale),
+        guidance_scale: args.guidance_scale.unwrap_or(if triposplat_selected {
+            triposplat_defaults.guidance_scale
+        } else {
+            defaults.guidance_scale
+        }),
+        triposplat_shift: args.triposplat_shift.unwrap_or(3.0),
+        triposplat_num_gaussians: args.gaussians.unwrap_or(triposplat_defaults.num_gaussians),
+        triposplat_erode_radius: args.triposplat_erode_radius.unwrap_or(1),
         seed,
         resolution: args.resolution.unwrap_or(defaults.resolution),
         chunk_size: args.chunk_size.unwrap_or(defaults.chunk_size),
@@ -421,7 +511,7 @@ pub fn build_app_args(args: Args) -> AppArgs {
         output: args.output,
         mesh: args.mesh,
         bg_weights_root: args.bg_weights_root,
-        synthesis_models: sanitize_synthesis_models(args.synthesis_models),
+        synthesis_models,
         rmbg_model: args.rmbg_model,
         backend: args.backend,
         rmbg_backend: args.rmbg_backend,
@@ -432,6 +522,41 @@ pub fn build_app_args(args: Args) -> AppArgs {
         max_batch_size: args.max_batch_size.max(1),
         mcp_scene_control_path: args.mcp_scene_control_path,
     }
+}
+
+impl Default for AppArgs {
+    fn default() -> Self {
+        build_app_args(Args::parse_from(["bevy_synth"]))
+    }
+}
+
+impl AppArgs {
+    pub fn apply_triposplat_profile(&mut self, profile: TripoSplatProfile) {
+        self.triposplat_profile = profile;
+        if profile == TripoSplatProfile::Custom {
+            return;
+        }
+        let settings = profile.settings();
+        self.num_steps = settings.steps;
+        self.guidance_scale = settings.guidance_scale;
+        self.triposplat_num_gaussians = settings.num_gaussians;
+    }
+
+    pub fn refresh_triposplat_profile_from_current_settings(&mut self) {
+        self.triposplat_profile = triposplat_profile_for_settings(
+            self.num_steps,
+            self.guidance_scale,
+            self.triposplat_num_gaussians,
+        )
+        .into();
+    }
+}
+
+fn parse_triposplat_gaussians(value: &str) -> Result<usize, String> {
+    let raw = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid TripoSplat gaussian count `{value}`: {err}"))?;
+    normalize_num_gaussians(raw)
 }
 
 fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel> {
@@ -453,7 +578,7 @@ mod tests {
 
     use super::{
         Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, QualityPreset, RmbgModel, SynthesisModel,
-        WeightPrecision, build_app_args,
+        TripoSplatProfile, WeightPrecision, build_app_args,
     };
 
     #[test]
@@ -522,6 +647,53 @@ mod tests {
         assert_eq!(defaults.num_tokens, 1024);
         assert_eq!(defaults.flash_octree_depth, 8);
         assert_eq!(defaults.flash_min_resolution, 31);
+    }
+
+    #[test]
+    fn triposplat_profile_controls_default_steps_guidance_and_gaussians() {
+        let low = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposplat",
+            "--triposplat-profile",
+            "low",
+        ]));
+        assert_eq!(low.triposplat_profile, TripoSplatProfile::Low);
+        assert_eq!(low.num_steps, 5);
+        assert_eq!(low.guidance_scale, 3.0);
+        assert_eq!(low.triposplat_num_gaussians, 32_768);
+
+        let high = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposplat",
+            "--triposplat-profile",
+            "high",
+        ]));
+        assert_eq!(high.num_steps, 50);
+        assert_eq!(high.guidance_scale, 3.0);
+        assert_eq!(high.triposplat_num_gaussians, 262_144);
+    }
+
+    #[test]
+    fn explicit_triposplat_flags_override_profile() {
+        let args = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposplat",
+            "--triposplat-profile",
+            "low",
+            "--num-steps",
+            "18",
+            "--guidance-scale",
+            "4.5",
+            "--gaussians",
+            "65537",
+        ]));
+        assert_eq!(args.triposplat_profile, TripoSplatProfile::Low);
+        assert_eq!(args.num_steps, 18);
+        assert_eq!(args.guidance_scale, 4.5);
+        assert_eq!(args.triposplat_num_gaussians, 65_536);
     }
 
     #[test]

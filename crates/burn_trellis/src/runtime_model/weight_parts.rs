@@ -1,7 +1,9 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::blob_burnpack::load_blob_bytes_from_burnpack_bytes;
+use crate::virtual_fs;
 
 #[derive(Debug, Deserialize)]
 struct BurnpackPartEntry {
@@ -29,7 +31,7 @@ pub(crate) fn burnpack_parts_manifest_path(burnpack_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn candidate_exists_or_has_parts(path: &Path) -> bool {
-    path.exists() || burnpack_parts_manifest_path(path).exists()
+    virtual_fs::exists(path) || virtual_fs::exists(&burnpack_parts_manifest_path(path))
 }
 
 pub(crate) fn load_blob_bytes_from_burnpack_or_parts<F>(
@@ -39,12 +41,12 @@ pub(crate) fn load_blob_bytes_from_burnpack_or_parts<F>(
 where
     F: FnMut(&Path) -> Result<Vec<u8>, String>,
 {
-    if burnpack_path.exists() {
+    if virtual_fs::exists(burnpack_path) {
         return load_blob_from_burnpack(burnpack_path);
     }
 
     let manifest_path = burnpack_parts_manifest_path(burnpack_path);
-    let manifest_bytes = fs::read(&manifest_path).map_err(|err| {
+    let manifest_bytes = virtual_fs::read(&manifest_path).map_err(|err| {
         format!(
             "failed to read burnpack parts manifest '{}': {err}",
             manifest_path.display()
@@ -81,26 +83,70 @@ where
     let mut all_part_sizes_match_file_sizes = true;
     let mut all_part_sizes_match_payload_sizes = true;
     let mut file_size_total = 0u64;
+    let manifest_source_url = virtual_fs::source_url(&manifest_path);
     for (index, part) in manifest.parts.iter().enumerate() {
         let part_path = resolve_manifest_part_path(&manifest_path, part.path.as_str())?;
-        let part_file_size = fs::metadata(&part_path)
-            .map_err(|err| {
+        let part_file_size = if virtual_fs::has_virtual_file(&part_path) || part_path.exists() {
+            virtual_fs::metadata_len(&part_path).map_err(|err| {
                 format!(
                     "failed to stat burnpack part '{}': {err}",
                     part_path.display()
                 )
             })?
-            .len();
+        } else {
+            part.bytes
+        };
         file_size_total = file_size_total.saturating_add(part_file_size);
-        let bytes = load_blob_from_burnpack(&part_path).map_err(|err| {
-            format!(
-                "failed to load burnpack part {}/{} '{}' for '{}': {err}",
-                index + 1,
-                manifest.parts.len(),
-                part_path.display(),
-                burnpack_path.display()
-            )
-        })?;
+        let bytes = if virtual_fs::has_virtual_file(&part_path) {
+            let burnpack_bytes = virtual_fs::read(&part_path).map_err(|err| {
+                format!(
+                    "failed to read virtual burnpack part {}/{} '{}' for '{}': {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_path.display(),
+                    burnpack_path.display()
+                )
+            })?;
+            load_blob_bytes_from_burnpack_bytes(&burnpack_bytes).map_err(|err| {
+                format!(
+                    "failed to decode virtual burnpack part {}/{} '{}' for '{}': {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_path.display(),
+                    burnpack_path.display()
+                )
+            })?
+        } else if let Some(manifest_url) = manifest_source_url.as_deref() {
+            let part_url = resolve_manifest_part_url(manifest_url, part.path.as_str());
+            let burnpack_bytes = virtual_fs::fetch_url(part_url.as_str()).map_err(|err| {
+                format!(
+                    "failed to fetch burnpack part {}/{} '{}' for '{}': {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_url,
+                    burnpack_path.display()
+                )
+            })?;
+            load_blob_bytes_from_burnpack_bytes(&burnpack_bytes).map_err(|err| {
+                format!(
+                    "failed to decode fetched burnpack part {}/{} '{}' for '{}': {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_url,
+                    burnpack_path.display()
+                )
+            })?
+        } else {
+            load_blob_from_burnpack(&part_path).map_err(|err| {
+                format!(
+                    "failed to load burnpack part {}/{} '{}' for '{}': {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_path.display(),
+                    burnpack_path.display()
+                )
+            })?
+        };
         if part.bytes > 0 {
             let payload_bytes = bytes.len() as u64;
             let matches_file_size = part_file_size == part.bytes;
@@ -147,6 +193,17 @@ where
     }
 
     Ok(merged)
+}
+
+fn resolve_manifest_part_url(manifest_url: &str, entry: &str) -> String {
+    if entry.contains("://") || entry.starts_with('/') {
+        return entry.to_string();
+    }
+    let normalized = entry.replace('\\', "/");
+    if let Some((parent, _)) = manifest_url.rsplit_once('/') {
+        return format!("{}/{}", parent.trim_end_matches('/'), normalized);
+    }
+    normalized
 }
 
 fn resolve_manifest_part_path(manifest_path: &Path, entry: &str) -> Result<PathBuf, String> {

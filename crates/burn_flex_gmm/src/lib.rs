@@ -47,10 +47,14 @@ struct KernelLayout {
     rows: usize,
 }
 
+#[cfg(feature = "cuda-kernel")]
+pub mod cuda_patchify;
+#[cfg(feature = "wgpu-kernel")]
+pub mod wgpu;
 #[cfg(feature = "wgpu-kernel")]
 pub mod wgpu_patchify;
-#[cfg(feature = "wgpu-kernel")]
-pub use wgpu_patchify as wgpu;
+#[cfg(feature = "cuda-kernel")]
+pub use cuda_patchify as cuda;
 
 pub fn kernel_rows(config: &SparseSubmConvConfig) -> Result<usize, String> {
     validate_config(config)?;

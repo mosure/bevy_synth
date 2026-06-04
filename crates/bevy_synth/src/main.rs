@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod app;
+mod infinite_grid;
 #[cfg(all(
     target_arch = "wasm32",
     target_os = "unknown",

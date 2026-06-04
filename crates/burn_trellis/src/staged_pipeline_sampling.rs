@@ -522,6 +522,8 @@ fn build_sparse_runtime_noise_rows_only(
     rng: &mut Lcg,
     channels: usize,
     rows: usize,
+    sparse_resolution: usize,
+    dense_resolution: usize,
     dense_override: Option<&[f32]>,
     sparse_row_override: Option<&SparseRowNoiseOverride>,
     stage: &str,
@@ -529,22 +531,63 @@ fn build_sparse_runtime_noise_rows_only(
     if rows == 0 || channels == 0 {
         return Ok(Vec::new());
     }
-    if dense_override.is_some() {
-        return Err(format!(
-            "burn_trellis: {stage} dense noise override requires host sparse coordinates; canonical device-token path refuses host completion fallback"
-        ));
-    }
-    if sparse_row_override.is_some() {
-        return Err(format!(
-            "burn_trellis: {stage} sparse-row noise override requires host sparse coordinates; canonical device-token path refuses host completion fallback"
-        ));
-    }
-    Ok((0..rows.saturating_mul(channels))
+    let mut noise = (0..rows.saturating_mul(channels))
         .map(|_| rng.next_normal_f32())
-        .collect())
+        .collect::<Vec<_>>();
+    if let Some(override_rows) = sparse_row_override {
+        if override_rows.feats.len() != override_rows.coords.len() {
+            return Err(format!(
+                "burn_trellis: {stage} sparse-row noise override has mismatched coords/feats rows (coords={}, feats={})",
+                override_rows.coords.len(),
+                override_rows.feats.len()
+            ));
+        }
+        if override_rows.feats.len() != rows {
+            return Err(format!(
+                "burn_trellis: {stage} sparse-row noise override rows ({}) must match runtime sparse rows ({rows}) on canonical device-token path",
+                override_rows.feats.len()
+            ));
+        }
+        if let Some(values) = dense_override {
+            let dense_res = dense_resolution.max(1);
+            let voxel_count = dense_res
+                .saturating_mul(dense_res)
+                .saturating_mul(dense_res);
+            let expected = channels.saturating_mul(voxel_count);
+            if values.len() != expected {
+                return Err(format!(
+                    "burn_trellis: {stage} dense noise override len mismatch on canonical device-token path (expected {expected}, got {})",
+                    values.len()
+                ));
+            }
+            for (row_idx, coord) in override_rows.coords.iter().enumerate() {
+                let dense_idx = map_coord_to_dense_flat(
+                    *coord,
+                    sparse_resolution.max(1),
+                    dense_res,
+                );
+                let row_base = row_idx.saturating_mul(channels);
+                for ch in 0..channels {
+                    noise[row_base + ch] = values[ch * voxel_count + dense_idx];
+                }
+            }
+        }
+        // Canonical device-token path forbids host coord completion. For parity
+        // harnesses we still permit sparse-row override injection by row index.
+        for (row_idx, row) in override_rows.feats.iter().enumerate() {
+            let row_base = row_idx.saturating_mul(channels);
+            for ch in 0..channels.min(32) {
+                noise[row_base + ch] = row[ch];
+            }
+        }
+    } else if dense_override.is_some() {
+        return Err(format!(
+            "burn_trellis: {stage} dense noise override on canonical device-token path requires sparse-row override coords"
+        ));
+    }
+    Ok(noise)
 }
 
-#[cfg(feature = "runtime-model")]
 fn sparse_layout_from_batch_ids(
     batch_ids: &[usize],
     context: &str,
@@ -573,7 +616,6 @@ fn sparse_layout_from_batch_ids(
     Ok(layout)
 }
 
-#[cfg(feature = "runtime-model")]
 fn sparse_layout_from_coords(coords: &[[u32; 4]]) -> Result<Vec<std::ops::Range<usize>>, String> {
     let mut batch_ids = Vec::with_capacity(coords.len());
     for coord in coords {
@@ -582,7 +624,6 @@ fn sparse_layout_from_coords(coords: &[[u32; 4]]) -> Result<Vec<std::ops::Range<
     sparse_layout_from_batch_ids(batch_ids.as_slice(), "sparse_layout_from_coords")
 }
 
-#[cfg(feature = "runtime-model")]
 fn validate_sparse_layout_rows(
     layout: &[std::ops::Range<usize>],
     rows: usize,
@@ -711,6 +752,8 @@ fn sample_shape_slat_with_model(
                 rng,
                 config.out_channels,
                 sparse_row_count,
+                sparse_resolution,
+                dense_resolution,
                 noise_dense_override,
                 noise_override,
                 "shape_slat_runtime",
@@ -831,7 +874,7 @@ fn sample_shape_slat_with_model(
             .sparse_tensor_from_host_layout(
                 coords.to_vec(),
                 noise.clone(),
-                sparse_layout,
+                sparse_layout.clone(),
                 config.out_channels,
                 sparse_resolution.max(1),
             )
@@ -925,7 +968,7 @@ fn sample_shape_slat_with_model(
         }
     }
     #[cfg(feature = "runtime-model-wgpu")]
-    let coords_out = if use_device_coords {
+    let coords_out = if use_device_coords && !materialize_host_rows {
         Vec::new()
     } else {
         coords.to_vec()
@@ -1115,6 +1158,8 @@ fn sample_tex_slat_with_model(
                 rng,
                 config.out_channels,
                 sparse_row_count,
+                sparse_resolution,
+                dense_resolution,
                 noise_dense_override,
                 noise_override,
                 "tex_slat_runtime",
@@ -1263,7 +1308,11 @@ fn sample_tex_slat_with_model(
             )
             .map_err(|err| format!("burn_trellis: tex slat sparse tensor assembly failed ({err})"))?;
         let concat_owned = tex_flow
-            .varlen_tensor_from_host_layout(concat_rows.to_vec(), sparse_layout, concat_channels)
+            .varlen_tensor_from_host_layout(
+                concat_rows.to_vec(),
+                sparse_layout.clone(),
+                concat_channels,
+            )
             .map_err(|err| format!("burn_trellis: tex slat concat tensor assembly failed ({err})"))?;
         tex_flow.sample_sparse_rows_with_trace(
             &sparse_noise,
@@ -1366,7 +1415,7 @@ fn sample_tex_slat_with_model(
     }
 
     #[cfg(feature = "runtime-model-wgpu")]
-    let coords_out = if use_device_coords {
+    let coords_out = if use_device_coords && !materialize_host_rows {
         Vec::new()
     } else {
         shape_slat.coords.clone()

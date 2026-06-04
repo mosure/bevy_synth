@@ -3,6 +3,7 @@ use burn::{
     tensor::{
         activation::{quiet_softmax, softmax},
         module::attention as module_attention,
+        ops::AttentionModuleOptions,
     },
 };
 
@@ -145,7 +146,19 @@ impl<B: Backend> Attention<B> {
                     C / self.num_heads
                 );
             }
-            module_attention(q, k, v, None).swap_dims(1, 2).reshape([B, N, C])
+            module_attention(
+                q,
+                k,
+                v,
+                None,
+                None,
+                AttentionModuleOptions {
+                    scale: Some(self.scale as f64),
+                    ..Default::default()
+                },
+            )
+            .swap_dims(1, 2)
+            .reshape([B, N, C])
         } else {
             if attention_debug_enabled() && N >= 1024 {
                 let backend_name = std::any::type_name::<B>();

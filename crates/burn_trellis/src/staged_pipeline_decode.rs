@@ -559,13 +559,17 @@ pub(super) fn bake_pbr_from_voxels_with_options(
         && matches!(voxel_lookup, VoxelAttrLookup::Dense { .. });
     #[cfg(not(feature = "runtime-model-wgpu"))]
     let _ = prefer_wgpu_sampling;
-    #[cfg(not(feature = "runtime-model-wgpu"))]
-    let use_wgpu_dense_sampling = false;
+    #[cfg(feature = "runtime-model-wgpu")]
     let mut deferred_positions = Vec::<[f32; 3]>::new();
+    #[cfg(feature = "runtime-model-wgpu")]
     let mut deferred_next = Vec::<i32>::new();
+    #[cfg(feature = "runtime-model-wgpu")]
     let mut deferred_head = vec![-1i32; texel_count];
+    #[cfg(feature = "runtime-model-wgpu")]
     let mut deferred_tail = vec![-1i32; texel_count];
+    #[cfg(feature = "runtime-model-wgpu")]
     let mut deferred_candidate_counts = vec![0u8; texel_count];
+    #[cfg(feature = "runtime-model-wgpu")]
     if use_wgpu_dense_sampling {
         deferred_positions.reserve(texel_count / 2);
         deferred_next.reserve(texel_count / 2);
@@ -608,6 +612,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
                 p0[1] * bary[0] + p1[1] * bary[1] + p2[1] * bary[2],
                 p0[2] * bary[0] + p1[2] * bary[1] + p2[2] * bary[2],
             ];
+            #[cfg(feature = "runtime-model-wgpu")]
             if use_wgpu_dense_sampling {
                 if deferred_candidate_counts[idx] as usize
                     >= DENSE_VOXEL_WGPU_MAX_CANDIDATES_PER_TEXEL
@@ -654,6 +659,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
     if let Some(err) = sample_error {
         return Err(err);
     }
+    #[cfg(feature = "runtime-model-wgpu")]
     if use_wgpu_dense_sampling {
         let wgpu_sampler = match &voxel_lookup {
             VoxelAttrLookup::Dense {

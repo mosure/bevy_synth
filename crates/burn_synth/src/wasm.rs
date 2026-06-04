@@ -4,11 +4,17 @@
 /// are configured consistently unless callers override fields explicitly.
 pub const DEFAULT_WASM_FLASH_NUM_CHUNKS: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WasmInferencePreset {
     pub quality: &'static str,
+    pub synthesis_model: &'static str,
+    pub rmbg_model: &'static str,
     pub num_steps: usize,
     pub num_tokens: usize,
+    pub guidance_scale: f32,
+    pub triposplat_shift: f32,
+    pub triposplat_num_gaussians: usize,
+    pub triposplat_erode_radius: usize,
     pub resolution: usize,
     pub faces: usize,
     pub flash_octree_depth: usize,
@@ -26,8 +32,14 @@ impl Default for WasmInferencePreset {
     fn default() -> Self {
         Self {
             quality: "balanced",
+            synthesis_model: "triposg",
+            rmbg_model: "rmbg14",
             num_steps: 20,
             num_tokens: 1024,
+            guidance_scale: 3.0,
+            triposplat_shift: 3.0,
+            triposplat_num_gaussians: 262_144,
+            triposplat_erode_radius: 1,
             // On wasm this maps to flash extraction min_resolution.
             resolution: 31,
             faces: 10_000,
@@ -40,7 +52,7 @@ impl Default for WasmInferencePreset {
             backend: "wgpu",
             rmbg_backend: "auto",
             dino_backend: "auto",
-            weights_precision: "f16",
+            weights_precision: "auto",
             rmbg_weights_precision: "auto",
         }
     }
@@ -53,10 +65,22 @@ impl WasmInferencePreset {
             program_name.to_string(),
             "--quality".to_string(),
             self.quality.to_string(),
+            "--synthesis-models".to_string(),
+            self.synthesis_model.to_string(),
+            "--rmbg-model".to_string(),
+            self.rmbg_model.to_string(),
             "--num-steps".to_string(),
             self.num_steps.to_string(),
             "--num-tokens".to_string(),
             self.num_tokens.to_string(),
+            "--guidance-scale".to_string(),
+            self.guidance_scale.to_string(),
+            "--triposplat-shift".to_string(),
+            self.triposplat_shift.to_string(),
+            "--gaussians".to_string(),
+            self.triposplat_num_gaussians.to_string(),
+            "--triposplat-erode-radius".to_string(),
+            self.triposplat_erode_radius.to_string(),
             "--resolution".to_string(),
             self.resolution.to_string(),
             "--faces".to_string(),
@@ -85,7 +109,9 @@ impl WasmInferencePreset {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_WASM_FLASH_NUM_CHUNKS, WasmInferencePreset};
+    #[cfg(feature = "runtime")]
+    use super::DEFAULT_WASM_FLASH_NUM_CHUNKS;
+    use super::WasmInferencePreset;
     #[cfg(feature = "runtime")]
     use crate::RuntimeConfig;
 
@@ -98,10 +124,22 @@ mod tests {
                 "bevy_synth",
                 "--quality",
                 "balanced",
+                "--synthesis-models",
+                "triposg",
+                "--rmbg-model",
+                "rmbg14",
                 "--num-steps",
                 "20",
                 "--num-tokens",
                 "1024",
+                "--guidance-scale",
+                "3",
+                "--triposplat-shift",
+                "3",
+                "--gaussians",
+                "262144",
+                "--triposplat-erode-radius",
+                "1",
                 "--resolution",
                 "31",
                 "--faces",
@@ -121,7 +159,7 @@ mod tests {
                 "--dino-backend",
                 "auto",
                 "--weights-precision",
-                "f16",
+                "auto",
                 "--rmbg-weights-precision",
                 "auto",
             ]
@@ -135,8 +173,14 @@ mod tests {
         let runtime = RuntimeConfig::default();
 
         assert_eq!(preset.quality, "balanced");
+        assert_eq!(preset.synthesis_model, "triposg");
+        assert_eq!(preset.rmbg_model, "rmbg14");
         assert_eq!(preset.num_steps, 20);
         assert_eq!(preset.num_tokens, 1024);
+        assert_eq!(preset.guidance_scale, 3.0);
+        assert_eq!(preset.triposplat_shift, 3.0);
+        assert_eq!(preset.triposplat_num_gaussians, 262_144);
+        assert_eq!(preset.triposplat_erode_radius, 1);
         assert_eq!(preset.resolution, 31);
         assert_eq!(preset.flash_octree_depth, 8);
         assert_eq!(preset.flash_num_chunks, DEFAULT_WASM_FLASH_NUM_CHUNKS);

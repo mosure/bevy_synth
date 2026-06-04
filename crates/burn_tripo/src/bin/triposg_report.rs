@@ -443,7 +443,7 @@ fn run_with_backend<B: Backend>(
             .to_ascii_lowercase()
             .contains("wgpu")
     {
-        let cpu_device = <CpuBackend as Backend>::Device::default();
+        let cpu_device = <CpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let cpu_pipeline =
             TripoSGPipeline::<CpuBackend>::from_pretrained(weights_root, &cpu_device)?;
         let cpu_image = tensor_from_data_4d::<CpuBackend>(&input_image_hook, &cpu_device)?;

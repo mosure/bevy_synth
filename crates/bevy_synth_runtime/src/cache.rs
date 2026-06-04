@@ -15,9 +15,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 
-use crate::{SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures, SynthMeshTexture};
+use crate::{
+    GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshMaterial, SynthMeshPbrTextures,
+    SynthMeshTexture,
+};
 
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 const INDEX_FILE_NAME: &str = "index.json";
 #[cfg(not(target_arch = "wasm32"))]
 const MESH_DIR_NAME: &str = "meshes";
@@ -45,15 +48,27 @@ impl std::fmt::Display for CacheError {
 
 impl std::error::Error for CacheError {}
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CachedAssetKind {
+    #[default]
+    Mesh,
+    GaussianSplat,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CachedMeshMetadata {
     pub cache_key: String,
     pub source_image_path: String,
     pub label: String,
+    #[serde(default)]
+    pub asset_kind: CachedAssetKind,
     pub mesh_payload_id: String,
     #[serde(default)]
     pub gltf_output_id: Option<String>,
     pub glb_output_id: String,
+    #[serde(default)]
+    pub splat_payload_id: Option<String>,
     pub updated_at_unix_ms: u64,
 }
 
@@ -293,6 +308,10 @@ impl MeshCache {
         &self.index.meshes
     }
 
+    pub fn asset_entries(&self) -> &[CachedMeshMetadata] {
+        &self.index.meshes
+    }
+
     pub fn world_items(&self) -> &[CachedWorldItem] {
         &self.index.world_items
     }
@@ -316,6 +335,33 @@ impl MeshCache {
         let payload: MeshPayload = serde_json::from_str(&mesh_payload)
             .map_err(|err| CacheError::Serialization(err.to_string()))?;
         Ok(Some(payload.into()))
+    }
+
+    pub fn load_asset(&self, cache_key: &str) -> CacheResult<Option<SynthAsset>> {
+        let kind = self
+            .index
+            .meshes
+            .iter()
+            .find(|entry| entry.cache_key == cache_key)
+            .map(|entry| entry.asset_kind)
+            .unwrap_or(CachedAssetKind::Mesh);
+        match kind {
+            CachedAssetKind::Mesh => self
+                .load_mesh(cache_key)
+                .map(|mesh| mesh.map(SynthAsset::Mesh)),
+            CachedAssetKind::GaussianSplat => self
+                .load_gaussian_splat(cache_key)
+                .map(|splats| splats.map(SynthAsset::GaussianSplat)),
+        }
+    }
+
+    pub fn load_gaussian_splat(&self, cache_key: &str) -> CacheResult<Option<GaussianSplatCloud>> {
+        let Some(payload) = self.read_splat_payload(cache_key)? else {
+            return Ok(None);
+        };
+        let splats: GaussianSplatCloud = serde_json::from_str(&payload)
+            .map_err(|err| CacheError::Serialization(err.to_string()))?;
+        Ok(Some(splats))
     }
 
     pub fn upsert_mesh_for_image(
@@ -342,23 +388,75 @@ impl MeshCache {
             cache_key: cache_key.clone(),
             source_image_path: source_image_path.clone(),
             label,
+            asset_kind: CachedAssetKind::Mesh,
             mesh_payload_id: glb_output_id.clone(),
             gltf_output_id: None,
             glb_output_id,
+            splat_payload_id: None,
             updated_at_unix_ms: now_unix_ms(),
         };
 
-        if let Some(position) = self
-            .index
-            .meshes
-            .iter()
-            .position(|entry| entry.source_image_path == source_image_path)
-        {
+        if let Some(position) = self.index.meshes.iter().position(|entry| {
+            entry.source_image_path == source_image_path
+                && entry.asset_kind == CachedAssetKind::Mesh
+        }) {
             let old_cache_key = self.index.meshes[position].cache_key.clone();
             if old_cache_key != cache_key {
                 self.remove_mesh_payload(&old_cache_key)?;
                 self.remove_gltf_output(&old_cache_key)?;
                 self.remove_glb_output(&old_cache_key)?;
+                self.remove_splat_payload(&old_cache_key)?;
+            }
+            self.index.meshes[position] = metadata.clone();
+        } else {
+            self.index.meshes.push(metadata.clone());
+        }
+
+        self.save_index()?;
+        Ok(metadata)
+    }
+
+    pub fn upsert_gaussian_splat_for_image(
+        &mut self,
+        source_image_path: &Path,
+        splats: &GaussianSplatCloud,
+    ) -> CacheResult<CachedMeshMetadata> {
+        let source_image_path = normalize_source_image_path(source_image_path);
+        let cache_key =
+            cache_key_from_source_and_kind(&source_image_path, CachedAssetKind::GaussianSplat);
+        let label = asset_label(&source_image_path, CachedAssetKind::GaussianSplat);
+
+        self.remove_mesh_payload(&cache_key)?;
+        self.remove_gltf_output(&cache_key)?;
+        self.remove_glb_output(&cache_key)?;
+
+        let payload = serde_json::to_string(splats)
+            .map_err(|err| CacheError::Serialization(err.to_string()))?;
+        self.write_splat_payload(&cache_key, &payload)?;
+        let splat_payload_id = self.splat_payload_id(&cache_key);
+
+        let metadata = CachedMeshMetadata {
+            cache_key: cache_key.clone(),
+            source_image_path: source_image_path.clone(),
+            label,
+            asset_kind: CachedAssetKind::GaussianSplat,
+            mesh_payload_id: splat_payload_id.clone(),
+            gltf_output_id: None,
+            glb_output_id: splat_payload_id.clone(),
+            splat_payload_id: Some(splat_payload_id),
+            updated_at_unix_ms: now_unix_ms(),
+        };
+
+        if let Some(position) = self.index.meshes.iter().position(|entry| {
+            entry.source_image_path == source_image_path
+                && entry.asset_kind == CachedAssetKind::GaussianSplat
+        }) {
+            let old_cache_key = self.index.meshes[position].cache_key.clone();
+            if old_cache_key != cache_key {
+                self.remove_mesh_payload(&old_cache_key)?;
+                self.remove_gltf_output(&old_cache_key)?;
+                self.remove_glb_output(&old_cache_key)?;
+                self.remove_splat_payload(&old_cache_key)?;
             }
             self.index.meshes[position] = metadata.clone();
         } else {
@@ -383,6 +481,7 @@ impl MeshCache {
         self.remove_mesh_payload(cache_key)?;
         self.remove_gltf_output(cache_key)?;
         self.remove_glb_output(cache_key)?;
+        self.remove_splat_payload(cache_key)?;
         self.index
             .world_items
             .retain(|item| item.cache_key != cache_key);
@@ -432,6 +531,21 @@ impl MeshCache {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn read_splat_payload(&self, cache_key: &str) -> CacheResult<Option<String>> {
+        let path = self.splat_payload_path(cache_key);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(path).map_err(|err| CacheError::Io(err.to_string()))?;
+        Ok(Some(content))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_splat_payload(&self, cache_key: &str) -> CacheResult<Option<String>> {
+        web_storage_get(&self.splat_payload_storage_key(cache_key))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn read_glb_output(&self, cache_key: &str) -> CacheResult<Option<Vec<u8>>> {
         let path = self.glb_output_path(cache_key);
         if !path.exists() {
@@ -465,6 +579,31 @@ impl MeshCache {
     #[cfg(target_arch = "wasm32")]
     fn remove_mesh_payload(&self, cache_key: &str) -> CacheResult<()> {
         web_storage_remove(&self.mesh_payload_storage_key(cache_key))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_splat_payload(&self, cache_key: &str, payload: &str) -> CacheResult<()> {
+        fs::write(self.splat_payload_path(cache_key), payload)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_splat_payload(&self, cache_key: &str, payload: &str) -> CacheResult<()> {
+        web_storage_set(&self.splat_payload_storage_key(cache_key), payload)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remove_splat_payload(&self, cache_key: &str) -> CacheResult<()> {
+        let path = self.splat_payload_path(cache_key);
+        if path.exists() {
+            fs::remove_file(path).map_err(|err| CacheError::Io(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn remove_splat_payload(&self, cache_key: &str) -> CacheResult<()> {
+        web_storage_remove(&self.splat_payload_storage_key(cache_key))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -530,6 +669,18 @@ impl MeshCache {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn splat_payload_path(&self, cache_key: &str) -> PathBuf {
+        self.root
+            .join(MESH_DIR_NAME)
+            .join(format!("{cache_key}.splat.json"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn splat_payload_storage_key(&self, cache_key: &str) -> String {
+        format!("{}/splat/{cache_key}", self.prefix)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn gltf_output_path(&self, cache_key: &str) -> PathBuf {
         self.root
             .join(MESH_DIR_NAME)
@@ -565,11 +716,43 @@ impl MeshCache {
             self.glb_output_storage_key(cache_key)
         }
     }
+
+    fn splat_payload_id(&self, cache_key: &str) -> String {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.splat_payload_path(cache_key)
+                .to_string_lossy()
+                .to_string()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.splat_payload_storage_key(cache_key)
+        }
+    }
 }
 
 pub fn cache_key_from_image_path(path: &Path) -> String {
     let normalized = normalize_source_image_path(path);
     cache_key_from_source(&normalized)
+}
+
+fn cache_key_from_source_and_kind(source: &str, kind: CachedAssetKind) -> String {
+    match kind {
+        CachedAssetKind::Mesh => cache_key_from_source(source),
+        CachedAssetKind::GaussianSplat => cache_key_from_source(&format!("{source}#triposplat")),
+    }
+}
+
+fn asset_label(source_image_path: &str, kind: CachedAssetKind) -> String {
+    let label = Path::new(source_image_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image")
+        .to_string();
+    match kind {
+        CachedAssetKind::Mesh => label,
+        CachedAssetKind::GaussianSplat => format!("{label} (splat)"),
+    }
 }
 
 fn cache_key_from_source(source: &str) -> String {
@@ -660,7 +843,7 @@ fn migrate_legacy_native_cache_root() -> CacheResult<()> {
 
 #[cfg(target_arch = "wasm32")]
 fn default_web_cache_prefix() -> String {
-    "burn_synth/cache/v4".to_string()
+    "burn_synth/cache/v5".to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -827,6 +1010,42 @@ mod tests {
             .expect("mesh exists");
         assert_eq!(loaded.mesh.vertices.len(), 3);
         assert_eq!(loaded.mesh.faces.len(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mesh_and_splat_entries_coexist_for_same_image() {
+        let root = temp_root("mesh_splat");
+        let image = PathBuf::from("C:/data/input/object.png");
+
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let mesh_entry = cache
+            .upsert_mesh_for_image(&image, &dummy_mesh(1.0))
+            .expect("insert mesh");
+        let splat_entry = cache
+            .upsert_gaussian_splat_for_image(&image, &GaussianSplatCloud::canonical_debug_cloud())
+            .expect("insert splat");
+
+        assert_eq!(cache.asset_entries().len(), 2);
+        assert_ne!(mesh_entry.cache_key, splat_entry.cache_key);
+        assert_eq!(mesh_entry.asset_kind, CachedAssetKind::Mesh);
+        assert_eq!(splat_entry.asset_kind, CachedAssetKind::GaussianSplat);
+
+        let mesh = cache
+            .load_asset(&mesh_entry.cache_key)
+            .expect("load mesh asset")
+            .expect("mesh asset");
+        assert!(matches!(mesh, SynthAsset::Mesh(_)));
+        let splats = cache
+            .load_asset(&splat_entry.cache_key)
+            .expect("load splat asset")
+            .expect("splat asset");
+        match splats {
+            SynthAsset::GaussianSplat(cloud) => assert_eq!(cloud.len(), 2),
+            SynthAsset::Mesh(_) => panic!("expected splat asset"),
+        }
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }

@@ -27,8 +27,8 @@ pub use mesh::{
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
 pub use native_model_bootstrap::set_bootstrap_status_callback;
 pub use pipeline::{
-    ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisModel,
-    sanitize_synthesis_models,
+    ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisAsset,
+    SynthesisModel, sanitize_synthesis_models,
 };
 #[cfg(feature = "runtime")]
 pub use progress::{
@@ -37,8 +37,9 @@ pub use progress::{
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{
-    DinoBackend, ForegroundOutput, ForegroundRequest, InferenceBackend,
-    MeshOutput as RuntimeMeshOutput, MeshRequest, RuntimeConfig, RuntimeError, SynthRuntime,
+    AssetOutput as RuntimeAssetOutput, AssetRequest, DinoBackend, ForegroundOutput,
+    ForegroundRequest, InferenceBackend, MeshOutput as RuntimeMeshOutput, MeshRequest,
+    RuntimeConfig, RuntimeError, SplatOutput as RuntimeSplatOutput, SplatRequest, SynthRuntime,
     TrellisQuality,
 };
 
@@ -47,6 +48,8 @@ pub use burn_tripo as triposg;
 
 #[cfg(feature = "trellis")]
 pub use burn_trellis as trellis;
+
+pub use burn_triposplat as triposplat;
 
 #[cfg(feature = "bg-removal")]
 pub use burn_foreground as bg_removal;

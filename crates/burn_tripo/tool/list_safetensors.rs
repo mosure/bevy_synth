@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use bevy_args::{Deserialize, Parser, Serialize, parse_args};
+use clap::Parser;
 use safetensors::SafeTensors;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Serialize, Deserialize, Debug)]
 #[command(about = "List keys in a safetensors file", version, long_about = None)]
@@ -20,7 +21,7 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args::<Args>();
+    let args = Args::parse();
     let bytes = fs::read(&args.path)?;
     let safetensors = SafeTensors::deserialize(&bytes)?;
     let mut keys = safetensors.names();

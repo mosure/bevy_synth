@@ -43,7 +43,7 @@ impl HookRecorder {
             .to_vec::<f32>()
             .expect("hook tensor should convert to f32");
         let hook = HookTensor {
-            shape: data.shape.clone(),
+            shape: data.shape.to_vec(),
             data: values,
         };
         self.tensors.insert(name.to_string(), hook);

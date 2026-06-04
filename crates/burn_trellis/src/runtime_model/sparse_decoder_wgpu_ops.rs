@@ -151,7 +151,13 @@ fn linear_forward_wgpu(
                 context, rows, chunk_rows, layer.out_channels, output_bytes, max_output_bytes
             );
         }
-        let mut chunks: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
+        // Avoid `Tensor::cat(chunks, 0)` here: cat needs a full destination tensor while
+        // keeping all chunk outputs alive, which can double peak memory and OOM on large
+        // decode MLP shapes. Preallocate once and slice-assign each chunk directly.
+        let mut output = Tensor::<DefaultWgpuBackend, 2>::zeros(
+            [rows, layer.out_channels],
+            &context_gpu.device,
+        );
         let total_chunks = rows.div_ceil(chunk_rows);
         let mut chunk_idx = 0usize;
         let mut start = 0usize;
@@ -168,14 +174,10 @@ fn linear_forward_wgpu(
                     context, chunk_idx, total_chunks, start, end, chunk_ms
                 );
             }
-            chunks.push(output_chunk);
+            output = output.slice_assign([start..end, 0..layer.out_channels], output_chunk);
             start = end;
         }
-        if chunks.len() == 1 {
-            Ok(chunks.remove(0))
-        } else {
-            Ok(Tensor::cat(chunks, 0))
-        }
+        Ok(output)
     })();
     telemetry_record_op_duration(context, op_start.elapsed().as_secs_f64() * 1000.0);
     result
@@ -302,6 +304,7 @@ fn tensor_bytes_f32(rows: usize, channels: usize, context: &str) -> Result<usize
 fn convnext_block_mlp_forward_wgpu(
     context_gpu: &mut DecoderWgpuConvContext,
     input_t: Tensor<DefaultWgpuBackend, 2>,
+    residual_t: Tensor<DefaultWgpuBackend, 2>,
     block: &ConvNeXtBlock,
     stage_idx: usize,
     block_idx: usize,
@@ -322,6 +325,13 @@ fn convnext_block_mlp_forward_wgpu(
             block.mlp_0.out_channels, block.mlp_2.in_channels
         ));
     }
+    let [residual_rows, residual_channels] = residual_t.dims();
+    if residual_rows != rows || residual_channels != block.mlp_2.out_channels {
+        return Err(format!(
+            "decoder stage {stage_idx} block {block_idx} residual mismatch: residual=[{},{}] expected=[{},{}]",
+            residual_rows, residual_channels, rows, block.mlp_2.out_channels
+        ));
+    }
 
     let max_output_bytes = decoder_wgpu_max_output_bytes();
     let hidden_bytes = tensor_bytes_f32(
@@ -329,24 +339,6 @@ fn convnext_block_mlp_forward_wgpu(
         block.mlp_0.out_channels,
         format!("decoder stage {stage_idx} block {block_idx} mlp_0").as_str(),
     )?;
-    if hidden_bytes <= max_output_bytes {
-        let state_t = linear_forward_wgpu(
-            context_gpu,
-            input_t,
-            &block.mlp_0,
-            format!("stage {stage_idx} block {block_idx} mlp_0(wgpu_math)").as_str(),
-        )?;
-        let state_t = silu_wgpu(
-            state_t,
-            format!("stage {stage_idx} block {block_idx} silu(wgpu_math)").as_str(),
-        );
-        return linear_forward_wgpu(
-            context_gpu,
-            state_t,
-            &block.mlp_2,
-            format!("stage {stage_idx} block {block_idx} mlp_2(wgpu_math)").as_str(),
-        );
-    }
 
     let hidden_bytes_per_row = block
         .mlp_0
@@ -362,12 +354,16 @@ fn convnext_block_mlp_forward_wgpu(
         .ok_or_else(|| {
             format!("decoder stage {stage_idx} block {block_idx} output row bytes overflow")
         })?;
+    // Even when byte caps allow a full-row dispatch, keeping ConvNeXt MLP chunks bounded
+    // avoids large transient linear outputs on adapters with tighter practical limits.
+    let mlp_chunk_rows_cap = 8_192usize;
     let chunk_rows = decoder_wgpu_chunk_rows(rows, hidden_bytes_per_row, max_output_bytes)
         .min(decoder_wgpu_chunk_rows(
             rows,
             output_bytes_per_row,
             max_output_bytes,
         ))
+        .min(mlp_chunk_rows_cap)
         .max(1);
 
     if decoder_conv_debug_enabled() {
@@ -383,7 +379,9 @@ fn convnext_block_mlp_forward_wgpu(
         );
     }
 
-    let mut chunk_tensors: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
+    // Keep residual tensor as the destination buffer and slice-assign each MLP chunk.
+    // This avoids materializing a second full [rows, channels] tensor for large blocks.
+    let mut output_t = residual_t;
     let mut start = 0usize;
     while start < rows {
         let end = (start + chunk_rows).min(rows);
@@ -407,20 +405,15 @@ fn convnext_block_mlp_forward_wgpu(
             format!("stage {stage_idx} block {block_idx} mlp_2(wgpu_math chunk[{start}:{end}])")
                 .as_str(),
         )?;
-        chunk_tensors.push(output_chunk);
+        let residual_chunk = output_t
+            .clone()
+            .slice([start..end, 0..block.mlp_2.out_channels]);
+        let combined_chunk = output_chunk.add(residual_chunk);
+        output_t = output_t.slice_assign([start..end, 0..block.mlp_2.out_channels], combined_chunk);
         start = end;
     }
 
-    if chunk_tensors.is_empty() {
-        return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
-            [0, block.mlp_2.out_channels],
-            &context_gpu.device,
-        ));
-    }
-    if chunk_tensors.len() == 1 {
-        return Ok(chunk_tensors.remove(0));
-    }
-    Ok(Tensor::cat(chunk_tensors, 0))
+    Ok(output_t)
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -692,9 +685,14 @@ fn convnext_blocks_forward_wgpu_tensor(
             LAYER_NORM32_EPS,
             format!("stage {stage_idx} block {block_idx} layer_norm(wgpu_math)").as_str(),
         )?;
-        state_t =
-            convnext_block_mlp_forward_wgpu(context_gpu, state_t, block, stage_idx, block_idx)?;
-        state_t = state_t.add(residual);
+        state_t = convnext_block_mlp_forward_wgpu(
+            context_gpu,
+            state_t,
+            residual,
+            block,
+            stage_idx,
+            block_idx,
+        )?;
     }
     Ok(state_t)
 }
@@ -1380,6 +1378,30 @@ fn decoder_wgpu_max_output_bytes() -> usize {
     // Keep decode conv dispatches device-resident with a larger default guard to
     // reduce avoidable chunking in large upsample blocks.
     512 * 1024 * 1024
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_sparse_conv_max_output_bytes() -> usize {
+    // Sparse-conv kernels can require additional transient buffers beyond output.
+    // Keep per-dispatch output conservative so memory-constrained adapters don't
+    // fail on ~180MB direct allocations in canonical decode stages.
+    96 * 1024 * 1024
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_max_weight_bytes() -> usize {
+    // Large monolithic decoder weight uploads can OOM on some adapters before the
+    // chunked row-dispatch logic even runs. Keep a bounded per-dispatch weight
+    // upload size and split output channels instead of falling back to host.
+    128 * 1024 * 1024
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn decoder_wgpu_upsample_conv1_max_output_bytes() -> usize {
+    // Upsample conv1 has a dedicated chunk+gather path in decoder runtime.
+    // Use a lower direct-dispatch cap so that path engages before large parent-row
+    // outputs request monolithic buffers on memory-constrained adapters.
+    128 * 1024 * 1024
 }
 
 #[cfg(feature = "runtime-model-wgpu")]

@@ -255,7 +255,7 @@ mod tests {
 
         let mut state =
             SystemState::<(Query<(), With<Selectable>>, Query<&ChildOf>)>::new(&mut world);
-        let (selectable_query, parent_query) = state.get(&world);
+        let (selectable_query, parent_query) = state.get(&world).expect("selection test queries");
 
         let resolved = resolve_selectable_target(child, &selectable_query, &parent_query);
         assert_eq!(resolved, Some(parent));

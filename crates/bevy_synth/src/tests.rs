@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 use bevy_mesh::Mesh as BevyMesh;
-use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState};
+use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState, CatalogStatus};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::should_pause_render_during_inference;
@@ -16,13 +16,13 @@ use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, QualityPreset, RmbgBackend, RmbgModel,
-    SynthesisModel, TrellisQuality, WeightPrecision,
+    SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
 };
 use bevy_synth_runtime::cache::MeshCache;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
-use bevy_synth_runtime::{SynthMesh, TripoMesh};
+use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, TripoMesh};
 use bevy_synth_ui::bevy_transform_gizmos::GizmoTransformable;
 
 static TEST_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,15 +35,20 @@ fn test_args() -> AppArgs {
         text_embeds_key: "input.text_embeds".to_string(),
         weights_root: None,
         trellis_weights_root: None,
+        triposplat_weights_root: None,
         trellis_image_large_root: None,
         trellis_python_bin: None,
         trellis_bridge_script: None,
         trellis_quality: TrellisQuality::Medium,
         scribble_weights_root: None,
         quality: QualityPreset::Full,
+        triposplat_profile: TripoSplatProfile::Balanced,
         num_steps: 1,
         num_tokens: 4,
         guidance_scale: 1.0,
+        triposplat_shift: 3.0,
+        triposplat_num_gaussians: 262_144,
+        triposplat_erode_radius: 1,
         seed: None,
         resolution: 16,
         chunk_size: 256,
@@ -163,6 +168,25 @@ fn inference_queue_advances_and_tracks_completed() {
 }
 
 #[test]
+fn enqueue_inference_snapshots_triposplat_settings() {
+    let mut queue = InferenceQueue::default();
+    let mut args = test_args();
+    args.synthesis_models = vec![SynthesisModel::Triposplat];
+    args.num_steps = 5;
+    args.guidance_scale = 3.0;
+    args.triposplat_num_gaussians = 32_768;
+
+    let request = enqueue_inference(PathBuf::from("splat.png"), &args, &mut queue);
+    args.num_steps = 50;
+    args.guidance_scale = 4.5;
+    args.triposplat_num_gaussians = 262_144;
+
+    assert_eq!(request.settings.num_steps, 5);
+    assert_eq!(request.settings.guidance_scale, 3.0);
+    assert_eq!(request.settings.triposplat_num_gaussians, 32_768);
+}
+
+#[test]
 fn inference_result_spawns_mesh_entity() {
     let (cmd_tx, _cmd_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -192,7 +216,7 @@ fn inference_result_spawns_mesh_entity() {
     event_tx
         .send(WorkerEvent {
             requests: vec![request],
-            results: vec![Ok(Some(dummy_mesh()))],
+            results: vec![Ok(Some(SynthAsset::Mesh(dummy_mesh())))],
             elapsed: Duration::from_millis(1),
             status_message: None,
         })
@@ -203,6 +227,83 @@ fn inference_result_spawns_mesh_entity() {
     let world = app.world_mut();
     let count = world.query::<&GizmoTransformable>().iter(world).count();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn inference_result_with_splats_writes_output_and_spawns_preview_mesh() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let worker = InferenceWorker {
+        sender: cmd_tx,
+        receiver: Mutex::new(event_rx),
+    };
+
+    let mut queue = InferenceQueue::default();
+    let args = test_args();
+    enqueue_inference(PathBuf::from("splat.png"), &args, &mut queue);
+    queue.active = Some(vec![queue.pending.pop_front().expect("pending request")]);
+    let status = UiStatus {
+        message: String::new(),
+        processing: true,
+        worker_message: None,
+    };
+
+    let mut request = queue
+        .active
+        .as_ref()
+        .and_then(|batch| batch.first())
+        .cloned()
+        .expect("active request");
+    let request_id = request.id;
+    let output_path = isolated_cache_root().join("debug.splat");
+    request.output_path = Some(output_path.clone());
+    let splats = GaussianSplatCloud::canonical_debug_cloud();
+    let expected_bytes = splats.stats().splat_bytes;
+    let mut app = build_test_app(worker, queue, status);
+    app.world_mut()
+        .resource_mut::<CatalogState>()
+        .add_pending(&request);
+
+    event_tx
+        .send(WorkerEvent {
+            requests: vec![request],
+            results: vec![Ok(Some(SynthAsset::GaussianSplat(splats)))],
+            elapsed: Duration::from_millis(1),
+            status_message: None,
+        })
+        .expect("send worker event");
+
+    app.update();
+
+    let world = app.world_mut();
+    let count = world.query::<&GizmoTransformable>().iter(world).count();
+    assert_eq!(count, 1);
+
+    let (mesh_handle, material_handle) = {
+        let catalog = world.resource::<CatalogState>();
+        let entry = catalog.entry(request_id).expect("catalog entry");
+        assert!(matches!(entry.status, CatalogStatus::Ready));
+        assert!(
+            entry.cache_key.is_some(),
+            "splat preview should be cache-backed"
+        );
+        (
+            entry.mesh.clone().expect("catalog mesh handle"),
+            entry.material.clone().expect("catalog material handle"),
+        )
+    };
+    let meshes = world.resource::<Assets<BevyMesh>>();
+    let mesh = meshes.get(&mesh_handle).expect("preview mesh");
+    assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_POSITION));
+    assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_COLOR));
+    let materials = world.resource::<Assets<StandardMaterial>>();
+    assert!(materials.get(&material_handle).is_some());
+    assert_eq!(
+        std::fs::metadata(&output_path)
+            .expect("splat output metadata")
+            .len(),
+        expected_bytes as u64
+    );
 }
 
 #[test]
@@ -252,21 +353,21 @@ fn render_pause_toggle_follows_queue_state() {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 #[test]
-fn linux_full_flash_workload_uses_isolated_wgpu_device() {
+fn linux_full_flash_workload_uses_shared_wgpu_device_when_versions_align() {
     let mut args = test_args();
     args.backend = BackendKind::Wgpu;
     args.mesh_mode = MeshMode::Flash;
     args.flash_octree_depth = 9;
     args.flash_min_resolution = 63;
     assert!(
-        !should_share_wgpu_inference_device_for_platform(&args, true),
-        "Linux full+flash should isolate Burn WGPU device from Bevy render device"
+        should_share_wgpu_inference_device_for_platform(&args, true),
+        "Bevy and Burn both use wgpu 29, so the WGPU inference device should be shared"
     );
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 #[test]
-fn non_linux_or_lighter_flash_workloads_keep_shared_wgpu_device() {
+fn current_wgpu_stack_uses_shared_device_for_lighter_workloads() {
     let mut args = test_args();
     args.backend = BackendKind::Wgpu;
     args.mesh_mode = MeshMode::Flash;
@@ -275,10 +376,10 @@ fn non_linux_or_lighter_flash_workloads_keep_shared_wgpu_device() {
 
     assert!(
         should_share_wgpu_inference_device_for_platform(&args, true),
-        "Linux lower flash workloads should continue to share the Bevy render device"
+        "Bevy and Burn both use wgpu 29, so native WGPU inference should share the render device"
     );
     assert!(
         should_share_wgpu_inference_device_for_platform(&args, false),
-        "Non-Linux platforms should continue to share the Bevy render device"
+        "Bevy and Burn both use wgpu 29, so native WGPU inference should share the render device"
     );
 }

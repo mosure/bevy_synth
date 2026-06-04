@@ -1,4 +1,4 @@
-use burn::{module::Ignored, nn, prelude::*, tensor::Int};
+use burn::{nn, prelude::*, tensor::Int};
 
 use super::{
     components::{CrossAttention, FeedForward, record_tensor},
@@ -337,7 +337,8 @@ impl<B: Backend> TripoSGDiTBlock<B> {
 
 #[derive(Module, Debug)]
 pub struct TripoSGDiT<B: Backend> {
-    config: Ignored<TripoSGDiTConfig>,
+    #[module(skip)]
+    config: TripoSGDiTConfig,
     pub time_proj: TimestepEmbedding<B>,
     pub proj_in: nn::Linear<B>,
     pub blocks: Vec<TripoSGDiTBlock<B>>,
@@ -381,7 +382,7 @@ impl<B: Backend> TripoSGDiT<B> {
             .init(device);
 
         Self {
-            config: Ignored(config),
+            config,
             time_proj,
             proj_in,
             blocks,

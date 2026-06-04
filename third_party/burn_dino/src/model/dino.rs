@@ -1,7 +1,7 @@
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode as OpsInterpolateMode, InterpolateOptions};
 use burn::{
-    module::{Ignored, Param},
+    module::Param,
     nn::{Gelu, Initializer},
     prelude::*,
 };
@@ -94,6 +94,7 @@ impl DinoVisionTransformerConfig {
                 mode: nn::interpolate::InterpolateMode::Cubic,
                 output_size: interpolate_size.into(),
                 scale_factor: None, //[sx, sy].into(),
+                align_corners: true,
             },
             num_patches,
         )
@@ -205,7 +206,8 @@ pub struct DinoVisionTransformer<B: Backend> {
     mask_token: Option<Param<Tensor<B, 2>>>,
     register_tokens: Option<Param<Tensor<B, 3>>>,
     camera_token: Option<Param<Tensor<B, 3>>>,
-    positional_encoding_mode: Ignored<OpsInterpolateMode>,
+    #[module(skip)]
+    positional_encoding_mode: OpsInterpolateMode,
     patch_embed: PatchEmbed<B>,
     norm: LayerNorm<B>,
     blocks: Vec<Block<B>>,
@@ -289,8 +291,8 @@ impl<B: Backend> DinoVisionTransformer<B> {
             None
         };
 
-        let positional_encoding_mode: Ignored<OpsInterpolateMode> =
-            Ignored(config.positional_encoding_interpolate.mode.clone().into());
+        let positional_encoding_mode: OpsInterpolateMode =
+            config.positional_encoding_interpolate.mode.clone().into();
 
         let patch_embed = PatchEmbedConfig::new(
             config.image_size,
@@ -360,8 +362,8 @@ impl<B: Backend> DinoVisionTransformer<B> {
     ) -> DinoOutput<B> {
         let x_norm = self.norm.forward(tokens.clone());
 
-        let b_dim = tokens.shape().dims[0];
-        let n_dim = tokens.shape().dims[1];
+        let b_dim = tokens.shape().dims::<3>()[0];
+        let n_dim = tokens.shape().dims::<3>()[1];
         let reg_count = self.register_token_count;
         let x_norm_clstoken = x_norm.clone().slice([0..b_dim, 0..1]).squeeze_dim(1);
         let x_norm_regtokens = if reg_count > 0 {
@@ -383,14 +385,14 @@ impl<B: Backend> DinoVisionTransformer<B> {
 
     #[allow(non_snake_case)]
     pub fn interpolate_pos_encoding(&self, x: Tensor<B, 3>, W: usize, H: usize) -> Tensor<B, 3> {
-        let npatch = x.shape().dims[1] - 1;
+        let npatch = x.shape().dims::<3>()[1] - 1;
         let register_offset = self.register_token_count;
         let tokens_start = 1 + register_offset;
-        let N = self.pos_embed.shape().dims[1] - tokens_start;
+        let N = self.pos_embed.shape().dims::<3>()[1] - tokens_start;
 
-        let b_dim = self.pos_embed.shape().dims[0];
-        let n_dim = self.pos_embed.shape().dims[1];
-        // let c_dim: usize = self.pos_embed.shape().dims[2];
+        let b_dim = self.pos_embed.shape().dims::<3>()[0];
+        let n_dim = self.pos_embed.shape().dims::<3>()[1];
+        // let c_dim: usize = self.pos_embed.shape().dims::<3>()[2];
 
         let class_pos_embed: Tensor<B, 2> = self
             .pos_embed
@@ -408,7 +410,7 @@ impl<B: Backend> DinoVisionTransformer<B> {
             return Tensor::cat(vec![class_pos_embed.unsqueeze_dim(0), patch_pos_embed], 1);
         }
 
-        let dim = x.shape().dims[2];
+        let dim = x.shape().dims::<3>()[2];
         let M = N.isqrt();
         let target_h = W / self.patch_size;
         let target_w = H / self.patch_size;
@@ -447,7 +449,7 @@ impl<B: Backend> DinoVisionTransformer<B> {
         let resized = interpolate(
             hw_tokens,
             [output_h, output_w],
-            InterpolateOptions::new(self.positional_encoding_mode.0.clone()),
+            InterpolateOptions::new(self.positional_encoding_mode.clone()),
         );
         resized
             .reshape([1_i32, channels as i32, (output_h * output_w) as i32])
@@ -478,7 +480,7 @@ impl<B: Backend> DinoVisionTransformer<B> {
             vec![
                 self.cls_token
                     .val()
-                    .expand([x.shape().dims[0] as i64, -1, -1]),
+                    .expand([x.shape().dims::<3>()[0] as i64, -1, -1]),
                 x,
             ],
             1,
@@ -488,13 +490,13 @@ impl<B: Backend> DinoVisionTransformer<B> {
         let x = x + residual;
 
         if let Some(register_tokens) = &self.register_tokens {
-            let cls = x.clone().slice([0..x.shape().dims[0], 0..1]);
+            let cls = x.clone().slice([0..x.shape().dims::<3>()[0], 0..1]);
             let patches = x
                 .clone()
-                .slice([0..x.shape().dims[0], 1..x.shape().dims[1]]);
+                .slice([0..x.shape().dims::<3>()[0], 1..x.shape().dims::<3>()[1]]);
             let registers = register_tokens
                 .val()
-                .expand([x.shape().dims[0] as i64, -1, -1]);
+                .expand([x.shape().dims::<3>()[0] as i64, -1, -1]);
             Tensor::cat(vec![cls, registers, patches], 1)
         } else {
             x
@@ -610,8 +612,8 @@ impl<B: Backend> DinoVisionTransformer<B> {
             return tokens;
         }
 
-        let batch = tokens.shape().dims[0];
-        let embed_dim = tokens.shape().dims[2];
+        let batch = tokens.shape().dims::<3>()[0];
+        let embed_dim = tokens.shape().dims::<3>()[2];
         let replacement = if let Some(token) = provided {
             token
         } else if let Some(param) = &self.camera_token {
@@ -628,7 +630,7 @@ impl<B: Backend> DinoVisionTransformer<B> {
         let head = replacement.reshape([batch as i32, 1, embed_dim as i32]);
         let tail = tokens.clone().slice([
             0..batch as i32,
-            1..tokens.shape().dims[1] as i32,
+            1..tokens.shape().dims::<3>()[1] as i32,
             0..embed_dim as i32,
         ]);
         Tensor::cat(vec![head, tail], 1)
@@ -717,9 +719,9 @@ impl<B: Backend> DinoVisionTransformer<B> {
                 combined
                     .clone()
                     .slice([
-                        0..combined.shape().dims[0] as i32,
+                        0..combined.shape().dims::<3>()[0] as i32,
                         0..1,
-                        0..combined.shape().dims[2] as i32,
+                        0..combined.shape().dims::<3>()[2] as i32,
                     ])
                     .squeeze_dim(1),
             )

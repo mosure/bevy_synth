@@ -1,0 +1,24 @@
+{
+  "path": "tmp/runs/20260604T195602Z_triposplat_cuda_sweep/cfg3_steps5_262144.splat",
+  "byte_length": 8388608,
+  "count": 262144,
+  "bounds_min": [
+    -0.5689835548400879,
+    -0.5001664161682129,
+    -0.47265544533729553
+  ],
+  "bounds_max": [
+    0.5143895149230957,
+    0.33123165369033813,
+    0.5605762004852295
+  ],
+  "non_finite": 0,
+  "positive_alpha": 233637,
+  "positive_scale": 786432,
+  "alpha_min": 0,
+  "alpha_max": 255,
+  "alpha_mean": 166.00493240356445,
+  "scale_min": 0.0008999999845400453,
+  "scale_max": 0.08677224814891815,
+  "scale_mean": 0.0030593852039696077
+}

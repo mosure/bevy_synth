@@ -1,6 +1,5 @@
 use burn::tensor::{DType, Int, Shape, Tensor as BurnTensor, TensorPrimitive};
 use burn_cubecl::cubecl;
-use burn_cubecl::cubecl::std::tensor::layout::linear::LinearView;
 use burn_cubecl::cubecl::{calculate_cube_count_elemwise, prelude::*};
 use burn_cubecl::tensor::CubeTensor;
 
@@ -9,42 +8,42 @@ use crate::{SparsePatchify3dConfig, validate_sparse_patchify3d_config};
 /// Default WGPU backend type used by the sparse patchify tensor wrapper.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
 
-#[cube(launch_unchecked, address_type = "dynamic")]
+#[cube(launch_unchecked)]
 fn sparse_patchify3d_kernel(
-    input: &LinearView<f32>,
-    coords: &LinearView<i32>,
-    weight: &LinearView<f32>,
-    bias: &LinearView<f32>,
-    output: &mut LinearView<f32, ReadWrite>,
-    rows: usize,
-    batch_count: usize,
-    in_channels: usize,
-    out_channels: usize,
-    frames: usize,
-    height: usize,
-    width: usize,
-    tubelet_size: usize,
-    patch_h: usize,
-    patch_w: usize,
+    input: &Array<f32>,
+    coords: &Array<i32>,
+    weight: &Array<f32>,
+    bias: &Array<f32>,
+    output: &mut Array<f32>,
+    rows: &usize,
+    batch_count: &usize,
+    in_channels: &usize,
+    out_channels: &usize,
+    frames: &usize,
+    height: &usize,
+    width: &usize,
+    tubelet_size: &usize,
+    patch_h: &usize,
+    patch_w: &usize,
 ) {
-    if !output.is_in_bounds(ABSOLUTE_POS) {
+    if ABSOLUTE_POS >= output.len() {
         terminate!();
     }
     let idx = ABSOLUTE_POS;
-    let row = idx / out_channels;
-    if row >= rows {
+    let row = idx / *out_channels;
+    if row >= *rows {
         terminate!();
     }
-    let out_channel = idx % out_channels;
+    let out_channel = idx % *out_channels;
     let coord_base = row * 4;
     let batch_i = coords[coord_base];
     let tubelet_i = coords[coord_base + 1];
     let patch_row_i = coords[coord_base + 2];
     let patch_col_i = coords[coord_base + 3];
 
-    let grid_t = frames / tubelet_size;
-    let grid_h = height / patch_h;
-    let grid_w = width / patch_w;
+    let grid_t = *frames / *tubelet_size;
+    let grid_h = *height / *patch_h;
+    let grid_w = *width / *patch_w;
     if batch_i < 0 || tubelet_i < 0 || patch_row_i < 0 || patch_col_i < 0 {
         output[idx] = bias[out_channel];
         terminate!();
@@ -53,27 +52,27 @@ fn sparse_patchify3d_kernel(
     let tubelet = usize::cast_from(tubelet_i);
     let patch_row = usize::cast_from(patch_row_i);
     let patch_col = usize::cast_from(patch_col_i);
-    if batch >= batch_count || tubelet >= grid_t || patch_row >= grid_h || patch_col >= grid_w {
+    if batch >= *batch_count || tubelet >= grid_t || patch_row >= grid_h || patch_col >= grid_w {
         output[idx] = bias[out_channel];
         terminate!();
     }
 
-    let t0 = tubelet * tubelet_size;
-    let y0 = patch_row * patch_h;
-    let x0 = patch_col * patch_w;
+    let t0 = tubelet * *tubelet_size;
+    let y0 = patch_row * *patch_h;
+    let x0 = patch_col * *patch_w;
     let mut acc = bias[out_channel];
-    for c in 0..in_channels {
-        for dt in 0..tubelet_size {
+    for c in 0..*in_channels {
+        for dt in 0..*tubelet_size {
             let t = t0 + dt;
-            for py in 0..patch_h {
+            for py in 0..*patch_h {
                 let y = y0 + py;
-                for px in 0..patch_w {
+                for px in 0..*patch_w {
                     let x = x0 + px;
                     let input_idx =
-                        (((batch * in_channels + c) * frames + t) * height + y) * width + x;
+                        (((batch * *in_channels + c) * *frames + t) * *height + y) * *width + x;
                     let weight_idx =
-                        ((((out_channel * in_channels + c) * tubelet_size + dt) * patch_h + py)
-                            * patch_w)
+                        ((((out_channel * *in_channels + c) * *tubelet_size + dt) * *patch_h + py)
+                            * *patch_w)
                             + px;
                     acc += input[input_idx] * weight[weight_idx];
                 }
@@ -166,39 +165,29 @@ pub fn sparse_patchify3d_forward_wgpu(
     let cube_dim = CubeDim::new(&input_p.client, output_elements);
     let cube_count = calculate_cube_count_elemwise(&input_p.client, output_elements, cube_dim);
     let client = input_p.client.clone();
-    let address_type = [
-        input_p.required_address_type(),
-        coords_p.required_address_type(),
-        weight_p.required_address_type(),
-        bias_p.required_address_type(),
-        output.required_address_type(),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or_default();
 
     unsafe {
         sparse_patchify3d_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
             &client,
             cube_count,
             cube_dim,
-            address_type,
-            input_p.into_linear_view(),
-            coords_p.into_linear_view(),
-            weight_p.into_linear_view(),
-            bias_p.into_linear_view(),
-            output.clone().into_linear_view(),
-            rows,
-            batch,
-            config.in_channels,
-            config.out_channels,
-            config.frames,
-            config.height,
-            config.width,
-            config.tubelet_size,
-            config.patch_h,
-            config.patch_w,
-        );
+            input_p.as_array_arg::<f32>(1),
+            coords_p.as_array_arg::<i32>(1),
+            weight_p.as_array_arg::<f32>(1),
+            bias_p.as_array_arg::<f32>(1),
+            output.as_array_arg::<f32>(1),
+            ScalarArg::new(rows),
+            ScalarArg::new(batch),
+            ScalarArg::new(config.in_channels),
+            ScalarArg::new(config.out_channels),
+            ScalarArg::new(config.frames),
+            ScalarArg::new(config.height),
+            ScalarArg::new(config.width),
+            ScalarArg::new(config.tubelet_size),
+            ScalarArg::new(config.patch_h),
+            ScalarArg::new(config.patch_w),
+        )
+        .map_err(|err| format!("sparse_patchify3d_kernel launch failed: {err:?}"))?;
     }
 
     Ok(BurnTensor::<DefaultWgpuBackend, 2>::from_primitive(

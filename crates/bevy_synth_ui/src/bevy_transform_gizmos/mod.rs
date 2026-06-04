@@ -806,11 +806,11 @@ fn gizmo_cam_copy_settings(
             *gizmo_cam_pos = *main_cam_pos;
         }
         if main_cam.is_changed() {
-            *gizmo_cam = main_cam.clone();
+            *gizmo_cam = (*main_cam).clone();
             gizmo_cam.order += 1;
         }
         if main_proj.is_changed() {
-            *proj = main_proj.clone();
+            *proj = (*main_proj).clone();
         }
     }
 }

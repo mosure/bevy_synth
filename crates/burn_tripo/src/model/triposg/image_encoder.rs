@@ -94,6 +94,7 @@ impl DinoImageProcessor {
                 let new_width = (width as f32 * scale).round() as usize;
                 let options = InterpolateOptions {
                     mode: self.resize_mode.clone(),
+                    align_corners: true,
                 };
                 image = interpolate(image, [new_height, new_width], options);
             }

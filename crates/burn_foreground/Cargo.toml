@@ -24,19 +24,19 @@ import = [
 ]
 
 [dependencies]
-burn = { version = "0.21.0-pre.1", default-features = false, features = ["ndarray", "std"] }
+burn = { version = "=0.21.0", default-features = false, features = ["ndarray", "std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
-burn-store = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
+burn-store = { version = "=0.21.0", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
 clap = { version = "4.5", features = ["derive"], optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies]
-burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies]
-burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
 
 [dev-dependencies]
 safetensors = "0.6"

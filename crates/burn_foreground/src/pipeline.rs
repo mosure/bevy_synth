@@ -152,13 +152,7 @@ fn prepare_loaded_image<B: Backend>(
     let has_alpha = loaded.has_alpha;
 
     let alpha = if has_alpha {
-        alpha.and_then(|alpha| {
-            if is_valid_alpha(&alpha, width, height, 0.01) {
-                Some(alpha)
-            } else {
-                None
-            }
-        })
+        alpha.filter(|alpha| is_valid_alpha(alpha, width, height, 0.01))
     } else {
         None
     };
@@ -559,6 +553,7 @@ async fn infer_alpha_mask_async<B: Backend>(
     let mask_data = mask
         .into_data_async()
         .await
+        .map_err(|err| PrepareImageError(format!("failed to materialize RMBG mask: {err:?}")))?
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|err| PrepareImageError(format!("failed to read RMBG mask: {err:?}")))?;
@@ -612,7 +607,7 @@ fn postprocess_alpha_mask(
         .map(|value| (value * 255.0) as u8)
         .collect::<Vec<u8>>();
 
-    let thresh = otsu_threshold(&alpha_u8) as u8;
+    let thresh = otsu_threshold(&alpha_u8);
     for value in &mut alpha_u8 {
         *value = if *value > thresh { 255 } else { 0 };
     }

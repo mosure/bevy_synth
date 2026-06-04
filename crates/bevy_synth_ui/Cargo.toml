@@ -18,19 +18,19 @@ triposg = ["bevy_synth_runtime/triposg"]
 trellis = ["bevy_synth_runtime/trellis"]
 
 [dependencies]
-bevy = "0.17"
-bevy_mesh = "0.17"
-bevy_picking = "0.17"
+bevy = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_mesh = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_picking = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
 bevy_synth_runtime = { version = "0.2.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
 crossbeam-channel = "0.5"
-bevy_tasks = { version = "0.17", features = ["multi_threaded"] }
-bevy_app = { version = "0.17", default-features = false }
-bevy_ecs = { version = "0.17", default-features = false }
-bevy_utils = "0.17"
-bevy_window = { version = "0.17", default-features = false }
-bevy_winit = { version = "0.17" }
-bevy_derive = "0.17"
+bevy_tasks = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", features = ["multi_threaded"] }
+bevy_app = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", default-features = false }
+bevy_ecs = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", default-features = false }
+bevy_utils = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_window = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", default-features = false }
+bevy_winit = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_derive = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
 log = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

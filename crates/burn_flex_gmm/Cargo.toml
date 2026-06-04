@@ -1,6 +1,6 @@
 [package]
 name = "burn_flex_gmm"
-version = "0.21.0"
+version = "0.21.2"
 edition = "2024"
 description = "Sparse submanifold convolution kernels and FlexGMM-style gather+GEMM helpers."
 authors.workspace = true
@@ -18,32 +18,34 @@ default = []
 # launch API.
 legacy-wgpu-kernel = []
 wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
+cuda-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-cuda"]
 
 [dependencies]
 matrixmultiply = "0.3"
-burn = { version = "0.21.0", default-features = false, features = ["std"], optional = true }
+burn = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
 # Keep CubeCL deterministic on the canonical WGPU path: avoid default
 # `autotune` so runtime doesn't select vecmat kernels that require
 # unavailable plane-wide ops on some adapters.
-burn-cubecl = { version = "0.21.0", optional = true, default-features = false, features = ["std", "fusion"] }
+burn-cubecl = { version = "=0.21.0", optional = true, default-features = false, features = ["std"] }
+burn-cuda = { version = "=0.21.0", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
-version = "0.21.0"
+version = "=0.21.0"
 optional = true
 default-features = false
 features = ["fusion", "std", "vulkan"]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
-version = "0.21.0"
+version = "=0.21.0"
 optional = true
 default-features = false
 features = ["fusion", "std", "metal"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
-version = "0.21.0"
+version = "=0.21.0"
 optional = true
 default-features = false
-features = ["fusion", "std", "webgpu"]
+features = ["std", "webgpu"]
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }

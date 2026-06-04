@@ -135,6 +135,23 @@ pub(crate) fn load_blob_bytes_from_burnpack(path: &Path) -> Result<Vec<u8>, Stri
     read_blob_segments(path, payload_start, &segments)
 }
 
+pub(crate) fn load_blob_bytes_from_burnpack_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (metadata_start, file_len, metadata) = read_burnpack_metadata_from_bytes(bytes)?;
+    if metadata.tensors.is_empty() {
+        return Err("burnpack bytes contain no tensors".to_string());
+    }
+
+    let segments = resolve_blob_segments(Path::new("<memory>"), &metadata)?;
+    let max_end = segments
+        .iter()
+        .map(|segment| segment.end)
+        .max()
+        .unwrap_or(0);
+    let inferred_payload_start = file_len.saturating_sub(max_end);
+    let payload_start = inferred_payload_start.max(metadata_start);
+    read_blob_segments_from_bytes(bytes, payload_start, &segments)
+}
+
 fn read_burnpack_metadata(path: &Path) -> Result<(u64, u64, RawBurnpackMetadata), String> {
     let mut file = fs::File::open(path)
         .map_err(|err| format!("failed to open burnpack '{}': {err}", path.display()))?;
@@ -174,6 +191,38 @@ fn read_burnpack_metadata(path: &Path) -> Result<(u64, u64, RawBurnpackMetadata)
         file_len,
         metadata,
     ))
+}
+
+fn read_burnpack_metadata_from_bytes(
+    bytes: &[u8],
+) -> Result<(u64, u64, RawBurnpackMetadata), String> {
+    if bytes.len() < HEADER_SIZE {
+        return Err(format!(
+            "burnpack byte stream is too short ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let header = &bytes[..HEADER_SIZE];
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != MAGIC_NUMBER {
+        return Err(format!(
+            "invalid burnpack magic in in-memory bytes: expected {MAGIC_NUMBER:#x}, found {magic:#x}",
+        ));
+    }
+    let metadata_size = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    let metadata_end = HEADER_SIZE.saturating_add(metadata_size);
+    if metadata_end > bytes.len() {
+        return Err(format!(
+            "burnpack metadata out of bounds: header={} metadata={} total={}",
+            HEADER_SIZE,
+            metadata_size,
+            bytes.len()
+        ));
+    }
+    let metadata: RawBurnpackMetadata =
+        ciborium::de::from_reader(&bytes[HEADER_SIZE..metadata_end])
+            .map_err(|err| format!("failed to parse in-memory burnpack metadata: {err}"))?;
+    Ok((metadata_end as u64, bytes.len() as u64, metadata))
 }
 
 fn resolve_blob_segments(
@@ -258,6 +307,38 @@ fn read_blob_segments(
                 segment.end
             )
         })?;
+    }
+    Ok(out)
+}
+
+fn read_blob_segments_from_bytes(
+    bytes: &[u8],
+    data_start: u64,
+    segments: &[TensorSegment],
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for segment in segments {
+        if segment.end < segment.start {
+            return Err(format!(
+                "invalid in-memory burnpack tensor offsets: {}..{}",
+                segment.start, segment.end
+            ));
+        }
+        let len = segment.end.saturating_sub(segment.start) as usize;
+        if len == 0 {
+            continue;
+        }
+        let start = data_start.saturating_add(segment.start) as usize;
+        let end = start.saturating_add(len);
+        if end > bytes.len() {
+            return Err(format!(
+                "in-memory burnpack payload slice out of bounds: {}..{} (total={})",
+                start,
+                end,
+                bytes.len()
+            ));
+        }
+        out.extend_from_slice(&bytes[start..end]);
     }
     Ok(out)
 }

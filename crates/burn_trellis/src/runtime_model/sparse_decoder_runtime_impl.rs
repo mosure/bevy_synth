@@ -20,7 +20,7 @@ impl SparseUnetDecoderRuntime {
     ) -> Result<Self, String> {
         let config_path =
             resolve_model_source_path(model_stem, "json", weights_root, image_large_root);
-        let config_bytes = std::fs::read(&config_path).map_err(|err| {
+        let config_bytes = crate::virtual_fs::read(&config_path).map_err(|err| {
             format!(
                 "failed to read sparse decoder config '{}': {err}",
                 config_path.display()
@@ -1178,7 +1178,7 @@ impl SparseUnetDecoderRuntime {
                 } else if let Some(state_t) = state_feats_wgpu.take() {
                     if canonical_wgpu {
                         if let Some(context_gpu) = wgpu_context.as_deref_mut() {
-                            let output_layer_start = std::time::Instant::now();
+                            let output_layer_start = crate::time::Instant::now();
                             if decoder_conv_debug_enabled() {
                                 eprintln!(
                                     "burn_trellis: wgpu output_layer begin rows={} channels={}",
@@ -1961,8 +1961,10 @@ fn upsample_stage_to_output_chunks_wgpu(
             )
         })?;
     let max_tensor_bytes = decoder_wgpu_max_tensor_bytes();
+    let max_conv1_stream_bytes =
+        decoder_wgpu_upsample_conv1_max_output_bytes().min(max_tensor_bytes);
     let mut parent_chunk_rows =
-        decoder_wgpu_chunk_rows(parent_rows, bytes_per_parent_row, max_tensor_bytes).max(1);
+        decoder_wgpu_chunk_rows(parent_rows, bytes_per_parent_row, max_conv1_stream_bytes).max(1);
     let linear_parent_idx_t = linear_idx_t.clone().div_scalar(8i32);
     let idx_col = Tensor::<DefaultWgpuBackend, 1, Int>::from_ints([0], &context_gpu.device);
     let mut chunk_positions_t: Vec<Tensor<DefaultWgpuBackend, 1, Int>> = Vec::new();
@@ -2181,7 +2183,9 @@ fn upsample_conv1_select_children_wgpu(
             )
         })?;
     let max_tensor_bytes = decoder_wgpu_max_tensor_bytes();
-    if conv1_output_bytes <= max_tensor_bytes {
+    let max_conv1_direct_bytes =
+        decoder_wgpu_upsample_conv1_max_output_bytes().min(max_tensor_bytes);
+    if conv1_output_bytes <= max_conv1_direct_bytes {
         let h_conv1_t = context_gpu.forward_with_coords_tensor_device(
             &conv1_config,
             &up.conv1,
@@ -2204,7 +2208,7 @@ fn upsample_conv1_select_children_wgpu(
     let linear_parent_idx_t = linear_idx_t.clone().div_scalar(8i32);
     let idx_col = Tensor::<DefaultWgpuBackend, 1, Int>::from_ints([0], &context_gpu.device);
     let mut parent_chunk_rows =
-        decoder_wgpu_chunk_rows(parent_rows, bytes_per_parent_row, max_tensor_bytes).max(1);
+        decoder_wgpu_chunk_rows(parent_rows, bytes_per_parent_row, max_conv1_direct_bytes).max(1);
     let mut chunk_positions_t: Vec<Tensor<DefaultWgpuBackend, 1, Int>> = Vec::new();
     let mut chunk_features_t: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
     let mut start = 0usize;

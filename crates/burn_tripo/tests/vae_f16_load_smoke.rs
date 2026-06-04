@@ -1,6 +1,9 @@
+#![cfg(feature = "import")]
+
 use std::path::PathBuf;
 
 use burn::backend::NdArray;
+use burn::tensor::backend::BackendTypes;
 use burn_tripo::model::triposg::vae::TripoSGVaeConfig;
 use burn_tripo::model::triposg::vae::import::load_triposg_vae_decoder_from_burnpack_bytes;
 
@@ -13,7 +16,7 @@ fn vae_f16_burnpack_loads_on_ndarray() {
     }
 
     let bytes = std::fs::read(&path).expect("read f16 vae burnpack");
-    let device = <NdArray<f32> as burn::prelude::Backend>::Device::default();
+    let device = <NdArray<f32> as BackendTypes>::Device::default();
     let config = TripoSGVaeConfig::midi_3d();
     let result =
         load_triposg_vae_decoder_from_burnpack_bytes::<NdArray<f32>>(&config, &device, bytes);

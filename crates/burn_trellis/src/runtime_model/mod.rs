@@ -1,3 +1,5 @@
+#[cfg(all(feature = "runtime-model", target_arch = "wasm32"))]
+pub(crate) mod chunked_blob_safetensors;
 #[cfg(feature = "runtime-model")]
 pub mod fdg_decoder;
 #[cfg(feature = "runtime-model")]

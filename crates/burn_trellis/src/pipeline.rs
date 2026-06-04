@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
+#[cfg(feature = "runtime-model-wgpu")]
+use burn::tensor::{Int, Tensor};
 use clap::ValueEnum;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
@@ -18,13 +19,17 @@ use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_r
 use crate::preprocess::{
     PreprocessConfig, PreprocessOutput, preprocess_image, preprocess_image_path,
 };
+#[cfg(feature = "runtime-model-wgpu")]
+use crate::runtime_model::sparse_structure_flow::WgpuRuntimeBackend as PipelineWgpuBackend;
 use crate::sampler::{FlowEulerSampleConfig, timestep_pairs};
 use crate::staged_pipeline::{
-    DecodeShapeSubSample, DecodeStageSource, DecodeTexVoxelSample, SamplerConfigOverride,
-    SparseRowNoiseOverride, SparseStructureStageSource, TrellisNoiseOverrides,
-    TrellisSamplerRuntimeOverrides, TrellisStageOutput, TrellisStageRunConfig, TrellisStageRuntime,
+    DecodeStageSource, SamplerConfigOverride, SparseRowNoiseOverride, SparseStructureStageSource,
+    TrellisNoiseOverrides, TrellisSamplerRuntimeOverrides, TrellisStageOutput,
+    TrellisStageRunConfig, TrellisStageRuntime,
 };
+use crate::time::Instant;
 use crate::trellis_config::{TrellisPipelineArgs, TrellisPipelineConfig};
+use crate::virtual_fs;
 
 const HOOK_MAX_ROWS: usize = usize::MAX;
 const HOOK_MAX_DENSE_ELEMENTS: usize = usize::MAX;
@@ -242,14 +247,14 @@ impl Trellis2Pipeline {
 
     pub fn validate_runtime(&self) -> Result<(), TrellisRuntimeError> {
         let pipeline_path = self.config.weights_root.join("pipeline.json");
-        if !pipeline_path.exists() {
+        if !virtual_fs::exists(&pipeline_path) {
             return Err(TrellisRuntimeError::new(format!(
                 "missing Trellis2 pipeline.json: {}",
                 pipeline_path.display()
             )));
         }
 
-        let pipeline_bytes = std::fs::read(&pipeline_path).map_err(|err| {
+        let pipeline_bytes = virtual_fs::read(&pipeline_path).map_err(|err| {
             TrellisRuntimeError::new(format!(
                 "failed to read Trellis2 pipeline config '{}': {err}",
                 pipeline_path.display()
@@ -277,7 +282,7 @@ impl Trellis2Pipeline {
                 &self.config.weights_root,
                 self.config.image_large_root.as_deref(),
             );
-            if !config_path.exists() {
+            if !virtual_fs::exists(&config_path) {
                 missing.push(config_path.display().to_string());
             }
 
@@ -291,11 +296,11 @@ impl Trellis2Pipeline {
             let bpk_f16_path = with_file_stem_suffix(&bpk_path, "_f16");
             let bpk_parts_path = burnpack_parts_manifest_path(&bpk_path);
             let bpk_f16_parts_path = burnpack_parts_manifest_path(&bpk_f16_path);
-            if !safetensors_path.exists()
-                && !bpk_path.exists()
-                && !bpk_f16_path.exists()
-                && !bpk_parts_path.exists()
-                && !bpk_f16_parts_path.exists()
+            if !virtual_fs::exists(&safetensors_path)
+                && !virtual_fs::exists(&bpk_path)
+                && !virtual_fs::exists(&bpk_f16_path)
+                && !virtual_fs::exists(&bpk_parts_path)
+                && !virtual_fs::exists(&bpk_f16_parts_path)
             {
                 missing.push(format!(
                     "{} (or {} / {} / {} / {})",
@@ -533,7 +538,7 @@ impl Trellis2Pipeline {
             return Ok(args);
         }
         let pipeline_path = self.config.weights_root.join("pipeline.json");
-        let pipeline_bytes = std::fs::read(&pipeline_path).map_err(|err| {
+        let pipeline_bytes = virtual_fs::read(&pipeline_path).map_err(|err| {
             TrellisRuntimeError::new(format!(
                 "failed to read Trellis2 pipeline config '{}': {err}",
                 pipeline_path.display()
@@ -594,23 +599,19 @@ impl Trellis2Pipeline {
         )?;
         overrides.tex_noise =
             extract_sparse_row_noise_override(&snapshot, "sample_tex_slat.noise", path.as_path())?;
-        overrides.shape_slat =
-            extract_sparse_row_noise_override(&snapshot, "sample_shape_slat.slat", path.as_path())?;
-        overrides.tex_slat =
-            extract_sparse_row_noise_override(&snapshot, "sample_tex_slat.slat", path.as_path())?;
-        overrides.decode_shape_input = extract_sparse_row_noise_override(
-            &snapshot,
-            "decode_shape_slat.input",
-            path.as_path(),
-        )?;
-        overrides.decode_tex_input =
-            extract_sparse_row_noise_override(&snapshot, "decode_tex_slat.input", path.as_path())?;
-        overrides.decode_shape_subs =
-            extract_decode_shape_subs_override(&snapshot, path.as_path())?;
-        overrides.decode_tex_voxels =
-            extract_decode_tex_voxels_override(&snapshot, path.as_path())?;
-        overrides.decode_mesh_vertices = extract_decode_mesh_vertices_override(&snapshot)?;
-        overrides.decode_mesh_faces = extract_decode_mesh_faces_override(&snapshot)?;
+        // Keep runtime model stages active during parity runs; do not inject final
+        // stage outputs from hooks because that bypasses canonical shape/tex flows.
+        overrides.shape_slat = None;
+        overrides.tex_slat = None;
+        // Canonical runtime decode is intentionally fail-fast and non-bypassable.
+        // Keep hook overrides restricted to sampling/conditioning stages so strict
+        // parity runs compare real runtime decode outputs instead of injected tensors.
+        overrides.decode_shape_input = None;
+        overrides.decode_tex_input = None;
+        overrides.decode_shape_subs = None;
+        overrides.decode_tex_voxels = None;
+        overrides.decode_mesh_vertices = None;
+        overrides.decode_mesh_faces = None;
         overrides.shape_noise_dense =
             extract_dense_f32_override(&snapshot, "sample_shape_slat.noise_dense");
         overrides.tex_noise_dense =
@@ -880,12 +881,43 @@ impl Trellis2Pipeline {
                     stage_output.sparse.latent.clone(),
                 )
                 .map_err(TrellisRuntimeError::new)?;
-            let sparse_indices = sampled_row_indices(stage_output.sparse.coords.len(), 4);
+            #[cfg(feature = "runtime-model-wgpu")]
+            let sparse_coords_for_hook = hook_sparse_coords_for_trace(
+                stage_output.sparse.coords.as_slice(),
+                stage_output.sparse.coords_wgpu.as_ref(),
+                "sample_sparse_structure.coords",
+            )?;
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            let sparse_coords_for_hook =
+                hook_sparse_coords_for_trace(stage_output.sparse.coords.as_slice(), None, "")?;
+            #[cfg(feature = "runtime-model-wgpu")]
+            let shape_coords_for_hook = hook_sparse_coords_for_trace(
+                stage_output.shape_slat.coords.as_slice(),
+                stage_output.shape_slat.coords_wgpu.as_ref(),
+                "sample_shape_slat.coords",
+            )?;
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            let shape_coords_for_hook =
+                hook_sparse_coords_for_trace(stage_output.shape_slat.coords.as_slice(), None, "")?;
+            #[cfg(feature = "runtime-model-wgpu")]
+            let tex_coords_for_hook = hook_sparse_coords_for_trace(
+                stage_output.tex_slat.coords.as_slice(),
+                stage_output.tex_slat.coords_wgpu.as_ref(),
+                "sample_tex_slat.coords",
+            )?;
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            let tex_coords_for_hook =
+                hook_sparse_coords_for_trace(stage_output.tex_slat.coords.as_slice(), None, "")?;
+
+            let sparse_indices = sampled_row_indices(sparse_coords_for_hook.len(), 4);
             trace
                 .insert_f32(
                     "sample_sparse_structure.coords",
                     vec![sparse_indices.len(), 4],
-                    flatten_coords_indices(&stage_output.sparse.coords, sparse_indices.as_slice()),
+                    flatten_coords_indices(
+                        sparse_coords_for_hook.as_slice(),
+                        sparse_indices.as_slice(),
+                    ),
                 )
                 .map_err(TrellisRuntimeError::new)?;
             if let Some(dense_noise) = stage_output.shape_slat.dense_noise.as_ref()
@@ -910,7 +942,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_shape_slat.noise",
-                &stage_output.shape_slat.coords,
+                shape_coords_for_hook.as_slice(),
                 &stage_output.shape_slat.noise,
                 32,
                 stage_output.sparse.resolution,
@@ -933,7 +965,7 @@ impl Trellis2Pipeline {
                 insert_sparse_trace_rows(
                     &mut trace,
                     prefix.as_str(),
-                    &stage_output.shape_slat.coords,
+                    shape_coords_for_hook.as_slice(),
                     shape_slat_step_values(&stage_output.shape_slat, step_idx),
                     32,
                     stage_output.sparse.resolution,
@@ -943,7 +975,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_shape_slat.slat",
-                &stage_output.shape_slat.coords,
+                shape_coords_for_hook.as_slice(),
                 &stage_output.shape_slat.features,
                 32,
                 stage_output.sparse.resolution,
@@ -971,7 +1003,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.noise",
-                &stage_output.tex_slat.coords,
+                tex_coords_for_hook.as_slice(),
                 &stage_output.tex_slat.noise,
                 32,
                 stage_output.sparse.resolution,
@@ -994,7 +1026,7 @@ impl Trellis2Pipeline {
                 insert_sparse_trace_rows(
                     &mut trace,
                     prefix.as_str(),
-                    &stage_output.tex_slat.coords,
+                    tex_coords_for_hook.as_slice(),
                     tex_slat_step_values(&stage_output.tex_slat, step_idx),
                     32,
                     stage_output.sparse.resolution,
@@ -1004,7 +1036,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.shape_slat_cond",
-                &stage_output.tex_slat.coords,
+                tex_coords_for_hook.as_slice(),
                 &stage_output.tex_slat.shape_slat_cond,
                 32,
                 stage_output.sparse.resolution,
@@ -1013,7 +1045,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.slat",
-                &stage_output.tex_slat.coords,
+                tex_coords_for_hook.as_slice(),
                 &stage_output.tex_slat.features,
                 32,
                 stage_output.sparse.resolution,
@@ -1021,11 +1053,11 @@ impl Trellis2Pipeline {
             .map_err(TrellisRuntimeError::new)?;
             let (decode_shape_coords, decode_shape_feats) =
                 if let Some(rows) = stage_output.decode_shape_input.as_ref() {
-                    (&rows.coords, &rows.feats)
+                    (rows.coords.as_slice(), rows.feats.as_slice())
                 } else {
                     (
-                        &stage_output.shape_slat.coords,
-                        &stage_output.shape_slat.features,
+                        shape_coords_for_hook.as_slice(),
+                        stage_output.shape_slat.features.as_slice(),
                     )
                 };
             insert_sparse_trace_rows(
@@ -1039,11 +1071,11 @@ impl Trellis2Pipeline {
             .map_err(TrellisRuntimeError::new)?;
             let (decode_tex_coords, decode_tex_feats) =
                 if let Some(rows) = stage_output.decode_tex_input.as_ref() {
-                    (&rows.coords, &rows.feats)
+                    (rows.coords.as_slice(), rows.feats.as_slice())
                 } else {
                     (
-                        &stage_output.tex_slat.coords,
-                        &stage_output.tex_slat.features,
+                        tex_coords_for_hook.as_slice(),
+                        stage_output.tex_slat.features.as_slice(),
                     )
                 };
             insert_sparse_trace_rows(
@@ -1395,121 +1427,6 @@ fn extract_sparse_row_noise_override(
     }
 }
 
-fn extract_decode_shape_subs_override(
-    snapshot: &HookSnapshot,
-    source_path: &Path,
-) -> Result<Option<Vec<DecodeShapeSubSample>>, TrellisRuntimeError> {
-    let mut levels = Vec::new();
-    let mut saw_any_key = false;
-    for level in 0..4usize {
-        let coords_key = format!("decode_shape_slat.subs.{level}.coords");
-        let feats_key = format!("decode_shape_slat.subs.{level}.feats");
-        let spatial_key = format!("decode_shape_slat.subs.{level}.spatial_shape");
-        let coords = snapshot.tensors.get(coords_key.as_str());
-        let feats = snapshot.tensors.get(feats_key.as_str());
-        let spatial = snapshot.tensors.get(spatial_key.as_str());
-        if coords.is_none() && feats.is_none() && spatial.is_none() {
-            continue;
-        }
-        saw_any_key = true;
-        let Some(coords) = coords else {
-            return Err(TrellisRuntimeError::new(format!(
-                "noise override hook '{}' missing key '{}' for decode shape override level {}",
-                source_path.display(),
-                coords_key,
-                level
-            )));
-        };
-        let Some(feats) = feats else {
-            return Err(TrellisRuntimeError::new(format!(
-                "noise override hook '{}' missing key '{}' for decode shape override level {}",
-                source_path.display(),
-                feats_key,
-                level
-            )));
-        };
-        let Some(spatial) = spatial else {
-            return Err(TrellisRuntimeError::new(format!(
-                "noise override hook '{}' missing key '{}' for decode shape override level {}",
-                source_path.display(),
-                spatial_key,
-                level
-            )));
-        };
-        levels.push(DecodeShapeSubSample {
-            coords: hook_tensor_to_coords4(coords_key.as_str(), coords)?,
-            feats: hook_tensor_to_rows8(feats_key.as_str(), feats)?,
-            spatial_shape: hook_tensor_to_spatial_shape3(spatial_key.as_str(), spatial)?,
-        });
-    }
-    if saw_any_key {
-        Ok(Some(levels))
-    } else {
-        Ok(None)
-    }
-}
-
-fn extract_decode_tex_voxels_override(
-    snapshot: &HookSnapshot,
-    source_path: &Path,
-) -> Result<Option<DecodeTexVoxelSample>, TrellisRuntimeError> {
-    let coords_key = "decode_tex_slat.voxels.coords";
-    let feats_key = "decode_tex_slat.voxels.feats";
-    let spatial_key = "decode_tex_slat.voxels.spatial_shape";
-    let coords = snapshot.tensors.get(coords_key);
-    let feats = snapshot.tensors.get(feats_key);
-    let spatial = snapshot.tensors.get(spatial_key);
-    if coords.is_none() && feats.is_none() && spatial.is_none() {
-        return Ok(None);
-    }
-    let Some(coords) = coords else {
-        return Err(TrellisRuntimeError::new(format!(
-            "noise override hook '{}' missing key '{}' for decode tex override",
-            source_path.display(),
-            coords_key
-        )));
-    };
-    let Some(feats) = feats else {
-        return Err(TrellisRuntimeError::new(format!(
-            "noise override hook '{}' missing key '{}' for decode tex override",
-            source_path.display(),
-            feats_key
-        )));
-    };
-    let Some(spatial) = spatial else {
-        return Err(TrellisRuntimeError::new(format!(
-            "noise override hook '{}' missing key '{}' for decode tex override",
-            source_path.display(),
-            spatial_key
-        )));
-    };
-    Ok(Some(DecodeTexVoxelSample {
-        coords: hook_tensor_to_coords4(coords_key, coords)?,
-        feats: hook_tensor_to_rows6(feats_key, feats)?,
-        spatial_shape: hook_tensor_to_spatial_shape3(spatial_key, spatial)?,
-    }))
-}
-
-fn extract_decode_mesh_vertices_override(
-    snapshot: &HookSnapshot,
-) -> Result<Option<Vec<[f32; 3]>>, TrellisRuntimeError> {
-    let key = "decode_shape_slat.meshes.0.vertices";
-    let Some(tensor) = snapshot.tensors.get(key) else {
-        return Ok(None);
-    };
-    hook_tensor_to_vertices3(key, tensor).map(Some)
-}
-
-fn extract_decode_mesh_faces_override(
-    snapshot: &HookSnapshot,
-) -> Result<Option<Vec<[u32; 3]>>, TrellisRuntimeError> {
-    let key = "decode_shape_slat.meshes.0.faces";
-    let Some(tensor) = snapshot.tensors.get(key) else {
-        return Ok(None);
-    };
-    hook_tensor_to_faces3(key, tensor).map(Some)
-}
-
 fn extract_dense_f32_override(snapshot: &HookSnapshot, key: &str) -> Option<Vec<f32>> {
     snapshot.tensors.get(key).map(|tensor| tensor.data.clone())
 }
@@ -1557,6 +1474,56 @@ fn extract_sampler_override(
             guidance_interval: [interval_start, interval_end],
         },
     }))
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn hook_sparse_coords_for_trace(
+    host_coords: &[[u32; 4]],
+    coords_wgpu: Option<&Tensor<PipelineWgpuBackend, 2, Int>>,
+    context: &str,
+) -> Result<Vec<[u32; 4]>, TrellisRuntimeError> {
+    if !host_coords.is_empty() {
+        return Ok(host_coords.to_vec());
+    }
+    let Some(coords_t) = coords_wgpu else {
+        return Ok(Vec::new());
+    };
+    let [rows, cols] = coords_t.dims();
+    if cols != 4 {
+        return Err(TrellisRuntimeError::new(format!(
+            "{context}: invalid device coord shape [{rows},{cols}], expected [N,4]"
+        )));
+    }
+    let flat =
+        crate::runtime_model::types::extraction::tensor_i32_to_vec(coords_t.clone(), context)
+            .map_err(TrellisRuntimeError::new)?;
+    if flat.len() != rows.saturating_mul(4) {
+        return Err(TrellisRuntimeError::new(format!(
+            "{context}: invalid device coord payload len {} for rows {}",
+            flat.len(),
+            rows
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row * 4;
+        out.push([
+            flat[base].max(0) as u32,
+            flat[base + 1].max(0) as u32,
+            flat[base + 2].max(0) as u32,
+            flat[base + 3].max(0) as u32,
+        ]);
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "runtime-model-wgpu"))]
+fn hook_sparse_coords_for_trace(
+    host_coords: &[[u32; 4]],
+    _coords_wgpu: Option<&()>,
+    _context: &str,
+) -> Result<Vec<[u32; 4]>, TrellisRuntimeError> {
+    Ok(host_coords.to_vec())
 }
 
 fn hook_tensor_to_coords4(
@@ -1616,145 +1583,6 @@ fn hook_tensor_to_rows32(
         out.push(values);
     }
     Ok(out)
-}
-
-fn hook_tensor_to_rows8(
-    key: &str,
-    tensor: &HookTensor,
-) -> Result<Vec<[f32; 8]>, TrellisRuntimeError> {
-    if tensor.shape.len() != 2 || tensor.shape[1] != 8 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has invalid shape {:?}; expected [N, 8]",
-            tensor.shape
-        )));
-    }
-    let rows = tensor.shape[0];
-    if tensor.data.len() != rows * 8 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has {} elements, expected {}",
-            tensor.data.len(),
-            rows * 8
-        )));
-    }
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let base = row * 8;
-        let mut values = [0.0f32; 8];
-        values.copy_from_slice(&tensor.data[base..base + 8]);
-        out.push(values);
-    }
-    Ok(out)
-}
-
-fn hook_tensor_to_rows6(
-    key: &str,
-    tensor: &HookTensor,
-) -> Result<Vec<[f32; 6]>, TrellisRuntimeError> {
-    if tensor.shape.len() != 2 || tensor.shape[1] != 6 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has invalid shape {:?}; expected [N, 6]",
-            tensor.shape
-        )));
-    }
-    let rows = tensor.shape[0];
-    if tensor.data.len() != rows * 6 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has {} elements, expected {}",
-            tensor.data.len(),
-            rows * 6
-        )));
-    }
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let base = row * 6;
-        let mut values = [0.0f32; 6];
-        values.copy_from_slice(&tensor.data[base..base + 6]);
-        out.push(values);
-    }
-    Ok(out)
-}
-
-fn hook_tensor_to_vertices3(
-    key: &str,
-    tensor: &HookTensor,
-) -> Result<Vec<[f32; 3]>, TrellisRuntimeError> {
-    if tensor.shape.len() != 2 || tensor.shape[1] != 3 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has invalid shape {:?}; expected [N, 3]",
-            tensor.shape
-        )));
-    }
-    let rows = tensor.shape[0];
-    if tensor.data.len() != rows * 3 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has {} elements, expected {}",
-            tensor.data.len(),
-            rows * 3
-        )));
-    }
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let base = row * 3;
-        out.push([
-            tensor.data[base],
-            tensor.data[base + 1],
-            tensor.data[base + 2],
-        ]);
-    }
-    Ok(out)
-}
-
-fn hook_tensor_to_faces3(
-    key: &str,
-    tensor: &HookTensor,
-) -> Result<Vec<[u32; 3]>, TrellisRuntimeError> {
-    if tensor.shape.len() != 2 || tensor.shape[1] != 3 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has invalid shape {:?}; expected [N, 3]",
-            tensor.shape
-        )));
-    }
-    let rows = tensor.shape[0];
-    if tensor.data.len() != rows * 3 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has {} elements, expected {}",
-            tensor.data.len(),
-            rows * 3
-        )));
-    }
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let base = row * 3;
-        out.push([
-            tensor.data[base].round().max(0.0) as u32,
-            tensor.data[base + 1].round().max(0.0) as u32,
-            tensor.data[base + 2].round().max(0.0) as u32,
-        ]);
-    }
-    Ok(out)
-}
-
-fn hook_tensor_to_spatial_shape3(
-    key: &str,
-    tensor: &HookTensor,
-) -> Result<[u32; 3], TrellisRuntimeError> {
-    if tensor.shape.len() != 1 || tensor.shape[0] != 3 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has invalid shape {:?}; expected [3]",
-            tensor.shape
-        )));
-    }
-    if tensor.data.len() != 3 {
-        return Err(TrellisRuntimeError::new(format!(
-            "hook tensor '{key}' has {} elements, expected 3",
-            tensor.data.len()
-        )));
-    }
-    Ok([
-        tensor.data[0].round().max(0.0) as u32,
-        tensor.data[1].round().max(0.0) as u32,
-        tensor.data[2].round().max(0.0) as u32,
-    ])
 }
 
 fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {

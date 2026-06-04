@@ -4,13 +4,18 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
+#[cfg(target_arch = "wasm32")]
+use super::chunked_blob_safetensors::{
+    ChunkedBlobSafetensorsStore, chunked_blob_parts_manifest_exists,
+};
 use super::runtime_config::{
     runtime_model_attention_debug_enabled, runtime_model_stage_debug_enabled,
 };
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
+use crate::time::Instant;
+use crate::virtual_fs;
 use burn::module::{Ignored, Module, Param};
 use burn::nn;
 use burn::prelude::Backend;
@@ -2312,7 +2317,7 @@ where
     ) -> Result<Self, String> {
         let config_path =
             resolve_model_source_path(model_stem, "json", weights_root, image_large_root);
-        let config_bytes = std::fs::read(&config_path).map_err(|err| {
+        let config_bytes = virtual_fs::read(&config_path).map_err(|err| {
             format!(
                 "failed to read sparse structure flow config '{}': {err}",
                 config_path.display()
@@ -4420,21 +4425,24 @@ fn sparse_flow_mlp_chunk_tokens_for_backend<B: Backend>(tokens: usize) -> usize 
     if !attention_uses_non_fusion_module_kernel::<B>() {
         return default;
     }
-    if tokens <= 8_192 {
-        // Keep native non-fusion WGPU sparse-flow MLP unchunked for small/mid
-        // token regimes. This removes per-chunk matmul/concat overhead on the
-        // common 4k-token shape/tex SLAT path while preserving larger-token
-        // chunking safeguards.
-        return tokens.max(1);
-    }
     // Non-fusion WGPU module-attention path can tolerate wider MLP chunks.
-    // This cuts launch/concatenation overhead without unbounding peak memory.
-    if tokens >= 65_536 {
+    // This cuts launch/concatenation overhead while keeping canonical sparse
+    // SLAT stages below common adapter allocation ceilings.
+    let widened = if tokens >= 65_536 {
         8_192usize.min(tokens.max(1)).max(default)
     } else if tokens >= 16_384 {
         4_096usize.min(tokens.max(1)).max(default)
     } else {
         default
+    };
+    // Keep per-chunk hidden activations bounded for WGPU sparse-flow MLP.
+    // The 1024 shape_slat path (rows ~= 4_912, hidden ~= 8_192) can otherwise
+    // request a single ~161 MiB buffer and panic on adapters with ~128 MiB
+    // effective storage allocation limits.
+    if attention_uses_module_kernel::<B>() {
+        widened.min(4_096usize).min(tokens.max(1))
+    } else {
+        widened
     }
 }
 
@@ -5175,6 +5183,21 @@ fn load_sparse_model_weights<B: Backend>(
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("bpk"))
     {
+        #[cfg(target_arch = "wasm32")]
+        if chunked_blob_parts_manifest_exists(path) {
+            let mut chunked_store =
+                ChunkedBlobSafetensorsStore::from_blob_burnpack_parts(path, key_remap_rules())?;
+            return model
+                .load_from(&mut chunked_store)
+                .map(|_| ())
+                .map_err(|err| {
+                    format!(
+                        "failed to load sparse flow burnpack parts '{}' on wasm chunked safetensors path: {err}",
+                        path.display()
+                    )
+                });
+        }
+
         // Canonical sparse-flow checkpoints are stored as raw safetensors blobs in burnpacks.
         // Legacy module-layout burnpacks are not supported on the canonical runtime path.
         let blob_bytes = load_blob_bytes_from_burnpack_or_parts(path, load_burnpack_blob_bytes)?;
@@ -5189,7 +5212,17 @@ fn load_sparse_model_weights<B: Backend>(
                 )
             })
     } else {
-        let mut store = build_safetensor_store(path)?;
+        let mut store = if virtual_fs::has_virtual_file(path) {
+            let bytes = virtual_fs::read(path).map_err(|err| {
+                format!(
+                    "failed to read virtual sparse flow safetensors '{}': {err}",
+                    path.display()
+                )
+            })?;
+            build_safetensor_store_from_bytes(bytes)?
+        } else {
+            build_safetensor_store(path)?
+        };
         model.load_from(&mut store).map(|_| ()).map_err(|err| {
             format!(
                 "failed to load sparse flow safetensors '{}': {err}",
@@ -6071,14 +6104,14 @@ mod tests {
 
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
-    fn sparse_flow_backend_chunk_tokens_wgpu_use_wider_chunks() {
+    fn sparse_flow_backend_chunk_tokens_wgpu_respect_memory_safe_chunks() {
         assert_eq!(
             super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(4_096),
-            4_096
+            2_048
         );
         assert_eq!(
             super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(8_192),
-            8_192
+            2_048
         );
         assert_eq!(
             super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(32_768),

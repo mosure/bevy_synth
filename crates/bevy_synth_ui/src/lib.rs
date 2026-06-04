@@ -1,13 +1,14 @@
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{CameraOutputMode, RenderTarget};
 use bevy::pbr::MeshMaterial3d;
 use bevy::prelude::*;
-use bevy::render::alpha::AlphaMode;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::ui::widget::Button;
 use bevy::window::PrimaryWindow;
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
+use log::info;
 
 /// Internalized editor-core module.
 ///
@@ -27,6 +28,10 @@ pub mod bevy_transform_gizmos;
 
 use crate::bevy_file_dialog::prelude::FileDialogExt;
 
+use bevy_synth_runtime::args::{
+    AppArgs, BackendKind, SynthesisModel, TRIPOSPLAT_GAUSSIAN_STEP, TRIPOSPLAT_MAX_NUM_GAUSSIANS,
+    TRIPOSPLAT_MIN_NUM_GAUSSIANS, TripoSplatProfile,
+};
 use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest, UiStatus};
 
 const PANEL_WIDTH: f32 = 336.0;
@@ -61,6 +66,8 @@ const BUTTON_OPEN_BG_PRESSED: Color = Color::srgb(0.22, 0.29, 0.47);
 const BUTTON_OPEN_BORDER: Color = Color::srgb(0.32, 0.4, 0.62);
 const BUTTON_OPEN_BORDER_HOVER: Color = Color::srgb(0.43, 0.53, 0.8);
 const BUTTON_OPEN_BORDER_PRESSED: Color = Color::srgb(0.55, 0.66, 0.95);
+const BUTTON_ACTIVE_BG: Color = Color::srgb(0.18, 0.23, 0.34);
+const BUTTON_ACTIVE_BORDER: Color = Color::srgb(0.48, 0.58, 0.78);
 const ENTRY_BG: Color = Color::srgb(0.1, 0.11, 0.14);
 const ENTRY_BG_HOVER: Color = Color::srgb(0.13, 0.15, 0.2);
 const ENTRY_BG_PRESSED: Color = Color::srgb(0.17, 0.2, 0.28);
@@ -72,6 +79,14 @@ const STATUS_BADGE_BORDER: Color = Color::srgb(0.24, 0.27, 0.33);
 const STATUS_IDLE: Color = Color::srgb(0.52, 0.56, 0.64);
 const STATUS_PENDING: Color = Color::srgb(0.26, 0.62, 0.88);
 const STATUS_PROCESSING: Color = Color::srgb(0.93, 0.66, 0.2);
+const MODAL_SCRIM: Color = Color::srgba(0.0, 0.0, 0.0, 0.45);
+const MODAL_BG: Color = Color::srgb(0.07, 0.08, 0.1);
+const MODAL_BORDER: Color = Color::srgb(0.24, 0.27, 0.34);
+const TRIPOSPLAT_MIN_STEPS: usize = 1;
+const TRIPOSPLAT_MAX_STEPS: usize = 50;
+const TRIPOSPLAT_MIN_GUIDANCE: f32 = 1.0;
+const TRIPOSPLAT_MAX_GUIDANCE: f32 = 10.0;
+const TRIPOSPLAT_GUIDANCE_STEP: f32 = 0.5;
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -100,6 +115,7 @@ impl Plugin for BurnSynthUiPlugin {
         app.init_resource::<CatalogState>()
             .init_resource::<DragState>()
             .init_resource::<CatalogSelectionState>()
+            .init_resource::<SettingsModalState>()
             .add_message::<CatalogSpawnRequest>()
             .add_message::<CatalogDeleteRequest>()
             .add_systems(Startup, setup_ui)
@@ -111,6 +127,13 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_page_buttons,
                     handle_catalog_delete_button,
                     handle_catalog_delete_shortcut,
+                    handle_pipeline_button,
+                    handle_settings_button,
+                    handle_settings_close_button,
+                    handle_triposplat_profile_button,
+                    handle_triposplat_setting_step_button,
+                    sync_settings_modal,
+                    update_settings_labels,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
                     update_button_visuals,
                     (
@@ -324,10 +347,14 @@ pub struct CatalogUiState {
     last_revision: u64,
     last_expanded: bool,
     panel_width: f32,
+    settings_modal_open: bool,
 }
 
 impl CatalogUiState {
     pub fn cursor_over_ui(&self, window: &Window) -> bool {
+        if self.settings_modal_open {
+            return true;
+        }
         window
             .cursor_position()
             .map(|cursor| {
@@ -395,6 +422,52 @@ struct CatalogDeleteButton;
 struct OpenImageButton;
 
 #[derive(Component)]
+struct PipelineButton {
+    model: SynthesisModel,
+}
+
+#[derive(Component)]
+struct SettingsButton;
+
+#[derive(Component)]
+struct SettingsCloseButton;
+
+#[derive(Component)]
+struct SettingsModalRoot;
+
+#[derive(Component)]
+struct TripoSplatProfileButton {
+    profile: TripoSplatProfile,
+}
+
+#[derive(Component)]
+struct TripoSplatSettingStepButton {
+    setting: TripoSplatSetting,
+    delta: TripoSplatSettingDelta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TripoSplatSetting {
+    Steps,
+    Guidance,
+    Gaussians,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TripoSplatSettingDelta {
+    Integer(isize),
+    Float(f32),
+}
+
+#[derive(Component)]
+struct TripoSplatSettingValueLabel {
+    setting: TripoSplatSetting,
+}
+
+#[derive(Component)]
+struct TripoSplatProfileValueLabel;
+
+#[derive(Component)]
 struct ThumbnailSpin;
 
 #[derive(Component)]
@@ -415,6 +488,40 @@ struct ButtonLabel;
 
 #[derive(Component)]
 struct UiRootNode;
+
+#[derive(Resource, Default)]
+struct SettingsModalState {
+    open: bool,
+    entity: Option<Entity>,
+}
+
+fn pipeline_label(model: SynthesisModel) -> &'static str {
+    match model {
+        SynthesisModel::Triposg => "TripoSG",
+        SynthesisModel::Trellis => "Trellis",
+        SynthesisModel::Triposplat => "TripoSplat",
+    }
+}
+
+fn pipeline_supported(args: Option<&AppArgs>, model: SynthesisModel) -> bool {
+    let Some(args) = args else {
+        return true;
+    };
+    match model {
+        SynthesisModel::Triposplat => triposplat_supported_for_backend(args.backend.clone()),
+        SynthesisModel::Triposg | SynthesisModel::Trellis => true,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn triposplat_supported_for_backend(backend: BackendKind) -> bool {
+    matches!(backend, BackendKind::Cuda)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn triposplat_supported_for_backend(backend: BackendKind) -> bool {
+    matches!(backend, BackendKind::Wgpu)
+}
 
 fn setup_ui(mut commands: Commands) {
     let mut list_entity = Entity::PLACEHOLDER;
@@ -474,7 +581,6 @@ fn setup_ui(mut commands: Commands) {
                         },
                         BorderColor::all(BUTTON_OPEN_BORDER),
                         BackgroundColor(BUTTON_OPEN_BG),
-                        BorderRadius::all(Val::Px(7.0)),
                     ))
                     .with_children(|button| {
                         button.spawn((
@@ -483,6 +589,38 @@ fn setup_ui(mut commands: Commands) {
                             TextColor(BUTTON_TEXT),
                             ButtonLabel,
                         ));
+                    });
+
+                    left.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|selector| {
+                        for model in [SynthesisModel::Triposg, SynthesisModel::Triposplat] {
+                            selector
+                                .spawn((
+                                    Button,
+                                    PipelineButton { model },
+                                    ControlButton(ControlButtonKind::Secondary),
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(9.0), Val::Px(5.0)),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        ..default()
+                                    },
+                                    BorderColor::all(BUTTON_BORDER),
+                                    BackgroundColor(BUTTON_BG),
+                                ))
+                                .with_children(|button| {
+                                    button.spawn((
+                                        Text::new(pipeline_label(model)),
+                                        TextFont::from_font_size(12.0),
+                                        TextColor(BUTTON_TEXT),
+                                        ButtonLabel,
+                                    ));
+                                });
+                        }
                     });
                 });
 
@@ -495,6 +633,28 @@ fn setup_ui(mut commands: Commands) {
                 .with_children(|right| {
                     right
                         .spawn((
+                            Button,
+                            SettingsButton,
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new("settings"),
+                                TextFont::from_font_size(13.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+
+                    right
+                        .spawn((
                             Node {
                                 flex_direction: FlexDirection::Row,
                                 align_items: AlignItems::Center,
@@ -505,7 +665,6 @@ fn setup_ui(mut commands: Commands) {
                             },
                             BackgroundColor(STATUS_BADGE_BG),
                             BorderColor::all(STATUS_BADGE_BORDER),
-                            BorderRadius::all(Val::Px(999.0)),
                             QueueStatusBadge,
                         ))
                         .with_children(|badge| {
@@ -516,7 +675,6 @@ fn setup_ui(mut commands: Commands) {
                                     ..default()
                                 },
                                 BackgroundColor(STATUS_IDLE),
-                                BorderRadius::all(Val::Px(999.0)),
                                 QueueStatusDot,
                             ));
                             badge.spawn((
@@ -578,7 +736,6 @@ fn setup_ui(mut commands: Commands) {
                                         },
                                         BorderColor::all(BUTTON_BORDER),
                                         BackgroundColor(BUTTON_BG),
-                                        BorderRadius::all(Val::Px(6.0)),
                                     ))
                                     .with_children(|button| {
                                         button.spawn((
@@ -606,7 +763,6 @@ fn setup_ui(mut commands: Commands) {
                                         },
                                         BorderColor::all(BUTTON_BORDER),
                                         BackgroundColor(BUTTON_BG),
-                                        BorderRadius::all(Val::Px(6.0)),
                                     ))
                                     .with_children(|button| {
                                         button.spawn((
@@ -628,7 +784,6 @@ fn setup_ui(mut commands: Commands) {
                                         },
                                         BorderColor::all(BUTTON_BORDER),
                                         BackgroundColor(BUTTON_BG),
-                                        BorderRadius::all(Val::Px(6.0)),
                                     ))
                                     .with_children(|button| {
                                         button.spawn((
@@ -650,7 +805,6 @@ fn setup_ui(mut commands: Commands) {
                                         },
                                         BorderColor::all(BUTTON_BORDER),
                                         BackgroundColor(BUTTON_BG),
-                                        BorderRadius::all(Val::Px(6.0)),
                                     ))
                                     .with_children(|button| {
                                         button.spawn((
@@ -686,6 +840,7 @@ fn setup_ui(mut commands: Commands) {
         last_revision: 0,
         last_expanded: true,
         panel_width: PANEL_WIDTH,
+        settings_modal_open: false,
     });
 }
 
@@ -845,7 +1000,6 @@ fn rebuild_catalog_list(
                     },
                     BackgroundColor(Color::srgb(0.08, 0.09, 0.12)),
                     BorderColor::all(Color::srgb(0.2, 0.22, 0.28)),
-                    BorderRadius::all(Val::Px(8.0)),
                 ))
                 .with_children(|empty| {
                     empty.spawn((
@@ -895,7 +1049,6 @@ fn rebuild_catalog_list(
                     },
                     BackgroundColor(ENTRY_BG),
                     BorderColor::all(ENTRY_BORDER),
-                    BorderRadius::all(Val::Px(8.0)),
                 ))
                 .with_children(|row| {
                     if let Some(preview) = entry.preview.as_ref() {
@@ -917,7 +1070,6 @@ fn rebuild_catalog_list(
                             },
                             BackgroundColor(Color::srgb(0.08, 0.09, 0.12)),
                             BorderColor::all(Color::srgb(0.22, 0.24, 0.3)),
-                            BorderRadius::all(Val::Px(6.0)),
                         ))
                         .with_children(|pending| {
                             pending.spawn((
@@ -956,7 +1108,6 @@ fn rebuild_catalog_list(
                             ..default()
                         },
                         BackgroundColor(status_color),
-                        BorderRadius::all(Val::Px(6.0)),
                     ));
                 });
         }
@@ -1124,6 +1275,7 @@ fn handle_page_buttons(
 fn update_button_visuals(
     catalog: Res<CatalogState>,
     drag: Res<DragState>,
+    args: Option<Res<AppArgs>>,
     mut selection: ResMut<CatalogSelectionState>,
     mut controls: Query<
         (
@@ -1132,6 +1284,8 @@ fn update_button_visuals(
             Option<&CatalogPrevButton>,
             Option<&CatalogNextButton>,
             Option<&CatalogDeleteButton>,
+            Option<&PipelineButton>,
+            Option<&TripoSplatProfileButton>,
             &Children,
             &mut BackgroundColor,
             &mut BorderColor,
@@ -1155,8 +1309,21 @@ fn update_button_visuals(
         selection.selected = None;
     }
 
-    for (interaction, button, prev, next, delete, children, mut bg, mut border) in
-        controls.iter_mut()
+    let args_ref = args.as_deref();
+    let selected_pipeline = args_ref.and_then(|args| args.synthesis_models.first().copied());
+
+    for (
+        interaction,
+        button,
+        prev,
+        next,
+        delete,
+        pipeline,
+        profile,
+        children,
+        mut bg,
+        mut border,
+    ) in controls.iter_mut()
     {
         let disabled = if prev.is_some() {
             catalog.page() == 0
@@ -1164,11 +1331,19 @@ fn update_button_visuals(
             catalog.page() + 1 >= catalog.page_count()
         } else if delete.is_some() {
             selection.selected.is_none()
+        } else if let Some(pipeline) = pipeline {
+            !pipeline_supported(args_ref, pipeline.model)
         } else {
             false
         };
+        let active = pipeline
+            .map(|pipeline| Some(pipeline.model) == selected_pipeline)
+            .unwrap_or(false)
+            || profile
+                .zip(args_ref)
+                .is_some_and(|(profile, args)| profile.profile == args.triposplat_profile);
         let (button_bg, button_border, text_color) =
-            control_button_palette(button.0, *interaction, disabled);
+            control_button_palette(button.0, *interaction, disabled, active);
         if bg.0 != button_bg {
             bg.0 = button_bg;
         }
@@ -1207,6 +1382,7 @@ fn control_button_palette(
     kind: ControlButtonKind,
     interaction: Interaction,
     disabled: bool,
+    active: bool,
 ) -> (Color, Color, Color) {
     if disabled {
         return (
@@ -1214,6 +1390,17 @@ fn control_button_palette(
             BUTTON_BORDER_DISABLED,
             BUTTON_TEXT_DISABLED,
         );
+    }
+    if active {
+        return match interaction {
+            Interaction::Pressed => (
+                BUTTON_OPEN_BG_PRESSED,
+                BUTTON_OPEN_BORDER_PRESSED,
+                BUTTON_TEXT,
+            ),
+            Interaction::Hovered => (BUTTON_OPEN_BG_HOVER, BUTTON_OPEN_BORDER_HOVER, BUTTON_TEXT),
+            Interaction::None => (BUTTON_ACTIVE_BG, BUTTON_ACTIVE_BORDER, BUTTON_TEXT),
+        };
     }
 
     match kind {
@@ -1521,6 +1708,422 @@ fn handle_open_button(
     }
 }
 
+fn handle_pipeline_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<(&Interaction, &PipelineButton), Changed<Interaction>>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if args
+            .synthesis_models
+            .first()
+            .is_some_and(|current| *current == button.model)
+        {
+            continue;
+        }
+        if !pipeline_supported(Some(&args), button.model) {
+            info!(
+                "synthesis pipeline {} requires app backend cuda",
+                pipeline_label(button.model)
+            );
+            continue;
+        }
+        args.synthesis_models = vec![button.model];
+        if matches!(button.model, SynthesisModel::Triposplat)
+            && args.triposplat_profile != TripoSplatProfile::Custom
+        {
+            let profile = args.triposplat_profile;
+            args.apply_triposplat_profile(profile);
+        }
+        info!(
+            "selected synthesis pipeline: {}",
+            pipeline_label(button.model)
+        );
+    }
+}
+
+fn handle_settings_button(
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<SettingsButton>)>,
+    mut modal: ResMut<SettingsModalState>,
+) {
+    for interaction in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            modal.open = !modal.open;
+        }
+    }
+}
+
+fn handle_settings_close_button(
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<SettingsCloseButton>)>,
+    mut modal: ResMut<SettingsModalState>,
+) {
+    for interaction in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            modal.open = false;
+        }
+    }
+}
+
+fn handle_triposplat_profile_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<(&Interaction, &TripoSplatProfileButton), Changed<Interaction>>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        args.apply_triposplat_profile(button.profile);
+        info!(
+            "selected TripoSplat profile: {}",
+            triposplat_profile_label(button.profile)
+        );
+    }
+}
+
+fn handle_triposplat_setting_step_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<(&Interaction, &TripoSplatSettingStepButton), Changed<Interaction>>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        adjust_triposplat_setting(&mut args, button.setting, button.delta);
+    }
+}
+
+fn sync_settings_modal(
+    mut commands: Commands,
+    mut modal: ResMut<SettingsModalState>,
+    mut ui: ResMut<CatalogUiState>,
+    children: Query<&Children>,
+) {
+    ui.settings_modal_open = modal.open;
+    match (modal.open, modal.entity) {
+        (true, None) => {
+            modal.entity = Some(spawn_settings_modal(&mut commands));
+        }
+        (false, Some(entity)) => {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+            modal.entity = None;
+        }
+        _ => {}
+    }
+}
+
+fn update_settings_labels(
+    args: Option<Res<AppArgs>>,
+    mut profile_labels: Query<
+        &mut Text,
+        (
+            With<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+        ),
+    >,
+    mut value_labels: Query<
+        (&TripoSplatSettingValueLabel, &mut Text),
+        Without<TripoSplatProfileValueLabel>,
+    >,
+) {
+    let Some(args) = args else {
+        return;
+    };
+    for mut label in profile_labels.iter_mut() {
+        let next = triposplat_profile_label(args.triposplat_profile).to_string();
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+    for (value, mut label) in value_labels.iter_mut() {
+        let next = triposplat_setting_value_text(&args, value.setting);
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+}
+
+fn spawn_settings_modal(commands: &mut Commands) -> Entity {
+    commands
+        .spawn((
+            SettingsModalRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(MODAL_SCRIM),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    width: Val::Px(390.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(14.0),
+                    padding: UiRect::all(Val::Px(16.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(MODAL_BG),
+                BorderColor::all(MODAL_BORDER),
+            ))
+            .with_children(|panel| {
+                panel
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|header| {
+                        header.spawn((
+                            Text::new("TripoSplat settings"),
+                            TextFont::from_font_size(16.0),
+                            TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                        ));
+                        header
+                            .spawn((
+                                Button,
+                                SettingsCloseButton,
+                                ControlButton(ControlButtonKind::Secondary),
+                                Node {
+                                    padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BorderColor::all(BUTTON_BORDER),
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|button| {
+                                button.spawn((
+                                    Text::new("close"),
+                                    TextFont::from_font_size(12.0),
+                                    TextColor(BUTTON_TEXT),
+                                    ButtonLabel,
+                                ));
+                            });
+                    });
+
+                panel
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|profiles| {
+                        profiles.spawn((
+                            Text::new("profile"),
+                            TextFont::from_font_size(12.0),
+                            TextColor(Color::srgb(0.66, 0.7, 0.78)),
+                        ));
+                        profiles
+                            .spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(6.0),
+                                align_items: AlignItems::Center,
+                                ..default()
+                            })
+                            .with_children(|row| {
+                                for profile in [
+                                    TripoSplatProfile::Low,
+                                    TripoSplatProfile::Balanced,
+                                    TripoSplatProfile::High,
+                                ] {
+                                    row.spawn((
+                                        Button,
+                                        TripoSplatProfileButton { profile },
+                                        ControlButton(ControlButtonKind::Secondary),
+                                        Node {
+                                            padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                            border: UiRect::all(Val::Px(1.0)),
+                                            ..default()
+                                        },
+                                        BorderColor::all(BUTTON_BORDER),
+                                        BackgroundColor(BUTTON_BG),
+                                    ))
+                                    .with_children(|button| {
+                                        button.spawn((
+                                            Text::new(triposplat_profile_label(profile)),
+                                            TextFont::from_font_size(12.0),
+                                            TextColor(BUTTON_TEXT),
+                                            ButtonLabel,
+                                        ));
+                                    });
+                                }
+                                row.spawn((
+                                    Text::new("balanced"),
+                                    TextFont::from_font_size(12.0),
+                                    TextColor(Color::srgb(0.72, 0.76, 0.84)),
+                                    TripoSplatProfileValueLabel,
+                                ));
+                            });
+                    });
+
+                spawn_triposplat_setting_row(panel, "steps", TripoSplatSetting::Steps);
+                spawn_triposplat_setting_row(panel, "cfg guidance", TripoSplatSetting::Guidance);
+                spawn_triposplat_setting_row(panel, "gaussians", TripoSplatSetting::Gaussians);
+            });
+        })
+        .id()
+}
+
+fn spawn_triposplat_setting_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: TripoSplatSetting,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(7.0),
+                ..default()
+            })
+            .with_children(|control| {
+                spawn_setting_step_button(control, setting, false);
+                control.spawn((
+                    Text::new("0"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                    TripoSplatSettingValueLabel { setting },
+                ));
+                spawn_setting_step_button(control, setting, true);
+            });
+        });
+}
+
+fn spawn_setting_step_button(
+    parent: &mut ChildSpawnerCommands,
+    setting: TripoSplatSetting,
+    positive: bool,
+) {
+    let delta = match setting {
+        TripoSplatSetting::Steps => TripoSplatSettingDelta::Integer(if positive { 1 } else { -1 }),
+        TripoSplatSetting::Guidance => TripoSplatSettingDelta::Float(if positive {
+            TRIPOSPLAT_GUIDANCE_STEP
+        } else {
+            -TRIPOSPLAT_GUIDANCE_STEP
+        }),
+        TripoSplatSetting::Gaussians => TripoSplatSettingDelta::Integer(if positive {
+            TRIPOSPLAT_GAUSSIAN_STEP as isize
+        } else {
+            -(TRIPOSPLAT_GAUSSIAN_STEP as isize)
+        }),
+    };
+    parent
+        .spawn((
+            Button,
+            TripoSplatSettingStepButton { setting, delta },
+            ControlButton(ControlButtonKind::Nav),
+            Node {
+                width: Val::Px(28.0),
+                height: Val::Px(24.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(BUTTON_BORDER),
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(if positive { "+" } else { "-" }),
+                TextFont::from_font_size(14.0),
+                TextColor(BUTTON_TEXT),
+                ButtonLabel,
+            ));
+        });
+}
+
+fn adjust_triposplat_setting(
+    args: &mut AppArgs,
+    setting: TripoSplatSetting,
+    delta: TripoSplatSettingDelta,
+) {
+    match (setting, delta) {
+        (TripoSplatSetting::Steps, TripoSplatSettingDelta::Integer(delta)) => {
+            args.num_steps = apply_integer_delta(
+                args.num_steps,
+                delta,
+                TRIPOSPLAT_MIN_STEPS,
+                TRIPOSPLAT_MAX_STEPS,
+            );
+        }
+        (TripoSplatSetting::Guidance, TripoSplatSettingDelta::Float(delta)) => {
+            args.guidance_scale = (args.guidance_scale + delta)
+                .clamp(TRIPOSPLAT_MIN_GUIDANCE, TRIPOSPLAT_MAX_GUIDANCE);
+        }
+        (TripoSplatSetting::Gaussians, TripoSplatSettingDelta::Integer(delta)) => {
+            args.triposplat_num_gaussians = apply_integer_delta(
+                args.triposplat_num_gaussians,
+                delta,
+                TRIPOSPLAT_MIN_NUM_GAUSSIANS,
+                TRIPOSPLAT_MAX_NUM_GAUSSIANS,
+            );
+        }
+        _ => {}
+    }
+    args.refresh_triposplat_profile_from_current_settings();
+    info!(
+        "TripoSplat settings: profile={} steps={} guidance_scale={:.3} gaussians={}",
+        triposplat_profile_label(args.triposplat_profile),
+        args.num_steps,
+        args.guidance_scale,
+        args.triposplat_num_gaussians
+    );
+}
+
+fn apply_integer_delta(value: usize, delta: isize, min: usize, max: usize) -> usize {
+    value.saturating_add_signed(delta).clamp(min, max)
+}
+
+fn triposplat_profile_label(profile: TripoSplatProfile) -> &'static str {
+    match profile {
+        TripoSplatProfile::Low => "low",
+        TripoSplatProfile::Balanced => "balanced",
+        TripoSplatProfile::High => "high",
+        TripoSplatProfile::Custom => "custom",
+    }
+}
+
+fn triposplat_setting_value_text(args: &AppArgs, setting: TripoSplatSetting) -> String {
+    match setting {
+        TripoSplatSetting::Steps => args.num_steps.to_string(),
+        TripoSplatSetting::Guidance => format!("{:.1}", args.guidance_scale),
+        TripoSplatSetting::Gaussians => args.triposplat_num_gaussians.to_string(),
+    }
+}
+
 fn spawn_preview_scene(
     commands: &mut Commands,
     images: &mut Assets<Image>,
@@ -1569,9 +2172,13 @@ fn spawn_preview_scene(
             Camera3d::default(),
             Camera {
                 order: 2,
-                target: RenderTarget::Image(image_handle.clone().into()),
+                output_mode: CameraOutputMode::Write {
+                    blend_state: None,
+                    clear_color: ClearColorConfig::Default,
+                },
                 ..default()
             },
+            RenderTarget::Image(image_handle.clone().into()),
             Projection::Perspective(PerspectiveProjection {
                 fov: PREVIEW_CAMERA_FOV,
                 near: 0.01,
@@ -1683,5 +2290,59 @@ mod tests {
             Some("builtin-cube-cache-key".to_string()),
         );
         assert!(catalog.has_ready_cube_entry());
+    }
+
+    #[test]
+    fn triposplat_profile_buttons_apply_canonical_settings() {
+        let mut args = AppArgs::default();
+        args.apply_triposplat_profile(TripoSplatProfile::Low);
+        assert_eq!(args.num_steps, 5);
+        assert_eq!(args.guidance_scale, 3.0);
+        assert_eq!(args.triposplat_num_gaussians, TRIPOSPLAT_MIN_NUM_GAUSSIANS);
+
+        args.apply_triposplat_profile(TripoSplatProfile::High);
+        assert_eq!(args.num_steps, 50);
+        assert_eq!(args.guidance_scale, 3.0);
+        assert_eq!(args.triposplat_num_gaussians, TRIPOSPLAT_MAX_NUM_GAUSSIANS);
+    }
+
+    #[test]
+    fn triposplat_manual_steps_mark_profile_custom_and_clamp() {
+        let mut args = AppArgs::default();
+        args.apply_triposplat_profile(TripoSplatProfile::Low);
+        adjust_triposplat_setting(
+            &mut args,
+            TripoSplatSetting::Steps,
+            TripoSplatSettingDelta::Integer(-100),
+        );
+        assert_eq!(args.num_steps, TRIPOSPLAT_MIN_STEPS);
+        assert_eq!(args.triposplat_profile, TripoSplatProfile::Custom);
+
+        adjust_triposplat_setting(
+            &mut args,
+            TripoSplatSetting::Steps,
+            TripoSplatSettingDelta::Integer(100),
+        );
+        assert_eq!(args.num_steps, TRIPOSPLAT_MAX_STEPS);
+    }
+
+    #[test]
+    fn triposplat_manual_gaussian_count_stays_in_supported_range() {
+        let mut args = AppArgs::default();
+        args.apply_triposplat_profile(TripoSplatProfile::High);
+        adjust_triposplat_setting(
+            &mut args,
+            TripoSplatSetting::Gaussians,
+            TripoSplatSettingDelta::Integer(TRIPOSPLAT_GAUSSIAN_STEP as isize),
+        );
+        assert_eq!(args.triposplat_num_gaussians, TRIPOSPLAT_MAX_NUM_GAUSSIANS);
+
+        args.apply_triposplat_profile(TripoSplatProfile::Low);
+        adjust_triposplat_setting(
+            &mut args,
+            TripoSplatSetting::Gaussians,
+            TripoSplatSettingDelta::Integer(-(TRIPOSPLAT_GAUSSIAN_STEP as isize)),
+        );
+        assert_eq!(args.triposplat_num_gaussians, TRIPOSPLAT_MIN_NUM_GAUSSIANS);
     }
 }

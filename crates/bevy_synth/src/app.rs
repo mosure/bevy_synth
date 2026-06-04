@@ -20,8 +20,9 @@ use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::light::{
-    AmbientLight, CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap,
+    CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight,
     PointLight,
 };
 use bevy::math::primitives::Cuboid;
@@ -42,10 +43,12 @@ use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(target_arch = "wasm32")]
 use bevy::window::{Window, WindowPlugin};
 #[cfg(not(target_arch = "wasm32"))]
-use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
-use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
+use bevy::winit::{
+    EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WinitSettings, WinitUserEvent,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_mesh::{Indices, PrimitiveTopology};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
-use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
 use bevy_picking::DefaultPickingPlugins;
 use bevy_picking::hover::PickingInteraction;
 use bevy_picking::input::PointerInputPlugin;
@@ -68,17 +71,18 @@ use serde::Deserialize;
 
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::args::BackendKind;
-#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
-use bevy_synth_runtime::args::MeshMode;
+use bevy_synth_runtime::args::SynthesisModel;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 #[cfg(target_arch = "wasm32")]
-use bevy_synth_runtime::args::{QualityPreset, WeightPrecision};
-use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
+use bevy_synth_runtime::args::{QualityPreset, RmbgModel, TripoSplatProfile, WeightPrecision};
+use bevy_synth_runtime::cache::{
+    CachedCameraState, CachedMeshMetadata, CachedWorldItem, MeshCache,
+};
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
 use bevy_synth_runtime::state::{
-    ExitState, InferenceQueue, InferenceRequest, InferenceWorker, Spinner, TitlePulse, UiStatus,
-    WorkerCommand,
+    ExitState, InferenceQueue, InferenceRequest, InferenceSettings, InferenceWorker, Spinner,
+    TitlePulse, UiStatus, WorkerCommand,
 };
 #[cfg(target_arch = "wasm32")]
 use bevy_synth_runtime::state::{
@@ -92,14 +96,84 @@ use bevy_synth_runtime::worker::{
 };
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "wgpu")))]
 use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
-use bevy_synth_runtime::{SynthMesh, SynthMeshTexture, TripoMesh};
+use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnRequest, CatalogState, CatalogStatus,
     CatalogUiState, DragState, MainCamera, preview_light_layers,
 };
 
+use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
+
 const BUILTIN_CUBE_SOURCE_IMAGE: &str = "builtin/cube";
+#[cfg(not(target_arch = "wasm32"))]
+const SPLAT_PREVIEW_MAX_SPLATS: usize = 8_192;
+#[cfg(not(target_arch = "wasm32"))]
+const SPLAT_PREVIEW_MIN_RADIUS: f32 = 0.005;
+#[cfg(not(target_arch = "wasm32"))]
+const SPLAT_PREVIEW_MAX_RADIUS: f32 = 0.05;
+#[cfg(not(target_arch = "wasm32"))]
+const SPLAT_PREVIEW_SH_C0: f32 = 0.282_094_8;
+const PANORBIT_MIN_RADIUS: f32 = 0.05;
+const PANORBIT_MAX_RADIUS: f32 = 500.0;
+const PANORBIT_ORBIT_SMOOTHNESS: f32 = 0.1;
+const PANORBIT_PAN_SMOOTHNESS: f32 = 0.02;
+const PANORBIT_ZOOM_SMOOTHNESS: f32 = 0.1;
+const PANORBIT_SNAP_EPSILON: f32 = 0.001;
+
+#[derive(Component, Clone, Debug)]
+struct PanOrbitCamera {
+    button_orbit: MouseButton,
+    button_pan: MouseButton,
+    enabled: bool,
+    initialized: bool,
+    allow_upside_down: bool,
+    is_upside_down: bool,
+    focus: Vec3,
+    target_focus: Vec3,
+    yaw: Option<f32>,
+    target_yaw: f32,
+    pitch: Option<f32>,
+    target_pitch: f32,
+    radius: Option<f32>,
+    target_radius: f32,
+}
+
+impl Default for PanOrbitCamera {
+    fn default() -> Self {
+        Self {
+            button_orbit: MouseButton::Left,
+            button_pan: MouseButton::Right,
+            enabled: true,
+            initialized: false,
+            allow_upside_down: false,
+            is_upside_down: false,
+            focus: Vec3::ZERO,
+            target_focus: Vec3::ZERO,
+            yaw: None,
+            target_yaw: 0.0,
+            pitch: None,
+            target_pitch: 0.0,
+            radius: None,
+            target_radius: 1.0,
+        }
+    }
+}
+
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PanOrbitCameraSystemSet;
+
+struct PanOrbitCameraPlugin;
+
+impl Plugin for PanOrbitCameraPlugin {
+    fn build(&self, app: &mut App) {
+        app.configure_sets(PostUpdate, PanOrbitCameraSystemSet)
+            .add_systems(
+                PostUpdate,
+                update_panorbit_camera.in_set(PanOrbitCameraSystemSet),
+            );
+    }
+}
 
 #[derive(Component, Clone, Debug)]
 pub(crate) struct CachedMeshInstance {
@@ -173,7 +247,10 @@ struct WasmWarmupKickoff {
 impl Default for WasmWarmupKickoff {
     fn default() -> Self {
         Self {
-            sent: false,
+            // The wasm worker warms model pipelines on demand before the first
+            // matching inference request. Startup should show the app first so
+            // model/profile selection happens inside the Bevy UI.
+            sent: true,
             timer: Timer::from_seconds(1.5, TimerMode::Once),
         }
     }
@@ -229,9 +306,7 @@ impl Plugin for SharedWgpuInferenceDevicePlugin {
             ))
         };
 
-        if shared_device.is_some() {
-            info!("Initialized shared Burn WGPU device from Bevy render context.");
-        }
+        info!("Initialized shared Burn WGPU device from Bevy render context.");
         app.insert_resource(SharedWgpuInferenceDevice {
             device: shared_device,
         });
@@ -292,7 +367,7 @@ fn sync_inference_render_pause(
     exit_state: Res<ExitState>,
     mut pause_state: ResMut<InferenceRenderPauseState>,
     winit_settings: Option<ResMut<WinitSettings>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     mut overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
 ) {
     let mut request_wakeup = false;
@@ -340,7 +415,7 @@ fn sync_inference_render_pause(
     }
 
     if request_wakeup && let Some(proxy) = event_loop_proxy.as_ref() {
-        let _ = proxy.send_event(WakeUp);
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }
 }
 
@@ -366,7 +441,7 @@ fn sync_inference_render_pause_before(
     exit_state: Res<ExitState>,
     pause_state: ResMut<InferenceRenderPauseState>,
     winit_settings: Option<ResMut<WinitSettings>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
 ) {
     sync_inference_render_pause(
@@ -387,7 +462,7 @@ fn sync_inference_render_pause_after(
     exit_state: Res<ExitState>,
     pause_state: ResMut<InferenceRenderPauseState>,
     winit_settings: Option<ResMut<WinitSettings>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
 ) {
     sync_inference_render_pause(
@@ -404,14 +479,14 @@ fn sync_inference_render_pause_after(
 #[cfg(not(target_arch = "wasm32"))]
 fn make_worker_wake_callback(
     args: &AppArgs,
-    event_loop_proxy: Option<&Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<&Res<EventLoopProxyWrapper>>,
 ) -> Option<WorkerWakeCallback> {
     if !args.pause_render_during_inference {
         return None;
     }
     let proxy = event_loop_proxy.map(|proxy| EventLoopProxy::clone(&**proxy))?;
     Some(std::sync::Arc::new(move || {
-        let _ = proxy.send_event(WakeUp);
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }))
 }
 
@@ -423,25 +498,9 @@ pub(crate) fn should_share_wgpu_inference_device(args: &AppArgs) -> bool {
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 pub(crate) fn should_share_wgpu_inference_device_for_platform(
     args: &AppArgs,
-    is_linux: bool,
+    _is_linux: bool,
 ) -> bool {
-    if !matches!(args.backend, BackendKind::Wgpu) {
-        return false;
-    }
-
-    let full_flash_workload = matches!(args.mesh_mode, MeshMode::Flash)
-        && args.flash_octree_depth >= 9
-        && args.flash_min_resolution >= 63;
-    if is_linux && full_flash_workload {
-        info!(
-            "Using isolated Burn WGPU device for Linux full+flash workload \
-             (octree_depth={}, min_resolution={}) to avoid render swapchain instability.",
-            args.flash_octree_depth, args.flash_min_resolution
-        );
-        return false;
-    }
-
-    true
+    matches!(args.backend, BackendKind::Wgpu)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -645,7 +704,7 @@ fn run_headless_once(args: &AppArgs) -> Result<(), String> {
     if !image_path.exists() {
         return Err(format!("input image not found: {}", image_path.display()));
     }
-    let output_path = resolve_output_path(args.output.as_ref(), &image_path, 0)
+    let output_path = resolve_asset_output_path(args, &image_path, 0)
         .ok_or_else(|| "headless mode requires --output".to_string())?;
 
     println!(
@@ -655,26 +714,30 @@ fn run_headless_once(args: &AppArgs) -> Result<(), String> {
     );
 
     let start = Instant::now();
-    let mesh = run_headless_once_inference(args, &image_path)?;
+    let asset = run_headless_once_inference(args, &image_path)?;
+    let asset_kind = synth_asset_kind(&asset);
 
-    write_glb(&output_path, &mesh)
+    write_synthesis_asset(&output_path, asset)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
     println!(
-        "headless synthesis completed in {:.2}s -> {}",
-        start.elapsed().as_secs_f32(),
+        "headless synthesis completed: asset_kind={} total_ms={:.1} -> {}",
+        asset_kind,
+        start.elapsed().as_secs_f64() * 1000.0,
         output_path.display()
     );
     Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<SynthMesh, String> {
+fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<SynthAsset, String> {
     let worker = start_worker(args);
     let request = InferenceRequest {
         id: 0,
         image_path: image_path.to_path_buf(),
         image_contents: None,
         output_path: None,
+        synthesis_models: args.synthesis_models.clone(),
+        settings: InferenceSettings::from_args(args),
     };
     worker
         .sender
@@ -722,15 +785,111 @@ fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<Synt
 
     let _ = worker.sender.send(WorkerCommand::Shutdown);
     match result.expect("result must be set before loop exits") {
-        Ok(Some(mesh)) => Ok(mesh),
+        Ok(Some(asset)) => Ok(asset),
         Ok(None) => Err(format!(
-            "synthesis produced an empty mesh for {}",
+            "synthesis produced an empty asset for {}",
             image_path.display()
         )),
         Err(err) => Err(format!(
             "synthesis inference failed for {}: {err}",
             image_path.display()
         )),
+    }
+}
+
+fn primary_synthesis_model_is_triposplat(args: &AppArgs) -> bool {
+    args.synthesis_models
+        .first()
+        .is_some_and(|model| matches!(model, SynthesisModel::Triposplat))
+}
+
+fn resolve_asset_output_path(args: &AppArgs, image_path: &Path, index: u32) -> Option<PathBuf> {
+    if primary_synthesis_model_is_triposplat(args) {
+        resolve_gaussian_splat_output_path(args.output.as_ref(), image_path, index)
+    } else {
+        resolve_output_path(args.output.as_ref(), image_path, index)
+    }
+}
+
+fn resolve_gaussian_splat_output_path(
+    output: Option<&PathBuf>,
+    image_path: &Path,
+    index: u32,
+) -> Option<PathBuf> {
+    let output = output?;
+    if output.extension().is_none() || output.is_dir() {
+        let dir = output.to_path_buf();
+        let stem = image_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("splats");
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!("_{index}")
+        };
+        return Some(dir.join(format!("{stem}{suffix}.splat")));
+    }
+
+    let output = if is_gaussian_splat_output_path(output) {
+        output.clone()
+    } else {
+        output.with_extension("splat")
+    };
+
+    if index == 0 {
+        return Some(output);
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("splats");
+    let ext = output
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("splat");
+    Some(parent.join(format!("{stem}_{index}.{ext}")))
+}
+
+fn is_gaussian_splat_output_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.to_ascii_lowercase()),
+        Some(ext) if matches!(ext.as_str(), "splat" | "ply")
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_synthesis_asset(path: &Path, asset: SynthAsset) -> Result<(), String> {
+    match asset {
+        SynthAsset::Mesh(mesh) => write_glb(path, &mesh).map_err(|err| err.to_string()),
+        SynthAsset::GaussianSplat(splats) => write_gaussian_splat_output(path, &splats),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn synth_asset_kind(asset: &SynthAsset) -> &'static str {
+    match asset {
+        SynthAsset::Mesh(_) => "mesh",
+        SynthAsset::GaussianSplat(_) => "gaussian_splat",
+    }
+}
+
+fn write_gaussian_splat_output(path: &Path, splats: &GaussianSplatCloud) -> Result<(), String> {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("splat") => splats.write_splat(path),
+        Some("ply") => splats.write_ply(path),
+        Some(ext) => Err(format!(
+            "Gaussian splat output requires .splat or .ply extension, got .{ext}"
+        )),
+        None => Err("Gaussian splat output requires .splat or .ply extension".to_string()),
     }
 }
 
@@ -814,6 +973,47 @@ fn parse_quality_override(value: &str) -> Option<QualityPreset> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn parse_triposplat_profile_override(value: &str) -> Option<TripoSplatProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" | "fast" => Some(TripoSplatProfile::Low),
+        "balanced" | "balance" | "default" => Some(TripoSplatProfile::Balanced),
+        "high" | "full" => Some(TripoSplatProfile::High),
+        "custom" => Some(TripoSplatProfile::Custom),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_synthesis_model_override(value: &str) -> Option<SynthesisModel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "triposg" | "tripo" => Some(SynthesisModel::Triposg),
+        "triposplat" | "tripo-splat" | "splat" => Some(SynthesisModel::Triposplat),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_synthesis_models_override(value: &str) -> Option<Vec<SynthesisModel>> {
+    let mut models = Vec::new();
+    for item in value.split(',') {
+        if let Some(model) = parse_synthesis_model_override(item)
+            && !models.contains(&model)
+        {
+            models.push(model);
+        }
+    }
+    (!models.is_empty()).then_some(models)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_rmbg_model_override(value: &str) -> Option<RmbgModel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rmbg14" | "rmbg-1.4" | "bria-rmbg-1.4" => Some(RmbgModel::Rmbg14),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn apply_quality_override(args: &mut AppArgs, quality: QualityPreset) {
     let defaults = quality.defaults();
     args.quality = quality;
@@ -845,6 +1045,8 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
     }
 
     let mut quality_override: Option<QualityPreset> = None;
+    let mut triposplat_profile_override: Option<TripoSplatProfile> = None;
+    let mut synthesis_models_override: Option<Vec<SynthesisModel>> = None;
     for pair in search.trim_start_matches('?').split('&') {
         if pair.is_empty() {
             continue;
@@ -860,6 +1062,34 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
             if let Some(quality) = parse_quality_override(value) {
                 quality_override = Some(quality);
             }
+            continue;
+        }
+
+        if matches!(key.as_str(), "triposplat_profile" | "splat_profile") {
+            if let Some(profile) = parse_triposplat_profile_override(value) {
+                triposplat_profile_override = Some(profile);
+            }
+            continue;
+        }
+
+        if matches!(key.as_str(), "synthesis_model" | "synthesis")
+            && let Some(model) = parse_synthesis_model_override(value)
+        {
+            synthesis_models_override = Some(vec![model]);
+            continue;
+        }
+
+        if key == "synthesis_models"
+            && let Some(models) = parse_synthesis_models_override(value)
+        {
+            synthesis_models_override = Some(models);
+            continue;
+        }
+
+        if matches!(key.as_str(), "rmbg_model" | "foreground_model")
+            && let Some(model) = parse_rmbg_model_override(value)
+        {
+            args.rmbg_model = model;
             continue;
         }
 
@@ -882,6 +1112,12 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
 
     if let Some(quality) = quality_override {
         apply_quality_override(args, quality);
+    }
+    if let Some(profile) = triposplat_profile_override {
+        args.apply_triposplat_profile(profile);
+    }
+    if let Some(models) = synthesis_models_override {
+        args.synthesis_models = models;
     }
 }
 
@@ -956,7 +1192,7 @@ fn spawn_inference_pause_overlay(commands: &mut Commands) {
                     ),
                     TextFont::from_font_size(22.0),
                     TextColor(Color::srgb(0.94, 0.96, 1.0)),
-                    TextLayout::new_with_justify(Justify::Center),
+                    TextLayout::justify(Justify::Center),
                 ));
             });
         });
@@ -969,7 +1205,7 @@ fn initialize_interactive_scene(
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
-    ambient_light: &mut ResMut<AmbientLight>,
+    ambient_light: &mut ResMut<GlobalAmbientLight>,
     args: &AppArgs,
     queue: &mut ResMut<InferenceQueue>,
     status: &mut ResMut<UiStatus>,
@@ -979,15 +1215,7 @@ fn initialize_interactive_scene(
 ) {
     let mut camera_transform =
         Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)).looking_at(Vec3::ZERO, Vec3::Y);
-    let mut camera_orbit = PanOrbitCamera {
-        allow_upside_down: true,
-        orbit_smoothness: 0.1,
-        pan_smoothness: 0.1,
-        zoom_smoothness: 0.1,
-        button_orbit: MouseButton::Right,
-        button_pan: MouseButton::Middle,
-        ..default()
-    };
+    let mut camera_orbit = PanOrbitCamera::default();
     if let Some(cached_camera) = cache.cache.camera_state()
         && !apply_cached_camera_state(cached_camera, &mut camera_transform, &mut camera_orbit)
     {
@@ -1008,8 +1236,13 @@ fn initialize_interactive_scene(
     commands.spawn((
         InfiniteGridBundle {
             settings: InfiniteGridSettings {
-                fadeout_distance: 200.0,
-                ..default()
+                scale: 1.0,
+                fadeout_distance: 90.0,
+                dot_fadeout_strength: 0.22,
+                minor_line_color: Color::srgba(0.32, 0.36, 0.44, 0.24),
+                major_line_color: Color::srgba(0.60, 0.66, 0.76, 0.42),
+                x_axis_color: Color::srgb(0.92, 0.24, 0.22),
+                z_axis_color: Color::srgb(0.20, 0.42, 0.95),
             },
             ..default()
         },
@@ -1046,14 +1279,12 @@ fn setup(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut ambient_light: ResMut<AmbientLight>,
+    mut ambient_light: ResMut<GlobalAmbientLight>,
     args: Res<AppArgs>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
         Res<SharedWgpuInferenceDevice>,
     >,
-    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<
-        Res<EventLoopProxyWrapper<WakeUp>>,
-    >,
+    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
@@ -1105,16 +1336,22 @@ fn setup(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn setup(mut commands: Commands, args: Res<AppArgs>, mut status: ResMut<UiStatus>) {
+fn setup(
+    mut commands: Commands,
+    args: Res<AppArgs>,
+    mut status: ResMut<UiStatus>,
+    mut startup: ResMut<WasmStartupGate>,
+) {
     info!("bevy_synth args: {:?}", *args);
-    wasm_set_warmup_state("idle");
-    wasm_set_warmup_message("Initializing wasm runtime...");
+    wasm_set_warmup_state("ready");
+    wasm_set_warmup_message("App ready. Open or drop an image to run inference.");
 
     let worker = start_worker(args.as_ref());
     commands.insert_resource(worker);
 
-    status.worker_message = Some("Initializing wasm runtime...".to_string());
-    status.message = "Initializing wasm runtime...".to_string();
+    startup.model_ready = true;
+    status.worker_message = None;
+    status.message = "upload an image (.png/.jpg) to begin.".to_string();
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1161,7 +1398,7 @@ fn finish_wasm_startup_when_models_ready(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut ambient_light: ResMut<AmbientLight>,
+    mut ambient_light: ResMut<GlobalAmbientLight>,
     args: Res<AppArgs>,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
@@ -1194,7 +1431,7 @@ fn finish_wasm_startup_when_models_ready(
     }
 }
 
-fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLight) {
+fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut GlobalAmbientLight) {
     // Keep a modest ambient base and drive shape with a single sun + soft point fills.
     // Web targets commonly support only one directional light in forward mode.
     ambient_light.color = Color::srgb(0.86, 0.9, 0.96);
@@ -1204,7 +1441,7 @@ fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLi
         DirectionalLight {
             color: Color::srgb(1.0, 0.98, 0.95),
             illuminance: 24_000.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             // Slightly higher bias to reduce self-shadow acne on simple hard-edge meshes (e.g. cube).
             shadow_depth_bias: 0.24,
             shadow_normal_bias: 1.8,
@@ -1274,41 +1511,40 @@ fn hydrate_from_cache(
         warn!("failed to refresh built-in cube cache entry: {err}");
     }
 
-    let mesh_entries = cache.cache.mesh_entries().to_vec();
+    let asset_entries = cache.cache.asset_entries().to_vec();
     let world_items = cache.cache.world_items().to_vec();
-    if mesh_entries.is_empty() && world_items.is_empty() {
+    if asset_entries.is_empty() && world_items.is_empty() {
         return;
     }
 
-    let mut loaded_meshes = 0usize;
+    let mut loaded_assets = 0usize;
     let mut loaded_world_items = 0usize;
     let mut handles_by_key: HashMap<String, (Handle<BevyMesh>, Handle<StandardMaterial>)> =
         HashMap::new();
 
-    for metadata in mesh_entries {
-        let mesh = match cache.cache.load_mesh(&metadata.cache_key) {
-            Ok(Some(mesh)) => mesh,
+    for metadata in asset_entries {
+        let asset = match cache.cache.load_asset(&metadata.cache_key) {
+            Ok(Some(asset)) => asset,
             Ok(None) => {
                 warn!(
-                    "cache metadata exists for key {} but mesh payload is missing.",
+                    "cache metadata exists for key {} but asset payload is missing.",
                     metadata.cache_key
                 );
                 continue;
             }
             Err(err) => {
                 warn!(
-                    "failed to load cached mesh for key {}: {err}",
+                    "failed to load cached asset for key {}: {err}",
                     metadata.cache_key
                 );
                 continue;
             }
         };
 
-        let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
-        let material = if metadata.source_image_path == BUILTIN_CUBE_SOURCE_IMAGE {
-            materials.add(default_cube_material())
-        } else {
-            materials.add(standard_material_for_inference(&mesh, images.as_mut()))
+        let Some((mesh_handle, material)) =
+            cached_asset_preview_handles(asset, &metadata, meshes, images, materials)
+        else {
+            continue;
         };
         handles_by_key.insert(
             metadata.cache_key.clone(),
@@ -1325,7 +1561,7 @@ fn hydrate_from_cache(
             Some(metadata.source_image_path.clone()),
             Some(metadata.cache_key.clone()),
         );
-        loaded_meshes += 1;
+        loaded_assets += 1;
     }
 
     for item in world_items {
@@ -1353,13 +1589,69 @@ fn hydrate_from_cache(
         loaded_world_items += 1;
     }
 
-    if loaded_meshes > 0 {
-        queue.completed = queue.completed.max(loaded_meshes);
+    if loaded_assets > 0 {
+        queue.completed = queue.completed.max(loaded_assets);
     }
-    if loaded_meshes > 0 || loaded_world_items > 0 {
+    if loaded_assets > 0 || loaded_world_items > 0 {
         info!(
-            "loaded {loaded_meshes} cached catalog mesh(es) and {loaded_world_items} cached world item(s)."
+            "loaded {loaded_assets} cached catalog asset(s) and {loaded_world_items} cached world item(s)."
         );
+    }
+}
+
+fn cached_asset_preview_handles(
+    asset: SynthAsset,
+    metadata: &CachedMeshMetadata,
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+) -> Option<(Handle<BevyMesh>, Handle<StandardMaterial>)> {
+    match asset {
+        SynthAsset::Mesh(mesh) => {
+            let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
+            let material = if metadata.source_image_path == BUILTIN_CUBE_SOURCE_IMAGE {
+                materials.add(default_cube_material())
+            } else {
+                materials.add(standard_material_for_inference(&mesh, images.as_mut()))
+            };
+            Some((mesh_handle, material))
+        }
+        SynthAsset::GaussianSplat(splats) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                match gaussian_splat_preview_mesh(&splats) {
+                    Ok((bevy_mesh, preview_count)) => {
+                        if preview_count < splats.len() {
+                            warn!(
+                                "Restored cached TripoSplat preview with {preview_count} of {} splats for key {}",
+                                splats.len(),
+                                metadata.cache_key
+                            );
+                        }
+                        let mesh_handle = meshes.add(bevy_mesh);
+                        let material =
+                            materials.add(standard_material_for_gaussian_splat_preview(&splats));
+                        Some((mesh_handle, material))
+                    }
+                    Err(err) => {
+                        warn!(
+                            "failed to build cached TripoSplat preview for key {}: {err}",
+                            metadata.cache_key
+                        );
+                        None
+                    }
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = splats;
+                warn!(
+                    "skipping cached TripoSplat asset for key {} because wasm splat rendering is not implemented",
+                    metadata.cache_key
+                );
+                None
+            }
+        }
     }
 }
 
@@ -1573,7 +1865,228 @@ fn apply_cached_camera_state(
     orbit.target_pitch = state.pitch;
     orbit.radius = Some(state.radius);
     orbit.target_radius = state.radius;
+    orbit.initialized = true;
     true
+}
+
+fn update_panorbit_camera(
+    time: Res<Time>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut motion_events: MessageReader<MouseMotion>,
+    mut wheel_events: MessageReader<MouseWheel>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<
+        (
+            &Camera,
+            &mut Projection,
+            &mut Transform,
+            &mut PanOrbitCamera,
+        ),
+        With<MainCamera>,
+    >,
+) {
+    let motion = motion_events
+        .read()
+        .fold(Vec2::ZERO, |acc, event| acc + event.delta);
+    let (scroll_line, scroll_pixel) =
+        wheel_events
+            .read()
+            .fold((0.0f32, 0.0f32), |acc, event| match event.unit {
+                MouseScrollUnit::Line => (acc.0 + event.y, acc.1),
+                MouseScrollUnit::Pixel => (acc.0, acc.1 + event.y * 0.005),
+            });
+    let has_motion = motion.length_squared() > 0.0;
+    let has_scroll = (scroll_line + scroll_pixel).abs() > 0.0;
+    let dt = time.delta_secs();
+    let window_size = windows
+        .single()
+        .ok()
+        .map(|window| Vec2::new(window.width(), window.height()));
+
+    for (camera, mut projection, mut transform, mut orbit) in cameras.iter_mut() {
+        if !orbit.initialized {
+            initialize_panorbit_from_transform(&mut transform, &mut projection, &mut orbit);
+        }
+
+        let mut has_moved = false;
+
+        if orbit.enabled {
+            if has_motion
+                && buttons.pressed(orbit.button_orbit)
+                && let Some(window_size) = window_size.filter(|size| size.x > 0.0 && size.y > 0.0)
+            {
+                let delta_x = motion.x / window_size.x * std::f32::consts::TAU;
+                let delta_x = if orbit.is_upside_down {
+                    -delta_x
+                } else {
+                    delta_x
+                };
+                let delta_y = motion.y / window_size.y * std::f32::consts::PI;
+                orbit.target_yaw -= delta_x;
+                orbit.target_pitch += delta_y;
+                has_moved = true;
+            }
+
+            if has_motion && buttons.pressed(orbit.button_pan) {
+                let viewport_size = camera
+                    .logical_viewport_size()
+                    .or(window_size)
+                    .filter(|size| size.x > 0.0 && size.y > 0.0);
+                if let Some(viewport_size) = viewport_size {
+                    let mut pan = motion;
+                    let mut multiplier = 1.0;
+                    match projection.as_ref() {
+                        Projection::Perspective(perspective) => {
+                            pan *= Vec2::new(
+                                perspective.fov * perspective.aspect_ratio,
+                                perspective.fov,
+                            ) / viewport_size;
+                            multiplier = orbit.target_radius.max(PANORBIT_MIN_RADIUS);
+                        }
+                        Projection::Orthographic(orthographic) => {
+                            pan *= Vec2::new(orthographic.area.width(), orthographic.area.height())
+                                / viewport_size;
+                        }
+                        Projection::Custom(_) => {
+                            pan *= Vec2::splat(1.0 / viewport_size.y);
+                            multiplier = orbit.target_radius.max(PANORBIT_MIN_RADIUS);
+                        }
+                    }
+                    let right = transform.rotation * Vec3::X * -pan.x;
+                    let up = transform.rotation * Vec3::Y * pan.y;
+                    orbit.target_focus += (right + up) * multiplier;
+                    has_moved = true;
+                }
+            }
+
+            if has_scroll {
+                let line_delta = -scroll_line * orbit.target_radius * 0.2;
+                let pixel_delta = -scroll_pixel * orbit.target_radius * 0.2;
+                orbit.target_radius += line_delta + pixel_delta;
+                if let Some(radius) = orbit.radius.as_mut() {
+                    *radius =
+                        (*radius + pixel_delta).clamp(PANORBIT_MIN_RADIUS, PANORBIT_MAX_RADIUS);
+                }
+                has_moved = true;
+            }
+        }
+
+        if buttons.just_pressed(orbit.button_orbit) || buttons.just_released(orbit.button_orbit) {
+            orbit.is_upside_down = transform.up().dot(Vec3::Y) < 0.0;
+        }
+
+        orbit.target_radius = orbit
+            .target_radius
+            .clamp(PANORBIT_MIN_RADIUS, PANORBIT_MAX_RADIUS);
+        if !orbit.allow_upside_down {
+            orbit.target_pitch = orbit
+                .target_pitch
+                .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
+        }
+
+        let (Some(yaw), Some(pitch), Some(radius)) = (orbit.yaw, orbit.pitch, orbit.radius) else {
+            continue;
+        };
+        if !has_moved
+            && orbit.target_yaw == yaw
+            && orbit.target_pitch == pitch
+            && orbit.target_radius == radius
+            && orbit.target_focus == orbit.focus
+        {
+            continue;
+        }
+
+        let new_yaw =
+            panorbit_lerp_and_snap_f32(yaw, orbit.target_yaw, PANORBIT_ORBIT_SMOOTHNESS, dt);
+        let new_pitch =
+            panorbit_lerp_and_snap_f32(pitch, orbit.target_pitch, PANORBIT_ORBIT_SMOOTHNESS, dt);
+        let new_radius =
+            panorbit_lerp_and_snap_f32(radius, orbit.target_radius, PANORBIT_ZOOM_SMOOTHNESS, dt);
+        let new_focus = panorbit_lerp_and_snap_vec3(
+            orbit.focus,
+            orbit.target_focus,
+            PANORBIT_PAN_SMOOTHNESS,
+            dt,
+        );
+
+        update_panorbit_transform(
+            new_yaw,
+            new_pitch,
+            new_radius,
+            new_focus,
+            &mut transform,
+            &mut projection,
+        );
+        orbit.yaw = Some(new_yaw);
+        orbit.pitch = Some(new_pitch);
+        orbit.radius = Some(new_radius);
+        orbit.focus = new_focus;
+    }
+}
+
+fn initialize_panorbit_from_transform(
+    transform: &mut Transform,
+    projection: &mut Projection,
+    orbit: &mut PanOrbitCamera,
+) {
+    let focus = orbit.focus;
+    let offset = transform.translation - focus;
+    let radius = offset
+        .length()
+        .clamp(PANORBIT_MIN_RADIUS, PANORBIT_MAX_RADIUS);
+    let direction = if radius > PANORBIT_MIN_RADIUS {
+        offset / radius
+    } else {
+        Vec3::Z
+    };
+    let yaw = direction.x.atan2(direction.z);
+    let pitch = direction.y.clamp(-1.0, 1.0).asin();
+    orbit.yaw = Some(yaw);
+    orbit.target_yaw = yaw;
+    orbit.pitch = Some(pitch);
+    orbit.target_pitch = pitch;
+    orbit.radius = Some(radius);
+    orbit.target_radius = radius;
+    orbit.focus = focus;
+    orbit.target_focus = focus;
+    update_panorbit_transform(yaw, pitch, radius, focus, transform, projection);
+    orbit.initialized = true;
+}
+
+fn update_panorbit_transform(
+    yaw: f32,
+    pitch: f32,
+    mut radius: f32,
+    focus: Vec3,
+    transform: &mut Transform,
+    projection: &mut Projection,
+) {
+    if let Projection::Orthographic(orthographic) = projection {
+        orthographic.scale = radius;
+        radius = (orthographic.near + orthographic.far) / 2.0;
+    }
+    let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
+    let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
+    transform.rotation = yaw_rot * pitch_rot;
+    transform.translation = focus + transform.rotation * Vec3::new(0.0, 0.0, radius);
+}
+
+fn panorbit_lerp_and_snap_f32(from: f32, to: f32, smoothness: f32, dt: f32) -> f32 {
+    let t = smoothness.powi(7);
+    let mut value = from.lerp(to, 1.0 - t.powf(dt));
+    if smoothness < 1.0 && (value - to).abs() < PANORBIT_SNAP_EPSILON {
+        value = to;
+    }
+    value
+}
+
+fn panorbit_lerp_and_snap_vec3(from: Vec3, to: Vec3, smoothness: f32, dt: f32) -> Vec3 {
+    let t = smoothness.powi(7);
+    let mut value = from.lerp(to, 1.0 - t.powf(dt));
+    if smoothness < 1.0 && (value - to).length() < PANORBIT_SNAP_EPSILON {
+        value = to;
+    }
+    value
 }
 
 fn handle_open_file_dialog(
@@ -1807,8 +2320,8 @@ fn poll_mcp_scene_control(
                 scale,
                 select,
             } => {
-                let mesh = match cache.cache.load_mesh(&cache_key) {
-                    Ok(Some(mesh)) => mesh,
+                let asset = match cache.cache.load_asset(&cache_key) {
+                    Ok(Some(asset)) => asset,
                     Ok(None) => {
                         warn!("MCP spawn_cached skipped: cache key {cache_key} not found");
                         continue;
@@ -1823,9 +2336,32 @@ fn poll_mcp_scene_control(
                     warn!("MCP spawn_cached skipped due to invalid transform values");
                     continue;
                 };
-                let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
-                let material =
-                    materials.add(standard_material_for_inference(&mesh, images.as_mut()));
+                let metadata = cache
+                    .cache
+                    .asset_entries()
+                    .iter()
+                    .find(|entry| entry.cache_key == cache_key)
+                    .cloned()
+                    .unwrap_or_else(|| CachedMeshMetadata {
+                        cache_key: cache_key.clone(),
+                        source_image_path: cache_key.clone(),
+                        label: cache_key.clone(),
+                        asset_kind: Default::default(),
+                        mesh_payload_id: String::new(),
+                        gltf_output_id: None,
+                        glb_output_id: String::new(),
+                        splat_payload_id: None,
+                        updated_at_unix_ms: 0,
+                    });
+                let Some((mesh_handle, material)) = cached_asset_preview_handles(
+                    asset,
+                    &metadata,
+                    &mut meshes,
+                    &mut images,
+                    &mut materials,
+                ) else {
+                    continue;
+                };
                 let entity = spawn_mesh_instance(
                     &mut commands,
                     mesh_handle,
@@ -2005,7 +2541,7 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
                         event.requests.len()
                     );
                 }
-                for (request, result) in event.requests.into_iter().zip(event.results.into_iter()) {
+                for (request, result) in event.requests.into_iter().zip(event.results) {
                     handle_inference_result(
                         &mut ctx.commands,
                         &mut ctx.meshes,
@@ -2115,11 +2651,11 @@ fn handle_catalog_delete_requests(
 
 fn sync_panorbit_bindings(mut cameras: Query<&mut PanOrbitCamera>) {
     for mut camera in cameras.iter_mut() {
-        if camera.button_orbit != MouseButton::Right {
-            camera.button_orbit = MouseButton::Right;
+        if camera.button_orbit != MouseButton::Left {
+            camera.button_orbit = MouseButton::Left;
         }
-        if camera.button_pan != MouseButton::Middle {
-            camera.button_pan = MouseButton::Middle;
+        if camera.button_pan != MouseButton::Right {
+            camera.button_pan = MouseButton::Right;
         }
     }
 }
@@ -2141,7 +2677,7 @@ fn sync_panorbit_enabled(
     let ui_block = windows
         .single()
         .ok()
-        .map(|window| ui_state.cursor_over_ui(window) && buttons.pressed(MouseButton::Left))
+        .map(|window| ui_state.cursor_over_ui(window))
         .unwrap_or(false);
     let enabled = !gizmo_active && !gizmo_handle_pressed && !drag.is_dragging() && !ui_block;
     for mut camera in cameras.iter_mut() {
@@ -2300,10 +2836,10 @@ fn handle_inference_result(
     cache: &mut ResMut<MeshCacheResource>,
     catalog: &mut ResMut<CatalogState>,
     request: InferenceRequest,
-    result: Result<Option<SynthMesh>, String>,
+    result: Result<Option<SynthAsset>, String>,
 ) {
     match result {
-        Ok(Some(mesh)) => {
+        Ok(Some(SynthAsset::Mesh(mesh))) => {
             if let Some(output) = request.output_path.as_ref()
                 && let Err(err) = write_glb(output, &mesh)
             {
@@ -2350,13 +2886,112 @@ fn handle_inference_result(
                 catalog.bump_revision();
             }
         }
+        Ok(Some(SynthAsset::GaussianSplat(splats))) => {
+            let count = splats.len();
+            if let Some(output) = request.output_path.as_ref() {
+                match write_gaussian_splat_output(output, &splats) {
+                    Ok(()) => info!(
+                        "Wrote Gaussian splat asset with {count} splats to {}",
+                        output.display()
+                    ),
+                    Err(err) => warn!(
+                        "Failed to write Gaussian splat asset to {}: {err}",
+                        output.display()
+                    ),
+                }
+            }
+
+            let cached_metadata = match cache
+                .cache
+                .upsert_gaussian_splat_for_image(&request.image_path, &splats)
+            {
+                Ok(metadata) => Some(metadata),
+                Err(err) => {
+                    warn!(
+                        "Failed to cache Gaussian splat output for {}: {err}",
+                        request.image_path.display()
+                    );
+                    None
+                }
+            };
+            #[cfg(target_arch = "wasm32")]
+            let _ = &cached_metadata;
+            #[cfg(not(target_arch = "wasm32"))]
+            let cache_key = cached_metadata
+                .as_ref()
+                .map(|metadata| metadata.cache_key.clone());
+
+            #[cfg(not(target_arch = "wasm32"))]
+            match gaussian_splat_preview_mesh(&splats) {
+                Ok((bevy_mesh, preview_count)) => {
+                    if preview_count < count {
+                        warn!(
+                            "Previewing {preview_count} of {count} Gaussian splats for {}; full asset was still exported when an output path was provided",
+                            request.image_path.display()
+                        );
+                    } else {
+                        info!(
+                            "Previewing {count} Gaussian splats for {} with native Bevy mesh proxy",
+                            request.image_path.display()
+                        );
+                    }
+                    let mesh_handle = meshes.add(bevy_mesh);
+                    let material =
+                        materials.add(standard_material_for_gaussian_splat_preview(&splats));
+                    spawn_mesh_instance(
+                        commands,
+                        mesh_handle.clone(),
+                        material.clone(),
+                        Transform::default(),
+                        cache_key.clone(),
+                    );
+                    if let Some(entry) = catalog.entry_mut(request.id) {
+                        entry.status = CatalogStatus::Ready;
+                        entry.mesh = Some(mesh_handle);
+                        entry.material = Some(material);
+                        entry.source_image_path = Some(request.image_path.display().to_string());
+                        entry.cache_key = cache_key;
+                        if let Some(metadata) = cached_metadata {
+                            entry.label = metadata.label;
+                            entry.source_image_path = Some(metadata.source_image_path);
+                        }
+                        catalog.bump_revision();
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to build Gaussian splat preview for {}: {err}",
+                        request.image_path.display()
+                    );
+                    if let Some(entry) = catalog.entry_mut(request.id) {
+                        entry.status =
+                            CatalogStatus::Failed(format!("Gaussian splat preview failed: {err}"));
+                        catalog.bump_revision();
+                    }
+                }
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let message =
+                    format!("Gaussian splat rendering not implemented on wasm ({count} splats)");
+                warn!(
+                    "TripoSplat produced {count} Gaussian splats for {}, but Bevy wasm splat rendering is not implemented yet",
+                    request.image_path.display()
+                );
+                if let Some(entry) = catalog.entry_mut(request.id) {
+                    entry.status = CatalogStatus::Failed(message);
+                    catalog.bump_revision();
+                }
+            }
+        }
         Ok(None) => {
             warn!(
-                "Synthesis inference produced an empty mesh for {}",
+                "Synthesis inference produced an empty asset for {}",
                 request.image_path.display()
             );
             if let Some(entry) = catalog.entry_mut(request.id) {
-                entry.status = CatalogStatus::Failed("empty mesh".to_string());
+                entry.status = CatalogStatus::Failed("empty asset".to_string());
                 catalog.bump_revision();
             }
         }
@@ -2401,7 +3036,19 @@ fn standard_material_for_inference(
         }
     };
 
+    let has_valid_uvs = mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty();
     if let Some(pbr) = mesh.pbr_textures.as_ref() {
+        // TRELLIS outputs ship PBR textures + UVs and should render through
+        // texture-backed StandardMaterial. TripoSG outputs have no PBR textures
+        // and stay on the default non-textured material path.
+        if !has_valid_uvs {
+            warn!(
+                "Skipping PBR texture assignment because mesh UVs are missing or invalid (vertices={}, uvs={}).",
+                mesh.mesh.vertices.len(),
+                mesh.uvs.len()
+            );
+            return out;
+        }
         out.base_color_texture = Some(images.add(synth_texture_to_image(
             &pbr.base_color,
             TextureFormat::Rgba8UnormSrgb,
@@ -2431,6 +3078,126 @@ fn standard_material_for_inference(
     }
 
     out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn standard_material_for_gaussian_splat_preview(splats: &GaussianSplatCloud) -> StandardMaterial {
+    let (rgb_sum, alpha_sum, count) =
+        splats
+            .splats
+            .iter()
+            .fold(([0.0f32; 3], 0.0f32, 0usize), |mut acc, splat| {
+                if splat.features_dc.iter().all(|v| v.is_finite()) && splat.opacity.is_finite() {
+                    let rgba = gaussian_splat_preview_rgba(splat);
+                    acc.0[0] += rgba[0];
+                    acc.0[1] += rgba[1];
+                    acc.0[2] += rgba[2];
+                    acc.1 += rgba[3];
+                    acc.2 += 1;
+                }
+                acc
+            });
+    let denom = count.max(1) as f32;
+    let alpha = (alpha_sum / denom).clamp(0.2, 1.0);
+    StandardMaterial {
+        base_color: Color::srgba(
+            (rgb_sum[0] / denom).clamp(0.0, 1.0),
+            (rgb_sum[1] / denom).clamp(0.0, 1.0),
+            (rgb_sum[2] / denom).clamp(0.0, 1.0),
+            alpha,
+        ),
+        alpha_mode: if alpha < 0.995 {
+            AlphaMode::Blend
+        } else {
+            AlphaMode::Opaque
+        },
+        cull_mode: None,
+        ..default()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn gaussian_splat_preview_mesh(splats: &GaussianSplatCloud) -> Result<(BevyMesh, usize), String> {
+    if splats.is_empty() {
+        return Err("cannot preview an empty Gaussian splat cloud".to_string());
+    }
+    let preview_count = splats.len().min(SPLAT_PREVIEW_MAX_SPLATS);
+    let mut positions = Vec::with_capacity(preview_count * 6);
+    let mut normals = Vec::with_capacity(preview_count * 6);
+    let mut uvs = Vec::with_capacity(preview_count * 6);
+    let mut colors = Vec::with_capacity(preview_count * 6);
+    let mut indices = Vec::with_capacity(preview_count * 24);
+    let directions = [
+        [1.0f32, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ];
+    let faces = [
+        [0u32, 2, 4],
+        [2, 1, 4],
+        [1, 3, 4],
+        [3, 0, 4],
+        [2, 0, 5],
+        [1, 2, 5],
+        [3, 1, 5],
+        [0, 3, 5],
+    ];
+
+    for (splat_index, splat) in splats.splats.iter().take(preview_count).enumerate() {
+        if !splat.position.iter().all(|v| v.is_finite())
+            || !splat.scale.iter().all(|v| v.is_finite() && *v > 0.0)
+            || !splat.features_dc.iter().all(|v| v.is_finite())
+            || !splat.opacity.is_finite()
+        {
+            return Err(format!(
+                "Gaussian splat {splat_index} contains non-finite or invalid values"
+            ));
+        }
+
+        let center = [splat.position[0], -splat.position[2], splat.position[1]];
+        let radius = ((splat.scale[0] + splat.scale[1] + splat.scale[2]) / 3.0)
+            .clamp(SPLAT_PREVIEW_MIN_RADIUS, SPLAT_PREVIEW_MAX_RADIUS);
+        let color = gaussian_splat_preview_rgba(splat);
+        for direction in directions {
+            positions.push([
+                center[0] + direction[0] * radius,
+                center[1] + direction[1] * radius,
+                center[2] + direction[2] * radius,
+            ]);
+            normals.push(direction);
+            uvs.push([0.0f32, 0.0]);
+            colors.push(color);
+        }
+
+        let base = (splat_index * 6) as u32;
+        for face in faces {
+            indices.extend_from_slice(&[base + face[0], base + face[1], base + face[2]]);
+        }
+    }
+
+    let mut bevy_mesh = BevyMesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_POSITION, positions);
+    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_NORMAL, normals);
+    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_UV_0, uvs);
+    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_COLOR, colors);
+    bevy_mesh.insert_indices(Indices::U32(indices));
+    Ok((bevy_mesh, preview_count))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn gaussian_splat_preview_rgba(splat: &bevy_synth_runtime::GaussianSplat) -> [f32; 4] {
+    [
+        (splat.features_dc[0] * SPLAT_PREVIEW_SH_C0 + 0.5).clamp(0.0, 1.0),
+        (splat.features_dc[1] * SPLAT_PREVIEW_SH_C0 + 0.5).clamp(0.0, 1.0),
+        (splat.features_dc[2] * SPLAT_PREVIEW_SH_C0 + 0.5).clamp(0.0, 1.0),
+        splat.opacity.clamp(0.0, 1.0),
+    ]
 }
 
 fn synth_texture_to_image(texture: &SynthMeshTexture, format: TextureFormat) -> Image {
@@ -2467,12 +3234,14 @@ pub(crate) fn enqueue_inference_with_contents(
     args: &AppArgs,
     queue: &mut InferenceQueue,
 ) -> InferenceRequest {
-    let output_path = resolve_output_path(args.output.as_ref(), &image_path, queue.counter);
+    let output_path = resolve_asset_output_path(args, &image_path, queue.counter);
     let request = InferenceRequest {
         id: queue.counter,
         image_path,
         image_contents,
         output_path,
+        synthesis_models: args.synthesis_models.clone(),
+        settings: InferenceSettings::from_args(args),
     };
     queue.counter = queue.counter.wrapping_add(1);
     queue.pending.push_back(request.clone());

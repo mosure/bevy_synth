@@ -9,7 +9,9 @@ pub mod pipeline;
 pub mod preprocess;
 pub mod sampler;
 pub mod staged_pipeline;
+pub(crate) mod time;
 pub mod trellis_config;
+pub mod virtual_fs;
 
 #[cfg(feature = "import")]
 pub mod import;

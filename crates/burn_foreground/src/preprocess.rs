@@ -60,6 +60,7 @@ impl RmbgImageProcessor {
         {
             let options = InterpolateOptions {
                 mode: self.resize_mode.clone(),
+                align_corners: true,
             };
             image = interpolate(image, [height, width], options);
         }

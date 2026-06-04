@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy_args::{Deserialize, Parser, Serialize, ValueEnum, parse_args};
 use burn::{
     module::Module,
     record::{FullPrecisionSettings, NamedMpkFileRecorder},
@@ -11,6 +10,8 @@ use burn::{
 use burn_store::{
     ApplyResult, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
+use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use burn_dino::{
     correctness::{self, CorrectnessReference},
@@ -92,8 +93,8 @@ pub struct DinoImportConfig {
 type Backend = burn::backend::NdArray<f32>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args::<DinoImportConfig>();
-    let device = <Backend as burn::tensor::backend::Backend>::Device::default();
+    let args = DinoImportConfig::parse();
+    let device = <Backend as burn::tensor::backend::BackendTypes>::Device::default();
     let mut config = args.vit_type.config();
     if let Some(register_tokens) = args.register_tokens {
         config = config.with_register_tokens(register_tokens);
@@ -116,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn import_dino_weights(
-    device: &<Backend as burn::tensor::backend::Backend>::Device,
+    device: &<Backend as burn::tensor::backend::BackendTypes>::Device,
     args: &DinoImportConfig,
     config: &DinoVisionTransformerConfig,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -176,7 +177,7 @@ fn import_dino_weights(
 }
 
 fn import_pca_weights(
-    device: &<Backend as burn::tensor::backend::Backend>::Device,
+    device: &<Backend as burn::tensor::backend::BackendTypes>::Device,
     args: &DinoImportConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !args.pca_weights.exists() {
@@ -212,7 +213,7 @@ fn import_pca_weights(
 }
 
 fn run_validation(
-    device: &<Backend as burn::tensor::backend::Backend>::Device,
+    device: &<Backend as burn::tensor::backend::BackendTypes>::Device,
     checkpoint_path: &Path,
     reference_path: &Path,
     config: &DinoVisionTransformerConfig,
@@ -322,8 +323,8 @@ fn report_apply_result(prefix: &str, result: &ApplyResult) {
 
     if !result.missing.is_empty() {
         println!("[IMPORT] Missing {} tensor(s):", result.missing.len());
-        for key in &result.missing {
-            println!("  - {key}");
+        for (key, container_stack) in &result.missing {
+            println!("  - {key} ({container_stack})");
         }
     }
 

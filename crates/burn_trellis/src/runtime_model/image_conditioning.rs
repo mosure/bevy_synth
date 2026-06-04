@@ -1,7 +1,10 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
 #[cfg(test)]
@@ -20,6 +23,7 @@ use serde::Deserialize;
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
 use crate::preprocess::PreprocessOutput;
+use crate::virtual_fs;
 
 type CpuRuntimeBackend = burn::backend::NdArray<f32>;
 #[cfg(feature = "runtime-model-wgpu")]
@@ -309,11 +313,11 @@ fn resolve_image_conditioning_assets(
 }
 
 fn assets_from_candidate_path(candidate: &Path) -> Option<ImageConditioningAssets> {
-    if !candidate.exists() {
+    if !virtual_fs::exists(candidate) {
         return None;
     }
 
-    if candidate.is_file() {
+    if virtual_fs::is_file(candidate) {
         let extension = candidate.extension().and_then(|value| value.to_str())?;
         if extension.eq_ignore_ascii_case("safetensors") {
             return Some(ImageConditioningAssets {
@@ -330,14 +334,6 @@ fn assets_from_candidate_path(candidate: &Path) -> Option<ImageConditioningAsset
         return None;
     }
 
-    let burnpack_f16 = candidate.join("model_f16.bpk");
-    if candidate_exists_or_has_parts(burnpack_f16.as_path()) {
-        return Some(ImageConditioningAssets {
-            model_weights: ImageConditioningWeights::Burnpack(burnpack_f16),
-            config_json: Some(candidate.join("config.json")),
-        });
-    }
-
     let burnpack = candidate.join("model.bpk");
     if candidate_exists_or_has_parts(burnpack.as_path()) {
         return Some(ImageConditioningAssets {
@@ -346,8 +342,16 @@ fn assets_from_candidate_path(candidate: &Path) -> Option<ImageConditioningAsset
         });
     }
 
+    let burnpack_f16 = candidate.join("model_f16.bpk");
+    if candidate_exists_or_has_parts(burnpack_f16.as_path()) {
+        return Some(ImageConditioningAssets {
+            model_weights: ImageConditioningWeights::Burnpack(burnpack_f16),
+            config_json: Some(candidate.join("config.json")),
+        });
+    }
+
     let weights = candidate.join("model.safetensors");
-    if !weights.exists() {
+    if !virtual_fs::exists(weights.as_path()) {
         return None;
     }
 
@@ -357,6 +361,12 @@ fn assets_from_candidate_path(candidate: &Path) -> Option<ImageConditioningAsset
     })
 }
 
+#[cfg(target_arch = "wasm32")]
+fn resolve_hf_hub_snapshot_weights(_model_name: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_hf_hub_snapshot_weights(model_name: &str) -> Option<PathBuf> {
     let mut matches = Vec::new();
     let suffix = model_name.rsplit('/').next().unwrap_or(model_name);
@@ -397,6 +407,7 @@ fn resolve_hf_hub_snapshot_weights(model_name: &str) -> Option<PathBuf> {
     matches.into_iter().next().map(|(_, path)| path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_snapshot_weights_from_repo(repo_root: &Path) -> Option<PathBuf> {
     if !repo_root.is_dir() {
         return None;
@@ -433,6 +444,12 @@ fn resolve_snapshot_weights_from_repo(repo_root: &Path) -> Option<PathBuf> {
     candidates.into_iter().next().map(|(_, path)| path)
 }
 
+#[cfg(target_arch = "wasm32")]
+fn huggingface_hub_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn huggingface_hub_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -478,6 +495,7 @@ fn huggingface_hub_roots() -> Vec<PathBuf> {
     roots.into_iter().filter(|path| path.is_dir()).collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !paths.iter().any(|existing| existing == &candidate) {
         paths.push(candidate);
@@ -502,11 +520,11 @@ fn load_dinov3_config(path: Option<&Path>) -> Result<Option<HfDinoV3Config>, Str
     let Some(path) = path else {
         return Ok(None);
     };
-    if !path.exists() {
+    if !virtual_fs::exists(path) {
         return Ok(None);
     }
 
-    let bytes = fs::read(path)
+    let bytes = virtual_fs::read(path)
         .map_err(|err| format!("failed to read DINOv3 config '{}': {err}", path.display()))?;
     let parsed: HfDinoV3Config = serde_json::from_slice(bytes.as_slice())
         .map_err(|err| format!("failed to parse DINOv3 config '{}': {err}", path.display()))?;
@@ -668,7 +686,7 @@ fn load_image_conditioning_weight_bytes(
     source: &ImageConditioningWeights,
 ) -> Result<Vec<u8>, String> {
     match source {
-        ImageConditioningWeights::Safetensors(path) => fs::read(path).map_err(|err| {
+        ImageConditioningWeights::Safetensors(path) => virtual_fs::read(path).map_err(|err| {
             format!(
                 "failed to read DINOv3 safetensors '{}': {err}",
                 path.display()

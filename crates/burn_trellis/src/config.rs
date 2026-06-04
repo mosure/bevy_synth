@@ -29,11 +29,12 @@ impl TrellisQuality {
             Self::Low => TrellisQualitySettings {
                 pipeline_type: "512_base",
                 max_num_tokens: None,
-                sparse_steps: 1,
-                shape_steps: 1,
-                texture_steps: 1,
-                guidance_strength_sparse: 6.0,
-                guidance_strength_shape: 6.0,
+                // Keep canonical TRELLIS.2 sampler budgets even on 512-base.
+                sparse_steps: 12,
+                shape_steps: 12,
+                texture_steps: 12,
+                guidance_strength_sparse: 7.5,
+                guidance_strength_shape: 7.5,
                 guidance_strength_texture: 1.0,
             },
             // Medium tracks TRELLIS.2 canonical 1024 cascade defaults.
@@ -81,7 +82,10 @@ mod tests {
             TrellisQuality::Medium.settings().pipeline_type,
             "1024_cascade"
         );
-        assert_eq!(TrellisQuality::High.settings().pipeline_type, "1024_cascade");
+        assert_eq!(
+            TrellisQuality::High.settings().pipeline_type,
+            "1024_cascade"
+        );
     }
 
     #[test]
@@ -89,11 +93,11 @@ mod tests {
         let low = TrellisQuality::Low.settings();
         let medium = TrellisQuality::Medium.settings();
         let high = TrellisQuality::High.settings();
-        assert!(low.sparse_steps < medium.sparse_steps);
+        assert!(low.sparse_steps <= medium.sparse_steps);
         assert!(medium.sparse_steps <= high.sparse_steps);
-        assert!(low.shape_steps < medium.shape_steps);
+        assert!(low.shape_steps <= medium.shape_steps);
         assert!(medium.shape_steps <= high.shape_steps);
-        assert!(low.texture_steps < medium.texture_steps);
+        assert!(low.texture_steps <= medium.texture_steps);
         assert!(medium.texture_steps <= high.texture_steps);
     }
 

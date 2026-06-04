@@ -5,6 +5,7 @@ use crate::mesh::Mesh;
 pub enum SynthesisModel {
     Triposg,
     Trellis,
+    Triposplat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,9 +71,17 @@ pub struct PipelineInput {
 #[derive(Clone, Debug, Default)]
 pub struct PipelineOutput<M = Mesh> {
     pub mesh: Option<M>,
+    pub asset: Option<SynthesisAsset>,
 }
 
 pub type MeshOutput = PipelineOutput<Mesh>;
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum SynthesisAsset {
+    Mesh(Mesh),
+    GaussianSplat(burn_triposplat::GaussianSplatCloud),
+}
 
 #[cfg(test)]
 mod tests {
@@ -91,10 +100,16 @@ mod tests {
             SynthesisModel::Triposg,
             SynthesisModel::Trellis,
             SynthesisModel::Trellis,
+            SynthesisModel::Triposplat,
+            SynthesisModel::Triposplat,
         ]);
         assert_eq!(
             models,
-            vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
+            vec![
+                SynthesisModel::Triposg,
+                SynthesisModel::Trellis,
+                SynthesisModel::Triposplat
+            ]
         );
     }
 

@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use burn::backend::NdArray;
-use burn::prelude::Backend;
 use burn::tensor::Tensor;
+use burn::tensor::backend::{Backend, BackendTypes};
+use burn::tensor::ops::InterpolateMode;
 use burn_foreground::pipeline::{
     PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data,
 };
+use burn_foreground::resize::resize_chw_align_corners_false;
 use burn_foreground::rmbg2::Rmbg2Pipeline;
 use burn_foreground::rmbg2::import::resolve_rmbg2_weights_root;
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
@@ -32,6 +34,11 @@ use burn_tripo::pipeline::runtime_parity::{
 use burn_tripo::pipeline::triposg::{
     TripoSGLoadOptions, TripoSGPipeline, TripoSGSamplerProgress, deterministic_latents_from_seed,
 };
+use burn_triposplat::{
+    GaussianSplatCloud, TripoSplatArtifactSet, TripoSplatBurnpackPrecision, TripoSplatOptions,
+    TripoSplatPipeline, TripoSplatPipelineConfig, TripoSplatRuntimeComponents,
+    normalize_num_gaussians,
+};
 use image::{ImageFormat, RgbaImage};
 
 use crate::io::ImageSource;
@@ -41,8 +48,11 @@ use crate::native_model_bootstrap::resolve_or_bootstrap_trellis_roots;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::native_model_bootstrap::{
     resolve_or_bootstrap_rmbg14_root, resolve_or_bootstrap_triposg_root,
+    resolve_or_bootstrap_triposplat_root,
 };
-use crate::pipeline::{ForegroundModel, ModelSelection, SynthesisModel, sanitize_synthesis_models};
+use crate::pipeline::{
+    ForegroundModel, ModelSelection, SynthesisAsset, SynthesisModel, sanitize_synthesis_models,
+};
 use crate::progress::{RuntimeProgressEvent, RuntimeProgressObserver};
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
@@ -55,6 +65,10 @@ const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
 const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
 const DEFAULT_SEED: u64 = 42;
 const DEFAULT_TARGET_FACES: usize = 10_000;
+const DEFAULT_TRIPOSPLAT_NUM_GAUSSIANS: usize = 262_144;
+const DEFAULT_TRIPOSPLAT_SHIFT: f32 = 3.0;
+const DEFAULT_TRIPOSPLAT_ERODE_RADIUS: usize = 1;
+const DEFAULT_TRIPOSPLAT_CANVAS_SIZE: usize = 1024;
 
 #[cfg(feature = "wgpu")]
 type WgpuBackend = burn_wgpu::Wgpu<f32, i32, u32>;
@@ -110,10 +124,20 @@ pub enum TrellisQuality {
 pub struct RuntimeConfig {
     pub model_selection: ModelSelection,
     pub backend: InferenceBackend,
+    /// Optional externally initialized WGPU device. Native Bevy wrappers use this
+    /// to share the render device with Burn/CubeCL instead of creating a second
+    /// WGPU device for inference.
+    #[cfg(feature = "wgpu")]
+    pub wgpu_device: Option<burn_wgpu::WgpuDevice>,
     /// TripoSG weights root.
     pub weights_root: Option<PathBuf>,
     /// Trellis2 weights root.
     pub trellis_weights_root: Option<PathBuf>,
+    /// TripoSplat weights root.
+    pub triposplat_weights_root: Option<PathBuf>,
+    /// Native TripoSplat BurnPack precision. `None` means auto-select from
+    /// available artifacts; explicit values fail fast when unavailable.
+    pub triposplat_weights_precision: Option<TripoSplatBurnpackPrecision>,
     /// Optional local root for TRELLIS-image-large assets.
     pub trellis_image_large_root: Option<PathBuf>,
     /// Legacy field retained for CLI compatibility; ignored by Trellis2 Rust runtime.
@@ -130,6 +154,9 @@ pub struct RuntimeConfig {
     pub num_steps: usize,
     pub num_tokens: usize,
     pub guidance_scale: f32,
+    pub triposplat_shift: f32,
+    pub triposplat_num_gaussians: usize,
+    pub triposplat_erode_radius: usize,
     pub seed: Option<u64>,
     pub dino_backend: DinoBackend,
     pub target_faces: Option<usize>,
@@ -144,8 +171,12 @@ impl Default for RuntimeConfig {
         Self {
             model_selection: ModelSelection::default(),
             backend: InferenceBackend::default(),
+            #[cfg(feature = "wgpu")]
+            wgpu_device: None,
             weights_root: None,
             trellis_weights_root: None,
+            triposplat_weights_root: None,
+            triposplat_weights_precision: Some(TripoSplatBurnpackPrecision::F32),
             trellis_image_large_root: None,
             trellis_python_bin: None,
             trellis_bridge_script: None,
@@ -156,6 +187,9 @@ impl Default for RuntimeConfig {
             num_steps: DEFAULT_NUM_STEPS,
             num_tokens: DEFAULT_NUM_TOKENS,
             guidance_scale: DEFAULT_GUIDANCE_SCALE,
+            triposplat_shift: DEFAULT_TRIPOSPLAT_SHIFT,
+            triposplat_num_gaussians: DEFAULT_TRIPOSPLAT_NUM_GAUSSIANS,
+            triposplat_erode_radius: DEFAULT_TRIPOSPLAT_ERODE_RADIUS,
             seed: Some(DEFAULT_SEED),
             dino_backend: DinoBackend::Auto,
             target_faces: Some(DEFAULT_TARGET_FACES),
@@ -216,6 +250,66 @@ pub struct MeshOutput {
     pub mesh: Mesh,
     pub foreground_model: ForegroundModel,
     pub synthesis_models: Vec<SynthesisModel>,
+    pub synthesis_backend: SynthesisModel,
+    pub backend: InferenceBackend,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetRequest {
+    pub image: ImageSource,
+    pub foreground_model: Option<ForegroundModel>,
+    pub synthesis_models: Option<Vec<SynthesisModel>>,
+    pub backend: Option<InferenceBackend>,
+    pub dry_run: bool,
+}
+
+impl AssetRequest {
+    pub fn from_image(image: ImageSource) -> Self {
+        Self {
+            image,
+            foreground_model: None,
+            synthesis_models: None,
+            backend: None,
+            dry_run: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AssetOutput {
+    pub asset: SynthesisAsset,
+    pub foreground_model: ForegroundModel,
+    pub synthesis_models: Vec<SynthesisModel>,
+    pub synthesis_backend: SynthesisModel,
+    pub backend: InferenceBackend,
+}
+
+#[derive(Debug, Clone)]
+pub struct SplatRequest {
+    pub image: ImageSource,
+    pub foreground_model: Option<ForegroundModel>,
+    pub backend: Option<InferenceBackend>,
+    pub num_gaussians: Vec<usize>,
+    pub dry_run: bool,
+}
+
+impl SplatRequest {
+    pub fn from_image(image: ImageSource) -> Self {
+        Self {
+            image,
+            foreground_model: None,
+            backend: None,
+            num_gaussians: Vec::new(),
+            dry_run: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SplatOutput {
+    pub splats: Vec<GaussianSplatCloud>,
+    pub num_gaussians: Vec<usize>,
+    pub foreground_model: ForegroundModel,
     pub synthesis_backend: SynthesisModel,
     pub backend: InferenceBackend,
 }
@@ -372,6 +466,10 @@ impl SynthRuntime {
         &self.config
     }
 
+    pub fn config_mut(&mut self) -> &mut RuntimeConfig {
+        &mut self.config
+    }
+
     pub fn extract_foreground(
         &mut self,
         request: ForegroundRequest,
@@ -445,6 +543,127 @@ impl SynthRuntime {
             foreground_model_label(output.model)
         )));
         Ok(output)
+    }
+
+    pub fn synthesize_asset(&mut self, request: AssetRequest) -> RuntimeResult<AssetOutput> {
+        let selected_foreground = request
+            .foreground_model
+            .unwrap_or(self.config.model_selection.foreground_model);
+        let selected_synthesis = request
+            .synthesis_models
+            .clone()
+            .map(sanitize_synthesis_models)
+            .unwrap_or_else(|| self.config.model_selection.synthesis_models.clone());
+        let selected_backend = request.backend.unwrap_or(self.config.backend);
+        let preferred_synthesis = selected_synthesis
+            .first()
+            .copied()
+            .unwrap_or(SynthesisModel::Triposg);
+
+        if matches!(preferred_synthesis, SynthesisModel::Triposplat) {
+            let splat_output = self.synthesize_splats_inner(
+                SplatRequest {
+                    image: request.image,
+                    foreground_model: Some(selected_foreground),
+                    backend: Some(selected_backend),
+                    num_gaussians: vec![self.config.triposplat_num_gaussians],
+                    dry_run: request.dry_run,
+                },
+                "asset",
+            )?;
+            let splats = splat_output
+                .splats
+                .into_iter()
+                .next()
+                .ok_or_else(|| RuntimeError::new("TripoSplat produced no splat clouds"))?;
+            let output = AssetOutput {
+                asset: SynthesisAsset::GaussianSplat(splats),
+                foreground_model: selected_foreground,
+                synthesis_models: selected_synthesis,
+                synthesis_backend: SynthesisModel::Triposplat,
+                backend: selected_backend,
+            };
+            return Ok(output);
+        }
+
+        let mesh_output = self.synthesize_mesh(MeshRequest {
+            image: request.image,
+            foreground_model: Some(selected_foreground),
+            synthesis_models: Some(selected_synthesis),
+            backend: Some(selected_backend),
+            dry_run: request.dry_run,
+        })?;
+        Ok(AssetOutput {
+            asset: SynthesisAsset::Mesh(mesh_output.mesh),
+            foreground_model: mesh_output.foreground_model,
+            synthesis_models: mesh_output.synthesis_models,
+            synthesis_backend: mesh_output.synthesis_backend,
+            backend: mesh_output.backend,
+        })
+    }
+
+    pub fn synthesize_splats(&mut self, request: SplatRequest) -> RuntimeResult<SplatOutput> {
+        self.synthesize_splats_inner(request, "splat")
+    }
+
+    fn synthesize_splats_inner(
+        &mut self,
+        request: SplatRequest,
+        run: &'static str,
+    ) -> RuntimeResult<SplatOutput> {
+        let selected_foreground = request
+            .foreground_model
+            .unwrap_or(self.config.model_selection.foreground_model);
+        let selected_backend = request.backend.unwrap_or(self.config.backend);
+        let num_gaussians = normalize_triposplat_counts(
+            &request.num_gaussians,
+            self.config.triposplat_num_gaussians,
+        )?;
+        let progress = ProgressRun::new(
+            &self.config.progress,
+            run,
+            Some(format!(
+                "synthesis_model=triposplat backend={} num_gaussians={} steps={} guidance_scale={:.3}",
+                selected_backend.as_str(),
+                triposplat_counts_label(&num_gaussians),
+                self.config.num_steps,
+                self.config.guidance_scale
+            )),
+        );
+        let splats = if request.dry_run {
+            if num_gaussians.len() != 1 {
+                return Err(RuntimeError::new(
+                    "TripoSplat dry-run emits one canonical debug cloud; request one gaussian count",
+                ));
+            }
+            progress.stage_started("triposplat.dry_run", None, None);
+            let dry_start = Instant::now();
+            let splats = self.debug_triposplat_splats_with_count(num_gaussians[0])?;
+            progress.stage_completed(
+                "triposplat.dry_run",
+                None,
+                dry_start.elapsed().as_secs_f64() * 1000.0,
+                Some(format!("splats={}", splats.len())),
+            );
+            vec![splats]
+        } else {
+            let materialized = MaterializedImageInput::from_source(&request.image)?;
+            self.infer_splats_triposplat_many(
+                materialized.path(),
+                selected_foreground,
+                selected_backend,
+                &num_gaussians,
+                &progress,
+            )?
+        };
+        progress.complete(Some(triposplat_splats_detail(&splats)));
+        Ok(SplatOutput {
+            splats,
+            num_gaussians,
+            foreground_model: selected_foreground,
+            synthesis_backend: SynthesisModel::Triposplat,
+            backend: selected_backend,
+        })
     }
 
     pub fn synthesize_mesh(&mut self, request: MeshRequest) -> RuntimeResult<MeshOutput> {
@@ -606,6 +825,9 @@ impl SynthRuntime {
                     Err(err) => Err(err),
                 }
             }
+            SynthesisModel::Triposplat => Err(RuntimeError::new(
+                "TripoSplat produces Gaussian splats, not meshes; use synthesize_asset or the CLI splat command",
+            )),
         }
     }
 
@@ -882,7 +1104,9 @@ impl SynthRuntime {
                     InferenceBackend::Wgpu => {
                         #[cfg(feature = "wgpu")]
                         {
-                            let pipeline = self.foreground.ensure_rmbg14_wgpu(&root)?;
+                            let pipeline = self
+                                .foreground
+                                .ensure_rmbg14_wgpu(&root, self.config.wgpu_device.as_ref())?;
                             let prepared = prepare_image_data(
                                 input_path,
                                 Some(pipeline),
@@ -939,6 +1163,136 @@ impl SynthRuntime {
         }
     }
 
+    fn infer_splats_triposplat_many(
+        &mut self,
+        input_image_path: &Path,
+        foreground_model: ForegroundModel,
+        backend: InferenceBackend,
+        num_gaussians: &[usize],
+        progress: &ProgressRun,
+    ) -> RuntimeResult<Vec<GaussianSplatCloud>> {
+        validate_triposplat_backend_support(backend, self.config.triposplat_weights_precision)?;
+        #[cfg(feature = "cuda")]
+        if matches!(backend, InferenceBackend::Cuda) && self.synthesis.triposplat_cuda.is_none() {
+            progress.stage_started(
+                "triposplat.cuda_preflight",
+                None,
+                Some("matmul/readback".to_string()),
+            );
+            let preflight_start = Instant::now();
+            preflight_triposplat_cuda_backend()?;
+            progress.stage_completed(
+                "triposplat.cuda_preflight",
+                None,
+                preflight_start.elapsed().as_secs_f64() * 1000.0,
+                None,
+            );
+        }
+        progress.stage_started(
+            "triposplat.preprocess_foreground",
+            None,
+            Some(format!(
+                "model={}",
+                foreground_model_label(foreground_model)
+            )),
+        );
+        let preprocess_start = Instant::now();
+        let prepared = self.prepare_image_for_mesh(input_image_path, foreground_model, backend)?;
+        let prepared =
+            resize_prepared_image_for_triposplat(prepared, DEFAULT_TRIPOSPLAT_CANVAS_SIZE);
+        progress.stage_completed(
+            "triposplat.preprocess_foreground",
+            None,
+            preprocess_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!(
+                "size={}x{} erode_radius={}",
+                prepared.width, prepared.height, self.config.triposplat_erode_radius
+            )),
+        );
+
+        progress.stage_started(
+            "triposplat.load_backend",
+            None,
+            Some(format!("backend={}", backend.as_str())),
+        );
+        let load_start = Instant::now();
+        let mut options = triposplat_options_from_config(&self.config);
+        if let Some(first) = num_gaussians.first().copied() {
+            options.num_gaussians = first;
+        }
+        match backend {
+            InferenceBackend::Cpu => {
+                let state = self.synthesis.ensure_triposplat_cpu(&self.config)?;
+                progress.stage_completed(
+                    "triposplat.load_backend",
+                    None,
+                    load_start.elapsed().as_secs_f64() * 1000.0,
+                    Some(state.load_detail()),
+                );
+                run_triposplat_preprocessed_many(state, &prepared, num_gaussians, options, progress)
+            }
+            InferenceBackend::Wgpu => {
+                #[cfg(feature = "wgpu")]
+                {
+                    let state = self.synthesis.ensure_triposplat_wgpu(&self.config)?;
+                    progress.stage_completed(
+                        "triposplat.load_backend",
+                        None,
+                        load_start.elapsed().as_secs_f64() * 1000.0,
+                        Some(state.load_detail()),
+                    );
+                    run_triposplat_preprocessed_many(
+                        state,
+                        &prepared,
+                        num_gaussians,
+                        options,
+                        progress,
+                    )
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    Err(RuntimeError::new(
+                        "wgpu backend not enabled; build with burn_synth feature `wgpu`",
+                    ))
+                }
+            }
+            InferenceBackend::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    let state = self.synthesis.ensure_triposplat_cuda(&self.config)?;
+                    progress.stage_completed(
+                        "triposplat.load_backend",
+                        None,
+                        load_start.elapsed().as_secs_f64() * 1000.0,
+                        Some(state.load_detail()),
+                    );
+                    run_triposplat_preprocessed_many(
+                        state,
+                        &prepared,
+                        num_gaussians,
+                        options,
+                        progress,
+                    )
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Err(RuntimeError::new(
+                        "cuda backend not enabled; build with burn_synth feature `cuda`",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn debug_triposplat_splats_with_count(
+        &self,
+        num_gaussians: usize,
+    ) -> RuntimeResult<GaussianSplatCloud> {
+        let mut options = triposplat_options_from_config(&self.config);
+        options.num_gaussians = num_gaussians;
+        Ok(TripoSplatPipeline::debug_output(options).splats)
+    }
+
     fn prepare_image_for_mesh(
         &mut self,
         input_path: &Path,
@@ -968,7 +1322,9 @@ impl SynthRuntime {
                     InferenceBackend::Wgpu => {
                         #[cfg(feature = "wgpu")]
                         {
-                            let pipeline = self.foreground.ensure_rmbg14_wgpu(&root)?;
+                            let pipeline = self
+                                .foreground
+                                .ensure_rmbg14_wgpu(&root, self.config.wgpu_device.as_ref())?;
                             prepare_image_data(
                                 input_path,
                                 Some(pipeline),
@@ -1036,7 +1392,7 @@ struct ForegroundRuntime {
 impl ForegroundRuntime {
     fn ensure_rmbg14(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<NdArray<f32>>> {
         if self.rmbg14.is_none() {
-            let device = <NdArray<f32> as Backend>::Device::default();
+            let device = <NdArray<f32> as BackendTypes>::Device::default();
             let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
                 RuntimeError::new(format!(
                     "failed to load RMBG-1.4 at {}: {err}",
@@ -1066,9 +1422,13 @@ impl ForegroundRuntime {
     }
 
     #[cfg(feature = "wgpu")]
-    fn ensure_rmbg14_wgpu(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<WgpuBackend>> {
+    fn ensure_rmbg14_wgpu(
+        &mut self,
+        root: &Path,
+        device: Option<&burn_wgpu::WgpuDevice>,
+    ) -> RuntimeResult<&RmbgPipeline<WgpuBackend>> {
         if self.rmbg14_wgpu.is_none() {
-            let device = <WgpuBackend as Backend>::Device::default();
+            let device = device.cloned().unwrap_or_default();
             let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
                 RuntimeError::new(format!(
                     "failed to load RMBG-1.4 (wgpu) at {}: {err}",
@@ -1085,7 +1445,7 @@ impl ForegroundRuntime {
     #[cfg(feature = "cuda")]
     fn ensure_rmbg14_cuda(&mut self, root: &Path) -> RuntimeResult<&RmbgPipeline<CudaBackend>> {
         if self.rmbg14_cuda.is_none() {
-            let device = <CudaBackend as Backend>::Device::default();
+            let device = <CudaBackend as BackendTypes>::Device::default();
             let pipeline = RmbgPipeline::from_pretrained(root, &device).map_err(|err| {
                 RuntimeError::new(format!(
                     "failed to load RMBG-1.4 (cuda) at {}: {err}",
@@ -1106,8 +1466,31 @@ struct BackendSynthesisState<B: Backend> {
     cpu_dino: Option<CpuDinoState>,
 }
 
+struct BackendTripoSplatState<B: Backend> {
+    device: B::Device,
+    components: TripoSplatRuntimeComponents<B>,
+    weights_root: PathBuf,
+    precision: TripoSplatBurnpackPrecision,
+}
+
+impl<B: Backend> BackendTripoSplatState<B> {
+    fn load_detail(&self) -> String {
+        let compute_detail = if self.precision == TripoSplatBurnpackPrecision::F16 {
+            " compute=f32"
+        } else {
+            ""
+        };
+        format!(
+            "weights_root={} precision={}{}",
+            self.weights_root.display(),
+            self.precision.as_str(),
+            compute_detail
+        )
+    }
+}
+
 struct CpuDinoState {
-    device: <NdArray<f32> as Backend>::Device,
+    device: <NdArray<f32> as BackendTypes>::Device,
     encoder: burn_tripo::model::triposg::image_encoder::TripoSGImageEncoder<NdArray<f32>>,
     processor: DinoImageProcessor,
 }
@@ -1121,6 +1504,11 @@ struct SynthesisRuntime {
     cuda: Option<BackendSynthesisState<CudaBackend>>,
     #[cfg(feature = "trellis")]
     trellis: Option<Trellis2Pipeline>,
+    triposplat_cpu: Option<BackendTripoSplatState<NdArray<f32>>>,
+    #[cfg(feature = "wgpu")]
+    triposplat_wgpu: Option<BackendTripoSplatState<WgpuBackend>>,
+    #[cfg(feature = "cuda")]
+    triposplat_cuda: Option<BackendTripoSplatState<CudaBackend>>,
 }
 
 impl SynthesisRuntime {
@@ -1165,7 +1553,7 @@ impl SynthesisRuntime {
         config: &RuntimeConfig,
     ) -> RuntimeResult<&mut BackendSynthesisState<WgpuBackend>> {
         if self.wgpu.is_none() {
-            self.wgpu = Some(load_backend_state::<WgpuBackend>(config)?);
+            self.wgpu = Some(load_wgpu_backend_state(config)?);
         }
         self.wgpu
             .as_mut()
@@ -1184,12 +1572,60 @@ impl SynthesisRuntime {
             .as_mut()
             .ok_or_else(|| RuntimeError::new("CUDA synthesis backend unavailable"))
     }
+
+    fn ensure_triposplat_cpu(
+        &mut self,
+        config: &RuntimeConfig,
+    ) -> RuntimeResult<&mut BackendTripoSplatState<NdArray<f32>>> {
+        if self.triposplat_cpu.is_none() {
+            self.triposplat_cpu = Some(load_triposplat_state::<NdArray<f32>>(
+                config,
+                InferenceBackend::Cpu,
+            )?);
+        }
+        self.triposplat_cpu
+            .as_mut()
+            .ok_or_else(|| RuntimeError::new("TripoSplat synthesis backend unavailable"))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn ensure_triposplat_wgpu(
+        &mut self,
+        config: &RuntimeConfig,
+    ) -> RuntimeResult<&mut BackendTripoSplatState<WgpuBackend>> {
+        if self.triposplat_wgpu.is_none() {
+            self.triposplat_wgpu = Some(load_wgpu_triposplat_state(config)?);
+        }
+        self.triposplat_wgpu
+            .as_mut()
+            .ok_or_else(|| RuntimeError::new("TripoSplat WGPU synthesis backend unavailable"))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_triposplat_cuda(
+        &mut self,
+        config: &RuntimeConfig,
+    ) -> RuntimeResult<&mut BackendTripoSplatState<CudaBackend>> {
+        if self.triposplat_cuda.is_none() {
+            self.triposplat_cuda = Some(load_cuda_triposplat_state(config)?);
+        }
+        self.triposplat_cuda
+            .as_mut()
+            .ok_or_else(|| RuntimeError::new("TripoSplat CUDA synthesis backend unavailable"))
+    }
 }
 
 fn load_backend_state<B: Backend>(
     config: &RuntimeConfig,
 ) -> RuntimeResult<BackendSynthesisState<B>> {
     let device = B::Device::default();
+    load_backend_state_with_device(config, device)
+}
+
+fn load_backend_state_with_device<B: Backend>(
+    config: &RuntimeConfig,
+    device: B::Device,
+) -> RuntimeResult<BackendSynthesisState<B>> {
     if let Some(seed) = config.seed {
         B::seed(&device, seed);
     }
@@ -1214,7 +1650,7 @@ fn load_backend_state<B: Backend>(
                 ))
             })?;
     let cpu_dino = if use_cpu_dino {
-        let cpu_device = <NdArray<f32> as Backend>::Device::default();
+        let cpu_device = <NdArray<f32> as BackendTypes>::Device::default();
         let encoder = load_triposg_dinov2_with_policy(
             &cpu_device,
             weights_root.join("image_encoder_dinov2/model.safetensors"),
@@ -1248,6 +1684,104 @@ fn load_backend_state<B: Backend>(
     })
 }
 
+#[cfg(feature = "wgpu")]
+fn load_wgpu_backend_state(
+    config: &RuntimeConfig,
+) -> RuntimeResult<BackendSynthesisState<WgpuBackend>> {
+    load_backend_state_with_device(config, wgpu_runtime_device(config))
+}
+
+fn load_triposplat_state<B: Backend>(
+    config: &RuntimeConfig,
+    backend: InferenceBackend,
+) -> RuntimeResult<BackendTripoSplatState<B>> {
+    let device = B::Device::default();
+    load_triposplat_state_with_device(config, device, backend)
+}
+
+fn load_triposplat_state_with_device<B: Backend>(
+    config: &RuntimeConfig,
+    device: B::Device,
+    backend: InferenceBackend,
+) -> RuntimeResult<BackendTripoSplatState<B>> {
+    if let Some(seed) = config.seed {
+        B::seed(&device, seed);
+    }
+    let weights_root = resolve_triposplat_runtime_weights_root(
+        config.triposplat_weights_root.as_deref(),
+        config.triposplat_weights_precision,
+    )?;
+    let precision =
+        resolve_triposplat_precision(&weights_root, config.triposplat_weights_precision)?;
+    validate_triposplat_backend_support(backend, Some(precision))?;
+    let pipeline = TripoSplatPipeline::new(TripoSplatPipelineConfig {
+        weights_root: weights_root.clone(),
+        precision,
+    })
+    .map_err(|err| RuntimeError::new(format!("failed to initialize TripoSplat: {err}")))?;
+    let components = pipeline
+        .load_runtime_components(&device)
+        .map_err(|err| RuntimeError::new(format!("failed to load TripoSplat components: {err}")))?;
+    Ok(BackendTripoSplatState {
+        device,
+        components,
+        weights_root,
+        precision,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn load_cuda_triposplat_state(
+    config: &RuntimeConfig,
+) -> RuntimeResult<BackendTripoSplatState<CudaBackend>> {
+    let device = <CudaBackend as BackendTypes>::Device::default();
+    if let Some(seed) = config.seed {
+        CudaBackend::seed(&device, seed);
+    }
+    let weights_root = resolve_triposplat_runtime_weights_root(
+        config.triposplat_weights_root.as_deref(),
+        config.triposplat_weights_precision,
+    )?;
+    let precision =
+        resolve_triposplat_precision(&weights_root, config.triposplat_weights_precision)?;
+    validate_triposplat_backend_support(InferenceBackend::Cuda, Some(precision))?;
+    let pipeline = TripoSplatPipeline::new(TripoSplatPipelineConfig {
+        weights_root: weights_root.clone(),
+        precision,
+    })
+    .map_err(|err| RuntimeError::new(format!("failed to initialize TripoSplat: {err}")))?;
+    let artifacts = TripoSplatArtifactSet::new(&weights_root, precision);
+    let components =
+        burn_triposplat::import::load_triposplat_runtime_components_with_compute_dtype_and_callback::<
+            CudaBackend,
+            _,
+        >(
+            &device,
+            &artifacts,
+            triposplat_compute_dtype_for_precision(precision),
+            |event| flush_cuda_upload_queue_after_runtime_triposplat_load_event(&device, event),
+        )
+        .map_err(|err| RuntimeError::new(format!("failed to load TripoSplat components: {err}")))?;
+    Ok(BackendTripoSplatState {
+        device,
+        components,
+        weights_root: pipeline.config().weights_root.clone(),
+        precision,
+    })
+}
+
+#[cfg(feature = "wgpu")]
+fn load_wgpu_triposplat_state(
+    config: &RuntimeConfig,
+) -> RuntimeResult<BackendTripoSplatState<WgpuBackend>> {
+    load_triposplat_state_with_device(config, wgpu_runtime_device(config), InferenceBackend::Wgpu)
+}
+
+#[cfg(feature = "wgpu")]
+fn wgpu_runtime_device(config: &RuntimeConfig) -> burn_wgpu::WgpuDevice {
+    config.wgpu_device.clone().unwrap_or_default()
+}
+
 fn resolve_triposg_runtime_weights_root(
     explicit: Option<&Path>,
     prefer_f16: bool,
@@ -1267,6 +1801,199 @@ fn resolve_triposg_runtime_weights_root(
     {
         let _ = prefer_f16;
         Ok(resolve_triposg_weights_root(None))
+    }
+}
+
+fn resolve_triposplat_runtime_weights_root(
+    explicit: Option<&Path>,
+    precision: Option<TripoSplatBurnpackPrecision>,
+) -> RuntimeResult<PathBuf> {
+    if let Some(path) = explicit {
+        return burn_triposplat::resolve_triposplat_weights_root(Some(path))
+            .map_err(RuntimeError::new);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let prefer_f16 = !matches!(precision, Some(TripoSplatBurnpackPrecision::F32));
+        resolve_or_bootstrap_triposplat_root(prefer_f16).map_err(|err| {
+            RuntimeError::new(format!(
+                "failed to prepare TripoSplat cache bootstrap: {err}"
+            ))
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = precision;
+        burn_triposplat::resolve_triposplat_weights_root(None).map_err(RuntimeError::new)
+    }
+}
+
+fn resolve_triposplat_precision(
+    root: &Path,
+    requested: Option<TripoSplatBurnpackPrecision>,
+) -> RuntimeResult<TripoSplatBurnpackPrecision> {
+    if let Some(precision) = requested {
+        TripoSplatArtifactSet::new(root, precision)
+            .validate_burnpacks()
+            .map_err(RuntimeError::new)?;
+        return Ok(precision);
+    }
+
+    let f32 = TripoSplatArtifactSet::new(root, TripoSplatBurnpackPrecision::F32);
+    if f32.validate_burnpacks().is_ok() {
+        return Ok(TripoSplatBurnpackPrecision::F32);
+    }
+    let f16 = TripoSplatArtifactSet::new(root, TripoSplatBurnpackPrecision::F16);
+    if f16.validate_burnpacks().is_ok() {
+        return Ok(TripoSplatBurnpackPrecision::F16);
+    }
+    f16.validate_burnpacks().map_err(RuntimeError::new)?;
+    Ok(TripoSplatBurnpackPrecision::F16)
+}
+
+fn validate_triposplat_backend_support(
+    backend: InferenceBackend,
+    precision: Option<TripoSplatBurnpackPrecision>,
+) -> RuntimeResult<()> {
+    if matches!(backend, InferenceBackend::Wgpu) {
+        let precision = precision
+            .map(|precision| precision.as_str())
+            .unwrap_or("auto");
+        return Err(RuntimeError::new(format!(
+            "TripoSplat native WGPU runtime is disabled for now (requested_precision={precision}) because previous end-to-end WGPU probes produced Burn/CubeCL worker panics while the process could still return success. The canonical TripoSplat attention path is now query-chunked, but WGPU stays fail-fast until a clean WGPU runtime smoke validates the full backend path."
+        )));
+    }
+    #[cfg(feature = "cuda")]
+    if matches!(backend, InferenceBackend::Cuda)
+        && matches!(precision, Some(TripoSplatBurnpackPrecision::F16))
+    {
+        return Err(RuntimeError::new(
+            "TripoSplat native CUDA f16 artifacts remain disabled for now; use f32 artifacts for the validated CUDA path",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn triposplat_compute_dtype_for_precision(
+    precision: TripoSplatBurnpackPrecision,
+) -> Option<burn::tensor::FloatDType> {
+    match precision {
+        TripoSplatBurnpackPrecision::F32 => None,
+        TripoSplatBurnpackPrecision::F16 => Some(burn::tensor::FloatDType::F32),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn flush_cuda_upload_queue_after_runtime_triposplat_load_event(
+    device: &<CudaBackend as BackendTypes>::Device,
+    event: burn_triposplat::import::TripoSplatRuntimeLoadEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use cubecl::Runtime;
+
+    let label = event.label();
+    cubecl::cuda::CudaRuntime::client(device).flush().map_err(
+        |err| -> Box<dyn std::error::Error> {
+            format!("failed to flush CUDA upload queue after {label}: {err}").into()
+        },
+    )?;
+    log::debug!("flushed CUDA upload queue after TripoSplat {label}");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn preflight_triposplat_cuda_backend() -> RuntimeResult<()> {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let device = <CudaBackend as BackendTypes>::Device::default();
+        let lhs = Tensor::<CudaBackend, 2>::from_floats([[1.0, 2.0], [3.0, 4.0]], &device);
+        let rhs = Tensor::<CudaBackend, 2>::from_floats([[5.0, 6.0], [7.0, 8.0]], &device);
+        lhs.matmul(rhs)
+            .try_into_data()
+            .map_err(|err| {
+                format!(
+                    "failed to execute/read CUDA preflight tensor: {}",
+                    summarize_cuda_execution_error(&format!("{err:?}"))
+                )
+            })?
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|err| format!("failed to read CUDA preflight tensor: {err:?}"))
+    }));
+    std::panic::set_hook(previous_hook);
+
+    let values = match result {
+        Ok(Ok(values)) => values,
+        Ok(Err(err)) => {
+            return Err(RuntimeError::new(format!(
+                "TripoSplat CUDA runtime preflight failed before model loading: {err}"
+            )));
+        }
+        Err(payload) => {
+            let detail = summarize_cuda_execution_error(&panic_payload_message(&payload));
+            return Err(RuntimeError::new(format!(
+                "TripoSplat CUDA runtime preflight failed before model loading: {detail}"
+            )));
+        }
+    };
+
+    let expected = [19.0, 22.0, 43.0, 50.0];
+    if values.len() != expected.len() {
+        return Err(RuntimeError::new(format!(
+            "TripoSplat CUDA runtime preflight returned {} values, expected {}",
+            values.len(),
+            expected.len()
+        )));
+    }
+    for (value, expected) in values.iter().zip(expected.iter()) {
+        if (value - expected).abs() > 1e-2 {
+            return Err(RuntimeError::new(format!(
+                "TripoSplat CUDA runtime preflight produced {value}, expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "panic payload was not a string".to_string()
+}
+
+fn triposplat_options_from_config(config: &RuntimeConfig) -> TripoSplatOptions {
+    TripoSplatOptions {
+        steps: config.num_steps,
+        guidance_scale: config.guidance_scale,
+        shift: config.triposplat_shift,
+        seed: config.seed.unwrap_or(DEFAULT_SEED),
+        num_gaussians: config.triposplat_num_gaussians,
+        erode_radius: config.triposplat_erode_radius,
+    }
+}
+
+fn normalize_triposplat_counts(raw: &[usize], default_count: usize) -> RuntimeResult<Vec<usize>> {
+    let counts = if raw.is_empty() {
+        vec![default_count]
+    } else {
+        raw.to_vec()
+    };
+    let counts = counts
+        .into_iter()
+        .map(|count| normalize_num_gaussians(count).map_err(RuntimeError::new))
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    if counts.is_empty() {
+        Err(RuntimeError::new("num_gaussians list must not be empty"))
+    } else {
+        Ok(counts)
     }
 }
 
@@ -1362,6 +2089,31 @@ fn validate_trellis_runtime_sources(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+fn summarize_cuda_execution_error(raw: &str) -> String {
+    if raw.contains("invalid value for --gpu-architecture") {
+        return "NVRTC rejected CubeCL's target GPU architecture (`invalid value for --gpu-architecture (-arch)`). This usually means the active CUDA/NVRTC runtime is too old for the installed GPU; on Blackwell, put a CUDA 12.9+ NVRTC runtime first on LD_LIBRARY_PATH and set CUDA_PATH to the matching toolkit before retrying.".to_string();
+    }
+
+    let lines = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("[Source]"))
+        .take(8)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "CUDA execution failed without a diagnostic message".to_string();
+    }
+    let mut summary = lines.join("; ");
+    const MAX_LEN: usize = 700;
+    if summary.len() > MAX_LEN {
+        summary = summary.chars().take(MAX_LEN).collect();
+        summary.push_str("...");
+    }
+    summary
+}
+
 fn foreground_model_label(model: ForegroundModel) -> &'static str {
     match model {
         ForegroundModel::Rmbg14 => "rmbg14",
@@ -1373,6 +2125,7 @@ fn synthesis_model_label(model: SynthesisModel) -> &'static str {
     match model {
         SynthesisModel::Triposg => "triposg",
         SynthesisModel::Trellis => "trellis",
+        SynthesisModel::Triposplat => "triposplat",
     }
 }
 
@@ -1382,6 +2135,115 @@ fn synthesis_models_label(models: &[SynthesisModel]) -> String {
         .map(|model| synthesis_model_label(*model))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn triposplat_counts_label(counts: &[usize]) -> String {
+    counts
+        .iter()
+        .map(|count| count.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn triposplat_splats_detail(splats: &[GaussianSplatCloud]) -> String {
+    if splats.len() == 1 {
+        return format!("splats={}", splats[0].len());
+    }
+    let counts = splats
+        .iter()
+        .map(|cloud| cloud.len().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("splats=[{counts}]")
+}
+
+fn resize_prepared_image_for_triposplat(
+    prepared: PreparedImageData,
+    canvas_size: usize,
+) -> PreparedImageData {
+    if prepared.width == canvas_size && prepared.height == canvas_size {
+        return prepared;
+    }
+    let data = resize_chw_align_corners_false(
+        &prepared.data,
+        3,
+        prepared.height,
+        prepared.width,
+        canvas_size,
+        canvas_size,
+        InterpolateMode::Lanczos3,
+    );
+    let alpha_mask = prepared.alpha_mask.map(|alpha| {
+        resize_chw_align_corners_false(
+            &alpha,
+            1,
+            prepared.height,
+            prepared.width,
+            canvas_size,
+            canvas_size,
+            InterpolateMode::Lanczos3,
+        )
+    });
+    let alpha_probs = prepared.alpha_probs.map(|alpha| {
+        resize_chw_align_corners_false(
+            &alpha,
+            1,
+            prepared.height,
+            prepared.width,
+            canvas_size,
+            canvas_size,
+            InterpolateMode::Lanczos3,
+        )
+    });
+    PreparedImageData {
+        data,
+        width: canvas_size,
+        height: canvas_size,
+        alpha_mask,
+        alpha_probs,
+        bbox: None,
+    }
+}
+
+fn run_triposplat_preprocessed_many<B: Backend>(
+    state: &mut BackendTripoSplatState<B>,
+    prepared: &PreparedImageData,
+    num_gaussians: &[usize],
+    mut options: TripoSplatOptions,
+    progress: &ProgressRun,
+) -> RuntimeResult<Vec<GaussianSplatCloud>> {
+    let counts = normalize_triposplat_counts(num_gaussians, options.num_gaussians)?;
+    options.num_gaussians = counts[0];
+    progress.stage_started(
+        "triposplat.infer",
+        Some(options.steps),
+        Some(format!(
+            "num_gaussians={} guidance_scale={:.3} shift={:.3} erode_radius={}",
+            triposplat_counts_label(&counts),
+            options.guidance_scale,
+            options.shift,
+            options.erode_radius
+        )),
+    );
+    let infer_start = Instant::now();
+    let image = prepared.to_tensor(&state.device);
+    let output = state
+        .components
+        .infer_preprocessed_image_many(image, counts.iter().copied(), options)
+        .map_err(|err| RuntimeError::new(format!("TripoSplat inference failed: {err}")))?;
+    let splats = output.splats;
+    let steps = output
+        .options
+        .first()
+        .map(|options| options.steps)
+        .unwrap_or(options.steps);
+    progress.stage_completed(
+        "triposplat.infer",
+        Some(steps),
+        infer_start.elapsed().as_secs_f64() * 1000.0,
+        Some(triposplat_splats_detail(&splats)),
+    );
+    Ok(splats)
 }
 
 #[cfg(feature = "trellis")]
@@ -1444,7 +2306,7 @@ fn run_backend_inference<B: Backend>(
         if state.pipeline.image_processor.is_strict_preprocess() {
             // Keep strict preprocessing numerics while avoiding a backend->CPU readback:
             // preprocess on CPU first, then upload once to the active backend.
-            let cpu_device = <NdArray<f32> as Backend>::Device::default();
+            let cpu_device = <NdArray<f32> as BackendTypes>::Device::default();
             let cpu_image = prepared.to_tensor::<NdArray<f32>>(&cpu_device);
             let cpu_processed = state.pipeline.image_processor.preprocess(cpu_image);
             let batch = cpu_processed.shape().dims::<4>()[0];
@@ -1658,6 +2520,7 @@ fn resolve_rmbg14_runtime_weights_root() -> RuntimeResult<PathBuf> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn rmbg14_root_has_full_burnpack(root: &Path) -> bool {
     root.join("model.bpk").exists() || root.join("model_f16.bpk").exists()
 }
@@ -1803,11 +2666,63 @@ fn unique_temp_png_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        fs,
+        io::Cursor,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use image::{DynamicImage, Rgba};
 
     use super::*;
+
+    #[cfg(any(feature = "wgpu", feature = "cuda"))]
+    fn assert_backend_type_uses_fusion<B>(label: &str) {
+        let type_name = std::any::type_name::<B>();
+        assert!(
+            type_name.contains("burn_fusion"),
+            "{label} must use Burn fusion, got backend type {type_name}"
+        );
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_backend_alias_uses_burn_fusion() {
+        assert_backend_type_uses_fusion::<WgpuBackend>("WGPU backend");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_backend_alias_uses_burn_fusion() {
+        assert_backend_type_uses_fusion::<CudaBackend>("CUDA backend");
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_tensor_smoke() {
+        if std::env::var("BURN_WGPU_SMOKE").is_err() {
+            eprintln!("skipping: set BURN_WGPU_SMOKE=1 to run WGPU tensor smoke");
+            return;
+        }
+
+        let device = <WgpuBackend as BackendTypes>::Device::default();
+        eprintln!(
+            "[wgpu_tensor_smoke] backend={}",
+            <WgpuBackend as Backend>::name(&device)
+        );
+        let lhs = Tensor::<WgpuBackend, 2>::from_floats([[1.0, 2.0], [3.0, 4.0]], &device);
+        let rhs = Tensor::<WgpuBackend, 2>::from_floats([[5.0, 6.0], [7.0, 8.0]], &device);
+        let values = (lhs + rhs)
+            .try_into_data()
+            .expect("WGPU tensor add should execute")
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("WGPU tensor add values should read back");
+
+        assert_eq!(values, vec![6.0, 8.0, 10.0, 12.0]);
+        <WgpuBackend as Backend>::sync(&device).expect("WGPU backend should sync cleanly");
+    }
 
     #[test]
     fn foreground_passthrough_alpha_from_bytes() {
@@ -1862,6 +2777,861 @@ mod tests {
         assert_eq!(output.synthesis_models, vec![SynthesisModel::Trellis]);
         assert_eq!(output.backend, InferenceBackend::Cpu);
         assert_eq!(output.foreground_model, ForegroundModel::Rmbg2);
+    }
+
+    #[test]
+    fn triposplat_asset_dry_run_returns_gaussian_splats() {
+        let mut runtime = SynthRuntime::new(RuntimeConfig {
+            backend: InferenceBackend::Cpu,
+            ..RuntimeConfig::default()
+        });
+        let output = runtime
+            .synthesize_asset(AssetRequest {
+                image: ImageSource::from_path("unused.png"),
+                foreground_model: Some(ForegroundModel::Rmbg14),
+                synthesis_models: Some(vec![SynthesisModel::Triposplat]),
+                backend: Some(InferenceBackend::Cpu),
+                dry_run: true,
+            })
+            .expect("dry-run TripoSplat asset should succeed");
+
+        match output.asset {
+            SynthesisAsset::GaussianSplat(splats) => assert!(!splats.is_empty()),
+            SynthesisAsset::Mesh(_) => panic!("TripoSplat asset dry-run returned a mesh"),
+        }
+        assert_eq!(output.synthesis_backend, SynthesisModel::Triposplat);
+        assert_eq!(output.backend, InferenceBackend::Cpu);
+    }
+
+    #[test]
+    fn triposplat_splat_dry_run_normalizes_gaussian_count() {
+        let mut runtime = SynthRuntime::new(RuntimeConfig {
+            backend: InferenceBackend::Cpu,
+            ..RuntimeConfig::default()
+        });
+        let output = runtime
+            .synthesize_splats(SplatRequest {
+                image: ImageSource::from_path("unused.png"),
+                foreground_model: Some(ForegroundModel::Rmbg14),
+                backend: Some(InferenceBackend::Cpu),
+                num_gaussians: vec![32_769],
+                dry_run: true,
+            })
+            .expect("dry-run TripoSplat splats should succeed");
+
+        assert_eq!(output.num_gaussians, vec![32_768]);
+        assert_eq!(output.splats.len(), 1);
+        assert!(!output.splats[0].is_empty());
+        assert_eq!(output.synthesis_backend, SynthesisModel::Triposplat);
+        assert_eq!(output.backend, InferenceBackend::Cpu);
+    }
+
+    #[test]
+    fn triposplat_splat_dry_run_rejects_multi_density() {
+        let mut runtime = SynthRuntime::new(RuntimeConfig {
+            backend: InferenceBackend::Cpu,
+            ..RuntimeConfig::default()
+        });
+        let err = runtime
+            .synthesize_splats(SplatRequest {
+                image: ImageSource::from_path("unused.png"),
+                foreground_model: Some(ForegroundModel::Rmbg14),
+                backend: Some(InferenceBackend::Cpu),
+                num_gaussians: vec![32_768, 65_536],
+                dry_run: true,
+            })
+            .expect_err("multi-density dry-run should fail explicitly");
+
+        assert!(
+            err.to_string().contains("dry-run emits one"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn triposplat_mesh_request_errors_without_fallback() {
+        let mut runtime = SynthRuntime::new(RuntimeConfig {
+            backend: InferenceBackend::Cpu,
+            ..RuntimeConfig::default()
+        });
+        let progress = ProgressRun::new(&runtime.config.progress, "mesh", None);
+        let err = runtime
+            .infer_mesh(
+                Path::new("unused.png"),
+                ForegroundModel::Rmbg14,
+                InferenceBackend::Cpu,
+                &[SynthesisModel::Triposplat, SynthesisModel::Triposg],
+                &progress,
+            )
+            .expect_err("TripoSplat mesh requests should fail instead of substituting TripoSG");
+        assert!(
+            err.to_string().contains("Gaussian splats, not meshes"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("falling back"),
+            "unexpected fallback wording: {err}"
+        );
+    }
+
+    #[test]
+    fn triposplat_precision_default_prefers_f32_when_both_are_available() {
+        let root = fake_triposplat_root(&[
+            TripoSplatBurnpackPrecision::F16,
+            TripoSplatBurnpackPrecision::F32,
+        ]);
+        let precision = resolve_triposplat_precision(
+            &root,
+            RuntimeConfig::default().triposplat_weights_precision,
+        )
+        .expect("default TripoSplat precision should resolve");
+
+        assert_eq!(precision, TripoSplatBurnpackPrecision::F32);
+        fs::remove_dir_all(root).expect("cleanup fake TripoSplat root");
+    }
+
+    #[test]
+    fn triposplat_precision_explicit_f16_is_respected() {
+        let root = fake_triposplat_root(&[
+            TripoSplatBurnpackPrecision::F16,
+            TripoSplatBurnpackPrecision::F32,
+        ]);
+        let precision = resolve_triposplat_precision(&root, Some(TripoSplatBurnpackPrecision::F16))
+            .expect("explicit f16 TripoSplat precision should resolve");
+
+        assert_eq!(precision, TripoSplatBurnpackPrecision::F16);
+        fs::remove_dir_all(root).expect("cleanup fake TripoSplat root");
+    }
+
+    #[test]
+    fn triposplat_native_wgpu_is_rejected_until_validated() {
+        let err = validate_triposplat_backend_support(
+            InferenceBackend::Wgpu,
+            Some(TripoSplatBurnpackPrecision::F16),
+        )
+        .expect_err("native WGPU TripoSplat should fail fast");
+
+        assert!(
+            err.to_string().contains("native WGPU runtime is disabled"),
+            "unexpected error: {err}"
+        );
+        validate_triposplat_backend_support(
+            InferenceBackend::Wgpu,
+            Some(TripoSplatBurnpackPrecision::F32),
+        )
+        .expect_err("native WGPU f32 TripoSplat should also fail fast");
+        #[cfg(feature = "cuda")]
+        validate_triposplat_backend_support(
+            InferenceBackend::Cuda,
+            Some(TripoSplatBurnpackPrecision::F16),
+        )
+        .expect_err("native CUDA TripoSplat f16 artifacts should fail fast until validated");
+        #[cfg(feature = "cuda")]
+        validate_triposplat_backend_support(
+            InferenceBackend::Cuda,
+            Some(TripoSplatBurnpackPrecision::F32),
+        )
+        .expect("native CUDA TripoSplat f32 artifacts should use the validated CUDA path");
+        validate_triposplat_backend_support(
+            InferenceBackend::Cpu,
+            Some(TripoSplatBurnpackPrecision::F16),
+        )
+        .expect("CPU f16 storage path should remain loadable");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn triposplat_cuda_preflight_smoke() {
+        if std::env::var("BURN_CUDA_SMOKE").is_err() {
+            eprintln!("skipping: set BURN_CUDA_SMOKE=1 to run TripoSplat CUDA preflight smoke");
+            return;
+        }
+
+        preflight_triposplat_cuda_backend().expect("TripoSplat CUDA preflight should pass");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn triposplat_cuda_large_attention_smoke() {
+        if std::env::var("BURN_CUDA_SMOKE").is_err() {
+            eprintln!(
+                "skipping: set BURN_CUDA_SMOKE=1 to run TripoSplat CUDA large-attention smoke"
+            );
+            return;
+        }
+
+        let device = <CudaBackend as BackendTypes>::Device::default();
+        let q = Tensor::<CudaBackend, 4>::zeros([1, 32_768, 8, 64], &device);
+        let k = Tensor::<CudaBackend, 4>::zeros([1, 32_768, 8, 64], &device);
+        let v = Tensor::<CudaBackend, 4>::zeros([1, 32_768, 8, 64], &device);
+        let out = burn_triposplat::components::scaled_dot_product_attention(q, k, v, 64);
+
+        assert_eq!(out.dims(), [1, 32_768, 8, 64]);
+        let sample = out
+            .slice([0..1, 0..1, 0..1, 0..1])
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("attention output sample");
+        assert_eq!(sample, vec![0.0]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn triposplat_cuda_decoder_diagnostic_reference_latent() {
+        if std::env::var("TRIPOSPLAT_CUDA_DECODER_DIAGNOSTIC").is_err() {
+            eprintln!(
+                "skipping: set TRIPOSPLAT_CUDA_DECODER_DIAGNOSTIC=1 to run TripoSplat CUDA decoder diagnostics"
+            );
+            return;
+        }
+
+        let stage_tensors = std::env::var("TRIPOSPLAT_STAGE_TENSORS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(
+                    "tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors",
+                )
+            });
+        let stage_tensors = workspace_relative_path(stage_tensors);
+        assert!(
+            stage_tensors.exists(),
+            "missing TripoSplat stage tensor file {}",
+            stage_tensors.display()
+        );
+        let weights_root = std::env::var("TRIPOSPLAT_WEIGHTS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("crates/burn_triposplat/assets/models/TripoSplat"));
+        let weights_root = workspace_relative_path(weights_root);
+        let decoder_path = weights_root.join("vae/triposplat_vae_decoder.bpk");
+        assert!(
+            decoder_path.exists(),
+            "missing TripoSplat f32 decoder burnpack {}",
+            decoder_path.display()
+        );
+
+        let device = <CudaBackend as BackendTypes>::Device::default();
+        let latent = read_f32_safetensor_3d::<CudaBackend>(&stage_tensors, "latent", &device)
+            .expect("read upstream TripoSplat latent tensor");
+        let decoder =
+            burn_triposplat::import::load_triposplat_decoder_from_burnpack_file::<CudaBackend>(
+                &device,
+                decoder_path,
+                &burn_triposplat::OctreeProbabilityFixedlenDecoderConfig::triposplat(),
+                &burn_triposplat::ElasticGaussianFixedlenDecoderConfig::triposplat(),
+            )
+            .expect("load TripoSplat f32 decoder burnpack");
+
+        match decoder.decode_to_cloud_with_seed_checked(latent, 32_768, 42) {
+            Ok(cloud) => {
+                eprintln!(
+                    "[triposplat_cuda_decoder_diagnostic] decoded_splats={}",
+                    cloud.len()
+                );
+                assert_eq!(cloud.len(), 32_768);
+            }
+            Err(err) => {
+                eprintln!("[triposplat_cuda_decoder_diagnostic] first_failure={err}");
+                assert!(
+                    err.contains("gaussian_decoder") || err.contains("octree_gaussian_decoder"),
+                    "diagnostic should report a checked decoder stage, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn triposplat_cuda_stage_parity_reference_tensors() {
+        if std::env::var("TRIPOSPLAT_CUDA_STAGE_PARITY").is_err() {
+            eprintln!(
+                "skipping: set TRIPOSPLAT_CUDA_STAGE_PARITY=1 to run TripoSplat CUDA stage parity diagnostics"
+            );
+            return;
+        }
+
+        let stage_tensors = default_triposplat_stage_tensors_path();
+        assert!(
+            stage_tensors.exists(),
+            "missing TripoSplat stage tensor file {}",
+            stage_tensors.display()
+        );
+        let weights_root = std::env::var("TRIPOSPLAT_WEIGHTS_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("crates/burn_triposplat/assets/models/TripoSplat"));
+        let weights_root = workspace_relative_path(weights_root);
+        assert!(
+            weights_root.exists(),
+            "missing TripoSplat weights root {}",
+            weights_root.display()
+        );
+
+        let device = <CudaBackend as BackendTypes>::Device::default();
+        let flow_only = std::env::var("TRIPOSPLAT_FLOW_ONLY").is_ok();
+        let compute_dtype = std::env::var("TRIPOSPLAT_COMPUTE_DTYPE")
+            .ok()
+            .map(|value| match value.as_str() {
+                "bf16" => burn::tensor::FloatDType::BF16,
+                "f16" => burn::tensor::FloatDType::F16,
+                "f32" => burn::tensor::FloatDType::F32,
+                other => panic!(
+                    "TRIPOSPLAT_COMPUTE_DTYPE must be bf16, f16, or f32 for diagnostics, got {other}"
+                ),
+            })
+            .unwrap_or(burn::tensor::FloatDType::F32);
+        let weights_precision = std::env::var("TRIPOSPLAT_WEIGHTS_PRECISION")
+            .ok()
+            .map(|value| match value.as_str() {
+                "f16" => TripoSplatBurnpackPrecision::F16,
+                "f32" => TripoSplatBurnpackPrecision::F32,
+                other => panic!(
+                    "TRIPOSPLAT_WEIGHTS_PRECISION must be f16 or f32 for diagnostics, got {other}"
+                ),
+            })
+            .unwrap_or(TripoSplatBurnpackPrecision::F16);
+        eprintln!(
+            "[triposplat_cuda_stage_parity] weights_precision={} compute_dtype={}",
+            weights_precision.as_str(),
+            match compute_dtype {
+                burn::tensor::FloatDType::BF16 => "bf16",
+                burn::tensor::FloatDType::F16 => "f16",
+                burn::tensor::FloatDType::F32 => "f32",
+                _ => "other",
+            }
+        );
+        let artifacts = TripoSplatArtifactSet::new(&weights_root, weights_precision);
+        let components =
+            burn_triposplat::import::load_triposplat_runtime_components_with_compute_dtype_and_callback::<
+                CudaBackend,
+                _,
+            >(
+                &device,
+                &artifacts,
+                Some(compute_dtype),
+                |event| flush_cuda_upload_queue_after_triposplat_load_event(&device, event),
+            )
+            .expect("load TripoSplat runtime components for CUDA parity diagnostic");
+
+        let rust_condition = if flow_only {
+            eprintln!(
+                "[triposplat_cuda_stage_parity] flow_only=1; skipping Rust DINO/Flux conditioning replay"
+            );
+            None
+        } else {
+            let image =
+                read_f32_safetensor_4d::<CudaBackend>(&stage_tensors, "image_rgb_0_1", &device)
+                    .expect("read upstream TripoSplat preprocessed image tensor");
+            let expected_feature1 = read_f32_safetensor_vec(&stage_tensors, "feature1")
+                .expect("read feature1 reference");
+            let expected_feature2 = read_f32_safetensor_vec(&stage_tensors, "feature2")
+                .expect("read feature2 reference");
+            let condition = match read_f32_safetensor_4d::<CudaBackend>(
+                &stage_tensors,
+                "vae_noise",
+                &device,
+            ) {
+                Ok(noise) => {
+                    eprintln!(
+                        "[triposplat_cuda_stage_parity] using upstream vae_noise for conditioning replay"
+                    );
+                    let flux_trace_image = image.clone();
+                    let flux_trace_noise = noise.clone();
+                    let diagnostics =
+                        components.conditioning_diagnostics_with_vae_noise(image, noise);
+                    if std::env::var("TRIPOSPLAT_FLUX_TRACE").is_ok() {
+                        let flux_image = (flux_trace_image * 2.0 - 1.0).cast(compute_dtype);
+                        let trace = components.flux2_vae_encoder.encode_with_noise_trace(
+                            flux_image,
+                            flux_trace_noise.cast(compute_dtype),
+                        );
+                        print_flux_trace_diffs(&stage_tensors, trace);
+                    }
+                    if let Ok(expected_dinov3_raw) =
+                        read_f32_safetensor_vec(&stage_tensors, "dinov3_raw")
+                    {
+                        print_stage_diff(
+                            "dinov3_raw",
+                            diagnostics.dinov3_raw.clone(),
+                            &expected_dinov3_raw.shape,
+                            &expected_dinov3_raw.values,
+                        );
+                    }
+                    if let Ok(expected_vae_mean) =
+                        read_f32_safetensor_vec(&stage_tensors, "vae_mean")
+                    {
+                        print_stage_diff(
+                            "vae_mean",
+                            diagnostics.vae_mean.clone(),
+                            &expected_vae_mean.shape,
+                            &expected_vae_mean.values,
+                        );
+                    }
+                    if let Ok(expected_vae_logvar) =
+                        read_f32_safetensor_vec(&stage_tensors, "vae_logvar")
+                    {
+                        print_stage_diff(
+                            "vae_logvar",
+                            diagnostics.vae_logvar.clone(),
+                            &expected_vae_logvar.shape,
+                            &expected_vae_logvar.values,
+                        );
+                    }
+                    diagnostics.into_condition()
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[triposplat_cuda_stage_parity] upstream vae_noise unavailable ({err}); using seeded Rust VAE noise"
+                    );
+                    components.encode_preprocessed_image(image, DEFAULT_SEED)
+                }
+            };
+            print_stage_diff(
+                "feature1",
+                condition.feature1.clone(),
+                &expected_feature1.shape,
+                &expected_feature1.values,
+            );
+            let actual_feature2 = condition
+                .feature2
+                .clone()
+                .expect("TripoSplat condition should include Flux2 feature2");
+            print_stage_diff(
+                "feature2",
+                actual_feature2,
+                &expected_feature2.shape,
+                &expected_feature2.values,
+            );
+            Some(condition)
+        };
+        if std::env::var("TRIPOSPLAT_CONDITION_ONLY").is_ok() {
+            eprintln!("[triposplat_cuda_stage_parity] condition_only=1; skipping flow replay");
+            return;
+        }
+        let expected_latent =
+            read_f32_safetensor_vec(&stage_tensors, "latent").expect("read latent reference");
+        let expected_camera =
+            read_f32_safetensor_vec(&stage_tensors, "camera").expect("read camera reference");
+
+        let reference_condition = burn_triposplat::TripoSplatCondition {
+            feature1: read_f32_safetensor_3d::<CudaBackend>(&stage_tensors, "feature1", &device)
+                .expect("read upstream feature1 tensor"),
+            feature2: Some(
+                read_f32_safetensor_3d::<CudaBackend>(&stage_tensors, "feature2", &device)
+                    .expect("read upstream feature2 tensor"),
+            ),
+        };
+        let options = TripoSplatOptions {
+            num_gaussians: 32_768,
+            ..TripoSplatOptions::default()
+        };
+        let reference_flow_noise =
+            read_f32_safetensor_3d::<CudaBackend>(&stage_tensors, "flow_noise_latent", &device)
+                .ok()
+                .map(|latent_noise| burn_triposplat::FlowState {
+                    latent: latent_noise,
+                    camera: read_f32_safetensor_3d::<CudaBackend>(
+                        &stage_tensors,
+                        "flow_noise_camera",
+                        &device,
+                    )
+                    .ok(),
+                });
+        if let Some(noise) = reference_flow_noise.clone() {
+            if let Ok(expected_pred_000) =
+                read_f32_safetensor_vec(&stage_tensors, "flow_pred_000_latent")
+            {
+                let pred = components.flow_prediction_from_noise_at_step(
+                    reference_condition.clone(),
+                    noise.clone(),
+                    options,
+                    0,
+                );
+                print_stage_diff(
+                    "flow_pred_000_latent",
+                    pred.latent,
+                    &expected_pred_000.shape,
+                    &expected_pred_000.values,
+                );
+                if let (Some(camera), Ok(expected_camera)) = (
+                    pred.camera,
+                    read_f32_safetensor_vec(&stage_tensors, "flow_pred_000_camera"),
+                ) {
+                    print_stage_diff(
+                        "flow_pred_000_camera",
+                        camera,
+                        &expected_camera.shape,
+                        &expected_camera.values,
+                    );
+                }
+            }
+            if let Ok(expected_step_001) =
+                read_f32_safetensor_vec(&stage_tensors, "flow_step_001_latent")
+            {
+                let step = components.sample_latent_prefix_from_noise(
+                    reference_condition.clone(),
+                    noise,
+                    options,
+                    1,
+                );
+                print_stage_diff(
+                    "latent_after_flow_step_001",
+                    step.latent,
+                    &expected_step_001.shape,
+                    &expected_step_001.values,
+                );
+            }
+            if std::env::var("TRIPOSPLAT_PREFIX_ONLY").is_ok() {
+                eprintln!(
+                    "[triposplat_cuda_stage_parity] prefix_only=1; skipping full flow replay"
+                );
+                return;
+            }
+        }
+        let sampled = match reference_flow_noise.clone() {
+            Some(noise) => {
+                eprintln!(
+                    "[triposplat_cuda_stage_parity] using upstream flow_noise_latent for flow replay"
+                );
+                components.sample_latent_from_noise(reference_condition, noise, options)
+            }
+            None => {
+                eprintln!(
+                    "[triposplat_cuda_stage_parity] upstream flow noise unavailable; using seeded Rust flow noise"
+                );
+                components.sample_latent(reference_condition, options)
+            }
+        };
+        let replay_latent_for_decode = sampled.latent.clone();
+        print_stage_diff(
+            "latent_from_reference_condition",
+            sampled.latent,
+            &expected_latent.shape,
+            &expected_latent.values,
+        );
+        let camera = sampled
+            .camera
+            .expect("TripoSplat flow should emit camera channels");
+        print_stage_diff(
+            "camera_from_reference_condition",
+            camera,
+            &expected_camera.shape,
+            &expected_camera.values,
+        );
+        decode_replayed_triposplat_latent(
+            &components,
+            "reference_condition",
+            replay_latent_for_decode,
+            options,
+        );
+        if std::env::var("TRIPOSPLAT_RUST_CONDITION_FLOW").is_ok()
+            && let (Some(noise), Some(condition)) = (reference_flow_noise, rust_condition)
+        {
+            eprintln!(
+                "[triposplat_cuda_stage_parity] using Rust conditioning with upstream flow noise"
+            );
+            let sampled = components.sample_latent_from_noise(condition, noise, options);
+            let replay_latent_for_decode = sampled.latent.clone();
+            print_stage_diff(
+                "latent_from_rust_condition",
+                sampled.latent,
+                &expected_latent.shape,
+                &expected_latent.values,
+            );
+            let camera = sampled
+                .camera
+                .expect("TripoSplat flow should emit camera channels");
+            print_stage_diff(
+                "camera_from_rust_condition",
+                camera,
+                &expected_camera.shape,
+                &expected_camera.values,
+            );
+            decode_replayed_triposplat_latent(
+                &components,
+                "rust_condition",
+                replay_latent_for_decode,
+                options,
+            );
+        }
+    }
+
+    fn fake_triposplat_root(precisions: &[TripoSplatBurnpackPrecision]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "burn_synth_triposplat_precision_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        ));
+        for precision in precisions {
+            for artifact in burn_triposplat::artifact::TRIPOSPLAT_ARTIFACTS
+                .into_iter()
+                .filter(|artifact| artifact.is_triposplat_runtime_required())
+            {
+                let path = artifact.burnpack_path(&root, *precision);
+                fs::create_dir_all(path.parent().expect("artifact parent"))
+                    .expect("create fake artifact parent");
+                fs::write(path, []).expect("write fake artifact");
+            }
+        }
+        root
+    }
+
+    #[cfg(feature = "cuda")]
+    fn default_triposplat_stage_tensors_path() -> PathBuf {
+        let path = std::env::var("TRIPOSPLAT_STAGE_TENSORS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(
+                    "tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors",
+                )
+            });
+        workspace_relative_path(path)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn flush_cuda_upload_queue_after_triposplat_load_event(
+        device: &<CudaBackend as BackendTypes>::Device,
+        event: burn_triposplat::import::TripoSplatRuntimeLoadEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use cubecl::Runtime;
+
+        let label = event.label();
+        cubecl::cuda::CudaRuntime::client(device).flush().map_err(
+            |err| -> Box<dyn std::error::Error> {
+                format!("failed to flush CUDA upload queue after {label}: {err}").into()
+            },
+        )?;
+        eprintln!("[triposplat_cuda_stage_parity] flushed CUDA upload queue after {label}");
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_replayed_triposplat_latent(
+        components: &TripoSplatRuntimeComponents<CudaBackend>,
+        label: &str,
+        latent: Tensor<CudaBackend, 3>,
+        options: TripoSplatOptions,
+    ) {
+        if std::env::var("TRIPOSPLAT_DECODE_REPLAY").is_err() {
+            return;
+        }
+        let cloud = components
+            .decoder
+            .decode_to_cloud_with_seed_checked(latent, options.num_gaussians, DEFAULT_SEED)
+            .unwrap_or_else(|err| {
+                panic!("[triposplat_cuda_stage_parity] {label} decode failed: {err}")
+            });
+        eprintln!(
+            "[triposplat_cuda_stage_parity] {label}_decoded_splats={}",
+            cloud.len()
+        );
+        assert_eq!(cloud.len(), options.num_gaussians);
+    }
+
+    #[cfg(feature = "cuda")]
+    struct F32Safetensor {
+        shape: Vec<usize>,
+        values: Vec<f32>,
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_f32_safetensor_vec(
+        path: &Path,
+        name: &str,
+    ) -> Result<F32Safetensor, Box<dyn std::error::Error>> {
+        let bytes = fs::read(path)?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let view = tensors.tensor(name)?;
+        if view.dtype() != safetensors::tensor::Dtype::F32 {
+            return Err(format!("{name} must be F32, got {:?}", view.dtype()).into());
+        }
+        let chunks = view.data().chunks_exact(4);
+        if !chunks.remainder().is_empty() {
+            return Err(format!("{name} F32 byte length is not divisible by 4").into());
+        }
+        let values = chunks
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+        Ok(F32Safetensor {
+            shape: view.shape().to_vec(),
+            values,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_f32_safetensor_3d<B: Backend>(
+        path: &Path,
+        name: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 3>, Box<dyn std::error::Error>> {
+        let tensor = read_f32_safetensor_vec(path, name)?;
+        let shape = tensor.shape.as_slice();
+        if shape.len() != 3 {
+            return Err(format!("{name} must be rank 3, got shape {shape:?}").into());
+        }
+        Ok(
+            Tensor::<B, 1>::from_floats(tensor.values.as_slice(), device)
+                .reshape([shape[0], shape[1], shape[2]]),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_f32_safetensor_4d<B: Backend>(
+        path: &Path,
+        name: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 4>, Box<dyn std::error::Error>> {
+        let tensor = read_f32_safetensor_vec(path, name)?;
+        let shape = tensor.shape.as_slice();
+        if shape.len() != 4 {
+            return Err(format!("{name} must be rank 4, got shape {shape:?}").into());
+        }
+        Ok(
+            Tensor::<B, 1>::from_floats(tensor.values.as_slice(), device)
+                .reshape([shape[0], shape[1], shape[2], shape[3]]),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn print_stage_diff<B: Backend, const D: usize>(
+        label: &str,
+        actual: Tensor<B, D>,
+        expected_shape: &[usize],
+        expected: &[f32],
+    ) {
+        let actual_shape = actual.dims().to_vec();
+        assert_eq!(
+            actual_shape, expected_shape,
+            "{label} shape mismatch: actual={actual_shape:?} expected={expected_shape:?}"
+        );
+        let actual = actual
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("stage tensor values");
+        let summary = diff_summary(&actual, expected);
+        eprintln!(
+            "[triposplat_cuda_stage_parity] {label} elements={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} actual_min={:.6e} actual_max={:.6e} expected_min={:.6e} expected_max={:.6e}",
+            actual.len(),
+            summary.max_abs,
+            summary.mean_abs,
+            summary.rms,
+            summary.actual_min,
+            summary.actual_max,
+            summary.expected_min,
+            summary.expected_max
+        );
+        assert!(
+            summary.all_finite,
+            "{label} contains non-finite values in actual or expected tensor"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    fn print_flux_trace_diffs(path: &Path, trace: burn_flux::Flux2VaeEncodeTrace<CudaBackend>) {
+        print_optional_stage_diff(path, "flux2_conv_in", trace.encoder.conv_in);
+        print_optional_stage_diff(path, "flux2_down_0_resnet_0", trace.encoder.down_0_resnet_0);
+        print_optional_stage_diff(path, "flux2_down_0_resnet_1", trace.encoder.down_0_resnet_1);
+        print_optional_stage_diff(path, "flux2_down_0_sampler", trace.encoder.down_0_sampler);
+        print_optional_stage_diff(path, "flux2_down_1_resnet_0", trace.encoder.down_1_resnet_0);
+        print_optional_stage_diff(path, "flux2_down_1_resnet_1", trace.encoder.down_1_resnet_1);
+        print_optional_stage_diff(path, "flux2_down_1_sampler", trace.encoder.down_1_sampler);
+        print_optional_stage_diff(path, "flux2_down_2_resnet_0", trace.encoder.down_2_resnet_0);
+        print_optional_stage_diff(path, "flux2_down_2_resnet_1", trace.encoder.down_2_resnet_1);
+        print_optional_stage_diff(path, "flux2_down_2_sampler", trace.encoder.down_2_sampler);
+        print_optional_stage_diff(path, "flux2_down_3_resnet_0", trace.encoder.down_3_resnet_0);
+        print_optional_stage_diff(path, "flux2_down_3_resnet_1", trace.encoder.down_3_resnet_1);
+        print_optional_stage_diff(path, "flux2_mid_resnet_0", trace.encoder.mid_resnet_0);
+        print_optional_stage_diff(path, "flux2_mid_attn", trace.encoder.mid_attn);
+        print_optional_stage_diff(path, "flux2_mid_resnet_1", trace.encoder.mid_resnet_1);
+        print_optional_stage_diff(path, "flux2_encoder_out", trace.encoder.encoder_out);
+        print_optional_stage_diff(path, "flux2_moments", trace.moments);
+        print_optional_stage_diff(path, "flux2_latents", trace.latents);
+        print_optional_stage_diff(path, "flux2_unshuffled", trace.unshuffled);
+        print_optional_stage_diff(path, "flux2_normalized", trace.normalized);
+        print_optional_stage_diff(path, "flux2_tokens", trace.tokens);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn print_optional_stage_diff<const D: usize>(
+        path: &Path,
+        label: &str,
+        actual: Tensor<CudaBackend, D>,
+    ) {
+        match read_f32_safetensor_vec(path, label) {
+            Ok(expected) => {
+                print_stage_diff(label, actual, &expected.shape, &expected.values);
+            }
+            Err(err) => {
+                eprintln!("[triposplat_cuda_stage_parity] missing optional {label}: {err}");
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    struct DiffSummary {
+        max_abs: f64,
+        mean_abs: f64,
+        rms: f64,
+        actual_min: f64,
+        actual_max: f64,
+        expected_min: f64,
+        expected_max: f64,
+        all_finite: bool,
+    }
+
+    #[cfg(feature = "cuda")]
+    fn diff_summary(actual: &[f32], expected: &[f32]) -> DiffSummary {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "stage tensor length mismatch: actual={} expected={}",
+            actual.len(),
+            expected.len()
+        );
+        let mut max_abs = 0.0f64;
+        let mut sum_abs = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut actual_min = f64::INFINITY;
+        let mut actual_max = f64::NEG_INFINITY;
+        let mut expected_min = f64::INFINITY;
+        let mut expected_max = f64::NEG_INFINITY;
+        let mut all_finite = true;
+        for (&actual, &expected) in actual.iter().zip(expected.iter()) {
+            let actual = actual as f64;
+            let expected = expected as f64;
+            all_finite &= actual.is_finite() && expected.is_finite();
+            actual_min = actual_min.min(actual);
+            actual_max = actual_max.max(actual);
+            expected_min = expected_min.min(expected);
+            expected_max = expected_max.max(expected);
+            let abs = (actual - expected).abs();
+            max_abs = max_abs.max(abs);
+            sum_abs += abs;
+            sum_sq += abs * abs;
+        }
+        let len = actual.len().max(1) as f64;
+        DiffSummary {
+            max_abs,
+            mean_abs: sum_abs / len,
+            rms: (sum_sq / len).sqrt(),
+            actual_min,
+            actual_max,
+            expected_min,
+            expected_max,
+            all_finite,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn workspace_relative_path(path: PathBuf) -> PathBuf {
+        if path.is_absolute() {
+            return path;
+        }
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path)
     }
 
     #[cfg(not(feature = "trellis"))]

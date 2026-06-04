@@ -453,6 +453,7 @@ async fn tensor_to_vec_f32_async_wasm<B: Backend, const D: usize>(
     tensor
         .into_data_async()
         .await
+        .map_err(|err| format!("failed to materialize tensor data: {err:?}"))?
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|err| format!("failed to read tensor data: {err:?}"))
@@ -469,6 +470,7 @@ async fn build_flash_refinement_coords_from_mask_async_wasm<B: Backend>(
     let curr_mask_values = curr_mask
         .into_data_async()
         .await
+        .map_err(|err| format!("failed to materialize refinement mask: {err:?}"))?
         .convert::<bool>()
         .to_vec::<bool>()
         .map_err(|err| format!("failed to read refinement mask: {err:?}"))?;
@@ -1918,7 +1920,7 @@ mod tests {
     #[test]
     fn zero_padded_flash_delta_tail_masks_only_padding() {
         type B = NdArray<f32>;
-        let device = <B as Backend>::Device::default();
+        let device = <B as burn::tensor::backend::BackendTypes>::Device::default();
         let delta = Tensor::<B, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device);
         let masked = zero_padded_flash_delta_tail(delta, 3);
         let values = masked

@@ -1,0 +1,389 @@
+# TripoSplat WGPU 29 And Runtime Loader Pass
+
+Run id: `20260604T032526Z_triposplat_wgpu29_runtime_loader`
+
+## Summary
+
+- Bevy is pinned to `ae2fcc0353d95e887470f0f6fc8a7e434e5549ce`; the live dependency tree resolves Bevy render and Burn/CubeCL to `wgpu v29.0.3`.
+- `wgpu@27.0.1` and `wgpu@26.0.1` are absent from the `bevy_synth` dependency graph.
+- Native Bevy WGPU inference now passes the Bevy-render-created `burn_wgpu::WgpuDevice` into canonical `burn_synth::RuntimeConfig`, so TripoSG, RMBG-1.4, and TripoSplat WGPU runtime state use the shared Bevy/Burn device instead of silently creating a second default Burn device.
+- `burn_dino` DINOv3 support and `burn_flux` Flux2 VAE encoder support compile and pass their focused tests.
+- `burn_triposplat` now has deterministic flow noise, systematic host octree sampling, runtime component loading, preprocessed-tensor inference, and single-file-vs-parts loader parity tests for flow and decoder.
+- `burn_triposplat` now supports upstream-style multi-density decoding: one sampled latent can be replayed through the decoder for multiple Gaussian-count outputs.
+- Native `burn_synth` TripoSplat root resolution now uses the same cache bootstrap contract as TripoSG/RMBG/Trellis: explicit roots still win, otherwise it attempts `MODEL_BASE_URL/TripoSplat` `.bpk.parts.json` bundles before falling back to valid repo-local artifacts.
+- `burn_synth::runtime::SynthRuntime::{synthesize_splats,synthesize_asset}` now wires native TripoSplat requests through canonical foreground preprocessing and cached backend-specific TripoSplat runtime components, returning Gaussian-splat assets.
+- The native `burn_synth splat` command now uses the canonical TripoSplat splat API directly, defaults to TripoSplat for splat output, rejects explicit mesh-producing synthesis models, accepts repeated/comma-delimited `--gaussians` counts, and writes count-suffixed multi-density `.splat` or `.ply` outputs.
+- `bevy_synth_runtime` now transports mesh-or-splat worker assets, and native `bevy_synth` writes TripoSplat `.splat`/binary PLY output paths while spawning a bounded Bevy mesh proxy for in-scene splat inspection.
+- `burn_synth` wasm now has async sharded TripoSplat component loading plus JS-facing `.splat` and binary PLY outputs; `bevy_synth_runtime` wasm maps TripoSplat requests to canonical Gaussian-splat assets. Browser production splat rendering remains unsupported.
+- The web entry pages now expose only supported wasm choices (`triposg`, `triposplat`, `rmbg14`), and the standalone `burn_synth` wasm API page routes TripoSplat selections to `.splat`/PLY APIs instead of the GLB API.
+- DINOv3 import now normalizes official BF16 safetensors to F32 for Burn import, then casts saved BurnPacks explicitly to the requested precision.
+- TripoSplat import now writes both true f16 and true f32 BurnPacks from the official upstream checkpoint. The bootstrap script uses the WGPU import backend for both precisions because the official flow/decoder sources contain F16 tensors.
+- Native TripoSplat runtime precision is now explicit. The native CLI exposes `--triposplat-weights-precision auto|f16|f32` and defaults to f32 for correctness-first runs; explicit f16 remains available for artifact loading and non-WGPU backend investigation.
+- TripoSplat quantization is currently explicit f32/f16 BurnPack artifact precision. Lower-bit or weight-only quantization is intentionally unsupported until stage-level upstream parity thresholds exist.
+- Real native WGPU TripoSplat f32 and f16 smoke attempts both reproduced CubeCL worker-thread panics during inference while the process could still return success. Native WGPU TripoSplat remains fail-fast in `burn_synth` before preprocessing/model load. The canonical attention helper is now query-chunked, but WGPU should be re-enabled only after a no-panic end-to-end WGPU runtime smoke validates the full backend path.
+- A CUDA-enabled upstream PyTorch reference environment now exists under `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv`. It verifies CUDA on the local RTX PRO 6000 and generated a successful upstream alpha-input reference run under `tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference`.
+- Native Rust CUDA TripoSplat f32 is enabled in `burn_synth`; f16 remains fail-fast with an explicit precision-stability error. With a CUDA 12.9 NVRTC shim, Rust/CubeCL CUDA backend preflight, production-sized query-chunked attention smoke, f32 stage diagnostics, flow-to-decode replay, and the 20-step CLI `.splat` smoke all pass without CubeCL worker panics.
+- The CUDA environment caveat is now explicit: system `/usr/bin/nvcc` is CUDA 12.0 and lists only up to `compute_90`, while the PyTorch venv's CUDA 12.9 NVRTC accepts `sm_120a`, `sm_120`, and `compute_120`. Rust/CubeCL TripoSplat CUDA on this Blackwell GPU requires `libnvrtc.so` to resolve to the CUDA 12.9 shim used in the verification commands below.
+- Flow positional encoding now uses a PyTorch-generated `SobolEngine(dimension=3, scramble=True, seed=123)` table instead of the earlier radical-inverse approximation. Flow loaders reset this canonical table after safetensors, single-file BurnPack, or sharded BurnPack loads so stale serialized `pos_pe` values cannot override upstream-equivalent generated state.
+- CUDA stage parity now has an opt-in diagnostic that compares Rust `feature1`, `feature2`, `latent`, and `camera` against upstream stage safetensors. With the existing v1 reference tensors, Rust DINO feature1 is close but not exact (`mean_abs ~= 7.25e-3`), Flux2 feature2 is not parity-aligned (`mean_abs ~= 4.03e-1`), and flow from upstream conditioning remains finite but divergent. Resetting canonical Sobol improves latent drift from `mean_abs ~= 1.13` to `mean_abs ~= 0.94`.
+- `scripts/triposplat_reference.py` now writes v2 stage tensors with explicit `vae_mean`, `vae_logvar`, `vae_noise`, `flow_noise_latent`, `flow_noise_camera`, `flow_pred_000_*`, and `flow_step_001_*` when run with `--save-stage-arrays`, and the Rust CUDA diagnostic replays those tensors when present. The refreshed v2 CUDA reference under `tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise` preserves the original v1 `feature1`, `feature2`, `latent`, and `camera` tensors exactly while adding stochastic inputs and first-step traces.
+- Exact-noise CUDA parity narrowed substantially after two canonical flow fixes: legacy PCD position embedding now uses `2 * pi`, and RoPE is applied before Q/K RMSNorm to match upstream `RopeMultiHeadAttention`. With upstream conditioning and flow noise, the first prediction is `flow_pred_000_latent mean_abs=3.283846e-3`, the first Euler update is `latent_after_flow_step_001 mean_abs=5.675029e-5`, and the 20-step final latent is `mean_abs=3.472442e-3` with a large residual max outlier (`max_abs=2.324124e0`). Rust conditioning plus upstream flow noise currently gives final latent `mean_abs=2.703686e-2`, so DINO/Flux conditioning drift remains the correctness floor.
+- The CUDA diagnostic now accepts `TRIPOSPLAT_WEIGHTS_PRECISION=f16|f32`, `TRIPOSPLAT_COMPUTE_DTYPE=f16|f32`, `TRIPOSPLAT_PREFIX_ONLY=1`, `TRIPOSPLAT_FLOW_ONLY=1`, `TRIPOSPLAT_DECODE_REPLAY=1`, and `TRIPOSPLAT_RUST_CONDITION_FLOW=1`. The diagnostic loader now emits component-load events, and `burn_synth/cuda` flushes the CubeCL CUDA client after those events. The 64x64 true-f32 condition trace, full true-f32 flow replay, and flow-to-decode replay all pass without the previous `drop_queue/policy.rs:36` overflow.
+- The reference generator's `--model-dtype` path now reloads DINOv3, Flux2 VAE, flow, and decoder directly from source safetensors at the requested dtype instead of casting an already-loaded upstream default pipeline. This matters for Flux2: upstream default loads DINOv3/Flux2 as BF16 and flow/decoder as F16, while true f32 references should be generated from the original f32 safetensors.
+- Flux2 VAE now has an opt-in per-stage trace API (`Flux2VaeEncodeTrace`) and the CUDA diagnostic can compare those stages when `TRIPOSPLAT_FLUX_TRACE=1`. On the 64x64 true-f32 trace, f32 BurnPack execution matches the first Flux conv closely (`flux2_conv_in max_abs=9.536743e-7 mean_abs=2.750128e-8`) and ends at `feature2 max_abs=1.890182e-3 mean_abs=2.970085e-4`; this supports the Flux architecture/import mapping. The larger apparent full-size Flux gap was traced to upstream PyTorch cuDNN TF32 behavior: a true-f32, no-TF32 reference reduces `feature2` drift to `mean_abs=6.716680e-6`.
+- Production f32 CUDA runtime now resizes TripoSplat preprocessed foreground images to the upstream 1024 canvas before model inference. The verified 20-step smoke emits `size=1024x1024`, completes inference in `429700.7 ms`, and writes a `1,048,576` byte `.splat` with 32,768 records.
+- On the 64x64 trace with f16 BurnPack storage promoted to f32 compute, the first Flux difference starts immediately at `flux2_conv_in` (`max_abs=3.871799e-3 mean_abs=4.364161e-4`) and ends at `feature2 max_abs=2.882707e-2 mean_abs=3.090878e-3`. That is a precision/storage gap rather than a later VAE formula mismatch.
+- A diagnostic f16 compute override exists for parity investigation, but f16 full-component execution was not practical: it stalled before conditioning metrics under low GPU utilization, and f16 flow-only execution stalled before the first-step metric. Native CUDA f16 remains guarded; production CUDA uses f32 artifacts.
+
+## Implementation Notes
+
+- Fixed shared BurnPack parts writing in `burn_synth_import::parts`:
+  - source reads now use BurnPack's aligned data-section start,
+  - part files write aligned data-section padding,
+  - tensor payloads preserve BurnPack's 256-byte tensor alignment,
+  - part size estimation includes the same padding.
+- Added `burn_triposplat` parity coverage that saves tiny flow/decoder modules to `.bpk`, generates `.bpk.parts.json`, removes the base `.bpk`, reloads from parts, and compares outputs against single-file loads.
+- Added `TripoSplatRuntimeComponents::{decode_latent_many,infer_preprocessed_image_many}` to match upstream `pipe.run(..., num_gaussians=[...])` behavior without re-running the denoiser.
+- Added `SplatRequest`/`SplatOutput` to `burn_synth::runtime`; multi-count native runtime calls preprocess/load/sample once and decode the same latent for each requested Gaussian count.
+- Added backend-specific TripoSplat component caches in `burn_synth` native runtime for CPU/WGPU/CUDA feature builds.
+- Added optional `RuntimeConfig::wgpu_device` and threaded it through native Bevy's shared-device worker bridge; WGPU backend initialization now honors that device for foreground preprocessing, TripoSG synthesis, and TripoSplat synthesis.
+- Updated `burn_synth splat` so one `--gaussians` value preserves the existing output path, while multiple values write `<stem>_<count>.splat` or `<stem>_<count>.ply`; global `--synthesis-models` defaults are command-aware to avoid silently rewriting explicit user choices.
+- Replaced the native Bevy worker's mesh-only result surface with `SynthAsset::{Mesh, GaussianSplat}`.
+- Headless/queued Bevy output resolution now uses `.splat` by default for TripoSplat and preserves explicit `.splat`/`.ply` paths; mesh outputs remain GLB.
+- Added a native-only Gaussian splat preview helper in `bevy_synth` that converts up to 8,192 splats into small colored octahedron mesh proxies for catalog readiness and scene inspection. The canonical export remains `.splat`/PLY; wasm still reports splat rendering as unsupported.
+- Updated `burn_dino` DINO/DINOv3 transformer state to use Burn 0.21 `#[module(skip)]` instead of deprecated `Ignored<T>` for interpolation mode metadata.
+- Updated TripoSG DiT/VAE metadata fields to use Burn 0.21 `#[module(skip)]` instead of deprecated `Ignored<T>`, removing downstream deprecation warnings from TripoSplat runtime checks.
+- Hardened `burn_flux` Flux2 VAE encoder imports so safetensors, single-file BurnPack, and BurnPack part application fail when no tensors are applied.
+- Added diagnostic-only Flux2 VAE trace surfaces in `burn_flux` and exposed matching upstream trace export from `scripts/triposplat_reference.py --save-flux-trace`.
+- Added TripoSplat loader parity coverage for Flux2 VAE encoder single-file `.bpk` vs `.bpk.parts.json` loading, comparing deterministic conditioning-token outputs.
+- Added native TripoSplat BurnPack-parts bootstrap in `burn_synth::native_model_bootstrap`, keyed to the canonical output artifact names: `clip_vision/dino_v3_vit_h`, `vae/flux2_vae_encoder`, `diffusion_models/triposplat_flow`, and `vae/triposplat_vae_decoder`.
+- Added `scripts/triposplat_bootstrap.sh`, which downloads or reuses the official `VAST-AI/TripoSplat` safetensors layout, runs `triposplat_import`, and writes `.bpk.parts.json` shards under a repo-relative output root.
+- Added `scripts/triposplat_reference.py`, which runs the checked-out upstream Python implementation stage-by-stage and writes `reference.json`, prepared image output, `.splat`/PLY assets, and optional `.npz` feature/latent arrays under `tmp/runs/<run_id>/`.
+- Extended `scripts/triposplat_reference.py` so `--save-stage-arrays` also writes `stage_tensors_f32.safetensors` with `image_rgb_0_1`, `feature1`, `feature2`, `latent`, and optional `camera` tensors for Rust/upstream stage parity checks.
+- Added `scripts/triposplat_compare_stage_tensors.py`, which compares TripoSplat stage safetensors with explicit max/mean/RMS thresholds and emits a machine-readable report.
+- Added `scripts/triposplat_compare_splat.py`, which compares upstream and Rust `.splat` files with explicit position/scale/RGBA/rotation thresholds and emits a machine-readable report.
+- Added `triposplat_stage_export`, a Rust-side stage tensor exporter that reads `image_rgb_0_1` from a safetensors file, runs canonical Rust TripoSplat components, and writes safetensors stage outputs for `scripts/triposplat_compare_stage_tensors.py`.
+- Added workspace-relative path handling to the gated `burn_triposplat` reference-contract test so `TRIPOSPLAT_REFERENCE_JSON=tmp/runs/<run>/reference.json cargo test ...` works from the workspace root.
+- Documented the artifact bootstrap path in `crates/burn_triposplat/README.md`.
+- Added a separate cached TripoSplat wasm state in `burn_synth::wasm_api` that loads DINOv3, Flux2 VAE, flow, and decoder components from async `.bpk.parts.json` manifests under `assets/models/TripoSplat`.
+- Added JS-facing `infer_splat_from_image_bytes*` and `infer_ply_from_image_bytes_with_options` APIs; the GLB API now rejects TripoSplat with an explicit asset-format error.
+- Routed `bevy_synth_runtime` wasm TripoSplat requests through the canonical splat-cloud wasm API and returns `SynthAsset::GaussianSplat`.
+- Updated `www/index.html` and `www/synth_api.html` so browser controls normalize `triposplat` query params consistently with the Rust wasm preset parser. The `synth_api.html` demo now switches its run action/download extension between GLB, `.splat`, and PLY based on selected model/format.
+- Added dtype alignment for f16 runtime execution:
+  - `burn_dino` casts generated DINOv3 RoPE tensors to the patch-embed dtype,
+  - `burn_flux` casts VAE sampling noise to the latent mean dtype and avoids Burn's f16 asymmetric-conv pad mismatch with explicit dtype-preserving bottom/right padding,
+  - `burn_triposplat` casts image, noise, timestep, positional, octree, and Gaussian decoder temporary tensors to the loaded model dtype at canonical stage boundaries.
+- Updated TripoSplat import precision handling so f32 output is explicitly cast to `FloatDType::F32` instead of preserving f16 source tensor dtypes.
+- Added native TripoSplat precision policy tests proving f32 is selected by default when both f32 and f16 artifact sets are present, while explicit f16 remains honored.
+- Documented the current TripoSplat quantization policy in `crates/burn_triposplat/README.md`: f32 is the correctness-first native default, f16 is the supported storage/loading precision, and lower-bit formats need explicit future parity gates.
+- Added canonical `burn_synth` guards for native TripoSplat WGPU and CUDA requests. The guards reject f32/f16 precision requests with explicit backend-stability errors before foreground preprocessing, preventing CubeCL/Burn worker panics from being hidden behind successful or partial runs.
+- Added a CUDA preflight smoke helper in `burn_synth` so CUDA/NVRTC setup can be tested independently from the guarded full TripoSplat inference path.
+- Updated stale Burn 0.21 device-type call sites in `burn_tripo` CUDA/test paths from the old qualified `Backend::Device` form to `BackendTypes::Device`, and gated the VAE f16 BurnPack load smoke behind the `import` feature.
+- Updated `burn_triposplat::components::scaled_dot_product_attention` to use explicit canonical `1/sqrt(head_dim)` scale inside bounded query chunks. Each chunk still attends over the full key/value context, but CubeCL fallback/autotune cannot materialize the full `32768 x 32768` score tensor in one allocation.
+- Added focused attention tests proving explicit-scale dense attention matches the reference and forced query-chunked attention matches dense attention on NdArray.
+- Added opt-in Gaussian decoder finite diagnostics: `decode_to_cloud_with_seed_checked` validates the upstream latent, octree sample, and each Gaussian decoder projection/attention/MLP stage when explicitly requested.
+- Matched flow positional/rotary math to upstream more closely:
+  - legacy `PcdAbsolutePositionEmbedder` now scales by `2 * pi`,
+  - `RePo3dRotaryEmbedding` initializes learnable freqs with upstream `linspace(1.0, 16.0, steps=freq_dim)`,
+  - rope-enabled self-attention now applies RoPE before Q/K RMSNorm, matching upstream `RopeMultiHeadAttention`.
+- Replaced TripoSplat flow `pos_pe` generation with a checked PyTorch Sobol table (`seed=123`, `dimension=3`, `8192` rows) and added a prefix test against PyTorch's first rows.
+- Added `TripoSplatRuntimeComponents::{encode_preprocessed_image_with_vae_noise,sample_latent_from_noise,sample_latent_prefix_from_noise,flow_prediction_from_noise_at_step}` so correctness diagnostics can replay upstream stochastic inputs and first-step velocity predictions exactly instead of relying on unrelated Rust seeded noise.
+- Extended `scripts/triposplat_reference.py` with explicit stochastic input export and `--skip-decode` for fast conditioning/flow reference refreshes.
+- Added the gated `TRIPOSPLAT_CUDA_STAGE_PARITY=1` diagnostic in `burn_synth` for CUDA stage metrics. It uses v2 explicit-noise tensors when available and logs a v1 fallback when the reference file lacks those tensors.
+- Added a diagnostic-only TripoSplat component loader with explicit compute dtype selection plus `TRIPOSPLAT_WEIGHTS_PRECISION`, `TRIPOSPLAT_FLOW_ONLY=1`, `TRIPOSPLAT_PREFIX_ONLY=1`, and `TRIPOSPLAT_RUST_CONDITION_FLOW=1` stage diagnostic modes. These are validation hooks; guarded runtime defaults still use f32 compute for f16 artifacts.
+- Added `TripoSplatRuntimeLoadEvent` and `load_triposplat_runtime_components_with_compute_dtype_and_callback`. Runtime component load/cast now happens per component, skips redundant same-dtype casts, and lets CUDA diagnostics flush the CubeCL upload queue after each heavy component without adding CUDA-specific code to `burn_triposplat`.
+- Updated the production CUDA TripoSplat loader to use the same per-component load callback and CUDA upload flush policy as the diagnostic path. f32 artifacts now avoid redundant casting; f16 artifacts remain rejected for native CUDA runtime until validated.
+- Resized only the TripoSplat prepared foreground tensor/masks to upstream's 1024 canvas before TripoSplat inference. Mesh paths keep their existing preprocessing behavior.
+
+## Verification
+
+- `cargo tree -p bevy_synth -i wgpu@29.0.3`
+  - shows `bevy_render v0.19.0-dev (rev ae2fcc03)` and `cubecl-wgpu v0.10.0` under `wgpu v29.0.3`.
+- `cargo tree -p bevy_synth -i wgpu@27.0.1`
+  - expected failure: package ID did not match any packages.
+- `cargo tree -p bevy_synth -i wgpu@26.0.1`
+  - expected failure: package ID did not match any packages.
+- `cargo test -p burn_triposplat --features import -- --nocapture`
+  - passed: 26 unit tests and 3 conditioning integration tests, including Flux2 single-file-vs-parts loader parity and dtype-safe TripoSplat stage temporaries.
+- `cargo test -p burn_triposplat runtime::tests:: -- --nocapture`
+  - passed: tiny preprocessed inference, conditioning padding, and multi-density latent replay tests.
+- `cargo test -p burn_triposplat pipeline::tests:: -- --nocapture`
+  - passed: status contract and direct image-entrypoint fail-fast diagnostics.
+- `cargo test -p burn_synth_import -- --nocapture`
+  - passed: 8 library tests, 6 artifact binary tests.
+- `cargo test -p burn_synth splat -- --nocapture`
+  - passed: TripoSplat mesh fail-fast, asset dry-run, splat runtime dry-run/count normalization, multi-density dry-run rejection, CLI count parsing, and multi-output path tests.
+- `cargo test -p burn_synth --bin burn_synth -- --nocapture`
+  - passed: 7 CLI tests, including command-aware synthesis defaults, f32 TripoSplat native precision default, and explicit mesh-model rejection for `splat`.
+- `cargo check -p burn_synth`
+  - passed.
+- `cargo check -p burn_synth --features wgpu`
+  - passed: native WGPU runtime config and shared-device plumbing compile; after the TripoSG metadata patch this no longer emits `Ignored<T>` deprecation warnings from `burn_tripo`.
+- `cargo check -p burn_synth --features cuda`
+  - passed: the Rust CUDA backend compiles for the current TripoSplat wiring.
+- `cargo check -p burn_trellis --no-default-features`
+  - passed: the host-path `sparse_layout_from_coords` build break is fixed outside `runtime-model`.
+- `cargo check -p burn_trellis`
+  - passed: default Trellis feature set compiles cleanly after warning cleanup.
+- `cargo test -p burn_synth --features runtime triposplat -- --nocapture`
+  - passed: 8 runtime/bootstrap tests and 1 CLI test, including native TripoSplat WGPU fail-fast policy, f32 default precision, explicit f16 precision resolution, splat dry-runs, and command-aware CLI defaults.
+- `cargo test -p burn_triposplat -- --nocapture`
+  - passed: 23 library tests, 2 conditioning integration tests, and doc-tests, including the new default-scale and query-chunked attention checks.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH BURN_CUDA_SMOKE=1 cargo test -p burn_tripo --features cuda smoke_cuda_backend -- --nocapture`
+  - passed: the Rust/CubeCL CUDA backend performed the 2x2 matmul smoke without the skip message after adding unversioned `libnvrtc.so` and `libnvrtc-builtins.so` symlinks to the CUDA 12.9 shim.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH LD_DEBUG=libs BURN_CUDA_SMOKE=1 target/debug/deps/backend_smoke-367f7f4ff76558bc smoke_cuda_backend --nocapture`
+  - passed: loader trace shows `libnvrtc.so` initializing from the CUDA 12.9 shim root, not `/lib/x86_64-linux-gnu/libnvrtc.so`.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH BURN_CUDA_SMOKE=1 cargo test -p burn_synth --features runtime,cuda triposplat_ -- --nocapture`
+  - passed: 11 runtime/bootstrap tests and 1 CLI test, including native TripoSplat WGPU/CUDA f16 fail-fast policy, the opt-in decoder diagnostic skip path, and the explicit TripoSplat CUDA preflight/large-attention smoke tests.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH BURN_CUDA_SMOKE=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_large_attention_smoke -- --nocapture`
+  - passed: production-sized TripoSplat attention shape `[1, 32768, 8, 64]` returns the expected shape and finite zero sample through the canonical query-chunked attention path.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_CUDA_DECODER_DIAGNOSTIC=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_decoder_diagnostic_reference_latent -- --nocapture`
+  - passed: loading `vae/triposplat_vae_decoder.bpk` and decoding upstream `stage_tensors_f32.safetensors` latent produced `decoded_splats=32768` through the checked CUDA decoder path.
+- `cargo test -p burn_triposplat flow::tests:: -- --nocapture`
+  - passed: includes the PyTorch Sobol seed-123 prefix contract for the canonical flow positional table.
+- `cargo test -p burn_triposplat runtime::tests:: -- --nocapture`
+  - passed after adding explicit-noise runtime component APIs.
+- `cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture`
+  - passed with the diagnostic skipped by default.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture`
+  - passed as a diagnostic against the existing v1 upstream stage tensors. Before canonical `pos_pe` reset, `latent_from_reference_condition` reported `max_abs=6.335864e0 mean_abs=1.134708e0 rms=1.415214e0`; after reset it reported `max_abs=4.997291e0 mean_abs=9.393074e-1 rms=1.176824e0`. `feature2` remains divergent (`max_abs=3.342256e0 mean_abs=4.025335e-1 rms=5.498271e-1`) until v2 explicit VAE noise is regenerated with CUDA Torch and replayed.
+- `python3 -m py_compile scripts/triposplat_reference.py`
+  - passed after adding v2 explicit-noise export and `--skip-decode`.
+- `python3 scripts/triposplat_reference.py --validate-only`
+  - passed, but `python3 scripts/triposplat_reference.py --device cuda ... --save-stage-arrays --skip-decode` failed because the system Python Torch is CPU-only (`torch.cuda.is_available() == false`). Use `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python` for CUDA reference refreshes.
+- `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python scripts/triposplat_reference.py --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output-dir tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise --device cuda --seed 42 --steps 20 --guidance-scale 3.0 --shift 3.0 --erode-radius 1 --gaussians 32768 --save-stage-arrays --skip-decode --save-flow-steps 1`
+  - passed after disabling autograd in the manual reference helpers. The new v2 safetensors file includes `vae_noise`, `flow_noise_latent`, `flow_noise_camera`, `flow_pred_000_latent`, `flow_pred_000_camera`, `flow_step_001_latent`, and `flow_step_001_camera`.
+- `python3 scripts/triposplat_compare_stage_tensors.py tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/stage_tensors_f32.safetensors --report tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/v1_v2_stage_compare.json`
+  - passed: v2 reference generation preserves the original v1 `image_rgb_0_1`, `feature1`, `feature2`, `latent`, and `camera` tensors with zero difference.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/stage_tensors_f32.safetensors TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture`
+  - passed as an exact-noise f16-storage/f32-compute diagnostic after the PCD and RoPE/RMSNorm order fixes. Metrics: `feature1 max_abs=3.521647e-1 mean_abs=7.252009e-3 rms=1.006669e-2`; `feature2 max_abs=1.884683e-1 mean_abs=1.153482e-2 rms=1.525383e-2`; `flow_pred_000_latent max_abs=2.772464e-2 mean_abs=3.283846e-3 rms=4.212877e-3`; `flow_pred_000_camera max_abs=4.311860e-3 mean_abs=2.279481e-3 rms=2.654595e-3`; `latent_after_flow_step_001 max_abs=4.783869e-4 mean_abs=5.675029e-5 rms=7.281000e-5`; final `latent_from_reference_condition max_abs=2.324124e0 mean_abs=3.472442e-3 rms=1.484755e-2`; final `camera_from_reference_condition max_abs=5.560517e-4 mean_abs=4.003823e-4 rms=4.158253e-4`.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/stage_tensors_f32.safetensors TRIPOSPLAT_CUDA_STAGE_PARITY=1 TRIPOSPLAT_RUST_CONDITION_FLOW=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture`
+  - passed as an opt-in end-to-end conditioning diagnostic. With upstream flow noise but Rust DINO/Flux conditioning, final `latent_from_rust_condition max_abs=3.124656e0 mean_abs=2.703686e-2 rms=6.895429e-2`; final `camera_from_rust_condition max_abs=4.425973e-3 mean_abs=1.756617e-3 rms=2.295859e-3`.
+- `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_CUDA_STAGE_PARITY=1 TRIPOSPLAT_RUST_CONDITION_FLOW=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture`
+  - terminated after CubeCL worker threads repeatedly panicked in `cubecl-runtime ... drop_queue/policy.rs:36` with `attempt to add with overflow` during conditioning. Partial metrics before termination matched f16-storage conditioning closely (`feature1 mean_abs=7.252014e-3`, `feature2 mean_abs=1.146118e-2`), but this is not a valid f32 CUDA parity pass.
+- `TRIPOSPLAT_COMPUTE_DTYPE=f16 TRIPOSPLAT_FLOW_ONLY=1 ... TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture`
+  - terminated after the f16 flow-only diagnostic stayed low-utilization and did not produce the first-step metric. Earlier f16 full-component diagnostic also stalled before feature metrics. Do not enable f16 compute as a runtime path from this evidence.
+- Latest fast validation after the PCD/RoPE flow parity fixes and diagnostic updates:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo tree -p bevy_synth -i wgpu@29.0.3 --edges normal` passed and shows Bevy `ae2fcc03` plus Burn/CubeCL under `wgpu v29.0.3`.
+  - `cargo tree -p bevy_synth -i wgpu@27.0.1 --edges normal` failed as expected because no such package exists in the graph.
+  - `cargo tree -p bevy_synth -i wgpu@26.0.1 --edges normal` failed as expected because no such package exists in the graph.
+  - `cargo test -p burn_triposplat components::tests:: -- --nocapture` passed: 5 focused component tests, including upstream RePo frequency initialization.
+  - `cargo test -p burn_triposplat flow::tests:: -- --nocapture` passed: 4 focused flow tests, including the PyTorch Sobol prefix contract.
+  - `cargo test -p burn_triposplat runtime::tests:: -- --nocapture` passed: 3 focused runtime tests.
+  - `cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed with the expensive CUDA diagnostic skipped by default.
+  - `cargo check -p bevy_synth --features wgpu` passed.
+- Latest Flux trace validation:
+  - `python3 -m py_compile scripts/triposplat_reference.py` passed after true-dtype loading and `--save-flux-trace`.
+  - `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python scripts/triposplat_reference.py --input tmp/runs/20260604T123500Z_triposplat_conditioning_small/input_rgba_64.png --output-dir tmp/runs/20260604T132500Z_triposplat_flux_trace_small_true_f32/reference_f32_encode_trace --device cuda --seed 42 --steps 20 --guidance-scale 3.0 --shift 3.0 --erode-radius 1 --gaussians 32 --model-dtype f32 --save-stage-arrays --save-flux-trace --skip-preprocess --skip-flow --skip-decode` passed.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T132500Z_triposplat_flux_trace_small_true_f32/reference_f32_encode_trace/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_CONDITION_ONLY=1 TRIPOSPLAT_FLUX_TRACE=1 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed and logged component-load CUDA flushes under `tmp/runs/20260604T114004Z_triposplat_cuda_f32_flush/01_cuda_stage_parity_condition_only.log`.
+  - `rg -n "attempt to add with overflow|thread .* panicked|flushed CUDA upload queue|feature2 elements|flux2_conv_in" tmp/runs/20260604T114004Z_triposplat_cuda_f32_flush/01_cuda_stage_parity_condition_only.log` found the four flush markers plus `flux2_conv_in max_abs=9.536743e-7 mean_abs=2.750128e-8` and `feature2 max_abs=1.890182e-3 mean_abs=2.970085e-4`; it found no overflow or panic lines.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_PREFIX_ONLY=1 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed and logged flushes/no overflow under `tmp/runs/20260604T114405Z_triposplat_cuda_f32_prefix_flush/01_cuda_stage_parity_prefix.log`. Metrics matched the earlier exact-noise first-step values: `flow_pred_000_latent mean_abs=3.283846e-3`; `latent_after_flow_step_001 mean_abs=5.675029e-5`.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T091951Z_triposplat_cuda_reference_noise/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed and logged flushes/no overflow under `tmp/runs/20260604T114526Z_triposplat_cuda_f32_flow_flush/01_cuda_stage_parity_flow.log`. Against the mixed-precision upstream reference, final `latent_from_reference_condition mean_abs=3.472442e-3` and `camera_from_reference_condition mean_abs=4.003823e-4`.
+  - `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python scripts/triposplat_reference.py --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output-dir tmp/runs/20260604T115053Z_triposplat_cuda_reference_true_f32 --device cuda --seed 42 --steps 20 --guidance-scale 3.0 --shift 3.0 --erode-radius 1 --gaussians 32768 --model-dtype f32 --save-stage-arrays --save-flow-steps 1 --skip-decode` passed and wrote full true-f32 stage tensors.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T115053Z_triposplat_cuda_reference_true_f32/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed and logged flushes/no overflow under `tmp/runs/20260604T115153Z_triposplat_cuda_true_f32_flow_replay/01_cuda_stage_parity_true_f32_flow.log`. True-f32 metrics: `feature1 mean_abs=3.259325e-6`; `feature2 mean_abs=4.124476e-3`; `flow_pred_000_latent mean_abs=3.074872e-4`; `latent_after_flow_step_001 mean_abs=5.308579e-6`; final `latent_from_reference_condition mean_abs=8.336825e-4`; final `camera_from_reference_condition mean_abs=2.509832e-4`.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T115053Z_triposplat_cuda_reference_true_f32/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_RUST_CONDITION_FLOW=1 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed and logged flushes/no overflow under `tmp/runs/20260604T115705Z_triposplat_cuda_true_f32_rust_condition/01_cuda_stage_parity_true_f32_rust_condition.log`. With Rust conditioning plus upstream flow noise, final `latent_from_rust_condition mean_abs=2.480202e-3` and `camera_from_rust_condition mean_abs=6.576151e-4`.
+  - `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python scripts/triposplat_reference.py --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output-dir tmp/runs/20260604T120916Z_triposplat_cuda_reference_true_f32_no_tf32 --device cuda --seed 42 --steps 20 --guidance-scale 3.0 --shift 3.0 --erode-radius 1 --gaussians 32768 --model-dtype f32 --disable-tf32 --save-stage-arrays --save-flow-steps 1 --skip-decode` passed and wrote a true-f32 no-TF32 reference. Metadata records `matmul_allow_tf32=false`, `cudnn_allow_tf32=false`, and `float32_matmul_precision=highest`.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T120916Z_triposplat_cuda_reference_true_f32_no_tf32/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed under `tmp/runs/20260604T121015Z_triposplat_cuda_true_f32_no_tf32_replay/01_cuda_stage_parity_true_f32_no_tf32.log`. Key metrics: `feature2 mean_abs=6.716680e-6`, `vae_mean mean_abs=1.172393e-5`, `vae_logvar mean_abs=4.733769e-6`, `flow_pred_000_latent mean_abs=3.078404e-4`, `latent_after_flow_step_001 mean_abs=5.314777e-6`, final `latent_from_reference_condition mean_abs=7.708753e-4`, and `camera_from_reference_condition mean_abs=9.493828e-5`.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T120916Z_triposplat_cuda_reference_true_f32_no_tf32/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_RUST_CONDITION_FLOW=1 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed under `tmp/runs/20260604T121540Z_triposplat_cuda_true_f32_no_tf32_rust_condition/01_cuda_stage_parity_true_f32_no_tf32_rust_condition.log`. With Rust conditioning plus upstream flow noise, final `latent_from_rust_condition mean_abs=7.580492e-4` and `camera_from_rust_condition mean_abs=9.424984e-5`.
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH TRIPOSPLAT_STAGE_TENSORS=tmp/runs/20260604T120916Z_triposplat_cuda_reference_true_f32_no_tf32/stage_tensors_f32.safetensors TRIPOSPLAT_WEIGHTS_PRECISION=f32 TRIPOSPLAT_RUST_CONDITION_FLOW=1 TRIPOSPLAT_DECODE_REPLAY=1 TRIPOSPLAT_CUDA_STAGE_PARITY=1 cargo test -p burn_synth --features runtime,cuda triposplat_cuda_stage_parity_reference_tensors -- --nocapture` passed under `tmp/runs/20260604T122754Z_triposplat_cuda_true_f32_no_tf32_decode_replay/01_cuda_stage_parity_true_f32_no_tf32_decode_replay.log` and decoded both reference-condition and Rust-condition replay latents into 32,768 splats.
+  - `cargo test -p burn_synth --features runtime,cuda triposplat_native_wgpu_is_rejected_until_validated -- --nocapture` passed after native CUDA f32 enablement: WGPU remains rejected, CUDA f16 remains rejected, and CUDA f32 is accepted.
+  - `cargo test -p burn_flux --features import -- --nocapture` passed: 5 tests, including `flux2_vae_zero_noise_trace_matches_deterministic_encode`.
+  - `cargo test -p burn_triposplat runtime::tests:: -- --nocapture` passed: 3 runtime tests.
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo tree -p bevy_synth -i wgpu@29.0.3 --edges normal` passed and shows Bevy `ae2fcc03` plus Burn/CubeCL under `wgpu v29.0.3`.
+  - `cargo tree -p bevy_synth -i wgpu@27.0.1 --edges normal` and `cargo tree -p bevy_synth -i wgpu@26.0.1 --edges normal` both failed as expected because no such package IDs exist in the graph.
+- Latest production CUDA f32 runtime smoke:
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH timeout 1400s cargo run -p burn_synth --features runtime,cuda -- --backend cuda --synthesis-models triposplat --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f32 --num-steps 20 --guidance-scale 3.0 --triposplat-shift 3.0 --triposplat-erode-radius 1 --gaussians 32768 --progress stages splat --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output tmp/runs/20260604T125821Z_triposplat_cuda_runtime_smoke_1024/rust_cuda_32768.splat` passed.
+  - Log: `tmp/runs/20260604T125821Z_triposplat_cuda_runtime_smoke_1024/01_burn_synth_splat_cuda.log`.
+  - Evidence: preprocessing `size=1024x1024`, backend load `precision=f32`, inference completed `splats=32768` in `429700.7 ms`, run completed in `440706.0 ms`, and the CLI wrote `rust_cuda_32768.splat`.
+  - Output size: `1,048,576` bytes (`32768 * 32`). Output SHA-256: `5e2d7e494cd4dd75adabb2c66044360bc060018ec4ddfb4d4edcaf367ccbd580`.
+  - GPU evidence sampled during inference: `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`, `100 %` utilization, `20705 MiB / 97887 MiB` used.
+- `cargo test -p burn_synth native_model_bootstrap --features runtime -- --nocapture`
+  - passed: 3 focused native bootstrap tests, including the TripoSplat BurnPack parts base-name contract.
+- `bash -n scripts/triposplat_bootstrap.sh`
+  - passed.
+- `scripts/triposplat_bootstrap.sh --help`
+  - passed and prints source/output/precision/parts options without touching artifacts.
+- `python3 scripts/triposplat_reference.py --help`
+  - passed and prints upstream-code, checkpoint-root, input, output, seed, step, Gaussian-count, and stage-array options.
+- `python3 scripts/triposplat_reference.py --validate-only`
+  - passed: the local upstream Python checkout and official TripoSplat safetensors are present.
+- `python3 -m py_compile scripts/triposplat_reference.py scripts/triposplat_compare_splat.py scripts/triposplat_compare_stage_tensors.py`
+  - passed.
+- `python3 scripts/triposplat_compare_stage_tensors.py --help`
+  - passed and prints tensor-selection and numeric threshold options.
+- `python3 scripts/triposplat_compare_stage_tensors.py tmp/runs/20260604T070000Z_triposplat_stage_compare_synthetic/stage_tensors_f32.safetensors tmp/runs/20260604T070000Z_triposplat_stage_compare_synthetic/stage_tensors_f32.safetensors --report tmp/runs/20260604T070000Z_triposplat_stage_compare_synthetic/self_compare.json`
+  - passed: synthetic self-compare reports zero max/mean/RMS differences for `image_rgb_0_1`, `feature1`, `feature2`, and `latent`.
+- `python3 scripts/triposplat_compare_splat.py --help`
+  - passed and prints numeric threshold options.
+- `python3 scripts/triposplat_compare_splat.py tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/chair_f32_minimal_env.splat tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/chair_f32_minimal_env.splat --report tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/self_compare.json`
+  - passed: self-compare reports 32,768 records and zero position/scale/RGBA/rotation differences.
+- CUDA Python reference environment:
+  - `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python - <<'PY' ... torch.cuda.is_available() ... PY`
+    - passed with `torch=2.11.0+cu129`, `torchvision=0.26.0+cu129`, `cuda_available=True`, and `cuda_device=NVIDIA RTX PRO 6000 Blackwell Workstation Edition`.
+  - `python3 scripts/triposplat_reference.py --input docs/input_chair.jpg --device cuda --save-stage-arrays`
+    - failed during upstream RMBG/BiRefNet preprocessing because `torchvision.ops.deform_conv2d` reports `CUDA error: no kernel image is available for execution on the device` on this Blackwell GPU.
+  - `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/bin/python scripts/triposplat_reference.py --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output-dir tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference --device cuda --seed 42 --steps 20 --guidance-scale 3.0 --shift 3.0 --erode-radius 1 --gaussians 32768 --save-stage-arrays`
+    - passed by using upstream's supported RGBA input path to skip RMBG and generate model-stage reference evidence.
+    - key outputs: `feature1` shape `[1, 4101, 1280]` sha256 `25a4f6c5231fbbbab468f403a4b8543f97c6cebd43ecd142372506a527cc7f89`; `feature2` shape `[1, 4101, 128]` sha256 `40b6cf0c219e914951c95abdc11fccd1218e1b45714c5f95db6c91b9ac7dc45b`; `latent` shape `[1, 8192, 16]` sha256 `8ee076abfb435f5653bee3bfd45ff981e298f4554ea0824f70515fc6c67590ef`; `.splat` bytes `1048576` sha256 `7119686dddc371e92b990bdf50752da0e29f84aa75262e953b732334cfe303ff`.
+  - `TRIPOSPLAT_REFERENCE_JSON=tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/reference.json cargo test -p burn_triposplat --features import triposplat_reference_metadata_contract_reference -- --nocapture`
+    - passed: Rust validates the upstream reference metadata, output splat byte count, and stage safetensors contract.
+  - `python3 scripts/triposplat_compare_stage_tensors.py tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors --report tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_self_compare.json`
+    - passed: self-compare reports zero differences for `image_rgb_0_1`, `feature1`, `feature2`, `latent`, and `camera`.
+  - `python3 scripts/triposplat_compare_splat.py tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/reference_32768.splat tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/reference_32768.splat --report tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/splat_self_compare.json`
+    - passed: self-compare reports 32,768 records and zero position/scale/RGBA/rotation differences.
+- Rust stage exporter:
+  - `cargo check -p burn_triposplat --features import --bin triposplat_stage_export`
+    - passed.
+  - `cargo run -p burn_triposplat --features import --bin triposplat_stage_export -- --help`
+    - passed and prints weights-root, precision, input-stages, output, seed, steps, guidance scale, shift, Gaussian count, and stop-after options.
+  - `cargo run -p burn_triposplat --features import --bin triposplat_stage_export -- --weights-root crates/burn_triposplat/assets/models/TripoSplat --precision f16 --input-stages tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors --output tmp/runs/20260604T082000Z_triposplat_rust_stage_export_cpu_encode/rejected.safetensors --stop-after encode`
+    - failed fast with `triposplat_stage_export uses the NdArray backend, which does not support F16 tensors; use --precision f32`.
+  - `timeout 600s cargo run -p burn_triposplat --features import --bin triposplat_stage_export -- --weights-root crates/burn_triposplat/assets/models/TripoSplat --precision f32 --input-stages tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/stage_tensors_f32.safetensors --output tmp/runs/20260604T082000Z_triposplat_rust_stage_export_cpu_encode/stage_tensors_f32.safetensors --seed 42 --steps 20 --guidance-scale 3.0 --shift 3.0 --gaussians 32768 --stop-after encode`
+    - timed out after 600 seconds without writing an output file; full ViT-H/Flux2 CPU stage export is not practical for real-model parity on this machine.
+- `scripts/triposplat_bootstrap.sh`
+  - passed for f16 from the official `VAST-AI/TripoSplat` snapshot, generating f16 `.bpk` and `.bpk.parts.json` artifacts for DINOv3, Flux2 VAE encoder, TripoSplat flow, and TripoSplat decoder.
+- `scripts/triposplat_bootstrap.sh --skip-download --precision f32 --overwrite --overwrite-parts`
+  - passed, generating f32 `.bpk` and `.bpk.parts.json` artifacts for all four required runtime components.
+- `cargo check -p burn_tripo --features import`
+  - passed after replacing deprecated TripoSG metadata wrappers with `#[module(skip)]`.
+- `cargo check -p bevy_synth`
+  - passed.
+- `cargo check -p bevy_synth_runtime --features wgpu`
+  - passed.
+- `cargo check -p bevy_synth --features wgpu`
+  - passed.
+- `cargo check -p burn_synth_mcp`
+  - passed after the `RuntimeConfig` API extension.
+- `cargo test -p bevy_synth_runtime canonical_runtime_ -- --nocapture`
+  - passed: TripoSplat asset requests are accepted by canonical runtime validation.
+- `cargo test -p bevy_synth_runtime runtime_config_preserves_shared_wgpu_device --features wgpu -- --nocapture`
+  - passed: worker runtime config carries the Bevy-created `burn_wgpu::WgpuDevice::Existing`.
+- `cargo test -p bevy_synth_runtime canonical_runtime_ --features wgpu -- --nocapture`
+  - passed.
+- `cargo test -p bevy_synth shared_wgpu_device --features wgpu -- --nocapture`
+  - passed: Linux full-flash WGPU workload selects shared-device inference.
+- `cargo test -p bevy_synth current_wgpu_stack_uses_shared_device_for_lighter_workloads --features wgpu -- --nocapture`
+  - passed.
+- `cargo test -p bevy_synth --features wgpu -- --nocapture`
+  - passed: 8 tests, including shared WGPU device policy, mesh result spawning, and splat result output plus native preview mesh spawning.
+- `cargo fmt --check`
+  - passed after the native Bevy splat preview slice.
+- `cargo check -p bevy_synth_runtime --target wasm32-unknown-unknown`
+  - passed.
+- `cargo check -p bevy_synth --target wasm32-unknown-unknown`
+  - passed.
+- `cargo check -p burn_synth --target wasm32-unknown-unknown --features wasm-api,wasm-api-wgpu`
+  - passed: TripoSplat wasm async parts loader and `.splat`/PLY APIs compile.
+- `cargo check -p bevy_synth_runtime --target wasm32-unknown-unknown`
+  - passed: Bevy runtime wasm routes TripoSplat to `SynthAsset::GaussianSplat`.
+- `cargo check -p bevy_synth --target wasm32-unknown-unknown`
+  - passed: Bevy app wasm compiles with TripoSplat asset transport and explicit unsupported rendering status.
+- `npx playwright test --config playwright.config.mjs tests/synth-api.spec.mjs tests/bevy-index.spec.mjs -g "asset-specific TripoSplat controls|boot controls" --reporter=list`
+  - passed: browser pages expose supported model choices, keep query params canonical, and route TripoSplat UI state to `.splat`/PLY outputs.
+- `cargo test -p burn_flux --features import -- --nocapture`
+  - passed: 4 tests.
+- `cargo test -p burn_triposplat --features import flux2_single_burnpack_and_parts_loads_are_numerically_equivalent -- --nocapture`
+  - passed: Flux2 VAE single BurnPack and sharded parts produce numerically identical conditioning tokens.
+- `cargo test --manifest-path third_party/burn_dino/Cargo.toml --features import dinov3 --lib -- --nocapture`
+  - passed: 4 DINOv3-focused lib tests, including BF16 safetensors normalization; no `burn_dino` deprecated `Ignored<T>` warnings after the metadata-field patch.
+- `cargo test --manifest-path third_party/burn_dino/Cargo.toml --features import -- --nocapture`
+  - DINOv3 library tests passed, but the full vendored suite failed in existing DINOv2 correctness coverage because `assets/models/dinov2.mpk` is missing. The missing DINOv2 asset is unrelated to the DINOv3 TripoSplat path.
+- `cargo bench -p burn_triposplat --bench triposplat_stages -- --warm-up-time 0.1 --measurement-time 0.2 --sample-size 10`
+  - passed; tiny CPU stage medians were approximately flow `410 us`, octree `78 us`, Gaussian `73 us`.
+- `cargo test -p burn_synth triposplat_precision --features runtime -- --nocapture`
+  - passed: f32 is the native default when both artifact sets exist, and explicit f16 is respected.
+- `cargo check -p burn_synth_mcp`
+  - passed after the TripoSplat runtime precision field.
+- `cargo check -p bevy_synth_runtime --features wgpu`
+  - passed after the TripoSplat runtime precision field.
+- `cargo check -p bevy_synth --features wgpu`
+  - passed after the TripoSplat runtime precision field.
+- `cargo check -p burn_synth --target wasm32-unknown-unknown --features wasm-api,wasm-api-wgpu`
+  - passed after dtype and precision-policy changes.
+- `cargo check -p bevy_synth_runtime --target wasm32-unknown-unknown`
+  - passed after dtype and precision-policy changes.
+- `cargo check -p bevy_synth --target wasm32-unknown-unknown`
+  - passed after dtype and precision-policy changes.
+- Pre-guard native WGPU smoke attempts:
+  - `RUST_BACKTRACE=1 cargo run -p burn_synth --features wgpu -- --backend wgpu --synthesis-models triposplat --num-steps 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f32 --progress stages splat --input docs/input_chair.jpg --output tmp/runs/20260604T055000Z_triposplat_wgpu_real_smoke/chair_f32.splat`
+    - reproduced CubeCL worker panics: `can't allocate buffer of size: 31320504576` and `Only constant end can be unrolled`, even though the command saved a 1,048,576-byte `.splat`.
+  - `CUBECL_AUTOTUNE_LEVEL=minimal cargo run -p burn_synth --features wgpu -- --backend wgpu --synthesis-models triposplat --num-steps 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f32 --progress stages splat --input docs/input_chair.jpg --output tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/chair_f32_minimal_env.splat`
+    - reproduced the same CubeCL worker panics; minimal autotune is not a sufficient fix.
+  - `cargo run -p burn_synth --features wgpu -- --backend wgpu --synthesis-models triposplat --num-steps 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --progress stages splat --input docs/input_chair.jpg --output tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/chair_f16_nonfusion.splat`
+    - reproduced CubeCL worker panics after f16 BurnPack storage was promoted to f32 compute for stability; non-fusion backend aliasing did not fix it and was not kept.
+- Post-guard native WGPU checks:
+  - `cargo run -p burn_synth --features wgpu -- --backend wgpu --synthesis-models triposplat --num-steps 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f32 --progress stages splat --input docs/input_chair.jpg --output tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/chair_f32_rejected.splat`
+    - failed before preprocessing/model load with `TripoSplat native WGPU runtime is disabled for now (requested_precision=f32)` and emitted no CubeCL worker panic output.
+  - `cargo run -p burn_synth --features wgpu -- --backend wgpu --synthesis-models triposplat --num-steps 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --progress stages splat --input docs/input_chair.jpg --output tmp/runs/20260604T060000Z_triposplat_wgpu_autotune_probe/chair_f16_rejected.splat`
+    - failed before preprocessing/model load with `TripoSplat native WGPU runtime is disabled for now (requested_precision=f16)` and emitted no CubeCL worker panic output.
+- Pre-guard native CUDA smoke:
+  - `CUDA_VISIBLE_DEVICES=0 timeout 1800s cargo run -p burn_synth --features cuda -- --backend cuda --synthesis-models triposplat --num-steps 20 --guidance-scale 3.0 --triposplat-shift 3.0 --triposplat-erode-radius 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --progress stages splat --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output tmp/runs/20260604T075500Z_triposplat_rust_cuda_alpha/rust_cuda_alpha_32768.splat`
+    - failed during CUDA foreground preprocessing with CubeCL CUDA/NVRTC `invalid value for --gpu-architecture`, followed by Burn fusion worker panics; no output file was written.
+- CUDA 12.9 Rust/CubeCL smoke:
+  - A temporary CUDA 12.9 root shim was built under `tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root` from the PyTorch CUDA 12.9 venv libraries and headers.
+  - `LD_DEBUG=libs ... target/debug/deps/backend_smoke-367f7f4ff76558bc smoke_cuda_backend --nocapture`
+    - showed `libnvrtc.so` resolving to `tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64/libnvrtc.so`.
+  - `BURN_CUDA_SMOKE=1 cargo test -p burn_tripo --features cuda smoke_cuda_backend -- --nocapture`
+    - passed without the backend-unavailable skip once the shim included unversioned `libnvrtc.so` and `libnvrtc-builtins.so` symlinks.
+  - `BURN_CUDA_SMOKE=1 cargo test -p burn_synth --features runtime,cuda triposplat_ -- --nocapture`
+    - passed the explicit `triposplat_cuda_preflight_smoke` test and the TripoSplat native backend fail-fast policy tests.
+- Native CUDA full-runtime probe with CUDA 12.9 NVRTC:
+  - `cargo run -p burn_synth --features runtime,cuda -- --backend cuda --synthesis-models triposplat --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --num-steps 1 --guidance-scale 3.0 --triposplat-shift 3.0 --gaussians 32768 --progress steps splat --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output tmp/runs/20260604T085500Z_triposplat_cuda_minimal_runtime/rust_cuda_32768.splat`
+    - completed foreground preprocessing in about `29711.6 ms`.
+    - completed TripoSplat f16 component loading in about `8574.2 ms` with `compute=f32`.
+    - failed during `triposplat.infer` with CubeCL CUDA allocation/panic evidence, including `can't allocate buffer of size: 31351652352` and an autotune key for a `32768 x 32768 x 64` matmul.
+    - no `.splat` output file was written; GPU memory returned to baseline after process exit.
+- Native CUDA full-runtime probe after query-chunked attention:
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH timeout 1800s cargo run -p burn_synth --features runtime,cuda -- --backend cuda --synthesis-models triposplat --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --num-steps 1 --guidance-scale 3.0 --triposplat-shift 3.0 --triposplat-erode-radius 1 --gaussians 32768 --progress stages splat --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output tmp/runs/20260604T091500Z_triposplat_cuda_chunked_runtime/rust_cuda_32768.splat`
+    - completed foreground preprocessing in about `5875.4 ms`.
+    - completed TripoSplat f16 component loading in about `5367.5 ms` with `compute=f32`.
+    - reached `triposplat.infer` and used the GPU heavily; `nvidia-smi pmon` showed `burn_synth` at about `99%` SM with about `48705 MiB` of `97887 MiB` used.
+    - failed with `TripoSplat inference failed: Gaussian decoder produced non-finite value: token=0 gaussian_index=0 field=xyz component=0 value=NaN`.
+  - A matching f32 probe under `tmp/runs/20260604T092500Z_triposplat_cuda_chunked_runtime_f32` reached backend load/infer but repeatedly panicked in CubeCL's drop-queue memory policy with `attempt to add with overflow`; the probe was terminated. This was later fixed for f32 by per-component runtime loading plus CUDA upload flushing.
+- Native CUDA full-runtime probe after explicit-scale bounded attention and decoder diagnostics:
+  - `CUDA_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root LD_LIBRARY_PATH=tmp/runs/20260604T084500Z_cubecl_cuda129_smoke/cuda-12.9-root/lib64:$LD_LIBRARY_PATH timeout 2400s cargo run -p burn_synth --features runtime,cuda -- --backend cuda --synthesis-models triposplat --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --num-steps 20 --guidance-scale 3.0 --triposplat-shift 3.0 --triposplat-erode-radius 1 --gaussians 32768 --progress stages splat --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output tmp/runs/20260604T100500Z_triposplat_cuda_explicit_attention_20step/rust_cuda_32768.splat`
+    - completed foreground preprocessing in about `5694.2 ms`.
+    - completed TripoSplat f16 component loading in about `4356.9 ms` with `compute=f32`.
+    - used the RTX PRO 6000 throughout inference, repeatedly sampling near `98-99%` SM with about `48340 MiB` allocated.
+    - failed with `TripoSplat inference failed: Gaussian decoder produced non-finite value: token=0 gaussian_index=0 field=xyz component=0 value=NaN`.
+    - paired decoder-only diagnostic with the upstream saved latent succeeds, so this failure is now attributed to Rust conditioning/flow latent parity rather than standalone decoder layout/weights.
+- Post-guard native CUDA f16 check:
+  - `cargo run -p burn_synth --features runtime,cuda -- --backend cuda --synthesis-models triposplat --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f16 --num-steps 1 --guidance-scale 3.0 --triposplat-shift 3.0 --gaussians 32768 --progress stages splat --input tmp/runs/20260604T074500Z_triposplat_cuda_alpha_reference/input_chair_alpha.png --output tmp/runs/20260604T090000Z_triposplat_cuda_failfast_attention/rust_cuda_rejected.splat`
+    - failed before foreground preprocessing/model load with `TripoSplat native CUDA f16 artifacts remain disabled` and the corrected precision-stability rationale; no CubeCL worker panic output or `.splat` output was emitted.
+- Bounded native CPU smoke:
+  - `timeout 600s cargo run -p burn_synth --features runtime -- --backend cpu --synthesis-models triposplat --num-steps 1 --gaussians 32768 --triposplat-weights-root crates/burn_triposplat/assets/models/TripoSplat --triposplat-weights-precision f32 --progress stages splat --input docs/input_chair.jpg --output tmp/runs/20260604T062000Z_triposplat_cpu_smoke/chair_cpu_f32.splat`
+    - timed out with exit code 124 during `triposplat.infer`.
+    - CPU foreground preprocessing completed in about `117090.6 ms`; f32 TripoSplat components loaded in about `4099.0 ms`; no `.splat` output was written.
+- CUDA environment probe:
+  - `nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader`
+    - reported `NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 595.71.05, 97887 MiB`.
+  - `python3 - <<'PY' ... torch.cuda.is_available() ... PY`
+    - reported `torch=2.10.0+cpu`, `cuda_available=False`, and `cuda_device_count=0`.
+  - No alternate `python`/`python3` executable was found under the workspace or `/home/mosure` within the checked depth.
+  - A CUDA-enabled venv was then created at `tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv` and verified with `torch=2.11.0+cu129`, `torchvision=0.26.0+cu129`, and `cuda_available=True`.
+  - `/usr/bin/nvcc --version && /usr/bin/nvcc --list-gpu-arch`
+    - reported CUDA compilation tools `12.0` and architecture support only through `compute_90`.
+  - `LD_LIBRARY_PATH=tmp/runs/20260604T073000Z_triposplat_cuda_reference_env/venv/... python - <<'PY' ... nvrtcCompileProgram ... PY`
+    - verified the CUDA 12.9 NVRTC shipped in the venv accepts `--gpu-architecture=sm_120a`, `sm_120`, and `compute_120`.
+- `du -sh crates/burn_triposplat/assets/models/TripoSplat tmp/upstream/TripoSplat tmp/runs/20260604T055000Z_triposplat_wgpu_real_smoke`
+  - `18G` generated TripoSplat f32/f16 BurnPack artifacts, `3.6G` upstream snapshot cache, `1.0M` smoke output.
+
+## Remaining Blockers
+
+- Upstream source locations were verified against the current official pages:
+  - Hugging Face `VAST-AI/TripoSplat` lists MIT license and the required files `birefnet.safetensors`, `triposplat_fp16.safetensors`, `dino_v3_vit_h.safetensors`, `flux2-vae.safetensors`, and `triposplat_vae_decoder_fp16.safetensors`: https://huggingface.co/VAST-AI/TripoSplat
+  - GitHub `VAST-AI-Research/TripoSplat` quickstart points to `hf download VAST-AI/TripoSplat --local-dir ckpts/` and states code/weights are MIT licensed: https://github.com/VAST-AI-Research/TripoSplat
+- Upstream TripoSplat safetensors and a reference-output harness are now available locally. A CUDA PyTorch reference run is now proven for the alpha-input path that bypasses RMBG; default RGB/RMBG preprocessing remains blocked by upstream `torchvision.ops.deform_conv2d` lacking a usable Blackwell kernel in the tested CUDA wheels.
+- Real upstream TripoSplat artifacts are now available locally in f32 and f16 BurnPack form, but these generated files are large and should not be committed without an explicit artifact-distribution decision.
+- `TripoSplatPipeline::infer_image` remains fail-fast until direct image-file preprocessing is reference-verified against upstream.
+- Native WGPU TripoSplat is disabled behind a fail-fast `burn_synth` runtime guard because both f32 and f16 precision runs previously reproduced CubeCL worker-thread panics while still returning success. The shared attention path is now query-chunked; re-enable WGPU only after a no-panic real-smoke run is recorded with the new attention path.
+- Native CUDA TripoSplat f32 is enabled and has a no-panic 20-step real smoke. CUDA f16 artifacts remain disabled behind a fail-fast runtime guard until f16-storage/f16-compute or f16-storage/f32-compute parity is separately proven without stalls or non-finite decoder output.
+- Native CPU TripoSplat with official f32 artifacts is not practical as a full-model smoke in this environment: a one-step 32,768-splat run exceeded a 600-second cap during inference after preprocessing and model load completed.
+- Rust stage-tensor parity export is implemented, but full real-model CPU export exceeded a 600-second cap at encode-only scope. Real-model stage comparison should use the CUDA diagnostic path; the standalone CPU exporter remains useful only for contracts and smaller fixtures.
+- Current octree sampling and splat cloud materialization still use host readback; GPU-resident octree/splat materialization is not complete.
+- Native Bevy splat display is currently a bounded mesh-proxy preview, not a production Gaussian splat renderer/shader.
+- Wasm TripoSplat compiles through async sharded loading and asset output, but browser e2e execution with real model parts was not run in this environment.

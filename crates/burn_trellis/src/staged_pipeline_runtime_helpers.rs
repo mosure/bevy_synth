@@ -236,6 +236,14 @@ fn load_image_conditioning_from_spec(
                 "burn_trellis: image conditioning runtime unavailable after {:.2} ms ({err}); inference will now fail fast before staged sampling.",
                 load_start.elapsed().as_secs_f64() * 1000.0
             );
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::error_1(
+                &format!(
+                    "burn_trellis: image conditioning runtime load failed after {:.2} ms: {err}",
+                    load_start.elapsed().as_secs_f64() * 1000.0
+                )
+                .into(),
+            );
             None
         }
     }

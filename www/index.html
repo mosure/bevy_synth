@@ -73,31 +73,6 @@
         opacity: 0.6;
         cursor: default;
       }
-      #boot-controls {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }
-      #boot-quality-label {
-        font-size: 12px;
-        letter-spacing: 0.01em;
-        color: #afc3e6;
-      }
-      #boot-quality {
-        appearance: none;
-        border: 1px solid rgba(180, 200, 240, 0.28);
-        background: rgba(24, 38, 60, 0.7);
-        color: #d6deeb;
-        border-radius: 8px;
-        padding: 5px 8px;
-        font: inherit;
-        font-size: 12px;
-        cursor: pointer;
-      }
-      #boot-quality:disabled {
-        opacity: 0.6;
-        cursor: default;
-      }
       canvas {
         display: block;
       }
@@ -107,21 +82,12 @@
     <div id="boot">
       <div id="dot"></div>
       <div id="boot-text">click start to initialize wasm</div>
-      <div id="boot-controls">
-        <label id="boot-quality-label" for="boot-quality">quality</label>
-        <select id="boot-quality" name="quality">
-          <option value="fast">fast</option>
-          <option value="balanced" selected>balanced</option>
-          <option value="full">full</option>
-        </select>
-      </div>
       <button id="boot-start" type="button">start</button>
     </div>
     <script type="module">
       const boot = document.getElementById("boot");
       const text = document.getElementById("boot-text");
       const startButton = document.getElementById("boot-start");
-      const qualitySelect = document.getElementById("boot-quality");
       let started = false;
       let wasm = null;
       let warmupPollActive = false;
@@ -170,37 +136,10 @@
         return serviceWorkerReadyPromise;
       };
 
-      const normalizeQuality = (value) => {
-        const normalized = String(value || "").trim().toLowerCase();
-        if (normalized === "fast") return "fast";
-        if (normalized === "balanced" || normalized === "balance") return "balanced";
-        if (normalized === "full") return "full";
-        return null;
-      };
-
-      const setQualityQueryParam = (qualityValue) => {
-        const quality = normalizeQuality(qualityValue) || "balanced";
-        const url = new URL(window.location.href);
-        if (quality === "balanced") {
-          url.searchParams.delete("quality");
-        } else {
-          url.searchParams.set("quality", quality);
-        }
-        window.history.replaceState({}, "", url);
-        return quality;
-      };
-
-      const initialQuality =
-        normalizeQuality(new URLSearchParams(window.location.search).get("quality")) ||
-        "balanced";
-      qualitySelect.value = initialQuality;
-
       const start = async () => {
         if (started) return;
         started = true;
         startButton.disabled = true;
-        qualitySelect.disabled = true;
-        qualitySelect.value = setQualityQueryParam(qualitySelect.value);
         text.textContent = "initializing model cache...";
         await ensureModelCacheServiceWorker();
         text.textContent = "loading wasm module...";
@@ -214,7 +153,7 @@
           wasm = mod;
           window.__burnSynthWasm = wasm;
           window.__burnSynthWasmReady = true;
-          text.textContent = "module ready. waiting for model warmup...";
+          text.textContent = "module ready. starting app...";
 
           const pollWarmup = () => {
             if (!warmupPollActive) return;
@@ -225,9 +164,9 @@
             } else if (state === "requested" || state === "loading") {
               text.textContent = "loading model weights...";
             } else if (state === "ready") {
-              text.textContent = "model warmup complete";
+              text.textContent = "app ready";
             } else if (state === "failed") {
-              text.textContent = "model warmup failed (see console logs)";
+              text.textContent = "app startup failed (see console logs)";
             }
 
             if (state === "ready") {
@@ -238,7 +177,6 @@
             if (state === "failed") {
               warmupPollActive = false;
               startButton.disabled = false;
-              qualitySelect.disabled = false;
               started = false;
               return;
             }
@@ -252,14 +190,10 @@
           text.textContent = "failed to load wasm module";
           warmupPollActive = false;
           startButton.disabled = false;
-          qualitySelect.disabled = false;
           started = false;
         }
       };
 
-      qualitySelect.addEventListener("change", () => {
-        qualitySelect.value = setQualityQueryParam(qualitySelect.value);
-      });
       startButton.addEventListener("click", start);
     </script>
   </body>

@@ -10,7 +10,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mesh::{Mesh, MeshMaterial, MeshPbrTextures, MeshTexture};
 use crate::preprocess::PreprocessOutput;
@@ -39,9 +40,8 @@ use crate::runtime_model::sparse_structure_flow::{
 use crate::runtime_model::sparse_unet_vae_decoder::{
     SparseUnetVaeDecoderRuntime, decode_tex_attrs_from_host,
 };
-use crate::sampler::{
-    FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig, FlowEulerSampleTrace,
-};
+use crate::sampler::{FlowEulerGuidanceIntervalSampler, FlowEulerSampleConfig};
+use crate::time::Instant;
 use crate::trellis_config::{TrellisNormalization, TrellisPipelineArgs, TrellisSamplerConfig};
 #[cfg(feature = "runtime-model-wgpu")]
 use burn::prelude::Backend;
@@ -71,10 +71,13 @@ fn stage_log_timestamp() -> String {
         .get_or_init(Instant::now)
         .elapsed()
         .as_secs_f64();
+    #[cfg(not(target_arch = "wasm32"))]
     let epoch_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
+    #[cfg(target_arch = "wasm32")]
+    let epoch_ms = 0u128;
     format!("ts_ms={epoch_ms} t+{elapsed:.3}s")
 }
 
@@ -547,6 +550,44 @@ struct ImageConditioningLoadSpec {
     prefer_wgpu: bool,
 }
 
+#[cfg(feature = "runtime-model")]
+fn flow_specs_load_same_model(
+    selected: Option<&FlowRuntimeLoadSpec>,
+    candidate: Option<&FlowRuntimeLoadSpec>,
+) -> bool {
+    match (selected, candidate) {
+        (Some(a), Some(b)) => {
+            a.weights_root == b.weights_root
+                && a.image_large_root == b.image_large_root
+                && a.model_stem == b.model_stem
+                && a.prefer_wgpu == b.prefer_wgpu
+                && a.slat_dense_resolution == b.slat_dense_resolution
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn should_preload_shape_flow_variant(
+    pipeline_type: &str,
+    selected_shape_spec: Option<&FlowRuntimeLoadSpec>,
+    candidate_shape_spec: Option<&FlowRuntimeLoadSpec>,
+    expected_flow_key: &str,
+) -> bool {
+    if pipeline_type != "1024_cascade" {
+        return false;
+    }
+    let Some(candidate) = candidate_shape_spec else {
+        return false;
+    };
+    if candidate.flow_key.as_deref() != Some(expected_flow_key) {
+        return false;
+    }
+    // Keep medium/high cascade warm-start behavior while avoiding duplicate
+    // preload of whichever shape flow model is already the selected primary.
+    !flow_specs_load_same_model(selected_shape_spec, Some(candidate))
+}
+
 impl TrellisStageRuntime {
     pub fn from_args(args: &TrellisPipelineArgs, preferred_pipeline_type: Option<&str>) -> Self {
         Self::from_args_with_assets(args, preferred_pipeline_type, None, None, false, None)
@@ -692,6 +733,20 @@ impl TrellisStageRuntime {
             _ => None,
         };
         #[cfg(feature = "runtime-model")]
+        let preload_shape_flow_512 = should_preload_shape_flow_variant(
+            pipeline_type.as_str(),
+            shape_flow_spec.as_ref(),
+            shape_flow_512_spec.as_ref(),
+            "shape_slat_flow_model_512",
+        );
+        #[cfg(feature = "runtime-model")]
+        let preload_shape_flow_1024 = should_preload_shape_flow_variant(
+            pipeline_type.as_str(),
+            shape_flow_spec.as_ref(),
+            shape_flow_1024_spec.as_ref(),
+            "shape_slat_flow_model_1024",
+        );
+        #[cfg(feature = "runtime-model")]
         let sparse_structure_decoder_spec =
             match (_weights_root, args.models.get("sparse_structure_decoder")) {
                 (Some(weights_root), Some(model_stem)) => Some(SparseStructureDecoderLoadSpec {
@@ -778,12 +833,20 @@ impl TrellisStageRuntime {
                 let shape_task = std::thread::spawn(move || {
                     load_flow_runtime_from_spec(shape_spec_clone.as_ref())
                 });
-                let shape_512_task = std::thread::spawn(move || {
-                    load_flow_runtime_from_spec(shape_512_spec_clone.as_ref())
-                });
-                let shape_1024_task = std::thread::spawn(move || {
-                    load_flow_runtime_from_spec(shape_1024_spec_clone.as_ref())
-                });
+                let shape_512_task = if preload_shape_flow_512 {
+                    Some(std::thread::spawn(move || {
+                        load_flow_runtime_from_spec(shape_512_spec_clone.as_ref())
+                    }))
+                } else {
+                    None
+                };
+                let shape_1024_task = if preload_shape_flow_1024 {
+                    Some(std::thread::spawn(move || {
+                        load_flow_runtime_from_spec(shape_1024_spec_clone.as_ref())
+                    }))
+                } else {
+                    None
+                };
                 let tex_task = std::thread::spawn(move || {
                     load_flow_runtime_from_spec(tex_spec_clone.as_ref())
                 });
@@ -819,23 +882,31 @@ impl TrellisStageRuntime {
                         None
                     }
                 };
-                let shape_512_loaded = match shape_512_task.join() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        trellis_stage_log!(
-                            "burn_trellis: shape-512 runtime preload task panicked; lazy load retry remains as the only recovery path"
-                        );
-                        None
+                let shape_512_loaded = if let Some(task) = shape_512_task {
+                    match task.join() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            trellis_stage_log!(
+                                "burn_trellis: shape-512 runtime preload task panicked; lazy load retry remains as the only recovery path"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
-                let shape_1024_loaded = match shape_1024_task.join() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        trellis_stage_log!(
-                            "burn_trellis: shape-1024 runtime preload task panicked; lazy load retry remains as the only recovery path"
-                        );
-                        None
+                let shape_1024_loaded = if let Some(task) = shape_1024_task {
+                    match task.join() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            trellis_stage_log!(
+                                "burn_trellis: shape-1024 runtime preload task panicked; lazy load retry remains as the only recovery path"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
                 let tex_loaded = match tex_task.join() {
                     Ok(value) => value,
@@ -884,8 +955,12 @@ impl TrellisStageRuntime {
                 };
                 let _ = sparse_flow.set(sparse_loaded);
                 let _ = shape_flow.set(shape_loaded);
-                let _ = shape_flow_512.set(shape_512_loaded);
-                let _ = shape_flow_1024.set(shape_1024_loaded);
+                if preload_shape_flow_512 {
+                    let _ = shape_flow_512.set(shape_512_loaded);
+                }
+                if preload_shape_flow_1024 {
+                    let _ = shape_flow_1024.set(shape_1024_loaded);
+                }
                 let _ = tex_flow.set(tex_loaded);
                 let _ = sparse_structure_decoder.set(sparse_structure_decoder_loaded);
                 let _ = shape_decoder.set(shape_decoder_loaded);
@@ -896,10 +971,14 @@ impl TrellisStageRuntime {
             {
                 let _ = sparse_flow.set(load_flow_runtime_from_spec(sparse_flow_spec.as_ref()));
                 let _ = shape_flow.set(load_flow_runtime_from_spec(shape_flow_spec.as_ref()));
-                let _ =
-                    shape_flow_512.set(load_flow_runtime_from_spec(shape_flow_512_spec.as_ref()));
-                let _ =
-                    shape_flow_1024.set(load_flow_runtime_from_spec(shape_flow_1024_spec.as_ref()));
+                if preload_shape_flow_512 {
+                    let _ = shape_flow_512
+                        .set(load_flow_runtime_from_spec(shape_flow_512_spec.as_ref()));
+                }
+                if preload_shape_flow_1024 {
+                    let _ = shape_flow_1024
+                        .set(load_flow_runtime_from_spec(shape_flow_1024_spec.as_ref()));
+                }
                 let _ = tex_flow.set(load_flow_runtime_from_spec(tex_flow_spec.as_ref()));
                 let _ = sparse_structure_decoder.set(load_sparse_structure_decoder_from_spec(
                     sparse_structure_decoder_spec.as_ref(),
@@ -974,6 +1053,12 @@ impl TrellisStageRuntime {
 
     #[cfg(feature = "runtime-model")]
     fn shape_flow_runtime_512(&self) -> Option<&SparseStructureFlowRuntime> {
+        if flow_specs_load_same_model(
+            self.shape_flow_spec.as_ref(),
+            self.shape_flow_512_spec.as_ref(),
+        ) {
+            return self.shape_flow_runtime();
+        }
         self.shape_flow_512
             .get_or_init(|| load_flow_runtime_from_spec(self.shape_flow_512_spec.as_ref()))
             .as_ref()
@@ -981,6 +1066,12 @@ impl TrellisStageRuntime {
 
     #[cfg(feature = "runtime-model")]
     fn shape_flow_runtime_1024(&self) -> Option<&SparseStructureFlowRuntime> {
+        if flow_specs_load_same_model(
+            self.shape_flow_spec.as_ref(),
+            self.shape_flow_1024_spec.as_ref(),
+        ) {
+            return self.shape_flow_runtime();
+        }
         self.shape_flow_1024
             .get_or_init(|| load_flow_runtime_from_spec(self.shape_flow_1024_spec.as_ref()))
             .as_ref()
@@ -1234,6 +1325,7 @@ impl TrellisStageRuntime {
         });
         let parity_strict = runtime_parity_strict();
         let max_sparse_coords_override = run_config.max_sparse_coords.filter(|limit| *limit > 0);
+        #[cfg(feature = "runtime-model")]
         let max_num_tokens = run_config
             .max_num_tokens
             .filter(|limit| *limit > 0)
@@ -1321,6 +1413,7 @@ impl TrellisStageRuntime {
         };
         #[cfg(not(feature = "runtime-model-wgpu"))]
         let sparse_requires_host_coords = cascade_requires_decoder_upsample;
+        let sparse_materialize_host_coords = sparse_requires_host_coords || capture_sampler_trace;
         #[cfg(feature = "runtime-model")]
         let sparse_flow_runtime = self.sparse_flow_runtime();
         #[cfg(feature = "runtime-model")]
@@ -1339,7 +1432,7 @@ impl TrellisStageRuntime {
             sparse_sampler_override,
             capture_sampler_trace,
             parity_strict,
-            sparse_requires_host_coords,
+            sparse_materialize_host_coords,
             max_sparse_coords_override,
             #[cfg(feature = "runtime-model")]
             sparse_flow_runtime,

@@ -5,6 +5,7 @@ use super::runtime_config::runtime_model_stage_debug_enabled;
 use super::types::extraction::tensor_i32_to_vec;
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
+use crate::virtual_fs;
 use burn::prelude::Backend;
 use burn::tensor::activation::sigmoid;
 use burn::tensor::module::conv3d;
@@ -232,7 +233,7 @@ where
     ) -> Result<Self, String> {
         let config_path =
             resolve_model_source_path(model_stem, "json", weights_root, image_large_root);
-        let config_bytes = std::fs::read(&config_path).map_err(|err| {
+        let config_bytes = virtual_fs::read(&config_path).map_err(|err| {
             format!(
                 "failed to read sparse structure decoder config '{}': {err}",
                 config_path.display()
@@ -1085,6 +1086,16 @@ fn load_weight_backing(path: &Path) -> Result<WeightsBacking, String> {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("bpk"))
     {
         let bytes = load_blob_bytes_from_burnpack_or_parts(path, load_burnpack_blob_bytes)?;
+        return Ok(WeightsBacking::Bytes(bytes));
+    }
+
+    if virtual_fs::has_virtual_file(path) {
+        let bytes = virtual_fs::read(path).map_err(|err| {
+            format!(
+                "failed to read virtual sparse structure decoder weights '{}': {err}",
+                path.display()
+            )
+        })?;
         return Ok(WeightsBacking::Bytes(bytes));
     }
 

@@ -18,37 +18,38 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["wgpu", "triposg", "shared-runtime"]
 triposg = ["burn_synth/triposg"]
-trellis = ["dep:burn_trellis", "burn_synth/trellis"]
+trellis = ["dep:burn_trellis", "burn_synth/trellis-wgpu"]
 wgpu = ["dep:burn-wgpu", "burn_synth/wgpu"]
 cuda = ["burn-cuda", "burn_synth/cuda"]
 shared-runtime = ["burn_synth/runtime"]
 
 [dependencies]
-bevy = "0.17"
-bevy_asset = "0.17"
-bevy_mesh = "0.17"
+bevy = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_asset = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_mesh = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
 base64 = "0.22"
 bytemuck = "1.25"
 clap = { version = "4.5", features = ["derive"] }
-burn = { version = "0.21.0-pre.1", default-features = false, features = ["ndarray", "std"] }
+burn = { version = "=0.21.0", default-features = false, features = ["ndarray", "std"] }
 burn_tripo = { version = "0.1.1", path = "../burn_tripo", features = ["import"] }
+burn_triposplat = { version = "0.1.0", path = "../burn_triposplat", default-features = false }
 burn_foreground = { version = "0.1.1", path = "../burn_foreground", features = ["import"] }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import" }
-burn-cuda = { version = "0.21.0-pre.1", optional = true }
+burn-cuda = { version = "=0.21.0", optional = true }
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 safetensors = "0.6"
 gltf = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-burn_trellis = { version = "0.1.0", path = "../burn_trellis", optional = true, features = ["runtime-model"] }
+burn_trellis = { version = "0.1.0", path = "../burn_trellis", optional = true, features = ["runtime-model-wgpu"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies]
-burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["fusion", "std", "metal"] }
 burn_synth = { version = "0.2.0", path = "../burn_synth", default-features = false }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies]
-burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["fusion", "std", "vulkan"] }
 burn_synth = { version = "0.2.0", path = "../burn_synth", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -61,7 +62,7 @@ web-sys = { version = "0.3", features = [
   "ReadableStreamDefaultReader",
   "Response",
 ] }
-burn-wgpu = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["fusion", "std", "webgpu"] }
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["fusion", "std", "webgpu"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

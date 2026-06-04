@@ -5,6 +5,8 @@ members = [
   "crates/burn_flex_gmm",
   "crates/burn_synth",
   "crates/burn_trellis",
+  "crates/burn_flux",
+  "crates/burn_triposplat",
   "crates/burn_tripo",
   "crates/bevy_synth",
   "crates/bevy_synth_runtime",
@@ -12,6 +14,7 @@ members = [
   "crates/burn_foreground",
   "crates/burn_synth_mcp",
 ]
+exclude = ["third_party/burn_dino"]
 
 [workspace.package]
 authors = ["mosure <mitchell@mosure.me>"]

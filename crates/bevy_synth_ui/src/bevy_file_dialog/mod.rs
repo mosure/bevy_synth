@@ -41,13 +41,18 @@
 //! and is included in `bevy_synth_ui::bevy_file_dialog::prelude`:
 //!
 //! ```rust
+//! use bevy::prelude::Commands;
+//! use bevy_synth_ui::bevy_file_dialog::prelude::FileDialogExt;
+//!
+//! struct MySaveDialog;
+//!
 //! fn system(mut commands: Commands) {
 //!     commands
 //!         .dialog()
 //!         .set_directory("/")
 //!         .set_title("My Save Dialog")
 //!         .add_filter("Text", &["txt"])
-//!         .save_file::<MySaveDialog>();
+//!         .save_file::<MySaveDialog>(b"hello".to_vec());
 //! }
 //! ```
 //!
@@ -74,7 +79,7 @@ use bevy_app::prelude::*;
 use bevy_derive::Deref;
 use bevy_ecs::prelude::*;
 use bevy_tasks::prelude::*;
-use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper, WakeUp};
+use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper, WinitUserEvent};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use rfd::AsyncFileDialog;
 
@@ -355,7 +360,7 @@ impl FileDialog<'_, '_, '_> {
                 .clone();
 
             let event_loop_proxy = world
-                .get_resource::<EventLoopProxyWrapper<WakeUp>>()
+                .get_resource::<EventLoopProxyWrapper>()
                 .map(|proxy| EventLoopProxy::clone(&**proxy));
 
             AsyncComputeTaskPool::get()
@@ -394,7 +399,7 @@ impl FileDialog<'_, '_, '_> {
                 .clone();
 
             let event_loop_proxy = world
-                .get_resource::<EventLoopProxyWrapper<WakeUp>>()
+                .get_resource::<EventLoopProxyWrapper>()
                 .map(|proxy| EventLoopProxy::clone(&**proxy));
 
             AsyncComputeTaskPool::get()
@@ -435,7 +440,7 @@ impl FileDialog<'_, '_, '_> {
                 .clone();
 
             let event_loop_proxy = world
-                .get_resource::<EventLoopProxyWrapper<WakeUp>>()
+                .get_resource::<EventLoopProxyWrapper>()
                 .map(|proxy| EventLoopProxy::clone(&**proxy));
 
             AsyncComputeTaskPool::get()
@@ -484,10 +489,10 @@ impl<'w, 's> FileDialogExt<'w, 's> for Commands<'w, 's> {
 
 /// A struct to send a WakeUp event to winit when dropped (i.e., when the scope
 /// ends).
-struct WakeUpOnDrop<'a>(&'a EventLoopProxy<WakeUp>);
+struct WakeUpOnDrop<'a>(&'a EventLoopProxy<WinitUserEvent>);
 
 impl Drop for WakeUpOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.send_event(WakeUp).unwrap();
+        self.0.send_event(WinitUserEvent::WakeUp).unwrap();
     }
 }

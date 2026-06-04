@@ -25,7 +25,7 @@ default = []
 
 benchmark = ["burn/autotune", "burn/fusion"]
 import = ["burn-store", "clap", "serde", "serde_json", "burn_synth_import"]
-import-cli = ["import", "bevy_args"]
+import-cli = ["import"]
 foreground = ["dep:burn_foreground"]
 cuda = ["burn-cuda"]
 report = []
@@ -34,9 +34,8 @@ report = []
 [dependencies]
 burn_dino = { version = "0.7", default-features = false, features = ["backend_ndarray"] }
 burn_foreground = { version = "0.1.1", path = "../burn_foreground", features = ["import"], optional = true }
-burn-store = { version = "0.21.0-pre.1", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
+burn-store = { version = "=0.21.0", optional = true, default-features = false, features = ["std", "burnpack", "safetensors"] }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
-bevy_args = { version = "2.0", optional = true }
 bytemuck = "1.25"
 marching-cubes = "0.1.2"
 fast-surface-nets = "0.2.1"
@@ -44,14 +43,14 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 safetensors = "0.6"
 serde_json = { version = "1.0", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
-burn-cuda = { version = "0.21.0-pre.1", optional = true }
+burn-cuda = { version = "=0.21.0", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 meshopt = "0.6.2"
 
 
 
 [dependencies.burn]
-version = "0.21.0-pre.1"
+version = "=0.21.0"
 default-features = false
 features = [
   "fusion",
@@ -60,7 +59,7 @@ features = [
 ]
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
-version = "0.21.0-pre.1"
+version = "=0.21.0"
 default-features = false
 features = [
   "fusion",
@@ -69,7 +68,7 @@ features = [
 ]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
-version = "0.21.0-pre.1"
+version = "=0.21.0"
 default-features = false
 features = [
   "fusion",
@@ -78,7 +77,7 @@ features = [
 ]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
-version = "0.21.0-pre.1"
+version = "=0.21.0"
 default-features = false
 features = [
   "fusion",
@@ -87,7 +86,7 @@ features = [
 ]
 
 [dependencies.cubecl]
-version = "0.10.0-pre.1"
+version = "=0.10.0"
 default-features = true
 features = ["std"]
 
@@ -180,4 +179,3 @@ test = false
 name = "triposg_pipeline"
 path = "benches/triposg_pipeline.rs"
 harness = false
-

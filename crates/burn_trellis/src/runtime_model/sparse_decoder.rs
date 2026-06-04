@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "runtime-model-wgpu")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
+use crate::time::Instant;
 #[cfg(feature = "runtime-model-wgpu")]
 use burn::tensor::TensorData;
 #[cfg(feature = "runtime-model-wgpu")]
@@ -1073,13 +1073,212 @@ impl DecoderWgpuConvContext {
                 input_rows, input_channels, rows, config.in_channels
             ));
         }
+        if let Some(chunk_out_channels) = self.single_group_output_channel_chunk(config, layer)? {
+            return self.forward_with_neighbor_tensor_tensor_single_group_channel_chunked(
+                config,
+                layer,
+                input_t,
+                context,
+                rows,
+                kernel_rows,
+                neighbor_t,
+                input_bytes,
+                chunk_out_channels,
+            );
+        }
         let weight_t = self.weight_tensor(layer);
         let bias_t = self.bias_tensor(layer);
+        self.forward_with_neighbor_tensor_tensor_with_weight_bias(
+            config,
+            input_t,
+            context,
+            rows,
+            kernel_rows,
+            neighbor_t,
+            input_bytes,
+            weight_t,
+            bias_t,
+        )
+    }
+
+    fn single_group_output_channel_chunk(
+        &self,
+        config: &FlexConvConfig,
+        layer: &SparseConvLayer,
+    ) -> Result<Option<usize>, String> {
+        if config.groups != 1 || layer.groups != 1 {
+            return Ok(None);
+        }
+        let weight_bytes = layer
+            .weight
+            .len()
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| "wgpu sparse conv weight-byte-size overflow".to_string())?;
+        let max_weight_bytes = decoder_wgpu_max_weight_bytes();
+        if weight_bytes <= max_weight_bytes {
+            return Ok(None);
+        }
+
+        let per_output_values = layer
+            .kernel_d
+            .checked_mul(layer.kernel_h)
+            .and_then(|value| value.checked_mul(layer.kernel_w))
+            .and_then(|value| value.checked_mul(layer.in_channels_per_group))
+            .ok_or_else(|| "wgpu sparse conv per-output weight-size overflow".to_string())?;
+        if per_output_values == 0 {
+            return Err("wgpu sparse conv per-output weight size is zero".to_string());
+        }
+        let per_output_bytes = per_output_values
+            .checked_mul(core::mem::size_of::<f32>())
+            .ok_or_else(|| "wgpu sparse conv per-output weight-byte overflow".to_string())?;
+
+        // Keep per-dispatch weight uploads bounded on memory-constrained adapters.
+        // This is a canonical device path (no host fallback), but avoids allocating a
+        // monolithic decoder weight tensor that can OOM before compute starts.
+        let raw_chunk = (max_weight_bytes / per_output_bytes)
+            .max(1)
+            .min(config.out_channels.max(1));
+        let aligned = raw_chunk - (raw_chunk % 8);
+        let chunk_out_channels = if aligned > 0 { aligned } else { raw_chunk };
+        if chunk_out_channels >= config.out_channels {
+            Ok(None)
+        } else {
+            Ok(Some(chunk_out_channels.max(1)))
+        }
+    }
+
+    fn chunk_weight_bias_tensors_single_group(
+        &self,
+        layer: &SparseConvLayer,
+        out_start: usize,
+        out_end: usize,
+    ) -> Result<(Tensor<DefaultWgpuBackend, 5>, Tensor<DefaultWgpuBackend, 1>), String> {
+        if out_start >= out_end || out_end > layer.out_channels {
+            return Err(format!(
+                "wgpu sparse conv output-channel slice out of range: start={} end={} out_channels={}",
+                out_start, out_end, layer.out_channels
+            ));
+        }
+        let per_output_values = layer
+            .kernel_d
+            .checked_mul(layer.kernel_h)
+            .and_then(|value| value.checked_mul(layer.kernel_w))
+            .and_then(|value| value.checked_mul(layer.in_channels_per_group))
+            .ok_or_else(|| "wgpu sparse conv per-output weight-size overflow".to_string())?;
+
+        let weight_start = out_start
+            .checked_mul(per_output_values)
+            .ok_or_else(|| "wgpu sparse conv weight slice start overflow".to_string())?;
+        let weight_end = out_end
+            .checked_mul(per_output_values)
+            .ok_or_else(|| "wgpu sparse conv weight slice end overflow".to_string())?;
+        let weight_slice = layer
+            .weight
+            .get(weight_start..weight_end)
+            .ok_or_else(|| "wgpu sparse conv weight slice out of bounds".to_string())?;
+        let bias_slice = layer
+            .bias
+            .get(out_start..out_end)
+            .ok_or_else(|| "wgpu sparse conv bias slice out of bounds".to_string())?;
+
+        let chunk_out_channels = out_end - out_start;
+        let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight_slice, &self.device)
+            .reshape([
+                chunk_out_channels,
+                layer.kernel_d,
+                layer.kernel_h,
+                layer.kernel_w,
+                layer.in_channels_per_group,
+            ]);
+        let bias_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(bias_slice, &self.device);
+        Ok((weight_t, bias_t))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_neighbor_tensor_tensor_single_group_channel_chunked(
+        &mut self,
+        config: &FlexConvConfig,
+        layer: &SparseConvLayer,
+        input_t: Tensor<DefaultWgpuBackend, 2>,
+        context: &str,
+        rows: usize,
+        kernel_rows: usize,
+        neighbor_t: Tensor<DefaultWgpuBackend, 2, Int>,
+        input_bytes: usize,
+        chunk_out_channels: usize,
+    ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
+        if decoder_conv_debug_enabled() {
+            eprintln!(
+                "burn_trellis: chunking wgpu sparse conv output channels for '{}' total_out_channels={} chunk_out_channels={} rows={}",
+                context, config.out_channels, chunk_out_channels, rows
+            );
+        }
+
+        let mut out_start = 0usize;
+        let mut outputs: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
+        while out_start < config.out_channels {
+            let out_end = (out_start + chunk_out_channels).min(config.out_channels);
+            let chunk_out = out_end - out_start;
+            let chunk_config = FlexConvConfig {
+                in_channels: config.in_channels,
+                out_channels: chunk_out,
+                kernel_d: config.kernel_d,
+                kernel_h: config.kernel_h,
+                kernel_w: config.kernel_w,
+                in_channels_per_group: config.in_channels_per_group,
+                out_channels_per_group: chunk_out,
+                groups: 1,
+                axis_order: config.axis_order,
+                axis_sign: config.axis_sign,
+            };
+            let (weight_t, bias_t) =
+                self.chunk_weight_bias_tensors_single_group(layer, out_start, out_end)?;
+            let chunk_context = format!("{context} oc_chunk[{out_start}:{out_end})");
+            let chunk_output = self.forward_with_neighbor_tensor_tensor_with_weight_bias(
+                &chunk_config,
+                input_t.clone(),
+                chunk_context.as_str(),
+                rows,
+                kernel_rows,
+                neighbor_t.clone(),
+                input_bytes,
+                weight_t,
+                bias_t,
+            )?;
+            outputs.push(chunk_output);
+            out_start = out_end;
+        }
+
+        if outputs.is_empty() {
+            return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
+                [rows, 0],
+                &self.device,
+            ));
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.remove(0));
+        }
+        Ok(Tensor::cat(outputs, 1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_neighbor_tensor_tensor_with_weight_bias(
+        &mut self,
+        config: &FlexConvConfig,
+        input_t: Tensor<DefaultWgpuBackend, 2>,
+        context: &str,
+        rows: usize,
+        kernel_rows: usize,
+        neighbor_t: Tensor<DefaultWgpuBackend, 2, Int>,
+        input_bytes: usize,
+        weight_t: Tensor<DefaultWgpuBackend, 5>,
+        bias_t: Tensor<DefaultWgpuBackend, 1>,
+    ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
         let bytes_per_row = config
             .out_channels
             .checked_mul(core::mem::size_of::<f32>())
             .ok_or_else(|| "wgpu sparse conv bytes-per-row overflow".to_string())?;
-        let max_output_bytes = decoder_wgpu_max_output_bytes();
+        let max_output_bytes = decoder_wgpu_sparse_conv_max_output_bytes();
         let output_bytes = rows
             .checked_mul(bytes_per_row)
             .ok_or_else(|| "wgpu sparse conv output-byte-size overflow".to_string())?;
@@ -1257,7 +1456,7 @@ impl DecoderWgpuConvContext {
             .checked_mul(neighbor_bytes_per_row)
             .ok_or_else(|| "wgpu sparse conv neighbor-byte-size overflow".to_string())?;
 
-        let max_output_bytes = decoder_wgpu_max_output_bytes();
+        let max_output_bytes = decoder_wgpu_sparse_conv_max_output_bytes();
         let max_neighbor_bytes = decoder_wgpu_max_neighbor_bytes();
         let output_chunk_rows = decoder_wgpu_chunk_rows(rows, bytes_per_row, max_output_bytes);
         let neighbor_chunk_rows =

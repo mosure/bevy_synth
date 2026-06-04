@@ -531,6 +531,7 @@ fn upsample_like<B: Backend>(src: Tensor<B, 4>, target: &Tensor<B, 4>) -> Tensor
     }
     let options = InterpolateOptions {
         mode: InterpolateMode::Bilinear,
+        align_corners: true,
     };
     interpolate(src, [height, width], options)
 }

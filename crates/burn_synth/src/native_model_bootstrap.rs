@@ -12,6 +12,7 @@ use burn_synth_import::parts::{BurnpackPartEntry, read_parts_manifest, resolve_p
 #[cfg(feature = "trellis")]
 use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use burn_tripo::paths::resolve_triposg_weights_root;
+use burn_triposplat::artifact::TRIPOSPLAT_ARTIFACTS;
 use log::{info, warn};
 #[cfg(feature = "trellis")]
 use serde_json::Value;
@@ -23,6 +24,7 @@ const DEFAULT_MODEL_BASE_URL: &str = "https://aberration.technology/model";
 const CACHE_MODELS_DIR: &str = ".burn_synth/models";
 const TRIPOSG_DIR: &str = "MIDI-3D";
 const RMBG14_DIR: &str = "RMBG-1.4";
+const TRIPOSPLAT_DIR: &str = "TripoSplat";
 #[cfg(feature = "trellis")]
 const TRELLIS2_DIR: &str = "TRELLIS.2-4B";
 #[cfg(feature = "trellis")]
@@ -136,6 +138,28 @@ pub(crate) fn resolve_or_bootstrap_rmbg14_root(prefer_f16: bool) -> Result<PathB
     }
 }
 
+pub(crate) fn resolve_or_bootstrap_triposplat_root(prefer_f16: bool) -> Result<PathBuf, String> {
+    let cache_root = default_cache_models_root();
+    let target_root = cache_root.join(TRIPOSPLAT_DIR);
+    let remote_root = triposplat_remote_root();
+
+    match ensure_triposplat_model_ready(&target_root, &remote_root, prefer_f16) {
+        Ok(()) => Ok(target_root),
+        Err(cache_err) => match burn_triposplat::resolve_triposplat_weights_root(None) {
+            Ok(fallback) => {
+                warn!(
+                    "TripoSplat cache bootstrap failed ({cache_err}); falling back to {}",
+                    fallback.display()
+                );
+                Ok(fallback)
+            }
+            Err(fallback_err) => Err(format!(
+                "TripoSplat cache bootstrap failed ({cache_err}); no valid local fallback ({fallback_err})"
+            )),
+        },
+    }
+}
+
 #[cfg(feature = "trellis")]
 pub(crate) fn resolve_or_bootstrap_trellis_roots(
     prefer_f16: bool,
@@ -173,6 +197,42 @@ pub(crate) fn resolve_or_bootstrap_trellis_roots(
             }
         }
     }
+}
+
+fn ensure_triposplat_model_ready(
+    local_root: &Path,
+    remote_root: &str,
+    prefer_f16: bool,
+) -> Result<(), String> {
+    fs::create_dir_all(local_root).map_err(|err| {
+        format!(
+            "failed to create TripoSplat cache directory {}: {err}",
+            local_root.display()
+        )
+    })?;
+
+    for base in triposplat_required_parts_bases() {
+        ensure_parts_bundle(local_root, remote_root, &base, prefer_f16, "TripoSplat")?;
+    }
+
+    emit_status(format!(
+        "TripoSplat weights ready under {}",
+        local_root.display()
+    ));
+    Ok(())
+}
+
+fn triposplat_required_parts_bases() -> Vec<String> {
+    TRIPOSPLAT_ARTIFACTS
+        .into_iter()
+        .filter(|artifact| artifact.is_triposplat_runtime_required())
+        .map(|artifact| {
+            format!(
+                "{}/{}.safetensors",
+                artifact.component, artifact.burnpack_stem
+            )
+        })
+        .collect()
 }
 
 #[cfg(feature = "trellis")]
@@ -1027,6 +1087,14 @@ fn rmbg14_remote_root() -> String {
         .unwrap_or_else(|| format!("{}/{}", model_base_url(), RMBG14_DIR))
 }
 
+fn triposplat_remote_root() -> String {
+    option_env!("TRIPOSPLAT_REMOTE_ROOT")
+        .or(option_env!("TRIPOSPLAT_WEIGHTS_REMOTE_ROOT"))
+        .or(option_env!("TRIPOSPLAT_WEIGHTS_ROOT"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}/{}", model_base_url(), TRIPOSPLAT_DIR))
+}
+
 #[cfg(feature = "trellis")]
 fn trellis2_remote_root() -> String {
     option_env!("TRELLIS2_WEIGHTS_REMOTE_ROOT")
@@ -1091,7 +1159,9 @@ mod tests {
 
     #[cfg(feature = "trellis")]
     use super::parse_trellis_requirements;
-    use super::{manifest_is_complete, resolve_manifest_entry_url};
+    use super::{
+        manifest_is_complete, resolve_manifest_entry_url, triposplat_required_parts_bases,
+    };
 
     fn unique_tmp_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -1152,6 +1222,20 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn triposplat_bootstrap_bases_match_burnpack_output_names() {
+        let bases = triposplat_required_parts_bases();
+        assert_eq!(
+            bases,
+            vec![
+                "clip_vision/dino_v3_vit_h.safetensors".to_string(),
+                "vae/flux2_vae_encoder.safetensors".to_string(),
+                "diffusion_models/triposplat_flow.safetensors".to_string(),
+                "vae/triposplat_vae_decoder.safetensors".to_string(),
+            ]
+        );
     }
 
     #[cfg(feature = "trellis")]

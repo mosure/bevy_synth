@@ -12,8 +12,10 @@ use clap::Parser;
 #[derive(Debug, Clone)]
 struct OversizedManifestIssue {
     reason: String,
-    unsplittable_single_tensor_blob: bool,
+    acceptable_single_tensor_oversize: bool,
 }
+
+const SINGLE_TENSOR_PART_OVERHEAD_TOLERANCE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -178,9 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.dry_run {
             println!("[ARTIFACTS][DRY RUN] {}", burnpack.display());
             if let Some(issue) = oversized_issue.as_ref() {
-                if issue.unsplittable_single_tensor_blob {
+                if issue.acceptable_single_tensor_oversize {
                     println!(
-                        "[ARTIFACTS][DRY RUN] oversized parts manifest for unsplittable single-tensor blob {} would be accepted: {}",
+                        "[ARTIFACTS][DRY RUN] oversized single-tensor parts manifest {} would be accepted: {}",
                         burnpack.display(),
                         issue.reason
                     );
@@ -209,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut overwrite_parts = args.overwrite;
         if let Some(issue) = oversized_issue.as_ref()
-            && !issue.unsplittable_single_tensor_blob
+            && !issue.acceptable_single_tensor_oversize
         {
             overwrite_parts = true;
             repaired_oversized_manifest_count += 1;
@@ -220,10 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         if let Some(issue) = oversized_issue.as_ref()
-            && issue.unsplittable_single_tensor_blob
+            && issue.acceptable_single_tensor_oversize
         {
             println!(
-                "[ARTIFACTS] oversized part accepted for unsplittable single-tensor blob {}: {}",
+                "[ARTIFACTS] oversized single-tensor part accepted for {}: {}",
                 burnpack.display(),
                 issue.reason
             );
@@ -245,9 +247,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(issue) = detect_oversized_parts_manifest(&parts_manifest, max_part_size_bytes)?
         {
-            if issue.unsplittable_single_tensor_blob {
+            if issue.acceptable_single_tensor_oversize {
                 println!(
-                    "[ARTIFACTS] oversized part remains for unsplittable single-tensor blob {}: {}",
+                    "[ARTIFACTS] oversized single-tensor part remains for {}: {}",
                     burnpack.display(),
                     issue.reason
                 );
@@ -294,9 +296,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parts_manifest.display()
             );
             if let Some(issue) = oversized_issue.as_ref() {
-                if issue.unsplittable_single_tensor_blob {
+                if issue.acceptable_single_tensor_oversize {
                     println!(
-                        "[ARTIFACTS][DRY RUN] manifest-only oversized check for unsplittable single-tensor blob {} would be accepted: {}",
+                        "[ARTIFACTS][DRY RUN] manifest-only oversized single-tensor check for {} would be accepted: {}",
                         burnpack.display(),
                         issue.reason
                     );
@@ -320,9 +322,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         if let Some(issue) = oversized_issue {
-            if issue.unsplittable_single_tensor_blob {
+            if issue.acceptable_single_tensor_oversize {
                 println!(
-                    "[ARTIFACTS] oversized manifest-only part accepted for unsplittable single-tensor blob {}: {}",
+                    "[ARTIFACTS] oversized manifest-only single-tensor part accepted for {}: {}",
                     burnpack.display(),
                     issue.reason
                 );
@@ -605,23 +607,30 @@ fn detect_oversized_parts_manifest(
     if manifest.parts.is_empty() {
         return Ok(Some(OversizedManifestIssue {
             reason: "manifest has zero parts".to_string(),
-            unsplittable_single_tensor_blob: false,
+            acceptable_single_tensor_oversize: false,
         }));
     }
 
-    let unsplittable_single_tensor_blob = manifest.parts.len() == 1
-        && manifest
-            .parts
-            .first()
-            .is_some_and(|entry| entry.tensors <= 1 && entry.bytes == manifest.total_bytes);
+    let acceptable_single_tensor_oversize = |bytes: u64, tensors: usize| {
+        tensors <= 1
+            && bytes > max_part_size_bytes
+            && bytes <= max_part_size_bytes + SINGLE_TENSOR_PART_OVERHEAD_TOLERANCE_BYTES
+    };
 
     if manifest.max_part_bytes > max_part_size_bytes {
+        let max_part_is_acceptable = manifest.max_part_bytes
+            <= max_part_size_bytes + SINGLE_TENSOR_PART_OVERHEAD_TOLERANCE_BYTES
+            && manifest
+                .parts
+                .iter()
+                .filter(|entry| entry.bytes > max_part_size_bytes)
+                .all(|entry| acceptable_single_tensor_oversize(entry.bytes, entry.tensors));
         return Ok(Some(OversizedManifestIssue {
             reason: format!(
                 "manifest.max_part_bytes={} exceeds cap={}",
                 manifest.max_part_bytes, max_part_size_bytes
             ),
-            unsplittable_single_tensor_blob,
+            acceptable_single_tensor_oversize: max_part_is_acceptable,
         }));
     }
 
@@ -635,7 +644,10 @@ fn detect_oversized_parts_manifest(
                 "part '{}' bytes={} exceeds cap={}",
                 entry.path, entry.bytes, max_part_size_bytes
             ),
-            unsplittable_single_tensor_blob,
+            acceptable_single_tensor_oversize: acceptable_single_tensor_oversize(
+                entry.bytes,
+                entry.tensors,
+            ),
         }));
     }
 
@@ -854,7 +866,7 @@ mod tests {
             .expect("detect issue")
             .expect("expected oversize issue");
         assert!(issue.reason.contains("exceeds cap"));
-        assert!(issue.unsplittable_single_tensor_blob);
+        assert!(issue.acceptable_single_tensor_oversize);
 
         fs::remove_dir_all(root).expect("cleanup");
     }

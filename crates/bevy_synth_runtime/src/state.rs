@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::SynthMesh;
+use crate::SynthAsset;
+use crate::args::{AppArgs, SynthesisModel};
 
 #[derive(Resource, Default)]
 pub struct UiStatus {
@@ -49,6 +50,25 @@ pub struct InferenceRequest {
     pub image_path: PathBuf,
     pub image_contents: Option<Vec<u8>>,
     pub output_path: Option<PathBuf>,
+    pub synthesis_models: Vec<SynthesisModel>,
+    pub settings: InferenceSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InferenceSettings {
+    pub num_steps: usize,
+    pub guidance_scale: f32,
+    pub triposplat_num_gaussians: usize,
+}
+
+impl InferenceSettings {
+    pub fn from_args(args: &AppArgs) -> Self {
+        Self {
+            num_steps: args.num_steps,
+            guidance_scale: args.guidance_scale,
+            triposplat_num_gaussians: args.triposplat_num_gaussians,
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -69,7 +89,7 @@ pub const WASM_STATUS_MODEL_LOAD_FAILED_PREFIX: &str = "Model load failed:";
 
 pub struct WorkerEvent {
     pub requests: Vec<InferenceRequest>,
-    pub results: Vec<Result<Option<SynthMesh>, String>>,
+    pub results: Vec<Result<Option<SynthAsset>, String>>,
     pub elapsed: Duration,
     pub status_message: Option<String>,
 }

@@ -10,6 +10,7 @@ pub mod state;
 pub mod worker;
 
 pub use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
+pub use burn_triposplat::{GaussianSplat, GaussianSplatCloud, GaussianSplatStats};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SynthMeshMaterial {
@@ -41,6 +42,35 @@ pub struct SynthMesh {
     pub uvs: Vec<[f32; 2]>,
     pub material: Option<SynthMeshMaterial>,
     pub pbr_textures: Option<SynthMeshPbrTextures>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SynthAsset {
+    Mesh(SynthMesh),
+    GaussianSplat(GaussianSplatCloud),
+}
+
+impl SynthAsset {
+    pub fn as_mesh(&self) -> Option<&SynthMesh> {
+        match self {
+            Self::Mesh(mesh) => Some(mesh),
+            Self::GaussianSplat(_) => None,
+        }
+    }
+
+    pub fn into_mesh(self) -> Option<SynthMesh> {
+        match self {
+            Self::Mesh(mesh) => Some(mesh),
+            Self::GaussianSplat(_) => None,
+        }
+    }
+}
+
+impl From<SynthMesh> for SynthAsset {
+    fn from(mesh: SynthMesh) -> Self {
+        Self::Mesh(mesh)
+    }
 }
 
 impl From<TripoMesh> for SynthMesh {

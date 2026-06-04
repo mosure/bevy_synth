@@ -144,10 +144,10 @@ fn run_imports_with_backend<B>(
     artifact_policy: ArtifactPolicy,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    B: burn::tensor::backend::Backend,
-    B::Device: Default,
+    B: burn::prelude::Backend,
+    <B as burn::tensor::backend::BackendTypes>::Device: Default,
 {
-    let device = <B as burn::tensor::backend::Backend>::Device::default();
+    let device = <B as burn::tensor::backend::BackendTypes>::Device::default();
 
     import_if_needed(
         "VAE",

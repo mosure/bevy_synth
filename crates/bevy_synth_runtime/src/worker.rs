@@ -1,3 +1,5 @@
+#[cfg(target_arch = "wasm32")]
+use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -16,14 +18,17 @@ use bevy::render::renderer::{
 };
 
 #[cfg(target_arch = "wasm32")]
-use crate::SynthMesh;
+use crate::SynthAsset;
 use crate::args::AppArgs;
 #[cfg(target_arch = "wasm32")]
-use crate::args::{BackendKind, DinoBackend, QualityPreset, RmbgBackend, WeightPrecision};
+use crate::args::{
+    BackendKind, DinoBackend, QualityPreset, RmbgBackend, RmbgModel, SynthesisModel,
+    WeightPrecision,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::io::{mesh_from_glb_bytes, mesh_to_glb_bytes};
 #[cfg(target_arch = "wasm32")]
-use crate::state::InferenceRequest;
+use crate::state::{InferenceRequest, InferenceSettings};
 #[cfg(target_arch = "wasm32")]
 use crate::state::{
     InferenceWorker, WASM_STATUS_LOADING_MODELS, WASM_STATUS_MODEL_LOAD_FAILED_PREFIX,
@@ -35,7 +40,9 @@ use crate::state::{InferenceWorker, WorkerCommand, WorkerEvent};
 use burn_synth::wasm::WasmInferencePreset;
 #[cfg(target_arch = "wasm32")]
 use burn_synth::wasm_api::{
-    infer_glb_from_image_bytes_with_preset_cached, warmup_pipeline_for_preset_with_status,
+    infer_glb_from_image_bytes_with_preset_cached,
+    infer_triposplat_cloud_from_image_bytes_with_preset_cached,
+    warmup_pipeline_for_preset_with_status,
 };
 #[cfg(target_arch = "wasm32")]
 use gloo_timers::future::TimeoutFuture;
@@ -61,8 +68,8 @@ pub type SharedWgpuDevice = ();
 pub type WorkerWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-fn unwrap_wgpu_wrapper<T: Clone>(wrapper: &WgpuWrapper<T>) -> T {
-    <WgpuWrapper<T> as Clone>::clone(wrapper).into_inner()
+fn clone_wgpu_wrapper<T: Clone>(wrapper: &Arc<WgpuWrapper<T>>) -> T {
+    wrapper.as_ref().clone().into_inner()
 }
 
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
@@ -79,14 +86,13 @@ pub fn init_shared_wgpu_device_from_bevy_render(
     render_queue: &RenderQueue,
 ) -> SharedWgpuDevice {
     let setup = burn_wgpu::WgpuSetup {
-        adapter: unwrap_wgpu_wrapper(&render_adapter.0),
+        adapter: clone_wgpu_wrapper(&render_adapter.0),
         device: render_device.wgpu_device().clone(),
-        instance: unwrap_wgpu_wrapper(&render_instance.0),
-        queue: unwrap_wgpu_wrapper(&render_queue.0),
+        instance: clone_wgpu_wrapper(&render_instance.0),
+        queue: clone_wgpu_wrapper(&render_queue.0),
         backend: render_adapter_info.backend,
     };
-    let options = native_wgpu_runtime_options();
-    burn_wgpu::init_device(setup, options)
+    burn_wgpu::init_device(setup, native_wgpu_runtime_options())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,6 +250,8 @@ pub async fn infer_glb_from_image_bytes_wasm(
         image_path: wasm_virtual_upload_path(file_name, request_id),
         image_contents: Some(image_bytes),
         output_path: None,
+        synthesis_models: args.synthesis_models.clone(),
+        settings: InferenceSettings::from_args(args),
     };
 
     worker
@@ -256,13 +264,17 @@ pub async fn infer_glb_from_image_bytes_wasm(
     let result = result?;
 
     match result {
-        Ok(Some(mesh)) => {
+        Ok(Some(SynthAsset::Mesh(mesh))) => {
             let glb = mesh_to_glb_bytes(&mesh)
                 .map_err(|err| format!("failed to serialize wasm inference mesh to GLB: {err}"))?;
             Ok(glb)
         }
+        Ok(Some(SynthAsset::GaussianSplat(splats))) => Err(format!(
+            "wasm GLB helper received {} Gaussian splats; splat asset output is not implemented",
+            splats.len()
+        )),
         Ok(None) => Err(format!(
-            "synthesis produced an empty mesh for {}",
+            "synthesis produced an empty asset for {}",
             request.image_path.display()
         )),
         Err(err) => Err(format!(
@@ -277,7 +289,7 @@ async fn wait_for_wasm_request_result(
     worker: &InferenceWorker,
     request_id: u32,
     timeout: Duration,
-) -> Result<Result<Option<SynthMesh>, String>, String> {
+) -> Result<Result<Option<SynthAsset>, String>, String> {
     let started_ms = wasm_now_ms();
     loop {
         let next_event = {
@@ -336,9 +348,14 @@ fn worker_loop(
     shared_wgpu_device: Option<SharedWgpuDevice>,
     wake_callback: Option<WorkerWakeCallback>,
 ) {
-    let _ = &shared_wgpu_device;
     info!("Using canonical burn_synth runtime worker path.");
-    worker_runtime_bridge::worker_loop_shared_runtime(args, command_rx, event_tx, wake_callback);
+    worker_runtime_bridge::worker_loop_shared_runtime(
+        args,
+        command_rx,
+        event_tx,
+        shared_wgpu_device,
+        wake_callback,
+    );
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -352,7 +369,10 @@ fn send_worker_status(event_tx: &Sender<WorkerEvent>, message: impl Into<String>
 }
 
 #[cfg(target_arch = "wasm32")]
-fn app_args_to_wasm_preset(args: &AppArgs) -> WasmInferencePreset {
+fn app_args_to_wasm_preset(
+    args: &AppArgs,
+    synthesis_models: &[SynthesisModel],
+) -> WasmInferencePreset {
     let quality = match args.quality {
         QualityPreset::Fast => "fast",
         QualityPreset::Balanced => "balanced",
@@ -383,10 +403,30 @@ fn app_args_to_wasm_preset(args: &AppArgs) -> WasmInferencePreset {
         WeightPrecision::F16 => "f16",
         WeightPrecision::F32 => "f32",
     };
+    let synthesis_model = synthesis_models
+        .first()
+        .copied()
+        .or_else(|| args.synthesis_models.first().copied())
+        .unwrap_or(SynthesisModel::Triposg);
+    let synthesis_model = match synthesis_model {
+        SynthesisModel::Triposg => "triposg",
+        SynthesisModel::Trellis => "trellis",
+        SynthesisModel::Triposplat => "triposplat",
+    };
+    let rmbg_model = match args.rmbg_model {
+        RmbgModel::Rmbg14 => "rmbg14",
+        RmbgModel::Rmbg2 => "rmbg2",
+    };
     WasmInferencePreset {
         quality,
+        synthesis_model,
+        rmbg_model,
         num_steps: args.num_steps,
         num_tokens: args.num_tokens,
+        guidance_scale: args.guidance_scale,
+        triposplat_shift: args.triposplat_shift,
+        triposplat_num_gaussians: args.triposplat_num_gaussians,
+        triposplat_erode_radius: args.triposplat_erode_radius,
         resolution: args.flash_min_resolution.max(2),
         faces: args.target_faces.unwrap_or(0),
         flash_octree_depth: args.flash_octree_depth.max(1),
@@ -402,12 +442,29 @@ fn app_args_to_wasm_preset(args: &AppArgs) -> WasmInferencePreset {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn wasm_preset_key(preset: &WasmInferencePreset) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        preset.synthesis_model,
+        preset.backend,
+        preset.rmbg_model,
+        preset.rmbg_backend,
+        preset.dino_backend,
+        preset.weights_precision,
+        preset.rmbg_weights_precision,
+        preset.seed,
+        preset.triposplat_num_gaussians
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn ensure_wasm_pipeline_state_via_burn_synth(
-    warmup: &mut Option<Result<(), String>>,
+    warmups: &mut HashMap<String, Result<(), String>>,
     preset: &WasmInferencePreset,
     event_tx: &Sender<WorkerEvent>,
-) {
-    if warmup.is_none() {
+) -> Result<(), String> {
+    let key = wasm_preset_key(preset);
+    if !warmups.contains_key(&key) {
         send_worker_status(event_tx, WASM_STATUS_LOADING_MODELS);
         let mut last_status: Option<String> = None;
         let loaded = warmup_pipeline_for_preset_with_status(preset, |message| {
@@ -427,21 +484,42 @@ async fn ensure_wasm_pipeline_state_via_burn_synth(
         } else {
             send_worker_status(event_tx, WASM_STATUS_MODEL_READY);
         }
-        *warmup = Some(loaded);
+        warmups.insert(key.clone(), loaded);
     }
+    warmups
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| Err("wasm warmup state unavailable".to_string()))
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn infer_request_via_burn_synth(
     request: &InferenceRequest,
     preset: &WasmInferencePreset,
-) -> Result<Option<SynthMesh>, String> {
+) -> Result<Option<SynthAsset>, String> {
     let image_bytes = request.image_contents.as_ref().ok_or_else(|| {
         format!(
             "wasm inference requires uploaded image bytes for '{}'",
             request.image_path.display()
         )
     })?;
+    if matches!(
+        preset.synthesis_model.trim().to_ascii_lowercase().as_str(),
+        "triposplat" | "tripo-splat" | "splat"
+    ) {
+        let splats = infer_triposplat_cloud_from_image_bytes_with_preset_cached(
+            image_bytes.as_slice(),
+            preset,
+        )
+        .await
+        .map_err(|err| {
+            format!(
+                "wasm TripoSplat inference failed for '{}': {err}",
+                request.image_path.display()
+            )
+        })?;
+        return Ok(Some(SynthAsset::GaussianSplat(splats)));
+    }
     let glb_bytes = infer_glb_from_image_bytes_with_preset_cached(image_bytes.as_slice(), preset)
         .await
         .map_err(|err| {
@@ -452,7 +530,7 @@ async fn infer_request_via_burn_synth(
         })?;
     let mesh = mesh_from_glb_bytes(glb_bytes.as_slice())
         .map_err(|err| format!("failed to decode wasm GLB output: {err}"))?;
-    Ok(Some(mesh))
+    Ok(Some(SynthAsset::Mesh(mesh)))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -463,28 +541,37 @@ async fn worker_loop_wasm(
 ) {
     // Keep Bevy wasm runtime behavior canonical by delegating all model load + inference
     // semantics to burn_synth's wasm API/cache layer.
-    let preset = app_args_to_wasm_preset(&args);
-    let mut warmup: Option<Result<(), String>> = None;
+    let startup_preset = app_args_to_wasm_preset(&args, &args.synthesis_models);
+    let mut warmups: HashMap<String, Result<(), String>> = HashMap::new();
 
     loop {
         match command_rx.try_recv() {
             Ok(WorkerCommand::Warmup) => {
-                ensure_wasm_pipeline_state_via_burn_synth(&mut warmup, &preset, &event_tx).await;
+                let _ = ensure_wasm_pipeline_state_via_burn_synth(
+                    &mut warmups,
+                    &startup_preset,
+                    &event_tx,
+                )
+                .await;
             }
             Ok(WorkerCommand::Infer(requests)) => {
-                ensure_wasm_pipeline_state_via_burn_synth(&mut warmup, &preset, &event_tx).await;
                 let start_ms = wasm_now_ms();
-                let results = match warmup.as_ref() {
-                    Some(Ok(())) => {
-                        let mut out = Vec::with_capacity(requests.len());
-                        for request in &requests {
-                            out.push(infer_request_via_burn_synth(request, &preset).await);
+                let mut results = Vec::with_capacity(requests.len());
+                for request in &requests {
+                    let preset = app_args_to_wasm_preset(&args, &request.synthesis_models);
+                    match ensure_wasm_pipeline_state_via_burn_synth(
+                        &mut warmups,
+                        &preset,
+                        &event_tx,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            results.push(infer_request_via_burn_synth(request, &preset).await)
                         }
-                        out
+                        Err(err) => results.push(Err(err)),
                     }
-                    Some(Err(err)) => vec![Err(err.clone()); requests.len()],
-                    None => vec![Err("wasm warmup state unavailable".to_string()); requests.len()],
-                };
+                }
                 let _ = event_tx.send(WorkerEvent {
                     requests,
                     results,

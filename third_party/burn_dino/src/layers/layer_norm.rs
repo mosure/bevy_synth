@@ -1,4 +1,4 @@
-use burn::{module::Param, nn::Initializer, prelude::*};
+use burn::{module::Param, nn::Initializer, prelude::*, tensor::FloatDType};
 
 #[derive(Config, Debug)]
 pub struct LayerNormConfig {
@@ -39,11 +39,45 @@ impl<B: Backend> LayerNorm<B> {
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let (var, mean) = x.clone().var_mean_bias(D - 1);
-        let input_normalized = x.sub(mean).div(var.add_scalar(self.epsilon).sqrt());
+        let dtype: FloatDType = x.dtype().into();
+        let acc_dtype = accumulation_dtype(dtype);
+        let x_acc = cast_low_precision_to_f32(x, dtype);
+        let (var, mean) = x_acc.clone().var_mean_bias(D - 1);
+        let input_normalized = x_acc.sub(mean).div(var.add_scalar(self.epsilon).sqrt());
 
-        input_normalized
-            .mul(self.gamma.val().unsqueeze())
-            .add(self.beta.val().unsqueeze())
+        let out = input_normalized
+            .mul(self.gamma.val().unsqueeze().cast(acc_dtype))
+            .add(self.beta.val().unsqueeze().cast(acc_dtype));
+        cast_from_f32_accum(out, dtype)
+    }
+}
+
+fn cast_low_precision_to_f32<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: FloatDType,
+) -> Tensor<B, D> {
+    if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+        tensor.cast(FloatDType::F32)
+    } else {
+        tensor
+    }
+}
+
+fn accumulation_dtype(dtype: FloatDType) -> FloatDType {
+    if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+        FloatDType::F32
+    } else {
+        dtype
+    }
+}
+
+fn cast_from_f32_accum<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: FloatDType,
+) -> Tensor<B, D> {
+    if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+        tensor.cast(dtype)
+    } else {
+        tensor
     }
 }
