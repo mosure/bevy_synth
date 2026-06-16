@@ -159,7 +159,13 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                 .forward(crate::components::silu(mod_signal));
         }
         for block in &self.blocks {
-            h = block.forward(h, mod_signal.clone(), cond.clone());
+            h = block.forward_with_query_chunk_tokens(
+                h,
+                mod_signal.clone(),
+                cond.clone(),
+                octree_cross_attention_query_chunk_tokens(),
+            );
+            cleanup_wasm_tensor_device(&h);
         }
         if !self.config.no_norm {
             h = layer_norm_last(h, 1.0e-6);
@@ -257,22 +263,16 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                 }
             }
 
-            let coords = Tensor::<B, 1>::from_floats(coords.as_slice(), &device).reshape([
+            let probs = self.sample_level_probs_host(
+                coords.as_slice(),
                 batch,
                 max_parent_count,
-                3,
-            ]);
-            let level_tensor =
-                Tensor::<B, 1>::from_floats(vec![resolution as f32; batch].as_slice(), &device);
-            let total_points =
-                Tensor::<B, 1>::from_floats(vec![num_points as f32; batch].as_slice(), &device);
-            let probs = self
-                .forward(coords, level_tensor, cond.clone(), Some(total_points))
-                .probs
-                .to_data()
-                .convert::<f32>()
-                .to_vec::<f32>()
-                .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?;
+                resolution,
+                num_points,
+                cond.clone(),
+                &device,
+                octree_host_forward_chunk_tokens(),
+            )?;
 
             let mut next = Vec::with_capacity(batch);
             for (batch_index, nodes) in prev.iter().enumerate() {
@@ -400,24 +400,18 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                 }
             }
 
-            let coords = Tensor::<B, 1>::from_floats(coords.as_slice(), &device).reshape([
-                batch,
-                max_parent_count,
-                3,
-            ]);
-            let level_tensor =
-                Tensor::<B, 1>::from_floats(vec![resolution as f32; batch].as_slice(), &device);
-            let total_points =
-                Tensor::<B, 1>::from_floats(vec![num_points as f32; batch].as_slice(), &device);
             let probs = self
-                .forward(coords, level_tensor, cond.clone(), Some(total_points))
-                .probs
-                .to_data_async()
-                .await
-                .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?
-                .convert::<f32>()
-                .to_vec::<f32>()
-                .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?;
+                .sample_level_probs_host_async(
+                    coords.as_slice(),
+                    batch,
+                    max_parent_count,
+                    resolution,
+                    num_points,
+                    cond.clone(),
+                    &device,
+                    octree_host_forward_chunk_tokens(),
+                )
+                .await?;
 
             let mut next = Vec::with_capacity(batch);
             for (batch_index, nodes) in prev.iter().enumerate() {
@@ -484,6 +478,82 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
 
     fn float_dtype(&self) -> FloatDType {
         self.in_proj.weight.val().dtype().into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_level_probs_host(
+        &self,
+        coords: &[f32],
+        batch: usize,
+        max_parent_count: usize,
+        resolution: usize,
+        num_points: usize,
+        cond: Tensor<B, 3>,
+        device: &B::Device,
+        chunk_tokens: usize,
+    ) -> Result<Vec<f32>, String> {
+        let chunk_tokens = chunk_tokens.max(1).min(max_parent_count.max(1));
+        let mut probs = vec![0.0f32; batch * max_parent_count * 8];
+        for start in (0..max_parent_count).step_by(chunk_tokens) {
+            let end = start.saturating_add(chunk_tokens).min(max_parent_count);
+            let width = end - start;
+            let coords = chunk_parent_coords(coords, batch, max_parent_count, start, width)?;
+            let coords =
+                Tensor::<B, 1>::from_floats(coords.as_slice(), device).reshape([batch, width, 3]);
+            let level_tensor =
+                Tensor::<B, 1>::from_floats(vec![resolution as f32; batch].as_slice(), device);
+            let total_points =
+                Tensor::<B, 1>::from_floats(vec![num_points as f32; batch].as_slice(), device);
+            let chunk = self
+                .forward(coords, level_tensor, cond.clone(), Some(total_points))
+                .probs
+                .to_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?;
+            copy_chunk_probs(&chunk, &mut probs, batch, max_parent_count, start, width)?;
+            cleanup_wasm_backend_memory::<B>(device);
+        }
+        Ok(probs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sample_level_probs_host_async(
+        &self,
+        coords: &[f32],
+        batch: usize,
+        max_parent_count: usize,
+        resolution: usize,
+        num_points: usize,
+        cond: Tensor<B, 3>,
+        device: &B::Device,
+        chunk_tokens: usize,
+    ) -> Result<Vec<f32>, String> {
+        let chunk_tokens = chunk_tokens.max(1).min(max_parent_count.max(1));
+        let mut probs = vec![0.0f32; batch * max_parent_count * 8];
+        for start in (0..max_parent_count).step_by(chunk_tokens) {
+            let end = start.saturating_add(chunk_tokens).min(max_parent_count);
+            let width = end - start;
+            let coords = chunk_parent_coords(coords, batch, max_parent_count, start, width)?;
+            let coords =
+                Tensor::<B, 1>::from_floats(coords.as_slice(), device).reshape([batch, width, 3]);
+            let level_tensor =
+                Tensor::<B, 1>::from_floats(vec![resolution as f32; batch].as_slice(), device);
+            let total_points =
+                Tensor::<B, 1>::from_floats(vec![num_points as f32; batch].as_slice(), device);
+            let chunk = self
+                .forward(coords, level_tensor, cond.clone(), Some(total_points))
+                .probs
+                .to_data_async()
+                .await
+                .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?;
+            copy_chunk_probs(&chunk, &mut probs, batch, max_parent_count, start, width)?;
+            cleanup_wasm_backend_memory::<B>(device);
+        }
+        Ok(probs)
     }
 }
 
@@ -737,7 +807,12 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
                     &norm0_out,
                 )?;
             }
-            let self_delta = self.self_attns[index].forward(norm0_out, None, None);
+            let self_delta = self.self_attns[index].forward_with_query_chunk_tokens(
+                norm0_out,
+                None,
+                None,
+                gaussian_self_attention_query_chunk_tokens(),
+            );
             if check_finite {
                 validate_tensor_finite(
                     &format!("gaussian_decoder.block{index}.self_attn"),
@@ -755,7 +830,12 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
                     &norm1_out,
                 )?;
             }
-            let cross_delta = self.cross_attns[index].forward(norm1_out, Some(cond.clone()), None);
+            let cross_delta = self.cross_attns[index].forward_with_query_chunk_tokens(
+                norm1_out,
+                Some(cond.clone()),
+                None,
+                gaussian_cross_attention_query_chunk_tokens(),
+            );
             if check_finite {
                 validate_tensor_finite(
                     &format!("gaussian_decoder.block{index}.cross_attn"),
@@ -781,6 +861,7 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
             if check_finite {
                 validate_tensor_finite(&format!("gaussian_decoder.block{index}.post_mlp"), &h)?;
             }
+            cleanup_wasm_tensor_device(&h);
         }
         if !self.config.no_norm {
             h = layer_norm_last(h, 1.0e-6);
@@ -858,6 +939,8 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
             .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|_| "failed to read TripoSplat decoder points".to_string())?;
+        cleanup_wasm_tensor_device(&sample.points);
+        let features_device = features.device();
         let features = features
             .slice([0..1, 0..tokens, 0..channels])
             .to_data_async()
@@ -866,6 +949,7 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
             .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|_| "failed to read TripoSplat decoder features".to_string())?;
+        cleanup_wasm_backend_memory::<B>(&features_device);
         Ok(GaussianSplatCloud::new(build_splats_host(
             &points,
             &features,
@@ -924,6 +1008,136 @@ fn cast_from_f32_accum<B: Backend, const D: usize>(
     } else {
         tensor
     }
+}
+
+fn chunk_parent_coords(
+    coords: &[f32],
+    batch: usize,
+    max_parent_count: usize,
+    start: usize,
+    width: usize,
+) -> Result<Vec<f32>, String> {
+    let expected = batch
+        .checked_mul(max_parent_count)
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| "octree parent coordinate shape overflow".to_string())?;
+    if coords.len() != expected {
+        return Err(format!(
+            "octree parent coordinate buffer mismatch: got {}, expected {expected}",
+            coords.len()
+        ));
+    }
+    if start.saturating_add(width) > max_parent_count {
+        return Err(format!(
+            "octree parent coordinate chunk out of bounds: start={start} width={width} parents={max_parent_count}"
+        ));
+    }
+
+    let mut out = vec![0.0f32; batch * width * 3];
+    for batch_index in 0..batch {
+        let src = (batch_index * max_parent_count + start) * 3;
+        let dst = batch_index * width * 3;
+        out[dst..dst + width * 3].copy_from_slice(&coords[src..src + width * 3]);
+    }
+    Ok(out)
+}
+
+fn copy_chunk_probs(
+    chunk: &[f32],
+    out: &mut [f32],
+    batch: usize,
+    max_parent_count: usize,
+    start: usize,
+    width: usize,
+) -> Result<(), String> {
+    let expected_chunk = batch
+        .checked_mul(width)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or_else(|| "octree probability chunk shape overflow".to_string())?;
+    if chunk.len() != expected_chunk {
+        return Err(format!(
+            "octree probability chunk mismatch: got {}, expected {expected_chunk}",
+            chunk.len()
+        ));
+    }
+    let expected_out = batch
+        .checked_mul(max_parent_count)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or_else(|| "octree probability output shape overflow".to_string())?;
+    if out.len() != expected_out {
+        return Err(format!(
+            "octree probability output mismatch: got {}, expected {expected_out}",
+            out.len()
+        ));
+    }
+    if start.saturating_add(width) > max_parent_count {
+        return Err(format!(
+            "octree probability chunk out of bounds: start={start} width={width} parents={max_parent_count}"
+        ));
+    }
+
+    for batch_index in 0..batch {
+        let src = batch_index * width * 8;
+        let dst = (batch_index * max_parent_count + start) * 8;
+        out[dst..dst + width * 8].copy_from_slice(&chunk[src..src + width * 8]);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cleanup_wasm_tensor_device<B: Backend, const D: usize>(tensor: &Tensor<B, D>) {
+    cleanup_wasm_backend_memory::<B>(&tensor.device());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cleanup_wasm_tensor_device<B: Backend, const D: usize>(_tensor: &Tensor<B, D>) {}
+
+#[cfg(target_arch = "wasm32")]
+fn cleanup_wasm_backend_memory<B: Backend>(device: &B::Device) {
+    B::memory_cleanup(device);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cleanup_wasm_backend_memory<B: Backend>(_device: &B::Device) {}
+
+#[cfg(target_arch = "wasm32")]
+fn gaussian_cross_attention_query_chunk_tokens() -> usize {
+    64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn gaussian_cross_attention_query_chunk_tokens() -> usize {
+    128
+}
+
+#[cfg(target_arch = "wasm32")]
+fn gaussian_self_attention_query_chunk_tokens() -> usize {
+    64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn gaussian_self_attention_query_chunk_tokens() -> usize {
+    128
+}
+
+#[cfg(target_arch = "wasm32")]
+fn octree_cross_attention_query_chunk_tokens() -> usize {
+    32
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn octree_cross_attention_query_chunk_tokens() -> usize {
+    128
+}
+
+#[cfg(target_arch = "wasm32")]
+fn octree_host_forward_chunk_tokens() -> usize {
+    32
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn octree_host_forward_chunk_tokens() -> usize {
+    usize::MAX
 }
 
 #[derive(Module, Debug)]
@@ -995,8 +1209,10 @@ impl<B: Backend> OctreeGaussianDecoder<B> {
             .octree
             .sample_systematic_host_async(latent.clone(), num_points, OCTREE_MAX_VOXEL_LEVEL, seed)
             .await?;
+        cleanup_wasm_tensor_device(&sample.points);
         debug_assert_eq!(sample.points.dims()[0], batch);
         let features = self.gs.forward(&sample, latent);
+        cleanup_wasm_tensor_device(&features);
         self.gs.build_cloud_async(&sample, features).await
     }
 
@@ -1293,6 +1509,24 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_scale_activation_matches_upstream_configured_softplus_bias() {
+        let mut config = GaussianRepresentationConfig::triposplat();
+        config.num_gaussians = 1;
+        let layout = GaussianFeatureLayout::new(&config, true);
+        let points = [0.5f32, 0.5, 0.5];
+        let features = vec![0.0f32; layout.out_channels];
+        let splats =
+            build_splats_host(&points, &features, 1, layout, &config).expect("build splat");
+        let scale = splats[0].scale[0];
+        let expected = (config.scaling_bias.powi(2) + config.filter_kernel_size_3d.powi(2)).sqrt();
+
+        assert!(
+            (scale - expected).abs() <= 1.0e-7,
+            "scale={scale} expected={expected}"
+        );
+    }
+
+    #[test]
     fn tiny_octree_decoder_smoke_produces_requested_multiple() {
         let device = Default::default();
         let decoder = OctreeGaussianDecoder::<TestBackend>::new(
@@ -1365,5 +1599,31 @@ mod tests {
             .expect("second vec");
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn octree_parent_chunking_matches_full_level_forward() {
+        let device = Default::default();
+        let config = OctreeProbabilityFixedlenDecoderConfig::tiny_for_tests();
+        let model = config.clone().init::<TestBackend>(&device);
+        let cond = Tensor::<TestBackend, 3>::zeros([1, 8, config.cond_channels], &device);
+        let coords = [
+            0.125f32, 0.125, 0.125, 0.375, 0.125, 0.125, 0.125, 0.375, 0.125, 0.375, 0.375, 0.125,
+            0.625, 0.625, 0.625,
+        ];
+        let full = model
+            .sample_level_probs_host(&coords, 1, 5, 4, 17, cond.clone(), &device, usize::MAX)
+            .expect("full probs");
+        let chunked = model
+            .sample_level_probs_host(&coords, 1, 5, 4, 17, cond, &device, 2)
+            .expect("chunked probs");
+
+        assert_eq!(full.len(), chunked.len());
+        for (index, (a, b)) in full.iter().zip(chunked.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1.0e-5,
+                "chunked octree prob mismatch at {index}: full={a} chunked={b}"
+            );
+        }
     }
 }

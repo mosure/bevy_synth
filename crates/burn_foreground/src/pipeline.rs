@@ -13,6 +13,8 @@ pub struct PrepareImageConfig {
     pub bg_color: [f32; 3],
     pub padding_ratio: f32,
     pub max_dimension: usize,
+    pub resize_shorter_to: Option<usize>,
+    pub alpha_erode_radius: usize,
     pub min_component_size: usize,
 }
 
@@ -22,6 +24,8 @@ impl Default for PrepareImageConfig {
             bg_color: [1.0, 1.0, 1.0],
             padding_ratio: 0.1,
             max_dimension: 2000,
+            resize_shorter_to: None,
+            alpha_erode_radius: 0,
             min_component_size: 200,
         }
     }
@@ -107,7 +111,7 @@ pub fn prepare_image_data<B: Backend>(
     pipeline: Option<&RmbgPipeline<B>>,
     config: &PrepareImageConfig,
 ) -> Result<PreparedImageData, PrepareImageError> {
-    let loaded = load_image_rgb(path, config.max_dimension)?;
+    let loaded = load_image_rgb(path, config)?;
     prepare_loaded_image(loaded, pipeline, config)
 }
 
@@ -116,7 +120,7 @@ pub fn prepare_image_data_from_bytes<B: Backend>(
     pipeline: Option<&RmbgPipeline<B>>,
     config: &PrepareImageConfig,
 ) -> Result<PreparedImageData, PrepareImageError> {
-    let loaded = load_image_rgb_from_bytes(bytes, config.max_dimension)?;
+    let loaded = load_image_rgb_from_bytes(bytes, config)?;
     prepare_loaded_image(loaded, pipeline, config)
 }
 
@@ -126,7 +130,7 @@ pub async fn prepare_image_data_async<B: Backend>(
     pipeline: Option<&RmbgPipeline<B>>,
     config: &PrepareImageConfig,
 ) -> Result<PreparedImageData, PrepareImageError> {
-    let loaded = load_image_rgb(path, config.max_dimension)?;
+    let loaded = load_image_rgb(path, config)?;
     prepare_loaded_image_async(loaded, pipeline, config).await
 }
 
@@ -136,7 +140,7 @@ pub async fn prepare_image_data_from_bytes_async<B: Backend>(
     pipeline: Option<&RmbgPipeline<B>>,
     config: &PrepareImageConfig,
 ) -> Result<PreparedImageData, PrepareImageError> {
-    let loaded = load_image_rgb_from_bytes(bytes, config.max_dimension)?;
+    let loaded = load_image_rgb_from_bytes(bytes, config)?;
     prepare_loaded_image_async(loaded, pipeline, config).await
 }
 
@@ -158,18 +162,14 @@ fn prepare_loaded_image<B: Backend>(
     };
 
     let (alpha_mask, alpha_probs, bbox) = if let Some(alpha) = alpha {
-        let alpha_mask = alpha
-            .iter()
-            .map(|value| *value as f32 / 255.0)
-            .collect::<Vec<f32>>();
-        let bbox = bbox_from_mask_all(&alpha, width, height)
-            .ok_or_else(|| PrepareImageError("input image too small".to_string()))?;
+        let (alpha_mask, bbox) = prepare_alpha_mask(alpha, width, height, config)?;
         (alpha_mask, None, Some(bbox))
     } else {
         let pipeline = pipeline.ok_or_else(|| {
             PrepareImageError("RMBG pipeline required for images without alpha".to_string())
         })?;
         let alpha = infer_alpha_mask(pipeline, &rgb, width, height, config.min_component_size)?;
+        let alpha = maybe_erode_alpha_result(alpha, width, height, config)?;
         (alpha.alpha_mask, Some(alpha.alpha_probs), Some(alpha.bbox))
     };
 
@@ -202,12 +202,7 @@ async fn prepare_loaded_image_async<B: Backend>(
     };
 
     let (alpha_mask, alpha_probs, bbox) = if let Some(alpha) = alpha {
-        let alpha_mask = alpha
-            .iter()
-            .map(|value| *value as f32 / 255.0)
-            .collect::<Vec<f32>>();
-        let bbox = bbox_from_mask_all(&alpha, width, height)
-            .ok_or_else(|| PrepareImageError("input image too small".to_string()))?;
+        let (alpha_mask, bbox) = prepare_alpha_mask(alpha, width, height, config)?;
         (alpha_mask, None, Some(bbox))
     } else {
         let pipeline = pipeline.ok_or_else(|| {
@@ -216,6 +211,7 @@ async fn prepare_loaded_image_async<B: Backend>(
         let alpha =
             infer_alpha_mask_async(pipeline, &rgb, width, height, config.min_component_size)
                 .await?;
+        let alpha = maybe_erode_alpha_result(alpha, width, height, config)?;
         (alpha.alpha_mask, Some(alpha.alpha_probs), Some(alpha.bbox))
     };
 
@@ -305,46 +301,62 @@ pub async fn prepare_image_tensor_from_bytes_async<B: Backend>(
 
 pub(crate) fn load_image_rgb(
     path: &Path,
-    max_dimension: usize,
+    config: &PrepareImageConfig,
 ) -> Result<LoadedImage, PrepareImageError> {
     let image = image::open(path)
         .map_err(|err| PrepareImageError(format!("invalid image path {path:?}: {err}")))?;
-    load_image_rgb_from_dynamic(image, max_dimension)
+    load_image_rgb_from_dynamic(image, config)
 }
 
 pub(crate) fn load_image_rgb_from_bytes(
     bytes: &[u8],
-    max_dimension: usize,
+    config: &PrepareImageConfig,
 ) -> Result<LoadedImage, PrepareImageError> {
     let image = image::load_from_memory(bytes)
         .map_err(|err| PrepareImageError(format!("invalid image bytes: {err}")))?;
-    load_image_rgb_from_dynamic(image, max_dimension)
+    load_image_rgb_from_dynamic(image, config)
 }
 
 fn load_image_rgb_from_dynamic(
     image: image::DynamicImage,
-    max_dimension: usize,
+    config: &PrepareImageConfig,
 ) -> Result<LoadedImage, PrepareImageError> {
     let has_alpha = image.color().has_alpha();
 
-    let rgba = image.to_rgba8();
-    let (width, height) = rgba.dimensions();
+    let mut rgba = image.to_rgba8();
+    let (mut width, mut height) = rgba.dimensions();
 
-    let (width, height, rgba) = if max_dimension > 0
-        && (width as usize > max_dimension || height as usize > max_dimension)
+    if let Some(target_shorter) = config.resize_shorter_to.filter(|target| *target > 0) {
+        let shorter = width.min(height).max(1);
+        if shorter as usize != target_shorter {
+            let scale = target_shorter as f32 / shorter as f32;
+            let new_width = (width as f32 * scale).round().max(1.0) as u32;
+            let new_height = (height as f32 * scale).round().max(1.0) as u32;
+            rgba = image::imageops::resize(
+                &rgba,
+                new_width,
+                new_height,
+                image::imageops::FilterType::Lanczos3,
+            );
+            width = new_width;
+            height = new_height;
+        }
+    }
+
+    if config.max_dimension > 0
+        && (width as usize > config.max_dimension || height as usize > config.max_dimension)
     {
         let scale = if height > width {
-            max_dimension as f32 / height as f32
+            config.max_dimension as f32 / height as f32
         } else {
-            max_dimension as f32 / width as f32
+            config.max_dimension as f32 / width as f32
         };
         let new_width = (width as f32 * scale).floor().max(1.0) as u32;
         let new_height = (height as f32 * scale).floor().max(1.0) as u32;
-        let resized = resize_rgba_inter_area(&rgba, new_width, new_height);
-        (new_width, new_height, resized)
-    } else {
-        (width, height, rgba)
-    };
+        rgba = resize_rgba_inter_area(&rgba, new_width, new_height);
+        width = new_width;
+        height = new_height;
+    }
 
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     let mut alpha = if has_alpha {
@@ -370,6 +382,77 @@ fn load_image_rgb_from_dynamic(
         height: height as usize,
         has_alpha,
     })
+}
+
+fn prepare_alpha_mask(
+    alpha: Vec<u8>,
+    width: usize,
+    height: usize,
+    config: &PrepareImageConfig,
+) -> Result<(Vec<f32>, [usize; 4]), PrepareImageError> {
+    let alpha = erode_alpha_u8(&alpha, width, height, config.alpha_erode_radius);
+    let bbox = bbox_from_mask_all(&alpha, width, height)
+        .ok_or_else(|| PrepareImageError("input image too small".to_string()))?;
+    let alpha_mask = alpha
+        .iter()
+        .map(|value| *value as f32 / 255.0)
+        .collect::<Vec<f32>>();
+    Ok((alpha_mask, bbox))
+}
+
+fn maybe_erode_alpha_result(
+    result: AlphaMaskResult,
+    width: usize,
+    height: usize,
+    config: &PrepareImageConfig,
+) -> Result<AlphaMaskResult, PrepareImageError> {
+    if config.alpha_erode_radius == 0 {
+        return Ok(result);
+    }
+    let alpha_u8 = result
+        .alpha_mask
+        .iter()
+        .map(|value| if *value > 0.0 { 255 } else { 0 })
+        .collect::<Vec<u8>>();
+    let alpha_u8 = erode_alpha_u8(&alpha_u8, width, height, config.alpha_erode_radius);
+    let bbox = bbox_from_mask_all(&alpha_u8, width, height)
+        .ok_or_else(|| PrepareImageError("input image too small".to_string()))?;
+    let alpha_mask = alpha_u8
+        .iter()
+        .map(|value| if *value > 0 { 1.0 } else { 0.0 })
+        .collect::<Vec<f32>>();
+    Ok(AlphaMaskResult {
+        alpha_mask,
+        alpha_probs: result.alpha_probs,
+        bbox,
+    })
+}
+
+fn erode_alpha_u8(alpha: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
+    if radius == 0 || alpha.is_empty() {
+        return alpha.to_vec();
+    }
+    let mut output = vec![0u8; alpha.len()];
+    let radius = radius as isize;
+    for y in 0..height {
+        for x in 0..width {
+            let mut min_value = u8::MAX;
+            for yy in (y as isize - radius)..=(y as isize + radius) {
+                if yy < 0 || yy >= height as isize {
+                    continue;
+                }
+                for xx in (x as isize - radius)..=(x as isize + radius) {
+                    if xx < 0 || xx >= width as isize {
+                        continue;
+                    }
+                    let value = alpha[yy as usize * width + xx as usize];
+                    min_value = min_value.min(value);
+                }
+            }
+            output[y * width + x] = min_value;
+        }
+    }
+    output
 }
 
 pub(crate) fn is_valid_alpha(alpha: &[u8], width: usize, height: usize, min_ratio: f32) -> bool {
@@ -989,4 +1072,47 @@ fn resize_rgba_inter_area(
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpha_erode_shrinks_mask_before_bbox() {
+        let mut alpha = vec![0u8; 25];
+        for y in 1..4 {
+            for x in 1..4 {
+                alpha[y * 5 + x] = 255;
+            }
+        }
+        let config = PrepareImageConfig {
+            alpha_erode_radius: 1,
+            ..PrepareImageConfig::default()
+        };
+
+        let (mask, bbox) =
+            prepare_alpha_mask(alpha, 5, 5, &config).expect("eroded center pixel should remain");
+
+        assert_eq!(bbox, [2, 2, 1, 1]);
+        assert_eq!(mask.iter().filter(|value| **value > 0.0).count(), 1);
+    }
+
+    #[test]
+    fn resize_shorter_to_scales_before_prepare() {
+        let mut image = image::RgbaImage::new(4, 2);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([255, 0, 0, 255]);
+        }
+        let config = PrepareImageConfig {
+            max_dimension: usize::MAX,
+            resize_shorter_to: Some(4),
+            ..PrepareImageConfig::default()
+        };
+
+        let loaded = load_image_rgb_from_dynamic(image::DynamicImage::ImageRgba8(image), &config)
+            .expect("load image");
+
+        assert_eq!((loaded.width, loaded.height), (8, 4));
+    }
 }

@@ -46,8 +46,12 @@ use bevy::window::{Window, WindowPlugin};
 use bevy::winit::{
     EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WinitSettings, WinitUserEvent,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_mesh::{Indices, PrimitiveTopology};
+use bevy_gaussian_splatting::gaussian::settings::GaussianColorSpace;
+use bevy_gaussian_splatting::sort::SortMode;
+use bevy_gaussian_splatting::{
+    CloudSettings, Gaussian3d, GaussianCamera, GaussianSplattingPlugin, PlanarGaussian3d,
+    PlanarGaussian3dHandle, SphericalHarmonicCoefficients,
+};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::DefaultPickingPlugins;
 use bevy_picking::hover::PickingInteraction;
@@ -99,21 +103,13 @@ use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
 use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
-    BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnRequest, CatalogState, CatalogStatus,
-    CatalogUiState, DragState, MainCamera, preview_light_layers,
+    BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnAsset, CatalogSpawnRequest, CatalogState,
+    CatalogStatus, CatalogUiState, DragState, MainCamera, preview_light_layers,
 };
 
 use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
 
 const BUILTIN_CUBE_SOURCE_IMAGE: &str = "builtin/cube";
-#[cfg(not(target_arch = "wasm32"))]
-const SPLAT_PREVIEW_MAX_SPLATS: usize = 8_192;
-#[cfg(not(target_arch = "wasm32"))]
-const SPLAT_PREVIEW_MIN_RADIUS: f32 = 0.005;
-#[cfg(not(target_arch = "wasm32"))]
-const SPLAT_PREVIEW_MAX_RADIUS: f32 = 0.05;
-#[cfg(not(target_arch = "wasm32"))]
-const SPLAT_PREVIEW_SH_C0: f32 = 0.282_094_8;
 const PANORBIT_MIN_RADIUS: f32 = 0.05;
 const PANORBIT_MAX_RADIUS: f32 = 500.0;
 const PANORBIT_ORBIT_SMOOTHNESS: f32 = 0.1;
@@ -315,10 +311,37 @@ impl Plugin for SharedWgpuInferenceDevicePlugin {
 
 #[cfg(not(target_arch = "wasm32"))]
 const INFERENCE_PAUSE_WAIT: Duration = Duration::from_secs(60 * 60);
+#[cfg(not(target_arch = "wasm32"))]
+const INFERENCE_DISPATCH_VISIBLE_FRAMES: u8 = 3;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 struct InferencePauseOverlay;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Debug, Clone)]
+pub(crate) struct InferenceDispatchGate {
+    visible_frames_remaining: u8,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for InferenceDispatchGate {
+    fn default() -> Self {
+        Self {
+            visible_frames_remaining: INFERENCE_DISPATCH_VISIBLE_FRAMES,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InferenceDispatchGate {
+    #[cfg(test)]
+    pub(crate) fn ready_for_dispatch() -> Self {
+        Self {
+            visible_frames_remaining: 0,
+        }
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Resource, Debug, Default, Clone)]
@@ -357,7 +380,28 @@ pub(crate) fn should_pause_render_during_inference(
         .as_ref()
         .map(|batch| !batch.is_empty())
         .unwrap_or(false);
-    active || !queue.pending.is_empty()
+    active
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn should_wait_before_inference_dispatch(
+    gate: &mut InferenceDispatchGate,
+    queue: &InferenceQueue,
+) -> bool {
+    if queue.active.is_some() || queue.pending.is_empty() {
+        gate.visible_frames_remaining = INFERENCE_DISPATCH_VISIBLE_FRAMES;
+        return false;
+    }
+    if gate.visible_frames_remaining == 0 {
+        return false;
+    }
+    gate.visible_frames_remaining -= 1;
+    true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reset_inference_dispatch_gate(gate: &mut InferenceDispatchGate) {
+    gate.visible_frames_remaining = INFERENCE_DISPATCH_VISIBLE_FRAMES;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -550,9 +594,12 @@ pub(crate) struct InferenceContext<'w, 's> {
     queue: ResMut<'w, InferenceQueue>,
     worker: Res<'w, InferenceWorker>,
     args: Res<'w, AppArgs>,
+    #[cfg(not(target_arch = "wasm32"))]
+    dispatch_gate: ResMut<'w, InferenceDispatchGate>,
     meshes: ResMut<'w, Assets<BevyMesh>>,
     images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
+    gaussian_clouds: ResMut<'w, Assets<PlanarGaussian3d>>,
     cache: ResMut<'w, MeshCacheResource>,
     status: ResMut<'w, UiStatus>,
     catalog: ResMut<'w, CatalogState>,
@@ -607,6 +654,8 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     app.init_resource::<InferenceRenderPauseState>();
     #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<InferenceDispatchGate>();
+    #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
     add_default_plugins(&mut app);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
@@ -617,6 +666,7 @@ pub(crate) fn run() {
     app.add_plugins(TransformGizmoPlugin);
     app.add_plugins(PanOrbitCameraPlugin);
     app.add_plugins(InfiniteGridPlugin);
+    app.add_plugins(GaussianSplattingPlugin);
     app.add_plugins(BurnSynthUiPlugin);
     app.add_systems(
         Update,
@@ -1168,7 +1218,7 @@ fn spawn_inference_pause_overlay(commands: &mut Commands) {
                 ..default()
             },
             GlobalZIndex(10_000),
-            BackgroundColor(Color::srgba(0.03, 0.04, 0.06, 0.9)),
+            BackgroundColor(Color::srgba(0.03, 0.04, 0.06, 0.58)),
             Visibility::Hidden,
         ))
         .with_children(|root| {
@@ -1205,6 +1255,7 @@ fn initialize_interactive_scene(
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
     ambient_light: &mut ResMut<GlobalAmbientLight>,
     args: &AppArgs,
     queue: &mut ResMut<InferenceQueue>,
@@ -1224,6 +1275,7 @@ fn initialize_interactive_scene(
 
     commands.spawn((
         Camera3d::default(),
+        GaussianCamera::default(),
         camera_transform,
         camera_orbit,
         GizmoCamera,
@@ -1250,7 +1302,16 @@ fn initialize_interactive_scene(
         RenderLayers::layer(0),
     ));
 
-    hydrate_from_cache(commands, meshes, images, materials, queue, catalog, cache);
+    hydrate_from_cache(
+        commands,
+        meshes,
+        images,
+        materials,
+        gaussian_clouds,
+        queue,
+        catalog,
+        cache,
+    );
     seed_default_catalog_cube(meshes, materials, queue, catalog, cache);
     world_cache.dirty = false;
     world_cache.timer.reset();
@@ -1279,6 +1340,7 @@ fn setup(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
     mut ambient_light: ResMut<GlobalAmbientLight>,
     args: Res<AppArgs>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
@@ -1325,6 +1387,7 @@ fn setup(
         &mut meshes,
         &mut images,
         &mut materials,
+        &mut gaussian_clouds,
         &mut ambient_light,
         args.as_ref(),
         &mut queue,
@@ -1398,6 +1461,7 @@ fn finish_wasm_startup_when_models_ready(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
     mut ambient_light: ResMut<GlobalAmbientLight>,
     args: Res<AppArgs>,
     mut queue: ResMut<InferenceQueue>,
@@ -1416,6 +1480,7 @@ fn finish_wasm_startup_when_models_ready(
         &mut meshes,
         &mut images,
         &mut materials,
+        &mut gaussian_clouds,
         &mut ambient_light,
         args.as_ref(),
         &mut queue,
@@ -1494,11 +1559,23 @@ fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut GlobalAmb
     ));
 }
 
+#[derive(Clone)]
+enum CachedAssetHandles {
+    Mesh {
+        mesh: Handle<BevyMesh>,
+        material: Handle<StandardMaterial>,
+    },
+    GaussianSplat {
+        cloud: Handle<PlanarGaussian3d>,
+    },
+}
+
 fn hydrate_from_cache(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
     queue: &mut ResMut<InferenceQueue>,
     catalog: &mut ResMut<CatalogState>,
     cache: &mut ResMut<MeshCacheResource>,
@@ -1519,8 +1596,7 @@ fn hydrate_from_cache(
 
     let mut loaded_assets = 0usize;
     let mut loaded_world_items = 0usize;
-    let mut handles_by_key: HashMap<String, (Handle<BevyMesh>, Handle<StandardMaterial>)> =
-        HashMap::new();
+    let mut handles_by_key: HashMap<String, CachedAssetHandles> = HashMap::new();
 
     for metadata in asset_entries {
         let asset = match cache.cache.load_asset(&metadata.cache_key) {
@@ -1541,31 +1617,41 @@ fn hydrate_from_cache(
             }
         };
 
-        let Some((mesh_handle, material)) =
-            cached_asset_preview_handles(asset, &metadata, meshes, images, materials)
+        let Some(handles) =
+            cached_asset_handles(asset, &metadata, meshes, images, materials, gaussian_clouds)
         else {
             continue;
         };
-        handles_by_key.insert(
-            metadata.cache_key.clone(),
-            (mesh_handle.clone(), material.clone()),
-        );
+        handles_by_key.insert(metadata.cache_key.clone(), handles.clone());
 
         let entry_id = queue.counter;
         queue.counter = queue.counter.wrapping_add(1);
-        catalog.add_ready(
-            entry_id,
-            metadata.label.clone(),
-            mesh_handle,
-            material,
-            Some(metadata.source_image_path.clone()),
-            Some(metadata.cache_key.clone()),
-        );
+        match handles {
+            CachedAssetHandles::Mesh { mesh, material } => {
+                catalog.add_ready(
+                    entry_id,
+                    metadata.label.clone(),
+                    mesh,
+                    material,
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+            CachedAssetHandles::GaussianSplat { cloud } => {
+                catalog.add_ready_gaussian_splat(
+                    entry_id,
+                    metadata.label.clone(),
+                    cloud,
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+        }
         loaded_assets += 1;
     }
 
     for item in world_items {
-        let Some((mesh, material)) = handles_by_key.get(&item.cache_key) else {
+        let Some(handles) = handles_by_key.get(&item.cache_key) else {
             warn!(
                 "skipping cached world item for unknown cache key {}",
                 item.cache_key
@@ -1579,13 +1665,7 @@ fn hydrate_from_cache(
             );
             continue;
         };
-        spawn_mesh_instance(
-            commands,
-            mesh.clone(),
-            material.clone(),
-            transform,
-            Some(item.cache_key.clone()),
-        );
+        spawn_cached_asset_instance(commands, handles, transform, Some(item.cache_key.clone()));
         loaded_world_items += 1;
     }
 
@@ -1599,13 +1679,14 @@ fn hydrate_from_cache(
     }
 }
 
-fn cached_asset_preview_handles(
+fn cached_asset_handles(
     asset: SynthAsset,
     metadata: &CachedMeshMetadata,
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
-) -> Option<(Handle<BevyMesh>, Handle<StandardMaterial>)> {
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+) -> Option<CachedAssetHandles> {
     match asset {
         SynthAsset::Mesh(mesh) => {
             let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
@@ -1614,42 +1695,21 @@ fn cached_asset_preview_handles(
             } else {
                 materials.add(standard_material_for_inference(&mesh, images.as_mut()))
             };
-            Some((mesh_handle, material))
+            Some(CachedAssetHandles::Mesh {
+                mesh: mesh_handle,
+                material,
+            })
         }
         SynthAsset::GaussianSplat(splats) => {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                match gaussian_splat_preview_mesh(&splats) {
-                    Ok((bevy_mesh, preview_count)) => {
-                        if preview_count < splats.len() {
-                            warn!(
-                                "Restored cached TripoSplat preview with {preview_count} of {} splats for key {}",
-                                splats.len(),
-                                metadata.cache_key
-                            );
-                        }
-                        let mesh_handle = meshes.add(bevy_mesh);
-                        let material =
-                            materials.add(standard_material_for_gaussian_splat_preview(&splats));
-                        Some((mesh_handle, material))
-                    }
-                    Err(err) => {
-                        warn!(
-                            "failed to build cached TripoSplat preview for key {}: {err}",
-                            metadata.cache_key
-                        );
-                        None
-                    }
+            match gaussian_splat_cloud_handle(&splats, gaussian_clouds) {
+                Ok(cloud) => Some(CachedAssetHandles::GaussianSplat { cloud }),
+                Err(err) => {
+                    warn!(
+                        "failed to build cached TripoSplat Gaussian cloud for key {}: {err}",
+                        metadata.cache_key
+                    );
+                    None
                 }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = splats;
-                warn!(
-                    "skipping cached TripoSplat asset for key {} because wasm splat rendering is not implemented",
-                    metadata.cache_key
-                );
-                None
             }
         }
     }
@@ -2258,6 +2318,7 @@ fn poll_mcp_scene_control(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
     mut cache: ResMut<MeshCacheResource>,
     mut selection: ResMut<EditorSelection>,
     transformables: Query<(), With<GizmoTransformable>>,
@@ -2353,19 +2414,19 @@ fn poll_mcp_scene_control(
                         splat_payload_id: None,
                         updated_at_unix_ms: 0,
                     });
-                let Some((mesh_handle, material)) = cached_asset_preview_handles(
+                let Some(handles) = cached_asset_handles(
                     asset,
                     &metadata,
                     &mut meshes,
                     &mut images,
                     &mut materials,
+                    &mut gaussian_clouds,
                 ) else {
                     continue;
                 };
-                let entity = spawn_mesh_instance(
+                let entity = spawn_cached_asset_instance(
                     &mut commands,
-                    mesh_handle,
-                    material,
+                    &handles,
                     transform,
                     Some(cache_key),
                 );
@@ -2547,6 +2608,7 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
                         &mut ctx.meshes,
                         &mut ctx.images,
                         &mut ctx.materials,
+                        &mut ctx.gaussian_clouds,
                         &mut ctx.cache,
                         &mut ctx.catalog,
                         request,
@@ -2571,6 +2633,12 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
     }
 
     if ctx.queue.active.is_none() && !ctx.queue.pending.is_empty() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if should_wait_before_inference_dispatch(&mut ctx.dispatch_gate, &ctx.queue) {
+            update_status_message(&ctx.args, &ctx.queue, &mut ctx.status);
+            return;
+        }
+
         if ctx.status.worker_message.is_some() {
             ctx.status.worker_message = None;
         }
@@ -2594,6 +2662,11 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if ctx.queue.active.is_none() && ctx.queue.pending.is_empty() {
+        reset_inference_dispatch_gate(&mut ctx.dispatch_gate);
+    }
+
     update_status_message(&ctx.args, &ctx.queue, &mut ctx.status);
 }
 
@@ -2603,13 +2676,21 @@ fn handle_catalog_spawn_requests(
     mut selection: Option<ResMut<EditorSelection>>,
 ) {
     for request in requests.read() {
-        let entity = spawn_mesh_instance(
-            &mut commands,
-            request.mesh.clone(),
-            request.material.clone(),
-            request.transform,
-            request.cache_key.clone(),
-        );
+        let entity = match &request.asset {
+            CatalogSpawnAsset::Mesh { mesh, material } => spawn_mesh_instance(
+                &mut commands,
+                mesh.clone(),
+                material.clone(),
+                request.transform,
+                request.cache_key.clone(),
+            ),
+            CatalogSpawnAsset::GaussianSplat { cloud } => spawn_gaussian_splat_instance(
+                &mut commands,
+                cloud.clone(),
+                request.transform,
+                request.cache_key.clone(),
+            ),
+        };
         if request.select_spawned
             && let Some(selection) = selection.as_mut()
         {
@@ -2833,6 +2914,7 @@ fn handle_inference_result(
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
     cache: &mut ResMut<MeshCacheResource>,
     catalog: &mut ResMut<CatalogState>,
     request: InferenceRequest,
@@ -2877,6 +2959,7 @@ fn handle_inference_result(
                 entry.status = CatalogStatus::Ready;
                 entry.mesh = Some(mesh_handle);
                 entry.material = Some(material);
+                entry.gaussian = None;
                 entry.source_image_path = Some(request.image_path.display().to_string());
                 entry.cache_key = cache_key;
                 if let Some(metadata) = cached_metadata {
@@ -2914,41 +2997,27 @@ fn handle_inference_result(
                     None
                 }
             };
-            #[cfg(target_arch = "wasm32")]
-            let _ = &cached_metadata;
-            #[cfg(not(target_arch = "wasm32"))]
             let cache_key = cached_metadata
                 .as_ref()
                 .map(|metadata| metadata.cache_key.clone());
 
-            #[cfg(not(target_arch = "wasm32"))]
-            match gaussian_splat_preview_mesh(&splats) {
-                Ok((bevy_mesh, preview_count)) => {
-                    if preview_count < count {
-                        warn!(
-                            "Previewing {preview_count} of {count} Gaussian splats for {}; full asset was still exported when an output path was provided",
-                            request.image_path.display()
-                        );
-                    } else {
-                        info!(
-                            "Previewing {count} Gaussian splats for {} with native Bevy mesh proxy",
-                            request.image_path.display()
-                        );
-                    }
-                    let mesh_handle = meshes.add(bevy_mesh);
-                    let material =
-                        materials.add(standard_material_for_gaussian_splat_preview(&splats));
-                    spawn_mesh_instance(
+            match gaussian_splat_cloud_handle(&splats, gaussian_clouds) {
+                Ok(cloud_handle) => {
+                    info!(
+                        "Showing Bevy Gaussian cloud with {count} TripoSplat splats from {}",
+                        request.image_path.display()
+                    );
+                    spawn_gaussian_splat_instance(
                         commands,
-                        mesh_handle.clone(),
-                        material.clone(),
+                        cloud_handle.clone(),
                         Transform::default(),
                         cache_key.clone(),
                     );
                     if let Some(entry) = catalog.entry_mut(request.id) {
                         entry.status = CatalogStatus::Ready;
-                        entry.mesh = Some(mesh_handle);
-                        entry.material = Some(material);
+                        entry.mesh = None;
+                        entry.material = None;
+                        entry.gaussian = Some(cloud_handle);
                         entry.source_image_path = Some(request.image_path.display().to_string());
                         entry.cache_key = cache_key;
                         if let Some(metadata) = cached_metadata {
@@ -2960,28 +3029,14 @@ fn handle_inference_result(
                 }
                 Err(err) => {
                     warn!(
-                        "Failed to build Gaussian splat preview for {}: {err}",
+                        "Failed to build Gaussian splat cloud for {}: {err}",
                         request.image_path.display()
                     );
                     if let Some(entry) = catalog.entry_mut(request.id) {
                         entry.status =
-                            CatalogStatus::Failed(format!("Gaussian splat preview failed: {err}"));
+                            CatalogStatus::Failed(format!("Gaussian splat cloud failed: {err}"));
                         catalog.bump_revision();
                     }
-                }
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                let message =
-                    format!("Gaussian splat rendering not implemented on wasm ({count} splats)");
-                warn!(
-                    "TripoSplat produced {count} Gaussian splats for {}, but Bevy wasm splat rendering is not implemented yet",
-                    request.image_path.display()
-                );
-                if let Some(entry) = catalog.entry_mut(request.id) {
-                    entry.status = CatalogStatus::Failed(message);
-                    catalog.bump_revision();
                 }
             }
         }
@@ -3080,124 +3135,46 @@ fn standard_material_for_inference(
     out
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn standard_material_for_gaussian_splat_preview(splats: &GaussianSplatCloud) -> StandardMaterial {
-    let (rgb_sum, alpha_sum, count) =
-        splats
-            .splats
-            .iter()
-            .fold(([0.0f32; 3], 0.0f32, 0usize), |mut acc, splat| {
-                if splat.features_dc.iter().all(|v| v.is_finite()) && splat.opacity.is_finite() {
-                    let rgba = gaussian_splat_preview_rgba(splat);
-                    acc.0[0] += rgba[0];
-                    acc.0[1] += rgba[1];
-                    acc.0[2] += rgba[2];
-                    acc.1 += rgba[3];
-                    acc.2 += 1;
-                }
-                acc
-            });
-    let denom = count.max(1) as f32;
-    let alpha = (alpha_sum / denom).clamp(0.2, 1.0);
-    StandardMaterial {
-        base_color: Color::srgba(
-            (rgb_sum[0] / denom).clamp(0.0, 1.0),
-            (rgb_sum[1] / denom).clamp(0.0, 1.0),
-            (rgb_sum[2] / denom).clamp(0.0, 1.0),
-            alpha,
-        ),
-        alpha_mode: if alpha < 0.995 {
-            AlphaMode::Blend
-        } else {
-            AlphaMode::Opaque
-        },
-        cull_mode: None,
-        ..default()
-    }
+fn gaussian_splat_cloud_handle(
+    splats: &GaussianSplatCloud,
+    gaussian_clouds: &mut Assets<PlanarGaussian3d>,
+) -> Result<Handle<PlanarGaussian3d>, String> {
+    Ok(gaussian_clouds.add(gaussian_splat_cloud_to_planar_gaussian_3d(splats)?))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn gaussian_splat_preview_mesh(splats: &GaussianSplatCloud) -> Result<(BevyMesh, usize), String> {
-    if splats.is_empty() {
-        return Err("cannot preview an empty Gaussian splat cloud".to_string());
-    }
-    let preview_count = splats.len().min(SPLAT_PREVIEW_MAX_SPLATS);
-    let mut positions = Vec::with_capacity(preview_count * 6);
-    let mut normals = Vec::with_capacity(preview_count * 6);
-    let mut uvs = Vec::with_capacity(preview_count * 6);
-    let mut colors = Vec::with_capacity(preview_count * 6);
-    let mut indices = Vec::with_capacity(preview_count * 24);
-    let directions = [
-        [1.0f32, 0.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, -1.0],
-    ];
-    let faces = [
-        [0u32, 2, 4],
-        [2, 1, 4],
-        [1, 3, 4],
-        [3, 0, 4],
-        [2, 0, 5],
-        [1, 2, 5],
-        [3, 1, 5],
-        [0, 3, 5],
-    ];
-
-    for (splat_index, splat) in splats.splats.iter().take(preview_count).enumerate() {
-        if !splat.position.iter().all(|v| v.is_finite())
-            || !splat.scale.iter().all(|v| v.is_finite() && *v > 0.0)
-            || !splat.features_dc.iter().all(|v| v.is_finite())
-            || !splat.opacity.is_finite()
-        {
-            return Err(format!(
-                "Gaussian splat {splat_index} contains non-finite or invalid values"
-            ));
-        }
-
-        let center = [splat.position[0], -splat.position[2], splat.position[1]];
-        let radius = ((splat.scale[0] + splat.scale[1] + splat.scale[2]) / 3.0)
-            .clamp(SPLAT_PREVIEW_MIN_RADIUS, SPLAT_PREVIEW_MAX_RADIUS);
-        let color = gaussian_splat_preview_rgba(splat);
-        for direction in directions {
-            positions.push([
-                center[0] + direction[0] * radius,
-                center[1] + direction[1] * radius,
-                center[2] + direction[2] * radius,
-            ]);
-            normals.push(direction);
-            uvs.push([0.0f32, 0.0]);
-            colors.push(color);
-        }
-
-        let base = (splat_index * 6) as u32;
-        for face in faces {
-            indices.extend_from_slice(&[base + face[0], base + face[1], base + face[2]]);
-        }
-    }
-
-    let mut bevy_mesh = BevyMesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_POSITION, positions);
-    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_NORMAL, normals);
-    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_UV_0, uvs);
-    bevy_mesh.insert_attribute(BevyMesh::ATTRIBUTE_COLOR, colors);
-    bevy_mesh.insert_indices(Indices::U32(indices));
-    Ok((bevy_mesh, preview_count))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn gaussian_splat_preview_rgba(splat: &bevy_synth_runtime::GaussianSplat) -> [f32; 4] {
-    [
-        (splat.features_dc[0] * SPLAT_PREVIEW_SH_C0 + 0.5).clamp(0.0, 1.0),
-        (splat.features_dc[1] * SPLAT_PREVIEW_SH_C0 + 0.5).clamp(0.0, 1.0),
-        (splat.features_dc[2] * SPLAT_PREVIEW_SH_C0 + 0.5).clamp(0.0, 1.0),
-        splat.opacity.clamp(0.0, 1.0),
-    ]
+pub(crate) fn gaussian_splat_cloud_to_planar_gaussian_3d(
+    splats: &GaussianSplatCloud,
+) -> Result<PlanarGaussian3d, String> {
+    let transformed = splats.transformed_splats_for_bevy_display()?;
+    let gaussians = transformed
+        .iter()
+        .enumerate()
+        .map(|(index, splat)| {
+            if !splat.opacity.is_finite() {
+                return Err(format!(
+                    "Gaussian splat {index} contains non-finite opacity"
+                ));
+            }
+            let mut spherical_harmonic = SphericalHarmonicCoefficients::default();
+            for channel in 0..3 {
+                spherical_harmonic.set(channel, splat.features_dc[channel]);
+            }
+            Ok(Gaussian3d {
+                position_visibility: [splat.position[0], splat.position[1], splat.position[2], 1.0]
+                    .into(),
+                spherical_harmonic,
+                rotation: splat.rotation.into(),
+                scale_opacity: [
+                    splat.scale[0],
+                    splat.scale[1],
+                    splat.scale[2],
+                    splat.opacity.clamp(0.0, 1.0),
+                ]
+                .into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(PlanarGaussian3d::from(gaussians))
 }
 
 fn synth_texture_to_image(texture: &SynthMeshTexture, format: TextureFormat) -> Image {
@@ -3322,6 +3299,59 @@ pub(crate) fn spawn_mesh_instance(
         entity_commands.insert(CachedMeshInstance { cache_key });
     }
     entity_commands.id()
+}
+
+fn spawn_cached_asset_instance(
+    commands: &mut Commands,
+    handles: &CachedAssetHandles,
+    transform: Transform,
+    cache_key: Option<String>,
+) -> Entity {
+    match handles {
+        CachedAssetHandles::Mesh { mesh, material } => spawn_mesh_instance(
+            commands,
+            mesh.clone(),
+            material.clone(),
+            transform,
+            cache_key,
+        ),
+        CachedAssetHandles::GaussianSplat { cloud } => {
+            spawn_gaussian_splat_instance(commands, cloud.clone(), transform, cache_key)
+        }
+    }
+}
+
+pub(crate) fn spawn_gaussian_splat_instance(
+    commands: &mut Commands,
+    cloud_handle: Handle<PlanarGaussian3d>,
+    transform: Transform,
+    cache_key: Option<String>,
+) -> Entity {
+    let mut entity_commands = commands.spawn((
+        GizmoTransformable,
+        Selectable,
+        Pickable {
+            should_block_lower: false,
+            is_hoverable: true,
+        },
+        PlanarGaussian3dHandle(cloud_handle),
+        triposplat_cloud_settings(),
+        transform,
+        RenderLayers::layer(0),
+        Name::new("triposplat_gaussian_cloud"),
+    ));
+    if let Some(cache_key) = cache_key {
+        entity_commands.insert(CachedMeshInstance { cache_key });
+    }
+    entity_commands.id()
+}
+
+pub(crate) fn triposplat_cloud_settings() -> CloudSettings {
+    CloudSettings {
+        sort_mode: SortMode::Std,
+        color_space: GaussianColorSpace::LinRec709Display,
+        ..default()
+    }
 }
 
 #[allow(clippy::type_complexity)]

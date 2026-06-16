@@ -71,26 +71,34 @@ echo "[web-e2e] wasm-bindgen burn_synth"
   --target web \
   --no-typescript
 
-echo "[web-e2e] build bevy_synth wasm (triposg wasm runtime)"
-MODEL_BASE_URL=assets/models \
-cargo build \
-  -p bevy_synth \
-  --target wasm32-unknown-unknown \
-  --profile wasm-release \
-  --no-default-features \
-  --features triposg,wgpu
+if [[ "${BURN_SYNTH_WEB_SKIP_BEVY_BUILD:-0}" != "1" ]]; then
+  echo "[web-e2e] build bevy_synth wasm (triposg wasm runtime)"
+  MODEL_BASE_URL=assets/models \
+  cargo build \
+    -p bevy_synth \
+    --target wasm32-unknown-unknown \
+    --profile wasm-release \
+    --no-default-features \
+    --features triposg,wgpu
 
-echo "[web-e2e] wasm-bindgen bevy_synth"
-"${WASM_BINDGEN_BIN}" \
-  "${ROOT_DIR}/target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm" \
-  --out-dir "${OUT_DIR}" \
-  --target web \
-  --no-typescript
+  echo "[web-e2e] wasm-bindgen bevy_synth"
+  "${WASM_BINDGEN_BIN}" \
+    "${ROOT_DIR}/target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm" \
+    --out-dir "${OUT_DIR}" \
+    --target web \
+    --no-typescript
+else
+  echo "[web-e2e] skip bevy_synth wasm build"
+fi
 
 cd "${TEST_DIR}"
 echo "[web-e2e] playwright deps"
 npm install --no-audit --no-fund
-npx playwright install chromium
+if [[ "${BURN_SYNTH_WEB_SKIP_PLAYWRIGHT_INSTALL:-0}" != "1" ]]; then
+  npx playwright install chromium
+else
+  echo "[web-e2e] skip playwright browser install"
+fi
 
 if [[ "${BURN_SYNTH_WEB_SKIP_ARTIFACT_ENSURE:-0}" != "1" ]]; then
   if [[ "${BURN_SYNTH_WEB_TRIPOSPLAT_SMOKE:-0}" == "1" ]]; then

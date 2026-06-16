@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="When saving stage arrays, also export Flux2 VAE encoder intermediate tensors.",
     )
+    parser.add_argument(
+        "--save-decoder-trace",
+        action="store_true",
+        help="When decoding, also export decoder points/log-probs/features for Gaussian parity replay.",
+    )
     return parser.parse_args()
 
 
@@ -349,6 +354,31 @@ def sample_latent_with_noise(
     return sample, initial_noise, traces
 
 
+def decode_latent_with_trace(
+    pipe: Any, latent: Any, num_gaussians: int
+) -> tuple[Any, dict[str, Any]]:
+    from model import OctreeProbabilityFixedlenDecoder
+    from triposplat import _build_gaussians
+
+    num_decoder_tokens = max(1, num_gaussians // pipe.decoder.gaussians_per_point)
+    points_pred = OctreeProbabilityFixedlenDecoder.sample(
+        pipe.decoder.octree,
+        latent,
+        num_points=num_decoder_tokens,
+        level=pipe.decoder._MAX_VOXEL_LEVEL,
+        temperature=1.0,
+        algo="systematic",
+    )
+    pred = pipe.decoder.gs(x=points_pred, cond=latent)
+    gaussian = _build_gaussians(pipe.decoder.gs, points_pred, pred)[0]
+    return gaussian, {
+        "latent": latent,
+        "decoder_points": points_pred["points"],
+        "decoder_log_probs": points_pred["log_probs"],
+        "decoder_features": pred["features"],
+    }
+
+
 def main() -> int:
     args = parse_args()
     args.upstream_code = args.upstream_code.resolve()
@@ -578,7 +608,28 @@ def main() -> int:
 
     for count in counts:
         t0 = time.perf_counter()
-        gaussian = pipe.decode_latent(latent_out["latent"], num_gaussians=count)
+        if args.save_decoder_trace:
+            torch.manual_seed(args.seed)
+            gaussian, decoder_trace = decode_latent_with_trace(
+                pipe, latent_out["latent"], num_gaussians=count
+            )
+            decoder_trace_path = args.output_dir / f"decoder_trace_{count}_f32.safetensors"
+            safetensors.torch.save_file(
+                {
+                    name: value.detach().float().cpu().contiguous()
+                    for name, value in decoder_trace.items()
+                },
+                str(decoder_trace_path),
+                metadata={
+                    "format": "triposplat_decoder_trace_v1",
+                    "dtype": "f32",
+                    "seed": str(args.seed),
+                    "num_gaussians": str(count),
+                },
+            )
+        else:
+            decoder_trace_path = None
+            gaussian = pipe.decode_latent(latent_out["latent"], num_gaussians=count)
         ply_path = args.output_dir / f"reference_{count}.ply"
         splat_path = args.output_dir / f"reference_{count}.splat"
         gaussian.save_ply(str(ply_path))
@@ -592,6 +643,12 @@ def main() -> int:
                 "splat_path": str(splat_path),
                 "splat_sha256": sha256_file(splat_path),
                 "splat_bytes": splat_path.stat().st_size,
+                "decoder_trace_path": str(decoder_trace_path)
+                if decoder_trace_path is not None
+                else None,
+                "decoder_trace_sha256": sha256_file(decoder_trace_path)
+                if decoder_trace_path is not None
+                else None,
             }
         )
 

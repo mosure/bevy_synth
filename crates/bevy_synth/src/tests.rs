@@ -6,13 +6,19 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
+use bevy_gaussian_splatting::gaussian::settings::GaussianColorSpace;
+use bevy_gaussian_splatting::sort::SortMode;
+use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dHandle};
 use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState, CatalogStatus};
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::should_pause_render_during_inference;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use crate::app::should_share_wgpu_inference_device_for_platform;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::{
+    InferenceDispatchGate, should_pause_render_during_inference,
+    should_wait_before_inference_dispatch,
+};
 use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, QualityPreset, RmbgBackend, RmbgModel,
@@ -22,7 +28,7 @@ use bevy_synth_runtime::cache::MeshCache;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
-use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, TripoMesh};
+use bevy_synth_runtime::{GaussianSplat, GaussianSplatCloud, SynthAsset, SynthMesh, TripoMesh};
 use bevy_synth_ui::bevy_transform_gizmos::GizmoTransformable;
 
 static TEST_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +112,8 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(queue);
     app.insert_resource(worker);
     app.insert_resource(status);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.insert_resource(InferenceDispatchGate::ready_for_dispatch());
     app.insert_resource(CatalogState::default());
     app.insert_resource(ExitState::default());
     let cache = MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache");
@@ -113,6 +121,7 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(Assets::<Image>::default());
     app.insert_resource(Assets::<BevyMesh>::default());
     app.insert_resource(Assets::<StandardMaterial>::default());
+    app.insert_resource(Assets::<PlanarGaussian3d>::default());
     app.add_systems(Update, drive_inference);
     app
 }
@@ -230,7 +239,7 @@ fn inference_result_spawns_mesh_entity() {
 }
 
 #[test]
-fn inference_result_with_splats_writes_output_and_spawns_preview_mesh() {
+fn inference_result_with_splats_writes_output_and_spawns_gaussian_cloud() {
     let (cmd_tx, _cmd_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let worker = InferenceWorker {
@@ -278,26 +287,32 @@ fn inference_result_with_splats_writes_output_and_spawns_preview_mesh() {
     let world = app.world_mut();
     let count = world.query::<&GizmoTransformable>().iter(world).count();
     assert_eq!(count, 1);
+    let cloud_entities = world.query::<&PlanarGaussian3dHandle>().iter(world).count();
+    assert_eq!(cloud_entities, 1);
+    let mut settings = world.query::<&CloudSettings>();
+    let settings = settings.single(world).expect("one Gaussian cloud settings");
+    assert_eq!(settings.sort_mode, SortMode::Std);
+    assert_eq!(settings.color_space, GaussianColorSpace::LinRec709Display);
+    let mesh_entities = world.query::<&Mesh3d>().iter(world).count();
+    assert_eq!(mesh_entities, 0, "TripoSplat should not spawn a mesh proxy");
 
-    let (mesh_handle, material_handle) = {
+    {
         let catalog = world.resource::<CatalogState>();
         let entry = catalog.entry(request_id).expect("catalog entry");
         assert!(matches!(entry.status, CatalogStatus::Ready));
         assert!(
             entry.cache_key.is_some(),
-            "splat preview should be cache-backed"
+            "splat renderer entity should be cache-backed"
         );
-        (
-            entry.mesh.clone().expect("catalog mesh handle"),
-            entry.material.clone().expect("catalog material handle"),
-        )
-    };
-    let meshes = world.resource::<Assets<BevyMesh>>();
-    let mesh = meshes.get(&mesh_handle).expect("preview mesh");
-    assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_POSITION));
-    assert!(mesh.contains_attribute(BevyMesh::ATTRIBUTE_COLOR));
-    let materials = world.resource::<Assets<StandardMaterial>>();
-    assert!(materials.get(&material_handle).is_some());
+        assert!(entry.mesh.is_none());
+        assert!(entry.material.is_none());
+        assert!(
+            entry.gaussian.is_some(),
+            "catalog entry should carry the splat cloud for preview and respawn"
+        );
+    }
+    let gaussian_clouds = world.resource::<Assets<PlanarGaussian3d>>();
+    assert_eq!(gaussian_clouds.iter().count(), 1);
     assert_eq!(
         std::fs::metadata(&output_path)
             .expect("splat output metadata")
@@ -307,11 +322,48 @@ fn inference_result_with_splats_writes_output_and_spawns_preview_mesh() {
 }
 
 #[test]
+fn gaussian_splat_cloud_conversion_preserves_full_cloud_count() {
+    let splat = GaussianSplat {
+        position: [0.0, 0.0, 0.0],
+        features_dc: [0.0, 0.0, 0.0],
+        opacity: 0.5,
+        scale: [0.01, 0.01, 0.01],
+        rotation: [1.0, 0.0, 0.0, 0.0],
+    };
+    let splats = GaussianSplatCloud::new(vec![splat; 8_193]);
+
+    let cloud = crate::app::gaussian_splat_cloud_to_planar_gaussian_3d(&splats)
+        .expect("build Gaussian cloud");
+
+    assert_eq!(cloud.position_visibility.len(), 8_193);
+}
+
+#[test]
+fn gaussian_splat_cloud_conversion_uses_bevy_display_orientation() {
+    let splats = GaussianSplatCloud::new(vec![GaussianSplat {
+        position: [1.0, 2.0, 3.0],
+        features_dc: [0.1, 0.2, 0.3],
+        opacity: 0.5,
+        scale: [0.01, 0.02, 0.03],
+        rotation: [1.0, 0.0, 0.0, 0.0],
+    }]);
+
+    let cloud =
+        crate::app::gaussian_splat_cloud_to_planar_gaussian_3d(&splats).expect("build cloud");
+
+    assert_eq!(cloud.position_visibility[0].position, [2.0, 3.0, 1.0]);
+    assert_eq!(cloud.position_visibility[0].visibility, 1.0);
+    assert_eq!(cloud.scale_opacity[0].scale, [0.01, 0.02, 0.03]);
+    assert_eq!(cloud.scale_opacity[0].opacity, 0.5);
+}
+
+#[test]
 fn ui_plugin_update_has_no_query_conflicts() {
     let mut app = App::new();
     app.insert_resource(InferenceQueue::default());
     app.insert_resource(Assets::<Image>::default());
     app.insert_resource(Assets::<BevyMesh>::default());
+    app.insert_resource(Assets::<PlanarGaussian3d>::default());
     app.insert_resource(ButtonInput::<MouseButton>::default());
     app.insert_resource(ButtonInput::<KeyCode>::default());
     app.insert_resource(Time::<()>::default());
@@ -344,11 +396,36 @@ fn render_pause_toggle_follows_queue_state() {
 
     assert!(!should_pause_render_during_inference(&args, &queue, false));
     enqueue_inference(PathBuf::from("chair.png"), &args, &mut queue);
+    assert!(!should_pause_render_during_inference(&args, &queue, false));
+    queue.active = Some(vec![queue.pending.pop_front().expect("pending request")]);
     assert!(should_pause_render_during_inference(&args, &queue, false));
     assert!(!should_pause_render_during_inference(&args, &queue, true));
 
     args.pause_render_during_inference = false;
     assert!(!should_pause_render_during_inference(&args, &queue, false));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn inference_dispatch_gate_waits_for_visible_startup_frames() {
+    let args = test_args();
+    let mut queue = InferenceQueue::default();
+    enqueue_inference(PathBuf::from("chair.png"), &args, &mut queue);
+    let mut gate = InferenceDispatchGate::default();
+
+    assert!(should_wait_before_inference_dispatch(&mut gate, &queue));
+    assert!(should_wait_before_inference_dispatch(&mut gate, &queue));
+    assert!(should_wait_before_inference_dispatch(&mut gate, &queue));
+    assert!(!should_wait_before_inference_dispatch(&mut gate, &queue));
+
+    queue.active = Some(vec![queue.pending.pop_front().expect("pending request")]);
+    assert!(!should_wait_before_inference_dispatch(&mut gate, &queue));
+    queue.active = None;
+    queue.pending.clear();
+    assert!(!should_wait_before_inference_dispatch(&mut gate, &queue));
+
+    enqueue_inference(PathBuf::from("next.png"), &args, &mut queue);
+    assert!(should_wait_before_inference_dispatch(&mut gate, &queue));
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]

@@ -32,6 +32,7 @@ fn bench_tiny_flow_forward(c: &mut Criterion) {
         feature2: config.cond2_channels.map(|channels| {
             Tensor::random([1, 5, channels], Distribution::Normal(0.0, 1.0), &device)
         }),
+        rng_normals_consumed: 0,
     };
     let timestep = Tensor::<BenchBackend, 1>::from_floats([0.5], &device);
 
@@ -67,6 +68,7 @@ fn bench_tiny_profile_flow_sample(c: &mut Criterion) {
         feature2: config.cond2_channels.map(|channels| {
             Tensor::random([1, 5, channels], Distribution::Normal(0.0, 1.0), &device)
         }),
+        rng_normals_consumed: 0,
     };
 
     for profile in [

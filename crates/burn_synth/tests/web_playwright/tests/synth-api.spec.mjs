@@ -509,11 +509,13 @@ test('burn_synth wasm TripoSplat inference produces valid splat output', async (
   );
 
   const expectedSplats = 32768;
+  const weightsPrecision = process.env.BURN_SYNTH_WEB_TRIPOSPLAT_PRECISION || 'auto';
   const inferenceTimeoutMs = Number.parseInt(
     process.env.BURN_SYNTH_WEB_TRIPOSPLAT_TIMEOUT_MS || '240000',
     10,
   );
   const pageErrors = [];
+  const consoleMessages = [];
   const consoleErrors = [];
   const modelRequests = [];
   const failedModelResponses = [];
@@ -530,6 +532,7 @@ test('burn_synth wasm TripoSplat inference produces valid splat output', async (
   page.on('pageerror', (error) => pageErrors.push(String(error)));
   page.on('crash', () => pageErrors.push('page crashed'));
   page.on('console', (msg) => {
+    consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
     if (msg.type() === 'error') {
       consoleErrors.push(msg.text());
     }
@@ -572,8 +575,43 @@ test('burn_synth wasm TripoSplat inference produces valid splat output', async (
   });
   expect(webgpu.hasGpu).toBe(true);
   expect(webgpu.adapter).toBe(true);
+  if (!webgpu.shaderF16) {
+    const tmpDir = process.env.BURN_SYNTH_WEB_TMP_DIR;
+    if (tmpDir) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, 'wasm_triposplat_result.json'),
+        JSON.stringify(
+          {
+            inference: {
+              ok: false,
+              skipped: true,
+              reason:
+                'TripoSplat wasm requires WebGPU shader-f16; f32 browser decode exceeds WebGPU memory limits.',
+            },
+            weightsPrecision,
+            webgpu,
+            modelRequests,
+            failedModelResponses,
+            pageErrors,
+          },
+          null,
+          2,
+        ),
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'wasm_triposplat_console.log'),
+        `${consoleMessages.join('\n')}\n`,
+      );
+    }
+    test.skip(
+      true,
+      'TripoSplat wasm requires WebGPU shader-f16; this adapter only exposes f32.',
+    );
+  }
 
-  const inference = await page.evaluate(async ({ expectedSplats, inferenceTimeoutMs }) => {
+  const inferenceStartedAt = Date.now();
+  const inferencePromise = page.evaluate(async ({ expectedSplats, inferenceTimeoutMs, weightsPrecision }) => {
     const started = performance.now();
     try {
       const imageResp = await fetch('/docs/output_chair_bg_removed.png');
@@ -586,7 +624,7 @@ test('burn_synth wasm TripoSplat inference produces valid splat output', async (
       options.set_rmbg_model('none');
       options.set_backend('wgpu');
       options.set_dino_backend('auto');
-      options.set_weights_precision('f32');
+      options.set_weights_precision(weightsPrecision);
       options.set_num_steps(5);
       options.set_guidance_scale(3.0);
       options.set_triposplat_num_gaussians(expectedSplats);
@@ -628,7 +666,51 @@ test('burn_synth wasm TripoSplat inference produces valid splat output', async (
         elapsedMs: performance.now() - started,
       };
     }
-  }, { expectedSplats, inferenceTimeoutMs });
+  }, { expectedSplats, inferenceTimeoutMs, weightsPrecision });
+  const nodeWatchdogMs =
+    (Number.isFinite(inferenceTimeoutMs) && inferenceTimeoutMs > 0 ? inferenceTimeoutMs : 240000) +
+    60000;
+  const inference = await Promise.race([
+    inferencePromise,
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            ok: false,
+            timeout: true,
+            nodeWatchdog: true,
+            elapsedMs: Date.now() - inferenceStartedAt,
+          }),
+        nodeWatchdogMs,
+      ),
+    ),
+  ]);
+
+  const tmpDir = process.env.BURN_SYNTH_WEB_TMP_DIR;
+  if (tmpDir) {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inferenceSummary = { ...inference };
+    delete inferenceSummary.splatData;
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_result.json'),
+      JSON.stringify(
+        {
+          inference: inferenceSummary,
+          weightsPrecision,
+          webgpu,
+          modelRequests,
+          failedModelResponses,
+          pageErrors,
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_console.log'),
+      `${consoleMessages.join('\n')}\n`,
+    );
+  }
 
   expect(inference.ok, `TripoSplat wasm inference failed: ${JSON.stringify(inference)}`).toBe(true);
   expect(inference.splatBytes).toBe(expectedSplats * 32);
@@ -644,13 +726,15 @@ test('burn_synth wasm TripoSplat inference produces valid splat output', async (
     expect(stats.boundsMax[axis]).toBeGreaterThan(stats.boundsMin[axis]);
   }
 
-  const tmpDir = process.env.BURN_SYNTH_WEB_TMP_DIR;
   if (tmpDir) {
-    fs.mkdirSync(tmpDir, { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'wasm_triposplat_output.splat'), Buffer.from(wasmSplatBytes));
     fs.writeFileSync(
       path.join(tmpDir, 'wasm_triposplat_stats.json'),
-      JSON.stringify({ stats, elapsedMs: inference.elapsedMs }, null, 2),
+      JSON.stringify({ stats, elapsedMs: inference.elapsedMs, weightsPrecision }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_console.log'),
+      `${consoleMessages.join('\n')}\n`,
     );
   }
 

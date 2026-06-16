@@ -6,6 +6,11 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::ui::widget::Button;
 use bevy::window::PrimaryWindow;
+use bevy_gaussian_splatting::gaussian::settings::GaussianColorSpace;
+use bevy_gaussian_splatting::sort::SortMode;
+use bevy_gaussian_splatting::{
+    CloudSettings, GaussianCamera, PlanarGaussian3d, PlanarGaussian3dHandle,
+};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
 use log::info;
@@ -39,6 +44,8 @@ const MENU_HEIGHT: f32 = 44.0;
 const THUMB_SIZE: f32 = 84.0;
 const ENTRY_GAP: f32 = 10.0;
 const CATALOG_PAGE_SIZE: usize = 6;
+const PIPELINE_SELECTOR_WIDTH: f32 = 176.0;
+const PIPELINE_SELECTOR_HEIGHT: f32 = 30.0;
 const PREVIEW_SIZE: u32 = 128;
 const PREVIEW_MAX_LAYER: usize = 30;
 const GIZMO_LAYER: usize = 12;
@@ -87,6 +94,8 @@ const TRIPOSPLAT_MAX_STEPS: usize = 50;
 const TRIPOSPLAT_MIN_GUIDANCE: f32 = 1.0;
 const TRIPOSPLAT_MAX_GUIDANCE: f32 = 10.0;
 const TRIPOSPLAT_GUIDANCE_STEP: f32 = 0.5;
+const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 2] =
+    [SynthesisModel::Triposg, SynthesisModel::Triposplat];
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -94,10 +103,20 @@ pub struct MainCamera;
 #[derive(Clone, Debug)]
 pub struct ImagePickDialog;
 
+#[derive(Clone, Debug)]
+pub enum CatalogSpawnAsset {
+    Mesh {
+        mesh: Handle<BevyMesh>,
+        material: Handle<StandardMaterial>,
+    },
+    GaussianSplat {
+        cloud: Handle<PlanarGaussian3d>,
+    },
+}
+
 #[derive(Message, Clone, Debug)]
 pub struct CatalogSpawnRequest {
-    pub mesh: Handle<BevyMesh>,
-    pub material: Handle<StandardMaterial>,
+    pub asset: CatalogSpawnAsset,
     pub transform: Transform,
     pub cache_key: Option<String>,
     pub select_spawned: bool,
@@ -116,6 +135,7 @@ impl Plugin for BurnSynthUiPlugin {
             .init_resource::<DragState>()
             .init_resource::<CatalogSelectionState>()
             .init_resource::<SettingsModalState>()
+            .init_resource::<PipelineDropdownState>()
             .add_message::<CatalogSpawnRequest>()
             .add_message::<CatalogDeleteRequest>()
             .add_systems(Startup, setup_ui)
@@ -127,7 +147,13 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_page_buttons,
                     handle_catalog_delete_button,
                     handle_catalog_delete_shortcut,
-                    handle_pipeline_button,
+                    (
+                        handle_pipeline_selector_button,
+                        handle_pipeline_option_button,
+                        sync_pipeline_dropdown,
+                        update_pipeline_value_label,
+                    )
+                        .chain(),
                     handle_settings_button,
                     handle_settings_close_button,
                     handle_triposplat_profile_button,
@@ -193,6 +219,7 @@ impl CatalogState {
             status: CatalogStatus::Pending,
             mesh: None,
             material: None,
+            gaussian: None,
             source_image_path: Some(request.image_path.display().to_string()),
             cache_key: None,
             preview: None,
@@ -216,6 +243,52 @@ impl CatalogState {
             status: CatalogStatus::Ready,
             mesh: Some(mesh),
             material: Some(material),
+            gaussian: None,
+            source_image_path,
+            cache_key,
+            preview: None,
+        });
+        self.clamp_page();
+        self.bump_revision();
+    }
+
+    pub fn add_ready_without_preview(
+        &mut self,
+        id: u32,
+        label: String,
+        source_image_path: Option<String>,
+        cache_key: Option<String>,
+    ) {
+        self.entries.push(CatalogEntry {
+            id,
+            label,
+            status: CatalogStatus::Ready,
+            mesh: None,
+            material: None,
+            gaussian: None,
+            source_image_path,
+            cache_key,
+            preview: None,
+        });
+        self.clamp_page();
+        self.bump_revision();
+    }
+
+    pub fn add_ready_gaussian_splat(
+        &mut self,
+        id: u32,
+        label: String,
+        gaussian: Handle<PlanarGaussian3d>,
+        source_image_path: Option<String>,
+        cache_key: Option<String>,
+    ) {
+        self.entries.push(CatalogEntry {
+            id,
+            label,
+            status: CatalogStatus::Ready,
+            mesh: None,
+            material: None,
+            gaussian: Some(gaussian),
             source_image_path,
             cache_key,
             preview: None,
@@ -305,6 +378,7 @@ pub struct CatalogEntry {
     pub status: CatalogStatus,
     pub mesh: Option<Handle<BevyMesh>>,
     pub material: Option<Handle<StandardMaterial>>,
+    pub gaussian: Option<Handle<PlanarGaussian3d>>,
     pub source_image_path: Option<String>,
     pub cache_key: Option<String>,
     pub preview: Option<PreviewScene>,
@@ -319,7 +393,7 @@ pub enum CatalogStatus {
 
 pub struct PreviewScene {
     pub image: Handle<Image>,
-    pub mesh_entity: Entity,
+    pub asset_entity: Entity,
     pub camera_entity: Entity,
     pub layer_index: usize,
 }
@@ -329,6 +403,17 @@ struct PreviewFit {
     mesh_translation: Vec3,
     mesh_scale: f32,
     radius: f32,
+}
+
+#[derive(Clone)]
+enum PreviewAsset {
+    Mesh {
+        mesh: Handle<BevyMesh>,
+        material: Handle<StandardMaterial>,
+    },
+    GaussianSplat {
+        cloud: Handle<PlanarGaussian3d>,
+    },
 }
 
 impl PreviewFit {
@@ -422,9 +507,21 @@ struct CatalogDeleteButton;
 struct OpenImageButton;
 
 #[derive(Component)]
-struct PipelineButton {
+struct PipelineDropdownHost;
+
+#[derive(Component)]
+struct PipelineSelectorButton;
+
+#[derive(Component)]
+struct PipelineOptionButton {
     model: SynthesisModel,
 }
+
+#[derive(Component)]
+struct PipelineDropdownRoot;
+
+#[derive(Component)]
+struct PipelineValueLabel;
 
 #[derive(Component)]
 struct SettingsButton;
@@ -495,12 +592,54 @@ struct SettingsModalState {
     entity: Option<Entity>,
 }
 
+#[derive(Resource, Default)]
+struct PipelineDropdownState {
+    open: bool,
+    entity: Option<Entity>,
+}
+
+#[derive(Resource, Clone, Debug, PartialEq, Eq)]
+struct AvailablePipelines {
+    models: Vec<SynthesisModel>,
+}
+
 fn pipeline_label(model: SynthesisModel) -> &'static str {
     match model {
         SynthesisModel::Triposg => "TripoSG",
         SynthesisModel::Trellis => "Trellis",
         SynthesisModel::Triposplat => "TripoSplat",
     }
+}
+
+fn pipeline_selector_value_text(model: SynthesisModel, option_count: usize) -> String {
+    if option_count <= 1 {
+        format!("{} only", pipeline_label(model))
+    } else {
+        pipeline_label(model).to_string()
+    }
+}
+
+fn available_pipeline_models(args: Option<&AppArgs>) -> Vec<SynthesisModel> {
+    let models: Box<dyn Iterator<Item = SynthesisModel> + '_> = match args {
+        Some(args) => Box::new(args.synthesis_models.iter().copied()),
+        None => Box::new(DEFAULT_PIPELINE_OPTIONS.into_iter()),
+    };
+    let mut out = Vec::new();
+    for model in models {
+        if !out.contains(&model) {
+            out.push(model);
+        }
+    }
+    if out.is_empty() {
+        out.push(SynthesisModel::Triposg);
+    }
+    out
+}
+
+fn pipeline_available(available: Option<&AvailablePipelines>, model: SynthesisModel) -> bool {
+    available
+        .map(|available| available.models.contains(&model))
+        .unwrap_or(true)
 }
 
 fn pipeline_supported(args: Option<&AppArgs>, model: SynthesisModel) -> bool {
@@ -515,7 +654,7 @@ fn pipeline_supported(args: Option<&AppArgs>, model: SynthesisModel) -> bool {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn triposplat_supported_for_backend(backend: BackendKind) -> bool {
-    matches!(backend, BackendKind::Cuda)
+    matches!(backend, BackendKind::Wgpu | BackendKind::Cuda)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -523,8 +662,18 @@ fn triposplat_supported_for_backend(backend: BackendKind) -> bool {
     matches!(backend, BackendKind::Wgpu)
 }
 
-fn setup_ui(mut commands: Commands) {
+fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
     let mut list_entity = Entity::PLACEHOLDER;
+    let pipeline_models = available_pipeline_models(args.as_deref());
+    let selected_pipeline = args
+        .as_deref()
+        .and_then(|args| args.synthesis_models.first().copied())
+        .or_else(|| pipeline_models.first().copied())
+        .unwrap_or(SynthesisModel::Triposg);
+    let multiple_pipelines = pipeline_models.len() > 1;
+    commands.insert_resource(AvailablePipelines {
+        models: pipeline_models.clone(),
+    });
 
     let root = commands
         .spawn((
@@ -591,33 +740,79 @@ fn setup_ui(mut commands: Commands) {
                         ));
                     });
 
-                    left.spawn(Node {
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(4.0),
-                        ..default()
-                    })
+                    left.spawn((
+                        PipelineDropdownHost,
+                        Node {
+                            position_type: PositionType::Relative,
+                            width: Val::Px(PIPELINE_SELECTOR_WIDTH),
+                            height: Val::Px(PIPELINE_SELECTOR_HEIGHT),
+                            overflow: Overflow::visible(),
+                            ..default()
+                        },
+                    ))
                     .with_children(|selector| {
-                        for model in [SynthesisModel::Triposg, SynthesisModel::Triposplat] {
+                        if multiple_pipelines {
                             selector
                                 .spawn((
                                     Button,
-                                    PipelineButton { model },
+                                    PipelineSelectorButton,
                                     ControlButton(ControlButtonKind::Secondary),
                                     Node {
-                                        padding: UiRect::axes(Val::Px(9.0), Val::Px(5.0)),
+                                        width: Val::Px(PIPELINE_SELECTOR_WIDTH),
+                                        height: Val::Px(PIPELINE_SELECTOR_HEIGHT),
+                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
                                         border: UiRect::all(Val::Px(1.0)),
+                                        column_gap: Val::Px(8.0),
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::SpaceBetween,
                                         ..default()
                                     },
-                                    BorderColor::all(BUTTON_BORDER),
-                                    BackgroundColor(BUTTON_BG),
+                                    BorderColor::all(BUTTON_ACTIVE_BORDER),
+                                    BackgroundColor(BUTTON_ACTIVE_BG),
                                 ))
                                 .with_children(|button| {
                                     button.spawn((
-                                        Text::new(pipeline_label(model)),
+                                        Text::new(pipeline_selector_value_text(
+                                            selected_pipeline,
+                                            pipeline_models.len(),
+                                        )),
+                                        TextFont::from_font_size(12.0),
+                                        TextColor(BUTTON_TEXT),
+                                        PipelineValueLabel,
+                                        ButtonLabel,
+                                    ));
+                                    button.spawn((
+                                        Text::new("v"),
                                         TextFont::from_font_size(12.0),
                                         TextColor(BUTTON_TEXT),
                                         ButtonLabel,
+                                    ));
+                                });
+                        } else {
+                            selector
+                                .spawn((
+                                    Node {
+                                        width: Val::Px(PIPELINE_SELECTOR_WIDTH),
+                                        height: Val::Px(PIPELINE_SELECTOR_HEIGHT),
+                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        column_gap: Val::Px(8.0),
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::FlexStart,
+                                        ..default()
+                                    },
+                                    BorderColor::all(BUTTON_ACTIVE_BORDER),
+                                    BackgroundColor(BUTTON_ACTIVE_BG),
+                                ))
+                                .with_children(|selector| {
+                                    selector.spawn((
+                                        Text::new(pipeline_selector_value_text(
+                                            selected_pipeline,
+                                            pipeline_models.len(),
+                                        )),
+                                        TextFont::from_font_size(12.0),
+                                        TextColor(BUTTON_TEXT),
+                                        PipelineValueLabel,
                                     ));
                                 });
                         }
@@ -1164,7 +1359,7 @@ fn delete_catalog_entry(
     };
 
     if let Some(preview) = entry.preview {
-        commands.entity(preview.mesh_entity).despawn();
+        commands.entity(preview.asset_entity).despawn();
         commands.entity(preview.camera_entity).despawn();
         catalog.release_preview_layer(preview.layer_index);
     }
@@ -1276,6 +1471,7 @@ fn update_button_visuals(
     catalog: Res<CatalogState>,
     drag: Res<DragState>,
     args: Option<Res<AppArgs>>,
+    available: Option<Res<AvailablePipelines>>,
     mut selection: ResMut<CatalogSelectionState>,
     mut controls: Query<
         (
@@ -1284,7 +1480,8 @@ fn update_button_visuals(
             Option<&CatalogPrevButton>,
             Option<&CatalogNextButton>,
             Option<&CatalogDeleteButton>,
-            Option<&PipelineButton>,
+            Option<&PipelineSelectorButton>,
+            Option<&PipelineOptionButton>,
             Option<&TripoSplatProfileButton>,
             &Children,
             &mut BackgroundColor,
@@ -1310,6 +1507,7 @@ fn update_button_visuals(
     }
 
     let args_ref = args.as_deref();
+    let available_ref = available.as_deref();
     let selected_pipeline = args_ref.and_then(|args| args.synthesis_models.first().copied());
 
     for (
@@ -1318,7 +1516,8 @@ fn update_button_visuals(
         prev,
         next,
         delete,
-        pipeline,
+        pipeline_selector,
+        pipeline_option,
         profile,
         children,
         mut bg,
@@ -1331,14 +1530,14 @@ fn update_button_visuals(
             catalog.page() + 1 >= catalog.page_count()
         } else if delete.is_some() {
             selection.selected.is_none()
-        } else if let Some(pipeline) = pipeline {
-            !pipeline_supported(args_ref, pipeline.model)
+        } else if let Some(pipeline_option) = pipeline_option {
+            !pipeline_available(available_ref, pipeline_option.model)
+                || !pipeline_supported(args_ref, pipeline_option.model)
         } else {
             false
         };
-        let active = pipeline
-            .map(|pipeline| Some(pipeline.model) == selected_pipeline)
-            .unwrap_or(false)
+        let active = pipeline_selector.is_some()
+            || pipeline_option.is_some_and(|pipeline| Some(pipeline.model) == selected_pipeline)
             || profile
                 .zip(args_ref)
                 .is_some_and(|(profile, args)| profile.profile == args.triposplat_profile);
@@ -1451,12 +1650,15 @@ fn handle_drag_release(
     let Some(entry) = catalog.entry(id) else {
         return;
     };
-    let (Some(mesh_handle), Some(material)) = (entry.mesh.clone(), entry.material.clone()) else {
+    let asset = if let (Some(mesh), Some(material)) = (entry.mesh.clone(), entry.material.clone()) {
+        CatalogSpawnAsset::Mesh { mesh, material }
+    } else if let Some(cloud) = entry.gaussian.clone() {
+        CatalogSpawnAsset::GaussianSplat { cloud }
+    } else {
         return;
     };
     spawn_requests.write(CatalogSpawnRequest {
-        mesh: mesh_handle,
-        material,
+        asset,
         transform: Transform::from_translation(position),
         cache_key: entry.cache_key.clone(),
         select_spawned: true,
@@ -1591,12 +1793,12 @@ fn sync_catalog_previews(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     meshes: Res<Assets<BevyMesh>>,
+    gaussian_clouds: Res<Assets<PlanarGaussian3d>>,
 ) {
     enum PreviewAction {
         Create {
             index: usize,
-            mesh: Handle<BevyMesh>,
-            material: Handle<StandardMaterial>,
+            asset: PreviewAsset,
             fit: PreviewFit,
         },
         Remove {
@@ -1614,8 +1816,7 @@ fn sync_catalog_previews(
     for (index, entry) in catalog.entries.iter().enumerate() {
         let should_show = visible_ids.contains(&entry.id)
             && matches!(entry.status, CatalogStatus::Ready)
-            && entry.mesh.is_some()
-            && entry.material.is_some();
+            && ((entry.mesh.is_some() && entry.material.is_some()) || entry.gaussian.is_some());
 
         match (should_show, entry.preview.is_some()) {
             (true, false) => {
@@ -1626,8 +1827,17 @@ fn sync_catalog_previews(
                         .unwrap_or_else(PreviewFit::fallback);
                     actions.push(PreviewAction::Create {
                         index,
-                        mesh,
-                        material,
+                        asset: PreviewAsset::Mesh { mesh, material },
+                        fit,
+                    });
+                } else if let Some(cloud) = entry.gaussian.clone() {
+                    let fit = gaussian_clouds
+                        .get(&cloud)
+                        .map(preview_fit_for_gaussian_cloud)
+                        .unwrap_or_else(PreviewFit::fallback);
+                    actions.push(PreviewAction::Create {
+                        index,
+                        asset: PreviewAsset::GaussianSplat { cloud },
                         fit,
                     });
                 }
@@ -1640,21 +1850,10 @@ fn sync_catalog_previews(
     let mut changed = false;
     for action in actions {
         match action {
-            PreviewAction::Create {
-                index,
-                mesh,
-                material,
-                fit,
-            } => {
+            PreviewAction::Create { index, asset, fit } => {
                 if let Some(layer_index) = catalog.alloc_preview_layer() {
-                    let preview = spawn_preview_scene(
-                        &mut commands,
-                        &mut images,
-                        mesh,
-                        material,
-                        layer_index,
-                        fit,
-                    );
+                    let preview =
+                        spawn_preview_scene(&mut commands, &mut images, asset, layer_index, fit);
                     if let Some(entry) = catalog.entries.get_mut(index) {
                         entry.preview = Some(preview);
                     }
@@ -1667,7 +1866,7 @@ fn sync_catalog_previews(
                     .get_mut(index)
                     .and_then(|entry| entry.preview.take());
                 if let Some(preview) = preview {
-                    commands.entity(preview.mesh_entity).despawn();
+                    commands.entity(preview.asset_entity).despawn();
                     commands.entity(preview.camera_entity).despawn();
                     catalog.release_preview_layer(preview.layer_index);
                     changed = true;
@@ -1708,15 +1907,42 @@ fn handle_open_button(
     }
 }
 
-fn handle_pipeline_button(
+fn handle_pipeline_selector_button(
+    available: Option<Res<AvailablePipelines>>,
+    mut dropdown: ResMut<PipelineDropdownState>,
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<PipelineSelectorButton>)>,
+) {
+    let option_count = available
+        .as_deref()
+        .map(|available| available.models.len())
+        .unwrap_or(DEFAULT_PIPELINE_OPTIONS.len());
+    for interaction in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        dropdown.open = option_count > 1 && !dropdown.open;
+    }
+}
+
+fn handle_pipeline_option_button(
     args: Option<ResMut<AppArgs>>,
-    mut interactions: Query<(&Interaction, &PipelineButton), Changed<Interaction>>,
+    available: Option<Res<AvailablePipelines>>,
+    mut dropdown: ResMut<PipelineDropdownState>,
+    mut interactions: Query<(&Interaction, &PipelineOptionButton), Changed<Interaction>>,
 ) {
     let Some(mut args) = args else {
         return;
     };
+    let available_ref = available.as_deref();
     for (interaction, button) in interactions.iter_mut() {
         if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if !pipeline_available(available_ref, button.model) {
+            info!(
+                "synthesis pipeline {} is not enabled for this app launch",
+                pipeline_label(button.model)
+            );
             continue;
         }
         if args
@@ -1724,16 +1950,19 @@ fn handle_pipeline_button(
             .first()
             .is_some_and(|current| *current == button.model)
         {
+            dropdown.open = false;
             continue;
         }
         if !pipeline_supported(Some(&args), button.model) {
             info!(
-                "synthesis pipeline {} requires app backend cuda",
-                pipeline_label(button.model)
+                "synthesis pipeline {} is unavailable for backend {:?}",
+                pipeline_label(button.model),
+                &args.backend
             );
             continue;
         }
         args.synthesis_models = vec![button.model];
+        dropdown.open = false;
         if matches!(button.model, SynthesisModel::Triposplat)
             && args.triposplat_profile != TripoSplatProfile::Custom
         {
@@ -1745,6 +1974,143 @@ fn handle_pipeline_button(
             pipeline_label(button.model)
         );
     }
+}
+
+fn sync_pipeline_dropdown(
+    mut commands: Commands,
+    args: Option<Res<AppArgs>>,
+    available: Option<Res<AvailablePipelines>>,
+    mut dropdown: ResMut<PipelineDropdownState>,
+    hosts: Query<Entity, With<PipelineDropdownHost>>,
+    children: Query<&Children>,
+) {
+    let Some(available) = available else {
+        dropdown.open = false;
+        if let Some(entity) = dropdown.entity.take() {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+    if available.models.len() <= 1 {
+        dropdown.open = false;
+    }
+
+    match (dropdown.open, dropdown.entity) {
+        (true, None) => {
+            let Ok(host) = hosts.single() else {
+                dropdown.open = false;
+                return;
+            };
+            dropdown.entity = Some(spawn_pipeline_dropdown(
+                &mut commands,
+                host,
+                args.as_deref(),
+                &available,
+            ));
+        }
+        (false, Some(entity)) => {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+            dropdown.entity = None;
+        }
+        _ => {}
+    }
+}
+
+fn update_pipeline_value_label(
+    args: Option<Res<AppArgs>>,
+    available: Option<Res<AvailablePipelines>>,
+    mut labels: Query<&mut Text, With<PipelineValueLabel>>,
+) {
+    let selected = args
+        .as_deref()
+        .and_then(|args| args.synthesis_models.first().copied())
+        .or_else(|| {
+            available
+                .as_deref()
+                .and_then(|available| available.models.first().copied())
+        })
+        .unwrap_or(SynthesisModel::Triposg);
+    let option_count = available
+        .as_deref()
+        .map(|available| available.models.len())
+        .unwrap_or(DEFAULT_PIPELINE_OPTIONS.len());
+    let next = pipeline_selector_value_text(selected, option_count);
+    for mut label in labels.iter_mut() {
+        if label.0 != next {
+            label.0 = next.clone();
+        }
+    }
+}
+
+fn spawn_pipeline_dropdown(
+    commands: &mut Commands,
+    host: Entity,
+    args: Option<&AppArgs>,
+    available: &AvailablePipelines,
+) -> Entity {
+    let selected_pipeline = args.and_then(|args| args.synthesis_models.first().copied());
+    let mut dropdown_entity = Entity::PLACEHOLDER;
+    commands.entity(host).with_children(|host| {
+        dropdown_entity = host
+            .spawn((
+                PipelineDropdownRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(PIPELINE_SELECTOR_HEIGHT + 4.0),
+                    left: Val::Px(0.0),
+                    width: Val::Px(PIPELINE_SELECTOR_WIDTH),
+                    padding: UiRect::all(Val::Px(4.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(3.0),
+                    ..default()
+                },
+                ZIndex(100),
+                GlobalZIndex(20_000),
+                BorderColor::all(PANEL_BORDER),
+                BackgroundColor(PANEL_BG),
+            ))
+            .with_children(|menu| {
+                for model in available.models.iter().copied() {
+                    menu.spawn((
+                        Button,
+                        PipelineOptionButton { model },
+                        ControlButton(ControlButtonKind::Secondary),
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(26.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::SpaceBetween,
+                            ..default()
+                        },
+                        BorderColor::all(if Some(model) == selected_pipeline {
+                            BUTTON_ACTIVE_BORDER
+                        } else {
+                            BUTTON_BORDER
+                        }),
+                        BackgroundColor(if Some(model) == selected_pipeline {
+                            BUTTON_ACTIVE_BG
+                        } else {
+                            BUTTON_BG
+                        }),
+                    ))
+                    .with_children(|button| {
+                        button.spawn((
+                            Text::new(pipeline_label(model)),
+                            TextFont::from_font_size(12.0),
+                            TextColor(BUTTON_TEXT),
+                            ButtonLabel,
+                        ));
+                    });
+                }
+            })
+            .id();
+    });
+    dropdown_entity
 }
 
 fn handle_settings_button(
@@ -2127,8 +2493,7 @@ fn triposplat_setting_value_text(args: &AppArgs, setting: TripoSplatSetting) -> 
 fn spawn_preview_scene(
     commands: &mut Commands,
     images: &mut Assets<Image>,
-    mesh_handle: Handle<BevyMesh>,
-    material: Handle<StandardMaterial>,
+    asset: PreviewAsset,
     layer_index: usize,
     fit: PreviewFit,
 ) -> PreviewScene {
@@ -2152,20 +2517,36 @@ fn spawn_preview_scene(
     let camera_distance =
         (fit.radius / half_fov.tan()).max(fit.radius + 0.35) + PREVIEW_CAMERA_MARGIN;
 
-    let mesh_entity = commands
-        .spawn((
-            Pickable::IGNORE,
-            Mesh3d(mesh_handle),
-            MeshMaterial3d(material),
-            Transform {
-                translation: fit.mesh_translation,
-                scale: Vec3::splat(fit.mesh_scale),
-                ..default()
-            },
-            layer.clone(),
-            ThumbnailSpin,
-        ))
-        .id();
+    let asset_entity = match asset {
+        PreviewAsset::Mesh { mesh, material } => commands
+            .spawn((
+                Pickable::IGNORE,
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                Transform {
+                    translation: fit.mesh_translation,
+                    scale: Vec3::splat(fit.mesh_scale),
+                    ..default()
+                },
+                layer.clone(),
+                ThumbnailSpin,
+            ))
+            .id(),
+        PreviewAsset::GaussianSplat { cloud } => commands
+            .spawn((
+                Pickable::IGNORE,
+                PlanarGaussian3dHandle(cloud),
+                triposplat_preview_cloud_settings(),
+                Transform {
+                    translation: fit.mesh_translation,
+                    scale: Vec3::splat(fit.mesh_scale),
+                    ..default()
+                },
+                layer.clone(),
+                ThumbnailSpin,
+            ))
+            .id(),
+    };
 
     let camera_entity = commands
         .spawn((
@@ -2186,15 +2567,24 @@ fn spawn_preview_scene(
             }),
             Transform::from_translation(Vec3::new(0.0, fit.radius * 0.35, camera_distance))
                 .looking_at(Vec3::ZERO, Vec3::Y),
+            GaussianCamera::default(),
             layer.clone(),
         ))
         .id();
 
     PreviewScene {
         image: image_handle,
-        mesh_entity,
+        asset_entity,
         camera_entity,
         layer_index,
+    }
+}
+
+fn triposplat_preview_cloud_settings() -> CloudSettings {
+    CloudSettings {
+        sort_mode: SortMode::Std,
+        color_space: GaussianColorSpace::LinRec709Display,
+        ..default()
     }
 }
 
@@ -2240,6 +2630,49 @@ fn preview_fit_for_mesh(mesh: &BevyMesh) -> PreviewFit {
     }
 }
 
+fn preview_fit_for_gaussian_cloud(cloud: &PlanarGaussian3d) -> PreviewFit {
+    if cloud.position_visibility.is_empty() {
+        return PreviewFit::fallback();
+    }
+
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for position_visibility in cloud.position_visibility.iter() {
+        let point = Vec3::new(
+            position_visibility.position[0],
+            position_visibility.position[1],
+            position_visibility.position[2],
+        );
+        if !point.is_finite() {
+            return PreviewFit::fallback();
+        }
+        min = min.min(point);
+        max = max.max(point);
+    }
+
+    if !min.is_finite() || !max.is_finite() {
+        return PreviewFit::fallback();
+    }
+
+    let center = (min + max) * 0.5;
+    let half_extents = (max - min) * 0.5;
+    let raw_radius = half_extents.length();
+    if !raw_radius.is_finite() || raw_radius <= 0.000_1 {
+        return PreviewFit::fallback();
+    }
+
+    let mesh_scale = PREVIEW_TARGET_RADIUS / raw_radius;
+    if !mesh_scale.is_finite() || mesh_scale <= 0.000_1 {
+        return PreviewFit::fallback();
+    }
+
+    PreviewFit {
+        mesh_translation: -center * mesh_scale,
+        mesh_scale,
+        radius: (raw_radius * mesh_scale).max(0.05),
+    }
+}
+
 pub fn preview_light_layers() -> RenderLayers {
     let mut layers = RenderLayers::layer(0);
     for layer in 1..=PREVIEW_MAX_LAYER {
@@ -2251,18 +2684,28 @@ pub fn preview_light_layers() -> RenderLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_gaussian_splatting::{Gaussian3d, SphericalHarmonicCoefficients};
     use bevy_synth_runtime::state::InferenceQueue;
 
-    #[test]
-    fn ui_root_is_pass_through_for_world_picking() {
+    fn ui_test_app(args: Option<AppArgs>) -> App {
         let mut app = App::new();
+        if let Some(args) = args {
+            app.insert_resource(args);
+        }
         app.insert_resource(InferenceQueue::default());
         app.insert_resource(Assets::<Image>::default());
         app.insert_resource(Assets::<BevyMesh>::default());
+        app.insert_resource(Assets::<PlanarGaussian3d>::default());
         app.insert_resource(ButtonInput::<MouseButton>::default());
         app.insert_resource(ButtonInput::<KeyCode>::default());
         app.insert_resource(Time::<()>::default());
         app.add_plugins(BurnSynthUiPlugin);
+        app
+    }
+
+    #[test]
+    fn ui_root_is_pass_through_for_world_picking() {
+        let mut app = ui_test_app(None);
 
         app.update();
 
@@ -2274,6 +2717,91 @@ mod tests {
             .collect();
         assert_eq!(pickables.len(), 1, "expected exactly one UI root node");
         assert_eq!(pickables[0], Pickable::IGNORE);
+    }
+
+    #[test]
+    fn pipeline_selector_collapses_to_single_launch_model() {
+        let mut args = AppArgs::default();
+        args.backend = BackendKind::Wgpu;
+        args.synthesis_models = vec![SynthesisModel::Triposplat];
+        let mut app = ui_test_app(Some(args));
+
+        app.update();
+
+        let world = app.world_mut();
+        let mut value_query = world.query_filtered::<&Text, With<PipelineValueLabel>>();
+        let values: Vec<_> = value_query
+            .iter(world)
+            .map(|label| label.0.clone())
+            .collect();
+        assert_eq!(values, vec!["TripoSplat only".to_string()]);
+        assert_eq!(
+            world.query::<&PipelineSelectorButton>().iter(world).count(),
+            0
+        );
+        assert_eq!(
+            world.query::<&PipelineOptionButton>().iter(world).count(),
+            0
+        );
+        assert_eq!(
+            world.resource::<AvailablePipelines>().models,
+            vec![SynthesisModel::Triposplat]
+        );
+    }
+
+    #[test]
+    fn pipeline_dropdown_spawns_enabled_model_options() {
+        let mut args = AppArgs::default();
+        args.backend = BackendKind::Wgpu;
+        args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        let mut app = ui_test_app(Some(args));
+
+        app.update();
+        {
+            let world = app.world_mut();
+            assert_eq!(
+                world.query::<&PipelineSelectorButton>().iter(world).count(),
+                1
+            );
+            assert_eq!(
+                world.query::<&PipelineOptionButton>().iter(world).count(),
+                0
+            );
+        }
+
+        app.world_mut().resource_mut::<PipelineDropdownState>().open = true;
+        app.update();
+
+        let world = app.world_mut();
+        let mut query = world.query::<&PipelineOptionButton>();
+        let models: Vec<_> = query.iter(world).map(|button| button.model).collect();
+        assert_eq!(
+            models,
+            vec![SynthesisModel::Triposg, SynthesisModel::Triposplat]
+        );
+    }
+
+    #[test]
+    fn unavailable_launch_models_are_not_selectable() {
+        let available = AvailablePipelines {
+            models: vec![SynthesisModel::Triposplat],
+        };
+        assert!(pipeline_available(
+            Some(&available),
+            SynthesisModel::Triposplat
+        ));
+        assert!(!pipeline_available(
+            Some(&available),
+            SynthesisModel::Triposg
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn triposplat_pipeline_is_supported_on_native_wgpu() {
+        let mut args = AppArgs::default();
+        args.backend = BackendKind::Wgpu;
+        assert!(pipeline_supported(Some(&args), SynthesisModel::Triposplat));
     }
 
     #[test]
@@ -2290,6 +2818,73 @@ mod tests {
             Some("builtin-cube-cache-key".to_string()),
         );
         assert!(catalog.has_ready_cube_entry());
+    }
+
+    #[test]
+    fn splat_catalog_entry_creates_gaussian_preview_scene() {
+        let mut app = App::new();
+        app.insert_resource(CatalogState::default());
+        app.insert_resource(Assets::<Image>::default());
+        app.insert_resource(Assets::<BevyMesh>::default());
+        app.insert_resource(Assets::<PlanarGaussian3d>::default());
+        app.add_systems(Update, sync_catalog_previews);
+
+        let cloud = PlanarGaussian3d::from(vec![
+            Gaussian3d {
+                position_visibility: [-0.25, 0.0, 0.0, 1.0].into(),
+                spherical_harmonic: SphericalHarmonicCoefficients::default(),
+                rotation: [1.0, 0.0, 0.0, 0.0].into(),
+                scale_opacity: [0.04, 0.04, 0.04, 0.8].into(),
+            },
+            Gaussian3d {
+                position_visibility: [0.25, 0.2, 0.0, 1.0].into(),
+                spherical_harmonic: SphericalHarmonicCoefficients::default(),
+                rotation: [1.0, 0.0, 0.0, 0.0].into(),
+                scale_opacity: [0.04, 0.04, 0.04, 0.8].into(),
+            },
+        ]);
+        let cloud_handle = app
+            .world_mut()
+            .resource_mut::<Assets<PlanarGaussian3d>>()
+            .add(cloud);
+        app.world_mut()
+            .resource_mut::<CatalogState>()
+            .add_ready_gaussian_splat(
+                7,
+                "splat".to_string(),
+                cloud_handle,
+                Some("input.png".to_string()),
+                Some("cache-key".to_string()),
+            );
+
+        app.update();
+
+        let world = app.world_mut();
+        let (has_preview, has_gaussian, has_mesh, has_material) = {
+            let catalog = world.resource::<CatalogState>();
+            let entry = catalog.entry(7).expect("splat catalog entry");
+            (
+                entry.preview.is_some(),
+                entry.gaussian.is_some(),
+                entry.mesh.is_some(),
+                entry.material.is_some(),
+            )
+        };
+        assert!(has_preview, "splat entry should get a preview");
+        assert!(has_gaussian);
+        assert!(!has_mesh);
+        assert!(!has_material);
+        assert_eq!(
+            world.query::<&PlanarGaussian3dHandle>().iter(world).count(),
+            1
+        );
+        let mut settings = world.query::<&CloudSettings>();
+        let settings = settings
+            .single(world)
+            .expect("one Gaussian preview settings");
+        assert_eq!(settings.sort_mode, SortMode::Std);
+        assert_eq!(settings.color_space, GaussianColorSpace::LinRec709Display);
+        assert_eq!(world.query::<&GaussianCamera>().iter(world).count(), 1);
     }
 
     #[test]

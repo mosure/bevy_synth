@@ -19,6 +19,7 @@ trellis = ["bevy_synth_runtime/trellis"]
 
 [dependencies]
 bevy = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_gaussian_splatting = { git = "https://github.com/mosure/bevy_gaussian_splatting.git", rev = "e0da1488d7441db54e4f86cc8f5845df308b306f", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std"] }
 bevy_mesh = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
 bevy_picking = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
 bevy_synth_runtime = { version = "0.2.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
@@ -34,6 +35,7 @@ bevy_derive = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc035
 log = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy_gaussian_splatting = { git = "https://github.com/mosure/bevy_gaussian_splatting.git", rev = "e0da1488d7441db54e4f86cc8f5845df308b306f", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std", "webgpu"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

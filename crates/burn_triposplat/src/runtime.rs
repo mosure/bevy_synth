@@ -1,8 +1,9 @@
 use burn::{prelude::*, tensor::FloatDType};
 
 use crate::{
-    FlowState, LatentSeqMmFlowModel, OctreeGaussianDecoder, TripoSplatCondition,
-    TripoSplatMultiRunOutput, TripoSplatOptions, TripoSplatRunOutput, normalize_num_gaussians,
+    CfgPredictionMode, FlowEulerTrace, FlowState, LatentSeqMmFlowModel, OctreeGaussianDecoder,
+    TripoSplatCondition, TripoSplatMultiRunOutput, TripoSplatOptions, TripoSplatRunOutput,
+    normalize_num_gaussians,
 };
 
 pub struct TripoSplatRuntimeComponents<B: Backend> {
@@ -22,9 +23,11 @@ pub struct TripoSplatConditioningDiagnostics<B: Backend> {
 
 impl<B: Backend> TripoSplatConditioningDiagnostics<B> {
     pub fn into_condition(self) -> TripoSplatCondition<B> {
+        let rng_normals_consumed = tensor_element_count_3d_dims(self.feature2.dims());
         TripoSplatCondition {
             feature1: self.feature1,
             feature2: Some(self.feature2),
+            rng_normals_consumed,
         }
         .with_prefix_padded_feature2()
     }
@@ -42,9 +45,29 @@ impl<B: Backend> TripoSplatRuntimeComponents<B> {
         let feature1 = layer_norm_last(self.dinov3.forward(dinov3_image), 1.0e-5);
         let flux_image = image_rgb_0_1 * 2.0 - 1.0;
         let feature2 = self.flux2_vae_encoder.encode_with_seed(flux_image, seed);
+        let rng_normals_consumed = tensor_element_count_3d_dims(feature2.dims());
         TripoSplatCondition {
             feature1,
             feature2: Some(feature2),
+            rng_normals_consumed,
+        }
+        .with_prefix_padded_feature2()
+    }
+
+    pub fn encode_preprocessed_image_random(
+        &self,
+        image_rgb_0_1: Tensor<B, 4>,
+    ) -> TripoSplatCondition<B> {
+        let dtype = self.float_dtype();
+        let image_rgb_0_1 = cast_float_tensor(image_rgb_0_1, dtype);
+        let dinov3_image = normalize_dinov3_image(image_rgb_0_1.clone(), dtype);
+        let feature1 = layer_norm_last(self.dinov3.forward(dinov3_image), 1.0e-5);
+        let flux_image = image_rgb_0_1 * 2.0 - 1.0;
+        let feature2 = self.flux2_vae_encoder.encode(flux_image, false);
+        TripoSplatCondition {
+            feature1,
+            feature2: Some(feature2),
+            rng_normals_consumed: 0,
         }
         .with_prefix_padded_feature2()
     }
@@ -89,13 +112,40 @@ impl<B: Backend> TripoSplatRuntimeComponents<B> {
         let device = condition.feature1.device();
         let dtype = self.float_dtype();
         let noise = cast_flow_state(
-            FlowState::deterministic_standard_normal(
+            FlowState::deterministic_standard_normal_after_skipping(
                 &device,
                 condition.feature1.dims()[0],
                 self.flow.config().q_token_length,
                 self.flow.config().in_channels,
                 self.flow.config().cam_channels,
                 options.seed,
+                condition.rng_normals_consumed,
+            ),
+            dtype,
+        );
+        self.flow.sample_euler_cfg(
+            noise,
+            condition,
+            options.steps,
+            options.guidance_scale,
+            options.shift,
+        )
+    }
+
+    pub fn sample_latent_random(
+        &self,
+        condition: TripoSplatCondition<B>,
+        options: TripoSplatOptions,
+    ) -> FlowState<B> {
+        let device = condition.feature1.device();
+        let dtype = self.float_dtype();
+        let noise = cast_flow_state(
+            FlowState::random(
+                &device,
+                condition.feature1.dims()[0],
+                self.flow.config().q_token_length,
+                self.flow.config().in_channels,
+                self.flow.config().cam_channels,
             ),
             dtype,
         );
@@ -114,13 +164,30 @@ impl<B: Backend> TripoSplatRuntimeComponents<B> {
         noise: FlowState<B>,
         options: TripoSplatOptions,
     ) -> FlowState<B> {
+        self.sample_latent_from_noise_with_cfg_mode(
+            condition,
+            noise,
+            options,
+            CfgPredictionMode::Batched,
+        )
+    }
+
+    pub fn sample_latent_from_noise_with_cfg_mode(
+        &self,
+        condition: TripoSplatCondition<B>,
+        noise: FlowState<B>,
+        options: TripoSplatOptions,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowState<B> {
         let dtype = self.float_dtype();
-        self.flow.sample_euler_cfg(
+        self.flow.sample_euler_cfg_prefix_with_mode(
             cast_flow_state(noise, dtype),
             cast_condition(condition, dtype),
             options.steps,
+            options.steps,
             options.guidance_scale,
             options.shift,
+            cfg_mode,
         )
     }
 
@@ -131,14 +198,52 @@ impl<B: Backend> TripoSplatRuntimeComponents<B> {
         options: TripoSplatOptions,
         prefix_steps: usize,
     ) -> FlowState<B> {
+        self.sample_latent_prefix_from_noise_with_cfg_mode(
+            condition,
+            noise,
+            options,
+            prefix_steps,
+            CfgPredictionMode::Batched,
+        )
+    }
+
+    pub fn sample_latent_prefix_from_noise_with_cfg_mode(
+        &self,
+        condition: TripoSplatCondition<B>,
+        noise: FlowState<B>,
+        options: TripoSplatOptions,
+        prefix_steps: usize,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowState<B> {
         let dtype = self.float_dtype();
-        self.flow.sample_euler_cfg_prefix(
+        self.flow.sample_euler_cfg_prefix_with_mode(
             cast_flow_state(noise, dtype),
             cast_condition(condition, dtype),
             options.steps,
             prefix_steps,
             options.guidance_scale,
             options.shift,
+            cfg_mode,
+        )
+    }
+
+    pub fn sample_latent_trace_from_noise_with_cfg_mode(
+        &self,
+        condition: TripoSplatCondition<B>,
+        noise: FlowState<B>,
+        options: TripoSplatOptions,
+        prefix_steps: usize,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowEulerTrace<B> {
+        let dtype = self.float_dtype();
+        self.flow.sample_euler_cfg_trace_with_mode(
+            cast_flow_state(noise, dtype),
+            cast_condition(condition, dtype),
+            options.steps,
+            prefix_steps,
+            options.guidance_scale,
+            options.shift,
+            cfg_mode,
         )
     }
 
@@ -149,14 +254,32 @@ impl<B: Backend> TripoSplatRuntimeComponents<B> {
         options: TripoSplatOptions,
         step: usize,
     ) -> FlowState<B> {
+        self.flow_prediction_from_noise_at_step_with_cfg_mode(
+            condition,
+            noise,
+            options,
+            step,
+            CfgPredictionMode::Batched,
+        )
+    }
+
+    pub fn flow_prediction_from_noise_at_step_with_cfg_mode(
+        &self,
+        condition: TripoSplatCondition<B>,
+        noise: FlowState<B>,
+        options: TripoSplatOptions,
+        step: usize,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowState<B> {
         let dtype = self.float_dtype();
-        self.flow.euler_cfg_prediction_at_step(
+        self.flow.euler_cfg_prediction_at_step_with_mode(
             cast_flow_state(noise, dtype),
             cast_condition(condition, dtype),
             options.steps,
             step,
             options.guidance_scale,
             options.shift,
+            cfg_mode,
         )
     }
 
@@ -286,7 +409,12 @@ fn cast_condition<B: Backend>(
         feature2: condition
             .feature2
             .map(|feature2| cast_float_tensor(feature2, dtype)),
+        rng_normals_consumed: condition.rng_normals_consumed,
     }
+}
+
+fn tensor_element_count_3d_dims(dims: [usize; 3]) -> usize {
+    dims[0].saturating_mul(dims[1]).saturating_mul(dims[2])
 }
 
 fn cast_float_tensor<B: Backend, const D: usize>(

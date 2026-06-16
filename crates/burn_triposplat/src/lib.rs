@@ -27,7 +27,10 @@ pub use decoder::{
     GaussianRepresentationConfig, OCTREE_MAX_VOXEL_LEVEL, OctreeGaussianDecoder, OctreePrediction,
     OctreeProbabilityFixedlenDecoder, OctreeProbabilityFixedlenDecoderConfig, OctreeSample,
 };
-pub use flow::{FlowState, LatentSeqMmFlowModel, LatentSeqMmFlowModelConfig, TripoSplatCondition};
+pub use flow::{
+    CfgPredictionMode, FlowEulerTrace, FlowState, LatentSeqMmFlowModel, LatentSeqMmFlowModelConfig,
+    TripoSplatCondition,
+};
 pub use gaussian::{GaussianSplat, GaussianSplatCloud, GaussianSplatStats};
 pub use paths::resolve_triposplat_weights_root;
 pub use pipeline::{

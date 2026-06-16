@@ -21,6 +21,7 @@ use crate::{
 };
 
 const CACHE_VERSION: u32 = 5;
+const TRIPOSPLAT_SPLAT_CACHE_NAMESPACE: &str = "triposplat-v2";
 const INDEX_FILE_NAME: &str = "index.json";
 #[cfg(not(target_arch = "wasm32"))]
 const MESH_DIR_NAME: &str = "meshes";
@@ -739,7 +740,9 @@ pub fn cache_key_from_image_path(path: &Path) -> String {
 fn cache_key_from_source_and_kind(source: &str, kind: CachedAssetKind) -> String {
     match kind {
         CachedAssetKind::Mesh => cache_key_from_source(source),
-        CachedAssetKind::GaussianSplat => cache_key_from_source(&format!("{source}#triposplat")),
+        CachedAssetKind::GaussianSplat => {
+            cache_key_from_source(&format!("{source}#{TRIPOSPLAT_SPLAT_CACHE_NAMESPACE}"))
+        }
     }
 }
 
@@ -1048,6 +1051,21 @@ mod tests {
         }
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[test]
+    fn gaussian_splat_cache_key_is_version_namespaced() {
+        let source = "C:/data/input/object.png";
+
+        let mesh_key = cache_key_from_source_and_kind(source, CachedAssetKind::Mesh);
+        let splat_key = cache_key_from_source_and_kind(source, CachedAssetKind::GaussianSplat);
+
+        assert_eq!(mesh_key, cache_key_from_source(source));
+        assert_eq!(
+            splat_key,
+            cache_key_from_source(&format!("{source}#{TRIPOSPLAT_SPLAT_CACHE_NAMESPACE}"))
+        );
+        assert_ne!(mesh_key, splat_key);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

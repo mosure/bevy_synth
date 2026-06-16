@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use burn::backend::NdArray;
 use burn::prelude::*;
-use burn::tensor::backend::BackendTypes;
+use burn::tensor::{FloatDType, backend::BackendTypes};
 use burn_foreground::pipeline::{
     PrepareImageConfig, PreparedImageData, RmbgPipeline, prepare_image_data_from_bytes_async,
 };
@@ -43,8 +43,8 @@ use burn_tripo::pipeline::triposg::{TripoSGPipeline, deterministic_latents_from_
 use burn_triposplat::artifact::{TRIPOSPLAT_ARTIFACTS, TripoSplatArtifact};
 use burn_triposplat::{
     ElasticGaussianFixedlenDecoderConfig, GaussianSplatCloud, LatentSeqMmFlowModelConfig,
-    OctreeGaussianDecoder, OctreeProbabilityFixedlenDecoderConfig, TripoSplatOptions,
-    TripoSplatRuntimeComponents,
+    OCTREE_MAX_VOXEL_LEVEL, OctreeGaussianDecoder, OctreeProbabilityFixedlenDecoderConfig,
+    TripoSplatOptions, TripoSplatRuntimeComponents, normalize_num_gaussians,
 };
 #[cfg(feature = "wasm-api-wgpu")]
 use js_sys::{Function, Promise};
@@ -61,6 +61,7 @@ use crate::mesh_to_glb_bytes;
 use crate::model_loader::{
     candidate_burnpack_names, parse_parts_manifest_bytes, resolve_manifest_entry_uri,
 };
+use crate::triposplat_preprocess::triposplat_prepare_image_config;
 use crate::wasm::{DEFAULT_WASM_FLASH_NUM_CHUNKS, WasmInferencePreset};
 use crate::wasm_loader::{
     DownloadTotals, WasmHostMemoryBudget, download_binary_with_status, fetch_optional_text,
@@ -71,6 +72,11 @@ use crate::wasm_loader::{
 type WgpuBackendF16 = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
 type WgpuBackendF32 = burn_wgpu::Wgpu<f32, i32, u32>;
+#[cfg(feature = "wasm-api-wgpu")]
+type WgpuTripoSplatBackendF16 =
+    burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, burn::tensor::f16, i32, u32>;
+#[cfg(feature = "wasm-api-wgpu")]
+type WgpuTripoSplatBackendF32 = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
 type WgpuRmbgBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
@@ -127,11 +133,11 @@ enum CachedWasmPipeline {
 enum CachedWasmTripoSplatPipeline {
     WgpuF32 {
         preset: WasmInferencePreset,
-        state: WasmTripoSplatPipelineState<WgpuBackendF32, WgpuRmbgBackend>,
+        state: WasmTripoSplatPipelineState<WgpuTripoSplatBackendF32, WgpuRmbgBackend>,
     },
     WgpuF16 {
         preset: WasmInferencePreset,
-        state: WasmTripoSplatPipelineState<WgpuBackendF16, WgpuRmbgBackend>,
+        state: WasmTripoSplatPipelineState<WgpuTripoSplatBackendF16, WgpuRmbgBackend>,
     },
 }
 
@@ -467,6 +473,26 @@ fn resolve_wgpu_precision_for_preset(
         return if shader_f16_supported { "f16" } else { "f32" };
     }
     "f32"
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+fn resolve_triposplat_wgpu_precision_for_preset(
+    preset: &WasmInferencePreset,
+    shader_f16_supported: bool,
+) -> Result<&'static str, String> {
+    if !shader_f16_supported {
+        return Err(
+            "TripoSplat wasm currently requires a WebGPU adapter with shader-f16; the f32 browser path exceeds WebGPU memory limits during octree decode. Use a shader-f16-capable browser/GPU for TripoSplat wasm."
+                .to_string(),
+        );
+    }
+    if preset.weights_precision.eq_ignore_ascii_case("f32") {
+        return Err(
+            "TripoSplat wasm f32 precision is disabled because it exceeds WebGPU memory limits during octree decode; use weights_precision=auto or f16 on a shader-f16-capable adapter."
+                .to_string(),
+        );
+    }
+    Ok("f16")
 }
 
 fn validate_wasm_preset_supported(preset: &WasmInferencePreset) -> Result<(), String> {
@@ -1023,7 +1049,7 @@ async fn run_triposplat_inference_once<BTripoSplat: Backend, BRmbg: Backend>(
     let prepared = prepare_image_data_from_bytes_async::<BRmbg>(
         image_bytes,
         state.rmbg.as_ref(),
-        &prepare_image_config_for_backend::<BRmbg>(),
+        &triposplat_prepare_image_config(preset.triposplat_erode_radius),
     )
     .await
     .map_err(|err| format!("failed to prepare image tensor: {err}"))?;
@@ -1046,19 +1072,110 @@ async fn run_triposplat_inference_once<BTripoSplat: Backend, BRmbg: Backend>(
         )
         .into(),
     );
-    let output = state
+    let encode_start = js_sys::Date::now();
+    web_sys::console::log_1(&"burn_synth wasm TripoSplat infer: encode start".into());
+    let condition = state.components.encode_preprocessed_image_random(image);
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: encode done (elapsed_ms={:.1})",
+            js_sys::Date::now() - encode_start
+        )
+        .into(),
+    );
+    BTripoSplat::memory_cleanup(&state.triposplat_device);
+
+    let sample_start = js_sys::Date::now();
+    web_sys::console::log_1(&"burn_synth wasm TripoSplat infer: sample start".into());
+    let latent = state
         .components
-        .infer_preprocessed_image_async(image, options)
+        .sample_latent_random(condition, options)
+        .latent;
+    BTripoSplat::memory_cleanup(&state.triposplat_device);
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: sample done (elapsed_ms={:.1})",
+            js_sys::Date::now() - sample_start
+        )
+        .into(),
+    );
+
+    let decode_start = js_sys::Date::now();
+    web_sys::console::log_1(&"burn_synth wasm TripoSplat infer: decode start".into());
+    let num_gaussians = normalize_num_gaussians(options.num_gaussians)
+        .map_err(|err| format!("TripoSplat wasm inference failed: {err}"))?;
+    let num_points = (num_gaussians / state.components.decoder.gaussians_per_point()).max(1);
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: decode octree sample start (points={} level={})",
+            num_points, OCTREE_MAX_VOXEL_LEVEL
+        )
+        .into(),
+    );
+    let octree_start = js_sys::Date::now();
+    let sample = state
+        .components
+        .decoder
+        .octree
+        .sample_systematic_host_async(
+            latent.clone(),
+            num_points,
+            OCTREE_MAX_VOXEL_LEVEL,
+            options.seed,
+        )
         .await
         .map_err(|err| format!("TripoSplat wasm inference failed: {err}"))?;
     web_sys::console::log_1(
         &format!(
-            "burn_synth wasm TripoSplat infer: done (splats={})",
-            output.splats.len()
+            "burn_synth wasm TripoSplat infer: decode octree sample done (elapsed_ms={:.1})",
+            js_sys::Date::now() - octree_start
         )
         .into(),
     );
-    Ok(output.splats)
+    BTripoSplat::memory_cleanup(&state.triposplat_device);
+    web_sys::console::log_1(
+        &"burn_synth wasm TripoSplat infer: decode gaussian forward start".into(),
+    );
+    let gaussian_start = js_sys::Date::now();
+    let features = state.components.decoder.gs.forward(&sample, latent);
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: decode gaussian forward done (elapsed_ms={:.1})",
+            js_sys::Date::now() - gaussian_start
+        )
+        .into(),
+    );
+    BTripoSplat::memory_cleanup(&state.triposplat_device);
+    web_sys::console::log_1(&"burn_synth wasm TripoSplat infer: decode build cloud start".into());
+    let build_start = js_sys::Date::now();
+    let splats = state
+        .components
+        .decoder
+        .gs
+        .build_cloud_async(&sample, features)
+        .await
+        .map_err(|err| format!("TripoSplat wasm inference failed: {err}"))?;
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: decode build cloud done (elapsed_ms={:.1})",
+            js_sys::Date::now() - build_start
+        )
+        .into(),
+    );
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: decode done (elapsed_ms={:.1})",
+            js_sys::Date::now() - decode_start
+        )
+        .into(),
+    );
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm TripoSplat infer: done (splats={})",
+            splats.len()
+        )
+        .into(),
+    );
+    Ok(splats)
 }
 
 async fn run_inference_once<BTriposg: Backend, BRmbg: Backend>(
@@ -1604,21 +1721,21 @@ where
     web_sys::console::log_1(&"burn_synth wasm TripoSplat warmup: runtime init start".into());
     initialize_wgpu_runtime_for_wasm().await?;
     web_sys::console::log_1(&"burn_synth wasm TripoSplat warmup: runtime init done".into());
-    if preset.weights_precision.eq_ignore_ascii_case("f16") && !adapter_profile.shader_f16_supported
-    {
-        return Err(
-            "weights_precision=f16 requested, but this WebGPU adapter lacks shader-f16; use weights_precision=auto or f32."
-                .to_string(),
-        );
-    }
-    let precision = resolve_wgpu_precision_for_preset(preset, adapter_profile.shader_f16_supported);
-    if preset.weights_precision.eq_ignore_ascii_case("f16") && !adapter_profile.shader_f16_supported
-    {
-        on_status(
-            "WebGPU adapter lacks shader-f16; running TripoSplat on f32 backend while preferring f16 model weights."
-                .to_string(),
-        );
-    }
+    let precision =
+        resolve_triposplat_wgpu_precision_for_preset(preset, adapter_profile.shader_f16_supported)?;
+    let prefer_f16_artifacts = true;
+    on_status(format!(
+        "TripoSplat wasm uses {} WebGPU compute and {} artifacts{}.",
+        precision,
+        if prefer_f16_artifacts { "f16" } else { "f32" },
+        if preset.weights_precision.eq_ignore_ascii_case("auto")
+            && !adapter_profile.shader_f16_supported
+        {
+            " because this adapter lacks shader-f16"
+        } else {
+            ""
+        }
+    ));
 
     let cache_hit = CACHED_WASM_TRIPOSPLAT_PIPELINE.with(|cache| {
         let guard = cache.borrow();
@@ -1640,16 +1757,18 @@ where
     let loaded = match precision {
         "f16" => CachedWasmTripoSplatPipeline::WgpuF16 {
             preset: preset.clone(),
-            state: load_triposplat_pipeline_state::<WgpuBackendF16, WgpuRmbgBackend, _>(
+            state: load_triposplat_pipeline_state::<WgpuTripoSplatBackendF16, WgpuRmbgBackend, _>(
                 preset,
+                prefer_f16_artifacts,
                 &mut on_status,
             )
             .await?,
         },
         _ => CachedWasmTripoSplatPipeline::WgpuF32 {
             preset: preset.clone(),
-            state: load_triposplat_pipeline_state::<WgpuBackendF32, WgpuRmbgBackend, _>(
+            state: load_triposplat_pipeline_state::<WgpuTripoSplatBackendF32, WgpuRmbgBackend, _>(
                 preset,
+                prefer_f16_artifacts,
                 &mut on_status,
             )
             .await?,
@@ -1665,12 +1784,12 @@ where
 #[cfg(feature = "wasm-api-wgpu")]
 async fn load_triposplat_pipeline_state<BTripoSplat: Backend, BRmbg: Backend, F>(
     preset: &WasmInferencePreset,
+    prefer_f16_triposplat_artifacts: bool,
     on_status: &mut F,
 ) -> Result<WasmTripoSplatPipelineState<BTripoSplat, BRmbg>, String>
 where
     F: FnMut(String),
 {
-    let use_wgpu = is_wgpu_backend::<BTripoSplat>();
     let backend_is_f16 = backend_uses_f16::<BTripoSplat>();
     let requested_precision = if preset.weights_precision.eq_ignore_ascii_case("f16") {
         "f16"
@@ -1679,10 +1798,11 @@ where
     } else {
         "f32"
     };
-    let prefer_f16 = match requested_precision {
-        "f16" => true,
-        "f32" => false,
-        _ => use_wgpu && backend_is_f16,
+    let prefer_f16 = prefer_f16_triposplat_artifacts;
+    let triposplat_compute_dtype = if prefer_f16 && !backend_is_f16 {
+        Some(FloatDType::F32)
+    } else {
+        None
     };
     let allow_cross_precision_fallback = requested_precision == "auto";
     let requested_rmbg_precision = if preset.rmbg_weights_precision.eq_ignore_ascii_case("f16") {
@@ -1703,9 +1823,26 @@ where
         "TripoSplat weight precision policy: {} ({})",
         if prefer_f16 { "f16" } else { "f32" },
         if requested_precision == "auto" {
-            "auto (wasm WebGPU backend-aligned)"
+            "auto (wasm shader-f16 policy)"
         } else {
             "forced by options"
+        }
+    ));
+    on_status(format!(
+        "TripoSplat compute precision policy: {} ({})",
+        if matches!(triposplat_compute_dtype, Some(FloatDType::F32)) {
+            "f32"
+        } else if backend_is_f16 {
+            "backend f16"
+        } else {
+            "backend f32"
+        },
+        if prefer_f16 && backend_is_f16 {
+            "f16 artifacts remain fp16 for upstream-style wasm memory/perf"
+        } else if prefer_f16 {
+            "f16 artifacts are promoted after load for backend compatibility"
+        } else {
+            "artifact dtype"
         }
     ));
     on_status(format!(
@@ -1757,6 +1894,7 @@ where
     let components = load_triposplat_components_wasm(
         &triposplat_device,
         prefer_f16,
+        triposplat_compute_dtype,
         allow_cross_precision_fallback,
         &mut load_ctx,
     )
@@ -1818,6 +1956,7 @@ where
 async fn load_triposplat_components_wasm<B: Backend, F>(
     device: &B::Device,
     prefer_f16: bool,
+    compute_dtype: Option<FloatDType>,
     allow_cross_precision_fallback: bool,
     load_ctx: &mut WasmLoadContext<'_, F>,
 ) -> Result<TripoSplatRuntimeComponents<B>, String>
@@ -1825,24 +1964,45 @@ where
     F: FnMut(String),
 {
     load_ctx.status("Loading TripoSplat DINOv3 component...".to_string());
-    let dinov3 =
+    let mut dinov3 =
         load_triposplat_dinov3_wasm(device, prefer_f16, allow_cross_precision_fallback, load_ctx)
             .await?;
+    if let Some(dtype) = compute_dtype {
+        dinov3 = burn_triposplat::import::cast_module_float_dtype(dinov3, dtype);
+        load_ctx.status("Cast TripoSplat DINOv3 component to f32 compute.".to_string());
+    }
+    cleanup_wasm_backend_memory::<B, _>(device, "TripoSplat DINOv3 load", load_ctx)?;
     load_ctx.status("Loaded TripoSplat DINOv3 component.".to_string());
     load_ctx.status("Loading TripoSplat Flux2 VAE encoder component...".to_string());
-    let flux2_vae_encoder =
+    let mut flux2_vae_encoder =
         load_triposplat_flux2_wasm(device, prefer_f16, allow_cross_precision_fallback, load_ctx)
             .await?;
+    if let Some(dtype) = compute_dtype {
+        flux2_vae_encoder =
+            burn_triposplat::import::cast_module_float_dtype(flux2_vae_encoder, dtype);
+        load_ctx.status("Cast TripoSplat Flux2 VAE encoder component to f32 compute.".to_string());
+    }
+    cleanup_wasm_backend_memory::<B, _>(device, "TripoSplat Flux2 VAE load", load_ctx)?;
     load_ctx.status("Loaded TripoSplat Flux2 VAE encoder component.".to_string());
     load_ctx.status("Loading TripoSplat flow component...".to_string());
-    let flow =
+    let mut flow =
         load_triposplat_flow_wasm(device, prefer_f16, allow_cross_precision_fallback, load_ctx)
             .await?;
+    if let Some(dtype) = compute_dtype {
+        flow = burn_triposplat::import::cast_module_float_dtype(flow, dtype);
+        load_ctx.status("Cast TripoSplat flow component to f32 compute.".to_string());
+    }
+    cleanup_wasm_backend_memory::<B, _>(device, "TripoSplat flow load", load_ctx)?;
     load_ctx.status("Loaded TripoSplat flow component.".to_string());
     load_ctx.status("Loading TripoSplat decoder component...".to_string());
-    let decoder =
+    let mut decoder =
         load_triposplat_decoder_wasm(device, prefer_f16, allow_cross_precision_fallback, load_ctx)
             .await?;
+    if let Some(dtype) = compute_dtype {
+        decoder = burn_triposplat::import::cast_module_float_dtype(decoder, dtype);
+        load_ctx.status("Cast TripoSplat decoder component to f32 compute.".to_string());
+    }
+    cleanup_wasm_backend_memory::<B, _>(device, "TripoSplat decoder load", load_ctx)?;
     load_ctx.status("Loaded TripoSplat decoder component.".to_string());
 
     Ok(TripoSplatRuntimeComponents {
@@ -1851,6 +2011,20 @@ where
         flow,
         decoder,
     })
+}
+
+#[cfg(feature = "wasm-api-wgpu")]
+fn cleanup_wasm_backend_memory<B: Backend, F>(
+    device: &B::Device,
+    label: &str,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<(), String>
+where
+    F: FnMut(String),
+{
+    B::memory_cleanup(device);
+    load_ctx.status(format!("Cleaned wasm backend memory after {label}."));
+    Ok(())
 }
 
 #[cfg(feature = "wasm-api-wgpu")]

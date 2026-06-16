@@ -11,6 +11,9 @@ use burn::{
 
 use crate::layers::layer_norm::{LayerNorm, LayerNormConfig};
 
+#[cfg(target_arch = "wasm32")]
+const WASM_DINOV3_ATTENTION_QUERY_CHUNK_TOKENS: usize = 64;
+
 #[derive(Config, Debug)]
 pub struct DinoV3Config {
     pub image_size: usize,
@@ -164,20 +167,76 @@ impl<B: Backend> DinoV3Attention<B> {
             k = k.clone() * cos.clone() + rotate_half(k) * sin;
         }
 
-        let out = module_attention(
-            q,
-            k,
-            v,
-            None,
-            None,
-            AttentionModuleOptions {
-                scale: Some((self.head_dim as f64).powf(-0.5)),
-                ..Default::default()
-            },
-        );
+        let out = dinov3_attention(q, k, v, self.head_dim);
         self.o_proj
             .forward(out.swap_dims(1, 2).reshape([batch, tokens, channels]))
     }
+}
+
+fn dinov3_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+) -> Tensor<B, 4> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        dinov3_attention_chunked(q, k, v, head_dim, WASM_DINOV3_ATTENTION_QUERY_CHUNK_TOKENS)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        dinov3_attention_dense(q, k, v, head_dim)
+    }
+}
+
+fn dinov3_attention_dense<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+) -> Tensor<B, 4> {
+    module_attention(
+        q,
+        k,
+        v,
+        None,
+        None,
+        AttentionModuleOptions {
+            scale: Some((head_dim as f64).powf(-0.5)),
+            ..Default::default()
+        },
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dinov3_attention_chunked<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+    query_chunk_tokens: usize,
+) -> Tensor<B, 4> {
+    let [batch, heads, query_tokens, _] = q.dims();
+    if query_tokens <= query_chunk_tokens {
+        return dinov3_attention_dense(q, k, v, head_dim);
+    }
+
+    let mut chunks = Vec::with_capacity(query_tokens.div_ceil(query_chunk_tokens));
+    let mut start = 0;
+    while start < query_tokens {
+        let end = (start + query_chunk_tokens).min(query_tokens);
+        let q_chunk = q
+            .clone()
+            .slice([0..batch, 0..heads, start..end, 0..head_dim]);
+        chunks.push(dinov3_attention_dense(
+            q_chunk,
+            k.clone(),
+            v.clone(),
+            head_dim,
+        ));
+        start = end;
+    }
+    Tensor::cat(chunks, 2)
 }
 
 fn apply_patch_rope<B: Backend>(
@@ -368,10 +427,19 @@ impl<B: Backend> DinoV3ViT<B> {
         let prefix = 1 + self.num_register_tokens;
         for block in &self.blocks {
             x = block.forward(x, cos.clone(), sin.clone(), prefix);
+            cleanup_wasm_dino_memory(&x);
         }
         self.norm.forward(x)
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+fn cleanup_wasm_dino_memory<B: Backend, const D: usize>(tensor: &Tensor<B, D>) {
+    B::memory_cleanup(&tensor.device());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cleanup_wasm_dino_memory<B: Backend, const D: usize>(_tensor: &Tensor<B, D>) {}
 
 fn rope_cos_sin<B: Backend>(
     height: usize,

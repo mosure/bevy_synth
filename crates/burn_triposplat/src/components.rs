@@ -12,7 +12,10 @@ use burn::{
 
 const RMS_NORM_EPS: f32 = 1.0e-12;
 const ATTENTION_SCORE_ELEMS_CHUNK_THRESHOLD: usize = 32 * 1024 * 1024;
+#[cfg(target_arch = "wasm32")]
 const ATTENTION_QUERY_CHUNK_TOKENS: usize = 128;
+#[cfg(not(target_arch = "wasm32"))]
+const ATTENTION_QUERY_CHUNK_TOKENS: usize = 512;
 
 pub fn silu<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
     x.clone() * sigmoid(x)
@@ -511,6 +514,16 @@ impl<B: Backend> MultiHeadAttention<B> {
         context: Option<Tensor<B, 3>>,
         rope_emb: Option<&RotaryAngles<B>>,
     ) -> Tensor<B, 3> {
+        self.forward_with_query_chunk_tokens(x, context, rope_emb, ATTENTION_QUERY_CHUNK_TOKENS)
+    }
+
+    pub fn forward_with_query_chunk_tokens(
+        &self,
+        x: Tensor<B, 3>,
+        context: Option<Tensor<B, 3>>,
+        rope_emb: Option<&RotaryAngles<B>>,
+        query_chunk_tokens: usize,
+    ) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
         let (mut q, mut k, v) = match self.kind {
             AttentionKind::SelfAttention => {
@@ -600,7 +613,13 @@ impl<B: Backend> MultiHeadAttention<B> {
         if let Some(norm) = &self.k_norm {
             k = norm.forward(k);
         }
-        let out = scaled_dot_product_attention(q, k, v, self.head_dim);
+        let out = scaled_dot_product_attention_with_query_chunk_tokens(
+            q,
+            k,
+            v,
+            self.head_dim,
+            query_chunk_tokens,
+        );
         self.out.forward(out.reshape([batch, tokens, channels]))
     }
 }
@@ -611,6 +630,22 @@ pub fn scaled_dot_product_attention<B: Backend>(
     v: Tensor<B, 4>,
     head_dim: usize,
 ) -> Tensor<B, 4> {
+    scaled_dot_product_attention_with_query_chunk_tokens(
+        q,
+        k,
+        v,
+        head_dim,
+        ATTENTION_QUERY_CHUNK_TOKENS,
+    )
+}
+
+fn scaled_dot_product_attention_with_query_chunk_tokens<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+    query_chunk_tokens: usize,
+) -> Tensor<B, 4> {
     let [batch, query_tokens, heads, _] = q.dims();
     let key_tokens = k.dims()[1];
     let score_elems = batch
@@ -618,16 +653,11 @@ pub fn scaled_dot_product_attention<B: Backend>(
         .saturating_mul(query_tokens)
         .saturating_mul(key_tokens);
 
-    if score_elems > ATTENTION_SCORE_ELEMS_CHUNK_THRESHOLD
-        && query_tokens > ATTENTION_QUERY_CHUNK_TOKENS
+    let explicit_chunk_limit = query_chunk_tokens < ATTENTION_QUERY_CHUNK_TOKENS;
+    if query_tokens > query_chunk_tokens
+        && (explicit_chunk_limit || score_elems > ATTENTION_SCORE_ELEMS_CHUNK_THRESHOLD)
     {
-        return scaled_dot_product_attention_chunked(
-            q,
-            k,
-            v,
-            head_dim,
-            ATTENTION_QUERY_CHUNK_TOKENS,
-        );
+        return scaled_dot_product_attention_chunked(q, k, v, head_dim, query_chunk_tokens);
     }
 
     scaled_dot_product_attention_dense(q, k, v, head_dim)
@@ -637,25 +667,16 @@ fn scaled_dot_product_attention_dense<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
-    head_dim: usize,
+    _head_dim: usize,
 ) -> Tensor<B, 4> {
     let q = q.permute([0, 2, 1, 3]);
     let k = k.permute([0, 2, 1, 3]);
     let v = v.permute([0, 2, 1, 3]);
-    // Keep the canonical PyTorch scale explicit. CubeCL routes explicit-scale
-    // attention through the generic fallback, so large TripoSplat shapes must be
-    // split before reaching this helper to keep fallback score tensors bounded.
-    let out = module_attention(
-        q,
-        k,
-        v,
-        None,
-        None,
-        AttentionModuleOptions {
-            scale: Some((head_dim as f64).powf(-0.5)),
-            ..Default::default()
-        },
-    );
+    // PyTorch's F.scaled_dot_product_attention and Burn's default options both
+    // use 1/sqrt(head_dim). Keeping scale unset preserves eligibility for
+    // native CubeCL attention paths; setting the equivalent value forces the
+    // slower fallback in Burn 0.21.
+    let out = module_attention(q, k, v, None, None, AttentionModuleOptions::default());
     out.permute([0, 2, 1, 3])
 }
 
@@ -844,8 +865,18 @@ impl<B: Backend> CrossOnlyBlock<B> {
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
+        mod_signal: Tensor<B, 2>,
+        context: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        self.forward_with_query_chunk_tokens(x, mod_signal, context, ATTENTION_QUERY_CHUNK_TOKENS)
+    }
+
+    pub fn forward_with_query_chunk_tokens(
+        &self,
+        x: Tensor<B, 3>,
         mut mod_signal: Tensor<B, 2>,
         context: Tensor<B, 3>,
+        query_chunk_tokens: usize,
     ) -> Tensor<B, 3> {
         if !self.share_mod {
             mod_signal = self
@@ -864,7 +895,12 @@ impl<B: Backend> CrossOnlyBlock<B> {
         let gate_mlp = mod_signal.slice([0..batch, 5 * c..6 * c]);
         let h = self.norm1.forward(x.clone()) * (scale_msa.unsqueeze_dim(1) + 1.0)
             + shift_msa.unsqueeze_dim(1);
-        let x = x + self.cross_attn.forward(h, Some(context), None) * gate_msa.unsqueeze_dim(1);
+        let x = x + self.cross_attn.forward_with_query_chunk_tokens(
+            h,
+            Some(context),
+            None,
+            query_chunk_tokens,
+        ) * gate_msa.unsqueeze_dim(1);
         let h = self.norm2.forward(x.clone()) * (scale_mlp.unsqueeze_dim(1) + 1.0)
             + shift_mlp.unsqueeze_dim(1);
         x + self.mlp.forward(h) * gate_mlp.unsqueeze_dim(1)
@@ -916,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_dense_matches_explicit_scale_reference() {
+    fn attention_dense_matches_default_scale_reference() {
         let device = Default::default();
         let values = |offset: f32| {
             (0..24)
@@ -943,10 +979,7 @@ mod tests {
             v.permute([0, 2, 1, 3]),
             None,
             None,
-            AttentionModuleOptions {
-                scale: Some(4.0f64.powf(-0.5)),
-                ..Default::default()
-            },
+            AttentionModuleOptions::default(),
         )
         .permute([0, 2, 1, 3]);
 

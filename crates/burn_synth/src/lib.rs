@@ -10,6 +10,8 @@ pub mod pipeline;
 pub mod progress;
 #[cfg(feature = "runtime")]
 pub mod runtime;
+#[cfg(any(feature = "runtime", all(target_arch = "wasm32", feature = "wasm-api")))]
+mod triposplat_preprocess;
 pub mod wasm;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-api"))]
 pub mod wasm_api;

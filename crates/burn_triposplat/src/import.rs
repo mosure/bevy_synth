@@ -47,14 +47,14 @@ pub fn load_triposplat_runtime_components<B: Backend>(
     device: &B::Device,
     artifacts: &TripoSplatArtifactSet,
 ) -> Result<TripoSplatRuntimeComponents<B>, Box<dyn std::error::Error>> {
-    let compute_dtype = if artifacts.precision == TripoSplatBurnpackPrecision::F16 {
-        // Official TripoSplat flow/decoder weights are distributed as fp16, but WGPU fp16
-        // execution currently produces non-finite Gaussian features. Keep f16 storage/sharding
-        // supported, then promote compute for numerically stable default inference.
-        Some(FloatDType::F32)
-    } else {
-        None
-    };
+    let compute_dtype =
+        if artifacts.precision == TripoSplatBurnpackPrecision::F16 && !backend_uses_f16::<B>() {
+            // Keep f16 burnpacks loadable on f32-only backends. Real f16 backends should retain
+            // upstream-style f16 module weights instead of being promoted by default.
+            Some(FloatDType::F32)
+        } else {
+            None
+        };
     load_triposplat_runtime_components_with_compute_dtype(device, artifacts, compute_dtype)
 }
 
@@ -585,7 +585,7 @@ impl<B: Backend> ModuleMapper<B> for FloatDTypeMapper {
     }
 }
 
-fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
+pub fn cast_module_float_dtype<B: Backend, M: Module<B>>(module: M, dtype: FloatDType) -> M {
     let mut mapper = FloatDTypeMapper { dtype };
     module.map(&mut mapper)
 }
@@ -604,6 +604,12 @@ fn save_burnpack<B: Backend, M: Module<B>>(
 
 fn should_validate_burnpack() -> bool {
     cfg!(all(not(target_arch = "wasm32"), debug_assertions))
+}
+
+fn backend_uses_f16<B: Backend>() -> bool {
+    std::any::type_name::<B>()
+        .to_ascii_lowercase()
+        .contains("f16")
 }
 
 #[cfg(test)]
@@ -730,6 +736,7 @@ mod tests {
                 [1, 4, config.cond2_channels.expect("cond2")],
                 &device,
             )),
+            rng_normals_consumed: 0,
         };
         let t = Tensor::<TestBackend, 1>::from_floats([500.0], &device);
         let file_out = file_loaded.forward(state.clone(), t.clone(), cond.clone());

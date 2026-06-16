@@ -37,6 +37,20 @@ pub(crate) fn push_standard_normals(rng: &mut SplitMix64, values: &mut Vec<f32>,
     }
 }
 
+pub(crate) fn skip_standard_normals(rng: &mut SplitMix64, total: usize) {
+    let mut consumed = 0usize;
+    while consumed < total {
+        let u1 = rng.next_unit_f32().max(f32::MIN_POSITIVE);
+        let u2 = rng.next_unit_f32();
+        let _radius = (-2.0 * u1.ln()).sqrt();
+        let _theta = core::f32::consts::TAU * u2;
+        consumed += 1;
+        if consumed < total {
+            consumed += 1;
+        }
+    }
+}
+
 pub(crate) fn deterministic_standard_normal_3d<B: Backend>(
     rng: &mut SplitMix64,
     shape: [usize; 3],

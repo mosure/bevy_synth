@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 
 const SH_C0: f32 = 0.282_094_8;
 const EPS: f32 = 1.0e-6;
-const DEFAULT_TRANSFORM: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]];
+// Matches upstream TripoSplat's default `.splat`/PLY export transform.
+pub const BEVY_GAUSSIAN_TRANSFORM: [[f32; 3]; 3] =
+    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]];
+// Matches the additional yaw/upright orientation used by the upstream viewer.
+pub const BEVY_GAUSSIAN_DISPLAY_TRANSFORM: [[f32; 3]; 3] =
+    [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GaussianSplat {
@@ -68,7 +73,7 @@ impl GaussianSplatCloud {
     }
 
     pub fn to_splat_bytes(&self) -> Result<Vec<u8>, String> {
-        self.to_splat_bytes_with_transform(DEFAULT_TRANSFORM)
+        self.to_splat_bytes_with_transform(BEVY_GAUSSIAN_TRANSFORM)
     }
 
     pub fn to_splat_bytes_with_transform(
@@ -109,7 +114,7 @@ impl GaussianSplatCloud {
     }
 
     pub fn to_ply_bytes(&self) -> Result<Vec<u8>, String> {
-        self.to_ply_bytes_with_transform(DEFAULT_TRANSFORM)
+        self.to_ply_bytes_with_transform(BEVY_GAUSSIAN_TRANSFORM)
     }
 
     pub fn to_ply_bytes_with_transform(&self, transform: [[f32; 3]; 3]) -> Result<Vec<u8>, String> {
@@ -149,6 +154,26 @@ impl GaussianSplatCloud {
         fs::write(path.as_ref(), self.to_ply_bytes()?)
             .map_err(|err| format!("failed to write {}: {err}", path.as_ref().display()))
     }
+
+    pub fn transformed_splats_for_bevy(&self) -> Result<Vec<GaussianSplat>, String> {
+        self.transformed_splats_with_transform(BEVY_GAUSSIAN_TRANSFORM)
+    }
+
+    pub fn transformed_splats_for_bevy_display(&self) -> Result<Vec<GaussianSplat>, String> {
+        self.transformed_splats_with_transform(BEVY_GAUSSIAN_DISPLAY_TRANSFORM)
+    }
+
+    pub fn transformed_splats_with_transform(
+        &self,
+        transform: [[f32; 3]; 3],
+    ) -> Result<Vec<GaussianSplat>, String> {
+        validate_non_empty(self)?;
+        self.splats
+            .iter()
+            .enumerate()
+            .map(|(index, splat)| transformed_splat(index, splat, transform))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -166,10 +191,7 @@ fn transformed_record(
     splat: &GaussianSplat,
     transform: [[f32; 3]; 3],
 ) -> Result<SplatRecord, String> {
-    validate_splat(index, splat)?;
-    let position = mat3_vec3(transform, splat.position);
-    let rotation = matrix_to_quat(mat3_mul(transform, quat_to_matrix(splat.rotation)));
-    let rotation = normalize_quat(rotation);
+    let transformed = transformed_splat(index, splat, transform)?;
     let opacity = splat.opacity.clamp(0.0, 1.0);
     let rgb = [
         to_u8((splat.features_dc[0] * SH_C0 + 0.5) * 255.0),
@@ -178,18 +200,35 @@ fn transformed_record(
     ];
     let rgba = [rgb[0], rgb[1], rgb[2], to_u8(opacity * 255.0)];
     let rotation_u8 = [
-        to_u8(rotation[0] * 128.0 + 128.0),
-        to_u8(rotation[1] * 128.0 + 128.0),
-        to_u8(rotation[2] * 128.0 + 128.0),
-        to_u8(rotation[3] * 128.0 + 128.0),
+        to_u8(transformed.rotation[0] * 128.0 + 128.0),
+        to_u8(transformed.rotation[1] * 128.0 + 128.0),
+        to_u8(transformed.rotation[2] * 128.0 + 128.0),
+        to_u8(transformed.rotation[3] * 128.0 + 128.0),
     ];
     Ok(SplatRecord {
-        position,
+        position: transformed.position,
         scale: splat.scale,
         rgba,
-        rotation,
+        rotation: transformed.rotation,
         rotation_u8,
         weight: opacity * splat.scale[0] * splat.scale[1] * splat.scale[2],
+    })
+}
+
+fn transformed_splat(
+    index: usize,
+    splat: &GaussianSplat,
+    transform: [[f32; 3]; 3],
+) -> Result<GaussianSplat, String> {
+    validate_splat(index, splat)?;
+    let position = mat3_vec3(transform, splat.position);
+    let rotation = matrix_to_quat(mat3_mul(transform, quat_to_matrix(splat.rotation)));
+    Ok(GaussianSplat {
+        position,
+        features_dc: splat.features_dc,
+        opacity: splat.opacity,
+        scale: splat.scale,
+        rotation: normalize_quat(rotation),
     })
 }
 
@@ -384,5 +423,47 @@ mod tests {
         assert!(text.contains("element vertex 2"));
         assert!(text.contains("property float f_dc_0"));
         assert!(text.contains("property float rot_3"));
+    }
+
+    #[test]
+    fn transformed_splats_for_bevy_preserves_count_and_coordinate_frame() {
+        let cloud = GaussianSplatCloud::new(vec![GaussianSplat {
+            position: [1.0, 2.0, 3.0],
+            features_dc: [0.1, 0.2, 0.3],
+            opacity: 0.75,
+            scale: [0.01, 0.02, 0.03],
+            rotation: [1.0, 0.0, 0.0, 0.0],
+        }]);
+
+        let transformed = cloud
+            .transformed_splats_for_bevy()
+            .expect("transformed splats");
+
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].position, [1.0, -3.0, 2.0]);
+        assert_eq!(transformed[0].features_dc, [0.1, 0.2, 0.3]);
+        assert_eq!(transformed[0].scale, [0.01, 0.02, 0.03]);
+        assert_eq!(transformed[0].opacity, 0.75);
+    }
+
+    #[test]
+    fn transformed_splats_for_bevy_display_matches_upstream_viewer_orientation() {
+        let cloud = GaussianSplatCloud::new(vec![GaussianSplat {
+            position: [1.0, 2.0, 3.0],
+            features_dc: [0.1, 0.2, 0.3],
+            opacity: 0.75,
+            scale: [0.01, 0.02, 0.03],
+            rotation: [1.0, 0.0, 0.0, 0.0],
+        }]);
+
+        let transformed = cloud
+            .transformed_splats_for_bevy_display()
+            .expect("display splats");
+
+        assert_eq!(transformed.len(), 1);
+        assert_eq!(transformed[0].position, [2.0, 3.0, 1.0]);
+        assert_eq!(transformed[0].features_dc, [0.1, 0.2, 0.3]);
+        assert_eq!(transformed[0].scale, [0.01, 0.02, 0.03]);
+        assert_eq!(transformed[0].opacity, 0.75);
     }
 }

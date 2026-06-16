@@ -14,7 +14,7 @@ readme = "README.md"
 [features]
 default = ["backend_ndarray"]
 backend_ndarray = ["burn/ndarray"]
-backend_wgpu = ["burn/wgpu"]
+backend_wgpu = ["burn/wgpu", "burn/autotune"]
 import = ["dep:burn-store", "dep:clap", "dep:safetensors", "dep:serde_json"]
 
 [dependencies]

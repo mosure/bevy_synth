@@ -9,7 +9,7 @@ use crate::components::{
     Mlp, PcdAbsolutePositionEmbedder, RePo3dRotaryEmbedding, SinusoidalEmbedder,
     UnifiedTransformerBlock, silu,
 };
-use crate::rng::{SplitMix64, deterministic_standard_normal_3d};
+use crate::rng::{SplitMix64, deterministic_standard_normal_3d, skip_standard_normals};
 
 #[derive(Config, Debug)]
 pub struct LatentSeqMmFlowModelConfig {
@@ -77,6 +77,7 @@ impl LatentSeqMmFlowModelConfig {
 pub struct TripoSplatCondition<B: Backend> {
     pub feature1: Tensor<B, 3>,
     pub feature2: Option<Tensor<B, 3>>,
+    pub rng_normals_consumed: usize,
 }
 
 impl<B: Backend> TripoSplatCondition<B> {
@@ -89,6 +90,7 @@ impl<B: Backend> TripoSplatCondition<B> {
                 let dtype: FloatDType = tensor.dtype().into();
                 Tensor::<B, 3>::zeros(tensor.shape(), &tensor.device()).cast(dtype)
             }),
+            rng_normals_consumed: self.rng_normals_consumed,
         }
     }
 
@@ -99,8 +101,15 @@ impl<B: Backend> TripoSplatCondition<B> {
         Self {
             feature1: self.feature1,
             feature2,
+            rng_normals_consumed: self.rng_normals_consumed,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfgPredictionMode {
+    Batched,
+    Separate,
 }
 
 #[derive(Clone, Debug)]
@@ -137,7 +146,28 @@ impl<B: Backend> FlowState<B> {
         cam_channels: Option<usize>,
         seed: u64,
     ) -> Self {
+        Self::deterministic_standard_normal_after_skipping(
+            device,
+            batch,
+            q_token_length,
+            in_channels,
+            cam_channels,
+            seed,
+            0,
+        )
+    }
+
+    pub fn deterministic_standard_normal_after_skipping(
+        device: &B::Device,
+        batch: usize,
+        q_token_length: usize,
+        in_channels: usize,
+        cam_channels: Option<usize>,
+        seed: u64,
+        skip_normals: usize,
+    ) -> Self {
         let mut rng = SplitMix64::new(seed);
+        skip_standard_normals(&mut rng, skip_normals);
         Self {
             latent: deterministic_standard_normal_3d(
                 &mut rng,
@@ -161,6 +191,13 @@ impl<B: Backend> FlowState<B> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct FlowEulerTrace<B: Backend> {
+    pub pred0: Option<FlowState<B>>,
+    pub steps: Vec<FlowState<B>>,
+}
+
+#[derive(Clone, Copy)]
 struct FlowPredictionContext<'a, B: Backend> {
     dtype: FloatDType,
     device: &'a B::Device,
@@ -396,7 +433,15 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         guidance_scale: f32,
         shift: f32,
     ) -> FlowState<B> {
-        self.sample_euler_cfg_prefix(noise, cond, steps, steps, guidance_scale, shift)
+        self.sample_euler_cfg_prefix_with_mode(
+            noise,
+            cond,
+            steps,
+            steps,
+            guidance_scale,
+            shift,
+            CfgPredictionMode::Batched,
+        )
     }
 
     pub fn sample_euler_cfg_prefix(
@@ -407,6 +452,27 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         prefix_steps: usize,
         guidance_scale: f32,
         shift: f32,
+    ) -> FlowState<B> {
+        self.sample_euler_cfg_prefix_with_mode(
+            noise,
+            cond,
+            total_steps,
+            prefix_steps,
+            guidance_scale,
+            shift,
+            CfgPredictionMode::Batched,
+        )
+    }
+
+    pub fn sample_euler_cfg_prefix_with_mode(
+        &self,
+        noise: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        prefix_steps: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
     ) -> FlowState<B> {
         let device = noise.latent.device();
         let dtype: FloatDType = noise.latent.dtype().into();
@@ -421,6 +487,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
                 cond.clone(),
                 neg_cond.clone(),
                 guidance_scale,
+                cfg_mode,
                 FlowPredictionContext {
                     dtype,
                     device: &device,
@@ -429,6 +496,46 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             sample = sample.sub_scaled(pred, t - t_prev);
         }
         sample
+    }
+
+    pub fn sample_euler_cfg_trace_with_mode(
+        &self,
+        noise: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        prefix_steps: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowEulerTrace<B> {
+        let device = noise.latent.device();
+        let dtype: FloatDType = noise.latent.dtype().into();
+        let mut sample = noise;
+        let neg_cond = cond.zeros_like();
+        let mut steps = vec![sample.clone()];
+        let mut pred0 = None;
+        for index in 0..prefix_steps.min(total_steps) {
+            let t = shifted_t(index, total_steps, shift);
+            let t_prev = shifted_t(index + 1, total_steps, shift);
+            let pred = self.euler_cfg_prediction(
+                sample.clone(),
+                t,
+                cond.clone(),
+                neg_cond.clone(),
+                guidance_scale,
+                cfg_mode,
+                FlowPredictionContext {
+                    dtype,
+                    device: &device,
+                },
+            );
+            if index == 0 {
+                pred0 = Some(pred.clone());
+            }
+            sample = sample.sub_scaled(pred, t - t_prev);
+            steps.push(sample.clone());
+        }
+        FlowEulerTrace { pred0, steps }
     }
 
     pub fn euler_cfg_prediction_at_step(
@@ -440,6 +547,27 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         guidance_scale: f32,
         shift: f32,
     ) -> FlowState<B> {
+        self.euler_cfg_prediction_at_step_with_mode(
+            sample,
+            cond,
+            total_steps,
+            step,
+            guidance_scale,
+            shift,
+            CfgPredictionMode::Batched,
+        )
+    }
+
+    pub fn euler_cfg_prediction_at_step_with_mode(
+        &self,
+        sample: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        step: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowState<B> {
         let device = sample.latent.device();
         let dtype: FloatDType = sample.latent.dtype().into();
         let neg_cond = cond.zeros_like();
@@ -450,6 +578,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             cond,
             neg_cond,
             guidance_scale,
+            cfg_mode,
             FlowPredictionContext {
                 dtype,
                 device: &device,
@@ -464,22 +593,68 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         cond: TripoSplatCondition<B>,
         neg_cond: TripoSplatCondition<B>,
         guidance_scale: f32,
+        cfg_mode: CfgPredictionMode,
         context: FlowPredictionContext<'_, B>,
     ) -> FlowState<B> {
-        let t_scaled =
-            Tensor::<B, 1>::from_floats([1000.0 * t], context.device).cast(context.dtype);
+        match (guidance_scale > 1.0, cfg_mode) {
+            (true, CfgPredictionMode::Batched) => self.euler_cfg_prediction_batched(
+                sample,
+                t,
+                cond,
+                neg_cond,
+                guidance_scale,
+                context,
+            ),
+            (true, CfgPredictionMode::Separate) => self.euler_cfg_prediction_separate(
+                sample,
+                t,
+                cond,
+                neg_cond,
+                guidance_scale,
+                context,
+            ),
+            (false, _) => {
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, t, context.device, context.dtype);
+                self.forward(sample, t_scaled, cond)
+            }
+        }
+    }
+
+    fn euler_cfg_prediction_batched(
+        &self,
+        sample: FlowState<B>,
+        t: f32,
+        cond: TripoSplatCondition<B>,
+        neg_cond: TripoSplatCondition<B>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+    ) -> FlowState<B> {
+        let batch = sample.latent.dims()[0];
+        let pred = self.forward(
+            concat_flow_state_batch(sample),
+            timestep_tensor(batch * 2, t, context.device, context.dtype),
+            concat_condition_batch(cond, neg_cond),
+        );
+        let (pred, neg) = split_flow_state_batch(pred, batch);
+        blend_cfg_prediction(pred, neg, guidance_scale)
+    }
+
+    fn euler_cfg_prediction_separate(
+        &self,
+        sample: FlowState<B>,
+        t: f32,
+        cond: TripoSplatCondition<B>,
+        neg_cond: TripoSplatCondition<B>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+    ) -> FlowState<B> {
+        let batch = sample.latent.dims()[0];
+        let t_scaled = timestep_tensor(batch, t, context.device, context.dtype);
         let pred = self.forward(sample.clone(), t_scaled.clone(), cond);
         if guidance_scale > 1.0 {
             let neg = self.forward(sample, t_scaled, neg_cond);
-            FlowState {
-                latent: pred.latent * guidance_scale - neg.latent * (guidance_scale - 1.0),
-                camera: match (pred.camera, neg.camera) {
-                    (Some(pred), Some(neg)) => {
-                        Some(pred * guidance_scale - neg * (guidance_scale - 1.0))
-                    }
-                    (pred, _) => pred,
-                },
-            }
+            blend_cfg_prediction(pred, neg, guidance_scale)
         } else {
             pred
         }
@@ -489,6 +664,95 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
 fn shifted_t(index: usize, steps: usize, shift: f32) -> f32 {
     let base = 1.0 - index as f32 / steps.max(1) as f32;
     shift * base / (1.0 + (shift - 1.0) * base)
+}
+
+fn timestep_tensor<B: Backend>(
+    batch: usize,
+    t: f32,
+    device: &B::Device,
+    dtype: FloatDType,
+) -> Tensor<B, 1> {
+    Tensor::<B, 1>::from_floats(vec![1000.0 * t; batch].as_slice(), device).cast(dtype)
+}
+
+fn concat_flow_state_batch<B: Backend>(sample: FlowState<B>) -> FlowState<B> {
+    FlowState {
+        latent: Tensor::cat(vec![sample.latent.clone(), sample.latent], 0),
+        camera: sample
+            .camera
+            .map(|camera| Tensor::cat(vec![camera.clone(), camera], 0)),
+    }
+}
+
+fn concat_condition_batch<B: Backend>(
+    cond: TripoSplatCondition<B>,
+    neg_cond: TripoSplatCondition<B>,
+) -> TripoSplatCondition<B> {
+    TripoSplatCondition {
+        feature1: Tensor::cat(vec![cond.feature1, neg_cond.feature1], 0),
+        feature2: match (cond.feature2, neg_cond.feature2) {
+            (Some(cond), Some(neg)) => Some(Tensor::cat(vec![cond, neg], 0)),
+            (None, None) => None,
+            _ => panic!("conditional and unconditional TripoSplat feature2 states must match"),
+        },
+        rng_normals_consumed: cond.rng_normals_consumed,
+    }
+}
+
+fn split_flow_state_batch<B: Backend>(
+    state: FlowState<B>,
+    batch: usize,
+) -> (FlowState<B>, FlowState<B>) {
+    let latent_channels = state.latent.dims()[2];
+    let pred_latent =
+        state
+            .latent
+            .clone()
+            .slice([0..batch, 0..state.latent.dims()[1], 0..latent_channels]);
+    let neg_latent = state.latent.slice([
+        batch..batch * 2,
+        0..pred_latent.dims()[1],
+        0..latent_channels,
+    ]);
+    let (pred_camera, neg_camera) = match state.camera {
+        Some(camera) => {
+            let camera_tokens = camera.dims()[1];
+            let camera_channels = camera.dims()[2];
+            (
+                Some(
+                    camera
+                        .clone()
+                        .slice([0..batch, 0..camera_tokens, 0..camera_channels]),
+                ),
+                Some(camera.slice([batch..batch * 2, 0..camera_tokens, 0..camera_channels])),
+            )
+        }
+        None => (None, None),
+    };
+    (
+        FlowState {
+            latent: pred_latent,
+            camera: pred_camera,
+        },
+        FlowState {
+            latent: neg_latent,
+            camera: neg_camera,
+        },
+    )
+}
+
+fn blend_cfg_prediction<B: Backend>(
+    pred: FlowState<B>,
+    neg: FlowState<B>,
+    guidance_scale: f32,
+) -> FlowState<B> {
+    FlowState {
+        latent: pred.latent * guidance_scale - neg.latent * (guidance_scale - 1.0),
+        camera: match (pred.camera, neg.camera) {
+            (Some(pred), Some(neg)) => Some(pred * guidance_scale - neg * (guidance_scale - 1.0)),
+            (pred, _) => pred,
+        },
+    }
 }
 
 fn layer_norm_last<B: Backend>(x: Tensor<B, 3>, epsilon: f64) -> Tensor<B, 3> {
@@ -583,6 +847,7 @@ mod tests {
                 [1, 4, config.cond2_channels.unwrap()],
                 &device,
             )),
+            rng_normals_consumed: 0,
         };
         let t = Tensor::<TestBackend, 1>::from_floats([1000.0], &device);
         let out = model.forward(state, t, cond);
@@ -602,6 +867,7 @@ mod tests {
         let condition = TripoSplatCondition {
             feature1: Tensor::<TestBackend, 3>::ones([1, 9, 16], &device),
             feature2: Some(Tensor::ones([1, 4, 8], &device)),
+            rng_normals_consumed: 0,
         }
         .with_prefix_padded_feature2();
 
@@ -688,5 +954,152 @@ mod tests {
 
         assert_eq!(first_latent, second_latent);
         assert_eq!(first_camera, second_camera);
+    }
+
+    #[test]
+    fn batched_cfg_prediction_matches_separate_cfg_prediction() {
+        let device = Default::default();
+        let config = LatentSeqMmFlowModelConfig::tiny_for_tests();
+        let model = config.clone().init::<TestBackend>(&device);
+        let sample = FlowState::<TestBackend>::deterministic_standard_normal(
+            &device,
+            1,
+            config.q_token_length,
+            config.in_channels,
+            config.cam_channels,
+            7,
+        );
+        let cond = TripoSplatCondition {
+            feature1: deterministic_standard_normal_3d(
+                &mut SplitMix64::new(11),
+                [1, 6, config.cond_channels],
+                &device,
+            ),
+            feature2: config.cond2_channels.map(|channels| {
+                deterministic_standard_normal_3d(
+                    &mut SplitMix64::new(13),
+                    [1, 4, channels],
+                    &device,
+                )
+            }),
+            rng_normals_consumed: 0,
+        }
+        .with_prefix_padded_feature2();
+        let neg_cond = cond.zeros_like();
+        let context = FlowPredictionContext {
+            dtype: FloatDType::F32,
+            device: &device,
+        };
+
+        let separate = model.euler_cfg_prediction_separate(
+            sample.clone(),
+            0.75,
+            cond.clone(),
+            neg_cond.clone(),
+            3.0,
+            context,
+        );
+        let batched =
+            model.euler_cfg_prediction_batched(sample, 0.75, cond, neg_cond, 3.0, context);
+
+        assert_tensor_close("latent", batched.latent, separate.latent, 1.0e-4);
+        assert_tensor_close(
+            "camera",
+            batched.camera.expect("batched camera"),
+            separate.camera.expect("separate camera"),
+            1.0e-4,
+        );
+    }
+
+    #[test]
+    fn flow_trace_matches_prefix_sampling() {
+        let device = Default::default();
+        let config = LatentSeqMmFlowModelConfig::tiny_for_tests();
+        let model = config.clone().init::<TestBackend>(&device);
+        let sample = FlowState::<TestBackend>::deterministic_standard_normal(
+            &device,
+            1,
+            config.q_token_length,
+            config.in_channels,
+            config.cam_channels,
+            17,
+        );
+        let cond = TripoSplatCondition {
+            feature1: deterministic_standard_normal_3d(
+                &mut SplitMix64::new(19),
+                [1, 6, config.cond_channels],
+                &device,
+            ),
+            feature2: config.cond2_channels.map(|channels| {
+                deterministic_standard_normal_3d(
+                    &mut SplitMix64::new(23),
+                    [1, 4, channels],
+                    &device,
+                )
+            }),
+            rng_normals_consumed: 0,
+        }
+        .with_prefix_padded_feature2();
+
+        let trace = model.sample_euler_cfg_trace_with_mode(
+            sample.clone(),
+            cond.clone(),
+            4,
+            3,
+            3.0,
+            3.0,
+            CfgPredictionMode::Separate,
+        );
+
+        assert_eq!(trace.steps.len(), 4);
+        assert!(trace.pred0.is_some());
+        for prefix in 0..=3 {
+            let expected = model.sample_euler_cfg_prefix_with_mode(
+                sample.clone(),
+                cond.clone(),
+                4,
+                prefix,
+                3.0,
+                3.0,
+                CfgPredictionMode::Separate,
+            );
+            assert_tensor_close(
+                &format!("latent prefix {prefix}"),
+                trace.steps[prefix].latent.clone(),
+                expected.latent,
+                1.0e-6,
+            );
+            assert_tensor_close(
+                &format!("camera prefix {prefix}"),
+                trace.steps[prefix].camera.clone().expect("trace camera"),
+                expected.camera.expect("expected camera"),
+                1.0e-6,
+            );
+        }
+    }
+
+    fn assert_tensor_close<const D: usize>(
+        label: &str,
+        actual: Tensor<TestBackend, D>,
+        expected: Tensor<TestBackend, D>,
+        tolerance: f32,
+    ) {
+        let actual = actual
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("actual tensor data");
+        let expected = expected
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("expected tensor data");
+        assert_eq!(actual.len(), expected.len(), "{label} length mismatch");
+        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "{label} mismatch at {index}: actual={actual} expected={expected}"
+            );
+        }
     }
 }

@@ -1,0 +1,38 @@
+{
+  "reference_splat": "tmp/runs/20260616T044042Z_triposplat_cuda_decoder_trace_reference/reference_32768.splat",
+  "candidate_splat": "tmp/runs/20260616T044133Z_triposplat_wgpu_decoder_trace_replay/upstream_points_features_32768.splat",
+  "reference_image": null,
+  "candidate_image": null,
+  "reference_render": "tmp/runs/20260616T135613Z_triposplat_render_psnr/reference_cuda_decoder.png",
+  "candidate_render": "tmp/runs/20260616T135613Z_triposplat_render_psnr/burn_wgpu_replay.png",
+  "width": 256,
+  "height": 256,
+  "reference_records": 32768,
+  "candidate_records": 32768,
+  "render": {
+    "frame_margin": 1.35,
+    "splat_scale": 1.0,
+    "min_sigma_px": 0.65,
+    "max_sigma_px": 16.0,
+    "sigma_extent": 3.0,
+    "include_alpha": false
+  },
+  "compare": {
+    "channels": 3,
+    "pixels": 65536,
+    "mse": 0.0185394287109375,
+    "psnr": 65.44984013557279,
+    "psnr_infinite": false,
+    "mean_abs": 0.011011759440104166,
+    "max_abs": 13,
+    "max_abs_pixel": [
+      118,
+      91
+    ],
+    "max_abs_channel": 2,
+    "reference_at_max_abs": 165,
+    "candidate_at_max_abs": 152
+  },
+  "failures": [],
+  "passed": true
+}

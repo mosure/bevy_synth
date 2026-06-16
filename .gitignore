@@ -29,11 +29,13 @@ tmp/
 scripts/
 !scripts/
 !scripts/guard_canonical_runtime.sh
+!scripts/triposplat_gsplat_render.py
 !scripts/guards/
 !scripts/guards/README.md
 !scripts/guards/*.baseline
 src/dino/
 screenshots/
+test-results/
 headless_output/
 www/assets/
 

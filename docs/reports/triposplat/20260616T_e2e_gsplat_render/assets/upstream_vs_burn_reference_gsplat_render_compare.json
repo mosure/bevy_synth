@@ -1,0 +1,38 @@
+{
+  "reference_splat": null,
+  "candidate_splat": null,
+  "reference_image": "tmp/runs/20260616T_e2e_gsplat_render/upstream_reference_shared_gsplat.png",
+  "candidate_image": "tmp/runs/20260616T_e2e_gsplat_render/burn_reference_latent_shared_gsplat.png",
+  "reference_render": null,
+  "candidate_render": null,
+  "width": 256,
+  "height": 256,
+  "reference_records": null,
+  "candidate_records": null,
+  "render": {
+    "frame_margin": 1.35,
+    "splat_scale": 1.0,
+    "min_sigma_px": 0.65,
+    "max_sigma_px": 16.0,
+    "sigma_extent": 3.0,
+    "include_alpha": false
+  },
+  "compare": {
+    "channels": 3,
+    "pixels": 65536,
+    "mse": 0.7641143798828125,
+    "psnr": 49.29921988111747,
+    "psnr_infinite": false,
+    "mean_abs": 0.060907999674479164,
+    "max_abs": 81,
+    "max_abs_pixel": [
+      131,
+      130
+    ],
+    "max_abs_channel": 0,
+    "reference_at_max_abs": 67,
+    "candidate_at_max_abs": 148
+  },
+  "failures": [],
+  "passed": true
+}

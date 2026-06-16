@@ -123,10 +123,25 @@ python3 scripts/triposplat_compare_stage_tensors.py \
   --report tmp/runs/<rust_run>/triposplat_stage_parity.json
 ```
 
-The Rust stage exporter currently uses the `NdArray` backend, so it requires
-`--precision f32`. Real-model CPU stage export is expected to be slow; use it as
-a parity harness and prefer GPU backends once native WGPU/CUDA execution is
-validated.
+The same comparison can run without Python package dependencies:
+
+```bash
+cargo run -p burn_triposplat --features import --bin triposplat_stage_compare -- \
+  tmp/runs/<reference_run>/stage_tensors_f32.safetensors \
+  tmp/runs/<rust_run>/stage_tensors_f32.safetensors \
+  --report tmp/runs/<rust_run>/triposplat_stage_parity.json
+```
+
+For native WGPU stage parity and GPU evidence capture:
+
+```bash
+TRIPOSPLAT_STOP_AFTER=encode \
+  scripts/triposplat_wgpu_reference_parity.sh
+```
+
+Set `TRIPOSPLAT_STOP_AFTER=sample` for full encode+flow-stage parity against
+the saved upstream latent. Real-model sample parity is intentionally slower and
+should be run with a timeout appropriate for the selected backend.
 
 Compare a Rust `.splat` output to an upstream reference with:
 
