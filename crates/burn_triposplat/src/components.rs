@@ -1256,6 +1256,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_profiled_with_qkv_capture(
         &self,
         label: &str,
@@ -1264,7 +1265,7 @@ impl<B: Backend> MultiHeadAttention<B> {
         rope_emb: Option<&RotaryAngles<B>>,
         query_chunk_tokens: usize,
         records: &mut Vec<TripoSplatProfileRecord>,
-        mut qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
+        qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
     ) -> Tensor<B, 3> {
         let device = x.device();
         let [batch, tokens, channels] = x.dims();
@@ -1421,7 +1422,7 @@ impl<B: Backend> MultiHeadAttention<B> {
             );
             push_finite_debug_record(records, format!("{label}.k_norm.out"), &k);
         }
-        if let Some(capture) = qkv_capture.as_deref_mut() {
+        if let Some(capture) = qkv_capture {
             capture.try_capture(label, &q, &k, &v);
         }
         let sdpa_start = Instant::now();
@@ -1541,6 +1542,7 @@ fn native_wgpu_f32_unit_flash_safe_query_chunk_tokens(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(target_arch = "wasm32"))]
 fn direct_public_attention_query_chunk_tokens(
     dtype: FloatDType,
@@ -1568,8 +1570,7 @@ fn direct_public_attention_query_chunk_tokens(
     }
     Some(
         requested_query_chunk_tokens
-            .max(1)
-            .min(WGPU_DIRECT_PUBLIC_ATTENTION_QUERY_CHUNK_TOKENS)
+            .clamp(1, WGPU_DIRECT_PUBLIC_ATTENTION_QUERY_CHUNK_TOKENS)
             .min(query_tokens),
     )
 }
@@ -1777,9 +1778,7 @@ fn native_wgpu_f16_blackbox_query_pad_multiple(
     if !matches!(dtype, FloatDType::F16) {
         return None;
     }
-    let Some(backend_name) = backend_name else {
-        return None;
-    };
+    let backend_name = backend_name?;
     let backend_name = backend_name.to_ascii_lowercase();
     if backend_name.contains("wgpu") || backend_name.contains("spirv") {
         Some(WGPU_F16_BLACKBOX_ATTENTION_QUERY_PAD_MULTIPLE)
@@ -1798,9 +1797,7 @@ fn native_wgpu_attention_binding_safe_query_chunk_tokens(
     requested_query_chunk_tokens: usize,
     backend_name: Option<&str>,
 ) -> Option<usize> {
-    let Some(backend_name) = backend_name else {
-        return None;
-    };
+    let backend_name = backend_name?;
     let backend_name = backend_name.to_ascii_lowercase();
     if !(backend_name.contains("wgpu") || backend_name.contains("spirv")) {
         return None;
@@ -2195,6 +2192,7 @@ impl<B: Backend> UnifiedTransformerBlock<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_profiled_with_qkv_capture(
         &self,
         label: &str,
@@ -2203,7 +2201,7 @@ impl<B: Backend> UnifiedTransformerBlock<B> {
         rope_emb: Option<&RotaryAngles<B>>,
         query_chunk_tokens: usize,
         records: &mut Vec<TripoSplatProfileRecord>,
-        mut qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
+        qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
     ) -> Tensor<B, 3> {
         let device = x.device();
         let [batch, tokens, channels] = x.dims();
@@ -2227,7 +2225,7 @@ impl<B: Backend> UnifiedTransformerBlock<B> {
                 rope_emb,
                 query_chunk_tokens,
                 records,
-                qkv_capture.as_deref_mut(),
+                qkv_capture,
             );
             let residual_start = Instant::now();
             let x = x + attn;
@@ -2330,7 +2328,7 @@ impl<B: Backend> UnifiedTransformerBlock<B> {
             rope_emb,
             query_chunk_tokens,
             records,
-            qkv_capture.as_deref_mut(),
+            qkv_capture,
         );
         let residual_start = Instant::now();
         let x = x + h * gate_msa.unsqueeze_dim(1);

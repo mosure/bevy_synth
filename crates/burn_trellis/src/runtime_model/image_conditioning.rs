@@ -150,7 +150,7 @@ where
         let source_label = assets.model_weights.path().display().to_string();
         let source_bytes = load_image_conditioning_weight_bytes(&assets.model_weights)?;
 
-        let device = <B as Backend>::Device::default();
+        let device = B::Device::default();
         let mut model = DinoVisionTransformer::<B>::new(&device, config.clone());
         let converted = convert_hf_dinov3(source_bytes.as_slice(), &config)?;
         let mut store = SafetensorsStore::from_bytes(Some(converted))
@@ -584,6 +584,7 @@ fn build_dinov3_config(parsed: Option<&HfDinoV3Config>) -> DinoVisionTransformer
             mode: nn::interpolate::InterpolateMode::Cubic,
             output_size: Some([patch_grid, patch_grid]),
             scale_factor: None,
+            align_corners: true,
         },
         num_patches,
     );

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use std::{fs, path::PathBuf, time::Instant};
 
 #[cfg(feature = "backend_wgpu")]
@@ -299,7 +301,7 @@ fn triposplat_wgpu_row_flash_attention_kernel<F: Float>(
         acc[dim] = F::new(0.0_f32);
     }
 
-    let mut row_max = F::new(-3.4028234663852886e38_f32);
+    let mut row_max = F::new(-3.402_823_5e38_f32);
     let mut row_sum = F::new(0.0_f32);
 
     for key_index in 0..key_tokens {
@@ -438,7 +440,7 @@ fn triposplat_wgpu_block_flash_partials_kernel<F: Float>(
         acc[dim] = F::new(0.0_f32);
     }
 
-    let mut local_max = F::new(-3.4028234663852886e38_f32);
+    let mut local_max = F::new(-3.402_823_5e38_f32);
     let mut local_sum = F::new(0.0_f32);
 
     for key_index in key_start..key_end {
@@ -490,7 +492,7 @@ fn triposplat_wgpu_block_flash_reduce_kernel<F: Float>(
     }
 
     let partial_row_base = row * key_blocks * PARTIAL_STRIDE;
-    let mut row_max = F::new(-3.4028234663852886e38_f32);
+    let mut row_max = F::new(-3.402_823_5e38_f32);
 
     for key_block in 0..key_blocks {
         let partial_base = partial_row_base + key_block * PARTIAL_STRIDE;

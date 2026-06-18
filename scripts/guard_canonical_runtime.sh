@@ -20,17 +20,21 @@ CANONICAL_FILES=(
 collect_occurrences() {
   local pattern="$1"
   local output_path="$2"
-  local rg_output
-  rg_output="$(rg -n --no-heading "${pattern}" "${CANONICAL_FILES[@]}" || true)"
-  if [[ -z "${rg_output}" ]]; then
+  local search_output
+  if command -v rg >/dev/null 2>&1; then
+    search_output="$(rg -n --no-heading "${pattern}" "${CANONICAL_FILES[@]}" || true)"
+  else
+    search_output="$(grep -n -E "${pattern}" "${CANONICAL_FILES[@]}" || true)"
+  fi
+  if [[ -z "${search_output}" ]]; then
     : > "${output_path}"
     return 0
   fi
-  rg_output="$(printf '%s\n' "${rg_output}" | sort -t: -k1,1 -k2,2n)"
+  search_output="$(printf '%s\n' "${search_output}" | sort -t: -k1,1 -k2,2n)"
   awk -F: '{
     count[$1]++
     printf "%s#%d\n", $1, count[$1]
-  }' <<<"${rg_output}" > "${output_path}"
+  }' <<<"${search_output}" > "${output_path}"
 }
 
 check_baseline() {

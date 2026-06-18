@@ -274,7 +274,7 @@ where
             )
         })?;
 
-        let device = <B as Backend>::Device::default();
+        let device = B::Device::default();
         let model = build_model::<B>(&parsed.args, &safetensors, &device)?;
         let _ = parsed.args.use_fp16;
 

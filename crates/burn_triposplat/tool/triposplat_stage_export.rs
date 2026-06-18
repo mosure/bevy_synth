@@ -1,3 +1,10 @@
+#![allow(
+    clippy::ptr_arg,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::vec_init_then_push
+)]
+
 use std::{borrow::Cow, fs, path::PathBuf, time::Instant};
 
 use burn::{
@@ -616,7 +623,7 @@ fn run_export<B: Backend>(
     let components =
         pipeline.load_runtime_components_with_compute_dtypes::<B>(&device, compute_dtypes)?;
     let image = read_image_tensor(&args.input_stages, &device)?;
-    let tensors = export_stages(&components, image, &args, backend_label)?;
+    let tensors = export_stages(&components, image, args, backend_label)?;
 
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)?;

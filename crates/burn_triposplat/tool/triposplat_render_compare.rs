@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, fs, path::PathBuf};
+use std::{
+    cmp::Ordering,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 use image::{ImageBuffer, Rgba, RgbaImage};
@@ -487,6 +491,6 @@ fn image_diff(
     })
 }
 
-fn display_path(path: &PathBuf) -> String {
-    path.display().to_string()
+fn display_path(path: impl AsRef<Path>) -> String {
+    path.as_ref().display().to_string()
 }

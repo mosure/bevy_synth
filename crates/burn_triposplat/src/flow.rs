@@ -111,17 +111,12 @@ impl<B: Backend> TripoSplatCondition<B> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CfgPredictionMode {
     Batched,
+    #[default]
     BatchedMain,
     Separate,
-}
-
-impl Default for CfgPredictionMode {
-    fn default() -> Self {
-        Self::BatchedMain
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -783,6 +778,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         FlowState { latent, camera }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn profile_forward_main_batched_with_prepared_prefix_optional_query_chunk_tokens(
         &self,
         label: &str,
@@ -820,6 +816,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         split_flow_state_batch(batched, batch)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn trace_euler_cfg_prediction_at_step_with_mode(
         &self,
         sample: FlowState<B>,
@@ -973,6 +970,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         trace
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trace_forward_with_prepared_condition_context(
         &self,
         label: &str,
@@ -1148,6 +1146,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         FlowState { latent, camera }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn profile_forward_with_prepared_condition_context(
         &self,
         label: &str,
@@ -1370,6 +1369,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sample_euler_cfg_prefix_with_mode(
         &self,
         noise: FlowState<B>,
@@ -1450,6 +1450,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         sample
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sample_euler_cfg_trace_with_mode(
         &self,
         noise: FlowState<B>,
@@ -1513,6 +1514,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn euler_cfg_prediction_at_step_with_mode(
         &self,
         sample: FlowState<B>,
@@ -1541,6 +1543,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn profile_euler_cfg_prediction_at_step_with_mode(
         &self,
         sample: FlowState<B>,
@@ -1590,6 +1593,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn profile_euler_cfg_prediction_at_step_with_query_chunk_tokens(
         &self,
         sample: FlowState<B>,
@@ -1681,6 +1685,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn euler_cfg_prediction(
         &self,
         sample: FlowState<B>,
@@ -1733,6 +1738,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         }
     }
 
+    #[allow(clippy::option_as_ref_deref, clippy::too_many_arguments)]
     fn profile_euler_cfg_prediction_with_prepared_context(
         &self,
         sample: FlowState<B>,
@@ -1756,7 +1762,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
                     pos.clone(),
                     query_chunk_tokens,
                     records,
-                    qkv_capture.as_deref_mut(),
+                    qkv_capture.as_mut().map(|capture| &mut **capture),
                 )
             }
             PreparedCfgContext::Batched { cond, pos } => {
@@ -1832,7 +1838,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
                         neg.clone(),
                         query_chunk_tokens,
                         records,
-                        qkv_capture.as_deref_mut(),
+                        qkv_capture,
                     );
                 push_profile_record(
                     records,
@@ -1877,7 +1883,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
                         pos.clone(),
                         query_chunk_tokens,
                         records,
-                        qkv_capture.as_deref_mut(),
+                        qkv_capture.as_mut().map(|capture| &mut **capture),
                     );
                     let blend_start = Instant::now();
                     let out = blend_cfg_prediction(pred, neg, guidance_scale);
@@ -2089,6 +2095,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn euler_cfg_prediction_separate_with_context(
         &self,
         sample: FlowState<B>,
@@ -2459,30 +2466,30 @@ mod tests {
             .to_vec::<f32>()
             .expect("sobol prefix values");
         let expected = [
-            0.0902513266,
-            0.5811105371,
-            0.4077436924,
-            0.7700406313,
-            0.2462926656,
-            0.6401962042,
-            0.6336019039,
-            0.7657466531,
-            0.0409966968,
-            0.4376287460,
-            0.4366661012,
-            0.7577631474,
-            0.3353308439,
-            0.9191896319,
-            0.5311235785,
-            0.5308214426,
-            0.2524206042,
-            0.2986711860,
-            0.8786804676,
-            0.7327319980,
-            0.8980799317,
-            0.1984085888,
-            0.0638877451,
-            0.1813135445,
+            0.090_251_33,
+            0.581_110_54,
+            0.407_743_7,
+            0.770_040_63,
+            0.246_292_67,
+            0.640_196_2,
+            0.633_601_9,
+            0.765_746_65,
+            0.040_996_697,
+            0.437_628_75,
+            0.436_666_1,
+            0.757_763_15,
+            0.335_330_84,
+            0.919_189_63,
+            0.531_123_6,
+            0.530_821_44,
+            0.252_420_6,
+            0.298_671_2,
+            0.878_680_47,
+            0.732_732,
+            0.898_079_93,
+            0.198_408_59,
+            0.063_887_745,
+            0.181_313_54,
         ];
         for (index, (actual, expected)) in pos.iter().zip(expected.iter()).enumerate() {
             assert!(

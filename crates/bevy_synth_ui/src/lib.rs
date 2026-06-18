@@ -2291,6 +2291,7 @@ fn sync_settings_modal(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn update_settings_labels(
     args: Option<Res<AppArgs>>,
     mut profile_labels: Query<

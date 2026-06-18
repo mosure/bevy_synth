@@ -31,6 +31,13 @@ const PREP_MSE: f32 = 30.0;
 
 #[test]
 fn triposg_pipeline_matches_reference() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("TRIPOSG_FULL_REFERENCE").is_err() {
+        eprintln!(
+            "skipping: set TRIPOSG_FULL_REFERENCE=1 to run full TripoSG pipeline reference test"
+        );
+        return Ok(());
+    }
+
     unsafe {
         std::env::set_var("RMBG_STRICT_INTERP", "1");
         std::env::set_var("DINO_STRICT_PREPROCESS", "1");

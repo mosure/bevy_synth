@@ -13,6 +13,7 @@ struct RuntimeDecodeModels<'a> {
     tex_decoder: Option<&'a SparseUnetVaeDecoderRuntime>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_latent_to_outputs(
     shape: &ShapeSLatSample,
     tex: &TexSLatSample,

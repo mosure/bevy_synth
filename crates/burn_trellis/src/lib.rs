@@ -1,4 +1,20 @@
 #![recursion_limit = "256"]
+#![cfg_attr(
+    feature = "runtime-model-wgpu",
+    allow(
+        clippy::collapsible_if,
+        clippy::manual_div_ceil,
+        clippy::manual_is_multiple_of,
+        clippy::manual_memcpy,
+        clippy::needless_return,
+        clippy::single_range_in_vec_init,
+        clippy::too_many_arguments,
+        clippy::type_complexity,
+        clippy::unnecessary_map_or,
+        clippy::unnecessary_min_or_max,
+        clippy::useless_conversion
+    )
+)]
 
 pub mod config;
 pub mod hook_diff;

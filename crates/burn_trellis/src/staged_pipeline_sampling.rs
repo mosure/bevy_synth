@@ -1,3 +1,6 @@
+#[cfg(feature = "runtime-model-wgpu")]
+use crate::sampler::FlowEulerSampleTrace;
+
 #[allow(clippy::too_many_arguments)]
 fn sample_sparse_structure(
     preprocess: &PreprocessOutput,
@@ -2210,7 +2213,8 @@ fn build_shape_concat_tensor_wgpu(
 fn coords_u32_to_wgpu_tensor(
     coords: &[[u32; 4]],
 ) -> Result<Tensor<SparseFlowWgpuBackend, 2, Int>, String> {
-    let device = <SparseFlowWgpuBackend as Backend>::Device::default();
+    let device: <SparseFlowWgpuBackend as burn::tensor::backend::BackendTypes>::Device =
+        Default::default();
     let mut flat = Vec::with_capacity(coords.len().saturating_mul(4));
     for (row_idx, coord) in coords.iter().enumerate() {
         for value in coord {

@@ -41,7 +41,7 @@ jobs:
 
     - name: canonical runtime guards
       shell: bash
-      run: ./scripts/guard_canonical_runtime.sh
+      run: bash ./scripts/guard_canonical_runtime.sh
 
     - name: test (default)
       run: cargo test
@@ -73,4 +73,4 @@ jobs:
         TRELLIS2_STRICT_BENCH_LOG="${strict_log}" \
         TRELLIS2_STRICT_BENCH_MIN_SHAPE_DISPATCHES=1 \
         TRELLIS2_STRICT_BENCH_MIN_TEX_DISPATCHES=1 \
-        ./scripts/guard_canonical_runtime.sh
+        bash ./scripts/guard_canonical_runtime.sh

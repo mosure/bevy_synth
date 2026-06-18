@@ -51,7 +51,7 @@ struct KernelLayout {
 pub mod cuda_patchify;
 #[cfg(feature = "wgpu-kernel")]
 pub mod wgpu;
-#[cfg(feature = "wgpu-kernel")]
+#[cfg(all(feature = "wgpu-kernel", feature = "legacy-wgpu-kernel"))]
 pub mod wgpu_patchify;
 #[cfg(feature = "cuda-kernel")]
 pub use cuda_patchify as cuda;
@@ -148,11 +148,10 @@ pub fn sparse_patchify3d_forward_flex(
     let mut gathered = vec![0.0f32; rows * k];
     let mut output = vec![0.0f32; rows * config.out_channels];
 
-    for row in 0..rows {
+    for (row, &[batch, tubelet, patch_row, patch_col]) in coords.iter().enumerate() {
         let out_base = row * config.out_channels;
         output[out_base..out_base + config.out_channels].copy_from_slice(weights.bias);
 
-        let [batch, tubelet, patch_row, patch_col] = coords[row];
         let batch = batch as usize;
         let t0 = tubelet as usize * config.tubelet_size;
         let y0 = patch_row as usize * config.patch_h;

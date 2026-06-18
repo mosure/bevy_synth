@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -21,7 +23,7 @@ use burn::nn;
 use burn::prelude::Backend;
 use burn::tensor::activation::{sigmoid, softmax};
 use burn::tensor::module::attention;
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData, ops::AttentionModuleOptions};
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::wgpu::{
     layer_norm_affine_forward_wgpu, rope_rotate_pairs_from_coords_wgpu, rope_rotate_pairs_wgpu,
@@ -1636,9 +1638,16 @@ where
             if reuse_qkv {
                 for q in q_chunks.into_iter() {
                     let q_tokens = q.dims()[2];
-                    let out = attention(q, k_full.clone(), v_full.clone(), None)
-                        .permute([0, 2, 1, 3])
-                        .reshape([batch, q_tokens, channels]);
+                    let out = attention(
+                        q,
+                        k_full.clone(),
+                        v_full.clone(),
+                        None,
+                        None,
+                        AttentionModuleOptions::default(),
+                    )
+                    .permute([0, 2, 1, 3])
+                    .reshape([batch, q_tokens, channels]);
                     out_chunks.push(linear_forward_stable(&self.to_out, out));
                 }
             } else {
@@ -1680,6 +1689,8 @@ where
                         k_full.clone(),
                         v_full.clone(),
                         None,
+                        None,
+                        AttentionModuleOptions::default(),
                     )
                     .permute([0, 2, 1, 3])
                     .reshape([batch, q_end - q_start, channels]);
@@ -1952,6 +1963,8 @@ impl<B: Backend> CrossAttention<B> {
                     k_module.clone().expect("module K must be present"),
                     v_module.clone().expect("module V must be present"),
                     None,
+                    None,
+                    AttentionModuleOptions::default(),
                 )
                 .permute([0, 2, 1, 3])
                 .reshape([batch, chunk_tokens, channels])
@@ -4634,7 +4647,7 @@ fn scaled_dot_product_attention<B: Backend>(
         }
 
         let out = if query_chunk >= query_tokens {
-            attention(q, k, v, None)
+            attention(q, k, v, None, None, AttentionModuleOptions::default())
         } else {
             let mut chunks = Vec::new();
             let mut start = 0usize;
@@ -4644,7 +4657,14 @@ fn scaled_dot_product_attention<B: Backend>(
                     .clone()
                     .slice([0..batch, 0..heads, start..end, 0..head_dim])
                     .clone();
-                chunks.push(attention(q_chunk, k.clone(), v.clone(), None));
+                chunks.push(attention(
+                    q_chunk,
+                    k.clone(),
+                    v.clone(),
+                    None,
+                    None,
+                    AttentionModuleOptions::default(),
+                ));
                 start = end;
             }
             Tensor::cat(chunks, 2)
