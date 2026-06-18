@@ -10,6 +10,7 @@ out/
 **/*.rs.bk
 *.pdb
 tmp/
+docs/reports/
 
 *.py
 
