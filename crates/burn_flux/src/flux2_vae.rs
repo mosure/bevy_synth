@@ -73,9 +73,9 @@ impl<B: Backend> Flux2ResnetBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let h = silu(self.norm1.forward(x.clone()));
+        let h = silu(group_norm_forward_accum_f32(&self.norm1, x.clone()));
         let h = self.conv1.forward(h);
-        let h = silu(self.norm2.forward(h));
+        let h = silu(group_norm_forward_accum_f32(&self.norm2, h));
         let h = self.conv2.forward(h);
         let residual = if let Some(shortcut) = &self.conv_shortcut {
             shortcut.forward(x)
@@ -95,12 +95,20 @@ impl<B: Backend> Flux2Downsampler<B> {
     pub fn new(device: &B::Device, channels: usize) -> Self {
         let conv = Conv2dConfig::new([channels, channels], [3, 3])
             .with_stride([2, 2])
+            .with_padding(PaddingConfig2d::Explicit(0, 0, 1, 1))
             .init(device);
         Self { conv }
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        self.conv.forward(pad_bottom_right_4d(x))
+        let dtype: FloatDType = x.dtype().into();
+        if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+            let mut conv = self.conv.clone();
+            conv.padding = PaddingConfig2d::Valid;
+            conv.forward(pad_bottom_right_4d(x))
+        } else {
+            self.conv.forward(x)
+        }
     }
 }
 
@@ -139,9 +147,7 @@ impl<B: Backend> Flux2Attention<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let [batch, channels, height, width] = x.dims();
         let tokens = height * width;
-        let h = self
-            .group_norm
-            .forward(x.clone())
+        let h = group_norm_forward_accum_f32(&self.group_norm, x.clone())
             .reshape([batch, channels, tokens])
             .swap_dims(1, 2);
         let q = self
@@ -255,7 +261,8 @@ impl<B: Backend> Flux2Encoder<B> {
         x = self.mid_resnets[0].forward(x);
         x = self.mid_attn.forward(x);
         x = self.mid_resnets[1].forward(x);
-        self.conv_out.forward(silu(self.conv_norm_out.forward(x)))
+        self.conv_out
+            .forward(silu(group_norm_forward_accum_f32(&self.conv_norm_out, x)))
     }
 
     pub fn forward_trace(&self, x: Tensor<B, 4>) -> Flux2EncoderTrace<B> {
@@ -294,7 +301,9 @@ impl<B: Backend> Flux2Encoder<B> {
         let mid_attn = x.clone();
         x = self.mid_resnets[1].forward(x);
         let mid_resnet_1 = x.clone();
-        let encoder_out = self.conv_out.forward(silu(self.conv_norm_out.forward(x)));
+        let encoder_out = self
+            .conv_out
+            .forward(silu(group_norm_forward_accum_f32(&self.conv_norm_out, x)));
 
         Flux2EncoderTrace {
             conv_in,
@@ -403,6 +412,10 @@ impl<B: Backend> Flux2VaeEncoder<B> {
                 config.batch_norm_eps,
             ),
         }
+    }
+
+    pub fn float_dtype(&self) -> FloatDType {
+        self.encoder.conv_in.weight.val().dtype().into()
     }
 
     pub fn encode(&self, images: Tensor<B, 4>, deterministic: bool) -> Tensor<B, 3> {
@@ -541,6 +554,72 @@ fn pad_bottom_right_4d<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
     let x = Tensor::cat(vec![x, right], 3);
     let bottom = Tensor::<B, 4>::zeros([batch, channels, 1, width + 1], &device).cast(dtype);
     Tensor::cat(vec![x, bottom], 2)
+}
+
+fn group_norm_forward_accum_f32<B: Backend, const D: usize>(
+    norm: &nn::GroupNorm<B>,
+    input: Tensor<B, D>,
+) -> Tensor<B, D> {
+    if input.shape()[1] != norm.num_channels {
+        panic!(
+            "The number of channels in the input tensor should be equal to the number of channels in the GroupNorm module. Expected {}, got {}",
+            norm.num_channels,
+            input.shape()[1]
+        );
+    }
+
+    let dtype: FloatDType = input.dtype().into();
+    if !matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+        return norm.forward(input);
+    }
+    if norm.affine && (norm.gamma.is_none() || norm.beta.is_none()) {
+        panic!("Affine is set to true, but gamma or beta is None");
+    }
+
+    let shape = input.shape();
+    if shape.num_elements() <= 2 {
+        panic!(
+            "input rank for GroupNorm should be at least 3, but got {}",
+            shape.num_elements()
+        );
+    }
+
+    let batch_size = shape[0];
+    let num_channels = shape[1];
+    let hidden_size = shape[2..].iter().product::<usize>() * num_channels / norm.num_groups;
+    let input = input
+        .cast(FloatDType::F32)
+        .reshape([batch_size, norm.num_groups, hidden_size]);
+    let mean = input.clone().sum_dim(2) / hidden_size as f64;
+    let input = input.sub(mean);
+    let var = input.clone().square().sum_dim(2) / hidden_size as f64;
+    let input_normalized = input.div(var.add_scalar(norm.epsilon).sqrt());
+
+    let output = if norm.affine {
+        let mut affine_shape = [1; D];
+        affine_shape[1] = num_channels;
+        input_normalized
+            .reshape(shape)
+            .mul(
+                norm.gamma
+                    .as_ref()
+                    .expect("group norm gamma should exist")
+                    .val()
+                    .cast(FloatDType::F32)
+                    .reshape(affine_shape),
+            )
+            .add(
+                norm.beta
+                    .as_ref()
+                    .expect("group norm beta should exist")
+                    .val()
+                    .cast(FloatDType::F32)
+                    .reshape(affine_shape),
+            )
+    } else {
+        input_normalized.reshape(shape)
+    };
+    output.cast(dtype)
 }
 
 fn silu<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
@@ -804,6 +883,38 @@ mod tests {
         let input = Tensor::<TestBackend, 4>::zeros([1, 3, 32, 32], &device);
         let out = model.encode(input, true);
         assert_eq!(out.dims(), [1, 4, 128]);
+    }
+
+    #[test]
+    fn flux2_downsampler_padding_matches_explicit_bottom_right_pad() {
+        let device = Default::default();
+        let downsampler = Flux2Downsampler::<TestBackend>::new(&device, 4);
+        let input = Tensor::<TestBackend, 4>::random([1, 4, 8, 8], Distribution::Default, &device);
+        let direct = downsampler.forward(input.clone());
+        let mut valid_conv = downsampler.conv.clone();
+        valid_conv.padding = PaddingConfig2d::Valid;
+        let reference = valid_conv.forward(pad_bottom_right_4d(input));
+
+        let direct = direct
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("direct vec");
+        let reference = reference
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("reference vec");
+        assert_eq!(direct.len(), reference.len());
+        let max_abs = direct
+            .iter()
+            .zip(reference.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs <= 1.0e-6,
+            "explicit conv padding changed downsampler output: max_abs={max_abs}"
+        );
     }
 
     #[test]

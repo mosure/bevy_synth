@@ -37,6 +37,48 @@ pub struct TripoSplatRuntimeLoadEvent {
     pub phase: TripoSplatRuntimeLoadPhase,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TripoSplatRuntimeComputeDtypes {
+    pub dinov3: Option<FloatDType>,
+    pub flux2_vae_encoder: Option<FloatDType>,
+    pub flow: Option<FloatDType>,
+    pub decoder: Option<FloatDType>,
+}
+
+impl TripoSplatRuntimeComputeDtypes {
+    pub fn all(dtype: Option<FloatDType>) -> Self {
+        Self {
+            dinov3: dtype,
+            flux2_vae_encoder: dtype,
+            flow: dtype,
+            decoder: dtype,
+        }
+    }
+}
+
+pub fn default_runtime_compute_dtypes_for_backend<B: Backend>(
+    precision: TripoSplatBurnpackPrecision,
+) -> TripoSplatRuntimeComputeDtypes {
+    let compute_dtype = if precision == TripoSplatBurnpackPrecision::F16 && !backend_uses_f16::<B>()
+    {
+        // Keep f16 burnpacks loadable on f32-only backends. Real f16 backends should retain
+        // upstream-style f16 module weights instead of being promoted by default.
+        Some(FloatDType::F32)
+    } else {
+        None
+    };
+    TripoSplatRuntimeComputeDtypes::all(compute_dtype)
+}
+
+pub fn wgpu_f16_fast_runtime_compute_dtypes() -> TripoSplatRuntimeComputeDtypes {
+    TripoSplatRuntimeComputeDtypes {
+        dinov3: Some(FloatDType::F32),
+        flux2_vae_encoder: Some(FloatDType::F16),
+        flow: Some(FloatDType::F16),
+        decoder: Some(FloatDType::F16),
+    }
+}
+
 impl TripoSplatRuntimeLoadEvent {
     pub fn label(self) -> String {
         format!("{}_{}", self.component, self.phase.as_str())
@@ -47,15 +89,12 @@ pub fn load_triposplat_runtime_components<B: Backend>(
     device: &B::Device,
     artifacts: &TripoSplatArtifactSet,
 ) -> Result<TripoSplatRuntimeComponents<B>, Box<dyn std::error::Error>> {
-    let compute_dtype =
-        if artifacts.precision == TripoSplatBurnpackPrecision::F16 && !backend_uses_f16::<B>() {
-            // Keep f16 burnpacks loadable on f32-only backends. Real f16 backends should retain
-            // upstream-style f16 module weights instead of being promoted by default.
-            Some(FloatDType::F32)
-        } else {
-            None
-        };
-    load_triposplat_runtime_components_with_compute_dtype(device, artifacts, compute_dtype)
+    load_triposplat_runtime_components_with_compute_dtypes_and_callback(
+        device,
+        artifacts,
+        default_runtime_compute_dtypes_for_backend::<B>(artifacts.precision),
+        |_| Ok::<(), Box<dyn std::error::Error>>(()),
+    )
 }
 
 pub fn load_triposplat_runtime_components_with_compute_dtype<B: Backend>(
@@ -81,6 +120,24 @@ where
     B: Backend,
     F: FnMut(TripoSplatRuntimeLoadEvent) -> Result<(), Box<dyn std::error::Error>>,
 {
+    load_triposplat_runtime_components_with_compute_dtypes_and_callback(
+        device,
+        artifacts,
+        TripoSplatRuntimeComputeDtypes::all(compute_dtype),
+        &mut after_component,
+    )
+}
+
+pub fn load_triposplat_runtime_components_with_compute_dtypes_and_callback<B, F>(
+    device: &B::Device,
+    artifacts: &TripoSplatArtifactSet,
+    compute_dtypes: TripoSplatRuntimeComputeDtypes,
+    mut after_component: F,
+) -> Result<TripoSplatRuntimeComponents<B>, Box<dyn std::error::Error>>
+where
+    B: Backend,
+    F: FnMut(TripoSplatRuntimeLoadEvent) -> Result<(), Box<dyn std::error::Error>>,
+{
     let dino = required_artifact("dino_v3_vit_h")?;
     let flux = required_artifact("flux2_vae_encoder")?;
     let flow = required_artifact("triposplat_flow")?;
@@ -91,23 +148,32 @@ where
         "dino_v3_vit_h",
         TripoSplatRuntimeLoadPhase::Loaded,
     ))?;
-    if should_cast_artifact(artifacts.precision, compute_dtype) {
-        dinov3 = cast_module_float_dtype(dinov3, compute_dtype.expect("checked cast dtype"));
+    if should_cast_artifact(artifacts.precision, compute_dtypes.dinov3) {
+        dinov3 =
+            cast_module_float_dtype(dinov3, compute_dtypes.dinov3.expect("checked cast dtype"));
         after_component(load_event(
             "dino_v3_vit_h",
             TripoSplatRuntimeLoadPhase::Cast,
         ))?;
     }
+    dinov3.rebuild_rope_cache(
+        device,
+        compute_dtypes
+            .dinov3
+            .unwrap_or_else(|| artifact_precision_dtype(artifacts.precision)),
+    );
 
     let mut flux2_vae_encoder = load_flux2_artifact(device, flux, artifacts)?;
     after_component(load_event(
         "flux2_vae_encoder",
         TripoSplatRuntimeLoadPhase::Loaded,
     ))?;
-    if should_cast_artifact(artifacts.precision, compute_dtype) {
+    if should_cast_artifact(artifacts.precision, compute_dtypes.flux2_vae_encoder) {
         flux2_vae_encoder = cast_module_float_dtype(
             flux2_vae_encoder,
-            compute_dtype.expect("checked cast dtype"),
+            compute_dtypes
+                .flux2_vae_encoder
+                .expect("checked cast dtype"),
         );
         after_component(load_event(
             "flux2_vae_encoder",
@@ -120,8 +186,9 @@ where
         "triposplat_flow",
         TripoSplatRuntimeLoadPhase::Loaded,
     ))?;
-    if should_cast_artifact(artifacts.precision, compute_dtype) {
-        flow = cast_module_float_dtype(flow, compute_dtype.expect("checked cast dtype"));
+    if should_cast_artifact(artifacts.precision, compute_dtypes.flow) {
+        flow = cast_module_float_dtype(flow, compute_dtypes.flow.expect("checked cast dtype"));
+        flow.reset_canonical_pos_pe(device);
         after_component(load_event(
             "triposplat_flow",
             TripoSplatRuntimeLoadPhase::Cast,
@@ -133,8 +200,9 @@ where
         "triposplat_vae_decoder",
         TripoSplatRuntimeLoadPhase::Loaded,
     ))?;
-    if should_cast_artifact(artifacts.precision, compute_dtype) {
-        decoder = cast_module_float_dtype(decoder, compute_dtype.expect("checked cast dtype"));
+    if should_cast_artifact(artifacts.precision, compute_dtypes.decoder) {
+        decoder =
+            cast_module_float_dtype(decoder, compute_dtypes.decoder.expect("checked cast dtype"));
         after_component(load_event(
             "triposplat_vae_decoder",
             TripoSplatRuntimeLoadPhase::Cast,
@@ -434,6 +502,13 @@ fn should_cast_artifact(
             | (TripoSplatBurnpackPrecision::F32, Some(FloatDType::F32))
             | (TripoSplatBurnpackPrecision::F16, Some(FloatDType::F16))
     )
+}
+
+fn artifact_precision_dtype(precision: TripoSplatBurnpackPrecision) -> FloatDType {
+    match precision {
+        TripoSplatBurnpackPrecision::F32 => FloatDType::F32,
+        TripoSplatBurnpackPrecision::F16 => FloatDType::F16,
+    }
 }
 
 fn load_dinov3_artifact<B: Backend>(

@@ -83,16 +83,41 @@ def apply_environment(args: argparse.Namespace) -> None:
         include_root = args.python_include_root / "usr" / "include"
         if include_root.exists():
             paths = [
-                str(path)
+                str(path.resolve())
                 for path in include_root.iterdir()
                 if path.is_dir() and path.name.startswith("python")
             ]
-            paths.append(str(include_root))
+            paths.append(str(include_root.resolve()))
         else:
-            paths = [str(args.python_include_root)]
+            paths = [str(args.python_include_root.resolve())]
         for key in ("CPATH", "CPLUS_INCLUDE_PATH"):
             current = os.environ.get(key)
             os.environ[key] = os.pathsep.join(paths + ([current] if current else []))
+        include_flags = " ".join(f"-I{path}" for path in paths)
+        for key in ("CFLAGS", "CXXFLAGS", "CPPFLAGS"):
+            current = os.environ.get(key)
+            os.environ[key] = (
+                f"{include_flags} {current}" if current else include_flags
+            )
+        python_include = next(
+            (path for path in paths if pathlib.Path(path).name.startswith("python")),
+            paths[0],
+        )
+        import sysconfig
+
+        sysconfig._INSTALL_SCHEMES.setdefault("posix_prefix", {})[
+            "include"
+        ] = python_include
+        original_get_path = sysconfig.get_path
+
+        def get_path(name, scheme=None, vars=None, expand=True):
+            if name == "include":
+                return python_include
+            if scheme is None:
+                return original_get_path(name, vars=vars, expand=expand)
+            return original_get_path(name, scheme=scheme, vars=vars, expand=expand)
+
+        sysconfig.get_path = get_path
 
 
 def parse_background(text: str) -> tuple[float, float, float]:

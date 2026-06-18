@@ -68,6 +68,9 @@ struct DiffSummary {
     candidate_at_max_abs: Option<f32>,
     count_abs_gt_threshold: usize,
     fraction_abs_gt_threshold: f64,
+    reference_nonfinite_count: usize,
+    candidate_nonfinite_count: usize,
+    nonfinite_pair_count: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -236,6 +239,14 @@ fn compare_tensor(
             .failures
             .push(format!("{name} rms {:.6e} > {:.6e}", diff.rms, args.rms));
     }
+    if diff.reference_nonfinite_count > 0 || diff.candidate_nonfinite_count > 0 {
+        report.failures.push(format!(
+            "{name} contains non-finite values: reference={} candidate={} pairs={}",
+            diff.reference_nonfinite_count,
+            diff.candidate_nonfinite_count,
+            diff.nonfinite_pair_count
+        ));
+    }
     report.tensors.push(tensor_report);
 }
 
@@ -289,15 +300,39 @@ fn diff_summary(reference: &[f32], candidate: &[f32], max_abs_threshold: f64) ->
             candidate_at_max_abs: None,
             count_abs_gt_threshold: 0,
             fraction_abs_gt_threshold: 0.0,
+            reference_nonfinite_count: 0,
+            candidate_nonfinite_count: 0,
+            nonfinite_pair_count: 0,
         };
     }
 
+    const NONFINITE_SENTINEL: f64 = 1.0e30;
     let mut max_abs = 0.0f64;
     let mut max_abs_flat_index = 0usize;
     let mut sum_abs = 0.0f64;
     let mut sum_sq = 0.0f64;
     let mut count_abs_gt_threshold = 0usize;
+    let mut reference_nonfinite_count = 0usize;
+    let mut candidate_nonfinite_count = 0usize;
+    let mut nonfinite_pair_count = 0usize;
     for (index, (reference, candidate)) in reference.iter().zip(candidate.iter()).enumerate() {
+        let reference_finite = reference.is_finite();
+        let candidate_finite = candidate.is_finite();
+        if !reference_finite {
+            reference_nonfinite_count += 1;
+        }
+        if !candidate_finite {
+            candidate_nonfinite_count += 1;
+        }
+        if !(reference_finite && candidate_finite) {
+            nonfinite_pair_count += 1;
+            count_abs_gt_threshold += 1;
+            if max_abs < NONFINITE_SENTINEL {
+                max_abs = NONFINITE_SENTINEL;
+                max_abs_flat_index = index;
+            }
+            continue;
+        }
         let diff = *candidate as f64 - *reference as f64;
         let abs = diff.abs();
         if abs > max_abs {
@@ -311,14 +346,40 @@ fn diff_summary(reference: &[f32], candidate: &[f32], max_abs_threshold: f64) ->
         sum_sq += diff * diff;
     }
     let count = reference.len() as f64;
+    let (mean_abs, rms) = if nonfinite_pair_count > 0 {
+        (NONFINITE_SENTINEL, NONFINITE_SENTINEL)
+    } else {
+        (sum_abs / count, (sum_sq / count).sqrt())
+    };
     DiffSummary {
         max_abs,
-        mean_abs: sum_abs / count,
-        rms: (sum_sq / count).sqrt(),
+        mean_abs,
+        rms,
         max_abs_flat_index: Some(max_abs_flat_index),
         reference_at_max_abs: Some(reference[max_abs_flat_index]),
         candidate_at_max_abs: Some(candidate[max_abs_flat_index]),
         count_abs_gt_threshold,
         fraction_abs_gt_threshold: count_abs_gt_threshold as f64 / count,
+        reference_nonfinite_count,
+        candidate_nonfinite_count,
+        nonfinite_pair_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_summary_counts_candidate_nan_as_failure_magnitude() {
+        let diff = diff_summary(&[1.0, 2.0, 3.0], &[1.0, f32::NAN, 3.0], 0.1);
+
+        assert_eq!(diff.reference_nonfinite_count, 0);
+        assert_eq!(diff.candidate_nonfinite_count, 1);
+        assert_eq!(diff.nonfinite_pair_count, 1);
+        assert_eq!(diff.count_abs_gt_threshold, 1);
+        assert!(diff.max_abs > 1.0e20);
+        assert!(diff.mean_abs > 1.0e20);
+        assert!(diff.rms > 1.0e20);
     }
 }

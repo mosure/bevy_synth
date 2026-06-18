@@ -1466,12 +1466,13 @@ fn handle_page_buttons(
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_button_visuals(
     catalog: Res<CatalogState>,
     drag: Res<DragState>,
     args: Option<Res<AppArgs>>,
     available: Option<Res<AvailablePipelines>>,
+    modal: Res<SettingsModalState>,
     mut selection: ResMut<CatalogSelectionState>,
     mut controls: Query<
         (
@@ -1482,6 +1483,7 @@ fn update_button_visuals(
             Option<&CatalogDeleteButton>,
             Option<&PipelineSelectorButton>,
             Option<&PipelineOptionButton>,
+            Option<&SettingsButton>,
             Option<&TripoSplatProfileButton>,
             &Children,
             &mut BackgroundColor,
@@ -1509,6 +1511,7 @@ fn update_button_visuals(
     let args_ref = args.as_deref();
     let available_ref = available.as_deref();
     let selected_pipeline = args_ref.and_then(|args| args.synthesis_models.first().copied());
+    let triposplat_settings_enabled = triposplat_settings_enabled(args_ref);
 
     for (
         interaction,
@@ -1518,6 +1521,7 @@ fn update_button_visuals(
         delete,
         pipeline_selector,
         pipeline_option,
+        settings_button,
         profile,
         children,
         mut bg,
@@ -1533,11 +1537,14 @@ fn update_button_visuals(
         } else if let Some(pipeline_option) = pipeline_option {
             !pipeline_available(available_ref, pipeline_option.model)
                 || !pipeline_supported(args_ref, pipeline_option.model)
+        } else if settings_button.is_some() {
+            !triposplat_settings_enabled
         } else {
             false
         };
         let active = pipeline_selector.is_some()
             || pipeline_option.is_some_and(|pipeline| Some(pipeline.model) == selected_pipeline)
+            || settings_button.is_some_and(|_| triposplat_settings_enabled && modal.open)
             || profile
                 .zip(args_ref)
                 .is_some_and(|(profile, args)| profile.profile == args.triposplat_profile);
@@ -1928,6 +1935,7 @@ fn handle_pipeline_option_button(
     args: Option<ResMut<AppArgs>>,
     available: Option<Res<AvailablePipelines>>,
     mut dropdown: ResMut<PipelineDropdownState>,
+    mut modal: ResMut<SettingsModalState>,
     mut interactions: Query<(&Interaction, &PipelineOptionButton), Changed<Interaction>>,
 ) {
     let Some(mut args) = args else {
@@ -1963,6 +1971,9 @@ fn handle_pipeline_option_button(
         }
         args.synthesis_models = vec![button.model];
         dropdown.open = false;
+        if !matches!(button.model, SynthesisModel::Triposplat) {
+            modal.open = false;
+        }
         if matches!(button.model, SynthesisModel::Triposplat)
             && args.triposplat_profile != TripoSplatProfile::Custom
         {
@@ -2115,11 +2126,16 @@ fn spawn_pipeline_dropdown(
 
 fn handle_settings_button(
     mut interactions: Query<&Interaction, (Changed<Interaction>, With<SettingsButton>)>,
+    args: Option<Res<AppArgs>>,
     mut modal: ResMut<SettingsModalState>,
 ) {
     for interaction in interactions.iter_mut() {
         if *interaction == Interaction::Pressed {
-            modal.open = !modal.open;
+            if triposplat_settings_enabled(args.as_deref()) {
+                modal.open = !modal.open;
+            } else {
+                modal.open = false;
+            }
         }
     }
 }
@@ -2142,6 +2158,9 @@ fn handle_triposplat_profile_button(
     let Some(mut args) = args else {
         return;
     };
+    if !triposplat_settings_enabled(Some(&*args)) {
+        return;
+    }
     for (interaction, button) in interactions.iter_mut() {
         if *interaction != Interaction::Pressed {
             continue;
@@ -2161,6 +2180,9 @@ fn handle_triposplat_setting_step_button(
     let Some(mut args) = args else {
         return;
     };
+    if !triposplat_settings_enabled(Some(&*args)) {
+        return;
+    }
     for (interaction, button) in interactions.iter_mut() {
         if *interaction != Interaction::Pressed {
             continue;
@@ -2171,10 +2193,14 @@ fn handle_triposplat_setting_step_button(
 
 fn sync_settings_modal(
     mut commands: Commands,
+    args: Option<Res<AppArgs>>,
     mut modal: ResMut<SettingsModalState>,
     mut ui: ResMut<CatalogUiState>,
     children: Query<&Children>,
 ) {
+    if !triposplat_settings_enabled(args.as_deref()) {
+        modal.open = false;
+    }
     ui.settings_modal_open = modal.open;
     match (modal.open, modal.entity) {
         (true, None) => {
@@ -2343,7 +2369,7 @@ fn spawn_settings_modal(commands: &mut Commands) -> Entity {
 
                 spawn_triposplat_setting_row(panel, "steps", TripoSplatSetting::Steps);
                 spawn_triposplat_setting_row(panel, "cfg guidance", TripoSplatSetting::Guidance);
-                spawn_triposplat_setting_row(panel, "gaussians", TripoSplatSetting::Gaussians);
+                spawn_triposplat_setting_row(panel, "gaussian count", TripoSplatSetting::Gaussians);
             });
         })
         .id()
@@ -2486,8 +2512,29 @@ fn triposplat_setting_value_text(args: &AppArgs, setting: TripoSplatSetting) -> 
     match setting {
         TripoSplatSetting::Steps => args.num_steps.to_string(),
         TripoSplatSetting::Guidance => format!("{:.1}", args.guidance_scale),
-        TripoSplatSetting::Gaussians => args.triposplat_num_gaussians.to_string(),
+        TripoSplatSetting::Gaussians => format_grouped_usize(args.triposplat_num_gaussians),
     }
+}
+
+fn triposplat_settings_enabled(args: Option<&AppArgs>) -> bool {
+    args.and_then(|args| args.synthesis_models.first().copied())
+        .is_some_and(|model| matches!(model, SynthesisModel::Triposplat))
+}
+
+fn format_grouped_usize(value: usize) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len().saturating_sub(1) / 3);
+    let first_group_len = raw.len() % 3;
+    for (index, ch) in raw.chars().enumerate() {
+        if index > 0
+            && (index == first_group_len
+                || (index > first_group_len && (index - first_group_len).is_multiple_of(3)))
+        {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn spawn_preview_scene(
@@ -2583,7 +2630,7 @@ fn spawn_preview_scene(
 fn triposplat_preview_cloud_settings() -> CloudSettings {
     CloudSettings {
         sort_mode: SortMode::Std,
-        color_space: GaussianColorSpace::LinRec709Display,
+        color_space: GaussianColorSpace::SrgbRec709Display,
         ..default()
     }
 }
@@ -2883,8 +2930,63 @@ mod tests {
             .single(world)
             .expect("one Gaussian preview settings");
         assert_eq!(settings.sort_mode, SortMode::Std);
-        assert_eq!(settings.color_space, GaussianColorSpace::LinRec709Display);
+        assert_eq!(settings.color_space, GaussianColorSpace::SrgbRec709Display);
         assert_eq!(world.query::<&GaussianCamera>().iter(world).count(), 1);
+    }
+
+    #[test]
+    fn triposplat_settings_modal_only_opens_for_triposplat_pipeline() {
+        let mut triposg_args = AppArgs::default();
+        triposg_args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        let mut app = ui_test_app(Some(triposg_args));
+
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+
+        {
+            let world = app.world_mut();
+            assert!(!world.resource::<SettingsModalState>().open);
+            assert_eq!(
+                world.query::<&SettingsModalRoot>().iter(world).count(),
+                0,
+                "TripoSplat settings should not be available for TripoSG"
+            );
+        }
+
+        app.world_mut().resource_mut::<AppArgs>().synthesis_models =
+            vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+
+        let world = app.world_mut();
+        assert!(world.resource::<SettingsModalState>().open);
+        assert_eq!(
+            world.query::<&SettingsModalRoot>().iter(world).count(),
+            1,
+            "TripoSplat settings should open when TripoSplat is active"
+        );
+    }
+
+    #[test]
+    fn triposplat_settings_modal_closes_when_pipeline_changes() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
+        let mut app = ui_test_app(Some(args));
+
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        {
+            let world = app.world_mut();
+            assert_eq!(world.query::<&SettingsModalRoot>().iter(world).count(), 1);
+        }
+
+        app.world_mut().resource_mut::<AppArgs>().synthesis_models =
+            vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        app.update();
+
+        let world = app.world_mut();
+        assert!(!world.resource::<SettingsModalState>().open);
+        assert_eq!(world.query::<&SettingsModalRoot>().iter(world).count(), 0);
     }
 
     #[test]
@@ -2939,5 +3041,25 @@ mod tests {
             TripoSplatSettingDelta::Integer(-(TRIPOSPLAT_GAUSSIAN_STEP as isize)),
         );
         assert_eq!(args.triposplat_num_gaussians, TRIPOSPLAT_MIN_NUM_GAUSSIANS);
+    }
+
+    #[test]
+    fn triposplat_gaussian_value_text_uses_exact_grouped_count() {
+        let mut args = AppArgs::default();
+        args.triposplat_num_gaussians = TRIPOSPLAT_MAX_NUM_GAUSSIANS;
+        assert_eq!(
+            triposplat_setting_value_text(&args, TripoSplatSetting::Gaussians),
+            "262,144"
+        );
+    }
+
+    #[test]
+    fn triposplat_setting_gate_tracks_active_pipeline() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        assert!(!triposplat_settings_enabled(Some(&args)));
+
+        args.synthesis_models = vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
+        assert!(triposplat_settings_enabled(Some(&args)));
     }
 }

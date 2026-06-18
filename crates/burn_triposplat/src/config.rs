@@ -1,9 +1,17 @@
+use crate::flow::CfgPredictionMode;
+
 pub const DEFAULT_NUM_STEPS: usize = 20;
 pub const DEFAULT_GUIDANCE_SCALE: f32 = 3.0;
 pub const DEFAULT_SHIFT: f32 = 3.0;
 pub const DEFAULT_SEED: u64 = 42;
 pub const DEFAULT_ERODE_RADIUS: usize = 1;
-pub const DEFAULT_Q_TOKEN_LENGTH: usize = 8192;
+pub const TRIPOSPLAT_CANONICAL_CANVAS_SIZE: usize = 1024;
+pub const TRIPOSPLAT_FAST_VAE_TOKEN_LENGTH: usize = 4096;
+pub const TRIPOSPLAT_DINOV3_PREFIX_TOKENS: usize = 5;
+pub const TRIPOSPLAT_FAST_DINOV3_TOKEN_LENGTH: usize =
+    TRIPOSPLAT_FAST_VAE_TOKEN_LENGTH + TRIPOSPLAT_DINOV3_PREFIX_TOKENS;
+pub const TRIPOSPLAT_FLOW_LATENT_TOKEN_LENGTH: usize = 8192;
+pub const DEFAULT_Q_TOKEN_LENGTH: usize = TRIPOSPLAT_FLOW_LATENT_TOKEN_LENGTH;
 pub const TRIPOSPLAT_GAUSSIANS_PER_POINT: usize = 32;
 pub const MIN_NUM_GAUSSIANS: usize = 32_768;
 pub const MAX_NUM_GAUSSIANS: usize = 262_144;
@@ -19,6 +27,8 @@ pub struct TripoSplatOptions {
     pub seed: u64,
     pub num_gaussians: usize,
     pub erode_radius: usize,
+    pub attention_query_chunk_tokens: Option<usize>,
+    pub cfg_mode: CfgPredictionMode,
 }
 
 impl Default for TripoSplatOptions {
@@ -30,6 +40,8 @@ impl Default for TripoSplatOptions {
             seed: DEFAULT_SEED,
             num_gaussians: DEFAULT_NUM_GAUSSIANS,
             erode_radius: DEFAULT_ERODE_RADIUS,
+            attention_query_chunk_tokens: None,
+            cfg_mode: CfgPredictionMode::default(),
         }
     }
 }
@@ -130,6 +142,16 @@ mod tests {
     }
 
     #[test]
+    fn defaults_match_upstream_fast_path_token_contract() {
+        assert_eq!(TRIPOSPLAT_CANONICAL_CANVAS_SIZE, 1024);
+        assert_eq!(TRIPOSPLAT_FAST_VAE_TOKEN_LENGTH, 4096);
+        assert_eq!(TRIPOSPLAT_DINOV3_PREFIX_TOKENS, 5);
+        assert_eq!(TRIPOSPLAT_FAST_DINOV3_TOKEN_LENGTH, 4101);
+        assert_eq!(TRIPOSPLAT_FLOW_LATENT_TOKEN_LENGTH, 8192);
+        assert_eq!(DEFAULT_Q_TOKEN_LENGTH, TRIPOSPLAT_FLOW_LATENT_TOKEN_LENGTH);
+    }
+
+    #[test]
     fn profiles_match_upstream_triposplat_ranges() {
         let low = TripoSplatProfile::Low.settings();
         assert_eq!(low.steps, 5);
@@ -145,5 +167,13 @@ mod tests {
         assert_eq!(high.steps, 50);
         assert_eq!(high.guidance_scale, DEFAULT_GUIDANCE_SCALE);
         assert_eq!(high.num_gaussians, MAX_NUM_GAUSSIANS);
+    }
+
+    #[test]
+    fn default_options_use_batched_main_cfg_prediction() {
+        assert_eq!(
+            TripoSplatOptions::default().cfg_mode,
+            CfgPredictionMode::BatchedMain
+        );
     }
 }

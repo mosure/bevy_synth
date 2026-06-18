@@ -35,11 +35,12 @@ use burn_tripo::pipeline::triposg::{
     TripoSGLoadOptions, TripoSGPipeline, TripoSGSamplerProgress, deterministic_latents_from_seed,
 };
 use burn_triposplat::{
-    GaussianSplatCloud, TripoSplatArtifactSet, TripoSplatBurnpackPrecision, TripoSplatOptions,
-    TripoSplatPipeline, TripoSplatPipelineConfig, TripoSplatRuntimeComponents,
+    CfgPredictionMode, GaussianSplatCloud, TripoSplatArtifactSet, TripoSplatBurnpackPrecision,
+    TripoSplatOptions, TripoSplatPipeline, TripoSplatPipelineConfig, TripoSplatRuntimeComponents,
     normalize_num_gaussians,
 };
 use image::{ImageFormat, RgbaImage};
+use sha2::{Digest, Sha256};
 
 use crate::io::ImageSource;
 use crate::mesh::Mesh;
@@ -74,11 +75,10 @@ const DEFAULT_TRIPOSPLAT_ERODE_RADIUS: usize = 1;
 type WgpuBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
 #[cfg(feature = "wgpu")]
-type WgpuTripoSplatBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+type WgpuTripoSplatBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
 #[cfg(feature = "wgpu")]
-type WgpuTripoSplatBackendF16 =
-    burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, burn::tensor::f16, i32, u32>;
+type WgpuTripoSplatBackendF16 = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 
 #[cfg(feature = "cuda")]
 type CudaBackend = burn_cuda::Cuda<f32, i32>;
@@ -161,6 +161,8 @@ pub struct RuntimeConfig {
     pub num_steps: usize,
     pub num_tokens: usize,
     pub guidance_scale: f32,
+    pub triposplat_num_steps: usize,
+    pub triposplat_guidance_scale: f32,
     pub triposplat_shift: f32,
     pub triposplat_num_gaussians: usize,
     pub triposplat_erode_radius: usize,
@@ -194,6 +196,8 @@ impl Default for RuntimeConfig {
             num_steps: DEFAULT_NUM_STEPS,
             num_tokens: DEFAULT_NUM_TOKENS,
             guidance_scale: DEFAULT_GUIDANCE_SCALE,
+            triposplat_num_steps: burn_triposplat::DEFAULT_NUM_STEPS,
+            triposplat_guidance_scale: burn_triposplat::DEFAULT_GUIDANCE_SCALE,
             triposplat_shift: DEFAULT_TRIPOSPLAT_SHIFT,
             triposplat_num_gaussians: DEFAULT_TRIPOSPLAT_NUM_GAUSSIANS,
             triposplat_erode_radius: DEFAULT_TRIPOSPLAT_ERODE_RADIUS,
@@ -633,8 +637,8 @@ impl SynthRuntime {
                 "synthesis_model=triposplat backend={} num_gaussians={} steps={} guidance_scale={:.3}",
                 selected_backend.as_str(),
                 triposplat_counts_label(&num_gaussians),
-                self.config.num_steps,
-                self.config.guidance_scale
+                self.config.triposplat_num_steps,
+                self.config.triposplat_guidance_scale
             )),
         );
         let splats = if request.dry_run {
@@ -1480,15 +1484,34 @@ struct BackendTripoSplatState<B: Backend> {
     components: TripoSplatRuntimeComponents<B>,
     weights_root: PathBuf,
     precision: TripoSplatBurnpackPrecision,
+    decoder_compute_label: &'static str,
+    latent_cache: Option<TripoSplatLatentCache<B>>,
+}
+
+struct TripoSplatLatentCache<B: Backend> {
+    key: TripoSplatLatentCacheKey,
+    latent: Tensor<B, 3>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TripoSplatLatentCacheKey {
+    image_hash: [u8; 32],
+    seed: u64,
+    steps: usize,
+    guidance_scale_bits: u32,
+    shift_bits: u32,
+    cfg_mode: CfgPredictionMode,
+    attention_query_chunk_tokens: Option<usize>,
 }
 
 impl<B: Backend> BackendTripoSplatState<B> {
     fn load_detail(&self) -> String {
         format!(
-            "weights_root={} precision={} compute={}",
+            "weights_root={} precision={} compute={} decoder_compute={}",
             self.weights_root.display(),
             self.precision.as_str(),
             backend_float_label::<B>(),
+            self.decoder_compute_label,
         )
     }
 }
@@ -1756,14 +1779,28 @@ fn load_triposplat_state_with_device<B: Backend>(
         precision,
     })
     .map_err(|err| RuntimeError::new(format!("failed to initialize TripoSplat: {err}")))?;
-    let components = pipeline
+    let mut components = pipeline
         .load_runtime_components(&device)
         .map_err(|err| RuntimeError::new(format!("failed to load TripoSplat components: {err}")))?;
+    let decoder_compute_label = if matches!(backend, InferenceBackend::Wgpu)
+        && matches!(precision, TripoSplatBurnpackPrecision::F16)
+        && backend_float_label::<B>() == "f16"
+    {
+        components.decoder = burn_triposplat::import::cast_module_float_dtype(
+            components.decoder,
+            burn::tensor::FloatDType::F32,
+        );
+        "f32"
+    } else {
+        backend_float_label::<B>()
+    };
     Ok(BackendTripoSplatState {
         device,
         components,
         weights_root,
         precision,
+        decoder_compute_label,
+        latent_cache: None,
     })
 }
 
@@ -1804,6 +1841,8 @@ fn load_cuda_triposplat_state(
         components,
         weights_root: pipeline.config().weights_root.clone(),
         precision,
+        decoder_compute_label: backend_float_label::<CudaBackend>(),
+        latent_cache: None,
     })
 }
 
@@ -2040,12 +2079,14 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 fn triposplat_options_from_config(config: &RuntimeConfig) -> TripoSplatOptions {
     TripoSplatOptions {
-        steps: config.num_steps,
-        guidance_scale: config.guidance_scale,
+        steps: config.triposplat_num_steps,
+        guidance_scale: config.triposplat_guidance_scale,
         shift: config.triposplat_shift,
         seed: config.seed.unwrap_or(DEFAULT_SEED),
         num_gaussians: config.triposplat_num_gaussians,
         erode_radius: config.triposplat_erode_radius,
+        cfg_mode: CfgPredictionMode::default(),
+        attention_query_chunk_tokens: None,
     }
 }
 
@@ -2226,6 +2267,44 @@ fn triposplat_splats_detail(splats: &[GaussianSplatCloud]) -> String {
     format!("splats=[{counts}]")
 }
 
+fn triposplat_latent_cache_key(
+    prepared: &PreparedImageData,
+    options: &TripoSplatOptions,
+) -> TripoSplatLatentCacheKey {
+    let mut hasher = Sha256::new();
+    hasher.update((prepared.width as u64).to_le_bytes());
+    hasher.update((prepared.height as u64).to_le_bytes());
+    update_f32_slice_hash(&mut hasher, prepared.data.as_slice());
+    update_optional_f32_slice_hash(&mut hasher, prepared.alpha_mask.as_deref());
+    update_optional_f32_slice_hash(&mut hasher, prepared.alpha_probs.as_deref());
+    TripoSplatLatentCacheKey {
+        image_hash: hasher.finalize().into(),
+        seed: options.seed,
+        steps: options.steps,
+        guidance_scale_bits: options.guidance_scale.to_bits(),
+        shift_bits: options.shift.to_bits(),
+        cfg_mode: options.cfg_mode,
+        attention_query_chunk_tokens: options.attention_query_chunk_tokens,
+    }
+}
+
+fn update_optional_f32_slice_hash(hasher: &mut Sha256, values: Option<&[f32]>) {
+    match values {
+        Some(values) => {
+            hasher.update([1]);
+            update_f32_slice_hash(hasher, values);
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn update_f32_slice_hash(hasher: &mut Sha256, values: &[f32]) {
+    hasher.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        hasher.update(value.to_le_bytes());
+    }
+}
+
 fn resize_prepared_image_for_triposplat(
     prepared: PreparedImageData,
     canvas_size: usize,
@@ -2290,67 +2369,95 @@ fn run_triposplat_preprocessed_many<B: Backend>(
 ) -> RuntimeResult<Vec<GaussianSplatCloud>> {
     let counts = normalize_triposplat_counts(num_gaussians, options.num_gaussians)?;
     options.num_gaussians = counts[0];
+    let cache_key = triposplat_latent_cache_key(prepared, &options);
 
-    progress.stage_started(
-        "triposplat.prepare_tensor",
-        None,
-        Some(format!("image={}x{}", prepared.width, prepared.height)),
-    );
-    let prepare_start = Instant::now();
-    let image = prepared.to_tensor(&state.device);
-    progress.stage_completed(
-        "triposplat.prepare_tensor",
-        None,
-        prepare_start.elapsed().as_secs_f64() * 1000.0,
-        None,
-    );
-    B::memory_cleanup(&state.device);
+    let latent = if let Some(cache) = state
+        .latent_cache
+        .as_ref()
+        .filter(|cache| cache.key == cache_key)
+    {
+        progress.stage_started(
+            "triposplat.sample",
+            Some(0),
+            Some(format!(
+                "cache=hit steps={} guidance_scale={:.3} shift={:.3}",
+                options.steps, options.guidance_scale, options.shift
+            )),
+        );
+        progress.stage_completed(
+            "triposplat.sample",
+            Some(0),
+            0.0,
+            Some("cache=hit reused_latent=true".to_string()),
+        );
+        cache.latent.clone()
+    } else {
+        progress.stage_started(
+            "triposplat.prepare_tensor",
+            None,
+            Some(format!("image={}x{}", prepared.width, prepared.height)),
+        );
+        let prepare_start = Instant::now();
+        let image = prepared.to_tensor(&state.device);
+        progress.stage_completed(
+            "triposplat.prepare_tensor",
+            None,
+            prepare_start.elapsed().as_secs_f64() * 1000.0,
+            None,
+        );
+        B::memory_cleanup(&state.device);
 
-    progress.stage_started(
-        "triposplat.encode",
-        None,
-        Some(format!("seed={}", options.seed)),
-    );
-    let encode_start = Instant::now();
-    B::seed(&state.device, options.seed);
-    let condition = state.components.encode_preprocessed_image_random(image);
-    progress.stage_completed(
-        "triposplat.encode",
-        None,
-        encode_start.elapsed().as_secs_f64() * 1000.0,
-        Some(format!(
-            "feature1_tokens={} feature2={}",
-            condition.feature1.dims()[1],
-            condition
-                .feature2
-                .as_ref()
-                .map(|feature2| format!("tokens={}", feature2.dims()[1]))
-                .unwrap_or_else(|| "none".to_string())
-        )),
-    );
-    B::memory_cleanup(&state.device);
+        progress.stage_started(
+            "triposplat.encode",
+            None,
+            Some(format!("seed={}", options.seed)),
+        );
+        let encode_start = Instant::now();
+        B::seed(&state.device, options.seed);
+        let condition = state.components.encode_preprocessed_image_random(image);
+        progress.stage_completed(
+            "triposplat.encode",
+            None,
+            encode_start.elapsed().as_secs_f64() * 1000.0,
+            Some(format!(
+                "feature1_tokens={} feature2={}",
+                condition.feature1.dims()[1],
+                condition
+                    .feature2
+                    .as_ref()
+                    .map(|feature2| format!("tokens={}", feature2.dims()[1]))
+                    .unwrap_or_else(|| "none".to_string())
+            )),
+        );
+        B::memory_cleanup(&state.device);
 
-    progress.stage_started(
-        "triposplat.sample",
-        Some(options.steps),
-        Some(format!(
-            "guidance_scale={:.3} shift={:.3}",
-            options.guidance_scale, options.shift
-        )),
-    );
-    let sample_start = Instant::now();
-    let latent = state
-        .components
-        .sample_latent_random(condition, options)
-        .latent;
-    let sample_elapsed_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
-    progress.stage_completed(
-        "triposplat.sample",
-        Some(options.steps),
-        sample_elapsed_ms,
-        Some(avg_step_detail(sample_elapsed_ms, options.steps, "flow")),
-    );
-    B::memory_cleanup(&state.device);
+        progress.stage_started(
+            "triposplat.sample",
+            Some(options.steps),
+            Some(format!(
+                "cache=miss guidance_scale={:.3} shift={:.3}",
+                options.guidance_scale, options.shift
+            )),
+        );
+        let sample_start = Instant::now();
+        let latent = state
+            .components
+            .sample_latent_random(condition, options)
+            .latent;
+        let sample_elapsed_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+        progress.stage_completed(
+            "triposplat.sample",
+            Some(options.steps),
+            sample_elapsed_ms,
+            Some(avg_step_detail(sample_elapsed_ms, options.steps, "flow")),
+        );
+        B::memory_cleanup(&state.device);
+        state.latent_cache = Some(TripoSplatLatentCache {
+            key: cache_key,
+            latent: latent.clone(),
+        });
+        latent
+    };
 
     progress.stage_started(
         "triposplat.decode",
@@ -2368,12 +2475,20 @@ fn run_triposplat_preprocessed_many<B: Backend>(
         .components
         .decode_latent_many(latent, counts.iter().copied(), options)
         .map_err(|err| RuntimeError::new(format!("TripoSplat inference failed: {err}")))?;
+    let decode_readbacks = output.decode_readbacks;
     let splats = output.splats;
     progress.stage_completed(
         "triposplat.decode",
         None,
         decode_start.elapsed().as_secs_f64() * 1000.0,
-        Some(triposplat_splats_detail(&splats)),
+        Some(format!(
+            "{} readbacks={} sync_readbacks={} async_readbacks={} readback_bytes={}",
+            triposplat_splats_detail(&splats),
+            decode_readbacks.total_readbacks(),
+            decode_readbacks.sync_readbacks,
+            decode_readbacks.async_readbacks,
+            decode_readbacks.bytes
+        )),
     );
     B::memory_cleanup(&state.device);
     Ok(splats)
@@ -2820,19 +2935,6 @@ mod tests {
     }
 
     #[cfg(feature = "wgpu")]
-    fn assert_backend_type_is_raw_wgpu<B>(label: &str) {
-        let type_name = std::any::type_name::<B>();
-        assert!(
-            type_name.contains("burn_cubecl::backend::CubeBackend"),
-            "{label} must use raw CubeCL WGPU backend, got backend type {type_name}"
-        );
-        assert!(
-            !type_name.contains("burn_fusion"),
-            "{label} must not use Burn fusion, got backend type {type_name}"
-        );
-    }
-
-    #[cfg(feature = "wgpu")]
     #[test]
     fn wgpu_backend_alias_uses_burn_fusion() {
         assert_backend_type_uses_fusion::<WgpuBackend>("WGPU backend");
@@ -2840,9 +2942,9 @@ mod tests {
 
     #[cfg(feature = "wgpu")]
     #[test]
-    fn triposplat_wgpu_backend_alias_uses_raw_wgpu_for_parity() {
-        assert_backend_type_is_raw_wgpu::<WgpuTripoSplatBackend>("TripoSplat WGPU backend");
-        assert_backend_type_is_raw_wgpu::<WgpuTripoSplatBackendF16>("TripoSplat WGPU f16 backend");
+    fn triposplat_wgpu_backend_alias_uses_burn_fusion() {
+        assert_backend_type_uses_fusion::<WgpuTripoSplatBackend>("TripoSplat WGPU backend");
+        assert_backend_type_uses_fusion::<WgpuTripoSplatBackendF16>("TripoSplat WGPU f16 backend");
     }
 
     #[cfg(feature = "cuda")]
@@ -3026,6 +3128,8 @@ mod tests {
             components,
             weights_root: PathBuf::from("unused"),
             precision: TripoSplatBurnpackPrecision::F32,
+            decoder_compute_label: "f32",
+            latent_cache: None,
         };
         let prepared = PreparedImageData {
             data: vec![0.5; 3 * 32 * 32],
@@ -3093,6 +3197,49 @@ mod tests {
     }
 
     #[test]
+    fn triposplat_latent_cache_key_ignores_decode_only_gaussian_count() {
+        let prepared = PreparedImageData {
+            data: vec![0.5; 3 * 2 * 2],
+            width: 2,
+            height: 2,
+            alpha_mask: None,
+            alpha_probs: None,
+            bbox: None,
+        };
+        let mut first = TripoSplatOptions {
+            steps: 5,
+            guidance_scale: 3.0,
+            shift: 3.0,
+            seed: 7,
+            num_gaussians: 32_768,
+            ..TripoSplatOptions::default()
+        };
+        let mut second = first;
+        second.num_gaussians = 262_144;
+
+        assert_eq!(
+            triposplat_latent_cache_key(&prepared, &first),
+            triposplat_latent_cache_key(&prepared, &second),
+            "Gaussian count is a decode-only setting and must not invalidate sampled latent cache"
+        );
+
+        first.guidance_scale = 4.0;
+        assert_ne!(
+            triposplat_latent_cache_key(&prepared, &first),
+            triposplat_latent_cache_key(&prepared, &second),
+            "Guidance affects sampling and must invalidate sampled latent cache"
+        );
+
+        let mut third = second;
+        third.cfg_mode = CfgPredictionMode::Separate;
+        assert_ne!(
+            triposplat_latent_cache_key(&prepared, &second),
+            triposplat_latent_cache_key(&prepared, &third),
+            "CFG execution mode affects sampling and must invalidate sampled latent cache"
+        );
+    }
+
+    #[test]
     fn triposplat_prepared_image_is_normalized_to_unit_rgb() {
         let prepared = PreparedImageData {
             data: vec![0.0, 127.5, 255.0],
@@ -3117,6 +3264,36 @@ mod tests {
         assert_eq!(config.max_dimension, usize::MAX);
         assert_eq!(config.resize_shorter_to, Some(TRIPOSPLAT_CANVAS_SIZE));
         assert_eq!(config.alpha_erode_radius, 1);
+        assert_eq!(
+            TRIPOSPLAT_CANVAS_SIZE,
+            burn_triposplat::TRIPOSPLAT_CANONICAL_CANVAS_SIZE
+        );
+        assert_eq!(burn_triposplat::TRIPOSPLAT_FAST_VAE_TOKEN_LENGTH, 4096);
+        assert_eq!(burn_triposplat::TRIPOSPLAT_FAST_DINOV3_TOKEN_LENGTH, 4101);
+        assert_eq!(burn_triposplat::DEFAULT_Q_TOKEN_LENGTH, 8192);
+    }
+
+    #[test]
+    fn runtime_config_has_triposplat_specific_upstream_defaults() {
+        let config = RuntimeConfig::default();
+
+        assert_eq!(config.num_steps, DEFAULT_NUM_STEPS);
+        assert_eq!(config.guidance_scale, DEFAULT_GUIDANCE_SCALE);
+        assert_eq!(
+            config.triposplat_num_steps,
+            burn_triposplat::DEFAULT_NUM_STEPS
+        );
+        assert_eq!(
+            config.triposplat_guidance_scale,
+            burn_triposplat::DEFAULT_GUIDANCE_SCALE
+        );
+
+        let options = triposplat_options_from_config(&config);
+        assert_eq!(options.steps, burn_triposplat::DEFAULT_NUM_STEPS);
+        assert_eq!(
+            options.guidance_scale,
+            burn_triposplat::DEFAULT_GUIDANCE_SCALE
+        );
     }
 
     #[test]

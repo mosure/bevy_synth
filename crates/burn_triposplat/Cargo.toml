@@ -14,12 +14,24 @@ readme = "README.md"
 [features]
 default = ["backend_ndarray"]
 backend_ndarray = ["burn/ndarray", "burn_dino/backend_ndarray", "burn_flux/backend_ndarray"]
+backend_cuda = [
+  "burn/cuda",
+  "burn/autotune",
+  "burn/fusion",
+  "burn_dino/backend_cuda",
+  "burn_flux/backend_cuda",
+]
 backend_wgpu = [
+  "dep:burn-wgpu",
+  "dep:burn-cubecl",
+  "dep:cubek",
   "burn/wgpu",
   "burn/autotune",
+  "burn/fusion",
   "burn_dino/backend_wgpu",
   "burn_flux/backend_wgpu",
 ]
+backend_wgpu_vulkan = ["backend_wgpu", "burn/vulkan"]
 import = [
   "dep:burn-store",
   "dep:clap",
@@ -42,6 +54,17 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 safetensors = { version = "0.6", optional = true }
 burn-store = { version = "=0.21.0", optional = true }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
+burn-cubecl = { version = "=0.21.0", optional = true, default-features = false, features = ["autotune", "fusion", "std"] }
+cubek = { version = "0.2.0", optional = true, default-features = false, features = ["attention"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies]
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["autotune", "fusion", "std", "metal"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies]
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["autotune", "fusion", "std", "vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+burn-wgpu = { version = "=0.21.0", optional = true, default-features = false, features = ["autotune", "fusion", "std", "webgpu"] }
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
@@ -73,6 +96,12 @@ test = false
 [[bin]]
 name = "triposplat_render_compare"
 path = "tool/triposplat_render_compare.rs"
+required-features = ["import"]
+test = false
+
+[[bin]]
+name = "triposplat_attention_bench"
+path = "tool/triposplat_attention_bench.rs"
 required-features = ["import"]
 test = false
 

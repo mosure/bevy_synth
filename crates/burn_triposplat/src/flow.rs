@@ -1,14 +1,19 @@
+use std::time::Instant;
+
 use burn::{
     module::Param,
     nn,
     prelude::*,
-    tensor::{Distribution, FloatDType},
+    tensor::{DType, Distribution, FloatDType, TensorData},
 };
 
 use crate::components::{
-    Mlp, PcdAbsolutePositionEmbedder, RePo3dRotaryEmbedding, SinusoidalEmbedder,
-    UnifiedTransformerBlock, silu,
+    AttentionQkvCapture, AttentionQkvCaptureState, Mlp, PcdAbsolutePositionEmbedder,
+    RePo3dRotaryEmbedding, SinusoidalEmbedder, TripoSplatProfileRecord, UnifiedTransformerBlock,
+    default_attention_query_chunk_tokens, push_finite_debug_record, push_profile_record, silu,
+    sync_elapsed_ms,
 };
+use crate::config::DEFAULT_Q_TOKEN_LENGTH;
 use crate::rng::{SplitMix64, deterministic_standard_normal_3d, skip_standard_normals};
 
 #[derive(Config, Debug)]
@@ -32,7 +37,7 @@ pub struct LatentSeqMmFlowModelConfig {
 impl LatentSeqMmFlowModelConfig {
     pub fn triposplat() -> Self {
         Self {
-            q_token_length: 8192,
+            q_token_length: DEFAULT_Q_TOKEN_LENGTH,
             in_channels: 16,
             cam_channels: Some(5),
             out_channels: 16,
@@ -109,7 +114,14 @@ impl<B: Backend> TripoSplatCondition<B> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CfgPredictionMode {
     Batched,
+    BatchedMain,
     Separate,
+}
+
+impl Default for CfgPredictionMode {
+    fn default() -> Self {
+        Self::BatchedMain
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -181,10 +193,15 @@ impl<B: Backend> FlowState<B> {
     }
 
     fn sub_scaled(self, velocity: FlowState<B>, dt: f32) -> Self {
+        let latent_dtype: FloatDType = self.latent.dtype().into();
+        let velocity_latent = cast_tensor_dtype(velocity.latent, latent_dtype);
         Self {
-            latent: self.latent - velocity.latent.mul_scalar(dt),
+            latent: self.latent - velocity_latent.mul_scalar(dt),
             camera: match (self.camera, velocity.camera) {
-                (Some(sample), Some(velocity)) => Some(sample - velocity.mul_scalar(dt)),
+                (Some(sample), Some(velocity)) => {
+                    let dtype: FloatDType = sample.dtype().into();
+                    Some(sample - cast_tensor_dtype(velocity, dtype).mul_scalar(dt))
+                }
                 (sample, _) => sample,
             },
         }
@@ -194,13 +211,59 @@ impl<B: Backend> FlowState<B> {
 #[derive(Clone, Debug)]
 pub struct FlowEulerTrace<B: Backend> {
     pub pred0: Option<FlowState<B>>,
+    pub preds: Vec<FlowState<B>>,
     pub steps: Vec<FlowState<B>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowPredictionProfile<B: Backend> {
+    pub output: FlowState<B>,
+    pub records: Vec<TripoSplatProfileRecord>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowPredictionQkvProfile<B: Backend> {
+    pub output: FlowState<B>,
+    pub records: Vec<TripoSplatProfileRecord>,
+    pub qkv_capture: Option<AttentionQkvCapture<B>>,
 }
 
 #[derive(Clone, Copy)]
 struct FlowPredictionContext<'a, B: Backend> {
     dtype: FloatDType,
     device: &'a B::Device,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedCfgContext<B: Backend> {
+    Conditional {
+        cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+    },
+    Batched {
+        cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+    },
+    BatchedMain {
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+    },
+    Separate {
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PreparedFlowPrefix<B: Backend> {
+    h_x: Tensor<B, 3>,
+    h_cam: Option<Tensor<B, 3>>,
+    t_emb: Tensor<B, 2>,
+    t_mod: Tensor<B, 2>,
+    batch: usize,
+    latent_tokens: usize,
 }
 
 #[derive(Module, Debug)]
@@ -221,6 +284,8 @@ pub struct LatentSeqMmFlowModel<B: Backend> {
     pub out_layer: nn::Linear<B>,
     pub cam_out_layer: Option<nn::Linear<B>>,
     pub pos_pe: Param<Tensor<B, 2>>,
+    #[module(skip)]
+    latent_pos_embed: Tensor<B, 2>,
     config: LatentSeqMmFlowModelConfig,
 }
 
@@ -228,6 +293,12 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
     pub fn new(device: &B::Device, config: LatentSeqMmFlowModelConfig) -> Self {
         let head_dim = config.model_channels / config.num_heads;
         let pos_pe = torch_sobol_seed123_dim3_positions(config.q_token_length, device);
+        let latent_pos_embed = canonical_latent_position_embedding(
+            config.q_token_length,
+            config.model_channels,
+            device,
+            pos_pe.val(),
+        );
         let block = |modulation, share_mod| {
             UnifiedTransformerBlock::new(
                 device,
@@ -330,6 +401,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
                     .init(device)
             }),
             pos_pe,
+            latent_pos_embed,
             config,
         }
     }
@@ -338,8 +410,18 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         &self.config
     }
 
+    pub fn float_dtype(&self) -> FloatDType {
+        self.input_layer.weight.val().dtype().into()
+    }
+
     pub fn reset_canonical_pos_pe(&mut self, device: &B::Device) {
         self.pos_pe = torch_sobol_seed123_dim3_positions(self.config.q_token_length, device);
+        self.latent_pos_embed = canonical_latent_position_embedding(
+            self.config.q_token_length,
+            self.config.model_channels,
+            device,
+            self.pos_pe.val(),
+        );
     }
 
     pub fn forward(
@@ -348,14 +430,120 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         t: Tensor<B, 1>,
         cond: TripoSplatCondition<B>,
     ) -> FlowState<B> {
-        let z = x_t.latent;
-        let [batch, latent_tokens, _] = z.dims();
+        let batch = x_t.latent.dims()[0];
+        let h_cond = self.prepare_condition_context(cond);
+        let pos = self.prepare_latent_position(batch);
+        self.forward_with_prepared_condition_context(x_t, t, h_cond, pos)
+    }
+
+    fn prepare_condition_context(&self, cond: TripoSplatCondition<B>) -> Tensor<B, 3> {
         let cond_tokens = cond.feature1.dims()[1];
-        let mut h_x = self.input_layer.forward(z);
-        let mut h_cond = self.cond_embedder.forward(cond.feature1);
+        let dtype = self.float_dtype();
+        let mut h_cond = self
+            .cond_embedder
+            .forward(cast_tensor_dtype(cond.feature1, dtype));
         if let (Some(embedder2), Some(feature2)) = (&self.cond_embedder2, cond.feature2) {
-            h_cond = h_cond + embedder2.forward(prefix_pad_feature2(feature2, cond_tokens));
+            h_cond = h_cond
+                + embedder2.forward(cast_tensor_dtype(
+                    prefix_pad_feature2(feature2, cond_tokens),
+                    dtype,
+                ));
         }
+        for (index, block) in self.context_refiner.iter().enumerate() {
+            let rope = self.context_repo_layers[index].forward(h_cond.clone());
+            h_cond = block.forward(h_cond, None, Some(&rope));
+        }
+        h_cond
+    }
+
+    fn prepare_latent_position(&self, batch: usize) -> Tensor<B, 3> {
+        let dtype = self.float_dtype();
+        self.latent_pos_embed
+            .clone()
+            .cast(dtype)
+            .unsqueeze_dim::<3>(0)
+            .expand([batch as i64, -1, -1])
+    }
+
+    fn prepare_cfg_context(
+        &self,
+        cond: TripoSplatCondition<B>,
+        guidance_scale: f32,
+        cfg_mode: CfgPredictionMode,
+    ) -> PreparedCfgContext<B> {
+        let batch = cond.feature1.dims()[0];
+        if guidance_scale <= 1.0 {
+            return PreparedCfgContext::Conditional {
+                cond: self.prepare_condition_context(cond),
+                pos: self.prepare_latent_position(batch),
+            };
+        }
+
+        let neg_cond = cond.zeros_like();
+        let cond = self.prepare_condition_context(cond);
+        let neg = self.prepare_condition_context(neg_cond);
+        match cfg_mode {
+            CfgPredictionMode::Batched => PreparedCfgContext::Batched {
+                cond: Tensor::cat(vec![cond, neg], 0),
+                pos: self.prepare_latent_position(batch * 2),
+            },
+            CfgPredictionMode::BatchedMain => PreparedCfgContext::BatchedMain {
+                cond,
+                neg,
+                pos: self.prepare_latent_position(batch),
+            },
+            CfgPredictionMode::Separate => PreparedCfgContext::Separate {
+                cond,
+                neg,
+                pos: self.prepare_latent_position(batch),
+            },
+        }
+    }
+
+    fn forward_with_prepared_condition_context(
+        &self,
+        x_t: FlowState<B>,
+        t: Tensor<B, 1>,
+        h_cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+    ) -> FlowState<B> {
+        self.forward_with_prepared_condition_context_optional_query_chunk_tokens(
+            x_t, t, h_cond, pos, None,
+        )
+    }
+
+    fn forward_with_prepared_condition_context_optional_query_chunk_tokens(
+        &self,
+        x_t: FlowState<B>,
+        t: Tensor<B, 1>,
+        h_cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
+        let prefix = self.prepare_forward_prefix_optional_query_chunk_tokens(
+            x_t,
+            t,
+            pos,
+            query_chunk_tokens,
+        );
+        self.forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+            prefix,
+            h_cond,
+            query_chunk_tokens,
+        )
+    }
+
+    fn prepare_forward_prefix_optional_query_chunk_tokens(
+        &self,
+        x_t: FlowState<B>,
+        t: Tensor<B, 1>,
+        pos: Tensor<B, 3>,
+        query_chunk_tokens: Option<usize>,
+    ) -> PreparedFlowPrefix<B> {
+        let dtype = self.float_dtype();
+        let z = cast_tensor_dtype(x_t.latent, dtype);
+        let [batch, latent_tokens, _] = z.dims();
+        let mut h_x = self.input_layer.forward(z);
         let t_emb = self.t_embedder.forward(t);
         let t_mod = if self.config.share_mod {
             self.ada_ln_modulation
@@ -366,25 +554,52 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             t_emb.clone()
         };
 
-        let pos = PcdAbsolutePositionEmbedder::legacy(self.config.model_channels)
-            .forward_2d(self.pos_pe.val())
-            .unsqueeze_dim::<3>(0)
-            .expand([batch as i64, -1, -1]);
         h_x = h_x + pos;
 
         for (index, block) in self.noise_refiner.iter().enumerate() {
             let rope = self.noise_repo_layers[index].forward(h_x.clone());
-            h_x = block.forward(h_x, Some(t_mod.clone()), Some(&rope));
-        }
-        for (index, block) in self.context_refiner.iter().enumerate() {
-            let rope = self.context_repo_layers[index].forward(h_cond.clone());
-            h_cond = block.forward(h_cond, None, Some(&rope));
+            h_x = if let Some(query_chunk_tokens) = query_chunk_tokens {
+                block.forward_with_query_chunk_tokens(
+                    h_x,
+                    Some(t_mod.clone()),
+                    Some(&rope),
+                    query_chunk_tokens,
+                )
+            } else {
+                block.forward(h_x, Some(t_mod.clone()), Some(&rope))
+            };
         }
 
         let h_cam = match (&self.cam_refiner, x_t.camera) {
-            (Some(refiner), Some(camera)) => Some(refiner.forward(camera)),
+            (Some(refiner), Some(camera)) => {
+                Some(refiner.forward(cast_tensor_dtype(camera, dtype)))
+            }
             _ => None,
         };
+        PreparedFlowPrefix {
+            h_x,
+            h_cam,
+            t_emb,
+            t_mod,
+            batch,
+            latent_tokens,
+        }
+    }
+
+    fn forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+        &self,
+        prefix: PreparedFlowPrefix<B>,
+        h_cond: Tensor<B, 3>,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
+        let PreparedFlowPrefix {
+            h_x,
+            h_cam,
+            t_emb,
+            t_mod,
+            batch,
+            latent_tokens,
+        } = prefix;
         let mut parts = vec![h_x, h_cond];
         if let Some(camera) = h_cam.clone() {
             parts.push(camera);
@@ -392,7 +607,16 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         let mut h = Tensor::cat(parts, 1);
         for (index, block) in self.blocks.iter().enumerate() {
             let rope = self.repo_layers[index].forward(h.clone());
-            h = block.forward(h, Some(t_mod.clone()), Some(&rope));
+            h = if let Some(query_chunk_tokens) = query_chunk_tokens {
+                block.forward_with_query_chunk_tokens(
+                    h,
+                    Some(t_mod.clone()),
+                    Some(&rope),
+                    query_chunk_tokens,
+                )
+            } else {
+                block.forward(h, Some(t_mod.clone()), Some(&rope))
+            };
         }
 
         let h_channels = h.dims()[2];
@@ -425,6 +649,688 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         }
     }
 
+    fn forward_main_batched_with_prepared_prefix_optional_query_chunk_tokens(
+        &self,
+        prefix: PreparedFlowPrefix<B>,
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        query_chunk_tokens: Option<usize>,
+    ) -> (FlowState<B>, FlowState<B>) {
+        let PreparedFlowPrefix {
+            h_x,
+            h_cam,
+            t_emb,
+            t_mod,
+            batch,
+            latent_tokens,
+        } = prefix;
+        let batched_prefix = PreparedFlowPrefix {
+            h_x: Tensor::cat(vec![h_x.clone(), h_x], 0),
+            h_cam: h_cam.map(|camera| Tensor::cat(vec![camera.clone(), camera], 0)),
+            t_emb: Tensor::cat(vec![t_emb.clone(), t_emb], 0),
+            t_mod: Tensor::cat(vec![t_mod.clone(), t_mod], 0),
+            batch: batch * 2,
+            latent_tokens,
+        };
+        let batched = self.forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+            batched_prefix,
+            Tensor::cat(vec![cond, neg], 0),
+            query_chunk_tokens,
+        );
+        split_flow_state_batch(batched, batch)
+    }
+
+    fn profile_forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+        &self,
+        label: &str,
+        prefix: PreparedFlowPrefix<B>,
+        h_cond: Tensor<B, 3>,
+        query_chunk_tokens: usize,
+        records: &mut Vec<TripoSplatProfileRecord>,
+        mut qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
+    ) -> FlowState<B> {
+        let device = h_cond.device();
+        let PreparedFlowPrefix {
+            h_x,
+            h_cam,
+            t_emb,
+            t_mod,
+            batch,
+            latent_tokens,
+        } = prefix;
+        let concat_start = Instant::now();
+        let mut parts = vec![h_x, h_cond];
+        if let Some(camera) = h_cam.clone() {
+            parts.push(camera);
+        }
+        let mut h = Tensor::cat(parts, 1);
+        push_profile_record(
+            records,
+            format!("{label}.concat_main_tokens"),
+            batch,
+            h.dims()[1],
+            self.config.model_channels,
+            sync_elapsed_ms::<B>(&device, concat_start),
+        );
+        push_finite_debug_record(records, format!("{label}.concat_main_tokens.out"), &h);
+
+        for (index, block) in self.blocks.iter().enumerate() {
+            let rope_start = Instant::now();
+            let rope = self.repo_layers[index].forward(h.clone());
+            push_profile_record(
+                records,
+                format!("{label}.main_{index:02}.repo"),
+                batch,
+                h.dims()[1],
+                self.config.model_channels,
+                sync_elapsed_ms::<B>(&device, rope_start),
+            );
+            h = block.forward_profiled_with_qkv_capture(
+                &format!("{label}.main_{index:02}.block"),
+                h,
+                Some(t_mod.clone()),
+                Some(&rope),
+                query_chunk_tokens,
+                records,
+                qkv_capture.as_deref_mut(),
+            );
+            push_finite_debug_record(records, format!("{label}.main_{index:02}.out"), &h);
+        }
+
+        let output_start = Instant::now();
+        let h_channels = h.dims()[2];
+        let mut h_x = h.clone().slice([0..batch, 0..latent_tokens, 0..h_channels]);
+        h_x = layer_norm_last(h_x, 1.0e-6);
+        let mut h_cam = h_cam.map(|camera| {
+            let cam_tokens = camera.dims()[1];
+            let h_tokens = h.dims()[1];
+            let mut h_cam =
+                h.clone()
+                    .slice([0..batch, h_tokens - cam_tokens..h_tokens, 0..h_channels]);
+            h_cam = layer_norm_last(h_cam, 1.0e-6);
+            h_cam
+        });
+
+        if let Some(shift_table) = &self.shift_table {
+            let shifted = shift_table.val() + t_emb.unsqueeze_dim(1);
+            let shift = shifted.clone().slice([0..batch, 0..1, 0..h_channels]);
+            let scale = shifted.slice([0..batch, 1..2, 0..h_channels]);
+            h_x = h_x * (scale.clone() + 1.0) + shift.clone();
+            h_cam = h_cam.map(|cam| cam * (scale + 1.0) + shift);
+        }
+
+        let latent = self.out_layer.forward(h_x);
+        let camera = match (self.cam_out_layer.as_ref(), h_cam) {
+            (Some(layer), Some(cam)) => Some(layer.forward(cam)),
+            _ => None,
+        };
+        push_profile_record(
+            records,
+            format!("{label}.output_projection"),
+            batch,
+            latent_tokens,
+            self.config.out_channels,
+            sync_elapsed_ms::<B>(&device, output_start),
+        );
+        push_finite_debug_record(
+            records,
+            format!("{label}.output_projection.latent"),
+            &latent,
+        );
+        if let Some(camera) = &camera {
+            push_finite_debug_record(records, format!("{label}.output_projection.camera"), camera);
+        }
+        FlowState { latent, camera }
+    }
+
+    fn profile_forward_main_batched_with_prepared_prefix_optional_query_chunk_tokens(
+        &self,
+        label: &str,
+        prefix: PreparedFlowPrefix<B>,
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        query_chunk_tokens: usize,
+        records: &mut Vec<TripoSplatProfileRecord>,
+        qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
+    ) -> (FlowState<B>, FlowState<B>) {
+        let PreparedFlowPrefix {
+            h_x,
+            h_cam,
+            t_emb,
+            t_mod,
+            batch,
+            latent_tokens,
+        } = prefix;
+        let batched_prefix = PreparedFlowPrefix {
+            h_x: Tensor::cat(vec![h_x.clone(), h_x], 0),
+            h_cam: h_cam.map(|camera| Tensor::cat(vec![camera.clone(), camera], 0)),
+            t_emb: Tensor::cat(vec![t_emb.clone(), t_emb], 0),
+            t_mod: Tensor::cat(vec![t_mod.clone(), t_mod], 0),
+            batch: batch * 2,
+            latent_tokens,
+        };
+        let batched = self.profile_forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+            label,
+            batched_prefix,
+            Tensor::cat(vec![cond, neg], 0),
+            query_chunk_tokens,
+            records,
+            qkv_capture,
+        );
+        split_flow_state_batch(batched, batch)
+    }
+
+    pub fn trace_euler_cfg_prediction_at_step_with_mode(
+        &self,
+        sample: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        step: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+        token_limit: usize,
+    ) -> Vec<(String, Tensor<B, 3>)> {
+        let device = sample.latent.device();
+        let dtype: FloatDType = sample.latent.dtype().into();
+        let schedule = flow_schedule_step(step, total_steps, shift);
+        let prepared_context = self.prepare_cfg_context(cond, guidance_scale, cfg_mode);
+        let mut trace = Vec::new();
+        match prepared_context {
+            PreparedCfgContext::Conditional { cond, pos } => {
+                let batch = sample.latent.dims()[0];
+                let pred = self.trace_forward_with_prepared_condition_context(
+                    "cfg.conditional.forward",
+                    sample,
+                    timestep_tensor(batch, schedule.t_scaled, &device, dtype),
+                    cond,
+                    pos,
+                    token_limit,
+                    &mut trace,
+                );
+                push_flow_trace_tensor3(
+                    &mut trace,
+                    "cfg.conditional.pred.latent",
+                    &pred.latent,
+                    token_limit,
+                );
+                if let Some(camera) = &pred.camera {
+                    push_flow_trace_tensor3(
+                        &mut trace,
+                        "cfg.conditional.pred.camera",
+                        camera,
+                        token_limit,
+                    );
+                }
+            }
+            PreparedCfgContext::Batched { cond, pos } => {
+                let batch = sample.latent.dims()[0];
+                let pred = self.trace_forward_with_prepared_condition_context(
+                    "cfg.batched.forward",
+                    concat_flow_state_batch(sample),
+                    timestep_tensor(batch * 2, schedule.t_scaled, &device, dtype),
+                    cond,
+                    pos,
+                    token_limit,
+                    &mut trace,
+                );
+                let (pred, neg) = split_flow_state_batch(pred, batch);
+                let out = blend_cfg_prediction(pred, neg, guidance_scale);
+                push_flow_trace_tensor3(
+                    &mut trace,
+                    "cfg.batched.blend.latent",
+                    &out.latent,
+                    token_limit,
+                );
+                if let Some(camera) = &out.camera {
+                    push_flow_trace_tensor3(
+                        &mut trace,
+                        "cfg.batched.blend.camera",
+                        camera,
+                        token_limit,
+                    );
+                }
+            }
+            PreparedCfgContext::BatchedMain { cond, neg, pos } => {
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, schedule.t_scaled, &device, dtype);
+                let pred = self.trace_forward_with_prepared_condition_context(
+                    "cfg.batched_main.cond_forward",
+                    sample.clone(),
+                    t_scaled.clone(),
+                    cond,
+                    pos.clone(),
+                    token_limit,
+                    &mut trace,
+                );
+                let neg = self.trace_forward_with_prepared_condition_context(
+                    "cfg.batched_main.neg_forward",
+                    sample,
+                    t_scaled,
+                    neg,
+                    pos,
+                    token_limit,
+                    &mut trace,
+                );
+                let out = blend_cfg_prediction(pred, neg, guidance_scale);
+                push_flow_trace_tensor3(
+                    &mut trace,
+                    "cfg.batched_main.blend.latent",
+                    &out.latent,
+                    token_limit,
+                );
+                if let Some(camera) = &out.camera {
+                    push_flow_trace_tensor3(
+                        &mut trace,
+                        "cfg.batched_main.blend.camera",
+                        camera,
+                        token_limit,
+                    );
+                }
+            }
+            PreparedCfgContext::Separate { cond, neg, pos } => {
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, schedule.t_scaled, &device, dtype);
+                let pred = self.trace_forward_with_prepared_condition_context(
+                    "cfg.separate.cond_forward",
+                    sample.clone(),
+                    t_scaled.clone(),
+                    cond,
+                    pos.clone(),
+                    token_limit,
+                    &mut trace,
+                );
+                let out = if guidance_scale > 1.0 {
+                    let neg = self.trace_forward_with_prepared_condition_context(
+                        "cfg.separate.neg_forward",
+                        sample,
+                        t_scaled,
+                        neg,
+                        pos,
+                        token_limit,
+                        &mut trace,
+                    );
+                    blend_cfg_prediction(pred, neg, guidance_scale)
+                } else {
+                    pred
+                };
+                push_flow_trace_tensor3(
+                    &mut trace,
+                    "cfg.separate.blend.latent",
+                    &out.latent,
+                    token_limit,
+                );
+                if let Some(camera) = &out.camera {
+                    push_flow_trace_tensor3(
+                        &mut trace,
+                        "cfg.separate.blend.camera",
+                        camera,
+                        token_limit,
+                    );
+                }
+            }
+        }
+        trace
+    }
+
+    fn trace_forward_with_prepared_condition_context(
+        &self,
+        label: &str,
+        x_t: FlowState<B>,
+        t: Tensor<B, 1>,
+        h_cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        token_limit: usize,
+        trace: &mut Vec<(String, Tensor<B, 3>)>,
+    ) -> FlowState<B> {
+        let dtype = self.float_dtype();
+        let z = cast_tensor_dtype(x_t.latent, dtype);
+        let [batch, latent_tokens, _] = z.dims();
+        let mut h_x = self.input_layer.forward(z);
+        push_flow_trace_tensor3(trace, format!("{label}.input_layer.out"), &h_x, token_limit);
+        let t_emb = self.t_embedder.forward(t);
+        let t_mod = if self.config.share_mod {
+            self.ada_ln_modulation
+                .as_ref()
+                .expect("shared adaLN modulation missing")
+                .forward(silu(t_emb.clone()))
+        } else {
+            t_emb.clone()
+        };
+        push_flow_trace_tensor3(
+            trace,
+            format!("{label}.latent_position.out"),
+            &pos,
+            token_limit,
+        );
+        h_x = h_x + pos;
+        push_flow_trace_tensor3(
+            trace,
+            format!("{label}.input_timestep_position.out"),
+            &h_x,
+            token_limit,
+        );
+        push_flow_trace_tensor3(
+            trace,
+            format!("{label}.condition_context.out"),
+            &h_cond,
+            token_limit,
+        );
+
+        for (index, block) in self.noise_refiner.iter().enumerate() {
+            let rope = self.noise_repo_layers[index].forward(h_x.clone());
+            h_x = block.forward_trace_selected(
+                &format!("{label}.noise_refiner_{index:02}.block"),
+                h_x,
+                Some(t_mod.clone()),
+                Some(&rope),
+                token_limit,
+                trace,
+            );
+            push_flow_trace_tensor3(
+                trace,
+                format!("{label}.noise_refiner_{index:02}.out"),
+                &h_x,
+                token_limit,
+            );
+        }
+
+        let h_cam = match (&self.cam_refiner, x_t.camera) {
+            (Some(refiner), Some(camera)) => {
+                let h_cam = refiner.forward(cast_tensor_dtype(camera, dtype));
+                push_flow_trace_tensor3(
+                    trace,
+                    format!("{label}.cam_refiner.out"),
+                    &h_cam,
+                    token_limit,
+                );
+                Some(h_cam)
+            }
+            _ => None,
+        };
+        let mut parts = vec![h_x, h_cond];
+        if let Some(camera) = h_cam.clone() {
+            parts.push(camera);
+        }
+        let mut h = Tensor::cat(parts, 1);
+        push_flow_trace_tensor3(
+            trace,
+            format!("{label}.concat_main_tokens.out"),
+            &h,
+            token_limit,
+        );
+        for (index, block) in self.blocks.iter().enumerate() {
+            let rope = self.repo_layers[index].forward(h.clone());
+            h = block.forward_trace_selected(
+                &format!("{label}.main_{index:02}.block"),
+                h,
+                Some(t_mod.clone()),
+                Some(&rope),
+                token_limit,
+                trace,
+            );
+            push_flow_trace_tensor3(
+                trace,
+                format!("{label}.main_{index:02}.out"),
+                &h,
+                token_limit,
+            );
+        }
+
+        let h_channels = h.dims()[2];
+        let mut h_x = h.clone().slice([0..batch, 0..latent_tokens, 0..h_channels]);
+        h_x = layer_norm_last(h_x, 1.0e-6);
+        push_flow_trace_tensor3(
+            trace,
+            format!("{label}.output_norm.latent"),
+            &h_x,
+            token_limit,
+        );
+        let mut h_cam = h_cam.map(|camera| {
+            let cam_tokens = camera.dims()[1];
+            let h_tokens = h.dims()[1];
+            let h_cam = h
+                .clone()
+                .slice([0..batch, h_tokens - cam_tokens..h_tokens, 0..h_channels]);
+            layer_norm_last(h_cam, 1.0e-6)
+        });
+        if let Some(camera) = &h_cam {
+            push_flow_trace_tensor3(
+                trace,
+                format!("{label}.output_norm.camera"),
+                camera,
+                token_limit,
+            );
+        }
+
+        if let Some(shift_table) = &self.shift_table {
+            let shifted = shift_table.val() + t_emb.unsqueeze_dim(1);
+            let shift = shifted.clone().slice([0..batch, 0..1, 0..h_channels]);
+            let scale = shifted.slice([0..batch, 1..2, 0..h_channels]);
+            h_x = h_x * (scale.clone() + 1.0) + shift.clone();
+            h_cam = h_cam.map(|cam| cam * (scale + 1.0) + shift);
+            push_flow_trace_tensor3(
+                trace,
+                format!("{label}.output_shift.latent"),
+                &h_x,
+                token_limit,
+            );
+            if let Some(camera) = &h_cam {
+                push_flow_trace_tensor3(
+                    trace,
+                    format!("{label}.output_shift.camera"),
+                    camera,
+                    token_limit,
+                );
+            }
+        }
+
+        let latent = self.out_layer.forward(h_x);
+        push_flow_trace_tensor3(
+            trace,
+            format!("{label}.output_projection.latent"),
+            &latent,
+            token_limit,
+        );
+        let camera = match (self.cam_out_layer.as_ref(), h_cam) {
+            (Some(layer), Some(cam)) => {
+                let camera = layer.forward(cam);
+                push_flow_trace_tensor3(
+                    trace,
+                    format!("{label}.output_projection.camera"),
+                    &camera,
+                    token_limit,
+                );
+                Some(camera)
+            }
+            _ => None,
+        };
+        FlowState { latent, camera }
+    }
+
+    fn profile_forward_with_prepared_condition_context(
+        &self,
+        label: &str,
+        x_t: FlowState<B>,
+        t: Tensor<B, 1>,
+        h_cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        query_chunk_tokens: usize,
+        records: &mut Vec<TripoSplatProfileRecord>,
+        mut qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
+    ) -> FlowState<B> {
+        let device = x_t.latent.device();
+        B::sync(&device).expect("profile pre-sync failed");
+        let total_start = Instant::now();
+        let dtype = self.float_dtype();
+        let z = cast_tensor_dtype(x_t.latent, dtype);
+        let [batch, latent_tokens, _] = z.dims();
+        let input_start = Instant::now();
+        let mut h_x = self.input_layer.forward(z);
+        push_finite_debug_record(records, format!("{label}.input_layer.out"), &h_x);
+        let t_emb = self.t_embedder.forward(t);
+        push_finite_debug_record(records, format!("{label}.t_embedder.out"), &t_emb);
+        let t_mod = if self.config.share_mod {
+            self.ada_ln_modulation
+                .as_ref()
+                .expect("shared adaLN modulation missing")
+                .forward(silu(t_emb.clone()))
+        } else {
+            t_emb.clone()
+        };
+        push_finite_debug_record(records, format!("{label}.t_mod.out"), &t_mod);
+        push_finite_debug_record(records, format!("{label}.latent_position.out"), &pos);
+        h_x = h_x + pos;
+        push_profile_record(
+            records,
+            format!("{label}.input_timestep_position"),
+            batch,
+            latent_tokens,
+            self.config.model_channels,
+            sync_elapsed_ms::<B>(&device, input_start),
+        );
+        push_finite_debug_record(
+            records,
+            format!("{label}.input_timestep_position.out"),
+            &h_x,
+        );
+
+        for (index, block) in self.noise_refiner.iter().enumerate() {
+            let rope_start = Instant::now();
+            let rope = self.noise_repo_layers[index].forward(h_x.clone());
+            push_profile_record(
+                records,
+                format!("{label}.noise_refiner_{index:02}.repo"),
+                batch,
+                h_x.dims()[1],
+                self.config.model_channels,
+                sync_elapsed_ms::<B>(&device, rope_start),
+            );
+            h_x = block.forward_profiled_with_qkv_capture(
+                &format!("{label}.noise_refiner_{index:02}.block"),
+                h_x,
+                Some(t_mod.clone()),
+                Some(&rope),
+                query_chunk_tokens,
+                records,
+                qkv_capture.as_deref_mut(),
+            );
+            push_finite_debug_record(
+                records,
+                format!("{label}.noise_refiner_{index:02}.out"),
+                &h_x,
+            );
+        }
+
+        let h_cam = match (&self.cam_refiner, x_t.camera) {
+            (Some(refiner), Some(camera)) => {
+                let cam_start = Instant::now();
+                let h_cam = refiner.forward(cast_tensor_dtype(camera, dtype));
+                push_profile_record(
+                    records,
+                    format!("{label}.cam_refiner"),
+                    batch,
+                    h_cam.dims()[1],
+                    self.config.model_channels,
+                    sync_elapsed_ms::<B>(&device, cam_start),
+                );
+                push_finite_debug_record(records, format!("{label}.cam_refiner.out"), &h_cam);
+                Some(h_cam)
+            }
+            _ => None,
+        };
+        let concat_start = Instant::now();
+        let mut parts = vec![h_x, h_cond];
+        if let Some(camera) = h_cam.clone() {
+            parts.push(camera);
+        }
+        let mut h = Tensor::cat(parts, 1);
+        push_profile_record(
+            records,
+            format!("{label}.concat_main_tokens"),
+            batch,
+            h.dims()[1],
+            self.config.model_channels,
+            sync_elapsed_ms::<B>(&device, concat_start),
+        );
+        push_finite_debug_record(records, format!("{label}.concat_main_tokens.out"), &h);
+        for (index, block) in self.blocks.iter().enumerate() {
+            let rope_start = Instant::now();
+            let rope = self.repo_layers[index].forward(h.clone());
+            push_profile_record(
+                records,
+                format!("{label}.main_{index:02}.repo"),
+                batch,
+                h.dims()[1],
+                self.config.model_channels,
+                sync_elapsed_ms::<B>(&device, rope_start),
+            );
+            h = block.forward_profiled_with_qkv_capture(
+                &format!("{label}.main_{index:02}.block"),
+                h,
+                Some(t_mod.clone()),
+                Some(&rope),
+                query_chunk_tokens,
+                records,
+                qkv_capture.as_deref_mut(),
+            );
+            push_finite_debug_record(records, format!("{label}.main_{index:02}.out"), &h);
+        }
+
+        let output_start = Instant::now();
+        let h_channels = h.dims()[2];
+        let mut h_x = h.clone().slice([0..batch, 0..latent_tokens, 0..h_channels]);
+        h_x = layer_norm_last(h_x, 1.0e-6);
+        let mut h_cam = h_cam.map(|camera| {
+            let cam_tokens = camera.dims()[1];
+            let h_tokens = h.dims()[1];
+            let mut h_cam =
+                h.clone()
+                    .slice([0..batch, h_tokens - cam_tokens..h_tokens, 0..h_channels]);
+            h_cam = layer_norm_last(h_cam, 1.0e-6);
+            h_cam
+        });
+
+        if let Some(shift_table) = &self.shift_table {
+            let shifted = shift_table.val() + t_emb.unsqueeze_dim(1);
+            let shift = shifted.clone().slice([0..batch, 0..1, 0..h_channels]);
+            let scale = shifted.slice([0..batch, 1..2, 0..h_channels]);
+            h_x = h_x * (scale.clone() + 1.0) + shift.clone();
+            h_cam = h_cam.map(|cam| cam * (scale + 1.0) + shift);
+        }
+
+        let latent = self.out_layer.forward(h_x);
+        let camera = match (self.cam_out_layer.as_ref(), h_cam) {
+            (Some(layer), Some(cam)) => Some(layer.forward(cam)),
+            _ => None,
+        };
+        push_profile_record(
+            records,
+            format!("{label}.output_projection"),
+            batch,
+            latent_tokens,
+            self.config.out_channels,
+            sync_elapsed_ms::<B>(&device, output_start),
+        );
+        push_finite_debug_record(
+            records,
+            format!("{label}.output_projection.latent"),
+            &latent,
+        );
+        if let Some(camera) = &camera {
+            push_finite_debug_record(records, format!("{label}.output_projection.camera"), camera);
+        }
+        push_profile_record(
+            records,
+            format!("{label}.total"),
+            batch,
+            latent_tokens,
+            self.config.model_channels,
+            sync_elapsed_ms::<B>(&device, total_start),
+        );
+        FlowState { latent, camera }
+    }
+
     pub fn sample_euler_cfg(
         &self,
         noise: FlowState<B>,
@@ -440,7 +1346,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             steps,
             guidance_scale,
             shift,
-            CfgPredictionMode::Batched,
+            CfgPredictionMode::Separate,
         )
     }
 
@@ -460,7 +1366,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             prefix_steps,
             guidance_scale,
             shift,
-            CfgPredictionMode::Batched,
+            CfgPredictionMode::Separate,
         )
     }
 
@@ -474,26 +1380,72 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         shift: f32,
         cfg_mode: CfgPredictionMode,
     ) -> FlowState<B> {
+        self.sample_euler_cfg_prefix_with_mode_optional_query_chunk_tokens(
+            noise,
+            cond,
+            total_steps,
+            prefix_steps,
+            guidance_scale,
+            shift,
+            cfg_mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_euler_cfg_prefix_with_mode_and_query_chunk_tokens(
+        &self,
+        noise: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        prefix_steps: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+        query_chunk_tokens: usize,
+    ) -> FlowState<B> {
+        self.sample_euler_cfg_prefix_with_mode_optional_query_chunk_tokens(
+            noise,
+            cond,
+            total_steps,
+            prefix_steps,
+            guidance_scale,
+            shift,
+            cfg_mode,
+            Some(query_chunk_tokens),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_euler_cfg_prefix_with_mode_optional_query_chunk_tokens(
+        &self,
+        noise: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        prefix_steps: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
         let device = noise.latent.device();
         let dtype: FloatDType = noise.latent.dtype().into();
         let mut sample = noise;
-        let neg_cond = cond.zeros_like();
+        let prepared_context = self.prepare_cfg_context(cond, guidance_scale, cfg_mode);
         for index in 0..prefix_steps.min(total_steps) {
-            let t = shifted_t(index, total_steps, shift);
-            let t_prev = shifted_t(index + 1, total_steps, shift);
-            let pred = self.euler_cfg_prediction(
+            let schedule = flow_schedule_step(index, total_steps, shift);
+            let pred = self.euler_cfg_prediction_with_prepared_context_optional_query_chunk_tokens(
                 sample.clone(),
-                t,
-                cond.clone(),
-                neg_cond.clone(),
+                schedule.t_scaled,
                 guidance_scale,
-                cfg_mode,
+                &prepared_context,
                 FlowPredictionContext {
                     dtype,
                     device: &device,
                 },
+                query_chunk_tokens,
             );
-            sample = sample.sub_scaled(pred, t - t_prev);
+            sample = sample.sub_scaled(pred, schedule.dt);
         }
         sample
     }
@@ -511,19 +1463,17 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         let device = noise.latent.device();
         let dtype: FloatDType = noise.latent.dtype().into();
         let mut sample = noise;
-        let neg_cond = cond.zeros_like();
+        let prepared_context = self.prepare_cfg_context(cond, guidance_scale, cfg_mode);
         let mut steps = vec![sample.clone()];
         let mut pred0 = None;
+        let mut preds = Vec::new();
         for index in 0..prefix_steps.min(total_steps) {
-            let t = shifted_t(index, total_steps, shift);
-            let t_prev = shifted_t(index + 1, total_steps, shift);
-            let pred = self.euler_cfg_prediction(
+            let schedule = flow_schedule_step(index, total_steps, shift);
+            let pred = self.euler_cfg_prediction_with_prepared_context(
                 sample.clone(),
-                t,
-                cond.clone(),
-                neg_cond.clone(),
+                schedule.t_scaled,
                 guidance_scale,
-                cfg_mode,
+                &prepared_context,
                 FlowPredictionContext {
                     dtype,
                     device: &device,
@@ -532,10 +1482,15 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             if index == 0 {
                 pred0 = Some(pred.clone());
             }
-            sample = sample.sub_scaled(pred, t - t_prev);
+            preds.push(pred.clone());
+            sample = sample.sub_scaled(pred, schedule.dt);
             steps.push(sample.clone());
         }
-        FlowEulerTrace { pred0, steps }
+        FlowEulerTrace {
+            pred0,
+            preds,
+            steps,
+        }
     }
 
     pub fn euler_cfg_prediction_at_step(
@@ -554,7 +1509,7 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             step,
             guidance_scale,
             shift,
-            CfgPredictionMode::Batched,
+            CfgPredictionMode::Separate,
         )
     }
 
@@ -571,10 +1526,10 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         let device = sample.latent.device();
         let dtype: FloatDType = sample.latent.dtype().into();
         let neg_cond = cond.zeros_like();
-        let t = shifted_t(step, total_steps, shift);
+        let schedule = flow_schedule_step(step, total_steps, shift);
         self.euler_cfg_prediction(
             sample,
-            t,
+            schedule.t_scaled,
             cond,
             neg_cond,
             guidance_scale,
@@ -586,10 +1541,150 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         )
     }
 
+    pub fn profile_euler_cfg_prediction_at_step_with_mode(
+        &self,
+        sample: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        step: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+    ) -> FlowPredictionProfile<B> {
+        let query_chunk_tokens = default_attention_query_chunk_tokens(sample.latent.dtype().into());
+        self.profile_euler_cfg_prediction_at_step_with_query_chunk_tokens(
+            sample,
+            cond,
+            total_steps,
+            step,
+            guidance_scale,
+            shift,
+            cfg_mode,
+            query_chunk_tokens,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn profile_euler_cfg_prediction_at_step_with_mode_and_qkv_capture(
+        &self,
+        sample: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        step: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+        attention_label_filter: impl Into<String>,
+    ) -> FlowPredictionQkvProfile<B> {
+        let query_chunk_tokens = default_attention_query_chunk_tokens(sample.latent.dtype().into());
+        self.profile_euler_cfg_prediction_at_step_with_qkv_capture(
+            sample,
+            cond,
+            total_steps,
+            step,
+            guidance_scale,
+            shift,
+            cfg_mode,
+            query_chunk_tokens,
+            attention_label_filter,
+        )
+    }
+
+    pub fn profile_euler_cfg_prediction_at_step_with_query_chunk_tokens(
+        &self,
+        sample: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        step: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+        query_chunk_tokens: usize,
+    ) -> FlowPredictionProfile<B> {
+        let device = sample.latent.device();
+        let dtype: FloatDType = sample.latent.dtype().into();
+        let batch = sample.latent.dims()[0];
+        let mut records = Vec::new();
+        let prep_start = Instant::now();
+        let prepared_context = self.prepare_cfg_context(cond, guidance_scale, cfg_mode);
+        push_profile_record(
+            &mut records,
+            "cfg.prepare_context",
+            batch,
+            0,
+            self.config.model_channels,
+            sync_elapsed_ms::<B>(&device, prep_start),
+        );
+        let schedule = flow_schedule_step(step, total_steps, shift);
+        let output = self.profile_euler_cfg_prediction_with_prepared_context(
+            sample,
+            schedule.t_scaled,
+            guidance_scale,
+            &prepared_context,
+            FlowPredictionContext {
+                dtype,
+                device: &device,
+            },
+            query_chunk_tokens,
+            &mut records,
+            None,
+        );
+        FlowPredictionProfile { output, records }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn profile_euler_cfg_prediction_at_step_with_qkv_capture(
+        &self,
+        sample: FlowState<B>,
+        cond: TripoSplatCondition<B>,
+        total_steps: usize,
+        step: usize,
+        guidance_scale: f32,
+        shift: f32,
+        cfg_mode: CfgPredictionMode,
+        query_chunk_tokens: usize,
+        attention_label_filter: impl Into<String>,
+    ) -> FlowPredictionQkvProfile<B> {
+        let device = sample.latent.device();
+        let dtype: FloatDType = sample.latent.dtype().into();
+        let batch = sample.latent.dims()[0];
+        let mut records = Vec::new();
+        let prep_start = Instant::now();
+        let prepared_context = self.prepare_cfg_context(cond, guidance_scale, cfg_mode);
+        push_profile_record(
+            &mut records,
+            "cfg.prepare_context",
+            batch,
+            0,
+            self.config.model_channels,
+            sync_elapsed_ms::<B>(&device, prep_start),
+        );
+        let schedule = flow_schedule_step(step, total_steps, shift);
+        let mut qkv_capture = AttentionQkvCaptureState::new(attention_label_filter);
+        let output = self.profile_euler_cfg_prediction_with_prepared_context(
+            sample,
+            schedule.t_scaled,
+            guidance_scale,
+            &prepared_context,
+            FlowPredictionContext {
+                dtype,
+                device: &device,
+            },
+            query_chunk_tokens,
+            &mut records,
+            Some(&mut qkv_capture),
+        );
+        FlowPredictionQkvProfile {
+            output,
+            records,
+            qkv_capture: qkv_capture.into_captured(),
+        }
+    }
+
     fn euler_cfg_prediction(
         &self,
         sample: FlowState<B>,
-        t: f32,
+        t_scaled: f32,
         cond: TripoSplatCondition<B>,
         neg_cond: TripoSplatCondition<B>,
         guidance_scale: f32,
@@ -599,15 +1694,30 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
         match (guidance_scale > 1.0, cfg_mode) {
             (true, CfgPredictionMode::Batched) => self.euler_cfg_prediction_batched(
                 sample,
-                t,
+                t_scaled,
                 cond,
                 neg_cond,
                 guidance_scale,
                 context,
             ),
+            (true, CfgPredictionMode::BatchedMain) => {
+                let cond = self.prepare_condition_context(cond);
+                let neg = self.prepare_condition_context(neg_cond);
+                let pos = self.prepare_latent_position(sample.latent.dims()[0]);
+                self.euler_cfg_prediction_batched_main_with_context_optional_query_chunk_tokens(
+                    sample,
+                    t_scaled,
+                    cond,
+                    neg,
+                    pos,
+                    guidance_scale,
+                    context,
+                    None,
+                )
+            }
             (true, CfgPredictionMode::Separate) => self.euler_cfg_prediction_separate(
                 sample,
-                t,
+                t_scaled,
                 cond,
                 neg_cond,
                 guidance_scale,
@@ -615,45 +1725,423 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
             ),
             (false, _) => {
                 let batch = sample.latent.dims()[0];
-                let t_scaled = timestep_tensor(batch, t, context.device, context.dtype);
-                self.forward(sample, t_scaled, cond)
+                let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+                let h_cond = self.prepare_condition_context(cond);
+                let pos = self.prepare_latent_position(batch);
+                self.forward_with_prepared_condition_context(sample, t_scaled, h_cond, pos)
             }
+        }
+    }
+
+    fn profile_euler_cfg_prediction_with_prepared_context(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        guidance_scale: f32,
+        prepared_context: &PreparedCfgContext<B>,
+        context: FlowPredictionContext<'_, B>,
+        query_chunk_tokens: usize,
+        records: &mut Vec<TripoSplatProfileRecord>,
+        mut qkv_capture: Option<&mut AttentionQkvCaptureState<B>>,
+    ) -> FlowState<B> {
+        match prepared_context {
+            PreparedCfgContext::Conditional { cond, pos } => {
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+                self.profile_forward_with_prepared_condition_context(
+                    "cfg.conditional.forward",
+                    sample,
+                    t_scaled,
+                    cond.clone(),
+                    pos.clone(),
+                    query_chunk_tokens,
+                    records,
+                    qkv_capture.as_deref_mut(),
+                )
+            }
+            PreparedCfgContext::Batched { cond, pos } => {
+                let device = sample.latent.device();
+                let batch = sample.latent.dims()[0];
+                let concat_start = Instant::now();
+                let sample = concat_flow_state_batch(sample);
+                push_profile_record(
+                    records,
+                    "cfg.batched.concat_sample",
+                    batch * 2,
+                    sample.latent.dims()[1],
+                    self.config.in_channels,
+                    sync_elapsed_ms::<B>(&device, concat_start),
+                );
+                let pred = self.profile_forward_with_prepared_condition_context(
+                    "cfg.batched.forward",
+                    sample,
+                    timestep_tensor(batch * 2, t_scaled, context.device, context.dtype),
+                    cond.clone(),
+                    pos.clone(),
+                    query_chunk_tokens,
+                    records,
+                    qkv_capture.as_deref_mut(),
+                );
+                let split_start = Instant::now();
+                let (pred, neg) = split_flow_state_batch(pred, batch);
+                push_profile_record(
+                    records,
+                    "cfg.batched.split",
+                    batch,
+                    pred.latent.dims()[1],
+                    self.config.out_channels,
+                    sync_elapsed_ms::<B>(&device, split_start),
+                );
+                let blend_start = Instant::now();
+                let out = blend_cfg_prediction(pred, neg, guidance_scale);
+                push_profile_record(
+                    records,
+                    "cfg.batched.blend",
+                    batch,
+                    out.latent.dims()[1],
+                    self.config.out_channels,
+                    sync_elapsed_ms::<B>(&device, blend_start),
+                );
+                out
+            }
+            PreparedCfgContext::BatchedMain { cond, neg, pos } => {
+                let device = sample.latent.device();
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+                let prefix_start = Instant::now();
+                let prefix = self.prepare_forward_prefix_optional_query_chunk_tokens(
+                    sample,
+                    t_scaled,
+                    pos.clone(),
+                    Some(query_chunk_tokens),
+                );
+                push_profile_record(
+                    records,
+                    "cfg.batched_main.prefix",
+                    batch,
+                    prefix.latent_tokens,
+                    self.config.model_channels,
+                    sync_elapsed_ms::<B>(&device, prefix_start),
+                );
+                let main_start = Instant::now();
+                let (pred, neg) = self
+                    .profile_forward_main_batched_with_prepared_prefix_optional_query_chunk_tokens(
+                        "cfg.batched_main.main_forward",
+                        prefix,
+                        cond.clone(),
+                        neg.clone(),
+                        query_chunk_tokens,
+                        records,
+                        qkv_capture.as_deref_mut(),
+                    );
+                push_profile_record(
+                    records,
+                    "cfg.batched_main.main",
+                    batch * 2,
+                    pred.latent.dims()[1],
+                    self.config.out_channels,
+                    sync_elapsed_ms::<B>(&device, main_start),
+                );
+                let blend_start = Instant::now();
+                let out = blend_cfg_prediction(pred, neg, guidance_scale);
+                push_profile_record(
+                    records,
+                    "cfg.batched_main.blend",
+                    batch,
+                    out.latent.dims()[1],
+                    self.config.out_channels,
+                    sync_elapsed_ms::<B>(&device, blend_start),
+                );
+                out
+            }
+            PreparedCfgContext::Separate { cond, neg, pos } => {
+                let device = sample.latent.device();
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+                let pred = self.profile_forward_with_prepared_condition_context(
+                    "cfg.separate.cond_forward",
+                    sample.clone(),
+                    t_scaled.clone(),
+                    cond.clone(),
+                    pos.clone(),
+                    query_chunk_tokens,
+                    records,
+                    qkv_capture.as_deref_mut(),
+                );
+                if guidance_scale > 1.0 {
+                    let neg = self.profile_forward_with_prepared_condition_context(
+                        "cfg.separate.neg_forward",
+                        sample,
+                        t_scaled,
+                        neg.clone(),
+                        pos.clone(),
+                        query_chunk_tokens,
+                        records,
+                        qkv_capture.as_deref_mut(),
+                    );
+                    let blend_start = Instant::now();
+                    let out = blend_cfg_prediction(pred, neg, guidance_scale);
+                    push_profile_record(
+                        records,
+                        "cfg.separate.blend",
+                        batch,
+                        out.latent.dims()[1],
+                        self.config.out_channels,
+                        sync_elapsed_ms::<B>(&device, blend_start),
+                    );
+                    out
+                } else {
+                    pred
+                }
+            }
+        }
+    }
+
+    fn euler_cfg_prediction_with_prepared_context(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        guidance_scale: f32,
+        prepared_context: &PreparedCfgContext<B>,
+        context: FlowPredictionContext<'_, B>,
+    ) -> FlowState<B> {
+        self.euler_cfg_prediction_with_prepared_context_optional_query_chunk_tokens(
+            sample,
+            t_scaled,
+            guidance_scale,
+            prepared_context,
+            context,
+            None,
+        )
+    }
+
+    fn euler_cfg_prediction_with_prepared_context_optional_query_chunk_tokens(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        guidance_scale: f32,
+        prepared_context: &PreparedCfgContext<B>,
+        context: FlowPredictionContext<'_, B>,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
+        match prepared_context {
+            PreparedCfgContext::Conditional { cond, pos } => {
+                let batch = sample.latent.dims()[0];
+                let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+                self.forward_with_prepared_condition_context_optional_query_chunk_tokens(
+                    sample,
+                    t_scaled,
+                    cond.clone(),
+                    pos.clone(),
+                    query_chunk_tokens,
+                )
+            }
+            PreparedCfgContext::Batched { cond, pos } => self
+                .euler_cfg_prediction_batched_with_context_optional_query_chunk_tokens(
+                    sample,
+                    t_scaled,
+                    cond.clone(),
+                    pos.clone(),
+                    guidance_scale,
+                    context,
+                    query_chunk_tokens,
+                ),
+            PreparedCfgContext::BatchedMain { cond, neg, pos } => self
+                .euler_cfg_prediction_batched_main_with_context_optional_query_chunk_tokens(
+                    sample,
+                    t_scaled,
+                    cond.clone(),
+                    neg.clone(),
+                    pos.clone(),
+                    guidance_scale,
+                    context,
+                    query_chunk_tokens,
+                ),
+            PreparedCfgContext::Separate { cond, neg, pos } => self
+                .euler_cfg_prediction_separate_with_context_optional_query_chunk_tokens(
+                    sample,
+                    t_scaled,
+                    cond.clone(),
+                    neg.clone(),
+                    pos.clone(),
+                    guidance_scale,
+                    context,
+                    query_chunk_tokens,
+                ),
         }
     }
 
     fn euler_cfg_prediction_batched(
         &self,
         sample: FlowState<B>,
-        t: f32,
+        t_scaled: f32,
         cond: TripoSplatCondition<B>,
         neg_cond: TripoSplatCondition<B>,
         guidance_scale: f32,
         context: FlowPredictionContext<'_, B>,
     ) -> FlowState<B> {
+        let cond = self.prepare_condition_context(cond);
+        let neg = self.prepare_condition_context(neg_cond);
+        let pos = self.prepare_latent_position(sample.latent.dims()[0] * 2);
+        self.euler_cfg_prediction_batched_with_context(
+            sample,
+            t_scaled,
+            Tensor::cat(vec![cond, neg], 0),
+            pos,
+            guidance_scale,
+            context,
+        )
+    }
+
+    fn euler_cfg_prediction_batched_with_context(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+    ) -> FlowState<B> {
+        self.euler_cfg_prediction_batched_with_context_optional_query_chunk_tokens(
+            sample,
+            t_scaled,
+            cond,
+            pos,
+            guidance_scale,
+            context,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn euler_cfg_prediction_batched_with_context_optional_query_chunk_tokens(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        cond: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
         let batch = sample.latent.dims()[0];
-        let pred = self.forward(
+        let pred = self.forward_with_prepared_condition_context_optional_query_chunk_tokens(
             concat_flow_state_batch(sample),
-            timestep_tensor(batch * 2, t, context.device, context.dtype),
-            concat_condition_batch(cond, neg_cond),
+            timestep_tensor(batch * 2, t_scaled, context.device, context.dtype),
+            cond,
+            pos,
+            query_chunk_tokens,
         );
         let (pred, neg) = split_flow_state_batch(pred, batch);
+        blend_cfg_prediction(pred, neg, guidance_scale)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn euler_cfg_prediction_batched_main_with_context_optional_query_chunk_tokens(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
+        let batch = sample.latent.dims()[0];
+        let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+        let prefix = self.prepare_forward_prefix_optional_query_chunk_tokens(
+            sample,
+            t_scaled,
+            pos,
+            query_chunk_tokens,
+        );
+        let (pred, neg) = self
+            .forward_main_batched_with_prepared_prefix_optional_query_chunk_tokens(
+                prefix,
+                cond,
+                neg,
+                query_chunk_tokens,
+            );
         blend_cfg_prediction(pred, neg, guidance_scale)
     }
 
     fn euler_cfg_prediction_separate(
         &self,
         sample: FlowState<B>,
-        t: f32,
+        t_scaled: f32,
         cond: TripoSplatCondition<B>,
         neg_cond: TripoSplatCondition<B>,
         guidance_scale: f32,
         context: FlowPredictionContext<'_, B>,
     ) -> FlowState<B> {
+        let cond = self.prepare_condition_context(cond);
+        let neg = self.prepare_condition_context(neg_cond);
+        let pos = self.prepare_latent_position(sample.latent.dims()[0]);
+        self.euler_cfg_prediction_separate_with_context(
+            sample,
+            t_scaled,
+            cond,
+            neg,
+            pos,
+            guidance_scale,
+            context,
+        )
+    }
+
+    fn euler_cfg_prediction_separate_with_context(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+    ) -> FlowState<B> {
+        self.euler_cfg_prediction_separate_with_context_optional_query_chunk_tokens(
+            sample,
+            t_scaled,
+            cond,
+            neg,
+            pos,
+            guidance_scale,
+            context,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn euler_cfg_prediction_separate_with_context_optional_query_chunk_tokens(
+        &self,
+        sample: FlowState<B>,
+        t_scaled: f32,
+        cond: Tensor<B, 3>,
+        neg: Tensor<B, 3>,
+        pos: Tensor<B, 3>,
+        guidance_scale: f32,
+        context: FlowPredictionContext<'_, B>,
+        query_chunk_tokens: Option<usize>,
+    ) -> FlowState<B> {
         let batch = sample.latent.dims()[0];
-        let t_scaled = timestep_tensor(batch, t, context.device, context.dtype);
-        let pred = self.forward(sample.clone(), t_scaled.clone(), cond);
+        let t_scaled = timestep_tensor(batch, t_scaled, context.device, context.dtype);
+        let prefix = self.prepare_forward_prefix_optional_query_chunk_tokens(
+            sample,
+            t_scaled,
+            pos,
+            query_chunk_tokens,
+        );
+        let pred = self.forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+            prefix.clone(),
+            cond,
+            query_chunk_tokens,
+        );
         if guidance_scale > 1.0 {
-            let neg = self.forward(sample, t_scaled, neg_cond);
+            let neg = self.forward_main_with_prepared_prefix_optional_query_chunk_tokens(
+                prefix,
+                neg,
+                query_chunk_tokens,
+            );
             blend_cfg_prediction(pred, neg, guidance_scale)
         } else {
             pred
@@ -661,18 +2149,35 @@ impl<B: Backend> LatentSeqMmFlowModel<B> {
     }
 }
 
-fn shifted_t(index: usize, steps: usize, shift: f32) -> f32 {
-    let base = 1.0 - index as f32 / steps.max(1) as f32;
+#[derive(Clone, Copy, Debug)]
+struct FlowScheduleStep {
+    t_scaled: f32,
+    dt: f32,
+}
+
+fn flow_schedule_step(index: usize, steps: usize, shift: f32) -> FlowScheduleStep {
+    let t = shifted_t64(index, steps, shift);
+    let t_next = shifted_t64(index + 1, steps, shift);
+    FlowScheduleStep {
+        t_scaled: (1000.0 * t) as f32,
+        dt: (t - t_next) as f32,
+    }
+}
+
+fn shifted_t64(index: usize, steps: usize, shift: f32) -> f64 {
+    let steps = steps.max(1) as f64;
+    let base = 1.0 - index as f64 / steps;
+    let shift = shift as f64;
     shift * base / (1.0 + (shift - 1.0) * base)
 }
 
 fn timestep_tensor<B: Backend>(
     batch: usize,
-    t: f32,
+    t_scaled: f32,
     device: &B::Device,
-    dtype: FloatDType,
+    _dtype: FloatDType,
 ) -> Tensor<B, 1> {
-    Tensor::<B, 1>::from_floats(vec![1000.0 * t; batch].as_slice(), device).cast(dtype)
+    Tensor::<B, 1>::from_floats(vec![t_scaled; batch].as_slice(), device)
 }
 
 fn concat_flow_state_batch<B: Backend>(sample: FlowState<B>) -> FlowState<B> {
@@ -681,21 +2186,6 @@ fn concat_flow_state_batch<B: Backend>(sample: FlowState<B>) -> FlowState<B> {
         camera: sample
             .camera
             .map(|camera| Tensor::cat(vec![camera.clone(), camera], 0)),
-    }
-}
-
-fn concat_condition_batch<B: Backend>(
-    cond: TripoSplatCondition<B>,
-    neg_cond: TripoSplatCondition<B>,
-) -> TripoSplatCondition<B> {
-    TripoSplatCondition {
-        feature1: Tensor::cat(vec![cond.feature1, neg_cond.feature1], 0),
-        feature2: match (cond.feature2, neg_cond.feature2) {
-            (Some(cond), Some(neg)) => Some(Tensor::cat(vec![cond, neg], 0)),
-            (None, None) => None,
-            _ => panic!("conditional and unconditional TripoSplat feature2 states must match"),
-        },
-        rng_normals_consumed: cond.rng_normals_consumed,
     }
 }
 
@@ -762,6 +2252,22 @@ fn layer_norm_last<B: Backend>(x: Tensor<B, 3>, epsilon: f64) -> Tensor<B, 3> {
     cast_from_f32_accum((x_acc - mean) / var.add_scalar(epsilon).sqrt(), dtype)
 }
 
+fn push_flow_trace_tensor3<B: Backend>(
+    trace: &mut Vec<(String, Tensor<B, 3>)>,
+    label: impl Into<String>,
+    tensor: &Tensor<B, 3>,
+    token_limit: usize,
+) {
+    let [batch, tokens, channels] = tensor.dims();
+    let end = token_limit.max(1).min(tokens);
+    let clipped = if end < tokens {
+        tensor.clone().slice([0..batch, 0..end, 0..channels])
+    } else {
+        tensor.clone()
+    };
+    trace.push((label.into(), clipped));
+}
+
 fn cast_low_precision_to_f32<B: Backend, const D: usize>(
     tensor: Tensor<B, D>,
     dtype: FloatDType,
@@ -784,9 +2290,25 @@ fn cast_from_f32_accum<B: Backend, const D: usize>(
     }
 }
 
+fn cast_tensor_dtype<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: FloatDType,
+) -> Tensor<B, D> {
+    let current: FloatDType = tensor.dtype().into();
+    if current == dtype {
+        tensor
+    } else {
+        tensor.cast(dtype)
+    }
+}
+
 const TORCH_SOBOL_SEED123_DIM3_COUNT: usize = 8192;
 const TORCH_SOBOL_SEED123_DIM3_BYTES: &[u8] =
     include_bytes!("torch_sobol_seed123_dim3_8192_f32le.bin");
+const TORCH_LATENT_POSITION_SEED123_COUNT: usize = 8192;
+const TORCH_LATENT_POSITION_CHANNELS: usize = 1024;
+const TORCH_LATENT_POSITION_SEED123_BYTES: &[u8] =
+    include_bytes!("torch_latent_position_seed123_8192x1024_f32le.bin");
 
 fn torch_sobol_seed123_dim3_positions<B: Backend>(
     count: usize,
@@ -801,7 +2323,36 @@ fn torch_sobol_seed123_dim3_positions<B: Backend>(
         .take(count * 3)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect::<Vec<_>>();
-    Param::from_tensor(Tensor::<B, 1>::from_floats(values.as_slice(), device).reshape([count, 3]))
+    Param::from_tensor(
+        Tensor::<B, 1>::from_data(TensorData::new(values, [count * 3]), (device, DType::F32))
+            .reshape([count, 3]),
+    )
+}
+
+fn canonical_latent_position_embedding<B: Backend>(
+    count: usize,
+    channels: usize,
+    device: &B::Device,
+    pos_pe: Tensor<B, 2>,
+) -> Tensor<B, 2> {
+    if channels == TORCH_LATENT_POSITION_CHANNELS {
+        assert!(
+            count <= TORCH_LATENT_POSITION_SEED123_COUNT,
+            "TripoSplat q_token_length {count} exceeds canonical PyTorch latent position table length {TORCH_LATENT_POSITION_SEED123_COUNT}"
+        );
+        let values = TORCH_LATENT_POSITION_SEED123_BYTES
+            .chunks_exact(4)
+            .take(count * channels)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+        Tensor::<B, 1>::from_data(
+            TensorData::new(values, [count * channels]),
+            (device, DType::F32),
+        )
+        .reshape([count, channels])
+    } else {
+        PcdAbsolutePositionEmbedder::legacy(channels).forward_2d(pos_pe.cast(FloatDType::F32))
+    }
 }
 
 fn prefix_pad_feature2<B: Backend>(feature2: Tensor<B, 3>, target_tokens: usize) -> Tensor<B, 3> {
@@ -862,6 +2413,16 @@ mod tests {
     }
 
     #[test]
+    fn triposplat_config_defaults_to_upstream_fast_latent_tokens() {
+        let config = LatentSeqMmFlowModelConfig::triposplat();
+        assert_eq!(config.q_token_length, crate::DEFAULT_Q_TOKEN_LENGTH);
+        assert_eq!(
+            config.q_token_length,
+            crate::TRIPOSPLAT_FLOW_LATENT_TOKEN_LENGTH
+        );
+    }
+
+    #[test]
     fn condition_pads_feature2_prefix_to_match_dinov3_tokens() {
         let device = Default::default();
         let condition = TripoSplatCondition {
@@ -872,6 +2433,20 @@ mod tests {
         .with_prefix_padded_feature2();
 
         assert_eq!(condition.feature2.unwrap().dims(), [1, 9, 8]);
+    }
+
+    #[test]
+    fn timestep_tensor_remains_f32_for_low_precision_flow_weights() {
+        let device = Default::default();
+        let t = timestep_tensor::<TestBackend>(2, 875.123_5, &device, FloatDType::F16);
+
+        assert_eq!(FloatDType::from(t.dtype()), FloatDType::F32);
+        let values = t
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("timestep values");
+        assert_eq!(values, vec![875.123_5, 875.123_5]);
     }
 
     #[test]
@@ -999,16 +2574,126 @@ mod tests {
             3.0,
             context,
         );
-        let batched =
-            model.euler_cfg_prediction_batched(sample, 0.75, cond, neg_cond, 3.0, context);
+        let batched = model.euler_cfg_prediction_batched(
+            sample.clone(),
+            0.75,
+            cond.clone(),
+            neg_cond.clone(),
+            3.0,
+            context,
+        );
+        let batched_main = model.euler_cfg_prediction(
+            sample,
+            0.75,
+            cond,
+            neg_cond,
+            3.0,
+            CfgPredictionMode::BatchedMain,
+            context,
+        );
 
-        assert_tensor_close("latent", batched.latent, separate.latent, 1.0e-4);
+        assert_tensor_close("latent", batched.latent, separate.latent.clone(), 1.0e-4);
         assert_tensor_close(
             "camera",
             batched.camera.expect("batched camera"),
+            separate.camera.clone().expect("separate camera"),
+            1.0e-4,
+        );
+        assert_tensor_close(
+            "batched-main latent",
+            batched_main.latent,
+            separate.latent,
+            1.0e-4,
+        );
+        assert_tensor_close(
+            "batched-main camera",
+            batched_main.camera.expect("batched-main camera"),
             separate.camera.expect("separate camera"),
             1.0e-4,
         );
+    }
+
+    #[test]
+    fn cached_cfg_sampling_matches_stepwise_prediction() {
+        let device = Default::default();
+        let config = LatentSeqMmFlowModelConfig::tiny_for_tests();
+        let model = config.clone().init::<TestBackend>(&device);
+        let sample = FlowState::<TestBackend>::deterministic_standard_normal(
+            &device,
+            1,
+            config.q_token_length,
+            config.in_channels,
+            config.cam_channels,
+            29,
+        );
+        let cond = TripoSplatCondition {
+            feature1: deterministic_standard_normal_3d(
+                &mut SplitMix64::new(31),
+                [1, 6, config.cond_channels],
+                &device,
+            ),
+            feature2: config.cond2_channels.map(|channels| {
+                deterministic_standard_normal_3d(
+                    &mut SplitMix64::new(37),
+                    [1, 4, channels],
+                    &device,
+                )
+            }),
+            rng_normals_consumed: 0,
+        }
+        .with_prefix_padded_feature2();
+        let total_steps = 4;
+        let prefix_steps = 3;
+        let guidance_scale = 3.0;
+        let shift = 3.0;
+
+        for cfg_mode in [
+            CfgPredictionMode::Batched,
+            CfgPredictionMode::BatchedMain,
+            CfgPredictionMode::Separate,
+        ] {
+            let neg_cond = cond.zeros_like();
+            let context = FlowPredictionContext {
+                dtype: FloatDType::F32,
+                device: &device,
+            };
+            let mut expected = sample.clone();
+            for index in 0..prefix_steps {
+                let schedule = flow_schedule_step(index, total_steps, shift);
+                let pred = model.euler_cfg_prediction(
+                    expected.clone(),
+                    schedule.t_scaled,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    guidance_scale,
+                    cfg_mode,
+                    context,
+                );
+                expected = expected.sub_scaled(pred, schedule.dt);
+            }
+
+            let cached = model.sample_euler_cfg_prefix_with_mode(
+                sample.clone(),
+                cond.clone(),
+                total_steps,
+                prefix_steps,
+                guidance_scale,
+                shift,
+                cfg_mode,
+            );
+            assert_tensor_close(
+                &format!("cached {cfg_mode:?} latent"),
+                cached.latent,
+                expected.latent,
+                1.0e-6,
+            );
+            assert_tensor_close(
+                &format!("cached {cfg_mode:?} camera"),
+                cached.camera.expect("cached camera"),
+                expected.camera.expect("expected camera"),
+                1.0e-6,
+            );
+        }
     }
 
     #[test]

@@ -68,7 +68,9 @@ use bevy_synth_ui::bevy_transform_gizmos;
 use bevy_synth_ui::bevy_transform_gizmos::TransformGizmoSystems;
 use bevy_synth_ui::bevy_transform_gizmos::prelude::GizmoCamera;
 use bevy_synth_ui::bevy_transform_gizmos::prelude::TransformGizmoPlugin;
-use bevy_synth_ui::bevy_transform_gizmos::{GizmoTransformable, TransformGizmo};
+use bevy_synth_ui::bevy_transform_gizmos::{
+    GizmoTransformable, TransformGizmo, TransformGizmoOffset,
+};
 use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
@@ -174,6 +176,12 @@ impl Plugin for PanOrbitCameraPlugin {
 #[derive(Component, Clone, Debug)]
 pub(crate) struct CachedMeshInstance {
     pub(crate) cache_key: String,
+}
+
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GaussianSplatPickBounds {
+    pub(crate) center: Vec3,
+    pub(crate) half_extents: Vec3,
 }
 
 #[derive(Resource)]
@@ -375,12 +383,11 @@ pub(crate) fn should_pause_render_during_inference(
     if !args.pause_render_during_inference || exit_requested {
         return false;
     }
-    let active = queue
+    queue
         .active
         .as_ref()
         .map(|batch| !batch.is_empty())
-        .unwrap_or(false);
-    active
+        .unwrap_or(false)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -709,8 +716,11 @@ pub(crate) fn run() {
         app.add_systems(
             PostUpdate,
             (
+                sync_gaussian_splat_pick_bounds,
                 remove_entity_from_selection_if_despawned,
-                update_selection_from_primary_click.after(TransformGizmoSystems::Main),
+                update_selection_from_primary_click
+                    .after(TransformGizmoSystems::Main)
+                    .after(sync_gaussian_splat_pick_bounds),
             ),
         );
     }
@@ -721,8 +731,11 @@ pub(crate) fn run() {
         app.add_systems(
             PostUpdate,
             (
+                sync_gaussian_splat_pick_bounds,
                 remove_entity_from_selection_if_despawned,
-                update_selection_from_primary_click.after(TransformGizmoSystems::Main),
+                update_selection_from_primary_click
+                    .after(TransformGizmoSystems::Main)
+                    .after(sync_gaussian_splat_pick_bounds),
             ),
         );
     }
@@ -1570,6 +1583,7 @@ enum CachedAssetHandles {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hydrate_from_cache(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<BevyMesh>>,
@@ -3349,7 +3363,7 @@ pub(crate) fn spawn_gaussian_splat_instance(
 pub(crate) fn triposplat_cloud_settings() -> CloudSettings {
     CloudSettings {
         sort_mode: SortMode::Std,
-        color_space: GaussianColorSpace::LinRec709Display,
+        color_space: GaussianColorSpace::SrgbRec709Display,
         ..default()
     }
 }
@@ -3523,6 +3537,62 @@ fn transform_from_optional_parts(
     })
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) fn sync_gaussian_splat_pick_bounds(
+    mut commands: Commands,
+    gaussian_clouds: Res<Assets<PlanarGaussian3d>>,
+    clouds_without_bounds: Query<
+        (Entity, &PlanarGaussian3dHandle),
+        (With<GizmoTransformable>, Without<GaussianSplatPickBounds>),
+    >,
+) {
+    for (entity, cloud_handle) in clouds_without_bounds.iter() {
+        let Some(cloud) = gaussian_clouds.get(&cloud_handle.0) else {
+            continue;
+        };
+        if let Some(bounds) = gaussian_splat_pick_bounds(cloud) {
+            commands
+                .entity(entity)
+                .insert((bounds, TransformGizmoOffset(bounds.center)));
+        }
+    }
+}
+
+pub(crate) fn gaussian_splat_pick_bounds(
+    cloud: &PlanarGaussian3d,
+) -> Option<GaussianSplatPickBounds> {
+    if cloud.position_visibility.is_empty() {
+        return None;
+    }
+
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for (position_visibility, scale_opacity) in cloud
+        .position_visibility
+        .iter()
+        .zip(cloud.scale_opacity.iter())
+    {
+        let position = Vec3::from_array(position_visibility.position);
+        let scale = Vec3::from_array(scale_opacity.scale);
+        if !position.is_finite() || !scale.is_finite() {
+            return None;
+        }
+        let radius = scale.abs() * 3.0 + Vec3::splat(0.01);
+        min = min.min(position - radius);
+        max = max.max(position + radius);
+    }
+
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let center = (min + max) * 0.5;
+    let half_extents = ((max - min) * 0.5).max(Vec3::splat(0.05));
+    Some(GaussianSplatPickBounds {
+        center,
+        half_extents,
+    })
+}
+
 fn delete_selected_meshes(
     keys: Res<ButtonInput<KeyCode>>,
     mut selection: ResMut<EditorSelection>,
@@ -3561,6 +3631,10 @@ fn update_selection_from_primary_click(
         With<bevy_transform_gizmos::InteractionKind>,
     >,
     transformables: Query<(Entity, &Mesh3d, &GlobalTransform), With<GizmoTransformable>>,
+    gaussian_transformables: Query<
+        (Entity, &GaussianSplatPickBounds, &GlobalTransform),
+        With<GizmoTransformable>,
+    >,
     meshes: Res<Assets<BevyMesh>>,
 ) {
     if !buttons.just_pressed(MouseButton::Left) {
@@ -3639,6 +3713,21 @@ fn update_selection_from_primary_click(
             best_hit = Some((entity, distance));
         }
     }
+    for (entity, bounds, transform) in gaussian_transformables.iter() {
+        let (world_min, world_max) = world_aabb(bounds.center, bounds.half_extents, transform);
+        let Some(distance) =
+            ray_aabb_intersection(ray.origin, ray.direction.as_vec3(), world_min, world_max)
+        else {
+            continue;
+        };
+        if best_hit
+            .as_ref()
+            .map(|(_, best_distance)| distance < *best_distance)
+            .unwrap_or(true)
+        {
+            best_hit = Some((entity, distance));
+        }
+    }
 
     if let Some((entity, _)) = best_hit {
         if keyboard_input.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
@@ -3654,7 +3743,7 @@ fn update_selection_from_primary_click(
     }
 }
 
-fn world_aabb(
+pub(crate) fn world_aabb(
     local_center: Vec3,
     local_half_extents: Vec3,
     transform: &GlobalTransform,
@@ -3676,7 +3765,12 @@ fn world_aabb(
     (world_min, world_max)
 }
 
-fn ray_aabb_intersection(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+pub(crate) fn ray_aabb_intersection(
+    origin: Vec3,
+    direction: Vec3,
+    min: Vec3,
+    max: Vec3,
+) -> Option<f32> {
     let mut t_min: f32 = 0.0;
     let mut t_max: f32 = f32::INFINITY;
     for (origin_axis, direction_axis, min_axis, max_axis) in [

@@ -29,7 +29,7 @@ use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
 use bevy_synth_runtime::{GaussianSplat, GaussianSplatCloud, SynthAsset, SynthMesh, TripoMesh};
-use bevy_synth_ui::bevy_transform_gizmos::GizmoTransformable;
+use bevy_synth_ui::bevy_transform_gizmos::{GizmoTransformable, TransformGizmoOffset};
 
 static TEST_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -122,7 +122,10 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(Assets::<BevyMesh>::default());
     app.insert_resource(Assets::<StandardMaterial>::default());
     app.insert_resource(Assets::<PlanarGaussian3d>::default());
-    app.add_systems(Update, drive_inference);
+    app.add_systems(
+        Update,
+        (drive_inference, crate::app::sync_gaussian_splat_pick_bounds).chain(),
+    );
     app
 }
 
@@ -289,10 +292,16 @@ fn inference_result_with_splats_writes_output_and_spawns_gaussian_cloud() {
     assert_eq!(count, 1);
     let cloud_entities = world.query::<&PlanarGaussian3dHandle>().iter(world).count();
     assert_eq!(cloud_entities, 1);
+    let mut pick_bounds =
+        world.query::<(&crate::app::GaussianSplatPickBounds, &TransformGizmoOffset)>();
+    let (bounds, offset) = pick_bounds
+        .single(world)
+        .expect("Gaussian cloud should expose pick bounds for selection");
+    assert_eq!(offset.0, bounds.center);
     let mut settings = world.query::<&CloudSettings>();
     let settings = settings.single(world).expect("one Gaussian cloud settings");
     assert_eq!(settings.sort_mode, SortMode::Std);
-    assert_eq!(settings.color_space, GaussianColorSpace::LinRec709Display);
+    assert_eq!(settings.color_space, GaussianColorSpace::SrgbRec709Display);
     let mesh_entities = world.query::<&Mesh3d>().iter(world).count();
     assert_eq!(mesh_entities, 0, "TripoSplat should not spawn a mesh proxy");
 
@@ -355,6 +364,57 @@ fn gaussian_splat_cloud_conversion_uses_bevy_display_orientation() {
     assert_eq!(cloud.position_visibility[0].visibility, 1.0);
     assert_eq!(cloud.scale_opacity[0].scale, [0.01, 0.02, 0.03]);
     assert_eq!(cloud.scale_opacity[0].opacity, 0.5);
+    assert_eq!(
+        cloud.spherical_harmonic[0].coefficients[0..3],
+        [0.1, 0.2, 0.3]
+    );
+}
+
+#[test]
+fn triposplat_cloud_settings_use_display_rgb_color_space() {
+    let settings = crate::app::triposplat_cloud_settings();
+    assert_eq!(settings.sort_mode, SortMode::Std);
+    assert_eq!(settings.color_space, GaussianColorSpace::SrgbRec709Display);
+}
+
+#[test]
+fn gaussian_splat_pick_bounds_cover_cloud_extent() {
+    let cloud = PlanarGaussian3d::from(vec![
+        bevy_gaussian_splatting::Gaussian3d {
+            position_visibility: [-1.0, 0.0, 0.0, 1.0].into(),
+            spherical_harmonic: Default::default(),
+            rotation: [1.0, 0.0, 0.0, 0.0].into(),
+            scale_opacity: [0.1, 0.2, 0.3, 0.8].into(),
+        },
+        bevy_gaussian_splatting::Gaussian3d {
+            position_visibility: [1.0, 2.0, 3.0, 1.0].into(),
+            spherical_harmonic: Default::default(),
+            rotation: [1.0, 0.0, 0.0, 0.0].into(),
+            scale_opacity: [0.2, 0.1, 0.1, 0.8].into(),
+        },
+    ]);
+
+    let bounds = crate::app::gaussian_splat_pick_bounds(&cloud).expect("bounds");
+    let (world_min, world_max) = crate::app::world_aabb(
+        bounds.center,
+        bounds.half_extents,
+        &GlobalTransform::IDENTITY,
+    );
+
+    assert!(world_min.x < -1.0);
+    assert!(world_max.x > 1.0);
+    assert!(world_max.y > 2.0);
+    assert!(world_max.z > 3.0);
+    assert!(
+        crate::app::ray_aabb_intersection(
+            Vec3::new(0.0, 1.0, 6.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            world_min,
+            world_max,
+        )
+        .is_some(),
+        "Gaussian cloud bounds should be usable as a click target"
+    );
 }
 
 #[test]

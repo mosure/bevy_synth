@@ -30,6 +30,7 @@ scripts/
 !scripts/
 !scripts/guard_canonical_runtime.sh
 !scripts/triposplat_gsplat_render.py
+!scripts/triposplat_torch_flow_bench.py
 !scripts/guards/
 !scripts/guards/README.md
 !scripts/guards/*.baseline
@@ -61,6 +62,8 @@ assets/images/
 *.engine
 *.gguf
 *.ggml
+!crates/burn_triposplat/src/torch_sobol_seed123_dim3_8192_f32le.bin
+!crates/burn_triposplat/src/torch_latent_position_seed123_8192x1024_f32le.bin
 output/
 sandbox/
 .burn_synth_cache/

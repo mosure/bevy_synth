@@ -1,6 +1,6 @@
 use burn_foreground::pipeline::PrepareImageConfig;
 
-pub(crate) const TRIPOSPLAT_CANVAS_SIZE: usize = 1024;
+pub(crate) const TRIPOSPLAT_CANVAS_SIZE: usize = burn_triposplat::TRIPOSPLAT_CANONICAL_CANVAS_SIZE;
 
 pub(crate) fn triposplat_prepare_image_config(erode_radius: usize) -> PrepareImageConfig {
     let default = PrepareImageConfig::default();

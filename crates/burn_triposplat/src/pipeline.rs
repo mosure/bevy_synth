@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::artifact::{TripoSplatArtifactSet, TripoSplatBurnpackPrecision};
 use crate::config::{TripoSplatOptions, normalize_num_gaussians};
+use crate::decoder::TripoSplatDecodeReadbackStats;
 use crate::gaussian::GaussianSplatCloud;
 use crate::paths::resolve_triposplat_weights_root;
 
@@ -94,12 +95,14 @@ pub const TRIPOSPLAT_STAGE_STATUS: [TripoSplatStageStatus; 9] = [
 pub struct TripoSplatRunOutput {
     pub splats: GaussianSplatCloud,
     pub options: TripoSplatOptions,
+    pub decode_readbacks: TripoSplatDecodeReadbackStats,
 }
 
 #[derive(Clone, Debug)]
 pub struct TripoSplatMultiRunOutput {
     pub splats: Vec<GaussianSplatCloud>,
     pub options: Vec<TripoSplatOptions>,
+    pub decode_readbacks: TripoSplatDecodeReadbackStats,
 }
 
 impl TripoSplatPipeline {
@@ -134,6 +137,23 @@ impl TripoSplatPipeline {
             .map_err(|err| err.to_string())
     }
 
+    #[cfg(feature = "import")]
+    pub fn load_runtime_components_with_compute_dtypes<B: burn::prelude::Backend>(
+        &self,
+        device: &B::Device,
+        compute_dtypes: crate::import::TripoSplatRuntimeComputeDtypes,
+    ) -> Result<crate::TripoSplatRuntimeComponents<B>, String> {
+        let artifacts =
+            TripoSplatArtifactSet::new(&self.config.weights_root, self.config.precision);
+        crate::import::load_triposplat_runtime_components_with_compute_dtypes_and_callback(
+            device,
+            &artifacts,
+            compute_dtypes,
+            |_| Ok::<(), Box<dyn std::error::Error>>(()),
+        )
+        .map_err(|err| err.to_string())
+    }
+
     pub fn infer_image(
         &mut self,
         _image_path: impl AsRef<std::path::Path>,
@@ -159,6 +179,7 @@ impl TripoSplatPipeline {
         TripoSplatRunOutput {
             splats: GaussianSplatCloud::canonical_debug_cloud(),
             options,
+            decode_readbacks: TripoSplatDecodeReadbackStats::default(),
         }
     }
 }

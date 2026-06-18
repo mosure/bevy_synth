@@ -18,6 +18,35 @@ pub struct OctreeSample<B: Backend> {
     pub log_probs: Tensor<B, 2>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TripoSplatDecodeReadbackStats {
+    pub sync_readbacks: usize,
+    pub async_readbacks: usize,
+    pub bytes: usize,
+}
+
+impl TripoSplatDecodeReadbackStats {
+    pub fn total_readbacks(&self) -> usize {
+        self.sync_readbacks + self.async_readbacks
+    }
+
+    fn add_sync_f32(&mut self, values: usize) {
+        self.sync_readbacks += 1;
+        self.bytes = self.bytes.saturating_add(values.saturating_mul(4));
+    }
+
+    fn add_async_f32(&mut self, values: usize) {
+        self.async_readbacks += 1;
+        self.bytes = self.bytes.saturating_add(values.saturating_mul(4));
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.sync_readbacks = self.sync_readbacks.saturating_add(other.sync_readbacks);
+        self.async_readbacks = self.async_readbacks.saturating_add(other.async_readbacks);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OctreePrediction<B: Backend> {
     pub logits: Tensor<B, 3>,
@@ -207,6 +236,17 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
         level: usize,
         seed: u64,
     ) -> Result<OctreeSample<B>, String> {
+        self.sample_systematic_host_with_readback_stats(cond, num_points, level, seed)
+            .map(|(sample, _stats)| sample)
+    }
+
+    pub fn sample_systematic_host_with_readback_stats(
+        &self,
+        cond: Tensor<B, 3>,
+        num_points: usize,
+        level: usize,
+        seed: u64,
+    ) -> Result<(OctreeSample<B>, TripoSplatDecodeReadbackStats), String> {
         let [batch, _tokens, _channels] = cond.dims();
         let dtype: FloatDType = cond.dtype().into();
         if batch == 0 {
@@ -222,6 +262,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
         }
 
         let device = cond.device();
+        let mut readbacks = TripoSplatDecodeReadbackStats::default();
         let child_offsets = [
             [0usize, 0, 0],
             [1, 0, 0],
@@ -272,6 +313,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                 cond.clone(),
                 &device,
                 octree_host_forward_chunk_tokens(),
+                &mut readbacks,
             )?;
 
             let mut next = Vec::with_capacity(batch);
@@ -327,14 +369,17 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
             }
         }
 
-        Ok(OctreeSample {
-            points: Tensor::<B, 1>::from_floats(points.as_slice(), &device)
-                .cast(dtype)
-                .reshape([batch, num_points, 3]),
-            log_probs: Tensor::<B, 1>::from_floats(log_probs.as_slice(), &device)
-                .cast(dtype)
-                .reshape([batch, num_points]),
-        })
+        Ok((
+            OctreeSample {
+                points: Tensor::<B, 1>::from_floats(points.as_slice(), &device)
+                    .cast(dtype)
+                    .reshape([batch, num_points, 3]),
+                log_probs: Tensor::<B, 1>::from_floats(log_probs.as_slice(), &device)
+                    .cast(dtype)
+                    .reshape([batch, num_points]),
+            },
+            readbacks,
+        ))
     }
 
     pub async fn sample_systematic_host_async(
@@ -344,6 +389,18 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
         level: usize,
         seed: u64,
     ) -> Result<OctreeSample<B>, String> {
+        self.sample_systematic_host_async_with_readback_stats(cond, num_points, level, seed)
+            .await
+            .map(|(sample, _stats)| sample)
+    }
+
+    pub async fn sample_systematic_host_async_with_readback_stats(
+        &self,
+        cond: Tensor<B, 3>,
+        num_points: usize,
+        level: usize,
+        seed: u64,
+    ) -> Result<(OctreeSample<B>, TripoSplatDecodeReadbackStats), String> {
         let [batch, _tokens, _channels] = cond.dims();
         let dtype: FloatDType = cond.dtype().into();
         if batch == 0 {
@@ -359,6 +416,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
         }
 
         let device = cond.device();
+        let mut readbacks = TripoSplatDecodeReadbackStats::default();
         let child_offsets = [
             [0usize, 0, 0],
             [1, 0, 0],
@@ -410,6 +468,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                     cond.clone(),
                     &device,
                     octree_host_forward_chunk_tokens(),
+                    &mut readbacks,
                 )
                 .await?;
 
@@ -466,17 +525,20 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
             }
         }
 
-        Ok(OctreeSample {
-            points: Tensor::<B, 1>::from_floats(points.as_slice(), &device)
-                .cast(dtype)
-                .reshape([batch, num_points, 3]),
-            log_probs: Tensor::<B, 1>::from_floats(log_probs.as_slice(), &device)
-                .cast(dtype)
-                .reshape([batch, num_points]),
-        })
+        Ok((
+            OctreeSample {
+                points: Tensor::<B, 1>::from_floats(points.as_slice(), &device)
+                    .cast(dtype)
+                    .reshape([batch, num_points, 3]),
+                log_probs: Tensor::<B, 1>::from_floats(log_probs.as_slice(), &device)
+                    .cast(dtype)
+                    .reshape([batch, num_points]),
+            },
+            readbacks,
+        ))
     }
 
-    fn float_dtype(&self) -> FloatDType {
+    pub fn float_dtype(&self) -> FloatDType {
         self.in_proj.weight.val().dtype().into()
     }
 
@@ -491,6 +553,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
         cond: Tensor<B, 3>,
         device: &B::Device,
         chunk_tokens: usize,
+        readbacks: &mut TripoSplatDecodeReadbackStats,
     ) -> Result<Vec<f32>, String> {
         let chunk_tokens = chunk_tokens.max(1).min(max_parent_count.max(1));
         let mut probs = vec![0.0f32; batch * max_parent_count * 8];
@@ -511,6 +574,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                 .convert::<f32>()
                 .to_vec::<f32>()
                 .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?;
+            readbacks.add_sync_f32(chunk.len());
             copy_chunk_probs(&chunk, &mut probs, batch, max_parent_count, start, width)?;
             cleanup_wasm_backend_memory::<B>(device);
         }
@@ -528,6 +592,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
         cond: Tensor<B, 3>,
         device: &B::Device,
         chunk_tokens: usize,
+        readbacks: &mut TripoSplatDecodeReadbackStats,
     ) -> Result<Vec<f32>, String> {
         let chunk_tokens = chunk_tokens.max(1).min(max_parent_count.max(1));
         let mut probs = vec![0.0f32; batch * max_parent_count * 8];
@@ -550,6 +615,7 @@ impl<B: Backend> OctreeProbabilityFixedlenDecoder<B> {
                 .convert::<f32>()
                 .to_vec::<f32>()
                 .map_err(|_| "failed to read octree probabilities for host sampler".to_string())?;
+            readbacks.add_async_f32(chunk.len());
             copy_chunk_probs(&chunk, &mut probs, batch, max_parent_count, start, width)?;
             cleanup_wasm_backend_memory::<B>(device);
         }
@@ -881,6 +947,16 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
         sample: &OctreeSample<B>,
         features: Tensor<B, 3>,
     ) -> Result<GaussianSplatCloud, String> {
+        self.build_cloud_with_readback_stats(sample, features)
+            .map(|(cloud, _stats)| cloud)
+    }
+
+    pub fn build_cloud_with_readback_stats(
+        &self,
+        sample: &OctreeSample<B>,
+        features: Tensor<B, 3>,
+    ) -> Result<(GaussianSplatCloud, TripoSplatDecodeReadbackStats), String> {
+        let mut readbacks = TripoSplatDecodeReadbackStats::default();
         let [batch, tokens, channels] = features.dims();
         if batch == 0 {
             return Err("Gaussian decoder output has empty batch".to_string());
@@ -899,19 +975,24 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
             .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|_| "failed to read TripoSplat decoder points".to_string())?;
+        readbacks.add_sync_f32(points.len());
         let features = features
             .slice([0..1, 0..tokens, 0..channels])
             .to_data()
             .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|_| "failed to read TripoSplat decoder features".to_string())?;
-        Ok(GaussianSplatCloud::new(build_splats_host(
-            &points,
-            &features,
-            tokens,
-            self.layout,
-            &self.rep_config,
-        )?))
+        readbacks.add_sync_f32(features.len());
+        Ok((
+            GaussianSplatCloud::new(build_splats_host(
+                &points,
+                &features,
+                tokens,
+                self.layout,
+                &self.rep_config,
+            )?),
+            readbacks,
+        ))
     }
 
     pub async fn build_cloud_async(
@@ -919,6 +1000,17 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
         sample: &OctreeSample<B>,
         features: Tensor<B, 3>,
     ) -> Result<GaussianSplatCloud, String> {
+        self.build_cloud_async_with_readback_stats(sample, features)
+            .await
+            .map(|(cloud, _stats)| cloud)
+    }
+
+    pub async fn build_cloud_async_with_readback_stats(
+        &self,
+        sample: &OctreeSample<B>,
+        features: Tensor<B, 3>,
+    ) -> Result<(GaussianSplatCloud, TripoSplatDecodeReadbackStats), String> {
+        let mut readbacks = TripoSplatDecodeReadbackStats::default();
         let [batch, tokens, channels] = features.dims();
         if batch == 0 {
             return Err("Gaussian decoder output has empty batch".to_string());
@@ -939,6 +1031,7 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
             .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|_| "failed to read TripoSplat decoder points".to_string())?;
+        readbacks.add_async_f32(points.len());
         cleanup_wasm_tensor_device(&sample.points);
         let features_device = features.device();
         let features = features
@@ -949,17 +1042,21 @@ impl<B: Backend> ElasticGaussianFixedlenDecoder<B> {
             .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|_| "failed to read TripoSplat decoder features".to_string())?;
+        readbacks.add_async_f32(features.len());
         cleanup_wasm_backend_memory::<B>(&features_device);
-        Ok(GaussianSplatCloud::new(build_splats_host(
-            &points,
-            &features,
-            tokens,
-            self.layout,
-            &self.rep_config,
-        )?))
+        Ok((
+            GaussianSplatCloud::new(build_splats_host(
+                &points,
+                &features,
+                tokens,
+                self.layout,
+                &self.rep_config,
+            )?),
+            readbacks,
+        ))
     }
 
-    fn float_dtype(&self) -> FloatDType {
+    pub fn float_dtype(&self) -> FloatDType {
         self.in_proj.weight.val().dtype().into()
     }
 }
@@ -1170,6 +1267,10 @@ impl<B: Backend> OctreeGaussianDecoder<B> {
         self.gs.rep_config.num_gaussians
     }
 
+    pub fn float_dtype(&self) -> FloatDType {
+        self.gs.float_dtype()
+    }
+
     pub fn decode_to_cloud(
         &self,
         latent: Tensor<B, 3>,
@@ -1184,9 +1285,19 @@ impl<B: Backend> OctreeGaussianDecoder<B> {
         num_gaussians: usize,
         seed: u64,
     ) -> Result<GaussianSplatCloud, String> {
+        self.decode_to_cloud_with_seed_readback_stats(latent, num_gaussians, seed)
+            .map(|(cloud, _stats)| cloud)
+    }
+
+    pub fn decode_to_cloud_with_seed_readback_stats(
+        &self,
+        latent: Tensor<B, 3>,
+        num_gaussians: usize,
+        seed: u64,
+    ) -> Result<(GaussianSplatCloud, TripoSplatDecodeReadbackStats), String> {
         let [batch, _tokens, _channels] = latent.dims();
         let num_points = (num_gaussians / self.gaussians_per_point()).max(1);
-        let sample = self.octree.sample_systematic_host(
+        let (sample, mut readbacks) = self.octree.sample_systematic_host_with_readback_stats(
             latent.clone(),
             num_points,
             OCTREE_MAX_VOXEL_LEVEL,
@@ -1194,7 +1305,10 @@ impl<B: Backend> OctreeGaussianDecoder<B> {
         )?;
         debug_assert_eq!(sample.points.dims()[0], batch);
         let features = self.gs.forward(&sample, latent);
-        self.gs.build_cloud(&sample, features)
+        let (cloud, cloud_readbacks) =
+            self.gs.build_cloud_with_readback_stats(&sample, features)?;
+        readbacks.merge(cloud_readbacks);
+        Ok((cloud, readbacks))
     }
 
     pub async fn decode_to_cloud_with_seed_async(
@@ -1203,17 +1317,38 @@ impl<B: Backend> OctreeGaussianDecoder<B> {
         num_gaussians: usize,
         seed: u64,
     ) -> Result<GaussianSplatCloud, String> {
+        self.decode_to_cloud_with_seed_async_readback_stats(latent, num_gaussians, seed)
+            .await
+            .map(|(cloud, _stats)| cloud)
+    }
+
+    pub async fn decode_to_cloud_with_seed_async_readback_stats(
+        &self,
+        latent: Tensor<B, 3>,
+        num_gaussians: usize,
+        seed: u64,
+    ) -> Result<(GaussianSplatCloud, TripoSplatDecodeReadbackStats), String> {
         let [batch, _tokens, _channels] = latent.dims();
         let num_points = (num_gaussians / self.gaussians_per_point()).max(1);
-        let sample = self
+        let (sample, mut readbacks) = self
             .octree
-            .sample_systematic_host_async(latent.clone(), num_points, OCTREE_MAX_VOXEL_LEVEL, seed)
+            .sample_systematic_host_async_with_readback_stats(
+                latent.clone(),
+                num_points,
+                OCTREE_MAX_VOXEL_LEVEL,
+                seed,
+            )
             .await?;
         cleanup_wasm_tensor_device(&sample.points);
         debug_assert_eq!(sample.points.dims()[0], batch);
         let features = self.gs.forward(&sample, latent);
         cleanup_wasm_tensor_device(&features);
-        self.gs.build_cloud_async(&sample, features).await
+        let (cloud, cloud_readbacks) = self
+            .gs
+            .build_cloud_async_with_readback_stats(&sample, features)
+            .await?;
+        readbacks.merge(cloud_readbacks);
+        Ok((cloud, readbacks))
     }
 
     pub fn decode_to_cloud_with_seed_checked(
@@ -1611,14 +1746,30 @@ mod tests {
             0.125f32, 0.125, 0.125, 0.375, 0.125, 0.125, 0.125, 0.375, 0.125, 0.375, 0.375, 0.125,
             0.625, 0.625, 0.625,
         ];
+        let mut full_stats = TripoSplatDecodeReadbackStats::default();
         let full = model
-            .sample_level_probs_host(&coords, 1, 5, 4, 17, cond.clone(), &device, usize::MAX)
+            .sample_level_probs_host(
+                &coords,
+                1,
+                5,
+                4,
+                17,
+                cond.clone(),
+                &device,
+                usize::MAX,
+                &mut full_stats,
+            )
             .expect("full probs");
+        let mut chunked_stats = TripoSplatDecodeReadbackStats::default();
         let chunked = model
-            .sample_level_probs_host(&coords, 1, 5, 4, 17, cond, &device, 2)
+            .sample_level_probs_host(&coords, 1, 5, 4, 17, cond, &device, 2, &mut chunked_stats)
             .expect("chunked probs");
 
         assert_eq!(full.len(), chunked.len());
+        assert_eq!(full_stats.sync_readbacks, 1);
+        assert_eq!(chunked_stats.sync_readbacks, 3);
+        assert_eq!(full_stats.bytes, full.len() * 4);
+        assert_eq!(chunked_stats.bytes, chunked.len() * 4);
         for (index, (a, b)) in full.iter().zip(chunked.iter()).enumerate() {
             assert!(
                 (a - b).abs() <= 1.0e-5,

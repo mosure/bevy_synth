@@ -325,6 +325,10 @@ fn run(cli: Cli) -> Result<(), String> {
     };
     let triposplat_counts =
         normalize_cli_gaussian_counts(&cli.gaussians, triposplat_profile_settings.num_gaussians)?;
+    let triposplat_num_steps = cli.num_steps.unwrap_or(triposplat_profile_settings.steps);
+    let triposplat_guidance_scale = cli
+        .guidance_scale
+        .unwrap_or(triposplat_profile_settings.guidance_scale);
     let mut runtime_config = RuntimeConfig {
         model_selection: ModelSelection::new(
             synthesis_models.iter().copied().map(Into::into),
@@ -353,6 +357,8 @@ fn run(cli: Cli) -> Result<(), String> {
         } else {
             quality_defaults.guidance_scale
         }),
+        triposplat_num_steps,
+        triposplat_guidance_scale,
         triposplat_shift: cli.triposplat_shift.unwrap_or(3.0),
         triposplat_num_gaussians: triposplat_counts[0],
         triposplat_erode_radius: cli.triposplat_erode_radius.unwrap_or(1),

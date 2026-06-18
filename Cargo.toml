@@ -59,3 +59,4 @@ panic = "abort"
 
 [patch.crates-io]
 burn_dino = { path = "third_party/burn_dino" }
+cubek-attention = { path = "third_party/cubek-attention" }

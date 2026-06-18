@@ -10,25 +10,26 @@ reference_run="${TRIPOSPLAT_REFERENCE_RUN:-tmp/runs/20260604T120916Z_triposplat_
 stage_tensors="${TRIPOSPLAT_STAGE_TENSORS:-${reference_run}/stage_tensors_f32.safetensors}"
 weights_root="${TRIPOSPLAT_WEIGHTS_ROOT:-crates/burn_triposplat/assets/models/TripoSplat}"
 precision="${TRIPOSPLAT_WEIGHTS_PRECISION:-f32}"
+backend="${TRIPOSPLAT_BACKEND:-wgpu}"
 steps="${TRIPOSPLAT_STEPS:-20}"
 guidance_scale="${TRIPOSPLAT_GUIDANCE_SCALE:-3.0}"
 shift="${TRIPOSPLAT_SHIFT:-3.0}"
 gaussians="${TRIPOSPLAT_GAUSSIANS:-32768}"
 stop_after="${TRIPOSPLAT_STOP_AFTER:-encode}"
-cfg_mode="${TRIPOSPLAT_CFG_MODE:-batched}"
+cfg_mode="${TRIPOSPLAT_CFG_MODE:-separate}"
 max_abs="${TRIPOSPLAT_STAGE_MAX_ABS:-1.0e-2}"
 mean_abs="${TRIPOSPLAT_STAGE_MEAN_ABS:-1.0e-3}"
 rms="${TRIPOSPLAT_STAGE_RMS:-2.0e-3}"
 timeout_seconds="${TRIPOSPLAT_TIMEOUT_SECONDS:-1200}"
 gpu_sample_ms="${GPU_SAMPLE_MS:-1000}"
-candidate="${TRIPOSPLAT_CANDIDATE_STAGES:-${run_dir}/stage_tensors_wgpu_${precision}_${stop_after}.safetensors}"
+candidate="${TRIPOSPLAT_CANDIDATE_STAGES:-${run_dir}/stage_tensors_${backend}_${precision}_${stop_after}.safetensors}"
 
 mkdir -p "$run_dir"
 
 cat >"${run_dir}/config.json" <<JSON
 {
   "run_id": "${run_id}",
-  "backend": "wgpu",
+  "backend": "${backend}",
   "reference_stage_tensors": "${stage_tensors}",
   "candidate_stage_tensors": "${candidate}",
   "weights_root": "${weights_root}",
@@ -69,7 +70,7 @@ fi
 
 set +e
 timeout "${timeout_seconds}s" cargo run -p burn_triposplat --features import,backend_wgpu --bin triposplat_stage_export -- \
-  --backend wgpu \
+  --backend "$backend" \
   --weights-root "$weights_root" \
   --precision "$precision" \
   --input-stages "$stage_tensors" \

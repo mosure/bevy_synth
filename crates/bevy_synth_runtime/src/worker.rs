@@ -444,7 +444,7 @@ fn app_args_to_wasm_preset(
 #[cfg(target_arch = "wasm32")]
 fn wasm_preset_key(preset: &WasmInferencePreset) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         preset.synthesis_model,
         preset.backend,
         preset.rmbg_model,
@@ -452,8 +452,7 @@ fn wasm_preset_key(preset: &WasmInferencePreset) -> String {
         preset.dino_backend,
         preset.weights_precision,
         preset.rmbg_weights_precision,
-        preset.seed,
-        preset.triposplat_num_gaussians
+        preset.seed
     )
 }
 

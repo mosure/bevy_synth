@@ -18,18 +18,21 @@ pub use artifact::{
 pub use config::{
     DEFAULT_ERODE_RADIUS, DEFAULT_GUIDANCE_SCALE, DEFAULT_NUM_GAUSSIANS, DEFAULT_NUM_STEPS,
     DEFAULT_Q_TOKEN_LENGTH, DEFAULT_SEED, DEFAULT_SHIFT, HIGH_PROFILE_NUM_STEPS,
-    LOW_PROFILE_NUM_STEPS, MAX_NUM_GAUSSIANS, MIN_NUM_GAUSSIANS, TRIPOSPLAT_GAUSSIANS_PER_POINT,
-    TripoSplatOptions, TripoSplatProfile, TripoSplatProfileSettings, normalize_num_gaussians,
-    triposplat_profile_for_settings,
+    LOW_PROFILE_NUM_STEPS, MAX_NUM_GAUSSIANS, MIN_NUM_GAUSSIANS, TRIPOSPLAT_CANONICAL_CANVAS_SIZE,
+    TRIPOSPLAT_DINOV3_PREFIX_TOKENS, TRIPOSPLAT_FAST_DINOV3_TOKEN_LENGTH,
+    TRIPOSPLAT_FAST_VAE_TOKEN_LENGTH, TRIPOSPLAT_FLOW_LATENT_TOKEN_LENGTH,
+    TRIPOSPLAT_GAUSSIANS_PER_POINT, TripoSplatOptions, TripoSplatProfile,
+    TripoSplatProfileSettings, normalize_num_gaussians, triposplat_profile_for_settings,
 };
 pub use decoder::{
     ElasticGaussianFixedlenDecoder, ElasticGaussianFixedlenDecoderConfig, GaussianFeatureLayout,
     GaussianRepresentationConfig, OCTREE_MAX_VOXEL_LEVEL, OctreeGaussianDecoder, OctreePrediction,
     OctreeProbabilityFixedlenDecoder, OctreeProbabilityFixedlenDecoderConfig, OctreeSample,
+    TripoSplatDecodeReadbackStats,
 };
 pub use flow::{
-    CfgPredictionMode, FlowEulerTrace, FlowState, LatentSeqMmFlowModel, LatentSeqMmFlowModelConfig,
-    TripoSplatCondition,
+    CfgPredictionMode, FlowEulerTrace, FlowPredictionProfile, FlowState, LatentSeqMmFlowModel,
+    LatentSeqMmFlowModelConfig, TripoSplatCondition,
 };
 pub use gaussian::{GaussianSplat, GaussianSplatCloud, GaussianSplatStats};
 pub use paths::resolve_triposplat_weights_root;

@@ -4,7 +4,8 @@ use burn::{
     nn::conv::{Conv2d, Conv2dConfig},
     prelude::*,
     tensor::{
-        activation::sigmoid, module::attention as module_attention,
+        activation::{sigmoid, softmax},
+        module::attention as module_attention,
         ops::AttentionModuleOptions, FloatDType,
     },
 };
@@ -13,6 +14,11 @@ use crate::layers::layer_norm::{LayerNorm, LayerNormConfig};
 
 #[cfg(target_arch = "wasm32")]
 const WASM_DINOV3_ATTENTION_QUERY_CHUNK_TOKENS: usize = 64;
+#[cfg(not(target_arch = "wasm32"))]
+const NATIVE_DINOV3_ATTENTION_QUERY_CHUNK_TOKENS: usize = 256;
+#[cfg(not(target_arch = "wasm32"))]
+const NATIVE_DINOV3_ATTENTION_CHUNK_THRESHOLD: usize = 8192;
+const DINOV3_ATTENTION_MIN_TAIL_QUERY_TOKENS: usize = 64;
 
 #[derive(Config, Debug)]
 pub struct DinoV3Config {
@@ -185,7 +191,17 @@ fn dinov3_attention<B: Backend>(
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        dinov3_attention_dense(q, k, v, head_dim)
+        if q.dims()[2] <= NATIVE_DINOV3_ATTENTION_CHUNK_THRESHOLD {
+            dinov3_attention_dense(q, k, v, head_dim)
+        } else {
+            dinov3_attention_chunked(
+                q,
+                k,
+                v,
+                head_dim,
+                NATIVE_DINOV3_ATTENTION_QUERY_CHUNK_TOKENS,
+            )
+        }
     }
 }
 
@@ -195,7 +211,11 @@ fn dinov3_attention_dense<B: Backend>(
     v: Tensor<B, 4>,
     head_dim: usize,
 ) -> Tensor<B, 4> {
-    module_attention(
+    let dtype: FloatDType = q.dtype().into();
+    let q = cast_low_precision_to_f32(q, dtype);
+    let k = cast_low_precision_to_f32(k, dtype);
+    let v = cast_low_precision_to_f32(v, dtype);
+    let out = module_attention(
         q,
         k,
         v,
@@ -205,10 +225,10 @@ fn dinov3_attention_dense<B: Backend>(
             scale: Some((head_dim as f64).powf(-0.5)),
             ..Default::default()
         },
-    )
+    );
+    cast_from_f32_accum(out, dtype)
 }
 
-#[cfg(target_arch = "wasm32")]
 fn dinov3_attention_chunked<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
@@ -224,11 +244,11 @@ fn dinov3_attention_chunked<B: Backend>(
     let mut chunks = Vec::with_capacity(query_tokens.div_ceil(query_chunk_tokens));
     let mut start = 0;
     while start < query_tokens {
-        let end = (start + query_chunk_tokens).min(query_tokens);
+        let end = next_dinov3_attention_chunk_end(start, query_tokens, query_chunk_tokens);
         let q_chunk = q
             .clone()
             .slice([0..batch, 0..heads, start..end, 0..head_dim]);
-        chunks.push(dinov3_attention_dense(
+        chunks.push(dinov3_attention_explicit(
             q_chunk,
             k.clone(),
             v.clone(),
@@ -237,6 +257,38 @@ fn dinov3_attention_chunked<B: Backend>(
         start = end;
     }
     Tensor::cat(chunks, 2)
+}
+
+fn dinov3_attention_explicit<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    head_dim: usize,
+) -> Tensor<B, 4> {
+    let dtype: FloatDType = q.dtype().into();
+    let q = cast_low_precision_to_f32(q, dtype) * (head_dim as f64).powf(-0.5);
+    let k = cast_low_precision_to_f32(k, dtype);
+    let v = cast_low_precision_to_f32(v, dtype);
+    let attn = softmax(q.matmul(k.swap_dims(2, 3)), 3);
+    cast_from_f32_accum(attn.matmul(v), dtype)
+}
+
+fn next_dinov3_attention_chunk_end(
+    start: usize,
+    query_tokens: usize,
+    query_chunk_tokens: usize,
+) -> usize {
+    let chunk_tokens = query_chunk_tokens.max(1);
+    let remaining = query_tokens.saturating_sub(start);
+    if remaining <= chunk_tokens {
+        return query_tokens;
+    }
+    let after_regular_chunk = remaining - chunk_tokens;
+    if after_regular_chunk < DINOV3_ATTENTION_MIN_TAIL_QUERY_TOKENS {
+        query_tokens
+    } else {
+        start + chunk_tokens
+    }
 }
 
 fn apply_patch_rope<B: Backend>(
@@ -360,6 +412,13 @@ pub struct DinoV3ViT<B: Backend> {
     num_heads: usize,
     num_register_tokens: usize,
     rope_theta: f32,
+    rope_cache_height: usize,
+    rope_cache_width: usize,
+    rope_cache_head_dim: usize,
+    #[module(skip)]
+    rope_cache_cos: Tensor<B, 4>,
+    #[module(skip)]
+    rope_cache_sin: Tensor<B, 4>,
 }
 
 impl<B: Backend> DinoV3ViT<B> {
@@ -372,6 +431,25 @@ impl<B: Backend> DinoV3ViT<B> {
         let blocks = (0..config.num_layers)
             .map(|_| DinoV3Block::new(device, &config))
             .collect();
+        let rope_cache_height = config.image_size / config.patch_size;
+        let rope_cache_width = config.image_size / config.patch_size;
+        let rope_cache_head_dim = config.hidden_size / config.num_heads;
+        let rope_cache_cos = rope_cos_sin::<B>(
+            rope_cache_height,
+            rope_cache_width,
+            rope_cache_head_dim,
+            config.rope_theta,
+            device,
+            true,
+        );
+        let rope_cache_sin = rope_cos_sin::<B>(
+            rope_cache_height,
+            rope_cache_width,
+            rope_cache_head_dim,
+            config.rope_theta,
+            device,
+            false,
+        );
         Self {
             patch_embed: DinoV3PatchEmbed::new(
                 device,
@@ -390,7 +468,33 @@ impl<B: Backend> DinoV3ViT<B> {
             num_heads: config.num_heads,
             num_register_tokens: config.num_register_tokens,
             rope_theta: config.rope_theta,
+            rope_cache_height,
+            rope_cache_width,
+            rope_cache_head_dim,
+            rope_cache_cos,
+            rope_cache_sin,
         }
+    }
+
+    pub fn rebuild_rope_cache(&mut self, device: &B::Device, dtype: FloatDType) {
+        self.rope_cache_cos = rope_cos_sin::<B>(
+            self.rope_cache_height,
+            self.rope_cache_width,
+            self.rope_cache_head_dim,
+            self.rope_theta,
+            device,
+            true,
+        )
+        .cast(dtype);
+        self.rope_cache_sin = rope_cos_sin::<B>(
+            self.rope_cache_height,
+            self.rope_cache_width,
+            self.rope_cache_head_dim,
+            self.rope_theta,
+            device,
+            false,
+        )
+        .cast(dtype);
     }
 
     pub fn forward(&self, pixel_values: Tensor<B, 4>) -> Tensor<B, 3> {
@@ -400,24 +504,13 @@ impl<B: Backend> DinoV3ViT<B> {
         let mut x = self.patch_embed.forward(pixel_values);
         let dtype: FloatDType = x.dtype().into();
         let batch = x.dims()[0];
-        let cos = rope_cos_sin::<B>(
+        let (cos, sin) = self.rope_cos_sin_cached(
             patch_h,
             patch_w,
             self.hidden_size / self.num_heads,
-            self.rope_theta,
+            dtype,
             &x.device(),
-            true,
-        )
-        .cast(dtype);
-        let sin = rope_cos_sin::<B>(
-            patch_h,
-            patch_w,
-            self.hidden_size / self.num_heads,
-            self.rope_theta,
-            &x.device(),
-            false,
-        )
-        .cast(dtype);
+        );
         let cls = self.cls_token.val().expand([batch as i64, -1, -1]);
         let registers = self
             .register_tokens
@@ -430,6 +523,45 @@ impl<B: Backend> DinoV3ViT<B> {
             cleanup_wasm_dino_memory(&x);
         }
         self.norm.forward(x)
+    }
+
+    fn rope_cos_sin_cached(
+        &self,
+        height: usize,
+        width: usize,
+        head_dim: usize,
+        dtype: FloatDType,
+        device: &B::Device,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        if self.rope_cache_height == height
+            && self.rope_cache_width == width
+            && self.rope_cache_head_dim == head_dim
+        {
+            return (
+                cast_float_tensor(self.rope_cache_cos.clone(), dtype),
+                cast_float_tensor(self.rope_cache_sin.clone(), dtype),
+            );
+        }
+
+        let cos = rope_cos_sin::<B>(
+            height,
+            width,
+            head_dim,
+            self.rope_theta,
+            device,
+            true,
+        )
+        .cast(dtype);
+        let sin = rope_cos_sin::<B>(
+            height,
+            width,
+            head_dim,
+            self.rope_theta,
+            device,
+            false,
+        )
+        .cast(dtype);
+        (cos, sin)
     }
 }
 
@@ -473,6 +605,40 @@ fn rope_cos_sin<B: Backend>(
         (height * width) as i32,
         head_dim as i32,
     ])
+}
+
+fn cast_float_tensor<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: FloatDType,
+) -> Tensor<B, D> {
+    let current: FloatDType = tensor.dtype().into();
+    if current == dtype {
+        tensor
+    } else {
+        tensor.cast(dtype)
+    }
+}
+
+fn cast_low_precision_to_f32<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: FloatDType,
+) -> Tensor<B, D> {
+    if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+        tensor.cast(FloatDType::F32)
+    } else {
+        tensor
+    }
+}
+
+fn cast_from_f32_accum<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: FloatDType,
+) -> Tensor<B, D> {
+    if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+        tensor.cast(dtype)
+    } else {
+        tensor
+    }
 }
 
 fn inv_frequencies(head_dim: usize, base: f32) -> Vec<f32> {
@@ -776,6 +942,31 @@ mod tests {
     }
 
     #[test]
+    fn dinov3_rope_cache_matches_input_patch_grid() {
+        let device = Default::default();
+        let config = DinoV3Config::tiny_for_tests(32, 16);
+        let mut model = config.init::<TestBackend>(&device);
+        assert_eq!(model.rope_cache_height, 2);
+        assert_eq!(model.rope_cache_width, 2);
+        assert_eq!(model.rope_cache_head_dim, 16);
+        assert_eq!(model.rope_cache_cos.dims(), [1, 1, 4, 16]);
+        assert_eq!(model.rope_cache_sin.dims(), [1, 1, 4, 16]);
+        model.rebuild_rope_cache(&device, FloatDType::F32);
+        assert_eq!(model.rope_cache_cos.dims(), [1, 1, 4, 16]);
+        assert_eq!(model.rope_cache_sin.dims(), [1, 1, 4, 16]);
+
+        let input = Tensor::<TestBackend, 4>::zeros([1, 3, 32, 32], &device);
+        let out = model.forward(input);
+        assert_eq!(out.dims(), [1, 7, 64]);
+
+        let resized = Tensor::<TestBackend, 4>::zeros([1, 3, 48, 32], &device);
+        let resized_out = model.forward(resized);
+        assert_eq!(resized_out.dims(), [1, 9, 64]);
+        assert_eq!(model.rope_cache_cos.dims(), [1, 1, 4, 16]);
+        assert_eq!(model.rope_cache_sin.dims(), [1, 1, 4, 16]);
+    }
+
+    #[test]
     fn dinov3_vith_config_matches_triposplat_reference() {
         let config = DinoV3Config::vit_h_16_plus(None);
         assert_eq!(config.hidden_size, 1280);
@@ -787,6 +978,19 @@ mod tests {
         assert!(config.query_bias);
         assert!(!config.key_bias);
         assert!(config.value_bias);
+    }
+
+    #[test]
+    fn dinov3_attention_chunking_folds_tiny_tail() {
+        assert_eq!(next_dinov3_attention_chunk_end(0, 16_389, 256), 256);
+        assert_eq!(
+            next_dinov3_attention_chunk_end(16_128, 16_389, 256),
+            16_389
+        );
+        assert_eq!(
+            next_dinov3_attention_chunk_end(16_384, 16_389, 256),
+            16_389
+        );
     }
 }
 

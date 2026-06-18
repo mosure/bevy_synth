@@ -20,8 +20,11 @@ use burn_synth::set_bootstrap_status_callback;
 use burn_synth::{
     ForegroundModel, ImageSource, SynthesisAsset as RuntimeSynthesisAsset, SynthesisModel,
 };
+use burn_triposplat::TripoSplatBurnpackPrecision;
 
-use crate::args::{AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality};
+use crate::args::{
+    AppArgs, BackendKind, DinoBackend, MeshMode, RmbgModel, TrellisQuality, WeightPrecision,
+};
 use crate::state::{
     InferenceRequest, WASM_STATUS_LOADING_MODELS, WASM_STATUS_MODEL_LOAD_FAILED_PREFIX,
     WASM_STATUS_MODEL_READY, WorkerCommand, WorkerEvent,
@@ -206,11 +209,22 @@ fn runtime_config_from_args(
         trellis_image_large_root: args.trellis_image_large_root.clone(),
         trellis_python_bin: args.trellis_python_bin.clone(),
         trellis_bridge_script: args.trellis_bridge_script.clone(),
+        triposplat_weights_precision: if args
+            .synthesis_models
+            .iter()
+            .any(|model| matches!(model, crate::args::SynthesisModel::Triposplat))
+        {
+            map_triposplat_weights_precision(args.weights_precision)
+        } else {
+            RuntimeConfig::default().triposplat_weights_precision
+        },
         trellis_quality: map_trellis_quality(args.trellis_quality),
         bg_weights_root: args.bg_weights_root.clone(),
         num_steps: args.num_steps,
         num_tokens: args.num_tokens,
         guidance_scale: args.guidance_scale,
+        triposplat_num_steps: args.num_steps,
+        triposplat_guidance_scale: args.guidance_scale,
         triposplat_shift: args.triposplat_shift,
         triposplat_num_gaussians: args.triposplat_num_gaussians,
         triposplat_erode_radius: args.triposplat_erode_radius,
@@ -251,6 +265,8 @@ fn infer_one_request(
         let config = runtime.config_mut();
         config.num_steps = request.settings.num_steps;
         config.guidance_scale = request.settings.guidance_scale;
+        config.triposplat_num_steps = request.settings.num_steps;
+        config.triposplat_guidance_scale = request.settings.guidance_scale;
         config.triposplat_num_gaussians = request.settings.triposplat_num_gaussians;
     }
 
@@ -363,6 +379,14 @@ fn map_trellis_quality(value: TrellisQuality) -> RuntimeTrellisQuality {
     }
 }
 
+fn map_triposplat_weights_precision(value: WeightPrecision) -> Option<TripoSplatBurnpackPrecision> {
+    match value {
+        WeightPrecision::Auto => None,
+        WeightPrecision::F16 => Some(TripoSplatBurnpackPrecision::F16),
+        WeightPrecision::F32 => Some(TripoSplatBurnpackPrecision::F32),
+    }
+}
+
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 fn configure_wgpu_runtime_memory_profile() {
     static INIT: Once = Once::new();
@@ -404,6 +428,7 @@ mod tests {
         validate_canonical_runtime_args,
     };
     use crate::args::{Args, BackendKind, MeshMode, SynthesisModel, build_app_args};
+    use burn_triposplat::TripoSplatBurnpackPrecision;
 
     #[test]
     fn validates_canonical_runtime_for_trellis_flash_pipeline() {
@@ -446,6 +471,37 @@ mod tests {
         ]));
         validate_canonical_runtime_args(&args)
             .expect("triposplat splat output should pass through the worker asset surface");
+    }
+
+    #[test]
+    fn runtime_config_maps_triposplat_precision_from_app_args() {
+        let f16_args = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposplat",
+            "--weights-precision",
+            "f16",
+        ]));
+        let f16_config = runtime_config_from_args(&f16_args, None)
+            .expect("runtime config should preserve triposplat precision");
+        assert_eq!(
+            f16_config.triposplat_weights_precision,
+            Some(TripoSplatBurnpackPrecision::F16)
+        );
+
+        let f32_args = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "triposplat",
+            "--weights-precision",
+            "f32",
+        ]));
+        let f32_config = runtime_config_from_args(&f32_args, None)
+            .expect("runtime config should preserve triposplat precision");
+        assert_eq!(
+            f32_config.triposplat_weights_precision,
+            Some(TripoSplatBurnpackPrecision::F32)
+        );
     }
 
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]

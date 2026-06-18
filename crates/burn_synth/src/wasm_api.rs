@@ -73,10 +73,9 @@ type WgpuBackendF16 = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
 type WgpuBackendF32 = burn_wgpu::Wgpu<f32, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
-type WgpuTripoSplatBackendF16 =
-    burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, burn::tensor::f16, i32, u32>;
+type WgpuTripoSplatBackendF16 = burn_wgpu::Wgpu<burn::tensor::f16, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
-type WgpuTripoSplatBackendF32 = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+type WgpuTripoSplatBackendF32 = burn_wgpu::Wgpu<f32, i32, u32>;
 #[cfg(feature = "wasm-api-wgpu")]
 type WgpuRmbgBackend = burn_wgpu::Wgpu<f32, i32, u32>;
 
@@ -1064,6 +1063,8 @@ async fn run_triposplat_inference_once<BTripoSplat: Backend, BRmbg: Backend>(
         seed: preset.seed,
         num_gaussians: preset.triposplat_num_gaussians,
         erode_radius: preset.triposplat_erode_radius,
+        cfg_mode: Default::default(),
+        attention_query_chunk_tokens: None,
     };
     web_sys::console::log_1(
         &format!(
@@ -1990,6 +1991,7 @@ where
             .await?;
     if let Some(dtype) = compute_dtype {
         flow = burn_triposplat::import::cast_module_float_dtype(flow, dtype);
+        flow.reset_canonical_pos_pe(device);
         load_ctx.status("Cast TripoSplat flow component to f32 compute.".to_string());
     }
     cleanup_wasm_backend_memory::<B, _>(device, "TripoSplat flow load", load_ctx)?;
