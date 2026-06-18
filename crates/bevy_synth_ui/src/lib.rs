@@ -94,6 +94,16 @@ const TRIPOSPLAT_MAX_STEPS: usize = 50;
 const TRIPOSPLAT_MIN_GUIDANCE: f32 = 1.0;
 const TRIPOSPLAT_MAX_GUIDANCE: f32 = 10.0;
 const TRIPOSPLAT_GUIDANCE_STEP: f32 = 0.5;
+const TRIPOSG_MIN_STEPS: usize = 1;
+const TRIPOSG_MAX_STEPS: usize = 50;
+const TRIPOSG_MIN_TOKENS: usize = 128;
+const TRIPOSG_MAX_TOKENS: usize = 4096;
+const TRIPOSG_TOKEN_STEP: usize = 128;
+const TRIPOSG_MIN_GUIDANCE: f32 = 1.0;
+const TRIPOSG_MAX_GUIDANCE: f32 = 12.0;
+const TRIPOSG_GUIDANCE_STEP: f32 = 0.5;
+const TRIPOSG_FACE_STEP: usize = 1000;
+const TRIPOSG_MAX_FACES: usize = 100_000;
 const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 2] =
     [SynthesisModel::Triposg, SynthesisModel::Triposplat];
 
@@ -129,6 +139,11 @@ pub struct CatalogDeleteRequest {
 
 pub struct BurnSynthUiPlugin;
 
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BurnSynthUiSystemSet {
+    CatalogRequests,
+}
+
 impl Plugin for BurnSynthUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CatalogState>()
@@ -145,8 +160,8 @@ impl Plugin for BurnSynthUiPlugin {
                     update_queue_text,
                     handle_catalog_toggle,
                     handle_page_buttons,
-                    handle_catalog_delete_button,
-                    handle_catalog_delete_shortcut,
+                    handle_catalog_delete_button.in_set(BurnSynthUiSystemSet::CatalogRequests),
+                    handle_catalog_delete_shortcut.in_set(BurnSynthUiSystemSet::CatalogRequests),
                     (
                         handle_pipeline_selector_button,
                         handle_pipeline_option_button,
@@ -158,6 +173,7 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_settings_close_button,
                     handle_triposplat_profile_button,
                     handle_triposplat_setting_step_button,
+                    handle_triposg_setting_step_button,
                     sync_settings_modal,
                     update_settings_labels,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
@@ -165,7 +181,7 @@ impl Plugin for BurnSynthUiPlugin {
                     (
                         handle_catalog_entry_interaction,
                         update_drag_ghost,
-                        handle_drag_release,
+                        handle_drag_release.in_set(BurnSynthUiSystemSet::CatalogRequests),
                         cleanup_drag_ghosts,
                     )
                         .chain(),
@@ -565,6 +581,31 @@ struct TripoSplatSettingValueLabel {
 struct TripoSplatProfileValueLabel;
 
 #[derive(Component)]
+struct TripoSgSettingStepButton {
+    setting: TripoSgSetting,
+    delta: TripoSgSettingDelta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TripoSgSetting {
+    Steps,
+    Tokens,
+    Guidance,
+    TargetFaces,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TripoSgSettingDelta {
+    Integer(isize),
+    Float(f32),
+}
+
+#[derive(Component)]
+struct TripoSgSettingValueLabel {
+    setting: TripoSgSetting,
+}
+
+#[derive(Component)]
 struct ThumbnailSpin;
 
 #[derive(Component)]
@@ -590,6 +631,7 @@ struct UiRootNode;
 struct SettingsModalState {
     open: bool,
     entity: Option<Entity>,
+    model: Option<SynthesisModel>,
 }
 
 #[derive(Resource, Default)]
@@ -621,7 +663,7 @@ fn pipeline_selector_value_text(model: SynthesisModel, option_count: usize) -> S
 
 fn available_pipeline_models(args: Option<&AppArgs>) -> Vec<SynthesisModel> {
     let models: Box<dyn Iterator<Item = SynthesisModel> + '_> = match args {
-        Some(args) => Box::new(args.synthesis_models.iter().copied()),
+        Some(args) => Box::new(args.available_synthesis_models.iter().copied()),
         None => Box::new(DEFAULT_PIPELINE_OPTIONS.into_iter()),
     };
     let mut out = Vec::new();
@@ -1511,7 +1553,7 @@ fn update_button_visuals(
     let args_ref = args.as_deref();
     let available_ref = available.as_deref();
     let selected_pipeline = args_ref.and_then(|args| args.synthesis_models.first().copied());
-    let triposplat_settings_enabled = triposplat_settings_enabled(args_ref);
+    let settings_enabled = pipeline_settings_enabled(args_ref);
 
     for (
         interaction,
@@ -1538,13 +1580,13 @@ fn update_button_visuals(
             !pipeline_available(available_ref, pipeline_option.model)
                 || !pipeline_supported(args_ref, pipeline_option.model)
         } else if settings_button.is_some() {
-            !triposplat_settings_enabled
+            !settings_enabled
         } else {
             false
         };
         let active = pipeline_selector.is_some()
             || pipeline_option.is_some_and(|pipeline| Some(pipeline.model) == selected_pipeline)
-            || settings_button.is_some_and(|_| triposplat_settings_enabled && modal.open)
+            || settings_button.is_some_and(|_| settings_enabled && modal.open)
             || profile
                 .zip(args_ref)
                 .is_some_and(|(profile, args)| profile.profile == args.triposplat_profile);
@@ -1634,6 +1676,7 @@ fn handle_drag_release(
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     catalog: Res<CatalogState>,
     mut drag: ResMut<DragState>,
+    mut selection: ResMut<CatalogSelectionState>,
     ui_state: Res<CatalogUiState>,
     mut commands: Commands,
     mut spawn_requests: MessageWriter<CatalogSpawnRequest>,
@@ -1670,6 +1713,9 @@ fn handle_drag_release(
         cache_key: entry.cache_key.clone(),
         select_spawned: true,
     });
+    if selection.selected == Some(id) {
+        selection.selected = None;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1971,7 +2017,7 @@ fn handle_pipeline_option_button(
         }
         args.synthesis_models = vec![button.model];
         dropdown.open = false;
-        if !matches!(button.model, SynthesisModel::Triposplat) {
+        if !pipeline_has_settings(button.model) {
             modal.open = false;
         }
         if matches!(button.model, SynthesisModel::Triposplat)
@@ -2131,7 +2177,7 @@ fn handle_settings_button(
 ) {
     for interaction in interactions.iter_mut() {
         if *interaction == Interaction::Pressed {
-            if triposplat_settings_enabled(args.as_deref()) {
+            if pipeline_settings_enabled(args.as_deref()) {
                 modal.open = !modal.open;
             } else {
                 modal.open = false;
@@ -2158,7 +2204,7 @@ fn handle_triposplat_profile_button(
     let Some(mut args) = args else {
         return;
     };
-    if !triposplat_settings_enabled(Some(&*args)) {
+    if active_settings_pipeline(Some(&*args)) != Some(SynthesisModel::Triposplat) {
         return;
     }
     for (interaction, button) in interactions.iter_mut() {
@@ -2180,7 +2226,7 @@ fn handle_triposplat_setting_step_button(
     let Some(mut args) = args else {
         return;
     };
-    if !triposplat_settings_enabled(Some(&*args)) {
+    if active_settings_pipeline(Some(&*args)) != Some(SynthesisModel::Triposplat) {
         return;
     }
     for (interaction, button) in interactions.iter_mut() {
@@ -2191,6 +2237,24 @@ fn handle_triposplat_setting_step_button(
     }
 }
 
+fn handle_triposg_setting_step_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<(&Interaction, &TripoSgSettingStepButton), Changed<Interaction>>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    if active_settings_pipeline(Some(&*args)) != Some(SynthesisModel::Triposg) {
+        return;
+    }
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        adjust_triposg_setting(&mut args, button.setting, button.delta);
+    }
+}
+
 fn sync_settings_modal(
     mut commands: Commands,
     args: Option<Res<AppArgs>>,
@@ -2198,18 +2262,30 @@ fn sync_settings_modal(
     mut ui: ResMut<CatalogUiState>,
     children: Query<&Children>,
 ) {
-    if !triposplat_settings_enabled(args.as_deref()) {
+    let active_model = active_settings_pipeline(args.as_deref());
+    if active_model.is_none() {
         modal.open = false;
+    }
+    if modal.entity.is_some() && modal.model != active_model {
+        if let Some(entity) = modal.entity.take() {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+        }
+        modal.model = None;
     }
     ui.settings_modal_open = modal.open;
     match (modal.open, modal.entity) {
         (true, None) => {
-            modal.entity = Some(spawn_settings_modal(&mut commands));
+            if let Some(model) = active_model {
+                modal.entity = Some(spawn_settings_modal(&mut commands, model));
+                modal.model = Some(model);
+            }
         }
         (false, Some(entity)) => {
             despawn_children_recursive(entity, &mut commands, &children);
             commands.entity(entity).despawn();
             modal.entity = None;
+            modal.model = None;
         }
         _ => {}
     }
@@ -2222,11 +2298,22 @@ fn update_settings_labels(
         (
             With<TripoSplatProfileValueLabel>,
             Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
         ),
     >,
     mut value_labels: Query<
         (&TripoSplatSettingValueLabel, &mut Text),
-        Without<TripoSplatProfileValueLabel>,
+        (
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+        ),
+    >,
+    mut triposg_value_labels: Query<
+        (&TripoSgSettingValueLabel, &mut Text),
+        (
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+        ),
     >,
 ) {
     let Some(args) = args else {
@@ -2244,9 +2331,15 @@ fn update_settings_labels(
             label.0 = next;
         }
     }
+    for (value, mut label) in triposg_value_labels.iter_mut() {
+        let next = triposg_setting_value_text(&args, value.setting);
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
 }
 
-fn spawn_settings_modal(commands: &mut Commands) -> Entity {
+fn spawn_settings_modal(commands: &mut Commands, model: SynthesisModel) -> Entity {
     commands
         .spawn((
             SettingsModalRoot,
@@ -2285,7 +2378,7 @@ fn spawn_settings_modal(commands: &mut Commands) -> Entity {
                     })
                     .with_children(|header| {
                         header.spawn((
-                            Text::new("TripoSplat settings"),
+                            Text::new(settings_modal_title(model)),
                             TextFont::from_font_size(16.0),
                             TextColor(Color::srgb(0.92, 0.94, 0.98)),
                         ));
@@ -2312,67 +2405,128 @@ fn spawn_settings_modal(commands: &mut Commands) -> Entity {
                             });
                     });
 
-                panel
-                    .spawn(Node {
-                        flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(8.0),
-                        ..default()
-                    })
-                    .with_children(|profiles| {
-                        profiles.spawn((
-                            Text::new("profile"),
-                            TextFont::from_font_size(12.0),
-                            TextColor(Color::srgb(0.66, 0.7, 0.78)),
-                        ));
-                        profiles
-                            .spawn(Node {
-                                flex_direction: FlexDirection::Row,
-                                column_gap: Val::Px(6.0),
-                                align_items: AlignItems::Center,
-                                ..default()
-                            })
-                            .with_children(|row| {
-                                for profile in [
-                                    TripoSplatProfile::Low,
-                                    TripoSplatProfile::Balanced,
-                                    TripoSplatProfile::High,
-                                ] {
-                                    row.spawn((
-                                        Button,
-                                        TripoSplatProfileButton { profile },
-                                        ControlButton(ControlButtonKind::Secondary),
-                                        Node {
-                                            padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
-                                            border: UiRect::all(Val::Px(1.0)),
-                                            ..default()
-                                        },
-                                        BorderColor::all(BUTTON_BORDER),
-                                        BackgroundColor(BUTTON_BG),
-                                    ))
-                                    .with_children(|button| {
-                                        button.spawn((
-                                            Text::new(triposplat_profile_label(profile)),
-                                            TextFont::from_font_size(12.0),
-                                            TextColor(BUTTON_TEXT),
-                                            ButtonLabel,
-                                        ));
-                                    });
-                                }
-                                row.spawn((
-                                    Text::new("balanced"),
-                                    TextFont::from_font_size(12.0),
-                                    TextColor(Color::srgb(0.72, 0.76, 0.84)),
-                                    TripoSplatProfileValueLabel,
-                                ));
-                            });
-                    });
-
-                spawn_triposplat_setting_row(panel, "steps", TripoSplatSetting::Steps);
-                spawn_triposplat_setting_row(panel, "cfg guidance", TripoSplatSetting::Guidance);
-                spawn_triposplat_setting_row(panel, "gaussian count", TripoSplatSetting::Gaussians);
+                match model {
+                    SynthesisModel::Triposg => spawn_triposg_settings(panel),
+                    SynthesisModel::Triposplat => spawn_triposplat_settings(panel),
+                    SynthesisModel::Trellis => {}
+                }
             });
         })
         .id()
+}
+
+fn settings_modal_title(model: SynthesisModel) -> &'static str {
+    match model {
+        SynthesisModel::Triposg => "TripoSG settings",
+        SynthesisModel::Triposplat => "TripoSplat settings",
+        SynthesisModel::Trellis => "Trellis settings",
+    }
+}
+
+fn spawn_triposplat_settings(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|profiles| {
+            profiles.spawn((
+                Text::new("profile"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb(0.66, 0.7, 0.78)),
+            ));
+            profiles
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    for profile in [
+                        TripoSplatProfile::Low,
+                        TripoSplatProfile::Balanced,
+                        TripoSplatProfile::High,
+                    ] {
+                        row.spawn((
+                            Button,
+                            TripoSplatProfileButton { profile },
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(triposplat_profile_label(profile)),
+                                TextFont::from_font_size(12.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+                    }
+                    row.spawn((
+                        Text::new("balanced"),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::srgb(0.72, 0.76, 0.84)),
+                        TripoSplatProfileValueLabel,
+                    ));
+                });
+        });
+
+    spawn_triposplat_setting_row(panel, "steps", TripoSplatSetting::Steps);
+    spawn_triposplat_setting_row(panel, "cfg guidance", TripoSplatSetting::Guidance);
+    spawn_triposplat_setting_row(panel, "gaussian count", TripoSplatSetting::Gaussians);
+}
+
+fn spawn_triposg_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_triposg_setting_row(panel, "steps", TripoSgSetting::Steps);
+    spawn_triposg_setting_row(panel, "tokens", TripoSgSetting::Tokens);
+    spawn_triposg_setting_row(panel, "cfg guidance", TripoSgSetting::Guidance);
+    spawn_triposg_setting_row(panel, "target faces", TripoSgSetting::TargetFaces);
+}
+
+fn spawn_triposg_setting_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: TripoSgSetting,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(7.0),
+                ..default()
+            })
+            .with_children(|control| {
+                spawn_triposg_setting_step_button(control, setting, false);
+                control.spawn((
+                    Text::new("0"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                    TripoSgSettingValueLabel { setting },
+                ));
+                spawn_triposg_setting_step_button(control, setting, true);
+            });
+        });
 }
 
 fn spawn_triposplat_setting_row(
@@ -2410,6 +2564,55 @@ fn spawn_triposplat_setting_row(
                 ));
                 spawn_setting_step_button(control, setting, true);
             });
+        });
+}
+
+fn spawn_triposg_setting_step_button(
+    parent: &mut ChildSpawnerCommands,
+    setting: TripoSgSetting,
+    positive: bool,
+) {
+    let delta = match setting {
+        TripoSgSetting::Steps => TripoSgSettingDelta::Integer(if positive { 1 } else { -1 }),
+        TripoSgSetting::Tokens => TripoSgSettingDelta::Integer(if positive {
+            TRIPOSG_TOKEN_STEP as isize
+        } else {
+            -(TRIPOSG_TOKEN_STEP as isize)
+        }),
+        TripoSgSetting::Guidance => TripoSgSettingDelta::Float(if positive {
+            TRIPOSG_GUIDANCE_STEP
+        } else {
+            -TRIPOSG_GUIDANCE_STEP
+        }),
+        TripoSgSetting::TargetFaces => TripoSgSettingDelta::Integer(if positive {
+            TRIPOSG_FACE_STEP as isize
+        } else {
+            -(TRIPOSG_FACE_STEP as isize)
+        }),
+    };
+    parent
+        .spawn((
+            Button,
+            TripoSgSettingStepButton { setting, delta },
+            ControlButton(ControlButtonKind::Nav),
+            Node {
+                width: Val::Px(28.0),
+                height: Val::Px(24.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(BUTTON_BORDER),
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(if positive { "+" } else { "-" }),
+                TextFont::from_font_size(14.0),
+                TextColor(BUTTON_TEXT),
+                ButtonLabel,
+            ));
         });
 }
 
@@ -2495,6 +2698,42 @@ fn adjust_triposplat_setting(
     );
 }
 
+fn adjust_triposg_setting(args: &mut AppArgs, setting: TripoSgSetting, delta: TripoSgSettingDelta) {
+    match (setting, delta) {
+        (TripoSgSetting::Steps, TripoSgSettingDelta::Integer(delta)) => {
+            args.num_steps =
+                apply_integer_delta(args.num_steps, delta, TRIPOSG_MIN_STEPS, TRIPOSG_MAX_STEPS);
+        }
+        (TripoSgSetting::Tokens, TripoSgSettingDelta::Integer(delta)) => {
+            args.num_tokens = apply_integer_delta(
+                args.num_tokens,
+                delta,
+                TRIPOSG_MIN_TOKENS,
+                TRIPOSG_MAX_TOKENS,
+            );
+        }
+        (TripoSgSetting::Guidance, TripoSgSettingDelta::Float(delta)) => {
+            args.guidance_scale =
+                (args.guidance_scale + delta).clamp(TRIPOSG_MIN_GUIDANCE, TRIPOSG_MAX_GUIDANCE);
+        }
+        (TripoSgSetting::TargetFaces, TripoSgSettingDelta::Integer(delta)) => {
+            let current = args.target_faces.unwrap_or(0);
+            let next = apply_integer_delta(current, delta, 0, TRIPOSG_MAX_FACES);
+            args.target_faces = (next > 0).then_some(next);
+        }
+        _ => {}
+    }
+    info!(
+        "TripoSG settings: steps={} tokens={} guidance_scale={:.3} target_faces={}",
+        args.num_steps,
+        args.num_tokens,
+        args.guidance_scale,
+        args.target_faces
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "disabled".to_string())
+    );
+}
+
 fn apply_integer_delta(value: usize, delta: isize, min: usize, max: usize) -> usize {
     value.saturating_add_signed(delta).clamp(min, max)
 }
@@ -2516,9 +2755,29 @@ fn triposplat_setting_value_text(args: &AppArgs, setting: TripoSplatSetting) -> 
     }
 }
 
-fn triposplat_settings_enabled(args: Option<&AppArgs>) -> bool {
+fn triposg_setting_value_text(args: &AppArgs, setting: TripoSgSetting) -> String {
+    match setting {
+        TripoSgSetting::Steps => args.num_steps.to_string(),
+        TripoSgSetting::Tokens => format_grouped_usize(args.num_tokens),
+        TripoSgSetting::Guidance => format!("{:.1}", args.guidance_scale),
+        TripoSgSetting::TargetFaces => args
+            .target_faces
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "disabled".to_string()),
+    }
+}
+
+fn pipeline_has_settings(model: SynthesisModel) -> bool {
+    matches!(model, SynthesisModel::Triposg | SynthesisModel::Triposplat)
+}
+
+fn active_settings_pipeline(args: Option<&AppArgs>) -> Option<SynthesisModel> {
     args.and_then(|args| args.synthesis_models.first().copied())
-        .is_some_and(|model| matches!(model, SynthesisModel::Triposplat))
+        .filter(|model| pipeline_has_settings(*model))
+}
+
+fn pipeline_settings_enabled(args: Option<&AppArgs>) -> bool {
+    active_settings_pipeline(args).is_some()
 }
 
 fn format_grouped_usize(value: usize) -> String {
@@ -2771,6 +3030,7 @@ mod tests {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
         args.synthesis_models = vec![SynthesisModel::Triposplat];
+        args.available_synthesis_models = vec![SynthesisModel::Triposplat];
         let mut app = ui_test_app(Some(args));
 
         app.update();
@@ -2800,7 +3060,8 @@ mod tests {
     fn pipeline_dropdown_spawns_enabled_model_options() {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
-        args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        args.synthesis_models = vec![SynthesisModel::Triposg];
+        args.available_synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
         let mut app = ui_test_app(Some(args));
 
         app.update();
@@ -2935,27 +3196,43 @@ mod tests {
     }
 
     #[test]
-    fn triposplat_settings_modal_only_opens_for_triposplat_pipeline() {
+    fn settings_modal_opens_for_triposg_and_triposplat_pipeline() {
         let mut triposg_args = AppArgs::default();
         triposg_args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
         let mut app = ui_test_app(Some(triposg_args));
 
         app.world_mut().resource_mut::<SettingsModalState>().open = true;
         app.update();
+        app.update();
 
         {
             let world = app.world_mut();
-            assert!(!world.resource::<SettingsModalState>().open);
+            assert!(world.resource::<SettingsModalState>().open);
             assert_eq!(
                 world.query::<&SettingsModalRoot>().iter(world).count(),
-                0,
-                "TripoSplat settings should not be available for TripoSG"
+                1,
+                "TripoSG settings should open when TripoSG is active"
+            );
+            assert_eq!(
+                world
+                    .query::<&TripoSgSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                4
+            );
+            assert_eq!(
+                world
+                    .query::<&TripoSplatProfileButton>()
+                    .iter(world)
+                    .count(),
+                0
             );
         }
 
         app.world_mut().resource_mut::<AppArgs>().synthesis_models =
             vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
         app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
         app.update();
 
         let world = app.world_mut();
@@ -2965,23 +3242,76 @@ mod tests {
             1,
             "TripoSplat settings should open when TripoSplat is active"
         );
+        assert_eq!(
+            world
+                .query::<&TripoSplatSettingValueLabel>()
+                .iter(world)
+                .count(),
+            3
+        );
+        assert_eq!(
+            world
+                .query::<&TripoSplatProfileButton>()
+                .iter(world)
+                .count(),
+            3
+        );
+        assert_eq!(
+            world
+                .query::<&TripoSgSettingValueLabel>()
+                .iter(world)
+                .count(),
+            0
+        );
     }
 
     #[test]
-    fn triposplat_settings_modal_closes_when_pipeline_changes() {
+    fn settings_modal_rebuilds_or_closes_when_pipeline_changes() {
         let mut args = AppArgs::default();
         args.synthesis_models = vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
         let mut app = ui_test_app(Some(args));
 
         app.world_mut().resource_mut::<SettingsModalState>().open = true;
         app.update();
+        app.update();
         {
             let world = app.world_mut();
             assert_eq!(world.query::<&SettingsModalRoot>().iter(world).count(), 1);
+            assert_eq!(
+                world
+                    .query::<&TripoSplatSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                3
+            );
         }
 
         app.world_mut().resource_mut::<AppArgs>().synthesis_models =
             vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        app.update();
+        app.update();
+
+        {
+            let world = app.world_mut();
+            assert!(world.resource::<SettingsModalState>().open);
+            assert_eq!(world.query::<&SettingsModalRoot>().iter(world).count(), 1);
+            assert_eq!(
+                world
+                    .query::<&TripoSgSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                4
+            );
+            assert_eq!(
+                world
+                    .query::<&TripoSplatSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                0
+            );
+        }
+
+        app.world_mut().resource_mut::<AppArgs>().synthesis_models = vec![SynthesisModel::Trellis];
         app.update();
 
         let world = app.world_mut();
@@ -3054,12 +3384,73 @@ mod tests {
     }
 
     #[test]
-    fn triposplat_setting_gate_tracks_active_pipeline() {
+    fn triposg_manual_settings_clamp_and_format_values() {
+        let mut args = AppArgs::default();
+        args.num_steps = 1;
+        adjust_triposg_setting(
+            &mut args,
+            TripoSgSetting::Steps,
+            TripoSgSettingDelta::Integer(-100),
+        );
+        assert_eq!(args.num_steps, TRIPOSG_MIN_STEPS);
+
+        adjust_triposg_setting(
+            &mut args,
+            TripoSgSetting::Steps,
+            TripoSgSettingDelta::Integer(100),
+        );
+        assert_eq!(args.num_steps, TRIPOSG_MAX_STEPS);
+
+        args.num_tokens = 1024;
+        adjust_triposg_setting(
+            &mut args,
+            TripoSgSetting::Tokens,
+            TripoSgSettingDelta::Integer(TRIPOSG_TOKEN_STEP as isize),
+        );
+        assert_eq!(args.num_tokens, 1152);
+        assert_eq!(
+            triposg_setting_value_text(&args, TripoSgSetting::Tokens),
+            "1,152"
+        );
+
+        args.target_faces = None;
+        adjust_triposg_setting(
+            &mut args,
+            TripoSgSetting::TargetFaces,
+            TripoSgSettingDelta::Integer(TRIPOSG_FACE_STEP as isize),
+        );
+        assert_eq!(args.target_faces, Some(TRIPOSG_FACE_STEP));
+        adjust_triposg_setting(
+            &mut args,
+            TripoSgSetting::TargetFaces,
+            TripoSgSettingDelta::Integer(-(TRIPOSG_FACE_STEP as isize)),
+        );
+        assert_eq!(args.target_faces, None);
+        assert_eq!(
+            triposg_setting_value_text(&args, TripoSgSetting::TargetFaces),
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn pipeline_setting_gate_tracks_active_pipeline() {
         let mut args = AppArgs::default();
         args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
-        assert!(!triposplat_settings_enabled(Some(&args)));
+        assert_eq!(
+            active_settings_pipeline(Some(&args)),
+            Some(SynthesisModel::Triposg)
+        );
+        assert!(pipeline_settings_enabled(Some(&args)));
 
         args.synthesis_models = vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
-        assert!(triposplat_settings_enabled(Some(&args)));
+        assert_eq!(
+            active_settings_pipeline(Some(&args)),
+            Some(SynthesisModel::Triposplat)
+        );
+        assert!(pipeline_settings_enabled(Some(&args)));
+
+        args.synthesis_models = vec![SynthesisModel::Trellis];
+        assert_eq!(active_settings_pipeline(Some(&args)), None);
+        assert!(!pipeline_settings_enabled(Some(&args)));
     }
 }

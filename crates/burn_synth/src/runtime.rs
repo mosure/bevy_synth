@@ -2309,48 +2309,66 @@ fn resize_prepared_image_for_triposplat(
     prepared: PreparedImageData,
     canvas_size: usize,
 ) -> PreparedImageData {
-    if prepared.width == canvas_size && prepared.height == canvas_size {
-        return normalize_prepared_image_rgb_0_1(prepared);
-    }
-    let data = resize_chw_align_corners_false(
-        &prepared.data,
-        3,
-        prepared.height,
-        prepared.width,
+    let in_height = prepared.height;
+    let in_width = prepared.width;
+    let same_size = in_width == canvas_size && in_height == canvas_size;
+    let data = if same_size {
+        prepared.data
+    } else {
+        resize_chw_align_corners_false(
+            &prepared.data,
+            3,
+            in_height,
+            in_width,
+            canvas_size,
+            canvas_size,
+            InterpolateMode::Lanczos3,
+        )
+    };
+    let alpha_mask = resize_prepared_alpha_channel_for_triposplat(
+        prepared.alpha_mask,
+        in_height,
+        in_width,
         canvas_size,
-        canvas_size,
-        InterpolateMode::Lanczos3,
     );
-    let alpha_mask = prepared.alpha_mask.map(|alpha| {
-        resize_chw_align_corners_false(
-            &alpha,
-            1,
-            prepared.height,
-            prepared.width,
-            canvas_size,
-            canvas_size,
-            InterpolateMode::Lanczos3,
-        )
-    });
-    let alpha_probs = prepared.alpha_probs.map(|alpha| {
-        resize_chw_align_corners_false(
-            &alpha,
-            1,
-            prepared.height,
-            prepared.width,
-            canvas_size,
-            canvas_size,
-            InterpolateMode::Lanczos3,
-        )
-    });
+    let alpha_probs = resize_prepared_alpha_channel_for_triposplat(
+        prepared.alpha_probs,
+        in_height,
+        in_width,
+        canvas_size,
+    );
     normalize_prepared_image_rgb_0_1(PreparedImageData {
         data,
         width: canvas_size,
         height: canvas_size,
         alpha_mask,
         alpha_probs,
-        bbox: None,
+        bbox: if same_size { prepared.bbox } else { None },
     })
+}
+
+fn resize_prepared_alpha_channel_for_triposplat(
+    alpha: Option<Vec<f32>>,
+    in_height: usize,
+    in_width: usize,
+    canvas_size: usize,
+) -> Option<Vec<f32>> {
+    let alpha = alpha?;
+    if alpha.len() != in_height.saturating_mul(in_width) {
+        return None;
+    }
+    if in_width == canvas_size && in_height == canvas_size {
+        return Some(alpha);
+    }
+    Some(resize_chw_align_corners_false(
+        &alpha,
+        1,
+        in_height,
+        in_width,
+        canvas_size,
+        canvas_size,
+        InterpolateMode::Lanczos3,
+    ))
 }
 
 fn normalize_prepared_image_rgb_0_1(mut prepared: PreparedImageData) -> PreparedImageData {
@@ -3012,6 +3030,51 @@ mod tests {
     }
 
     #[test]
+    fn shared_preprocess_accepts_odd_resolution_rgba_for_mesh_and_triposplat() {
+        let path = unique_temp_png_path();
+        let mut input = RgbaImage::new(37, 23);
+        for y in 0..23 {
+            for x in 0..37 {
+                let alpha = if (5..32).contains(&x) && (3..20).contains(&y) {
+                    255
+                } else {
+                    0
+                };
+                input.put_pixel(x, y, Rgba([120, 140, 200, alpha]));
+            }
+        }
+        DynamicImage::ImageRgba8(input)
+            .save_with_format(&path, ImageFormat::Png)
+            .expect("failed to write odd-resolution RGBA fixture");
+
+        let mut runtime = SynthRuntime::new(RuntimeConfig {
+            backend: InferenceBackend::Cpu,
+            ..RuntimeConfig::default()
+        });
+        let mesh_prepared = runtime
+            .prepare_image_for_mesh(&path, ForegroundModel::Rmbg14, InferenceBackend::Cpu)
+            .expect("mesh preprocessing should use RGBA alpha without RMBG");
+        let splat_prepared = runtime
+            .prepare_image_for_triposplat(&path, ForegroundModel::Rmbg14, InferenceBackend::Cpu)
+            .expect("TripoSplat preprocessing should use the same RGBA alpha path");
+        let splat_resized = resize_prepared_image_for_triposplat(splat_prepared, 16);
+
+        assert_eq!(
+            mesh_prepared
+                .alpha_mask
+                .as_ref()
+                .expect("mesh alpha mask")
+                .len(),
+            37 * 23
+        );
+        assert_eq!(splat_resized.width, 16);
+        assert_eq!(splat_resized.height, 16);
+        assert_eq!(splat_resized.data.len(), 3 * 16 * 16);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn mesh_dry_run_returns_canonical_cube() {
         let mut runtime = SynthRuntime::new(RuntimeConfig {
             backend: InferenceBackend::Cpu,
@@ -3253,6 +3316,32 @@ mod tests {
         let normalized = resize_prepared_image_for_triposplat(prepared, 1);
 
         assert_eq!(normalized.data, vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn triposplat_prepared_resize_drops_original_size_alpha_metadata() {
+        let prepared = PreparedImageData {
+            data: vec![255.0; 3 * 3 * 2],
+            width: 3,
+            height: 2,
+            alpha_mask: Some(vec![1.0; 2 * 2]),
+            alpha_probs: Some(vec![0.5; 2 * 2]),
+            bbox: Some([0, 0, 2, 2]),
+        };
+
+        let resized = resize_prepared_image_for_triposplat(prepared, 2);
+
+        assert_eq!(resized.width, 2);
+        assert_eq!(resized.height, 2);
+        assert_eq!(resized.data.len(), 3 * 2 * 2);
+        assert!(
+            resized.alpha_mask.is_none(),
+            "alpha_mask is original-image metadata and must not be resized with prepared RGB dimensions"
+        );
+        assert!(
+            resized.alpha_probs.is_none(),
+            "alpha_probs is original-image metadata and must not be resized with prepared RGB dimensions"
+        );
     }
 
     #[test]

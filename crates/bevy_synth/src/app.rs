@@ -105,8 +105,9 @@ use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
 use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
-    BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnAsset, CatalogSpawnRequest, CatalogState,
-    CatalogStatus, CatalogUiState, DragState, MainCamera, preview_light_layers,
+    BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogSpawnAsset,
+    CatalogSpawnRequest, CatalogState, CatalogStatus, CatalogUiState, DragState, MainCamera,
+    preview_light_layers,
 };
 
 use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -691,8 +692,8 @@ pub(crate) fn run() {
             drive_inference,
             #[cfg(not(target_arch = "wasm32"))]
             sync_inference_render_pause_after.after(drive_inference),
-            handle_catalog_spawn_requests,
-            handle_catalog_delete_requests,
+            handle_catalog_spawn_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            handle_catalog_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
             delete_selected_meshes,
             (mark_world_cache_dirty, persist_world_cache).chain(),
             update_spinner,
@@ -1180,7 +1181,8 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
         args.apply_triposplat_profile(profile);
     }
     if let Some(models) = synthesis_models_override {
-        args.synthesis_models = models;
+        args.synthesis_models = models.clone();
+        args.available_synthesis_models = models;
     }
 }
 
@@ -2713,7 +2715,7 @@ fn handle_catalog_spawn_requests(
     }
 }
 
-fn handle_catalog_delete_requests(
+pub(crate) fn handle_catalog_delete_requests(
     mut requests: MessageReader<CatalogDeleteRequest>,
     mut cache: ResMut<MeshCacheResource>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
@@ -2843,7 +2845,7 @@ fn update_window_title(
     if processing {
         pulse.timer.tick(time.delta());
         if pulse.timer.just_finished() {
-            pulse.phase = (pulse.phase + 1) % 4;
+            pulse.phase = (pulse.phase + 1) % title_rattler_frame_count();
             should_update = true;
         }
     } else if pulse.phase != 0 {
@@ -2856,7 +2858,6 @@ fn update_window_title(
     }
 
     let title = if let Some(active) = queue.active.as_ref() {
-        let dots = ".".repeat(pulse.phase);
         let name = if active.len() == 1 {
             active[0]
                 .image_path
@@ -2867,10 +2868,7 @@ fn update_window_title(
         } else {
             format!("{} images", active.len())
         };
-        format!(
-            "bevy_synth — processing: {name} (queued: {}){dots}",
-            queue.pending.len()
-        )
+        processing_window_title(&name, queue.pending.len(), pulse.phase)
     } else {
         format!("bevy_synth — {}", status.message)
     };
@@ -2878,6 +2876,26 @@ fn update_window_title(
     if let Ok(mut window) = windows.single_mut() {
         window.title = title;
     }
+}
+
+pub(crate) fn processing_window_title(name: &str, queued: usize, phase: usize) -> String {
+    format!(
+        "bevy_synth [{}] processing: {name} (queued: {queued})",
+        title_rattler_frame(phase)
+    )
+}
+
+pub(crate) fn title_rattler_frame(phase: usize) -> &'static str {
+    let rattler = rattles::presets::ascii::simple_dots();
+    let len = rattler.len();
+    if len == 0 {
+        return "   ";
+    }
+    rattler.frame(phase % len)
+}
+
+fn title_rattler_frame_count() -> usize {
+    rattles::presets::ascii::simple_dots().len().max(1)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -57,7 +57,9 @@ pub struct InferenceRequest {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InferenceSettings {
     pub num_steps: usize,
+    pub num_tokens: usize,
     pub guidance_scale: f32,
+    pub target_faces: Option<usize>,
     pub triposplat_num_gaussians: usize,
 }
 
@@ -65,7 +67,9 @@ impl InferenceSettings {
     pub fn from_args(args: &AppArgs) -> Self {
         Self {
             num_steps: args.num_steps,
+            num_tokens: args.num_tokens,
             guidance_scale: args.guidance_scale,
+            target_faces: args.target_faces,
             triposplat_num_gaussians: args.triposplat_num_gaussians,
         }
     }

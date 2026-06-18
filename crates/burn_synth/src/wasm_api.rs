@@ -16,6 +16,7 @@ use burn_foreground::rmbg14::import::{
     apply_rmbg_burnpack_part_bytes, load_rmbg_config_from_json_bytes,
 };
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
+use burn_synth_import::parts::normalize_burnpack_part_bytes;
 #[cfg(feature = "trellis")]
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
@@ -2434,6 +2435,14 @@ where
                     bytes.len()
                 ));
             }
+            let bytes = normalize_burnpack_part_bytes(&part_url, bytes).map_err(|err| {
+                format!(
+                    "{label} part {}/{} ({}) failed integrity validation: {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_url
+                )
+            })?;
             let verify_part_checksum = should_verify_wasm_part_checksums();
             if verify_part_checksum && !part.sha256.trim().is_empty() {
                 load_ctx.status(format!(

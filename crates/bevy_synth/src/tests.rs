@@ -5,21 +5,28 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bevy::ecs::message::MessageWriter;
 use bevy::prelude::*;
 use bevy_gaussian_splatting::gaussian::settings::GaussianColorSpace;
 use bevy_gaussian_splatting::sort::SortMode;
 use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dHandle};
 use bevy_mesh::Mesh as BevyMesh;
-use bevy_synth_ui::{BurnSynthUiPlugin, CatalogState, CatalogStatus};
+use bevy_synth_ui::{
+    BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogState, CatalogStatus,
+};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use crate::app::should_share_wgpu_inference_device_for_platform;
+use crate::app::{
+    CachedMeshInstance, MeshCacheResource, drive_inference, enqueue_inference,
+    handle_catalog_delete_requests, processing_window_title, should_run_headless_once,
+    title_rattler_frame,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
     InferenceDispatchGate, should_pause_render_during_inference,
     should_wait_before_inference_dispatch,
 };
-use crate::app::{MeshCacheResource, drive_inference, enqueue_inference, should_run_headless_once};
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DinoBackend, MeshMode, QualityPreset, RmbgBackend, RmbgModel,
     SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
@@ -73,6 +80,7 @@ fn test_args() -> AppArgs {
         mesh: None,
         bg_weights_root: None,
         synthesis_models: vec![SynthesisModel::Triposg],
+        available_synthesis_models: vec![SynthesisModel::Triposg, SynthesisModel::Triposplat],
         rmbg_model: RmbgModel::Rmbg14,
         backend: BackendKind::Cpu,
         rmbg_backend: RmbgBackend::Auto,
@@ -180,22 +188,82 @@ fn inference_queue_advances_and_tracks_completed() {
 }
 
 #[test]
+fn inference_queue_dispatches_batches_up_to_configured_limit() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (_event_tx, event_rx) = mpsc::channel();
+    let worker = InferenceWorker {
+        sender: cmd_tx,
+        receiver: Mutex::new(event_rx),
+    };
+
+    let mut queue = InferenceQueue::default();
+    let args = test_args();
+    enqueue_inference(PathBuf::from("first.png"), &args, &mut queue);
+    enqueue_inference(PathBuf::from("second.png"), &args, &mut queue);
+    enqueue_inference(PathBuf::from("third.png"), &args, &mut queue);
+    let status = UiStatus {
+        message: String::new(),
+        processing: false,
+        worker_message: None,
+    };
+
+    let mut app = build_test_app(worker, queue, status);
+    app.world_mut().resource_mut::<AppArgs>().max_batch_size = 2;
+    app.update();
+
+    let command = cmd_rx.try_recv().expect("expected batched infer command");
+    let WorkerCommand::Infer(batch) = command else {
+        panic!("expected infer command");
+    };
+    assert_eq!(
+        batch
+            .iter()
+            .map(|request| request.image_path.clone())
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("first.png"), PathBuf::from("second.png")]
+    );
+
+    let queue = app.world().resource::<InferenceQueue>();
+    assert_eq!(queue.active.as_ref().map(Vec::len), Some(2));
+    assert_eq!(queue.pending.len(), 1);
+}
+
+#[test]
 fn enqueue_inference_snapshots_triposplat_settings() {
     let mut queue = InferenceQueue::default();
     let mut args = test_args();
     args.synthesis_models = vec![SynthesisModel::Triposplat];
     args.num_steps = 5;
+    args.num_tokens = 768;
     args.guidance_scale = 3.0;
+    args.target_faces = Some(8_000);
     args.triposplat_num_gaussians = 32_768;
 
     let request = enqueue_inference(PathBuf::from("splat.png"), &args, &mut queue);
     args.num_steps = 50;
+    args.num_tokens = 2048;
     args.guidance_scale = 4.5;
+    args.target_faces = Some(20_000);
     args.triposplat_num_gaussians = 262_144;
 
     assert_eq!(request.settings.num_steps, 5);
+    assert_eq!(request.settings.num_tokens, 768);
     assert_eq!(request.settings.guidance_scale, 3.0);
+    assert_eq!(request.settings.target_faces, Some(8_000));
     assert_eq!(request.settings.triposplat_num_gaussians, 32_768);
+}
+
+#[test]
+fn processing_window_title_uses_constant_width_rattler() {
+    let titles = (0..8)
+        .map(|phase| processing_window_title("image.png", 2, phase))
+        .collect::<Vec<_>>();
+    let first_len = titles[0].len();
+
+    assert!(titles.iter().all(|title| title.len() == first_len));
+    assert!(titles.iter().all(|title| title.starts_with("bevy_synth [")));
+    assert!(titles.iter().all(|title| title.ends_with("(queued: 2)")));
+    assert!((0..8).all(|phase| title_rattler_frame(phase).len() == 3));
 }
 
 #[test]
@@ -430,6 +498,48 @@ fn ui_plugin_update_has_no_query_conflicts() {
     app.add_plugins(BurnSynthUiPlugin);
 
     app.update();
+}
+
+fn write_catalog_delete_request_once(
+    mut wrote: Local<bool>,
+    mut requests: MessageWriter<CatalogDeleteRequest>,
+) {
+    if *wrote {
+        return;
+    }
+    *wrote = true;
+    requests.write(CatalogDeleteRequest {
+        cache_key: Some("cache-key".to_string()),
+    });
+}
+
+#[test]
+fn catalog_delete_request_removes_cache_backed_instances_in_same_update() {
+    let mut app = App::new();
+    app.add_message::<CatalogDeleteRequest>();
+    app.insert_resource(MeshCacheResource {
+        cache: MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache"),
+    });
+    let entity = app
+        .world_mut()
+        .spawn(CachedMeshInstance {
+            cache_key: "cache-key".to_string(),
+        })
+        .id();
+    app.add_systems(
+        Update,
+        (
+            write_catalog_delete_request_once.in_set(BurnSynthUiSystemSet::CatalogRequests),
+            handle_catalog_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+        ),
+    );
+
+    app.update();
+
+    assert!(
+        !app.world().entities().contains(entity),
+        "cache-backed spawned instance should be despawned on the same update as the catalog delete request"
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]

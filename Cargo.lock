@@ -1790,6 +1790,7 @@ dependencies = [
  "clap",
  "console_error_panic_hook",
  "js-sys",
+ "rattles",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -2787,6 +2788,7 @@ dependencies = [
  "burn_trellis",
  "burn_tripo",
  "burn_triposplat",
+ "ciborium",
  "clap",
  "console_error_panic_hook",
  "cubecl",
@@ -2798,6 +2800,7 @@ dependencies = [
  "js-sys",
  "log",
  "safetensors 0.6.2",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sysinfo 0.36.1",
@@ -7961,6 +7964,12 @@ name = "range-alloc"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d6831663a5098ea164f89cff59c6284e95f4e3c76ce9848d4529f5ccca9bde"
+
+[[package]]
+name = "rattles"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0704e453f2514c76367349b878f07a9c969365dab09d8a97e96a89cd4c3e26e"
 
 [[package]]
 name = "rav1e"

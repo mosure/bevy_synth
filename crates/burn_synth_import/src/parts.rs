@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -47,6 +47,14 @@ pub struct BurnpackPartsReport {
     pub manifest_path: PathBuf,
     pub part_paths: Vec<PathBuf>,
     pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BurnpackPartIntegrity {
+    pub actual_bytes: u64,
+    pub required_bytes: u64,
+    pub tensors: usize,
+    pub trailing_padding_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -314,7 +322,13 @@ where
     let mut model = init_model();
     for (index, part) in manifest.parts.iter().enumerate() {
         let part_path = resolve_part_entry_path(manifest_path, &part.path)?;
-        let bytes = fs::read(&part_path).map_err(|err| {
+        let integrity = validate_burnpack_part_integrity(&part_path).map_err(|err| {
+            format!(
+                "{label} part {} failed integrity validation: {err}",
+                part_path.display()
+            )
+        })?;
+        let mut bytes = fs::read(&part_path).map_err(|err| {
             format!(
                 "failed to read {} part {}: {err}",
                 label,
@@ -340,6 +354,12 @@ where
                 ));
             }
         }
+        pad_legacy_short_tail_burnpack_part(&mut bytes, integrity).map_err(|err| {
+            format!(
+                "failed to normalize legacy short-tail {label} part {}: {err}",
+                part_path.display()
+            )
+        })?;
         apply_part(&mut model, bytes).map_err(|err| {
             format!(
                 "failed to apply {label} part {}/{} ({}): {err}",
@@ -409,8 +429,99 @@ pub fn remove_legacy_shard_artifacts_for_burnpack(burnpack_path: &Path) -> Resul
     Ok(removed)
 }
 
+pub fn validate_burnpack_part_integrity(path: &Path) -> Result<BurnpackPartIntegrity, String> {
+    let actual_bytes = fs::metadata(path)
+        .map_err(|err| format!("failed to stat burnpack part '{}': {err}", path.display()))?
+        .len();
+    let mut file = fs::File::open(path)
+        .map_err(|err| format!("failed to open burnpack part '{}': {err}", path.display()))?;
+    validate_burnpack_part_integrity_reader(path, actual_bytes, &mut file)
+}
+
+pub fn validate_burnpack_part_integrity_bytes(
+    source: &str,
+    bytes: &[u8],
+) -> Result<BurnpackPartIntegrity, String> {
+    let mut cursor = Cursor::new(bytes);
+    validate_burnpack_part_integrity_reader(Path::new(source), bytes.len() as u64, &mut cursor)
+}
+
+pub fn normalize_burnpack_part_bytes(source: &str, mut bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let integrity = validate_burnpack_part_integrity_bytes(source, &bytes)?;
+    pad_legacy_short_tail_burnpack_part(&mut bytes, integrity)?;
+    Ok(bytes)
+}
+
+fn pad_legacy_short_tail_burnpack_part(
+    bytes: &mut Vec<u8>,
+    integrity: BurnpackPartIntegrity,
+) -> Result<(), String> {
+    if integrity.trailing_padding_bytes == 0 {
+        return Ok(());
+    }
+    let required_len = usize::try_from(integrity.required_bytes)
+        .map_err(|_| "required burnpack part length exceeds usize".to_string())?;
+    bytes.resize(required_len, 0);
+    Ok(())
+}
+
+fn validate_burnpack_part_integrity_reader<R: Read + Seek>(
+    path: &Path,
+    actual_bytes: u64,
+    source: &mut R,
+) -> Result<BurnpackPartIntegrity, String> {
+    let (_, metadata_size, metadata) = read_burnpack_metadata(source, path)?;
+    if metadata.tensors.is_empty() {
+        return Err(format!(
+            "burnpack part '{}' contains no tensor descriptors",
+            path.display()
+        ));
+    }
+
+    let mut max_data_end = 0u64;
+    for (name, descriptor) in &metadata.tensors {
+        let (start, end) = descriptor.data_offsets;
+        if end < start {
+            return Err(format!(
+                "burnpack part '{}' tensor '{}' has invalid data offsets {}..{}",
+                path.display(),
+                name,
+                start,
+                end
+            ));
+        }
+        max_data_end = max_data_end.max(end);
+    }
+
+    let required_bytes = aligned_data_section_start(metadata_size as usize)
+        .checked_add(max_data_end)
+        .ok_or_else(|| {
+            format!(
+                "burnpack part '{}' required byte length overflows u64",
+                path.display()
+            )
+        })?;
+    let trailing_padding_bytes = required_bytes.saturating_sub(actual_bytes);
+    if trailing_padding_bytes > TENSOR_ALIGNMENT {
+        return Err(format!(
+            "burnpack part '{}' is truncated: tensor metadata requires {} bytes but file has {} bytes (short by {})",
+            path.display(),
+            required_bytes,
+            actual_bytes,
+            trailing_padding_bytes
+        ));
+    }
+
+    Ok(BurnpackPartIntegrity {
+        actual_bytes,
+        required_bytes,
+        tensors: metadata.tensors.len(),
+        trailing_padding_bytes,
+    })
+}
+
 fn read_burnpack_metadata(
-    source: &mut fs::File,
+    source: &mut (impl Read + Seek),
     burnpack_path: &Path,
 ) -> Result<(u16, u32, RawBurnpackMetadata), String> {
     source
@@ -714,10 +825,12 @@ fn manifest_has_all_parts(path: &Path, source_burnpack_path: Option<&Path>) -> b
                 return false;
             }
             if entry.bytes == 0 {
-                return true;
+                return validate_burnpack_part_integrity(&part).is_ok();
             }
             fs::metadata(&part)
-                .map(|metadata| metadata.len() == entry.bytes)
+                .map(|metadata| {
+                    metadata.len() == entry.bytes && validate_burnpack_part_integrity(&part).is_ok()
+                })
                 .unwrap_or(false)
         })
     })
@@ -913,8 +1026,10 @@ mod tests {
         fs::write(&candidate, b"abcdef").expect("write candidate");
         let part0 = root.join("model.bpk.part-00000.bpk");
         let part1 = root.join("model.bpk.part-00001.bpk");
-        fs::write(&part0, b"aaa").expect("write part0");
-        fs::write(&part1, b"bbb").expect("write part1");
+        let part0_bytes = tiny_burnpack_with_trailing_shortfall(4, &[1, 2, 3, 4]);
+        let part1_bytes = tiny_burnpack_with_trailing_shortfall(4, &[5, 6, 7, 8]);
+        fs::write(&part0, &part0_bytes).expect("write part0");
+        fs::write(&part1, &part1_bytes).expect("write part1");
 
         let source_modified_unix_ms = file_modified_unix_ms_for_test(&candidate);
         let manifest = BurnpackPartsManifest {
@@ -926,14 +1041,14 @@ mod tests {
             parts: vec![
                 BurnpackPartEntry {
                     path: "model.bpk.part-00000.bpk".to_string(),
-                    bytes: 3,
-                    sha256: sha256_bytes(b"aaa"),
+                    bytes: part0_bytes.len() as u64,
+                    sha256: sha256_bytes(&part0_bytes),
                     tensors: 1,
                 },
                 BurnpackPartEntry {
                     path: "model.bpk.part-00001.bpk".to_string(),
-                    bytes: 3,
-                    sha256: sha256_bytes(b"bbb"),
+                    bytes: part1_bytes.len() as u64,
+                    sha256: sha256_bytes(&part1_bytes),
                     tensors: 1,
                 },
             ],
@@ -959,8 +1074,105 @@ mod tests {
         .expect("manifest should be used");
 
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0], b"aaa");
-        assert_eq!(loaded[1], b"bbb");
+        assert_eq!(loaded[0], part0_bytes);
+        assert_eq!(loaded[1], part1_bytes);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn loader_pads_legacy_part_with_small_trailing_shortfall() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let candidate = root.join("model.bpk");
+        let short_part = root.join("model.bpk.part-00000.bpk");
+        let bytes = tiny_burnpack_with_trailing_shortfall(4, &[1, 2]);
+        fs::write(&short_part, &bytes).expect("write short-tail part");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: bytes.len() as u64,
+            max_part_bytes: bytes.len() as u64,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: bytes.len() as u64,
+                sha256: sha256_bytes(&bytes),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&candidate),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let loaded = load_model_from_burnpack_parts(
+            std::slice::from_ref(&candidate),
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect("small legacy trailing shortfall should be padded")
+        .expect("parts should load");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].len(), bytes.len() + 2);
+        assert!(loaded[0].ends_with(&[1, 2, 0, 0]));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn loader_rejects_part_with_large_truncated_internal_payload() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let candidate = root.join("model.bpk");
+        let truncated_part = root.join("model.bpk.part-00000.bpk");
+        let bytes = tiny_burnpack_with_trailing_shortfall(512, &[1, 2]);
+        fs::write(&truncated_part, &bytes).expect("write truncated part");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: bytes.len() as u64,
+            max_part_bytes: bytes.len() as u64,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: bytes.len() as u64,
+                sha256: sha256_bytes(&bytes),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            burnpack_parts_manifest_path(&candidate),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let err = load_model_from_burnpack_parts(
+            std::slice::from_ref(&candidate),
+            "test-model",
+            true,
+            Vec::<Vec<u8>>::new,
+            |parts, bytes| {
+                parts.push(bytes);
+                Ok(())
+            },
+        )
+        .expect_err("large truncated internal payload should be rejected");
+
+        assert!(
+            err.contains("integrity validation"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("truncated"), "unexpected error: {err}");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }
@@ -995,7 +1207,8 @@ mod tests {
         let candidate = root.join("model.bpk");
         fs::write(&candidate, b"abc").expect("write candidate");
         let part0 = root.join("model.bpk.part-00000.bpk");
-        fs::write(&part0, b"aaa").expect("write part0");
+        let part0_bytes = tiny_burnpack_with_trailing_shortfall(4, &[1, 2, 3, 4]);
+        fs::write(&part0, &part0_bytes).expect("write part0");
 
         let source_modified_unix_ms = file_modified_unix_ms_for_test(&candidate);
         let manifest = BurnpackPartsManifest {
@@ -1006,7 +1219,7 @@ mod tests {
             max_part_bytes: 3,
             parts: vec![BurnpackPartEntry {
                 path: "model.bpk.part-00000.bpk".to_string(),
-                bytes: 3,
+                bytes: part0_bytes.len() as u64,
                 sha256: "deadbeef".to_string(),
                 tensors: 1,
             }],
@@ -1043,8 +1256,10 @@ mod tests {
         let good_candidate = root.join("model.bpk");
         let bad_part = root.join("model_f16.bpk.part-00000.bpk");
         let good_part = root.join("model.bpk.part-00000.bpk");
-        fs::write(&bad_part, b"bad").expect("write bad part");
-        fs::write(&good_part, b"good").expect("write good part");
+        let bad_bytes = tiny_burnpack_with_trailing_shortfall(4, &[1, 2, 3, 4]);
+        let good_bytes = tiny_burnpack_with_trailing_shortfall(4, &[5, 6, 7, 8]);
+        fs::write(&bad_part, &bad_bytes).expect("write bad part");
+        fs::write(&good_part, &good_bytes).expect("write good part");
 
         let bad_manifest = BurnpackPartsManifest {
             version: 1,
@@ -1054,8 +1269,8 @@ mod tests {
             max_part_bytes: 3,
             parts: vec![BurnpackPartEntry {
                 path: "model_f16.bpk.part-00000.bpk".to_string(),
-                bytes: 3,
-                sha256: sha256_bytes(b"bad"),
+                bytes: bad_bytes.len() as u64,
+                sha256: sha256_bytes(&bad_bytes),
                 tensors: 1,
             }],
         };
@@ -1073,8 +1288,8 @@ mod tests {
             max_part_bytes: 4,
             parts: vec![BurnpackPartEntry {
                 path: "model.bpk.part-00000.bpk".to_string(),
-                bytes: 4,
-                sha256: sha256_bytes(b"good"),
+                bytes: good_bytes.len() as u64,
+                sha256: sha256_bytes(&good_bytes),
                 tensors: 1,
             }],
         };
@@ -1090,7 +1305,7 @@ mod tests {
             true,
             Vec::<Vec<u8>>::new,
             |parts, bytes| {
-                if bytes == b"bad" {
+                if bytes == bad_bytes {
                     return Err("synthetic preferred candidate failure".to_string());
                 }
                 parts.push(bytes);
@@ -1100,7 +1315,7 @@ mod tests {
         .expect("fallback candidate should load")
         .expect("parts should load");
 
-        assert_eq!(loaded, vec![b"good".to_vec()]);
+        assert_eq!(loaded, vec![good_bytes]);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -1114,7 +1329,8 @@ mod tests {
         fs::write(&existing_candidate, b"source").expect("write existing candidate");
 
         let bad_part = root.join("model_f16.bpk.part-00000.bpk");
-        fs::write(&bad_part, b"bad").expect("write bad part");
+        let bad_bytes = tiny_burnpack_with_trailing_shortfall(4, &[1, 2, 3, 4]);
+        fs::write(&bad_part, &bad_bytes).expect("write bad part");
         let bad_manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model_f16.bpk".to_string(),
@@ -1123,8 +1339,8 @@ mod tests {
             max_part_bytes: 3,
             parts: vec![BurnpackPartEntry {
                 path: "model_f16.bpk.part-00000.bpk".to_string(),
-                bytes: 3,
-                sha256: sha256_bytes(b"bad"),
+                bytes: bad_bytes.len() as u64,
+                sha256: sha256_bytes(&bad_bytes),
                 tensors: 1,
             }],
         };
@@ -1135,7 +1351,8 @@ mod tests {
         .expect("write bad manifest");
 
         let good_part = root.join("model.bpk.part-00000.bpk");
-        fs::write(&good_part, b"good").expect("write good part");
+        let good_bytes = tiny_burnpack_with_trailing_shortfall(4, &[5, 6, 7, 8]);
+        fs::write(&good_part, &good_bytes).expect("write good part");
         let good_manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model.bpk".to_string(),
@@ -1144,8 +1361,8 @@ mod tests {
             max_part_bytes: 4,
             parts: vec![BurnpackPartEntry {
                 path: "model.bpk.part-00000.bpk".to_string(),
-                bytes: 4,
-                sha256: sha256_bytes(b"good"),
+                bytes: good_bytes.len() as u64,
+                sha256: sha256_bytes(&good_bytes),
                 tensors: 1,
             }],
         };
@@ -1168,7 +1385,7 @@ mod tests {
         .expect("load parts")
         .expect("parts should load");
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0], b"good");
+        assert_eq!(loaded[0], good_bytes);
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

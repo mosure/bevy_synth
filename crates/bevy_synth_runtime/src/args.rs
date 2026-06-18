@@ -167,12 +167,7 @@ pub struct Args {
     pub bg_weights_root: Option<PathBuf>,
 
     /// Synthesis backend models to enable (comma-delimited, ordered by preference).
-    #[arg(
-        long,
-        value_enum,
-        value_delimiter = ',',
-        default_values_t = [SynthesisModel::Triposg]
-    )]
+    #[arg(long, value_enum, value_delimiter = ',')]
     pub synthesis_models: Vec<SynthesisModel>,
 
     /// Foreground model variant.
@@ -307,7 +302,7 @@ impl From<CoreTripoSplatProfile> for TripoSplatProfile {
     }
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshMode {
     Dense,
     Hierarchical,
@@ -429,6 +424,7 @@ pub struct AppArgs {
     pub mesh: Option<PathBuf>,
     pub bg_weights_root: Option<PathBuf>,
     pub synthesis_models: Vec<SynthesisModel>,
+    pub available_synthesis_models: Vec<SynthesisModel>,
     pub rmbg_model: RmbgModel,
     pub backend: BackendKind,
     pub rmbg_backend: RmbgBackend,
@@ -443,7 +439,13 @@ pub struct AppArgs {
 pub fn build_app_args(args: Args) -> AppArgs {
     let quality = args.quality;
     let defaults = quality.defaults();
+    let explicit_synthesis_models = !args.synthesis_models.is_empty();
     let synthesis_models = sanitize_synthesis_models(args.synthesis_models);
+    let available_synthesis_models = if explicit_synthesis_models {
+        synthesis_models.clone()
+    } else {
+        default_available_synthesis_models()
+    };
     let triposplat_selected = synthesis_models
         .first()
         .is_some_and(|model| matches!(model, SynthesisModel::Triposplat));
@@ -512,6 +514,7 @@ pub fn build_app_args(args: Args) -> AppArgs {
         mesh: args.mesh,
         bg_weights_root: args.bg_weights_root,
         synthesis_models,
+        available_synthesis_models,
         rmbg_model: args.rmbg_model,
         backend: args.backend,
         rmbg_backend: args.rmbg_backend,
@@ -572,6 +575,10 @@ fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel>
     out
 }
 
+fn default_available_synthesis_models() -> Vec<SynthesisModel> {
+    vec![SynthesisModel::Triposg, SynthesisModel::Triposplat]
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -587,6 +594,10 @@ mod tests {
         let app_args = build_app_args(args);
         assert!(matches!(app_args.rmbg_model, RmbgModel::Rmbg14));
         assert_eq!(app_args.synthesis_models, vec![SynthesisModel::Triposg]);
+        assert_eq!(
+            app_args.available_synthesis_models,
+            vec![SynthesisModel::Triposg, SynthesisModel::Triposplat]
+        );
         assert_eq!(app_args.max_batch_size, 1);
     }
 
@@ -605,6 +616,10 @@ mod tests {
         assert!(matches!(app_args.rmbg_model, RmbgModel::Rmbg14));
         assert_eq!(
             app_args.synthesis_models,
+            vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
+        );
+        assert_eq!(
+            app_args.available_synthesis_models,
             vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
         );
         assert_eq!(app_args.max_batch_size, 4);

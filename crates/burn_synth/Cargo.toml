@@ -91,7 +91,9 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [dev-dependencies]
+ciborium = "0.2"
 safetensors = "0.6"
+serde = { version = "1.0", features = ["derive"] }
 sysinfo = "0.36"
 
 [[bin]]

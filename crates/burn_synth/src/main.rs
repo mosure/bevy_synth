@@ -124,9 +124,9 @@ struct Cli {
 enum Command {
     /// Extract an RGBA foreground image.
     Foreground {
-        /// Input image path.
-        #[arg(long)]
-        input: PathBuf,
+        /// Input image path. Repeat --input to process multiple images with one loaded runtime.
+        #[arg(long = "input", required = true)]
+        inputs: Vec<PathBuf>,
 
         /// Output image path. Defaults to `<input>_foreground.png`.
         #[arg(long)]
@@ -134,9 +134,9 @@ enum Command {
     },
     /// Run image-to-mesh synthesis and write a GLB.
     Mesh {
-        /// Input image path.
-        #[arg(long)]
-        input: PathBuf,
+        /// Input image path. Repeat --input to process multiple images with one loaded runtime.
+        #[arg(long = "input", required = true)]
+        inputs: Vec<PathBuf>,
 
         /// Output mesh path. Defaults to `<input>_mesh.glb`.
         #[arg(long)]
@@ -148,9 +148,9 @@ enum Command {
     },
     /// Run image-to-splat synthesis and write a .splat or .ply file.
     Splat {
-        /// Input image path.
-        #[arg(long)]
-        input: PathBuf,
+        /// Input image path. Repeat --input to process multiple images with one loaded runtime.
+        #[arg(long = "input", required = true)]
+        inputs: Vec<PathBuf>,
 
         /// Output splat path. Defaults to `<input>_splat.splat`.
         #[arg(long)]
@@ -389,72 +389,49 @@ fn run(cli: Cli) -> Result<(), String> {
     let mut runtime = SynthRuntime::new(runtime_config);
 
     match cli.command {
-        Command::Foreground { input, output } => {
-            ensure_exists(input.as_path())?;
-            let command_start = Instant::now();
-            let output = output
-                .unwrap_or_else(|| default_output_path(input.as_path(), "_foreground", "png"));
-            let result = runtime
-                .extract_foreground(ForegroundRequest {
-                    image: ImageSource::from_path(input.clone()),
-                    model: Some(cli.rmbg_model.into()),
-                })
-                .map_err(|err| err.to_string())?;
-            result
-                .image
-                .save(&output)
-                .map_err(|err| format!("failed to save {}: {err}", output.display()))?;
-            println!(
-                "foreground saved: {} ({}x{}, model={}, total_ms={:.1})",
-                output.display(),
-                result.width,
-                result.height,
-                foreground_model_name(result.model),
-                command_start.elapsed().as_secs_f64() * 1000.0
-            );
+        Command::Foreground { inputs, output } => {
+            ensure_inputs_exist(inputs.as_slice())?;
+            let input_count = inputs.len();
+            for input in inputs.iter() {
+                let command_start = Instant::now();
+                let output = resolve_foreground_output_path(
+                    output.as_deref(),
+                    input.as_path(),
+                    input_count,
+                )?;
+                let result = runtime
+                    .extract_foreground(ForegroundRequest {
+                        image: ImageSource::from_path(input.clone()),
+                        model: Some(cli.rmbg_model.into()),
+                    })
+                    .map_err(|err| err.to_string())?;
+                result
+                    .image
+                    .save(&output)
+                    .map_err(|err| format!("failed to save {}: {err}", output.display()))?;
+                println!(
+                    "foreground saved: {} ({}x{}, model={}, total_ms={:.1})",
+                    output.display(),
+                    result.width,
+                    result.height,
+                    foreground_model_name(result.model),
+                    command_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         Command::Mesh {
-            input,
+            inputs,
             output,
             dry_run,
         } => {
-            ensure_exists(input.as_path())?;
-            let command_start = Instant::now();
-            let output = resolve_glb_output_path(output, input.as_path());
-            let result = runtime
-                .synthesize_mesh(MeshRequest {
-                    image: ImageSource::from_path(input.clone()),
-                    foreground_model: Some(cli.rmbg_model.into()),
-                    synthesis_models: Some(
-                        synthesis_models.iter().copied().map(Into::into).collect(),
-                    ),
-                    backend: Some(cli.backend.into()),
-                    dry_run,
-                })
-                .map_err(|err| err.to_string())?;
-            write_glb_mesh(output.as_path(), &result.mesh)?;
-            println!(
-                "mesh saved: {} (vertices={}, faces={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
-                output.display(),
-                result.mesh.vertices.len(),
-                result.mesh.faces.len(),
-                foreground_model_name(result.foreground_model),
-                synthesis_model_name(result.synthesis_backend),
-                backend_name(result.backend),
-                dry_run,
-                command_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        Command::Splat {
-            input,
-            output,
-            dry_run,
-        } => {
-            ensure_exists(input.as_path())?;
-            let command_start = Instant::now();
-            let result = if triposplat_counts.len() == 1 {
-                let output = runtime
-                    .synthesize_asset(AssetRequest {
+            ensure_inputs_exist(inputs.as_slice())?;
+            let input_count = inputs.len();
+            for input in inputs.iter() {
+                let command_start = Instant::now();
+                let output =
+                    resolve_glb_output_path(output.as_deref(), input.as_path(), input_count)?;
+                let result = runtime
+                    .synthesize_mesh(MeshRequest {
                         image: ImageSource::from_path(input.clone()),
                         foreground_model: Some(cli.rmbg_model.into()),
                         synthesis_models: Some(
@@ -464,60 +441,100 @@ fn run(cli: Cli) -> Result<(), String> {
                         dry_run,
                     })
                     .map_err(|err| err.to_string())?;
-                let splats = match output.asset {
-                    SynthesisAsset::GaussianSplat(splats) => splats,
-                    SynthesisAsset::Mesh(_) => {
-                        return Err(
-                            "internal TripoSplat output mismatch: splat command returned a mesh"
-                                .to_string(),
-                        );
-                    }
-                };
-                RuntimeSplatOutput {
-                    splats: vec![splats],
-                    num_gaussians: triposplat_counts.clone(),
-                    foreground_model: output.foreground_model,
-                    synthesis_backend: output.synthesis_backend,
-                    backend: output.backend,
-                }
-            } else {
-                runtime
-                    .synthesize_splats(SplatRequest {
-                        image: ImageSource::from_path(input.clone()),
-                        foreground_model: Some(cli.rmbg_model.into()),
-                        backend: Some(cli.backend.into()),
-                        num_gaussians: triposplat_counts,
-                        dry_run,
-                    })
-                    .map_err(|err| err.to_string())?
-            };
-            let outputs =
-                resolve_splat_output_paths(output, input.as_path(), &result.num_gaussians);
-            if outputs.len() != result.splats.len() {
-                return Err(format!(
-                    "internal TripoSplat output mismatch: {} paths for {} splat clouds",
-                    outputs.len(),
-                    result.splats.len()
-                ));
-            }
-            let total_ms = command_start.elapsed().as_secs_f64() * 1000.0;
-            for ((output, splats), count) in outputs
-                .iter()
-                .zip(result.splats.iter())
-                .zip(result.num_gaussians.iter())
-            {
-                write_splat_output(output.as_path(), splats)?;
+                write_glb_mesh(output.as_path(), &result.mesh)?;
                 println!(
-                    "splat saved: {} (gaussians={}, splats={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
+                    "mesh saved: {} (vertices={}, faces={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
                     output.display(),
-                    count,
-                    splats.len(),
+                    result.mesh.vertices.len(),
+                    result.mesh.faces.len(),
                     foreground_model_name(result.foreground_model),
                     synthesis_model_name(result.synthesis_backend),
                     backend_name(result.backend),
                     dry_run,
-                    total_ms
+                    command_start.elapsed().as_secs_f64() * 1000.0
                 );
+            }
+        }
+        Command::Splat {
+            inputs,
+            output,
+            dry_run,
+        } => {
+            ensure_inputs_exist(inputs.as_slice())?;
+            let input_count = inputs.len();
+            for input in inputs.iter() {
+                let command_start = Instant::now();
+                let result = if triposplat_counts.len() == 1 {
+                    let output = runtime
+                        .synthesize_asset(AssetRequest {
+                            image: ImageSource::from_path(input.clone()),
+                            foreground_model: Some(cli.rmbg_model.into()),
+                            synthesis_models: Some(
+                                synthesis_models.iter().copied().map(Into::into).collect(),
+                            ),
+                            backend: Some(cli.backend.into()),
+                            dry_run,
+                        })
+                        .map_err(|err| err.to_string())?;
+                    let splats = match output.asset {
+                        SynthesisAsset::GaussianSplat(splats) => splats,
+                        SynthesisAsset::Mesh(_) => {
+                            return Err(
+                                "internal TripoSplat output mismatch: splat command returned a mesh"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    RuntimeSplatOutput {
+                        splats: vec![splats],
+                        num_gaussians: triposplat_counts.clone(),
+                        foreground_model: output.foreground_model,
+                        synthesis_backend: output.synthesis_backend,
+                        backend: output.backend,
+                    }
+                } else {
+                    runtime
+                        .synthesize_splats(SplatRequest {
+                            image: ImageSource::from_path(input.clone()),
+                            foreground_model: Some(cli.rmbg_model.into()),
+                            backend: Some(cli.backend.into()),
+                            num_gaussians: triposplat_counts.clone(),
+                            dry_run,
+                        })
+                        .map_err(|err| err.to_string())?
+                };
+                let outputs = resolve_splat_output_paths(
+                    output.as_deref(),
+                    input.as_path(),
+                    &result.num_gaussians,
+                    input_count,
+                )?;
+                if outputs.len() != result.splats.len() {
+                    return Err(format!(
+                        "internal TripoSplat output mismatch: {} paths for {} splat clouds",
+                        outputs.len(),
+                        result.splats.len()
+                    ));
+                }
+                let total_ms = command_start.elapsed().as_secs_f64() * 1000.0;
+                for ((output, splats), count) in outputs
+                    .iter()
+                    .zip(result.splats.iter())
+                    .zip(result.num_gaussians.iter())
+                {
+                    write_splat_output(output.as_path(), splats)?;
+                    println!(
+                        "splat saved: {} (gaussians={}, splats={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
+                        output.display(),
+                        count,
+                        splats.len(),
+                        foreground_model_name(result.foreground_model),
+                        synthesis_model_name(result.synthesis_backend),
+                        backend_name(result.backend),
+                        dry_run,
+                        total_ms
+                    );
+                }
             }
         }
     }
@@ -539,6 +556,16 @@ fn ensure_exists(path: &Path) -> Result<(), String> {
     } else {
         Err(format!("path does not exist: {}", path.display()))
     }
+}
+
+fn ensure_inputs_exist(inputs: &[PathBuf]) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err("at least one --input is required".to_string());
+    }
+    for input in inputs {
+        ensure_exists(input.as_path())?;
+    }
+    Ok(())
 }
 
 fn normalize_cli_gaussian_counts(
@@ -570,65 +597,116 @@ fn default_output_path(input: &Path, suffix: &str, ext: &str) -> PathBuf {
     parent.join(format!("{stem}{suffix}.{ext}"))
 }
 
-fn resolve_glb_output_path(output: Option<PathBuf>, input: &Path) -> PathBuf {
+fn output_dir_path_or_error(
+    output: Option<&Path>,
+    input: &Path,
+    suffix: &str,
+    ext: &str,
+    input_count: usize,
+) -> Result<Option<PathBuf>, String> {
     let Some(path) = output else {
-        return default_output_path(input, "_mesh", "glb");
+        return Ok(None);
     };
     if path.extension().is_none() || path.is_dir() {
         let stem = input
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("mesh");
-        return path.join(format!("{stem}_mesh.glb"));
+            .unwrap_or("output");
+        return Ok(Some(path.join(format!("{stem}{suffix}.{ext}"))));
     }
+    if input_count > 1 {
+        return Err(format!(
+            "--output must be a directory or extensionless output root when processing multiple inputs; got {}",
+            path.display()
+        ));
+    }
+    Ok(None)
+}
+
+fn resolve_foreground_output_path(
+    output: Option<&Path>,
+    input: &Path,
+    input_count: usize,
+) -> Result<PathBuf, String> {
+    let Some(path) = output else {
+        return Ok(default_output_path(input, "_foreground", "png"));
+    };
+    if path.is_dir() || (input_count > 1 && path.extension().is_none()) {
+        let stem = input
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output");
+        return Ok(path.join(format!("{stem}_foreground.png")));
+    }
+    if input_count > 1 {
+        return Err(format!(
+            "--output must be a directory or extensionless output root when processing multiple inputs; got {}",
+            path.display()
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolve_glb_output_path(
+    output: Option<&Path>,
+    input: &Path,
+    input_count: usize,
+) -> Result<PathBuf, String> {
+    if let Some(path) = output_dir_path_or_error(output, input, "_mesh", "glb", input_count)? {
+        return Ok(path);
+    }
+    let Some(path) = output else {
+        return Ok(default_output_path(input, "_mesh", "glb"));
+    };
     if path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("glb"))
         .unwrap_or(false)
     {
-        path
+        Ok(path.to_path_buf())
     } else {
-        path.with_extension("glb")
+        Ok(path.with_extension("glb"))
     }
 }
 
-fn resolve_splat_output_path(output: Option<PathBuf>, input: &Path) -> PathBuf {
-    let Some(path) = output else {
-        return default_output_path(input, "_splat", "splat");
-    };
-    if path.extension().is_none() || path.is_dir() {
-        let stem = input
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("splat");
-        return path.join(format!("{stem}_splat.splat"));
+fn resolve_splat_output_path(
+    output: Option<&Path>,
+    input: &Path,
+    input_count: usize,
+) -> Result<PathBuf, String> {
+    if let Some(path) = output_dir_path_or_error(output, input, "_splat", "splat", input_count)? {
+        return Ok(path);
     }
+    let Some(path) = output else {
+        return Ok(default_output_path(input, "_splat", "splat"));
+    };
     let is_supported = path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("splat") || value.eq_ignore_ascii_case("ply"))
         .unwrap_or(false);
     if is_supported {
-        path
+        Ok(path.to_path_buf())
     } else {
-        path.with_extension("splat")
+        Ok(path.with_extension("splat"))
     }
 }
 
 fn resolve_splat_output_paths(
-    output: Option<PathBuf>,
+    output: Option<&Path>,
     input: &Path,
     counts: &[usize],
-) -> Vec<PathBuf> {
-    let base = resolve_splat_output_path(output, input);
+    input_count: usize,
+) -> Result<Vec<PathBuf>, String> {
+    let base = resolve_splat_output_path(output, input, input_count)?;
     if counts.len() <= 1 {
-        return vec![base];
+        return Ok(vec![base]);
     }
-    counts
+    Ok(counts
         .iter()
         .map(|count| splat_output_with_count(base.as_path(), *count))
-        .collect()
+        .collect())
 }
 
 fn splat_output_with_count(path: &Path, count: usize) -> PathBuf {
@@ -845,6 +923,25 @@ mod tests {
     }
 
     #[test]
+    fn mesh_cli_accepts_repeated_inputs_for_one_runtime_invocation() {
+        let cli = Cli::parse_from([
+            "burn_synth",
+            "mesh",
+            "--input",
+            "first.png",
+            "--input",
+            "second.png",
+        ]);
+        let Command::Mesh { inputs, .. } = cli.command else {
+            panic!("expected mesh command");
+        };
+        assert_eq!(
+            inputs,
+            vec![PathBuf::from("first.png"), PathBuf::from("second.png")]
+        );
+    }
+
+    #[test]
     fn explicit_flags_override_quality_preset_inputs() {
         let cli = Cli::parse_from([
             "burn_synth",
@@ -936,10 +1033,12 @@ mod tests {
     #[test]
     fn multi_splat_outputs_preserve_extension_with_count_suffixes() {
         let outputs = resolve_splat_output_paths(
-            Some(PathBuf::from("out/model.ply")),
+            Some(Path::new("out/model.ply")),
             Path::new("input.png"),
             &[32_768, 65_536],
-        );
+            1,
+        )
+        .unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -947,6 +1046,25 @@ mod tests {
                 PathBuf::from("out/model_65536.ply"),
             ]
         );
+    }
+
+    #[test]
+    fn multi_input_output_file_is_rejected_to_avoid_overwrite() {
+        let err = resolve_splat_output_paths(
+            Some(Path::new("out/model.splat")),
+            Path::new("input.png"),
+            &[32_768],
+            2,
+        )
+        .expect_err("file output should be ambiguous for multiple inputs");
+        assert!(err.contains("--output must be a directory"));
+    }
+
+    #[test]
+    fn multi_input_output_directory_derives_per_input_names() {
+        let output = resolve_glb_output_path(Some(Path::new("out")), Path::new("chair.png"), 2)
+            .expect("directory-like output should be valid for multiple inputs");
+        assert_eq!(output, PathBuf::from("out/chair_mesh.glb"));
     }
 
     #[test]
@@ -976,6 +1094,43 @@ mod tests {
         run(cli).expect("splat dry-run CLI should write a Gaussian splat asset");
         let metadata = fs::metadata(&output).expect("splat output should exist");
         assert!(metadata.len() > 0);
+        fs::remove_dir_all(root).expect("failed to remove temp test directory");
+    }
+
+    #[test]
+    fn splat_cli_dry_run_processes_repeated_inputs_with_one_runtime() {
+        let root = unique_test_dir("splat_cli_dry_run_batch");
+        let output_root = root.join("out");
+        fs::create_dir_all(&output_root).expect("failed to create temp test directory");
+        let first = root.join("first.png");
+        let second = root.join("second.png");
+        fs::write(&first, b"not decoded in dry-run").expect("failed to write first temp input");
+        fs::write(&second, b"not decoded in dry-run").expect("failed to write second temp input");
+
+        let cli = Cli::parse_from([
+            "burn_synth",
+            "--backend",
+            "cpu",
+            "--progress",
+            "off",
+            "--gaussians",
+            "32768",
+            "splat",
+            "--input",
+            first.to_str().expect("utf-8 first input path"),
+            "--input",
+            second.to_str().expect("utf-8 second input path"),
+            "--output",
+            output_root.to_str().expect("utf-8 output path"),
+            "--dry-run",
+        ]);
+
+        run(cli).expect("splat dry-run CLI should process every input");
+        for output in ["first_splat.splat", "second_splat.splat"] {
+            let output = output_root.join(output);
+            let metadata = fs::metadata(&output).expect("splat batch output should exist");
+            assert!(metadata.len() > 0);
+        }
         fs::remove_dir_all(root).expect("failed to remove temp test directory");
     }
 

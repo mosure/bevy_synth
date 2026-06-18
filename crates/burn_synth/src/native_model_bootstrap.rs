@@ -8,7 +8,10 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
-use burn_synth_import::parts::{BurnpackPartEntry, read_parts_manifest, resolve_part_entry_path};
+use burn_synth_import::parts::{
+    BurnpackPartEntry, read_parts_manifest, resolve_part_entry_path,
+    validate_burnpack_part_integrity,
+};
 #[cfg(feature = "trellis")]
 use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use burn_tripo::paths::resolve_triposg_weights_root;
@@ -39,6 +42,21 @@ const DOWNLOAD_PROGRESS_LOG_EVERY_SECS: u64 = 10;
 type BootstrapStatusCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 static BOOTSTRAP_STATUS_CALLBACK: OnceLock<Mutex<Option<BootstrapStatusCallback>>> =
     OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct DownloadPartContext {
+    label: String,
+    artifact: String,
+    part_number: usize,
+    part_count: usize,
+}
+
+#[derive(Debug)]
+enum CachedPartState {
+    Ready,
+    MissingOrStale,
+    Invalid(String),
+}
 
 const TRIPOSG_OPTIONAL_TEXT_RELPATHS: &[&str] = &[
     "vae/config.json",
@@ -512,35 +530,66 @@ fn ensure_parts_bundle(
         write_file_atomically(&local_manifest_path, &manifest_bytes)?;
 
         let part_count = manifest.parts.len();
+        let artifact = burnpack_display_name(&candidate);
+        let mut invalid_candidate = None;
         for (index, part) in manifest.parts.iter().enumerate() {
             let local_part_path = resolve_part_entry_path(&local_manifest_path, &part.path)?;
-            if part_matches_cache(&local_part_path, part)? {
-                continue;
+            match cached_part_state(&local_part_path, part)? {
+                CachedPartState::Ready => continue,
+                CachedPartState::Invalid(err) => {
+                    invalid_candidate = Some(format!(
+                        "cached part {} failed integrity validation: {err}",
+                        local_part_path.display()
+                    ));
+                    break;
+                }
+                CachedPartState::MissingOrStale => {}
             }
             let part_url = resolve_manifest_entry_url(&manifest_url, &part.path);
             let part_number = index + 1;
-            emit_status(format!(
+            let context = DownloadPartContext {
+                label: label.to_string(),
+                artifact: artifact.clone(),
+                part_number,
+                part_count,
+            };
+            info!(
                 "Downloading {label} part {part_number}/{part_count}: {} -> {} (expected_bytes={})",
                 part_url,
                 local_part_path.display(),
                 part.bytes
-            ));
-            let downloaded =
-                download_part_file(&part_url, &local_part_path, part).map_err(|err| {
+            );
+            emit_status(download_part_started_message(&context, part.bytes));
+            let downloaded = download_part_file(&part_url, &local_part_path, part, &context)
+                .map_err(|err| {
                     format!(
                         "failed downloading {label} part {part_number}/{part_count} ({}): {err}",
                         part.path
                     )
                 })?;
-            emit_status(format!(
+            info!(
                 "Downloaded {label} part {part_number}/{part_count}: {} bytes -> {}",
                 downloaded,
                 local_part_path.display()
-            ));
+            );
+            emit_status(download_part_completed_message(&context));
+            if let CachedPartState::Invalid(err) = cached_part_state(&local_part_path, part)? {
+                invalid_candidate = Some(format!(
+                    "downloaded part {} failed integrity validation: {err}",
+                    local_part_path.display()
+                ));
+                break;
+            }
+        }
+
+        if let Some(reason) = invalid_candidate {
+            warn!("Skipping {label} {artifact} burnpack candidate {manifest_url}: {reason}");
+            checked.push(format!("{manifest_url} ({reason})"));
+            continue;
         }
 
         if manifest_is_complete(&local_manifest_path)? {
-            emit_status(format!("Downloaded {label} parts manifest {manifest_url}"));
+            emit_status(format!("Downloaded {label} {artifact} manifest."));
             return Ok(());
         }
     }
@@ -564,32 +613,41 @@ fn manifest_is_complete(manifest_path: &Path) -> Result<bool, String> {
     }
     for part in &manifest.parts {
         let path = resolve_part_entry_path(manifest_path, &part.path)?;
-        if !part_matches_cache(&path, part)? {
-            return Ok(false);
+        match cached_part_state(&path, part)? {
+            CachedPartState::Ready => {}
+            CachedPartState::MissingOrStale | CachedPartState::Invalid(_) => return Ok(false),
         }
     }
     Ok(true)
 }
 
-fn part_matches_cache(path: &Path, part: &BurnpackPartEntry) -> Result<bool, String> {
+fn cached_part_state(path: &Path, part: &BurnpackPartEntry) -> Result<CachedPartState, String> {
     if !path.exists() {
-        return Ok(false);
+        return Ok(CachedPartState::MissingOrStale);
     }
     if part.bytes == 0 {
-        return Ok(true);
+        return match validate_burnpack_part_integrity(path) {
+            Ok(_) => Ok(CachedPartState::Ready),
+            Err(err) => Ok(CachedPartState::Invalid(err)),
+        };
     }
     let bytes = fs::metadata(path)
         .map_err(|err| format!("failed to read part metadata {}: {err}", path.display()))?
         .len();
     if bytes != part.bytes {
-        return Ok(false);
+        return Ok(CachedPartState::MissingOrStale);
     }
     let expected_sha = part.sha256.trim();
-    if expected_sha.is_empty() {
-        return Ok(true);
+    if !expected_sha.is_empty() {
+        let actual_sha = sha256_file(path)?;
+        if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+            return Ok(CachedPartState::MissingOrStale);
+        }
     }
-    let actual_sha = sha256_file(path)?;
-    Ok(actual_sha.eq_ignore_ascii_case(expected_sha))
+    match validate_burnpack_part_integrity(path) {
+        Ok(_) => Ok(CachedPartState::Ready),
+        Err(err) => Ok(CachedPartState::Invalid(err)),
+    }
 }
 
 fn sync_optional_text_file(
@@ -638,13 +696,14 @@ fn download_part_file(
     url: &str,
     destination: &Path,
     part: &BurnpackPartEntry,
+    context: &DownloadPartContext,
 ) -> Result<u64, String> {
     ensure_parent_dir(destination)?;
     let partial_path = partial_download_path(destination);
     let mut last_error = None;
 
     for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
-        match download_part_file_once(url, destination, &partial_path, part) {
+        match download_part_file_once(url, destination, &partial_path, part, context) {
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 if attempt == DOWNLOAD_MAX_ATTEMPTS {
@@ -717,6 +776,7 @@ fn download_part_file_once(
     destination: &Path,
     partial_path: &Path,
     part: &BurnpackPartEntry,
+    context: &DownloadPartContext,
 ) -> Result<u64, String> {
     let mut resume_from = if partial_path.exists() {
         fs::metadata(partial_path)
@@ -881,22 +941,18 @@ fn download_part_file_once(
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
             let throughput = (bytes_written.saturating_sub(resume_from)) as f64 / elapsed;
             if part.bytes > 0 {
-                let percent =
-                    ((bytes_written as f64 / part.bytes as f64) * 100.0).clamp(0.0, 100.0);
-                emit_status(format!(
-                    "Downloading {}: {:.1}% ({}/{}) {:.1} MiB/s",
-                    destination.display(),
-                    percent,
-                    format_mebibytes(bytes_written),
-                    format_mebibytes(part.bytes),
-                    throughput / (1024.0 * 1024.0)
+                emit_status(download_part_progress_message(
+                    context,
+                    bytes_written,
+                    Some(part.bytes),
+                    throughput,
                 ));
             } else {
-                emit_status(format!(
-                    "Downloading {}: {} ({:.1} MiB/s)",
-                    destination.display(),
-                    format_mebibytes(bytes_written),
-                    throughput / (1024.0 * 1024.0)
+                emit_status(download_part_progress_message(
+                    context,
+                    bytes_written,
+                    None,
+                    throughput,
                 ));
             }
             last_progress_log = Instant::now();
@@ -1013,6 +1069,72 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 
 fn format_mebibytes(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn burnpack_display_name(candidate: &str) -> String {
+    candidate
+        .trim_end_matches(".parts.json")
+        .trim_end_matches(".bpk")
+        .trim_end_matches(".safetensors")
+        .replace('\\', "/")
+}
+
+fn download_part_started_message(context: &DownloadPartContext, expected_bytes: u64) -> String {
+    if expected_bytes > 0 {
+        format!(
+            "Downloading model weights: {} {} shard {} of {} ({})",
+            context.label,
+            context.artifact,
+            context.part_number,
+            context.part_count,
+            format_mebibytes(expected_bytes)
+        )
+    } else {
+        format!(
+            "Downloading model weights: {} {} shard {} of {}",
+            context.label, context.artifact, context.part_number, context.part_count
+        )
+    }
+}
+
+fn download_part_progress_message(
+    context: &DownloadPartContext,
+    loaded_bytes: u64,
+    total_bytes: Option<u64>,
+    throughput_bytes_per_sec: f64,
+) -> String {
+    let throughput_mib = throughput_bytes_per_sec / (1024.0 * 1024.0);
+    if let Some(total_bytes) = total_bytes.filter(|bytes| *bytes > 0) {
+        let percent = ((loaded_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+        format!(
+            "Downloading model weights: {} {} shard {} of {} {:.1}% ({}/{}, {:.1} MiB/s)",
+            context.label,
+            context.artifact,
+            context.part_number,
+            context.part_count,
+            percent,
+            format_mebibytes(loaded_bytes),
+            format_mebibytes(total_bytes),
+            throughput_mib
+        )
+    } else {
+        format!(
+            "Downloading model weights: {} {} shard {} of {} {} ({:.1} MiB/s)",
+            context.label,
+            context.artifact,
+            context.part_number,
+            context.part_count,
+            format_mebibytes(loaded_bytes),
+            throughput_mib
+        )
+    }
+}
+
+fn download_part_completed_message(context: &DownloadPartContext) -> String {
+    format!(
+        "Downloaded model weights: {} {} shard {} of {}",
+        context.label, context.artifact, context.part_number, context.part_count
+    )
 }
 
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1151,6 +1273,7 @@ fn temp_download_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1160,7 +1283,9 @@ mod tests {
     #[cfg(feature = "trellis")]
     use super::parse_trellis_requirements;
     use super::{
-        manifest_is_complete, resolve_manifest_entry_url, triposplat_required_parts_bases,
+        DownloadPartContext, download_part_completed_message, download_part_progress_message,
+        download_part_started_message, manifest_is_complete, resolve_manifest_entry_url,
+        triposplat_required_parts_bases,
     };
 
     fn unique_tmp_dir() -> PathBuf {
@@ -1169,6 +1294,61 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("burn_synth_native_bootstrap_test_{nanos}"))
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestBurnpackMetadata {
+        tensors: BTreeMap<String, TestTensorDescriptor>,
+        metadata: BTreeMap<String, String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestTensorDescriptor {
+        dtype: ciborium::Value,
+        shape: Vec<u64>,
+        data_offsets: (u64, u64),
+        #[serde(skip_serializing_if = "Option::is_none")]
+        param_id: Option<u64>,
+    }
+
+    fn tiny_burnpack_part_bytes(data: &[u8]) -> Vec<u8> {
+        tiny_burnpack_part_bytes_with_declared_len(data, data.len() as u64)
+    }
+
+    fn tiny_burnpack_part_bytes_with_declared_len(data: &[u8], declared_len: u64) -> Vec<u8> {
+        const HEADER_SIZE: usize = 10;
+        const MAGIC_NUMBER: u32 = 0x4255_524E;
+        const TENSOR_ALIGNMENT: usize = 256;
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "tensor".to_string(),
+            TestTensorDescriptor {
+                dtype: ciborium::Value::Text("F32".to_string()),
+                shape: vec![declared_len / 4],
+                data_offsets: (0, declared_len),
+                param_id: None,
+            },
+        );
+        let metadata = TestBurnpackMetadata {
+            tensors,
+            metadata: BTreeMap::new(),
+        };
+        let mut metadata_bytes = Vec::new();
+        ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
+            .expect("serialize test burnpack metadata");
+        let metadata_size = u32::try_from(metadata_bytes.len()).expect("metadata size");
+        let data_start =
+            (HEADER_SIZE + metadata_bytes.len()).div_ceil(TENSOR_ALIGNMENT) * TENSOR_ALIGNMENT;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&metadata_size.to_le_bytes());
+        bytes.extend_from_slice(&metadata_bytes);
+        bytes.resize(data_start, 0);
+        bytes.extend_from_slice(data);
+        bytes
     }
 
     #[test]
@@ -1190,17 +1370,18 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         let manifest_path = root.join("model.bpk.parts.json");
         let part_path = root.join("model.bpk.part-00000.bpk");
-        fs::write(&part_path, b"abc").expect("write part");
+        let part_bytes = tiny_burnpack_part_bytes(&[1, 2, 3, 4]);
+        fs::write(&part_path, &part_bytes).expect("write part");
 
         let manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model.bpk".to_string(),
             source_modified_unix_ms: 0,
-            total_bytes: 3,
-            max_part_bytes: 3,
+            total_bytes: part_bytes.len() as u64,
+            max_part_bytes: part_bytes.len() as u64,
             parts: vec![BurnpackPartEntry {
                 path: "model.bpk.part-00000.bpk".to_string(),
-                bytes: 3,
+                bytes: part_bytes.len() as u64,
                 sha256: String::new(),
                 tensors: 1,
             }],
@@ -1225,6 +1406,78 @@ mod tests {
     }
 
     #[test]
+    fn manifest_complete_accepts_legacy_small_trailing_shortfall() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let manifest_path = root.join("model.bpk.parts.json");
+        let part_path = root.join("model.bpk.part-00000.bpk");
+        let part_bytes = tiny_burnpack_part_bytes_with_declared_len(&[1, 2], 4);
+        fs::write(&part_path, &part_bytes).expect("write short-tail part");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: part_bytes.len() as u64,
+            max_part_bytes: part_bytes.len() as u64,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: part_bytes.len() as u64,
+                sha256: String::new(),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        assert!(
+            manifest_is_complete(&manifest_path).expect("check complete"),
+            "small legacy short-tail parts are normalized at load time"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn manifest_complete_rejects_integrity_invalid_parts() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let manifest_path = root.join("model.bpk.parts.json");
+        let part_path = root.join("model.bpk.part-00000.bpk");
+        let part_bytes = tiny_burnpack_part_bytes_with_declared_len(&[1, 2], 512);
+        fs::write(&part_path, &part_bytes).expect("write truncated part");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: part_bytes.len() as u64,
+            max_part_bytes: part_bytes.len() as u64,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: part_bytes.len() as u64,
+                sha256: String::new(),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        assert!(
+            !manifest_is_complete(&manifest_path).expect("check incomplete"),
+            "large integrity-invalid manifest-matching parts must not mark a bundle complete"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
     fn triposplat_bootstrap_bases_match_burnpack_output_names() {
         let bases = triposplat_required_parts_bases();
         assert_eq!(
@@ -1235,6 +1488,33 @@ mod tests {
                 "diffusion_models/triposplat_flow.safetensors".to_string(),
                 "vae/triposplat_vae_decoder.safetensors".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn download_status_messages_expose_artifact_and_shard_progress() {
+        let context = DownloadPartContext {
+            label: "TripoSplat".to_string(),
+            artifact: "clip_vision/dino_v3_vit_h_f16".to_string(),
+            part_number: 7,
+            part_count: 26,
+        };
+        assert_eq!(
+            download_part_started_message(&context, 64 * 1024 * 1024),
+            "Downloading model weights: TripoSplat clip_vision/dino_v3_vit_h_f16 shard 7 of 26 (64.0 MiB)"
+        );
+        assert_eq!(
+            download_part_progress_message(
+                &context,
+                32 * 1024 * 1024,
+                Some(64 * 1024 * 1024),
+                8.5 * 1024.0 * 1024.0,
+            ),
+            "Downloading model weights: TripoSplat clip_vision/dino_v3_vit_h_f16 shard 7 of 26 50.0% (32.0 MiB/64.0 MiB, 8.5 MiB/s)"
+        );
+        assert_eq!(
+            download_part_completed_message(&context),
+            "Downloaded model weights: TripoSplat clip_vision/dino_v3_vit_h_f16 shard 7 of 26"
         );
     }
 
