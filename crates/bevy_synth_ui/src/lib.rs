@@ -2011,7 +2011,7 @@ fn handle_pipeline_option_button(
             info!(
                 "synthesis pipeline {} is unavailable for backend {:?}",
                 pipeline_label(button.model),
-                &args.backend
+                args.backend
             );
             continue;
         }
