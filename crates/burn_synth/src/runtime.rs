@@ -1014,6 +1014,7 @@ impl SynthRuntime {
             noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
             max_sparse_coords: self.config.trellis_max_sparse_coords,
             target_faces: self.config.target_faces,
+            pbr_texture_size: None,
             decode_output_mode: Default::default(),
             runtime_stage_debug: false,
             runtime_attention_debug: false,

@@ -435,6 +435,7 @@ fn pbr_bake_wgpu_dense_sampling_matches_cpu_sampling() {
         vox_coords.as_slice(),
         vox_attrs.as_slice(),
         32,
+        None,
         false,
         false,
     )
@@ -445,6 +446,7 @@ fn pbr_bake_wgpu_dense_sampling_matches_cpu_sampling() {
         vox_coords.as_slice(),
         vox_attrs.as_slice(),
         32,
+        None,
         false,
         true,
     )
@@ -940,6 +942,7 @@ fn pbr_bake_benchmark_report() {
             vox_coords.as_slice(),
             vox_attrs.as_slice(),
             fallback_res,
+            None,
             false,
             prefer_wgpu_sampling,
         )
@@ -1013,9 +1016,11 @@ fn decode_missing_runtime_decoders_errors_when_not_strict() {
         "512",
         None,
         None,
+        None,
         false,
         false,
         DecodeHookOverrides::default(),
+        Default::default(),
         RuntimeDecodeModels::default(),
     )
     .expect_err("decode should fail when runtime decoders are missing");
@@ -1032,9 +1037,11 @@ fn decode_missing_runtime_decoders_errors_when_strict() {
         "512",
         None,
         None,
+        None,
         true,
         false,
         DecodeHookOverrides::default(),
+        Default::default(),
         RuntimeDecodeModels::default(),
     )
     .expect_err("strict decode should fail when runtime decoders are missing");
@@ -1056,12 +1063,14 @@ fn decode_rejects_decode_hook_overrides() {
         "512",
         None,
         None,
+        None,
         true,
         false,
         DecodeHookOverrides {
             decode_shape_subs: Some(override_levels.as_slice()),
             ..DecodeHookOverrides::default()
         },
+        Default::default(),
         RuntimeDecodeModels::default(),
     )
     .expect_err("decode should reject hook overrides on canonical runtime path");

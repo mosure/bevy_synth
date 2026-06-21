@@ -162,6 +162,14 @@ struct Args {
     #[arg(long)]
     max_sparse_coords: Option<usize>,
 
+    /// Optional target face count before native PBR/GLB export. Use 0 to disable.
+    #[arg(long)]
+    target_faces: Option<usize>,
+
+    /// Optional native PBR texture size before GLB export. Use 0 for the runtime default.
+    #[arg(long)]
+    pbr_texture_size: Option<usize>,
+
     /// Optional sparse-structure sampler step override for benchmark/profiling runs.
     #[arg(long)]
     sparse_steps: Option<usize>,
@@ -301,7 +309,8 @@ fn run() -> Result<(), String> {
             },
             noise_overrides_hook: args.noise_overrides_hook.clone(),
             max_sparse_coords: args.max_sparse_coords,
-            target_faces: None,
+            target_faces: args.target_faces.filter(|limit| *limit > 0),
+            pbr_texture_size: args.pbr_texture_size.filter(|size| *size > 0),
             decode_output_mode: if matches!(glb_export_mode, GlbExportMode::Ovoxel) {
                 TrellisDecodeOutputMode::OvoxelHookExport
             } else {
@@ -464,6 +473,8 @@ fn run() -> Result<(), String> {
                 "tex_guidance": settings.guidance_strength_texture,
             },
             "max_sparse_coords": args.max_sparse_coords,
+            "target_faces": args.target_faces,
+            "pbr_texture_size": args.pbr_texture_size,
             "sampler_overrides": {
                 "sparse_steps": args.sparse_steps,
                 "shape_steps": args.shape_steps,
@@ -534,6 +545,8 @@ fn run() -> Result<(), String> {
                 "tex_guidance": settings.guidance_strength_texture,
             },
             "max_sparse_coords": args.max_sparse_coords,
+            "target_faces": args.target_faces,
+            "pbr_texture_size": args.pbr_texture_size,
             "sampler_overrides": {
                 "sparse_steps": args.sparse_steps,
                 "shape_steps": args.shape_steps,
@@ -828,12 +841,18 @@ mod tests {
             "input.png",
             "--sparse-steps",
             "2",
+            "--target-faces",
+            "1000000",
+            "--pbr-texture-size",
+            "1024",
             "--shape-steps",
             "3",
             "--texture-steps",
             "4",
         ]);
         assert_eq!(args.sparse_steps, Some(2));
+        assert_eq!(args.target_faces, Some(1_000_000));
+        assert_eq!(args.pbr_texture_size, Some(1024));
         assert_eq!(args.shape_steps, Some(3));
         assert_eq!(args.tex_steps, Some(4));
     }

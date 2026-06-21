@@ -18,7 +18,9 @@ reference_hook="${TRELLIS2_REFERENCE_HOOK:-}"
 python_bin="${TRELLIS2_PYTHON_BIN:-${HOME}/.venvs/torch/bin/python3}"
 timeout_s="${TRELLIS2_TIMEOUT_S:-3600}"
 gpu_sample_ms="${TRELLIS2_GPU_SAMPLE_MS:-1000}"
+burn_features="${TRELLIS2_BURN_FEATURES:-runtime-model-wgpu}"
 ratio_limit="${TRELLIS2_RATIO_LIMIT:-2.0}"
+enforce_stage_ratios="${TRELLIS2_ENFORCE_STAGE_RATIOS:-1}"
 render_psnr="${TRELLIS2_RENDER_PSNR:-0}"
 output_glb="${TRELLIS2_OUTPUT_GLB:-${render_psnr}}"
 burn_glb_export_mode="${TRELLIS2_GLB_EXPORT_MODE:-native}"
@@ -64,10 +66,12 @@ cat > "${run_dir}/config.json" <<JSON
   "max_num_tokens": ${max_num_tokens},
   "backend": "${backend}",
   "compute_profile": "${compute_profile}",
+  "burn_features": "${burn_features}",
   "seed": ${seed},
   "repeat": ${repeat},
   "strict": ${strict},
   "ratio_limit": ${ratio_limit},
+  "enforce_stage_ratios": ${enforce_stage_ratios},
   "capture_reference_hook": ${capture_reference_hook},
   "capture_row_noise": ${capture_row_noise},
   "reference_hook": "${reference_hook}",
@@ -172,7 +176,7 @@ if [[ "${run_python}" == "1" ]]; then
 fi
 
 if [[ "${run_burn}" == "1" ]]; then
-  cargo build --release -p burn_trellis --features runtime-model-wgpu --bin trellis2_run \
+  cargo build --release -p burn_trellis --features "${burn_features}" --bin trellis2_run \
     > "${run_dir}/burn/build.log" \
     2> "${run_dir}/burn/build.err"
   burn_args=(
@@ -193,6 +197,10 @@ if [[ "${run_burn}" == "1" ]]; then
     burn_args+=(--output "${burn_glb}")
     burn_args+=(--glb-export-mode "${burn_glb_export_mode}")
     case "${burn_glb_export_mode}" in
+      native)
+        burn_args+=(--target-faces "${decimation_target}")
+        burn_args+=(--pbr-texture-size "${texture_size}")
+        ;;
       ovoxel | ovxl | ovoxel-hook)
         burn_args+=(
           --hook-output "${run_dir}/burn/hook.safetensors"
@@ -221,7 +229,7 @@ fi
 if [[ "${render_psnr}" == "1" && "${render_burn_mode}" == "ovoxel-hook" ]]; then
   mkdir -p "${run_dir}/burn_render"
   if [[ "${run_burn}" != "1" ]]; then
-    cargo build --release -p burn_trellis --features runtime-model-wgpu --bin trellis2_run \
+    cargo build --release -p burn_trellis --features "${burn_features}" --bin trellis2_run \
       > "${run_dir}/burn_render/build.log" \
       2> "${run_dir}/burn_render/build.err"
   fi
@@ -292,7 +300,7 @@ if [[ "${render_psnr}" == "1" ]]; then
   fi
 fi
 
-"${python_bin}" - "${run_dir}" "${ratio_limit}" "${strict}" <<'PY'
+"${python_bin}" - "${run_dir}" "${ratio_limit}" "${strict}" "${enforce_stage_ratios}" <<'PY'
 from __future__ import annotations
 
 import csv
@@ -305,6 +313,7 @@ from typing import Any
 run_dir = Path(sys.argv[1])
 ratio_limit = float(sys.argv[2])
 strict = sys.argv[3] == "1"
+enforce_stage_ratios = sys.argv[4] == "1"
 
 def load_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
@@ -453,9 +462,9 @@ if py_summary is not None and burn_report is not None:
             "burn_ms": burn_ms,
             "python_ms": None if python_s is None else float(python_s) * 1000.0,
             "ratio": value,
-            "within_limit": value is None or value <= ratio_limit,
+            "within_limit": value is None or not enforce_stage_ratios or value <= ratio_limit,
         }
-        if value is not None and value > ratio_limit:
+        if enforce_stage_ratios and value is not None and value > ratio_limit:
             issues.append(f"stage ratio > {ratio_limit:g}: {name}={value:.3f}x")
 
 summary = {
@@ -468,6 +477,7 @@ summary = {
     "shape_checks": shape_checks,
     "stage_ratios": stage_ratios,
     "render_psnr": render_summary,
+    "enforce_stage_ratios": enforce_stage_ratios,
     "gpu": max_gpu_sample(run_dir / "gpu_samples.csv"),
     "issues": issues,
     "python_summary": str(py_summary_path if str(py_summary_path) else run_dir / "python/artifacts/python_reference_summary.json") if py_summary else None,

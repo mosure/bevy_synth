@@ -370,8 +370,12 @@ pub(super) fn summarize_material(
     })
 }
 
-pub(super) fn runtime_pbr_texture_size() -> usize {
-    256
+const DEFAULT_RUNTIME_PBR_TEXTURE_SIZE: usize = 256;
+
+pub(super) fn runtime_pbr_texture_size(requested: Option<usize>) -> usize {
+    requested
+        .filter(|size| *size > 0)
+        .unwrap_or(DEFAULT_RUNTIME_PBR_TEXTURE_SIZE)
 }
 
 #[allow(clippy::type_complexity)]
@@ -389,6 +393,7 @@ pub(super) fn bake_pbr_from_voxels(
         voxel_coords,
         voxel_attrs,
         fallback_spatial_resolution,
+        None,
         true,
         false,
     )?;
@@ -494,6 +499,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
     voxel_coords: &[[u32; 4]],
     voxel_attrs: &[[f32; 6]],
     fallback_spatial_resolution: u32,
+    pbr_texture_size: Option<usize>,
     capture_debug: bool,
     prefer_wgpu_sampling: bool,
 ) -> Result<(Vec<[f32; 2]>, Option<MeshPbrTextures>, Option<PbrBakeDebug>), String> {
@@ -519,7 +525,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
         return Err("decode pbr requires non-empty voxel coordinates".to_string());
     }
 
-    let texture_size = runtime_pbr_texture_size();
+    let texture_size = runtime_pbr_texture_size(pbr_texture_size);
     let uv_domain = build_uv_raster_domain(vertices, faces, texture_size);
     let texel_count = texture_size * texture_size;
     let mut raster_mask = vec![0u8; texel_count];
