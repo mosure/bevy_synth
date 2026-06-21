@@ -6,9 +6,10 @@ use std::path::PathBuf;
 #[cfg(feature = "runtime-model")]
 use super::{
     DecodeHookOverrides, DecodeShapeSubSample, FlowEulerSampleConfig, RuntimeDecodeModels,
-    ShapeSLatSample, TexSLatSample, cascade_resolution_accepts_token_budget,
-    decode_latent_to_outputs, dense_cond_with_override, merge_voxel_attrs_for_decode,
-    sparse_layout_from_batch_ids, sparse_layout_from_coords, validate_sparse_layout_rows,
+    ShapeSLatSample, SparseFlowOpTimingSummary, TexSLatSample,
+    cascade_resolution_accepts_token_budget, decode_latent_to_outputs, dense_cond_with_override,
+    merge_voxel_attrs_for_decode, sparse_layout_from_batch_ids, sparse_layout_from_coords,
+    validate_sparse_layout_rows,
 };
 use super::{
     SparseCoordCapSource, bake_pbr_from_voxels, runtime_max_sparse_coords_for_backend,
@@ -22,8 +23,6 @@ use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_r
 #[cfg(feature = "runtime-model")]
 use crate::preprocess::PreprocessOutput;
 #[cfg(feature = "runtime-model-wgpu")]
-use burn::prelude::Backend;
-#[cfg(feature = "runtime-model-wgpu")]
 use burn::tensor::{Int, Tensor, TensorData};
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::wgpu::DefaultWgpuBackend;
@@ -31,7 +30,8 @@ use burn_flex_gmm::wgpu::DefaultWgpuBackend;
 use crate::runtime_model::fdg_decoder::{FdgDecoderRuntime, decode_fdg_outputs};
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_decoder::{
-    SparseSubdivisionLogits, decoder_conv_telemetry, reset_decoder_conv_telemetry,
+    SparseSubdivisionLogits, decoder_conv_telemetry, decoder_op_telemetry,
+    reset_decoder_conv_telemetry, reset_decoder_op_telemetry,
 };
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_unet_vae_decoder::{SparseUnetVaeDecoderRuntime, decode_tex_outputs};
@@ -65,7 +65,7 @@ fn env_f32(name: &str) -> Option<f32> {
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn coords_to_default_wgpu_tensor(coords: &[[u32; 4]]) -> Tensor<DefaultWgpuBackend, 2, Int> {
-    let device = <DefaultWgpuBackend as Backend>::Device::default();
+    let device = <DefaultWgpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
     let mut flat = Vec::with_capacity(coords.len().saturating_mul(4));
     for (row_idx, coord) in coords.iter().enumerate() {
         for value in coord {
@@ -81,9 +81,53 @@ fn coords_to_default_wgpu_tensor(coords: &[[u32; 4]]) -> Tensor<DefaultWgpuBacke
     Tensor::<DefaultWgpuBackend, 2, Int>::from_data(TensorData::new(flat, [coords.len(), 4]), &device)
 }
 
+#[cfg(feature = "runtime-model")]
+fn print_decoder_op_telemetry(label: &str, top_n: usize) {
+    let telemetry = decoder_op_telemetry();
+    println!(
+        "runtime_decoder_hook_alignment_report {label}_op_telemetry calls={} total_ms={:.2} readback_count={} readback_elements={}",
+        telemetry.calls, telemetry.total_ms, telemetry.readback_count, telemetry.readback_elements
+    );
+    for (rank, op) in telemetry.ops.iter().take(top_n).enumerate() {
+        println!(
+            "runtime_decoder_hook_alignment_report {label}_op_telemetry.rank={} calls={} total_ms={:.2} max_ms={:.2} context={}",
+            rank + 1,
+            op.calls,
+            op.total_ms,
+            op.max_ms,
+            op.context
+        );
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn print_decoder_conv_block_telemetry(
+    label: &str,
+    telemetry: &crate::runtime_model::sparse_decoder::DecoderConvTelemetry,
+    top_n: usize,
+) {
+    for (rank, block) in telemetry.blocks.iter().take(top_n).enumerate() {
+        println!(
+            "runtime_decoder_hook_alignment_report {label}_conv_block.rank={} context={} conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
+            rank + 1,
+            block.context,
+            block.conv_calls,
+            block.wgpu_calls,
+            block.wgpu_successes,
+            block.wgpu_failures,
+            block.dispatches,
+            block.chunked_calls,
+            block.max_chunk_rows,
+            block.input_bytes,
+            block.output_bytes,
+            block.neighbor_elements
+        );
+    }
+}
+
 #[cfg(feature = "runtime-model-wgpu")]
 fn rows_to_default_wgpu_tensor<const C: usize>(rows: &[[f32; C]]) -> Tensor<DefaultWgpuBackend, 2> {
-    let device = <DefaultWgpuBackend as Backend>::Device::default();
+    let device = <DefaultWgpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
     let mut flat = Vec::with_capacity(rows.len().saturating_mul(C));
     for row in rows {
         flat.extend_from_slice(row);
@@ -140,11 +184,15 @@ fn dummy_shape_tex_samples() -> (ShapeSLatSample, TexSLatSample) {
         dense_noise: None,
         features: vec![[0.0; 32]],
         noise: vec![[0.0; 32]],
+        step_0_pred_v: vec![[0.0; 32]],
+        step_0_pred_v_pos: vec![[0.0; 32]],
+        step_0_pred_v_neg: vec![[0.0; 32]],
         step_0_x_t: vec![[0.0; 32]],
         step_mid_x_t: vec![[0.0; 32]],
         step_last_x_t: vec![[0.0; 32]],
         coords: vec![[0, 0, 0, 0]],
         layout: vec![0..1],
+        flow_ops: SparseFlowOpTimingSummary::default(),
         #[cfg(feature = "runtime-model-wgpu")]
         coords_wgpu: None,
         #[cfg(feature = "runtime-model-wgpu")]
@@ -165,12 +213,16 @@ fn dummy_shape_tex_samples() -> (ShapeSLatSample, TexSLatSample) {
         dense_noise: None,
         features: vec![[0.0; 32]],
         noise: vec![[0.0; 32]],
+        step_0_pred_v: vec![[0.0; 32]],
+        step_0_pred_v_pos: vec![[0.0; 32]],
+        step_0_pred_v_neg: vec![[0.0; 32]],
         step_0_x_t: vec![[0.0; 32]],
         step_mid_x_t: vec![[0.0; 32]],
         step_last_x_t: vec![[0.0; 32]],
         shape_slat_cond: vec![[0.0; 32]],
         coords: vec![[0, 0, 0, 0]],
         layout: vec![0..1],
+        flow_ops: SparseFlowOpTimingSummary::default(),
         #[cfg(feature = "runtime-model-wgpu")]
         coords_wgpu: None,
         #[cfg(feature = "runtime-model-wgpu")]
@@ -223,8 +275,15 @@ fn canonical_wgpu_no_host_readback_before_extraction() {
         let abs_path = repo_root.join(rel_path);
         let source = fs::read_to_string(&abs_path)
             .unwrap_or_else(|err| panic!("failed reading {}: {err}", abs_path.display()));
-        for (offset, _) in source.match_indices(".into_data(") {
-            let line_no = source[..offset].bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let scan_source = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .map_or(source.as_str(), |idx| &source[..idx]);
+        for (offset, _) in scan_source.match_indices(".into_data(") {
+            let line_no = scan_source[..offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
             occurrences.push((rel_path.to_string(), line_no));
         }
     }
@@ -489,7 +548,7 @@ fn cascade_quantize_wgpu_matches_host_sort_dedup_semantics() {
     let host = super::quantize_cascade_coords(hr_coords.as_slice(), 512, 64)
         .expect("host quantize should succeed");
 
-    let device = <super::SparseFlowWgpuBackend as Backend>::Device::default();
+    let device = <super::SparseFlowWgpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
     let mut flat = Vec::with_capacity(hr_coords.len().saturating_mul(4));
     for coord in hr_coords {
         for value in coord {
@@ -725,6 +784,36 @@ fn pbr_bake_produces_textures_and_uvs() {
         (textures.base_color.width * textures.base_color.height * 4) as usize
     );
     assert!(debug.raster_mask.iter().any(|value| *value != 0));
+}
+
+#[test]
+fn pbr_debug_samples_are_first_hit_bounded() {
+    let vertices = vec![
+        [-0.03, 0.0, -0.03],
+        [0.03, 0.0, -0.03],
+        [0.0, 0.0, 0.03],
+    ];
+    // Duplicate the face to force overdraw. Debug hooks should still record one
+    // accepted sample per covered texel, not every raster candidate.
+    let faces = vec![[0, 1, 2], [0, 1, 2]];
+    let vox_coords = vec![[0, 16, 16, 16], [0, 18, 16, 16], [0, 16, 18, 16]];
+    let vox_attrs = vec![
+        [0.8, 0.2, 0.1, 0.1, 0.8, 1.0],
+        [0.1, 0.8, 0.2, 0.3, 0.6, 1.0],
+        [0.2, 0.1, 0.8, 0.5, 0.4, 1.0],
+    ];
+
+    let (_, _, debug) = bake_pbr_from_voxels(&vertices, &faces, &vox_coords, &vox_attrs, 32)
+        .expect("pbr bake should succeed");
+    let covered = debug
+        .raster_mask
+        .iter()
+        .filter(|value| **value != 0)
+        .count();
+    assert!(covered > 0);
+    assert_eq!(debug.sample_positions.len(), covered);
+    assert_eq!(debug.sample_attrs.len(), covered);
+    assert!(debug.sample_positions.len() <= debug.texture_width * debug.texture_height);
 }
 
 #[test]
@@ -1121,6 +1210,7 @@ fn runtime_decoder_hook_alignment_report() {
     .expect("tex decoder should load");
 
     reset_decoder_conv_telemetry();
+    reset_decoder_op_telemetry();
     #[cfg(feature = "runtime-model-wgpu")]
     let shape_decoded = {
         // Canonical decode parity must exercise the tensor-native entrypoint.
@@ -1150,6 +1240,8 @@ fn runtime_decoder_hook_alignment_report() {
         .collect::<Result<Vec<_>, _>>()
         .expect("shape decoder subdivisions should materialize");
     let shape_conv_telemetry = decoder_conv_telemetry();
+    print_decoder_op_telemetry("shape_decoder", 16);
+    print_decoder_conv_block_telemetry("shape_decoder", &shape_conv_telemetry, 20);
     println!(
         "runtime_decoder_hook_alignment_report shape_decoder_telemetry conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
         shape_conv_telemetry.conv_calls,
@@ -1390,6 +1482,7 @@ fn runtime_decoder_hook_alignment_report() {
         );
     }
     reset_decoder_conv_telemetry();
+    reset_decoder_op_telemetry();
     #[cfg(feature = "runtime-model-wgpu")]
     let tex_decoded = {
         let tex_coords_t = coords_to_default_wgpu_tensor(&tex_coords[..rows]);
@@ -1412,6 +1505,8 @@ fn runtime_decoder_hook_alignment_report() {
         )
         .expect("tex decoder should run");
     let tex_conv_telemetry = decoder_conv_telemetry();
+    print_decoder_op_telemetry("tex_decoder", 16);
+    print_decoder_conv_block_telemetry("tex_decoder", &tex_conv_telemetry, 20);
     println!(
         "runtime_decoder_hook_alignment_report tex_decoder_telemetry conv_calls={} wgpu_calls={} wgpu_successes={} wgpu_failures={} dispatches={} chunked_calls={} max_chunk_rows={} input_bytes={} output_bytes={} neighbor_elements={}",
         tex_conv_telemetry.conv_calls,

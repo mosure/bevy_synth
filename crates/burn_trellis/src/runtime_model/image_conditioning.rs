@@ -1171,13 +1171,12 @@ mod tests {
         metadata_path, transpose_2d_f32,
     };
     use burn::module::{Param, ParamId};
-    use burn::prelude::Backend;
     use burn::tensor::{Int, Tensor, TensorData};
     use burn_store::{BurnpackStore, ModuleSnapshot};
 
     fn write_blob_burnpack(path: &std::path::Path, bytes: &[u8]) {
         type BlobBackend = burn::backend::NdArray<f32, u8>;
-        let device = <BlobBackend as Backend>::Device::default();
+        let device = <BlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
             TensorData::new(bytes.to_vec(), [bytes.len()]),
             &device,

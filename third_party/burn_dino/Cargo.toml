@@ -46,7 +46,7 @@ resolver = "2"
 backend_cpu = ["burn/cpu"]
 backend_cuda = ["burn/cuda"]
 backend_ndarray = ["burn/ndarray"]
-backend_wgpu = ["burn/wgpu", "burn/autotune"]
+backend_wgpu = ["burn/wgpu"]
 benchmark = [
     "burn/autotune",
     "burn/fusion",

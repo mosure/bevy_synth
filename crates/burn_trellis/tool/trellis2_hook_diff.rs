@@ -71,10 +71,10 @@ fn run(args: Args) -> Result<(), String> {
     let mut worst_rmse = 0.0f32;
 
     println!(
-        "{:<48} {:<16} {:>12} {:>12} {:>12}",
-        "hook", "status", "mean_abs", "max_abs", "rmse"
+        "{:<48} {:<16} {:>12} {:>12} {:>12} {:>12}",
+        "hook", "status", "mean_abs", "max_abs", "rmse", "non_finite"
     );
-    println!("{}", "-".repeat(108));
+    println!("{}", "-".repeat(121));
 
     for entry in &report.entries {
         match entry.status {
@@ -104,12 +104,15 @@ fn run(args: Args) -> Result<(), String> {
                 {
                     failed = true;
                 }
+                if stats.non_finite_count > 0 {
+                    failed = true;
+                }
                 if failed {
                     threshold_failures += 1;
                 }
 
                 println!(
-                    "{:<48} {:<16} {:>12.6e} {:>12.6e} {:>12.6e}",
+                    "{:<48} {:<16} {:>12.6e} {:>12.6e} {:>12.6e} {:>12}",
                     entry.key,
                     if failed {
                         "match(thresh-fail)"
@@ -118,21 +121,22 @@ fn run(args: Args) -> Result<(), String> {
                     },
                     stats.mean_abs,
                     stats.max_abs,
-                    stats.rmse
+                    stats.rmse,
+                    stats.non_finite_count
                 );
             }
             HookDiffStatus::MissingInActual => {
                 missing += 1;
                 println!(
-                    "{:<48} {:<16} {:>12} {:>12} {:>12}",
-                    entry.key, "missing", "-", "-", "-"
+                    "{:<48} {:<16} {:>12} {:>12} {:>12} {:>12}",
+                    entry.key, "missing", "-", "-", "-", "-"
                 );
             }
             HookDiffStatus::ShapeMismatch => {
                 shape_mismatch += 1;
                 println!(
-                    "{:<48} {:<16} {:>12} {:>12} {:>12}",
-                    entry.key, "shape-mismatch", "-", "-", "-"
+                    "{:<48} {:<16} {:>12} {:>12} {:>12} {:>12}",
+                    entry.key, "shape-mismatch", "-", "-", "-", "-"
                 );
                 if let Some(actual_shape) = entry.actual_shape.as_ref() {
                     println!(

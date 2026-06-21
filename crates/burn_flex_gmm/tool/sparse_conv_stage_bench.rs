@@ -6,8 +6,8 @@ use burn_flex_gmm::wgpu::{
     DefaultWgpuBackend, NeighborDeviceAlgoPreference, SparseWgpuForwardConfig,
     SparseWgpuKernelVariant, clear_neighbor_rows_tensor_cache,
     neighbor_rows_tensor_from_coords_with_algo, reset_sparse_wgpu_kernel_stats,
-    resolve_sparse_wgpu_forward_config, sparse_subm_conv_forward_wgpu_with_config,
-    sparse_wgpu_kernel_stats,
+    resolve_sparse_wgpu_forward_config, sparse_subm_conv_forward_wgpu_im2col_matmul,
+    sparse_subm_conv_forward_wgpu_with_config, sparse_wgpu_kernel_stats,
 };
 
 #[derive(Clone)]
@@ -60,22 +60,31 @@ fn parse_opt_usize_arg(args: &[String], name: &str) -> Result<Option<usize>, Str
     Ok(None)
 }
 
-fn parse_variant(args: &[String]) -> Result<SparseWgpuKernelVariant, String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchVariant {
+    Sparse(SparseWgpuKernelVariant),
+    Im2ColMatmul,
+}
+
+fn parse_variant(args: &[String]) -> Result<BenchVariant, String> {
     let mut i = 0usize;
     while i + 1 < args.len() {
         if args[i] == "--variant" {
             return match args[i + 1].as_str() {
-                "auto" => Ok(SparseWgpuKernelVariant::Auto),
-                "baseline" => Ok(SparseWgpuKernelVariant::Baseline),
-                "fused" | "fused-oc4" => Ok(SparseWgpuKernelVariant::FusedOc4),
+                "auto" => Ok(BenchVariant::Sparse(SparseWgpuKernelVariant::Auto)),
+                "baseline" => Ok(BenchVariant::Sparse(SparseWgpuKernelVariant::Baseline)),
+                "fused" | "fused-oc4" => {
+                    Ok(BenchVariant::Sparse(SparseWgpuKernelVariant::FusedOc4))
+                }
+                "im2col" | "im2col-matmul" => Ok(BenchVariant::Im2ColMatmul),
                 other => Err(format!(
-                    "unsupported --variant='{other}', expected auto|baseline|fused"
+                    "unsupported --variant='{other}', expected auto|baseline|fused|im2col"
                 )),
             };
         }
         i += 1;
     }
-    Ok(SparseWgpuKernelVariant::Auto)
+    Ok(BenchVariant::Sparse(SparseWgpuKernelVariant::Auto))
 }
 
 fn parse_neighbor_algo(args: &[String]) -> Result<NeighborDeviceAlgoPreference, String> {
@@ -186,8 +195,12 @@ fn run() -> Result<(), String> {
         neighbor_algo,
     )?;
 
+    let sparse_variant = match variant {
+        BenchVariant::Sparse(variant) => variant,
+        BenchVariant::Im2ColMatmul => SparseWgpuKernelVariant::Auto,
+    };
     let forward = SparseWgpuForwardConfig {
-        kernel_variant: variant,
+        kernel_variant: sparse_variant,
         split_k,
     };
     let resolved = resolve_sparse_wgpu_forward_config(&cfg, rows, forward)?;
@@ -196,14 +209,23 @@ fn run() -> Result<(), String> {
     reset_sparse_wgpu_kernel_stats();
     for step in 0..(warmup + iters) {
         let start = Instant::now();
-        let out = sparse_subm_conv_forward_wgpu_with_config(
-            &cfg,
-            input_t.clone(),
-            neighbor_t.clone(),
-            weight_t.clone(),
-            bias_t.clone(),
-            forward,
-        )?;
+        let out = match variant {
+            BenchVariant::Sparse(_) => sparse_subm_conv_forward_wgpu_with_config(
+                &cfg,
+                input_t.clone(),
+                neighbor_t.clone(),
+                weight_t.clone(),
+                bias_t.clone(),
+                forward,
+            )?,
+            BenchVariant::Im2ColMatmul => sparse_subm_conv_forward_wgpu_im2col_matmul(
+                &cfg,
+                input_t.clone(),
+                neighbor_t.clone(),
+                weight_t.clone(),
+                bias_t.clone(),
+            )?,
+        };
         let _ = out.to_data();
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         if step >= warmup {
@@ -222,9 +244,10 @@ fn run() -> Result<(), String> {
     let p90_ms = percentile_ms(run_ms.clone(), 0.90);
 
     let variant_name = match variant {
-        SparseWgpuKernelVariant::Auto => "auto",
-        SparseWgpuKernelVariant::Baseline => "baseline",
-        SparseWgpuKernelVariant::FusedOc4 => "fused-oc4",
+        BenchVariant::Sparse(SparseWgpuKernelVariant::Auto) => "auto",
+        BenchVariant::Sparse(SparseWgpuKernelVariant::Baseline) => "baseline",
+        BenchVariant::Sparse(SparseWgpuKernelVariant::FusedOc4) => "fused-oc4",
+        BenchVariant::Im2ColMatmul => "im2col-matmul",
     };
     let split_name = split_k
         .map(|v| v.to_string())

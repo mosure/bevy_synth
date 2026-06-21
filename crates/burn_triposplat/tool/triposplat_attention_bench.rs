@@ -967,7 +967,7 @@ fn random_attention_tensors<B: Backend>(
     key_tokens: usize,
     device: &B::Device,
 ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
-    match args.layout {
+    let (q, k, v) = match args.layout {
         LayoutArg::Triposplat => (
             Tensor::<B, 4>::random(
                 [args.batch, args.query_tokens, args.heads, args.head_dim],
@@ -1001,6 +1001,14 @@ fn random_attention_tensors<B: Backend>(
                 Distribution::Normal(0.0, 1.0),
                 device,
             ),
+        ),
+    };
+    match args.input_dtype {
+        InputDTypeArg::F32 => (q, k, v),
+        InputDTypeArg::F16 => (
+            q.cast(FloatDType::F16),
+            k.cast(FloatDType::F16),
+            v.cast(FloatDType::F16),
         ),
     }
 }

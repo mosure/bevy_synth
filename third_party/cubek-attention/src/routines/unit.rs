@@ -28,6 +28,8 @@ use crate::{
 pub struct UnitRoutine {}
 
 const WGPU_F32_UNIT_UNSAFE_SCORE_ELEMS_PER_HEAD: usize = 1 << 26;
+const WGPU_UNIT_MAX_VERIFIED_SEQ_KV_FOR_HEAD_DIM_64: usize = 21_504;
+const WGPU_UNIT_MAX_VERIFIED_SEQ_Q_FOR_LONG_K_HEAD_DIM_128: usize = 12_288;
 
 impl Routine for UnitRoutine {
     const TILE_KIND: TileAttentionKind = TileAttentionKind::Unit;
@@ -60,6 +62,11 @@ impl Routine for UnitRoutine {
         if wgpu_f32_unit_shape_is_unsafe::<R>(problem) {
             return Err(AttentionSetupError::InvalidConfig(Box::new(format!(
                 "CubeK unit attention is disabled for native WGPU f32 long-dense shapes with batch_heads >= 16 and seq_q * seq_kv >= {WGPU_F32_UNIT_UNSAFE_SCORE_ELEMS_PER_HEAD}; use smaller query chunks or fallback attention"
+            ))));
+        }
+        if wgpu_unit_long_k_shape_is_unsafe::<R>(problem) {
+            return Err(AttentionSetupError::InvalidConfig(Box::new(format!(
+                "CubeK unit attention is disabled for unverified long-K shapes (head_dim=64 with batch_heads >= 16 and seq_kv > {WGPU_UNIT_MAX_VERIFIED_SEQ_KV_FOR_HEAD_DIM_64}, or head_dim=128 with seq_q > {WGPU_UNIT_MAX_VERIFIED_SEQ_Q_FOR_LONG_K_HEAD_DIM_128}); use fallback attention"
             ))));
         }
 
@@ -181,4 +188,17 @@ fn wgpu_f32_unit_shape_is_unsafe<R: Runtime>(problem: &AttentionProblem) -> bool
     let batch_heads = problem.dims.batch.saturating_mul(problem.dims.num_heads);
     let per_head_score_elems = problem.dims.seq_q.saturating_mul(problem.dims.seq_kv);
     batch_heads >= 16 && per_head_score_elems >= WGPU_F32_UNIT_UNSAFE_SCORE_ELEMS_PER_HEAD
+}
+
+fn wgpu_unit_long_k_shape_is_unsafe<R: Runtime>(problem: &AttentionProblem) -> bool {
+    let _ = std::any::type_name::<R>();
+    let batch_heads = problem.dims.batch.saturating_mul(problem.dims.num_heads);
+    let long_k_head_dim_64 = batch_heads >= 16
+        && problem.dims.head_dim == 64
+        && problem.dims.seq_kv > WGPU_UNIT_MAX_VERIFIED_SEQ_KV_FOR_HEAD_DIM_64;
+    let long_k_head_dim_128 = problem.dims.head_dim == 128
+        && problem.dims.seq_kv > WGPU_UNIT_MAX_VERIFIED_SEQ_KV_FOR_HEAD_DIM_64
+        && problem.dims.seq_q > WGPU_UNIT_MAX_VERIFIED_SEQ_Q_FOR_LONG_K_HEAD_DIM_128;
+
+    long_k_head_dim_64 || long_k_head_dim_128
 }

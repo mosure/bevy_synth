@@ -65,7 +65,7 @@ pub(crate) fn save_blob_bytes_to_burnpack(
             .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
     }
 
-    let device = <BlobBackend as Backend>::Device::default();
+    let device = <BlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
     let mut chunks = Vec::new();
     if bytes.is_empty() {
         let tensor = Tensor::<BlobBackend, 1, Int>::from_data(

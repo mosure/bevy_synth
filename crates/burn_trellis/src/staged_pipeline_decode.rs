@@ -603,7 +603,7 @@ pub(super) fn bake_pbr_from_voxels_with_options(
                 return;
             }
             let idx = y * texture_size + x;
-            if !capture_debug && raster_mask[idx] != 0 {
+            if raster_mask[idx] != 0 {
                 return;
             }
 

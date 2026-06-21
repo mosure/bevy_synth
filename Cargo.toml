@@ -14,7 +14,7 @@ members = [
   "crates/burn_foreground",
   "crates/burn_synth_mcp",
 ]
-exclude = ["third_party/burn_dino"]
+exclude = ["third_party/burn_dino", "third_party/cubek-attention"]
 
 [workspace.package]
 authors = ["mosure <mitchell@mosure.me>"]

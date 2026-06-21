@@ -10,6 +10,42 @@ pub enum TrellisQuality {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrellisComputeProfile {
+    #[default]
+    ReferenceF32,
+    WgpuFastF16,
+}
+
+impl TrellisComputeProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReferenceF32 => "reference-f32",
+            Self::WgpuFastF16 => "wgpu-fast-f16",
+        }
+    }
+
+    pub fn wgpu_module_attention_f16(self) -> bool {
+        matches!(self, Self::WgpuFastF16)
+    }
+
+    pub fn wgpu_linear_f16(self) -> bool {
+        // The native WGPU f16 linear bridge currently violates SLat parity on
+        // HR flow hooks. Keep it opt-in for diagnostics instead of enabling it
+        // through the production fast profile.
+        false
+    }
+
+    pub fn wgpu_flow_torso_f16(self) -> bool {
+        false
+    }
+
+    pub fn wgpu_decoder_conv_f16(self) -> bool {
+        matches!(self, Self::WgpuFastF16)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrellisQualitySettings {
     pub pipeline_type: &'static str,
@@ -73,7 +109,7 @@ impl TrellisQuality {
 
 #[cfg(test)]
 mod tests {
-    use super::TrellisQuality;
+    use super::{TrellisComputeProfile, TrellisQuality};
 
     #[test]
     fn quality_pipeline_types_are_stable() {
@@ -109,5 +145,11 @@ mod tests {
         assert_eq!(low.max_num_tokens, None);
         assert_eq!(medium.max_num_tokens, Some(49_152));
         assert_eq!(high.max_num_tokens, Some(49_152));
+    }
+
+    #[test]
+    fn wgpu_fast_f16_keeps_linear_f16_disabled_until_parity_is_fixed() {
+        assert!(TrellisComputeProfile::WgpuFastF16.wgpu_module_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastF16.wgpu_linear_f16());
     }
 }

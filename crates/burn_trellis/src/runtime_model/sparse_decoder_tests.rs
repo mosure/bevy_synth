@@ -5,8 +5,6 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "runtime-model-wgpu")]
-use burn::prelude::Backend;
-#[cfg(feature = "runtime-model-wgpu")]
 use burn::tensor::{Int, Tensor, TensorData};
 #[cfg(feature = "runtime-model-wgpu")]
 use super::decoder_wgpu_neighbor_from_coords;
@@ -43,7 +41,8 @@ fn decoder_guide_subdivision_tensor_handoff_parity() {
         return;
     }
 
-    let device = <super::DefaultWgpuBackend as Backend>::Device::default();
+    let device =
+        <super::DefaultWgpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
     let coords_t = Tensor::<super::DefaultWgpuBackend, 2, Int>::from_data(
         TensorData::new(vec![0i32, 0, 0, 0, 0, 1, 0, 0], [2, 4]),
         &device,

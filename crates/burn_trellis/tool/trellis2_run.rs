@@ -1,14 +1,100 @@
+#![recursion_limit = "256"]
+
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use burn_trellis::TrellisQuality;
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
+use burn_trellis::staged_pipeline::TrellisSamplerRuntimeOverrides;
+use burn_trellis::{TrellisComputeProfile, TrellisQuality};
 use clap::Parser;
 use serde_json::json;
 
 const OVOXEL_MIN_SOURCE_VERTICES: usize = 1_000_000;
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+fn flow_ops_json(
+    ops: burn_trellis::staged_pipeline::SparseFlowOpTimingSummary,
+) -> serde_json::Value {
+    json!({
+        "self_attn_calls": ops.self_attn_calls,
+        "self_attn_ns": ops.self_attn_ns,
+        "self_attn_ms": ns_to_ms(ops.self_attn_ns),
+        "cross_attn_calls": ops.cross_attn_calls,
+        "cross_attn_ns": ops.cross_attn_ns,
+        "cross_attn_ms": ns_to_ms(ops.cross_attn_ns),
+        "mlp_calls": ops.mlp_calls,
+        "mlp_ns": ops.mlp_ns,
+        "mlp_ms": ns_to_ms(ops.mlp_ns),
+        "self_qkv_calls": ops.self_qkv_calls,
+        "self_qkv_ns": ops.self_qkv_ns,
+        "self_qkv_ms": ns_to_ms(ops.self_qkv_ns),
+        "self_norm_rope_calls": ops.self_norm_rope_calls,
+        "self_norm_rope_ns": ops.self_norm_rope_ns,
+        "self_norm_rope_ms": ns_to_ms(ops.self_norm_rope_ns),
+        "self_norm_rope_fused_qk_calls": ops.self_norm_rope_fused_qk_calls,
+        "self_norm_rope_fused_qkv_module_calls": ops.self_norm_rope_fused_qkv_module_calls,
+        "self_kernel_calls": ops.self_kernel_calls,
+        "self_kernel_ns": ops.self_kernel_ns,
+        "self_kernel_ms": ns_to_ms(ops.self_kernel_ns),
+        "self_out_calls": ops.self_out_calls,
+        "self_out_ns": ops.self_out_ns,
+        "self_out_ms": ns_to_ms(ops.self_out_ns),
+        "self_cat_calls": ops.self_cat_calls,
+        "self_cat_ns": ops.self_cat_ns,
+        "self_cat_ms": ns_to_ms(ops.self_cat_ns),
+        "cross_q_calls": ops.cross_q_calls,
+        "cross_q_ns": ops.cross_q_ns,
+        "cross_q_ms": ns_to_ms(ops.cross_q_ns),
+        "cross_kv_calls": ops.cross_kv_calls,
+        "cross_kv_ns": ops.cross_kv_ns,
+        "cross_kv_ms": ns_to_ms(ops.cross_kv_ns),
+        "cross_norm_calls": ops.cross_norm_calls,
+        "cross_norm_ns": ops.cross_norm_ns,
+        "cross_norm_ms": ns_to_ms(ops.cross_norm_ns),
+        "cross_kernel_calls": ops.cross_kernel_calls,
+        "cross_kernel_ns": ops.cross_kernel_ns,
+        "cross_kernel_ms": ns_to_ms(ops.cross_kernel_ns),
+        "cross_out_calls": ops.cross_out_calls,
+        "cross_out_ns": ops.cross_out_ns,
+        "cross_out_ms": ns_to_ms(ops.cross_out_ns),
+        "cross_cat_calls": ops.cross_cat_calls,
+        "cross_cat_ns": ops.cross_cat_ns,
+        "cross_cat_ms": ns_to_ms(ops.cross_cat_ns),
+        "module_cast_pad_calls": ops.module_cast_pad_calls,
+        "module_cast_pad_ns": ops.module_cast_pad_ns,
+        "module_cast_pad_ms": ns_to_ms(ops.module_cast_pad_ns),
+        "module_attention_calls": ops.module_attention_calls,
+        "module_attention_ns": ops.module_attention_ns,
+        "module_attention_ms": ns_to_ms(ops.module_attention_ns),
+        "module_output_calls": ops.module_output_calls,
+        "module_output_ns": ops.module_output_ns,
+        "module_output_ms": ns_to_ms(ops.module_output_ns),
+        "block_norm_mod_calls": ops.block_norm_mod_calls,
+        "block_norm_mod_ns": ops.block_norm_mod_ns,
+        "block_norm_mod_ms": ns_to_ms(ops.block_norm_mod_ns),
+        "block_norm_affine_calls": ops.block_norm_affine_calls,
+        "block_norm_affine_ns": ops.block_norm_affine_ns,
+        "block_norm_affine_ms": ns_to_ms(ops.block_norm_affine_ns),
+        "block_gate_residual_calls": ops.block_gate_residual_calls,
+        "block_gate_residual_ns": ops.block_gate_residual_ns,
+        "block_gate_residual_ms": ns_to_ms(ops.block_gate_residual_ns),
+        "model_io_calls": ops.model_io_calls,
+        "model_io_ns": ops.model_io_ns,
+        "model_io_ms": ns_to_ms(ops.model_io_ns),
+        "model_input_calls": ops.model_input_calls,
+        "model_input_ns": ops.model_input_ns,
+        "model_input_ms": ns_to_ms(ops.model_input_ns),
+        "model_output_calls": ops.model_output_calls,
+        "model_output_ns": ops.model_output_ns,
+        "model_output_ms": ns_to_ms(ops.model_output_ns),
+    })
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Run burn_trellis pipeline and optionally emit OBJ/GLB + safetensors hook")]
@@ -30,6 +116,10 @@ struct Args {
     #[arg(long)]
     hook_output: Option<PathBuf>,
 
+    /// Optional JSON report output path for machine-readable timings.
+    #[arg(long)]
+    report_json: Option<PathBuf>,
+
     /// Optional safetensors hook input path used as deterministic stage-noise overrides.
     #[arg(long)]
     noise_overrides_hook: Option<PathBuf>,
@@ -45,6 +135,10 @@ struct Args {
     /// Runtime quality preset.
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     quality: TrellisQuality,
+
+    /// Runtime compute profile. Use reference-f32 for strict parity and wgpu-fast-f16 for parity-checked WGPU f16 attention.
+    #[arg(long = "compute-profile", value_enum, default_value_t = TrellisComputeProfile::ReferenceF32)]
+    compute_profile: TrellisComputeProfile,
 
     /// Runtime backend target.
     #[arg(long = "backend", alias = "device", value_enum, default_value_t = TrellisDevice::Auto)]
@@ -69,6 +163,18 @@ struct Args {
     /// Optional cap on sparse coords before decode. Use lower values for short strict passes.
     #[arg(long)]
     max_sparse_coords: Option<usize>,
+
+    /// Optional sparse-structure sampler step override for benchmark/profiling runs.
+    #[arg(long)]
+    sparse_steps: Option<usize>,
+
+    /// Optional shape SLat sampler step override for benchmark/profiling runs.
+    #[arg(long)]
+    shape_steps: Option<usize>,
+
+    /// Optional texture SLat sampler step override for benchmark/profiling runs.
+    #[arg(long = "tex-steps", alias = "texture-steps")]
+    tex_steps: Option<usize>,
 
     /// Enable runtime stage-level debug logs from canonical runtime-model path.
     #[arg(long, default_value_t = false)]
@@ -115,8 +221,19 @@ struct Args {
     ovoxel_extension_webp: bool,
 }
 
+fn validate_benchmark_args(args: &Args) -> Result<(), String> {
+    if args.strict_benchmark && args.runtime_stage_debug {
+        return Err(
+            "--strict-benchmark cannot be combined with --runtime-stage-debug; stage debug enables probe readbacks and invalidates timing"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args = Args::parse();
+    validate_benchmark_args(&args)?;
     let output_glb = args
         .output
         .as_ref()
@@ -147,6 +264,7 @@ fn run() -> Result<(), String> {
         let options = TrellisRunOptions {
             quality: args.quality,
             device: args.backend,
+            compute_profile: args.compute_profile,
             seed: args.seed,
             hook_output: if run_idx + 1 == repeat {
                 args.hook_output.clone()
@@ -160,6 +278,14 @@ fn run() -> Result<(), String> {
             runtime_attention_debug: args.runtime_attention_debug,
             runtime_decoder_conv_telemetry: args.runtime_decoder_conv_telemetry,
             runtime_stage_fence: args.strict_benchmark,
+            sampler_overrides: TrellisSamplerRuntimeOverrides {
+                sparse_steps: args.sparse_steps,
+                shape_steps: args.shape_steps,
+                tex_steps: args.tex_steps,
+                sparse_guidance_strength: None,
+                shape_guidance_strength: None,
+                tex_guidance_strength: None,
+            },
         };
         let profiled = pipeline
             .infer_mesh_profile(&args.input, &options)
@@ -243,8 +369,11 @@ fn run() -> Result<(), String> {
             "sparse_cond": profiled.timings.sparse_cond_ms,
             "sparse_sample": profiled.timings.sparse_sample_ms,
             "sparse_post": profiled.timings.sparse_post_ms,
+            "sparse_flow_ops": flow_ops_json(profiled.timings.sparse_flow_ops),
             "shape_slat": profiled.timings.shape_slat_ms,
+            "shape_slat_flow_ops": flow_ops_json(profiled.timings.shape_slat_flow_ops),
             "tex_slat": profiled.timings.tex_slat_ms,
+            "tex_slat_flow_ops": flow_ops_json(profiled.timings.tex_slat_flow_ops),
             "decode": profiled.timings.decode_ms,
             "decode_stage_fenced": profiled.timings.decode_stage_fenced,
             "decode_shape_decoder": profiled.timings.decode_shape_decoder_ms,
@@ -270,39 +399,65 @@ fn run() -> Result<(), String> {
             "total": profiled.timings.total_ms
         })
     };
+    let shapes_json = |profiled: &burn_trellis::pipeline::TrellisInferenceProfile| {
+        json!({
+            "sparse_coords": profiled.shapes.sparse_coords,
+            "shape_slat_lr_rows": profiled.shapes.shape_slat_lr_rows,
+            "shape_slat_rows": profiled.shapes.shape_slat_rows,
+            "tex_slat_rows": profiled.shapes.tex_slat_rows,
+            "cond_512_tokens": profiled.shapes.cond_512_tokens,
+            "cond_1024_tokens": profiled.shapes.cond_1024_tokens,
+        })
+    };
+    let settings = args.quality.settings();
+    let effective_steps = |configured: Option<usize>, preset: usize| configured.unwrap_or(preset);
 
-    if repeat == 1 {
-        println!(
-            "{}",
-            json!({
-                "status": "ok",
-                "vertices": profiled.mesh.vertices.len(),
-                "faces": profiled.mesh.faces.len(),
-                "elapsed_ms": profiled.timings.total_ms,
-                "backend": args.backend.as_str(),
-                "device": args.backend.as_str(),
-                "quality": args.quality.as_str(),
-                "strict_benchmark": args.strict_benchmark,
-                "repeat": repeat,
-                "max_sparse_coords": args.max_sparse_coords,
-                "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
-                "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
-                "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
-                "sparse_source": profiled.sparse_source.as_str(),
-                "decode_source": profiled.decode_source.as_str(),
-                "kernel_invariants": {
-                    "sparse_runtime_model": matches!(profiled.sparse_source.as_str(), "runtime_model_cpu" | "runtime_model_wgpu"),
-                    "decode_runtime": profiled.decode_source.as_str() == "runtime",
-                    "wgpu_shape_dispatches": profiled.timings.decode_shape_wgpu_dispatches,
-                    "wgpu_tex_dispatches": profiled.timings.decode_tex_wgpu_dispatches,
-                },
-                "timings_ms": timings_json(profiled),
-                "hook_output": args.hook_output,
-                "noise_overrides_hook": args.noise_overrides_hook,
-                "output_obj": args.output_obj,
-                "output_glb": output_glb,
-            })
-        );
+    let report = if repeat == 1 {
+        json!({
+            "status": "ok",
+            "vertices": profiled.mesh.vertices.len(),
+            "faces": profiled.mesh.faces.len(),
+            "elapsed_ms": profiled.timings.total_ms,
+            "backend": args.backend.as_str(),
+            "device": args.backend.as_str(),
+            "quality": args.quality.as_str(),
+            "compute_profile": args.compute_profile.as_str(),
+            "strict_benchmark": args.strict_benchmark,
+            "repeat": repeat,
+            "effective_config": {
+                "pipeline_type": settings.pipeline_type,
+                "max_num_tokens": settings.max_num_tokens,
+                "sparse_steps": effective_steps(args.sparse_steps, settings.sparse_steps),
+                "shape_steps": effective_steps(args.shape_steps, settings.shape_steps),
+                "tex_steps": effective_steps(args.tex_steps, settings.texture_steps),
+                "sparse_guidance": settings.guidance_strength_sparse,
+                "shape_guidance": settings.guidance_strength_shape,
+                "tex_guidance": settings.guidance_strength_texture,
+            },
+            "max_sparse_coords": args.max_sparse_coords,
+            "sampler_overrides": {
+                "sparse_steps": args.sparse_steps,
+                "shape_steps": args.shape_steps,
+                "tex_steps": args.tex_steps,
+            },
+            "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
+            "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
+            "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
+            "sparse_source": profiled.sparse_source.as_str(),
+            "decode_source": profiled.decode_source.as_str(),
+            "kernel_invariants": {
+                "sparse_runtime_model": matches!(profiled.sparse_source.as_str(), "runtime_model_cpu" | "runtime_model_wgpu"),
+                "decode_runtime": profiled.decode_source.as_str() == "runtime",
+                "wgpu_shape_dispatches": profiled.timings.decode_shape_wgpu_dispatches,
+                "wgpu_tex_dispatches": profiled.timings.decode_tex_wgpu_dispatches,
+            },
+            "shapes": shapes_json(profiled),
+            "timings_ms": timings_json(profiled),
+            "hook_output": args.hook_output,
+            "noise_overrides_hook": args.noise_overrides_hook,
+            "output_obj": args.output_obj,
+            "output_glb": output_glb,
+        })
     } else {
         let runs_json = runs
             .iter()
@@ -316,6 +471,7 @@ fn run() -> Result<(), String> {
                     "faces": run.mesh.faces.len(),
                     "sparse_source": run.sparse_source.as_str(),
                     "decode_source": run.decode_source.as_str(),
+                    "shapes": shapes_json(run),
                     "timings_ms": timings_json(run),
                 })
             })
@@ -327,39 +483,69 @@ fn run() -> Result<(), String> {
             / runs.len() as f64;
         let total_mean =
             runs.iter().map(|run| run.timings.total_ms).sum::<f64>() / runs.len() as f64;
-        println!(
-            "{}",
-            json!({
-                "status": "ok",
-                "backend": args.backend.as_str(),
-                "device": args.backend.as_str(),
-                "quality": args.quality.as_str(),
-                "strict_benchmark": args.strict_benchmark,
-                "repeat": repeat,
-                "max_sparse_coords": args.max_sparse_coords,
-                "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
-                "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
-                "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
-                "summary": {
-                    "runtime_setup_mean_ms": setup_mean,
-                    "total_mean_ms": total_mean,
-                },
-                "last": {
-                    "vertices": profiled.mesh.vertices.len(),
-                    "faces": profiled.mesh.faces.len(),
-                    "elapsed_ms": profiled.timings.total_ms,
-                    "sparse_source": profiled.sparse_source.as_str(),
-                    "decode_source": profiled.decode_source.as_str(),
-                    "timings_ms": timings_json(profiled),
-                },
-                "runs": runs_json,
-                "hook_output": args.hook_output,
-                "noise_overrides_hook": args.noise_overrides_hook,
-                "output_obj": args.output_obj,
-                "output_glb": output_glb,
-            })
-        );
+        json!({
+            "status": "ok",
+            "backend": args.backend.as_str(),
+            "device": args.backend.as_str(),
+            "quality": args.quality.as_str(),
+            "compute_profile": args.compute_profile.as_str(),
+            "strict_benchmark": args.strict_benchmark,
+            "repeat": repeat,
+            "effective_config": {
+                "pipeline_type": settings.pipeline_type,
+                "max_num_tokens": settings.max_num_tokens,
+                "sparse_steps": effective_steps(args.sparse_steps, settings.sparse_steps),
+                "shape_steps": effective_steps(args.shape_steps, settings.shape_steps),
+                "tex_steps": effective_steps(args.tex_steps, settings.texture_steps),
+                "sparse_guidance": settings.guidance_strength_sparse,
+                "shape_guidance": settings.guidance_strength_shape,
+                "tex_guidance": settings.guidance_strength_texture,
+            },
+            "max_sparse_coords": args.max_sparse_coords,
+            "sampler_overrides": {
+                "sparse_steps": args.sparse_steps,
+                "shape_steps": args.shape_steps,
+                "tex_steps": args.tex_steps,
+            },
+            "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
+            "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
+            "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
+            "summary": {
+                "runtime_setup_mean_ms": setup_mean,
+                "total_mean_ms": total_mean,
+            },
+            "last": {
+                "vertices": profiled.mesh.vertices.len(),
+                "faces": profiled.mesh.faces.len(),
+                "elapsed_ms": profiled.timings.total_ms,
+                "sparse_source": profiled.sparse_source.as_str(),
+                "decode_source": profiled.decode_source.as_str(),
+                "shapes": shapes_json(profiled),
+                "timings_ms": timings_json(profiled),
+            },
+            "runs": runs_json,
+            "hook_output": args.hook_output,
+            "noise_overrides_hook": args.noise_overrides_hook,
+            "output_obj": args.output_obj,
+            "output_glb": output_glb,
+        })
+    };
+    if let Some(path) = args.report_json.as_ref() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!("failed to create report parent {}: {err}", parent.display())
+            })?;
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&report)
+                .map_err(|err| format!("failed to serialize JSON report: {err}"))?,
+        )
+        .map_err(|err| format!("failed to write JSON report {}: {err}", path.display()))?;
     }
+    println!("{report}");
     Ok(())
 }
 
@@ -583,6 +769,41 @@ mod tests {
         assert!(args.runtime_stage_debug);
         assert!(args.runtime_attention_debug);
         assert!(args.runtime_decoder_conv_telemetry);
+    }
+
+    #[test]
+    fn accepts_sampler_step_overrides() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--sparse-steps",
+            "2",
+            "--shape-steps",
+            "3",
+            "--texture-steps",
+            "4",
+        ]);
+        assert_eq!(args.sparse_steps, Some(2));
+        assert_eq!(args.shape_steps, Some(3));
+        assert_eq!(args.tex_steps, Some(4));
+    }
+
+    #[test]
+    fn strict_benchmark_rejects_stage_debug_probe_path() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--strict-benchmark",
+            "--runtime-stage-debug",
+        ]);
+        let err = validate_benchmark_args(&args)
+            .expect_err("strict benchmark should reject stage-debug probe instrumentation");
+        assert!(
+            err.contains("--runtime-stage-debug"),
+            "unexpected validation error: {err}"
+        );
     }
 
     #[test]

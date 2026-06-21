@@ -325,6 +325,20 @@ pub fn import_trellis2_assets(
     })
 }
 
+pub fn extract_blob_burnpack(
+    burnpack_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let burnpack_path = burnpack_path.as_ref();
+    let output_path = output_path.as_ref();
+    let bytes = load_blob_bytes_from_blob_burnpack(burnpack_path)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output_path, bytes.as_slice())?;
+    Ok(bytes.len())
+}
+
 pub fn load_burnpack_blob_bytes(
     burnpack_path: impl AsRef<Path>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -460,7 +474,21 @@ fn prepare_blob_payload(source_bytes: &[u8], precision: &str) -> Vec<u8> {
         return source_bytes.to_vec();
     }
 
+    if safetensors_contains_low_precision_float(source_bytes).unwrap_or(false) {
+        return source_bytes.to_vec();
+    }
+
     convert_safetensors_blob_to_f16(source_bytes).unwrap_or_else(|_| source_bytes.to_vec())
+}
+
+fn safetensors_contains_low_precision_float(source_bytes: &[u8]) -> Result<bool, String> {
+    let safetensors = SafeTensors::deserialize(source_bytes).map_err(|err| {
+        format!("failed to deserialize safetensors for low-precision scan: {err}")
+    })?;
+    Ok(safetensors
+        .tensors()
+        .into_iter()
+        .any(|(_, view)| matches!(view.dtype(), Dtype::F16 | Dtype::BF16)))
 }
 
 fn convert_safetensors_blob_to_f16(source_bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -1164,7 +1192,7 @@ mod tests {
         let burnpack = root.join("legacy_blob.bpk");
 
         let source = b"legacy_blob_bytes";
-        let device = <LegacyBlobBackend as Backend>::Device::default();
+        let device = <LegacyBlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let tensor = Tensor::<LegacyBlobBackend, 1, Int>::from_data(
             TensorData::new(source.to_vec(), [source.len()]),
             &device,
@@ -1266,7 +1294,7 @@ mod tests {
         )
         .expect("write config");
 
-        let device = <TestBackend as Backend>::Device::default();
+        let device = <TestBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let model = SparseStructureFlowModel::<TestBackend>::new(&device, config);
         let source_path = ckpts.join("flow_model.safetensors");
         let mut safetensor_store = SafetensorsStore::from_file(&source_path);
@@ -1443,11 +1471,6 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let bf16_values = [0.5f32, -7.0f32];
-        let bf16_bytes = bf16_values
-            .iter()
-            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
-            .collect::<Vec<_>>();
         let int_values = [5i32, -3i32];
         let int_bytes = int_values
             .iter()
@@ -1456,16 +1479,10 @@ mod tests {
 
         let view_f32 =
             TensorView::new(Dtype::F32, vec![2], float_bytes.as_slice()).expect("f32 view");
-        let view_bf16 =
-            TensorView::new(Dtype::BF16, vec![2], bf16_bytes.as_slice()).expect("bf16 view");
         let view_i32 =
             TensorView::new(Dtype::I32, vec![2], int_bytes.as_slice()).expect("i32 view");
         let source = serialize(
-            vec![
-                ("f32".to_string(), view_f32),
-                ("bf16".to_string(), view_bf16),
-                ("i32".to_string(), view_i32),
-            ],
+            vec![("f32".to_string(), view_f32), ("i32".to_string(), view_i32)],
             None,
         )
         .expect("serialize source safetensors");
@@ -1483,18 +1500,47 @@ mod tests {
         assert!((f32_data[0] - float_values[0]).abs() <= 1.0e-3);
         assert!((f32_data[1] - float_values[1]).abs() <= 1.0e-3);
 
-        let bf16_tensor = parsed.tensor("bf16").expect("bf16 tensor");
-        assert_eq!(bf16_tensor.dtype(), Dtype::F16);
-        let bf16_data = bf16_tensor
-            .data()
-            .chunks_exact(2)
-            .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
-            .collect::<Vec<_>>();
-        assert!((bf16_data[0] - bf16_values[0]).abs() <= 1.0e-3);
-        assert!((bf16_data[1] - bf16_values[1]).abs() <= 1.0e-3);
-
         let i32_tensor = parsed.tensor("i32").expect("i32 tensor");
         assert_eq!(i32_tensor.dtype(), Dtype::I32);
         assert_eq!(i32_tensor.data(), int_bytes.as_slice());
+    }
+
+    #[test]
+    fn f16_blob_conversion_preserves_mixed_native_low_precision_payloads() {
+        let float_values = [1.25f32, -2.5f32];
+        let float_bytes = float_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let bf16_values = [0.5f32, -7.0f32];
+        let bf16_bytes = bf16_values
+            .iter()
+            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+
+        let view_f32 =
+            TensorView::new(Dtype::F32, vec![2], float_bytes.as_slice()).expect("f32 view");
+        let view_bf16 =
+            TensorView::new(Dtype::BF16, vec![2], bf16_bytes.as_slice()).expect("bf16 view");
+        let source = serialize(
+            vec![
+                ("f32".to_string(), view_f32),
+                ("bf16".to_string(), view_bf16),
+            ],
+            None,
+        )
+        .expect("serialize mixed source safetensors");
+
+        let converted = prepare_blob_payload(source.as_slice(), "f16");
+        let parsed =
+            SafeTensors::deserialize(converted.as_slice()).expect("deserialize preserved payload");
+
+        let f32_tensor = parsed.tensor("f32").expect("f32 tensor");
+        assert_eq!(f32_tensor.dtype(), Dtype::F32);
+        assert_eq!(f32_tensor.data(), float_bytes.as_slice());
+
+        let bf16_tensor = parsed.tensor("bf16").expect("bf16 tensor");
+        assert_eq!(bf16_tensor.dtype(), Dtype::BF16);
+        assert_eq!(bf16_tensor.data(), bf16_bytes.as_slice());
     }
 }

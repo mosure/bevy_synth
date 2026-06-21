@@ -1,5 +1,6 @@
 #![allow(deprecated)]
 
+#[cfg(feature = "runtime-model-wgpu")]
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -12,7 +13,15 @@ use super::chunked_blob_safetensors::{
     ChunkedBlobSafetensorsStore, chunked_blob_parts_manifest_exists,
 };
 use super::runtime_config::{
-    runtime_model_attention_debug_enabled, runtime_model_stage_debug_enabled,
+    runtime_model_attention_debug_enabled, runtime_model_sparse_flow_module_attention_f16_enabled,
+    runtime_model_stage_debug_enabled,
+};
+#[cfg(feature = "runtime-model-wgpu")]
+use super::runtime_config::{
+    runtime_model_sparse_flow_coord_rope_kernel_enabled,
+    runtime_model_sparse_flow_linear_f16_enabled,
+    runtime_model_sparse_flow_module_attention_enabled,
+    runtime_model_sparse_flow_torso_f16_enabled,
 };
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
@@ -26,7 +35,11 @@ use burn::tensor::module::attention;
 use burn::tensor::{Int, Tensor, TensorData, ops::AttentionModuleOptions};
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::wgpu::{
-    layer_norm_affine_forward_wgpu, rope_rotate_pairs_from_coords_wgpu, rope_rotate_pairs_wgpu,
+    layer_norm_affine_forward_wgpu, layer_norm_modulated_forward_wgpu, linear_skinny_forward_wgpu,
+    multihead_qk_rms_norm_rope_from_qkv_coords_wgpu,
+    multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu, multihead_rms_norm_forward_wgpu,
+    multihead_rms_norm_rope_from_coords_wgpu, rope_rotate_pairs_from_coords_wgpu,
+    rope_rotate_pairs_wgpu,
 };
 use burn_store::{KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use serde::Deserialize;
@@ -34,7 +47,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::sampler::{
-    FlowEulerSampleConfig, FlowEulerSampleTrace, mid_snapshot_step, timestep_pairs,
+    FlowEulerSampleConfig, FlowEulerSampleTrace, guidance_interval_contains, mid_snapshot_step,
+    timestep_pairs,
 };
 
 const F16_SUFFIX: &str = "_f16";
@@ -42,6 +56,15 @@ const MAX_PERIOD: f32 = 10_000.0;
 const LAYER_NORM_EPS: f32 = 1.0e-6;
 const RMS_NORM_EPS: f32 = 1.0e-12;
 const ROPE_CACHE_MAX_ENTRIES: usize = 256;
+const SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV: usize = 21_504;
+const SPARSE_FLOW_MODULE_ATTENTION_LONG_K_QUERY_CHUNK: usize = 12_288;
+// Native WGPU/CubeK blackbox attention is verified for the TRELLIS.2 long-key
+// HR SLat head_dim=128 shape through q=12288. Larger query dispatches run, but
+// do not improve the model forward and can move queue waits into other stages.
+const SPARSE_FLOW_MODULE_ATTENTION_LONG_K_HEAD_DIM_128_QUERY_CHUNK: usize = 12_288;
+const SPARSE_FLOW_MODULE_ATTENTION_VERIFIED_LONG_QUERY_CHUNK: usize = 49_152;
+const SPARSE_FLOW_MODULE_ATTENTION_F16_MAX_KEY_TOKENS: usize = 8_192;
+const SPARSE_FLOW_INPUT_SKINNY_LINEAR_WGPU: bool = true;
 static HOST_READBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOST_READBACK_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static FLOW_SELF_ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -50,12 +73,84 @@ static FLOW_CROSS_ATTN_CALLS: AtomicU64 = AtomicU64::new(0);
 static FLOW_CROSS_ATTN_NS: AtomicU64 = AtomicU64::new(0);
 static FLOW_MLP_CALLS: AtomicU64 = AtomicU64::new(0);
 static FLOW_MLP_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_QKV_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_QKV_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_NORM_ROPE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_NORM_ROPE_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_NORM_ROPE_FUSED_QK_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_NORM_ROPE_FUSED_QKV_MODULE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_OUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_OUT_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_CAT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_SELF_CAT_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_Q_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_Q_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_KV_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_KV_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_NORM_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_NORM_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_OUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_OUT_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_CAT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_CROSS_CAT_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODULE_CAST_PAD_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODULE_CAST_PAD_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODULE_ATTENTION_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODULE_ATTENTION_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODULE_OUTPUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODULE_OUTPUT_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_BLOCK_NORM_MOD_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_BLOCK_NORM_MOD_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_BLOCK_NORM_AFFINE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_BLOCK_NORM_AFFINE_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_BLOCK_GATE_RESIDUAL_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_BLOCK_GATE_RESIDUAL_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODEL_IO_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODEL_IO_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODEL_INPUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODEL_INPUT_NS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODEL_OUTPUT_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLOW_MODEL_OUTPUT_NS: AtomicU64 = AtomicU64::new(0);
 static CFG_POS_NEG_DEBUG_COUNT: AtomicU64 = AtomicU64::new(0);
 static ROPE_CACHE: OnceLock<Mutex<HashMap<RopeCacheKey, Arc<RopeCosSinRange>>>> = OnceLock::new();
 #[cfg(feature = "runtime-model-wgpu")]
 thread_local! {
     static LAYER_NORM_NO_AFFINE_PARAMS_CACHE: RefCell<HashMap<usize, (Tensor<WgpuRuntimeBackend, 1>, Tensor<WgpuRuntimeBackend, 1>)>> =
         RefCell::new(HashMap::new());
+    static LINEAR_F16_PARAMS_CACHE: RefCell<HashMap<LinearF16CacheKey, (Tensor<WgpuRuntimeBackend, 2>, Option<Tensor<WgpuRuntimeBackend, 1>>)>> =
+        RefCell::new(HashMap::new());
+    static LINEAR_SKINNY_PARAMS_CACHE: RefCell<HashMap<LinearF16CacheKey, (Tensor<WgpuRuntimeBackend, 2>, Tensor<WgpuRuntimeBackend, 1>)>> =
+        RefCell::new(HashMap::new());
+}
+
+fn dense_grid_token_coords<B: Backend>(resolution: usize, device: B::Device) -> Tensor<B, 2, Int> {
+    let tokens = resolution
+        .saturating_mul(resolution)
+        .saturating_mul(resolution);
+    let mut coords = Vec::with_capacity(tokens.saturating_mul(3));
+    for x in 0..resolution {
+        for y in 0..resolution {
+            for z in 0..resolution {
+                coords.push(x as i64);
+                coords.push(y as i64);
+                coords.push(z as i64);
+            }
+        }
+    }
+    Tensor::<B, 2, Int>::from_data(TensorData::new(coords, [tokens, 3]), &device)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct LinearF16CacheKey {
+    weight_id: u64,
+    bias_id: Option<u64>,
+    in_channels: usize,
+    out_channels: usize,
 }
 
 type CpuRuntimeBackend = burn::backend::NdArray<f32>;
@@ -199,7 +294,72 @@ where
 pub trait SparseFlowLayerNormWgpuBridge<B: Backend> {
     fn no_affine(x: Tensor<B, 3>, eps: f32) -> Option<Tensor<B, 3>>;
     fn affine(x: Tensor<B, 3>, norm: &nn::LayerNorm<B>, eps: f32) -> Option<Tensor<B, 3>>;
+    fn modulated(
+        x: Tensor<B, 3>,
+        scale: Tensor<B, 3>,
+        shift: Tensor<B, 3>,
+        eps: f32,
+    ) -> Option<Tensor<B, 3>>;
 }
+
+pub trait SparseFlowRmsNormWgpuBridge<B: Backend> {
+    fn multihead(
+        x: Tensor<B, 4>,
+        gamma: Tensor<B, 2>,
+        scale: f32,
+        eps: f32,
+    ) -> Option<Tensor<B, 4>>;
+    fn multihead_rope_coords(
+        x: Tensor<B, 4>,
+        gamma: Tensor<B, 2>,
+        coords: Tensor<B, 2, Int>,
+        rope_freq: [f32; 2],
+        scale: f32,
+        eps: f32,
+    ) -> Option<Tensor<B, 4>>;
+}
+
+pub trait SparseFlowQkRmsNormWgpuBridge<B: Backend> {
+    #[allow(clippy::too_many_arguments)]
+    fn qk_multihead_rope_coords_from_qkv(
+        qkv: Tensor<B, 5>,
+        q_gamma: Tensor<B, 2>,
+        k_gamma: Tensor<B, 2>,
+        coords: Tensor<B, 2, Int>,
+        rope_freq: [f32; 2],
+        scale: f32,
+        eps: f32,
+    ) -> Option<(Tensor<B, 4>, Tensor<B, 4>)>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_module_multihead_rope_coords_from_qkv(
+        qkv: Tensor<B, 5>,
+        q_gamma: Tensor<B, 2>,
+        k_gamma: Tensor<B, 2>,
+        coords: Tensor<B, 2, Int>,
+        rope_freq: [f32; 2],
+        scale: f32,
+        eps: f32,
+    ) -> Option<(Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>)>;
+}
+
+pub trait SparseFlowLinearWgpuBridge<B: Backend> {
+    fn f16_linear(
+        linear: &nn::Linear<B>,
+        x: Tensor<B, 2>,
+        output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<B, 2>>;
+
+    fn cache_f16_linear(linear: &nn::Linear<B>) -> bool;
+
+    fn skinny_linear(
+        linear: &nn::Linear<B>,
+        x: Tensor<B, 2>,
+        output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<B, 2>>;
+}
+
+pub struct SparseFlowLinearWgpuBridgeImpl;
 
 impl SparseFlowLayerNormWgpuBridge<CpuRuntimeBackend> for RopeRotateWgpuBridgeImpl {
     fn no_affine(
@@ -214,6 +374,89 @@ impl SparseFlowLayerNormWgpuBridge<CpuRuntimeBackend> for RopeRotateWgpuBridgeIm
         _norm: &nn::LayerNorm<CpuRuntimeBackend>,
         _eps: f32,
     ) -> Option<Tensor<CpuRuntimeBackend, 3>> {
+        None
+    }
+
+    fn modulated(
+        _x: Tensor<CpuRuntimeBackend, 3>,
+        _scale: Tensor<CpuRuntimeBackend, 3>,
+        _shift: Tensor<CpuRuntimeBackend, 3>,
+        _eps: f32,
+    ) -> Option<Tensor<CpuRuntimeBackend, 3>> {
+        None
+    }
+}
+
+impl SparseFlowRmsNormWgpuBridge<CpuRuntimeBackend> for RopeRotateWgpuBridgeImpl {
+    fn multihead(
+        _x: Tensor<CpuRuntimeBackend, 4>,
+        _gamma: Tensor<CpuRuntimeBackend, 2>,
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<Tensor<CpuRuntimeBackend, 4>> {
+        None
+    }
+
+    fn multihead_rope_coords(
+        _x: Tensor<CpuRuntimeBackend, 4>,
+        _gamma: Tensor<CpuRuntimeBackend, 2>,
+        _coords: Tensor<CpuRuntimeBackend, 2, Int>,
+        _rope_freq: [f32; 2],
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<Tensor<CpuRuntimeBackend, 4>> {
+        None
+    }
+}
+
+impl SparseFlowQkRmsNormWgpuBridge<CpuRuntimeBackend> for RopeRotateWgpuBridgeImpl {
+    fn qk_multihead_rope_coords_from_qkv(
+        _qkv: Tensor<CpuRuntimeBackend, 5>,
+        _q_gamma: Tensor<CpuRuntimeBackend, 2>,
+        _k_gamma: Tensor<CpuRuntimeBackend, 2>,
+        _coords: Tensor<CpuRuntimeBackend, 2, Int>,
+        _rope_freq: [f32; 2],
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<(Tensor<CpuRuntimeBackend, 4>, Tensor<CpuRuntimeBackend, 4>)> {
+        None
+    }
+
+    fn qkv_module_multihead_rope_coords_from_qkv(
+        _qkv: Tensor<CpuRuntimeBackend, 5>,
+        _q_gamma: Tensor<CpuRuntimeBackend, 2>,
+        _k_gamma: Tensor<CpuRuntimeBackend, 2>,
+        _coords: Tensor<CpuRuntimeBackend, 2, Int>,
+        _rope_freq: [f32; 2],
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<(
+        Tensor<CpuRuntimeBackend, 4>,
+        Tensor<CpuRuntimeBackend, 4>,
+        Tensor<CpuRuntimeBackend, 4>,
+    )> {
+        None
+    }
+}
+
+impl SparseFlowLinearWgpuBridge<CpuRuntimeBackend> for SparseFlowLinearWgpuBridgeImpl {
+    fn f16_linear(
+        _linear: &nn::Linear<CpuRuntimeBackend>,
+        _x: Tensor<CpuRuntimeBackend, 2>,
+        _output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<CpuRuntimeBackend, 2>> {
+        None
+    }
+
+    fn cache_f16_linear(_linear: &nn::Linear<CpuRuntimeBackend>) -> bool {
+        false
+    }
+
+    fn skinny_linear(
+        _linear: &nn::Linear<CpuRuntimeBackend>,
+        _x: Tensor<CpuRuntimeBackend, 2>,
+        _output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<CpuRuntimeBackend, 2>> {
         None
     }
 }
@@ -232,6 +475,95 @@ impl SparseFlowLayerNormWgpuBridge<burn_wgpu::Wgpu<f32, i32, u32>> for RopeRotat
         _norm: &nn::LayerNorm<burn_wgpu::Wgpu<f32, i32, u32>>,
         _eps: f32,
     ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 3>> {
+        None
+    }
+
+    fn modulated(
+        _x: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 3>,
+        _scale: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 3>,
+        _shift: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 3>,
+        _eps: f32,
+    ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 3>> {
+        None
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowRmsNormWgpuBridge<burn_wgpu::Wgpu<f32, i32, u32>> for RopeRotateWgpuBridgeImpl {
+    fn multihead(
+        _x: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+        _gamma: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>> {
+        None
+    }
+
+    fn multihead_rope_coords(
+        _x: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+        _gamma: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _coords: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2, Int>,
+        _rope_freq: [f32; 2],
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>> {
+        None
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowQkRmsNormWgpuBridge<burn_wgpu::Wgpu<f32, i32, u32>> for RopeRotateWgpuBridgeImpl {
+    fn qk_multihead_rope_coords_from_qkv(
+        _qkv: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 5>,
+        _q_gamma: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _k_gamma: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _coords: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2, Int>,
+        _rope_freq: [f32; 2],
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<(
+        Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+        Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+    )> {
+        None
+    }
+
+    fn qkv_module_multihead_rope_coords_from_qkv(
+        _qkv: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 5>,
+        _q_gamma: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _k_gamma: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _coords: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2, Int>,
+        _rope_freq: [f32; 2],
+        _scale: f32,
+        _eps: f32,
+    ) -> Option<(
+        Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+        Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+        Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 4>,
+    )> {
+        None
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowLinearWgpuBridge<burn_wgpu::Wgpu<f32, i32, u32>> for SparseFlowLinearWgpuBridgeImpl {
+    fn f16_linear(
+        _linear: &nn::Linear<burn_wgpu::Wgpu<f32, i32, u32>>,
+        _x: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>> {
+        None
+    }
+
+    fn cache_f16_linear(_linear: &nn::Linear<burn_wgpu::Wgpu<f32, i32, u32>>) -> bool {
+        false
+    }
+
+    fn skinny_linear(
+        _linear: &nn::Linear<burn_wgpu::Wgpu<f32, i32, u32>>,
+        _x: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>> {
         None
     }
 }
@@ -254,11 +586,45 @@ fn layer_norm_no_affine_params_wgpu(
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
+fn cached_linear_f16_params(
+    linear: &nn::Linear<WgpuRuntimeBackend>,
+) -> (
+    Tensor<WgpuRuntimeBackend, 2>,
+    Option<Tensor<WgpuRuntimeBackend, 1>>,
+) {
+    let weight = linear.weight.val();
+    let [in_channels, out_channels] = weight.dims();
+    let key = LinearF16CacheKey {
+        weight_id: linear.weight.id.val(),
+        bias_id: linear.bias.as_ref().map(|bias| bias.id.val()),
+        in_channels,
+        out_channels,
+    };
+    LINEAR_F16_PARAMS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(params) = cache.get(&key) {
+            return params.clone();
+        }
+        let f16 = burn::tensor::FloatDType::F16;
+        let weight_f16 = tensor_cast_float_2d_if_needed(weight, f16);
+        let bias_f16 = linear
+            .bias
+            .as_ref()
+            .map(|bias| tensor_cast_float_1d_if_needed(bias.val(), f16));
+        cache.insert(key, (weight_f16.clone(), bias_f16.clone()));
+        (weight_f16, bias_f16)
+    })
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
 impl SparseFlowLayerNormWgpuBridge<WgpuRuntimeBackend> for RopeRotateWgpuBridgeImpl {
     fn no_affine(
         x: Tensor<WgpuRuntimeBackend, 3>,
         eps: f32,
     ) -> Option<Tensor<WgpuRuntimeBackend, 3>> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled() {
+            return None;
+        }
         let [batch, tokens, channels] = x.dims();
         if batch == 0 || tokens == 0 || channels == 0 {
             return Some(x);
@@ -280,6 +646,9 @@ impl SparseFlowLayerNormWgpuBridge<WgpuRuntimeBackend> for RopeRotateWgpuBridgeI
         norm: &nn::LayerNorm<WgpuRuntimeBackend>,
         eps: f32,
     ) -> Option<Tensor<WgpuRuntimeBackend, 3>> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled() {
+            return None;
+        }
         let [batch, tokens, channels] = x.dims();
         if batch == 0 || tokens == 0 || channels == 0 {
             return Some(x);
@@ -317,6 +686,293 @@ impl SparseFlowLayerNormWgpuBridge<WgpuRuntimeBackend> for RopeRotateWgpuBridgeI
                 .reshape([batch, tokens, channels]),
         )
     }
+
+    fn modulated(
+        x: Tensor<WgpuRuntimeBackend, 3>,
+        scale: Tensor<WgpuRuntimeBackend, 3>,
+        shift: Tensor<WgpuRuntimeBackend, 3>,
+        eps: f32,
+    ) -> Option<Tensor<WgpuRuntimeBackend, 3>> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled() {
+            return None;
+        }
+        let [batch, tokens, channels] = x.dims();
+        if batch == 0 || tokens == 0 || channels == 0 {
+            return Some(x);
+        }
+        Some(
+            layer_norm_modulated_forward_wgpu(x, scale, shift, eps).unwrap_or_else(|err| {
+                panic!("sparse-flow layer_norm_modulated wgpu kernel failed: {err}")
+            }),
+        )
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowRmsNormWgpuBridge<WgpuRuntimeBackend> for RopeRotateWgpuBridgeImpl {
+    fn multihead(
+        x: Tensor<WgpuRuntimeBackend, 4>,
+        gamma: Tensor<WgpuRuntimeBackend, 2>,
+        scale: f32,
+        eps: f32,
+    ) -> Option<Tensor<WgpuRuntimeBackend, 4>> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled() {
+            return None;
+        }
+        let [batch, tokens, heads, head_dim] = x.dims();
+        if batch == 0 || tokens == 0 || heads == 0 || head_dim == 0 {
+            return Some(x);
+        }
+        let x_dtype: burn::tensor::FloatDType = x.dtype().into();
+        let gamma_dtype: burn::tensor::FloatDType = gamma.dtype().into();
+        let gamma = if gamma_dtype != x_dtype {
+            gamma.cast(x_dtype)
+        } else {
+            gamma
+        };
+        Some(
+            multihead_rms_norm_forward_wgpu(x, gamma, scale, eps).unwrap_or_else(|err| {
+                panic!("sparse-flow multihead_rms_norm wgpu kernel failed: {err}")
+            }),
+        )
+    }
+
+    fn multihead_rope_coords(
+        x: Tensor<WgpuRuntimeBackend, 4>,
+        gamma: Tensor<WgpuRuntimeBackend, 2>,
+        coords: Tensor<WgpuRuntimeBackend, 2, Int>,
+        rope_freq: [f32; 2],
+        scale: f32,
+        eps: f32,
+    ) -> Option<Tensor<WgpuRuntimeBackend, 4>> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled()
+            || !sparse_flow_wgpu_coord_rope_kernel_enabled()
+        {
+            return None;
+        }
+        let [batch, tokens, heads, head_dim] = x.dims();
+        if batch == 0 || tokens == 0 || heads == 0 || head_dim == 0 {
+            return Some(x);
+        }
+        let x_dtype: burn::tensor::FloatDType = x.dtype().into();
+        let gamma_dtype: burn::tensor::FloatDType = gamma.dtype().into();
+        let gamma = if gamma_dtype != x_dtype {
+            gamma.cast(x_dtype)
+        } else {
+            gamma
+        };
+        Some(
+            multihead_rms_norm_rope_from_coords_wgpu(x, gamma, coords, rope_freq, scale, eps)
+                .unwrap_or_else(|err| {
+                    panic!("sparse-flow multihead_rms_norm_rope wgpu kernel failed: {err}")
+                }),
+        )
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowQkRmsNormWgpuBridge<WgpuRuntimeBackend> for RopeRotateWgpuBridgeImpl {
+    fn qk_multihead_rope_coords_from_qkv(
+        qkv: Tensor<WgpuRuntimeBackend, 5>,
+        q_gamma: Tensor<WgpuRuntimeBackend, 2>,
+        k_gamma: Tensor<WgpuRuntimeBackend, 2>,
+        coords: Tensor<WgpuRuntimeBackend, 2, Int>,
+        rope_freq: [f32; 2],
+        scale: f32,
+        eps: f32,
+    ) -> Option<(Tensor<WgpuRuntimeBackend, 4>, Tensor<WgpuRuntimeBackend, 4>)> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled()
+            || !sparse_flow_wgpu_coord_rope_kernel_enabled()
+        {
+            return None;
+        }
+        let [batch, tokens, qkv_dim, heads, head_dim] = qkv.dims();
+        if batch == 0 || tokens == 0 || heads == 0 || head_dim == 0 {
+            return Some((
+                Tensor::<WgpuRuntimeBackend, 4>::zeros(
+                    [batch, tokens, heads, head_dim],
+                    &qkv.device(),
+                ),
+                Tensor::<WgpuRuntimeBackend, 4>::zeros(
+                    [batch, tokens, heads, head_dim],
+                    &qkv.device(),
+                ),
+            ));
+        }
+        if qkv_dim != 3 {
+            return None;
+        }
+        let qkv_dtype: burn::tensor::FloatDType = qkv.dtype().into();
+        let q_gamma_dtype: burn::tensor::FloatDType = q_gamma.dtype().into();
+        let q_gamma = if q_gamma_dtype != qkv_dtype {
+            q_gamma.cast(qkv_dtype)
+        } else {
+            q_gamma
+        };
+        let k_gamma_dtype: burn::tensor::FloatDType = k_gamma.dtype().into();
+        let k_gamma = if k_gamma_dtype != qkv_dtype {
+            k_gamma.cast(qkv_dtype)
+        } else {
+            k_gamma
+        };
+        Some(
+            multihead_qk_rms_norm_rope_from_qkv_coords_wgpu(
+                qkv, q_gamma, k_gamma, coords, rope_freq, scale, eps,
+            )
+            .unwrap_or_else(|err| {
+                panic!("sparse-flow qk multihead_rms_norm_rope wgpu kernel failed: {err}")
+            }),
+        )
+    }
+
+    fn qkv_module_multihead_rope_coords_from_qkv(
+        qkv: Tensor<WgpuRuntimeBackend, 5>,
+        q_gamma: Tensor<WgpuRuntimeBackend, 2>,
+        k_gamma: Tensor<WgpuRuntimeBackend, 2>,
+        coords: Tensor<WgpuRuntimeBackend, 2, Int>,
+        rope_freq: [f32; 2],
+        scale: f32,
+        eps: f32,
+    ) -> Option<(
+        Tensor<WgpuRuntimeBackend, 4>,
+        Tensor<WgpuRuntimeBackend, 4>,
+        Tensor<WgpuRuntimeBackend, 4>,
+    )> {
+        if !sparse_flow_wgpu_layer_norm_kernel_enabled()
+            || !sparse_flow_wgpu_coord_rope_kernel_enabled()
+        {
+            return None;
+        }
+        let [batch, tokens, qkv_dim, heads, head_dim] = qkv.dims();
+        if batch == 0 || tokens == 0 || heads == 0 || head_dim == 0 {
+            return Some((
+                Tensor::<WgpuRuntimeBackend, 4>::zeros(
+                    [batch, heads, tokens, head_dim],
+                    &qkv.device(),
+                ),
+                Tensor::<WgpuRuntimeBackend, 4>::zeros(
+                    [batch, heads, tokens, head_dim],
+                    &qkv.device(),
+                ),
+                Tensor::<WgpuRuntimeBackend, 4>::zeros(
+                    [batch, heads, tokens, head_dim],
+                    &qkv.device(),
+                ),
+            ));
+        }
+        if qkv_dim != 3 {
+            return None;
+        }
+        let qkv_dtype: burn::tensor::FloatDType = qkv.dtype().into();
+        let q_gamma_dtype: burn::tensor::FloatDType = q_gamma.dtype().into();
+        let q_gamma = if q_gamma_dtype != qkv_dtype {
+            q_gamma.cast(qkv_dtype)
+        } else {
+            q_gamma
+        };
+        let k_gamma_dtype: burn::tensor::FloatDType = k_gamma.dtype().into();
+        let k_gamma = if k_gamma_dtype != qkv_dtype {
+            k_gamma.cast(qkv_dtype)
+        } else {
+            k_gamma
+        };
+        Some(
+            multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu(
+                qkv, q_gamma, k_gamma, coords, rope_freq, scale, eps,
+            )
+            .unwrap_or_else(|err| {
+                panic!("sparse-flow qkv module multihead_rms_norm_rope wgpu kernel failed: {err}")
+            }),
+        )
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowLinearWgpuBridge<WgpuRuntimeBackend> for SparseFlowLinearWgpuBridgeImpl {
+    fn f16_linear(
+        linear: &nn::Linear<WgpuRuntimeBackend>,
+        x: Tensor<WgpuRuntimeBackend, 2>,
+        output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<WgpuRuntimeBackend, 2>> {
+        let [rows, in_channels] = x.dims();
+        let weight = linear.weight.val();
+        let [weight_in_channels, out_channels] = weight.dims();
+        if in_channels != weight_in_channels {
+            panic!(
+                "linear input/weight mismatch: input=[{rows},{in_channels}] weight=[{weight_in_channels},{out_channels}]"
+            );
+        }
+        if rows == 0 || in_channels == 0 || out_channels == 0 {
+            return None;
+        }
+
+        let (weight_f16, bias_f16) = cached_linear_f16_params(linear);
+
+        let f16 = burn::tensor::FloatDType::F16;
+        let mut output = tensor_cast_float_2d_if_needed(x, f16).matmul(weight_f16);
+        if let Some(bias) = bias_f16 {
+            output = output.add(bias.unsqueeze::<2>());
+        }
+        Some(tensor_cast_float_2d_if_needed(output, output_dtype))
+    }
+
+    fn cache_f16_linear(linear: &nn::Linear<WgpuRuntimeBackend>) -> bool {
+        let [in_channels, out_channels] = linear.weight.val().dims();
+        if in_channels == 0 || out_channels == 0 {
+            return false;
+        }
+        let _ = cached_linear_f16_params(linear);
+        true
+    }
+
+    fn skinny_linear(
+        linear: &nn::Linear<WgpuRuntimeBackend>,
+        x: Tensor<WgpuRuntimeBackend, 2>,
+        output_dtype: burn::tensor::FloatDType,
+    ) -> Option<Tensor<WgpuRuntimeBackend, 2>> {
+        let [rows, in_channels] = x.dims();
+        let weight = linear.weight.val();
+        let [weight_in_channels, out_channels] = weight.dims();
+        if in_channels != weight_in_channels {
+            panic!(
+                "linear input/weight mismatch: input=[{rows},{in_channels}] weight=[{weight_in_channels},{out_channels}]"
+            );
+        }
+        if rows == 0 || in_channels == 0 || out_channels == 0 {
+            return None;
+        }
+        let Some(bias) = linear.bias.as_ref() else {
+            return None;
+        };
+
+        let key = LinearF16CacheKey {
+            weight_id: linear.weight.id.val(),
+            bias_id: Some(bias.id.val()),
+            in_channels,
+            out_channels,
+        };
+        let (weight_f32_t, bias_f32) = LINEAR_SKINNY_PARAMS_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(params) = cache.get(&key) {
+                return params.clone();
+            }
+            let f32_dtype = burn::tensor::FloatDType::F32;
+            let weight_f32_t = tensor_cast_float_2d_if_needed(weight.swap_dims(0, 1), f32_dtype)
+                .reshape([out_channels * in_channels])
+                .reshape([out_channels, in_channels]);
+            let bias_f32 = tensor_cast_float_1d_if_needed(bias.val(), f32_dtype);
+            cache.insert(key, (weight_f32_t.clone(), bias_f32.clone()));
+            (weight_f32_t, bias_f32)
+        });
+
+        let output = linear_skinny_forward_wgpu(
+            tensor_cast_float_2d_if_needed(x, burn::tensor::FloatDType::F32),
+            weight_f32_t,
+            bias_f32,
+        )
+        .unwrap_or_else(|err| panic!("sparse-flow skinny linear wgpu kernel failed: {err}"));
+        Some(tensor_cast_float_2d_if_needed(output, output_dtype))
+    }
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -339,6 +995,124 @@ where
     RopeRotateWgpuBridgeImpl::affine(x, norm, eps)
 }
 
+#[cfg(feature = "runtime-model-wgpu")]
+fn maybe_layer_norm_modulated_wgpu<B: Backend>(
+    x: Tensor<B, 3>,
+    scale: Tensor<B, 3>,
+    shift: Tensor<B, 3>,
+    eps: f32,
+) -> Option<Tensor<B, 3>>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+{
+    RopeRotateWgpuBridgeImpl::modulated(x, scale, shift, eps)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn maybe_multihead_rms_norm_wgpu<B: Backend>(
+    x: Tensor<B, 4>,
+    gamma: Tensor<B, 2>,
+    scale: f32,
+    eps: f32,
+) -> Option<Tensor<B, 4>>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+{
+    RopeRotateWgpuBridgeImpl::multihead(x, gamma, scale, eps)
+}
+
+fn maybe_multihead_rms_norm_rope_coords_wgpu<B: Backend>(
+    x: Tensor<B, 4>,
+    gamma: Tensor<B, 2>,
+    coords: Tensor<B, 2, Int>,
+    rope_freq: [f32; 2],
+    scale: f32,
+    eps: f32,
+) -> Option<Tensor<B, 4>>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+{
+    RopeRotateWgpuBridgeImpl::multihead_rope_coords(x, gamma, coords, rope_freq, scale, eps)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn maybe_qk_multihead_rms_norm_rope_coords_from_qkv_wgpu<B: Backend>(
+    qkv: Tensor<B, 5>,
+    q_gamma: Tensor<B, 2>,
+    k_gamma: Tensor<B, 2>,
+    coords: Tensor<B, 2, Int>,
+    rope_freq: [f32; 2],
+    scale: f32,
+    eps: f32,
+) -> Option<(Tensor<B, 4>, Tensor<B, 4>)>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+{
+    let output = RopeRotateWgpuBridgeImpl::qk_multihead_rope_coords_from_qkv(
+        qkv, q_gamma, k_gamma, coords, rope_freq, scale, eps,
+    );
+    if output.is_some() {
+        FLOW_SELF_NORM_ROPE_FUSED_QK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    output
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn maybe_qkv_module_multihead_rms_norm_rope_coords_from_qkv_wgpu<B: Backend>(
+    qkv: Tensor<B, 5>,
+    q_gamma: Tensor<B, 2>,
+    k_gamma: Tensor<B, 2>,
+    coords: Tensor<B, 2, Int>,
+    rope_freq: [f32; 2],
+    scale: f32,
+    eps: f32,
+) -> Option<(Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>)>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+{
+    let output = RopeRotateWgpuBridgeImpl::qkv_module_multihead_rope_coords_from_qkv(
+        qkv, q_gamma, k_gamma, coords, rope_freq, scale, eps,
+    );
+    if output.is_some() {
+        FLOW_SELF_NORM_ROPE_FUSED_QKV_MODULE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    output
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn maybe_linear_f16_wgpu<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 2>,
+    output_dtype: burn::tensor::FloatDType,
+) -> Option<Tensor<B, 2>>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    SparseFlowLinearWgpuBridgeImpl::f16_linear(linear, x, output_dtype)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn maybe_cache_linear_f16_wgpu<B: Backend>(linear: &nn::Linear<B>) -> bool
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    SparseFlowLinearWgpuBridgeImpl::cache_f16_linear(linear)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn maybe_linear_skinny_wgpu<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 2>,
+    output_dtype: burn::tensor::FloatDType,
+) -> Option<Tensor<B, 2>>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    SparseFlowLinearWgpuBridgeImpl::skinny_linear(linear, x, output_dtype)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostTransferStats {
     pub readback_count: u64,
@@ -353,6 +1127,48 @@ pub struct SparseFlowOpTelemetry {
     pub cross_attn_ns: u64,
     pub mlp_calls: u64,
     pub mlp_ns: u64,
+    pub self_qkv_calls: u64,
+    pub self_qkv_ns: u64,
+    pub self_norm_rope_calls: u64,
+    pub self_norm_rope_ns: u64,
+    pub self_norm_rope_fused_qk_calls: u64,
+    pub self_norm_rope_fused_qkv_module_calls: u64,
+    pub self_kernel_calls: u64,
+    pub self_kernel_ns: u64,
+    pub self_out_calls: u64,
+    pub self_out_ns: u64,
+    pub self_cat_calls: u64,
+    pub self_cat_ns: u64,
+    pub cross_q_calls: u64,
+    pub cross_q_ns: u64,
+    pub cross_kv_calls: u64,
+    pub cross_kv_ns: u64,
+    pub cross_norm_calls: u64,
+    pub cross_norm_ns: u64,
+    pub cross_kernel_calls: u64,
+    pub cross_kernel_ns: u64,
+    pub cross_out_calls: u64,
+    pub cross_out_ns: u64,
+    pub cross_cat_calls: u64,
+    pub cross_cat_ns: u64,
+    pub module_cast_pad_calls: u64,
+    pub module_cast_pad_ns: u64,
+    pub module_attention_calls: u64,
+    pub module_attention_ns: u64,
+    pub module_output_calls: u64,
+    pub module_output_ns: u64,
+    pub block_norm_mod_calls: u64,
+    pub block_norm_mod_ns: u64,
+    pub block_norm_affine_calls: u64,
+    pub block_norm_affine_ns: u64,
+    pub block_gate_residual_calls: u64,
+    pub block_gate_residual_ns: u64,
+    pub model_io_calls: u64,
+    pub model_io_ns: u64,
+    pub model_input_calls: u64,
+    pub model_input_ns: u64,
+    pub model_output_calls: u64,
+    pub model_output_ns: u64,
 }
 
 #[cfg(test)]
@@ -407,6 +1223,48 @@ pub fn reset_sparse_flow_op_telemetry() {
     FLOW_CROSS_ATTN_NS.store(0, Ordering::Relaxed);
     FLOW_MLP_CALLS.store(0, Ordering::Relaxed);
     FLOW_MLP_NS.store(0, Ordering::Relaxed);
+    FLOW_SELF_QKV_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_QKV_NS.store(0, Ordering::Relaxed);
+    FLOW_SELF_NORM_ROPE_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_NORM_ROPE_NS.store(0, Ordering::Relaxed);
+    FLOW_SELF_NORM_ROPE_FUSED_QK_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_NORM_ROPE_FUSED_QKV_MODULE_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_KERNEL_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_KERNEL_NS.store(0, Ordering::Relaxed);
+    FLOW_SELF_OUT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_OUT_NS.store(0, Ordering::Relaxed);
+    FLOW_SELF_CAT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_SELF_CAT_NS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_Q_CALLS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_Q_NS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_KV_CALLS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_KV_NS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_NORM_CALLS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_NORM_NS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_KERNEL_CALLS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_KERNEL_NS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_OUT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_OUT_NS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_CAT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_CROSS_CAT_NS.store(0, Ordering::Relaxed);
+    FLOW_MODULE_CAST_PAD_CALLS.store(0, Ordering::Relaxed);
+    FLOW_MODULE_CAST_PAD_NS.store(0, Ordering::Relaxed);
+    FLOW_MODULE_ATTENTION_CALLS.store(0, Ordering::Relaxed);
+    FLOW_MODULE_ATTENTION_NS.store(0, Ordering::Relaxed);
+    FLOW_MODULE_OUTPUT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_MODULE_OUTPUT_NS.store(0, Ordering::Relaxed);
+    FLOW_BLOCK_NORM_MOD_CALLS.store(0, Ordering::Relaxed);
+    FLOW_BLOCK_NORM_MOD_NS.store(0, Ordering::Relaxed);
+    FLOW_BLOCK_NORM_AFFINE_CALLS.store(0, Ordering::Relaxed);
+    FLOW_BLOCK_NORM_AFFINE_NS.store(0, Ordering::Relaxed);
+    FLOW_BLOCK_GATE_RESIDUAL_CALLS.store(0, Ordering::Relaxed);
+    FLOW_BLOCK_GATE_RESIDUAL_NS.store(0, Ordering::Relaxed);
+    FLOW_MODEL_IO_CALLS.store(0, Ordering::Relaxed);
+    FLOW_MODEL_IO_NS.store(0, Ordering::Relaxed);
+    FLOW_MODEL_INPUT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_MODEL_INPUT_NS.store(0, Ordering::Relaxed);
+    FLOW_MODEL_OUTPUT_CALLS.store(0, Ordering::Relaxed);
+    FLOW_MODEL_OUTPUT_NS.store(0, Ordering::Relaxed);
 }
 
 pub fn sparse_flow_op_telemetry() -> SparseFlowOpTelemetry {
@@ -417,6 +1275,50 @@ pub fn sparse_flow_op_telemetry() -> SparseFlowOpTelemetry {
         cross_attn_ns: FLOW_CROSS_ATTN_NS.load(Ordering::Relaxed),
         mlp_calls: FLOW_MLP_CALLS.load(Ordering::Relaxed),
         mlp_ns: FLOW_MLP_NS.load(Ordering::Relaxed),
+        self_qkv_calls: FLOW_SELF_QKV_CALLS.load(Ordering::Relaxed),
+        self_qkv_ns: FLOW_SELF_QKV_NS.load(Ordering::Relaxed),
+        self_norm_rope_calls: FLOW_SELF_NORM_ROPE_CALLS.load(Ordering::Relaxed),
+        self_norm_rope_ns: FLOW_SELF_NORM_ROPE_NS.load(Ordering::Relaxed),
+        self_norm_rope_fused_qk_calls: FLOW_SELF_NORM_ROPE_FUSED_QK_CALLS
+            .load(Ordering::Relaxed),
+        self_norm_rope_fused_qkv_module_calls: FLOW_SELF_NORM_ROPE_FUSED_QKV_MODULE_CALLS
+            .load(Ordering::Relaxed),
+        self_kernel_calls: FLOW_SELF_KERNEL_CALLS.load(Ordering::Relaxed),
+        self_kernel_ns: FLOW_SELF_KERNEL_NS.load(Ordering::Relaxed),
+        self_out_calls: FLOW_SELF_OUT_CALLS.load(Ordering::Relaxed),
+        self_out_ns: FLOW_SELF_OUT_NS.load(Ordering::Relaxed),
+        self_cat_calls: FLOW_SELF_CAT_CALLS.load(Ordering::Relaxed),
+        self_cat_ns: FLOW_SELF_CAT_NS.load(Ordering::Relaxed),
+        cross_q_calls: FLOW_CROSS_Q_CALLS.load(Ordering::Relaxed),
+        cross_q_ns: FLOW_CROSS_Q_NS.load(Ordering::Relaxed),
+        cross_kv_calls: FLOW_CROSS_KV_CALLS.load(Ordering::Relaxed),
+        cross_kv_ns: FLOW_CROSS_KV_NS.load(Ordering::Relaxed),
+        cross_norm_calls: FLOW_CROSS_NORM_CALLS.load(Ordering::Relaxed),
+        cross_norm_ns: FLOW_CROSS_NORM_NS.load(Ordering::Relaxed),
+        cross_kernel_calls: FLOW_CROSS_KERNEL_CALLS.load(Ordering::Relaxed),
+        cross_kernel_ns: FLOW_CROSS_KERNEL_NS.load(Ordering::Relaxed),
+        cross_out_calls: FLOW_CROSS_OUT_CALLS.load(Ordering::Relaxed),
+        cross_out_ns: FLOW_CROSS_OUT_NS.load(Ordering::Relaxed),
+        cross_cat_calls: FLOW_CROSS_CAT_CALLS.load(Ordering::Relaxed),
+        cross_cat_ns: FLOW_CROSS_CAT_NS.load(Ordering::Relaxed),
+        module_cast_pad_calls: FLOW_MODULE_CAST_PAD_CALLS.load(Ordering::Relaxed),
+        module_cast_pad_ns: FLOW_MODULE_CAST_PAD_NS.load(Ordering::Relaxed),
+        module_attention_calls: FLOW_MODULE_ATTENTION_CALLS.load(Ordering::Relaxed),
+        module_attention_ns: FLOW_MODULE_ATTENTION_NS.load(Ordering::Relaxed),
+        module_output_calls: FLOW_MODULE_OUTPUT_CALLS.load(Ordering::Relaxed),
+        module_output_ns: FLOW_MODULE_OUTPUT_NS.load(Ordering::Relaxed),
+        block_norm_mod_calls: FLOW_BLOCK_NORM_MOD_CALLS.load(Ordering::Relaxed),
+        block_norm_mod_ns: FLOW_BLOCK_NORM_MOD_NS.load(Ordering::Relaxed),
+        block_norm_affine_calls: FLOW_BLOCK_NORM_AFFINE_CALLS.load(Ordering::Relaxed),
+        block_norm_affine_ns: FLOW_BLOCK_NORM_AFFINE_NS.load(Ordering::Relaxed),
+        block_gate_residual_calls: FLOW_BLOCK_GATE_RESIDUAL_CALLS.load(Ordering::Relaxed),
+        block_gate_residual_ns: FLOW_BLOCK_GATE_RESIDUAL_NS.load(Ordering::Relaxed),
+        model_io_calls: FLOW_MODEL_IO_CALLS.load(Ordering::Relaxed),
+        model_io_ns: FLOW_MODEL_IO_NS.load(Ordering::Relaxed),
+        model_input_calls: FLOW_MODEL_INPUT_CALLS.load(Ordering::Relaxed),
+        model_input_ns: FLOW_MODEL_INPUT_NS.load(Ordering::Relaxed),
+        model_output_calls: FLOW_MODEL_OUTPUT_CALLS.load(Ordering::Relaxed),
+        model_output_ns: FLOW_MODEL_OUTPUT_NS.load(Ordering::Relaxed),
     }
 }
 
@@ -437,11 +1339,99 @@ fn record_sparse_flow_op(kind: SparseFlowOpKind, elapsed_ns: u64) {
     }
 }
 
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_sparse_flow_detail(kind: SparseFlowOpDetailKind, elapsed_ns: u64) {
+    let (calls, nanos) = match kind {
+        SparseFlowOpDetailKind::SelfQkv => (&FLOW_SELF_QKV_CALLS, &FLOW_SELF_QKV_NS),
+        SparseFlowOpDetailKind::SelfNormRope => {
+            (&FLOW_SELF_NORM_ROPE_CALLS, &FLOW_SELF_NORM_ROPE_NS)
+        }
+        SparseFlowOpDetailKind::SelfKernel => (&FLOW_SELF_KERNEL_CALLS, &FLOW_SELF_KERNEL_NS),
+        SparseFlowOpDetailKind::SelfOut => (&FLOW_SELF_OUT_CALLS, &FLOW_SELF_OUT_NS),
+        SparseFlowOpDetailKind::SelfCat => (&FLOW_SELF_CAT_CALLS, &FLOW_SELF_CAT_NS),
+        SparseFlowOpDetailKind::CrossQ => (&FLOW_CROSS_Q_CALLS, &FLOW_CROSS_Q_NS),
+        SparseFlowOpDetailKind::CrossKv => (&FLOW_CROSS_KV_CALLS, &FLOW_CROSS_KV_NS),
+        SparseFlowOpDetailKind::CrossNorm => (&FLOW_CROSS_NORM_CALLS, &FLOW_CROSS_NORM_NS),
+        SparseFlowOpDetailKind::CrossKernel => (&FLOW_CROSS_KERNEL_CALLS, &FLOW_CROSS_KERNEL_NS),
+        SparseFlowOpDetailKind::CrossOut => (&FLOW_CROSS_OUT_CALLS, &FLOW_CROSS_OUT_NS),
+        SparseFlowOpDetailKind::CrossCat => (&FLOW_CROSS_CAT_CALLS, &FLOW_CROSS_CAT_NS),
+        SparseFlowOpDetailKind::ModuleCastPad => {
+            (&FLOW_MODULE_CAST_PAD_CALLS, &FLOW_MODULE_CAST_PAD_NS)
+        }
+        SparseFlowOpDetailKind::ModuleAttention => {
+            (&FLOW_MODULE_ATTENTION_CALLS, &FLOW_MODULE_ATTENTION_NS)
+        }
+        SparseFlowOpDetailKind::ModuleOutput => (&FLOW_MODULE_OUTPUT_CALLS, &FLOW_MODULE_OUTPUT_NS),
+        SparseFlowOpDetailKind::BlockNormMod => {
+            (&FLOW_BLOCK_NORM_MOD_CALLS, &FLOW_BLOCK_NORM_MOD_NS)
+        }
+        SparseFlowOpDetailKind::BlockNormAffine => {
+            (&FLOW_BLOCK_NORM_AFFINE_CALLS, &FLOW_BLOCK_NORM_AFFINE_NS)
+        }
+        SparseFlowOpDetailKind::BlockGateResidual => (
+            &FLOW_BLOCK_GATE_RESIDUAL_CALLS,
+            &FLOW_BLOCK_GATE_RESIDUAL_NS,
+        ),
+        SparseFlowOpDetailKind::ModelIo => (&FLOW_MODEL_IO_CALLS, &FLOW_MODEL_IO_NS),
+        SparseFlowOpDetailKind::ModelInput => (&FLOW_MODEL_INPUT_CALLS, &FLOW_MODEL_INPUT_NS),
+        SparseFlowOpDetailKind::ModelOutput => (&FLOW_MODEL_OUTPUT_CALLS, &FLOW_MODEL_OUTPUT_NS),
+    };
+    calls.fetch_add(1, Ordering::Relaxed);
+    nanos.fetch_add(elapsed_ns, Ordering::Relaxed);
+}
+
+fn sparse_flow_sync_profile_enabled() -> bool {
+    std::env::var("TRELLIS2_SPARSE_FLOW_SYNC_PROFILE")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn maybe_sync_sparse_flow_profile<B: Backend>(device: Option<&B::Device>) {
+    if let Some(device) = device {
+        let _ = B::sync(device);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SparseFlowOpKind {
     SelfAttn,
     CrossAttn,
     Mlp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SparseFlowOpDetailKind {
+    SelfQkv,
+    SelfNormRope,
+    SelfKernel,
+    SelfOut,
+    SelfCat,
+    CrossQ,
+    CrossKv,
+    CrossNorm,
+    CrossKernel,
+    CrossOut,
+    CrossCat,
+    ModuleCastPad,
+    ModuleAttention,
+    ModuleOutput,
+    BlockNormMod,
+    BlockNormAffine,
+    BlockGateResidual,
+    ModelIo,
+    ModelInput,
+    ModelOutput,
 }
 
 fn runtime_sample_progress_interval(steps: usize) -> usize {
@@ -453,17 +1443,38 @@ pub struct SparseFlowRowTrace {
     pub steps: usize,
     pub row_channels: usize,
     pub samples: Vec<f32>,
+    pub step_0_pred_v: Vec<f32>,
+    pub step_0_pred_v_pos: Vec<f32>,
+    pub step_0_pred_v_neg: Vec<f32>,
     pub step_0_x_t: Vec<f32>,
     pub step_mid_x_t: Vec<f32>,
     pub step_last_x_t: Vec<f32>,
     #[cfg(feature = "runtime-model-wgpu")]
     pub samples_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
     #[cfg(feature = "runtime-model-wgpu")]
+    pub step_0_pred_v_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub step_0_pred_v_pos_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub step_0_pred_v_neg_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
+    #[cfg(feature = "runtime-model-wgpu")]
     pub step_0_x_t_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
     #[cfg(feature = "runtime-model-wgpu")]
     pub step_mid_x_t_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
     #[cfg(feature = "runtime-model-wgpu")]
     pub step_last_x_t_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>,
+}
+
+struct SparseCfgPrediction<B: Backend> {
+    guided: Tensor<B, 3>,
+    pos: Option<Tensor<B, 3>>,
+    neg: Option<Tensor<B, 3>>,
+}
+
+struct DenseCfgPrediction<B: Backend> {
+    guided: Tensor<B, 5>,
+    pos: Option<Tensor<B, 5>>,
+    neg: Option<Tensor<B, 5>>,
 }
 
 #[derive(Clone, Debug)]
@@ -937,7 +1948,10 @@ pub struct TimestepEmbedder<B: Backend> {
     pub mlp_2: nn::Linear<B>,
 }
 
-impl<B: Backend> TimestepEmbedder<B> {
+impl<B: Backend> TimestepEmbedder<B>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
     pub fn new(device: &B::Device, frequency_embedding_size: usize, hidden_size: usize) -> Self {
         let mlp_0 = nn::LinearConfig::new(frequency_embedding_size, hidden_size)
             .with_bias(true)
@@ -970,8 +1984,20 @@ impl<B: Backend> MultiHeadRmsNorm<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4>
+    where
+        RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    {
         let [_, _, heads, head_dim] = x.dims();
+        #[cfg(feature = "runtime-model-wgpu")]
+        {
+            let gamma = self.gamma.val();
+            if let Some(y) =
+                maybe_multihead_rms_norm_wgpu(x.clone(), gamma, self.scale, RMS_NORM_EPS)
+            {
+                return y;
+            }
+        }
         let rms = x
             .clone()
             .powf_scalar(2.0)
@@ -997,7 +2023,10 @@ pub struct FeedForwardNet<B: Backend> {
     pub mlp_2: nn::Linear<B>,
 }
 
-impl<B: Backend> FeedForwardNet<B> {
+impl<B: Backend> FeedForwardNet<B>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
     pub fn new(device: &B::Device, channels: usize, mlp_ratio: f32) -> Self {
         let hidden = ((channels as f32) * mlp_ratio).round().max(1.0) as usize;
         let mlp_0 = nn::LinearConfig::new(channels, hidden)
@@ -1014,12 +2043,18 @@ impl<B: Backend> FeedForwardNet<B> {
         let chunk_tokens = sparse_flow_mlp_chunk_tokens_for_backend::<B>(tokens);
         let chunk_debug = attention_debug_enabled() && tokens >= 131_072;
         let sync_interval = sparse_flow_mlp_sync_interval_for_backend::<B>(tokens);
+        let use_f16_chain = feed_forward_f16_chain_enabled::<B>(&self.mlp_0, &self.mlp_2);
         if chunk_tokens >= tokens {
-            let hidden = linear_forward_stable_via_2d(&self.mlp_0, x);
-            return linear_forward_stable_via_2d(&self.mlp_2, gelu(hidden));
+            return if use_f16_chain {
+                feed_forward_f16_chain_via_2d(&self.mlp_0, &self.mlp_2, x)
+            } else {
+                let hidden = linear_forward_stable_via_2d(&self.mlp_0, x);
+                linear_forward_stable_via_2d(&self.mlp_2, gelu(hidden))
+            };
         }
 
         let device = x.device();
+        let output_dtype: burn::tensor::FloatDType = x.dtype().into();
         let rows = batch.saturating_mul(tokens);
         let x_flat = x.reshape([rows, channels]);
         let mut chunks = Vec::new();
@@ -1064,7 +2099,11 @@ impl<B: Backend> FeedForwardNet<B> {
                 } else {
                     None
                 };
-                let hidden = linear_forward_stable_2d(&self.mlp_0, x_chunk);
+                let hidden = if use_f16_chain {
+                    linear_forward_f16_raw_2d(&self.mlp_0, x_chunk)
+                } else {
+                    linear_forward_stable_2d(&self.mlp_0, x_chunk)
+                };
                 if let Some(stage_start) = mlp_0_start {
                     eprintln!(
                         "burn_trellis: mlp.chunk {}/{} mlp_0 done ({:.2} ms)",
@@ -1092,7 +2131,11 @@ impl<B: Backend> FeedForwardNet<B> {
                         stage_start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                let chunk_out = linear_forward_stable_2d(&self.mlp_2, hidden);
+                let chunk_out = if use_f16_chain {
+                    linear_forward_f16_raw_2d(&self.mlp_2, hidden).cast(output_dtype)
+                } else {
+                    linear_forward_stable_2d(&self.mlp_2, hidden)
+                };
                 if let Some(stage_start) = mlp_2_start {
                     eprintln!(
                         "burn_trellis: mlp.chunk {}/{} mlp_2 done ({:.2} ms)",
@@ -1145,6 +2188,7 @@ pub struct SelfAttention<B: Backend> {
     head_dim: usize,
     use_rope: bool,
     rope_freq: [f32; 2],
+    attention_projection_f16: bool,
 }
 
 #[derive(Module, Debug)]
@@ -1156,6 +2200,7 @@ pub struct CrossAttention<B: Backend> {
     pub k_rms_norm: Option<MultiHeadRmsNorm<B>>,
     num_heads: usize,
     head_dim: usize,
+    attention_projection_f16: bool,
 }
 
 #[derive(Module, Debug)]
@@ -1176,6 +2221,17 @@ pub struct SparseStructureFlowModel<B: Backend> {
     pub out_layer: nn::Linear<B>,
     config: Ignored<SparseStructureFlowConfig>,
 }
+
+#[derive(Clone)]
+struct CrossAttentionProjectedKv<B: Backend> {
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    module_k: Option<Tensor<B, 4>>,
+    module_v: Option<Tensor<B, 4>>,
+    module_dtype: Option<burn::tensor::FloatDType>,
+}
+
+type CrossAttentionKvCache<B> = Vec<CrossAttentionProjectedKv<B>>;
 
 #[derive(Debug)]
 pub(crate) struct SparseStructureFlowRuntimeImpl<B: Backend> {
@@ -1368,6 +2424,9 @@ impl SparseRuntimeTensorAccess<WgpuRuntimeBackend>
 impl<B: Backend> SelfAttention<B>
 where
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
 {
     pub fn new(
         device: &B::Device,
@@ -1376,6 +2435,7 @@ where
         use_rope: bool,
         rope_freq: [f32; 2],
         qk_rms_norm: bool,
+        attention_projection_f16: bool,
     ) -> Self {
         let head_dim = channels / num_heads.max(1);
         let to_qkv = nn::LinearConfig::new(channels, channels * 3)
@@ -1403,47 +2463,27 @@ where
             head_dim,
             use_rope,
             rope_freq,
+            attention_projection_f16,
         }
     }
 
-    pub fn forward(
+    fn forward(
         &self,
         x: Tensor<B, 3>,
         resolution: usize,
         token_coords: Option<Tensor<B, 2, Int>>,
     ) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
+        let x_dtype = x.dtype().into();
         if sparse_flow_chunked_forward_for_backend::<B>(tokens) {
             return self.forward_chunked_stream(x, resolution, token_coords);
         }
-        let qkv = linear_forward_stable(&self.to_qkv, x).reshape([
-            batch,
-            tokens,
-            3,
-            self.num_heads,
-            self.head_dim,
-        ]);
-        let q = qkv
-            .clone()
-            .slice([
-                0..batch,
-                0..tokens,
-                0..1,
-                0..self.num_heads,
-                0..self.head_dim,
-            ])
-            .reshape([batch, tokens, self.num_heads, self.head_dim]);
-        let k = qkv
-            .clone()
-            .slice([
-                0..batch,
-                0..tokens,
-                1..2,
-                0..self.num_heads,
-                0..self.head_dim,
-            ])
-            .reshape([batch, tokens, self.num_heads, self.head_dim]);
+        let qkv_start = Instant::now();
+        let qkv = linear_forward_attention(&self.to_qkv, x, self.attention_projection_f16)
+            .reshape([batch, tokens, 3, self.num_heads, self.head_dim]);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::SelfQkv, elapsed_ns(qkv_start));
         let v = qkv
+            .clone()
             .slice([
                 0..batch,
                 0..tokens,
@@ -1453,31 +2493,124 @@ where
             ])
             .reshape([batch, tokens, self.num_heads, self.head_dim]);
 
-        let q = if let Some(norm) = self.q_rms_norm.as_ref() {
-            norm.forward(q)
-        } else {
-            q
-        };
-        let k = if let Some(norm) = self.k_rms_norm.as_ref() {
-            norm.forward(k)
-        } else {
-            k
-        };
-        let (q, k) = if self.use_rope {
-            apply_rope(
-                q,
-                k,
-                resolution,
-                self.head_dim,
+        let norm_rope_start = Instant::now();
+        let (q, k) = {
+            #[cfg(feature = "runtime-model-wgpu")]
+            if let Some((q, k)) = maybe_apply_qk_rms_norm_and_rope_from_qkv(
+                qkv.clone(),
+                self.q_rms_norm.as_ref(),
+                self.k_rms_norm.as_ref(),
+                self.use_rope,
                 self.rope_freq,
-                token_coords,
-            )
-        } else {
-            (q, k)
+                token_coords.clone(),
+                0,
+            ) {
+                (q, k)
+            } else {
+                let q = qkv
+                    .clone()
+                    .slice([
+                        0..batch,
+                        0..tokens,
+                        0..1,
+                        0..self.num_heads,
+                        0..self.head_dim,
+                    ])
+                    .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                let k = qkv
+                    .slice([
+                        0..batch,
+                        0..tokens,
+                        1..2,
+                        0..self.num_heads,
+                        0..self.head_dim,
+                    ])
+                    .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                (
+                    apply_rms_norm_and_rope_single(
+                        q,
+                        self.q_rms_norm.as_ref(),
+                        self.use_rope,
+                        resolution,
+                        self.head_dim,
+                        self.rope_freq,
+                        token_coords.clone(),
+                        0,
+                    ),
+                    apply_rms_norm_and_rope_single(
+                        k,
+                        self.k_rms_norm.as_ref(),
+                        self.use_rope,
+                        resolution,
+                        self.head_dim,
+                        self.rope_freq,
+                        token_coords,
+                        0,
+                    ),
+                )
+            }
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            {
+                let q = qkv
+                    .clone()
+                    .slice([
+                        0..batch,
+                        0..tokens,
+                        0..1,
+                        0..self.num_heads,
+                        0..self.head_dim,
+                    ])
+                    .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                let k = qkv
+                    .slice([
+                        0..batch,
+                        0..tokens,
+                        1..2,
+                        0..self.num_heads,
+                        0..self.head_dim,
+                    ])
+                    .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                (
+                    apply_rms_norm_and_rope_single(
+                        q,
+                        self.q_rms_norm.as_ref(),
+                        self.use_rope,
+                        resolution,
+                        self.head_dim,
+                        self.rope_freq,
+                        token_coords.clone(),
+                        0,
+                    ),
+                    apply_rms_norm_and_rope_single(
+                        k,
+                        self.k_rms_norm.as_ref(),
+                        self.use_rope,
+                        resolution,
+                        self.head_dim,
+                        self.rope_freq,
+                        token_coords,
+                        0,
+                    ),
+                )
+            }
         };
+        record_sparse_flow_detail(
+            SparseFlowOpDetailKind::SelfNormRope,
+            elapsed_ns(norm_rope_start),
+        );
 
+        let kernel_start = Instant::now();
         let out = scaled_dot_product_attention(q, k, v, self.head_dim);
-        linear_forward_stable(&self.to_out, out.reshape([batch, tokens, channels]))
+        record_sparse_flow_detail(SparseFlowOpDetailKind::SelfKernel, elapsed_ns(kernel_start));
+        let out_start = Instant::now();
+        let out = linear_forward_attention_to_dtype(
+            &self.to_out,
+            out.reshape([batch, tokens, channels]),
+            x_dtype,
+            self.attention_projection_f16,
+        );
+        record_sparse_flow_detail(SparseFlowOpDetailKind::SelfOut, elapsed_ns(out_start));
+        out
     }
 
     fn forward_chunked_stream(
@@ -1487,6 +2620,12 @@ where
         token_coords: Option<Tensor<B, 2, Int>>,
     ) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
+        let x_dtype = x.dtype().into();
+        let sync_profile_device = if sparse_flow_sync_profile_enabled() && tokens >= 1024 {
+            Some(x.device())
+        } else {
+            None
+        };
         let kv_chunk_tokens = sparse_flow_self_attn_kv_chunk_tokens(tokens);
         let backend_name = std::any::type_name::<B>();
         let module_kernel = attention_uses_module_kernel::<B>();
@@ -1516,7 +2655,13 @@ where
             query_chunk_tokens = tokens.max(1);
             kv_chunk_tokens = tokens.max(1);
         } else if module_kernel {
-            let module_chunk_cap = sparse_flow_module_attention_chunk_cap(tokens);
+            let module_chunk_cap = sparse_flow_module_attention_chunk_cap_for_shape(
+                batch,
+                self.num_heads,
+                tokens,
+                tokens,
+                self.head_dim,
+            );
             if module_non_fusion {
                 // Raw CubeBackend module attention should stay on flash kernels.
                 // Avoid logits-budget downscaling here so moderate token counts
@@ -1541,6 +2686,245 @@ where
             }
         }
 
+        let module_attention_dtype = if module_kernel {
+            Some(sparse_flow_module_attention_dtype_for_shape(
+                batch,
+                self.num_heads,
+                tokens,
+                self.head_dim,
+            ))
+        } else {
+            None
+        };
+
+        if module_kernel
+            && module_non_fusion
+            && reuse_qkv
+            && tokens >= 16_384
+            && tokens <= sparse_flow_linear_chunk_tokens_for_backend::<B>(tokens)
+        {
+            let qkv_start = Instant::now();
+            let qkv =
+                linear_forward_attention(&self.to_qkv, x.clone(), self.attention_projection_f16)
+                    .reshape([batch, tokens, 3, self.num_heads, self.head_dim]);
+            maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+            record_sparse_flow_detail(SparseFlowOpDetailKind::SelfQkv, elapsed_ns(qkv_start));
+
+            let norm_rope_start = Instant::now();
+            let attention_dtype = module_attention_dtype
+                .expect("module attention dtype should be selected for module kernel");
+            let module_layout_qkv = {
+                #[cfg(feature = "runtime-model-wgpu")]
+                {
+                    maybe_apply_qkv_module_rms_norm_and_rope_from_qkv(
+                        qkv.clone(),
+                        self.q_rms_norm.as_ref(),
+                        self.k_rms_norm.as_ref(),
+                        self.use_rope,
+                        self.rope_freq,
+                        token_coords.clone(),
+                        0,
+                    )
+                }
+                #[cfg(not(feature = "runtime-model-wgpu"))]
+                {
+                    None
+                }
+            };
+            let (q_full, k_full, v_full) = if let Some((q, k, v)) = module_layout_qkv {
+                record_sparse_flow_detail(
+                    SparseFlowOpDetailKind::SelfNormRope,
+                    elapsed_ns(norm_rope_start),
+                );
+                let cat_start = Instant::now();
+                let q = tensor_cast_float_4d_if_needed(q, attention_dtype);
+                let k = tensor_cast_float_4d_if_needed(k, attention_dtype);
+                let v = tensor_cast_float_4d_if_needed(v, attention_dtype);
+                maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+                record_sparse_flow_detail(SparseFlowOpDetailKind::SelfCat, elapsed_ns(cat_start));
+                (q, k, v)
+            } else {
+                let v = qkv
+                    .clone()
+                    .slice([
+                        0..batch,
+                        0..tokens,
+                        2..3,
+                        0..self.num_heads,
+                        0..self.head_dim,
+                    ])
+                    .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                let (q, k) = {
+                    #[cfg(feature = "runtime-model-wgpu")]
+                    if let Some((q, k)) = maybe_apply_qk_rms_norm_and_rope_from_qkv(
+                        qkv.clone(),
+                        self.q_rms_norm.as_ref(),
+                        self.k_rms_norm.as_ref(),
+                        self.use_rope,
+                        self.rope_freq,
+                        token_coords.clone(),
+                        0,
+                    ) {
+                        (q, k)
+                    } else {
+                        let q = qkv
+                            .clone()
+                            .slice([
+                                0..batch,
+                                0..tokens,
+                                0..1,
+                                0..self.num_heads,
+                                0..self.head_dim,
+                            ])
+                            .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                        let k = qkv
+                            .slice([
+                                0..batch,
+                                0..tokens,
+                                1..2,
+                                0..self.num_heads,
+                                0..self.head_dim,
+                            ])
+                            .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                        (
+                            apply_rms_norm_and_rope_single(
+                                q,
+                                self.q_rms_norm.as_ref(),
+                                self.use_rope,
+                                resolution,
+                                self.head_dim,
+                                self.rope_freq,
+                                token_coords.clone(),
+                                0,
+                            ),
+                            apply_rms_norm_and_rope_single(
+                                k,
+                                self.k_rms_norm.as_ref(),
+                                self.use_rope,
+                                resolution,
+                                self.head_dim,
+                                self.rope_freq,
+                                token_coords.clone(),
+                                0,
+                            ),
+                        )
+                    }
+                    #[cfg(not(feature = "runtime-model-wgpu"))]
+                    {
+                        let q = qkv
+                            .clone()
+                            .slice([
+                                0..batch,
+                                0..tokens,
+                                0..1,
+                                0..self.num_heads,
+                                0..self.head_dim,
+                            ])
+                            .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                        let k = qkv
+                            .slice([
+                                0..batch,
+                                0..tokens,
+                                1..2,
+                                0..self.num_heads,
+                                0..self.head_dim,
+                            ])
+                            .reshape([batch, tokens, self.num_heads, self.head_dim]);
+                        (
+                            apply_rms_norm_and_rope_single(
+                                q,
+                                self.q_rms_norm.as_ref(),
+                                self.use_rope,
+                                resolution,
+                                self.head_dim,
+                                self.rope_freq,
+                                token_coords.clone(),
+                                0,
+                            ),
+                            apply_rms_norm_and_rope_single(
+                                k,
+                                self.k_rms_norm.as_ref(),
+                                self.use_rope,
+                                resolution,
+                                self.head_dim,
+                                self.rope_freq,
+                                token_coords.clone(),
+                                0,
+                            ),
+                        )
+                    }
+                };
+                maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+                record_sparse_flow_detail(
+                    SparseFlowOpDetailKind::SelfNormRope,
+                    elapsed_ns(norm_rope_start),
+                );
+
+                let cat_start = Instant::now();
+                let q_full = tensor_cast_float_4d_if_needed(
+                    force_contiguous_4d(q.permute([0, 2, 1, 3])),
+                    attention_dtype,
+                );
+                let k_full = tensor_cast_float_4d_if_needed(
+                    force_contiguous_4d(k.permute([0, 2, 1, 3])),
+                    attention_dtype,
+                );
+                let v_full = tensor_cast_float_4d_if_needed(
+                    force_contiguous_4d(v.permute([0, 2, 1, 3])),
+                    attention_dtype,
+                );
+                record_sparse_flow_detail(SparseFlowOpDetailKind::SelfCat, elapsed_ns(cat_start));
+                (q_full, k_full, v_full)
+            };
+
+            if attention_debug_enabled() && tokens >= 1024 {
+                eprintln!(
+                    "burn_trellis: attn chunked backend={backend_name} impl=flash_attention(module_attention_full_qkv) q_chunk={query_chunk_tokens} tokens={tokens}"
+                );
+            }
+
+            let mut attn_chunks = Vec::new();
+            let mut q_start = 0usize;
+            while q_start < tokens {
+                let q_end = (q_start + query_chunk_tokens).min(tokens);
+                let q_tokens = q_end - q_start;
+                let q_chunk = q_full.clone().slice([
+                    0..batch,
+                    0..self.num_heads,
+                    q_start..q_end,
+                    0..self.head_dim,
+                ]);
+                let kernel_start = Instant::now();
+                let out =
+                    sparse_flow_module_attention_prepared(q_chunk, k_full.clone(), v_full.clone())
+                        .permute([0, 2, 1, 3])
+                        .reshape([batch, q_tokens, channels]);
+                maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+                record_sparse_flow_detail(
+                    SparseFlowOpDetailKind::SelfKernel,
+                    elapsed_ns(kernel_start),
+                );
+                attn_chunks.push(out);
+                q_start = q_end;
+            }
+
+            let cat_start = Instant::now();
+            let attn_out = Tensor::cat(attn_chunks, 1);
+            maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+            record_sparse_flow_detail(SparseFlowOpDetailKind::SelfCat, elapsed_ns(cat_start));
+
+            let out_start = Instant::now();
+            let out = linear_forward_attention_to_dtype(
+                &self.to_out,
+                attn_out,
+                x_dtype,
+                self.attention_projection_f16,
+            );
+            maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+            record_sparse_flow_detail(SparseFlowOpDetailKind::SelfOut, elapsed_ns(out_start));
+            return tensor_cast_float_3d_if_needed(out, x_dtype);
+        }
+
         let mut k_chunks: Vec<Tensor<B, 4>> = Vec::new();
         let mut v_chunks: Vec<Tensor<B, 4>> = Vec::new();
         let mut q_chunks: Vec<Tensor<B, 4>> = Vec::new();
@@ -1548,23 +2932,11 @@ where
         while kv_start < tokens {
             let kv_end = (kv_start + kv_chunk_tokens).min(tokens);
             let x_chunk = x.clone().slice([0..batch, kv_start..kv_end, 0..channels]);
-            let qkv = linear_forward_stable(&self.to_qkv, x_chunk).reshape([
-                batch,
-                kv_end - kv_start,
-                3,
-                self.num_heads,
-                self.head_dim,
-            ]);
-            let mut k = qkv
-                .clone()
-                .slice([
-                    0..batch,
-                    0..(kv_end - kv_start),
-                    1..2,
-                    0..self.num_heads,
-                    0..self.head_dim,
-                ])
-                .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
+            let qkv_start = Instant::now();
+            let qkv =
+                linear_forward_attention(&self.to_qkv, x_chunk, self.attention_projection_f16)
+                    .reshape([batch, kv_end - kv_start, 3, self.num_heads, self.head_dim]);
+            record_sparse_flow_detail(SparseFlowOpDetailKind::SelfQkv, elapsed_ns(qkv_start));
             let v = qkv
                 .clone()
                 .slice([
@@ -1575,50 +2947,139 @@ where
                     0..self.head_dim,
                 ])
                 .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
-            let mut q = qkv
-                .slice([
-                    0..batch,
-                    0..(kv_end - kv_start),
-                    0..1,
-                    0..self.num_heads,
-                    0..self.head_dim,
-                ])
-                .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
 
-            if let Some(norm) = self.k_rms_norm.as_ref() {
-                k = norm.forward(k);
-            }
-            if let Some(norm) = self.q_rms_norm.as_ref() {
-                q = norm.forward(q);
-            }
-            if self.use_rope {
-                k = apply_rope_single(
-                    k,
-                    resolution,
-                    self.head_dim,
+            let norm_rope_start = Instant::now();
+            let (q, k) = {
+                #[cfg(feature = "runtime-model-wgpu")]
+                if let Some((q, k)) = maybe_apply_qk_rms_norm_and_rope_from_qkv(
+                    qkv.clone(),
+                    self.q_rms_norm.as_ref(),
+                    self.k_rms_norm.as_ref(),
+                    self.use_rope,
                     self.rope_freq,
                     token_coords.clone(),
                     kv_start,
-                );
-                q = apply_rope_single(
-                    q,
-                    resolution,
-                    self.head_dim,
-                    self.rope_freq,
-                    token_coords.clone(),
-                    kv_start,
-                );
-            }
+                ) {
+                    (q, k)
+                } else {
+                    let k = qkv
+                        .clone()
+                        .slice([
+                            0..batch,
+                            0..(kv_end - kv_start),
+                            1..2,
+                            0..self.num_heads,
+                            0..self.head_dim,
+                        ])
+                        .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
+                    let q = qkv
+                        .slice([
+                            0..batch,
+                            0..(kv_end - kv_start),
+                            0..1,
+                            0..self.num_heads,
+                            0..self.head_dim,
+                        ])
+                        .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
+                    (
+                        apply_rms_norm_and_rope_single(
+                            q,
+                            self.q_rms_norm.as_ref(),
+                            self.use_rope,
+                            resolution,
+                            self.head_dim,
+                            self.rope_freq,
+                            token_coords.clone(),
+                            kv_start,
+                        ),
+                        apply_rms_norm_and_rope_single(
+                            k,
+                            self.k_rms_norm.as_ref(),
+                            self.use_rope,
+                            resolution,
+                            self.head_dim,
+                            self.rope_freq,
+                            token_coords.clone(),
+                            kv_start,
+                        ),
+                    )
+                }
+                #[cfg(not(feature = "runtime-model-wgpu"))]
+                {
+                    let k = qkv
+                        .clone()
+                        .slice([
+                            0..batch,
+                            0..(kv_end - kv_start),
+                            1..2,
+                            0..self.num_heads,
+                            0..self.head_dim,
+                        ])
+                        .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
+                    let q = qkv
+                        .slice([
+                            0..batch,
+                            0..(kv_end - kv_start),
+                            0..1,
+                            0..self.num_heads,
+                            0..self.head_dim,
+                        ])
+                        .reshape([batch, kv_end - kv_start, self.num_heads, self.head_dim]);
+                    (
+                        apply_rms_norm_and_rope_single(
+                            q,
+                            self.q_rms_norm.as_ref(),
+                            self.use_rope,
+                            resolution,
+                            self.head_dim,
+                            self.rope_freq,
+                            token_coords.clone(),
+                            kv_start,
+                        ),
+                        apply_rms_norm_and_rope_single(
+                            k,
+                            self.k_rms_norm.as_ref(),
+                            self.use_rope,
+                            resolution,
+                            self.head_dim,
+                            self.rope_freq,
+                            token_coords.clone(),
+                            kv_start,
+                        ),
+                    )
+                }
+            };
+            record_sparse_flow_detail(
+                SparseFlowOpDetailKind::SelfNormRope,
+                elapsed_ns(norm_rope_start),
+            );
 
-            k_chunks.push(k.permute([0, 2, 1, 3]));
-            v_chunks.push(v.permute([0, 2, 1, 3]));
+            let k = k.permute([0, 2, 1, 3]);
+            let v = v.permute([0, 2, 1, 3]);
+            let (k, v) = if let Some(dtype) = module_attention_dtype {
+                (
+                    tensor_cast_float_4d_if_needed(k, dtype),
+                    tensor_cast_float_4d_if_needed(v, dtype),
+                )
+            } else {
+                (k, v)
+            };
+            k_chunks.push(k);
+            v_chunks.push(v);
             if reuse_qkv {
-                q_chunks.push(q.permute([0, 2, 1, 3]));
+                let q = q.permute([0, 2, 1, 3]);
+                let q = if let Some(dtype) = module_attention_dtype {
+                    tensor_cast_float_4d_if_needed(q, dtype)
+                } else {
+                    q
+                };
+                q_chunks.push(q);
             }
             kv_start = kv_end;
         }
 
         if attention_uses_module_kernel::<B>() {
+            let cat_start = Instant::now();
             let k_full = if k_chunks.len() == 1 {
                 k_chunks[0].clone()
             } else {
@@ -1629,6 +3090,17 @@ where
             } else {
                 Tensor::cat(v_chunks.clone(), 2)
             };
+            let attention_dtype = sparse_flow_module_attention_dtype_for_shape(
+                batch,
+                self.num_heads,
+                tokens,
+                self.head_dim,
+            );
+            let k_full =
+                force_contiguous_4d(tensor_cast_float_4d_if_needed(k_full, attention_dtype));
+            let v_full =
+                force_contiguous_4d(tensor_cast_float_4d_if_needed(v_full, attention_dtype));
+            record_sparse_flow_detail(SparseFlowOpDetailKind::SelfCat, elapsed_ns(cat_start));
             if attention_debug_enabled() && tokens >= 1024 {
                 eprintln!(
                     "burn_trellis: attn chunked backend={backend_name} impl=flash_attention(module_attention) q_chunk={query_chunk_tokens} kv_chunk={kv_chunk_tokens} tokens={tokens} reuse_qkv={reuse_qkv} full={module_full_attention}"
@@ -1638,30 +3110,49 @@ where
             if reuse_qkv {
                 for q in q_chunks.into_iter() {
                     let q_tokens = q.dims()[2];
-                    let out = attention(
-                        q,
-                        k_full.clone(),
-                        v_full.clone(),
-                        None,
-                        None,
-                        AttentionModuleOptions::default(),
-                    )
-                    .permute([0, 2, 1, 3])
-                    .reshape([batch, q_tokens, channels]);
-                    out_chunks.push(linear_forward_stable(&self.to_out, out));
+                    let kernel_start = Instant::now();
+                    let out =
+                        sparse_flow_module_attention_prepared(q, k_full.clone(), v_full.clone())
+                            .permute([0, 2, 1, 3])
+                            .reshape([batch, q_tokens, channels]);
+                    record_sparse_flow_detail(
+                        SparseFlowOpDetailKind::SelfKernel,
+                        elapsed_ns(kernel_start),
+                    );
+                    let out_start = Instant::now();
+                    out_chunks.push(linear_forward_attention_to_dtype(
+                        &self.to_out,
+                        out,
+                        x_dtype,
+                        self.attention_projection_f16,
+                    ));
+                    record_sparse_flow_detail(
+                        SparseFlowOpDetailKind::SelfOut,
+                        elapsed_ns(out_start),
+                    );
                 }
             } else {
                 let mut q_start = 0usize;
                 while q_start < tokens {
                     let q_end = (q_start + query_chunk_tokens).min(tokens);
                     let x_chunk = x.clone().slice([0..batch, q_start..q_end, 0..channels]);
-                    let qkv = linear_forward_stable(&self.to_qkv, x_chunk).reshape([
+                    let qkv_start = Instant::now();
+                    let qkv = linear_forward_attention(
+                        &self.to_qkv,
+                        x_chunk,
+                        self.attention_projection_f16,
+                    )
+                    .reshape([
                         batch,
                         q_end - q_start,
                         3,
                         self.num_heads,
                         self.head_dim,
                     ]);
+                    record_sparse_flow_detail(
+                        SparseFlowOpDetailKind::SelfQkv,
+                        elapsed_ns(qkv_start),
+                    );
                     let mut q = qkv
                         .slice([
                             0..batch,
@@ -1671,40 +3162,57 @@ where
                             0..self.head_dim,
                         ])
                         .reshape([batch, q_end - q_start, self.num_heads, self.head_dim]);
-                    if let Some(norm) = self.q_rms_norm.as_ref() {
-                        q = norm.forward(q);
-                    }
-                    if self.use_rope {
-                        q = apply_rope_single(
-                            q,
-                            resolution,
-                            self.head_dim,
-                            self.rope_freq,
-                            token_coords.clone(),
-                            q_start,
-                        );
-                    }
-                    let out = attention(
-                        q.permute([0, 2, 1, 3]),
-                        k_full.clone(),
-                        v_full.clone(),
-                        None,
-                        None,
-                        AttentionModuleOptions::default(),
-                    )
-                    .permute([0, 2, 1, 3])
-                    .reshape([batch, q_end - q_start, channels]);
-                    out_chunks.push(linear_forward_stable(&self.to_out, out));
+                    let norm_rope_start = Instant::now();
+                    q = apply_rms_norm_and_rope_single(
+                        q,
+                        self.q_rms_norm.as_ref(),
+                        self.use_rope,
+                        resolution,
+                        self.head_dim,
+                        self.rope_freq,
+                        token_coords.clone(),
+                        q_start,
+                    );
+                    record_sparse_flow_detail(
+                        SparseFlowOpDetailKind::SelfNormRope,
+                        elapsed_ns(norm_rope_start),
+                    );
+                    let kernel_start = Instant::now();
+                    let q =
+                        tensor_cast_float_4d_if_needed(q.permute([0, 2, 1, 3]), attention_dtype);
+                    let out =
+                        sparse_flow_module_attention_prepared(q, k_full.clone(), v_full.clone())
+                            .permute([0, 2, 1, 3])
+                            .reshape([batch, q_end - q_start, channels]);
+                    record_sparse_flow_detail(
+                        SparseFlowOpDetailKind::SelfKernel,
+                        elapsed_ns(kernel_start),
+                    );
+                    let out_start = Instant::now();
+                    out_chunks.push(linear_forward_attention_to_dtype(
+                        &self.to_out,
+                        out,
+                        x_dtype,
+                        self.attention_projection_f16,
+                    ));
+                    record_sparse_flow_detail(
+                        SparseFlowOpDetailKind::SelfOut,
+                        elapsed_ns(out_start),
+                    );
                     q_start = q_end;
                 }
             }
-            return Tensor::cat(out_chunks, 1);
+            let cat_start = Instant::now();
+            let out = Tensor::cat(out_chunks, 1);
+            record_sparse_flow_detail(SparseFlowOpDetailKind::SelfCat, elapsed_ns(cat_start));
+            return tensor_cast_float_3d_if_needed(out, x_dtype);
         }
 
         let mut out_chunks = Vec::new();
         if reuse_qkv {
             for q in q_chunks.into_iter() {
                 let q_tokens = q.dims()[2];
+                let kernel_start = Instant::now();
                 let out = scaled_dot_product_attention_stream_chunked_keys(
                     q,
                     k_chunks.as_slice(),
@@ -1713,20 +3221,29 @@ where
                 )
                 .permute([0, 2, 1, 3])
                 .reshape([batch, q_tokens, channels]);
-                out_chunks.push(linear_forward_stable(&self.to_out, out));
+                record_sparse_flow_detail(
+                    SparseFlowOpDetailKind::SelfKernel,
+                    elapsed_ns(kernel_start),
+                );
+                let out_start = Instant::now();
+                out_chunks.push(linear_forward_attention_to_dtype(
+                    &self.to_out,
+                    out,
+                    x_dtype,
+                    self.attention_projection_f16,
+                ));
+                record_sparse_flow_detail(SparseFlowOpDetailKind::SelfOut, elapsed_ns(out_start));
             }
         } else {
             let mut q_start = 0usize;
             while q_start < tokens {
                 let q_end = (q_start + query_chunk_tokens).min(tokens);
                 let x_chunk = x.clone().slice([0..batch, q_start..q_end, 0..channels]);
-                let qkv = linear_forward_stable(&self.to_qkv, x_chunk).reshape([
-                    batch,
-                    q_end - q_start,
-                    3,
-                    self.num_heads,
-                    self.head_dim,
-                ]);
+                let qkv_start = Instant::now();
+                let qkv =
+                    linear_forward_attention(&self.to_qkv, x_chunk, self.attention_projection_f16)
+                        .reshape([batch, q_end - q_start, 3, self.num_heads, self.head_dim]);
+                record_sparse_flow_detail(SparseFlowOpDetailKind::SelfQkv, elapsed_ns(qkv_start));
                 let mut q = qkv
                     .slice([
                         0..batch,
@@ -1736,20 +3253,23 @@ where
                         0..self.head_dim,
                     ])
                     .reshape([batch, q_end - q_start, self.num_heads, self.head_dim]);
-                if let Some(norm) = self.q_rms_norm.as_ref() {
-                    q = norm.forward(q);
-                }
-                if self.use_rope {
-                    q = apply_rope_single(
-                        q,
-                        resolution,
-                        self.head_dim,
-                        self.rope_freq,
-                        token_coords.clone(),
-                        q_start,
-                    );
-                }
+                let norm_rope_start = Instant::now();
+                q = apply_rms_norm_and_rope_single(
+                    q,
+                    self.q_rms_norm.as_ref(),
+                    self.use_rope,
+                    resolution,
+                    self.head_dim,
+                    self.rope_freq,
+                    token_coords.clone(),
+                    q_start,
+                );
+                record_sparse_flow_detail(
+                    SparseFlowOpDetailKind::SelfNormRope,
+                    elapsed_ns(norm_rope_start),
+                );
 
+                let kernel_start = Instant::now();
                 let out = scaled_dot_product_attention_stream_chunked_keys(
                     q.permute([0, 2, 1, 3]),
                     k_chunks.as_slice(),
@@ -1758,23 +3278,42 @@ where
                 )
                 .permute([0, 2, 1, 3])
                 .reshape([batch, q_end - q_start, channels]);
+                record_sparse_flow_detail(
+                    SparseFlowOpDetailKind::SelfKernel,
+                    elapsed_ns(kernel_start),
+                );
 
-                out_chunks.push(linear_forward_stable(&self.to_out, out));
+                let out_start = Instant::now();
+                out_chunks.push(linear_forward_attention_to_dtype(
+                    &self.to_out,
+                    out,
+                    x_dtype,
+                    self.attention_projection_f16,
+                ));
+                record_sparse_flow_detail(SparseFlowOpDetailKind::SelfOut, elapsed_ns(out_start));
                 q_start = q_end;
             }
         }
 
-        Tensor::cat(out_chunks, 1)
+        let cat_start = Instant::now();
+        let out = Tensor::cat(out_chunks, 1);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::SelfCat, elapsed_ns(cat_start));
+        tensor_cast_float_3d_if_needed(out, x_dtype)
     }
 }
 
-impl<B: Backend> CrossAttention<B> {
+impl<B: Backend> CrossAttention<B>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
     pub fn new(
         device: &B::Device,
         channels: usize,
         ctx_channels: usize,
         num_heads: usize,
         qk_rms_norm: bool,
+        attention_projection_f16: bool,
     ) -> Self {
         let head_dim = channels / num_heads.max(1);
         let to_q = nn::LinearConfig::new(channels, channels)
@@ -1804,23 +3343,20 @@ impl<B: Backend> CrossAttention<B> {
             k_rms_norm,
             num_heads,
             head_dim,
+            attention_projection_f16,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>, context: Tensor<B, 3>) -> Tensor<B, 3> {
-        let (k, v) = self.project_context_kv(context);
-        self.forward_from_projected_kv(x, k, v)
+        let kv = self.project_context_kv(context);
+        self.forward_from_projected_kv(x, &kv)
     }
 
-    fn project_context_kv(&self, context: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    fn project_context_kv(&self, context: Tensor<B, 3>) -> CrossAttentionProjectedKv<B> {
         let [batch, ctx_tokens, _ctx_channels] = context.dims();
-        let kv = linear_forward_stable(&self.to_kv, context).reshape([
-            batch,
-            ctx_tokens,
-            2,
-            self.num_heads,
-            self.head_dim,
-        ]);
+        let kv_start = Instant::now();
+        let kv = linear_forward_attention(&self.to_kv, context, self.attention_projection_f16)
+            .reshape([batch, ctx_tokens, 2, self.num_heads, self.head_dim]);
         let k = kv
             .clone()
             .slice([
@@ -1845,45 +3381,93 @@ impl<B: Backend> CrossAttention<B> {
         } else {
             k
         };
-        (k, v)
+        let (module_k, module_v, module_dtype) = if attention_uses_module_kernel::<B>() {
+            let dtype = sparse_flow_module_attention_dtype_for_shape(
+                batch,
+                self.num_heads,
+                ctx_tokens,
+                self.head_dim,
+            );
+            (
+                Some(force_contiguous_4d(tensor_cast_float_4d_if_needed(
+                    k.clone().permute([0, 2, 1, 3]),
+                    dtype,
+                ))),
+                Some(force_contiguous_4d(tensor_cast_float_4d_if_needed(
+                    v.clone().permute([0, 2, 1, 3]),
+                    dtype,
+                ))),
+                Some(dtype),
+            )
+        } else {
+            (None, None, None)
+        };
+        record_sparse_flow_detail(SparseFlowOpDetailKind::CrossKv, elapsed_ns(kv_start));
+        CrossAttentionProjectedKv {
+            k,
+            v,
+            module_k,
+            module_v,
+            module_dtype,
+        }
     }
 
     fn forward_from_projected_kv(
         &self,
         x: Tensor<B, 3>,
-        k: Tensor<B, 4>,
-        v: Tensor<B, 4>,
+        kv: &CrossAttentionProjectedKv<B>,
     ) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
+        let x_dtype = x.dtype().into();
         if sparse_flow_chunked_forward_for_backend::<B>(tokens) {
-            return self.forward_chunked_projected_kv(x, k, v);
+            return self.forward_chunked_projected_kv(x, kv);
         }
 
-        let mut q = linear_forward_stable(&self.to_q, x).reshape([
-            batch,
-            tokens,
-            self.num_heads,
-            self.head_dim,
-        ]);
+        let q_start = Instant::now();
+        let mut q = linear_forward_attention(&self.to_q, x, self.attention_projection_f16)
+            .reshape([batch, tokens, self.num_heads, self.head_dim]);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::CrossQ, elapsed_ns(q_start));
+        let norm_start = Instant::now();
         if let Some(norm) = self.q_rms_norm.as_ref() {
             q = norm.forward(q);
         }
+        record_sparse_flow_detail(SparseFlowOpDetailKind::CrossNorm, elapsed_ns(norm_start));
 
-        let out = scaled_dot_product_attention(q, k, v, self.head_dim);
-        linear_forward_stable(&self.to_out, out.reshape([batch, tokens, channels]))
+        let kernel_start = Instant::now();
+        let out = scaled_dot_product_attention(q, kv.k.clone(), kv.v.clone(), self.head_dim);
+        record_sparse_flow_detail(
+            SparseFlowOpDetailKind::CrossKernel,
+            elapsed_ns(kernel_start),
+        );
+        let out_start = Instant::now();
+        let out = linear_forward_attention_to_dtype(
+            &self.to_out,
+            out.reshape([batch, tokens, channels]),
+            x_dtype,
+            self.attention_projection_f16,
+        );
+        record_sparse_flow_detail(SparseFlowOpDetailKind::CrossOut, elapsed_ns(out_start));
+        out
     }
 
     fn forward_chunked_projected_kv(
         &self,
         x: Tensor<B, 3>,
-        k: Tensor<B, 4>,
-        v: Tensor<B, 4>,
+        kv: &CrossAttentionProjectedKv<B>,
     ) -> Tensor<B, 3> {
         let [batch, tokens, channels] = x.dims();
-        let ctx_tokens = k.dims()[1];
+        let x_dtype = x.dtype().into();
+        let ctx_tokens = kv.k.dims()[1];
 
         let backend_name = std::any::type_name::<B>();
-        let use_module_attention = attention_uses_module_kernel::<B>();
+        let use_module_attention = attention_uses_module_kernel::<B>()
+            && !sparse_flow_module_attention_cross_shape_requires_stream(
+                batch,
+                self.num_heads,
+                tokens,
+                ctx_tokens,
+                self.head_dim,
+            );
         let module_non_fusion = attention_uses_non_fusion_module_kernel::<B>();
         let module_full_attention =
             module_non_fusion && sparse_flow_module_attention_prefers_full(tokens);
@@ -1892,7 +3476,13 @@ impl<B: Backend> CrossAttention<B> {
             if module_full_attention {
                 tokens.max(1)
             } else {
-                sparse_flow_module_attention_chunk_cap(tokens)
+                sparse_flow_module_attention_chunk_cap_for_shape(
+                    batch,
+                    self.num_heads,
+                    tokens,
+                    ctx_tokens,
+                    self.head_dim,
+                )
             }
         } else {
             sparse_flow_self_attn_query_chunk_tokens(tokens)
@@ -1918,16 +3508,32 @@ impl<B: Backend> CrossAttention<B> {
             );
         }
 
+        let kv_layout_start = Instant::now();
+        let attention_dtype = kv.module_dtype.unwrap_or_else(|| {
+            sparse_flow_module_attention_dtype_for_shape(
+                batch,
+                self.num_heads,
+                ctx_tokens,
+                self.head_dim,
+            )
+        });
         let k_module = if use_module_attention {
-            Some(k.clone().permute([0, 2, 1, 3]))
+            Some(kv.module_k.clone().unwrap_or_else(|| {
+                tensor_cast_float_4d_if_needed(kv.k.clone().permute([0, 2, 1, 3]), attention_dtype)
+            }))
         } else {
             None
         };
         let v_module = if use_module_attention {
-            Some(v.clone().permute([0, 2, 1, 3]))
+            Some(kv.module_v.clone().unwrap_or_else(|| {
+                tensor_cast_float_4d_if_needed(kv.v.clone().permute([0, 2, 1, 3]), attention_dtype)
+            }))
         } else {
             None
         };
+        if use_module_attention {
+            record_sparse_flow_detail(SparseFlowOpDetailKind::CrossKv, elapsed_ns(kv_layout_start));
+        }
 
         let mut out_chunks = Vec::new();
         let mut start = 0usize;
@@ -1946,36 +3552,59 @@ impl<B: Backend> CrossAttention<B> {
                 );
             }
             let x_chunk = x.clone().slice([0..batch, start..end, 0..channels]);
-            let mut q = linear_forward_stable(&self.to_q, x_chunk).reshape([
-                batch,
-                chunk_tokens,
-                self.num_heads,
-                self.head_dim,
-            ]);
-            if let Some(norm) = self.q_rms_norm.as_ref() {
-                q = norm.forward(q);
-            }
+            let q_start = Instant::now();
+            let mut q =
+                linear_forward_attention(&self.to_q, x_chunk, self.attention_projection_f16)
+                    .reshape([batch, chunk_tokens, self.num_heads, self.head_dim]);
+            record_sparse_flow_detail(SparseFlowOpDetailKind::CrossQ, elapsed_ns(q_start));
+            let norm_start = Instant::now();
+            let (q_module, q_dense) = if use_module_attention {
+                if let Some(norm) = self.q_rms_norm.as_ref() {
+                    q = norm.forward(q);
+                } else {
+                }
+                (
+                    Some(tensor_cast_float_4d_if_needed(
+                        q.permute([0, 2, 1, 3]),
+                        attention_dtype,
+                    )),
+                    None,
+                )
+            } else {
+                if let Some(norm) = self.q_rms_norm.as_ref() {
+                    q = norm.forward(q);
+                }
+                (None, Some(q))
+            };
+            record_sparse_flow_detail(SparseFlowOpDetailKind::CrossNorm, elapsed_ns(norm_start));
 
             let attn_start = Instant::now();
             let out = if use_module_attention {
-                attention(
-                    q.permute([0, 2, 1, 3]),
+                sparse_flow_module_attention_prepared(
+                    q_module.expect("module Q must be present"),
                     k_module.clone().expect("module K must be present"),
                     v_module.clone().expect("module V must be present"),
-                    None,
-                    None,
-                    AttentionModuleOptions::default(),
                 )
                 .permute([0, 2, 1, 3])
                 .reshape([batch, chunk_tokens, channels])
             } else {
-                scaled_dot_product_attention(q, k.clone(), v.clone(), self.head_dim).reshape([
-                    batch,
-                    chunk_tokens,
-                    channels,
-                ])
+                scaled_dot_product_attention(
+                    q_dense.expect("dense Q must be present"),
+                    kv.k.clone(),
+                    kv.v.clone(),
+                    self.head_dim,
+                )
+                .reshape([batch, chunk_tokens, channels])
             };
-            out_chunks.push(linear_forward_stable(&self.to_out, out));
+            record_sparse_flow_detail(SparseFlowOpDetailKind::CrossKernel, elapsed_ns(attn_start));
+            let out_start = Instant::now();
+            out_chunks.push(linear_forward_attention_to_dtype(
+                &self.to_out,
+                out,
+                x_dtype,
+                self.attention_projection_f16,
+            ));
+            record_sparse_flow_detail(SparseFlowOpDetailKind::CrossOut, elapsed_ns(out_start));
             if debug_chunks && (chunk_idx % 8 == 0 || chunk_idx + 1 == total_chunks) {
                 eprintln!(
                     "burn_trellis: cross-attn chunk {}/{} done ({:.2} ms)",
@@ -1988,13 +3617,19 @@ impl<B: Backend> CrossAttention<B> {
             chunk_idx += 1;
         }
 
-        Tensor::cat(out_chunks, 1)
+        let cat_start = Instant::now();
+        let out = Tensor::cat(out_chunks, 1);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::CrossCat, elapsed_ns(cat_start));
+        tensor_cast_float_3d_if_needed(out, x_dtype)
     }
 }
 
 impl<B: Backend> ModulatedTransformerCrossBlock<B>
 where
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -2007,6 +3642,7 @@ where
         rope_freq: [f32; 2],
         qk_rms_norm: bool,
         qk_rms_norm_cross: bool,
+        attention_projection_f16: bool,
     ) -> Self {
         let self_attn = SelfAttention::new(
             device,
@@ -2015,9 +3651,16 @@ where
             use_rope,
             rope_freq,
             qk_rms_norm,
+            attention_projection_f16,
         );
-        let cross_attn =
-            CrossAttention::new(device, channels, ctx_channels, num_heads, qk_rms_norm_cross);
+        let cross_attn = CrossAttention::new(
+            device,
+            channels,
+            ctx_channels,
+            num_heads,
+            qk_rms_norm_cross,
+            attention_projection_f16,
+        );
         let mlp = FeedForwardNet::new(device, channels, mlp_ratio);
         let norm2 = nn::LayerNormConfig::new(channels)
             .with_epsilon(LAYER_NORM_EPS as f64)
@@ -2032,18 +3675,27 @@ where
         }
     }
 
-    pub fn forward(
+    fn forward(
         &self,
         x: Tensor<B, 3>,
         mod_signal: Tensor<B, 2>,
         context: Tensor<B, 3>,
         resolution: usize,
         token_coords: Option<Tensor<B, 2, Int>>,
+        cross_attn_kv: Option<&CrossAttentionProjectedKv<B>>,
     ) -> Tensor<B, 3>
     where
         RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+        RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+        RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+        SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
     {
         let [batch, tokens, channels] = x.dims();
+        let sync_profile_device = if sparse_flow_sync_profile_enabled() && tokens >= 1024 {
+            Some(x.device())
+        } else {
+            None
+        };
         let block_op_debug = attention_debug_enabled() && tokens >= 131_072;
         let mod_bias = self.modulation.val().reshape([1, channels * 6]);
         let mod_signal_dtype: burn::tensor::FloatDType = mod_signal.dtype().into();
@@ -2075,12 +3727,14 @@ where
             .slice([0..batch, (channels * 4)..(channels * 5)])
             .reshape([batch, 1, channels]);
         let gate_mlp = mod_signal
+            .clone()
             .slice([0..batch, (channels * 5)..(channels * 6)])
             .reshape([batch, 1, channels]);
 
-        let h = layer_norm_no_affine(x.clone(), LAYER_NORM_EPS)
-            .mul(scale_msa.add_scalar(1.0))
-            .add(shift_msa);
+        let norm_start = Instant::now();
+        let h = layer_norm_modulated(x.clone(), scale_msa, shift_msa, LAYER_NORM_EPS);
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+        record_sparse_flow_detail(SparseFlowOpDetailKind::BlockNormMod, elapsed_ns(norm_start));
         let self_attn_start = Instant::now();
         let h = if block_op_debug {
             let start = Instant::now();
@@ -2094,38 +3748,61 @@ where
         } else {
             self.self_attn.forward(h, resolution, token_coords.clone())
         };
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         let self_attn_ns = self_attn_start
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
         record_sparse_flow_op(SparseFlowOpKind::SelfAttn, self_attn_ns);
+        let gate_start = Instant::now();
         let h = h.mul(gate_msa);
         let x = x.add(h);
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+        record_sparse_flow_detail(
+            SparseFlowOpDetailKind::BlockGateResidual,
+            elapsed_ns(gate_start),
+        );
 
+        let norm_start = Instant::now();
         let h = layer_norm_affine_stable(x.clone(), &self.norm2, LAYER_NORM_EPS);
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+        record_sparse_flow_detail(
+            SparseFlowOpDetailKind::BlockNormAffine,
+            elapsed_ns(norm_start),
+        );
         let cross_attn_start = Instant::now();
         let x = if block_op_debug {
             let start = Instant::now();
             eprintln!("burn_trellis: flow.block op=cross_attn begin (tokens={tokens})");
-            let out = self.cross_attn.forward(h, context.clone());
+            let out = if let Some(kv) = cross_attn_kv {
+                self.cross_attn.forward_from_projected_kv(h, kv)
+            } else {
+                self.cross_attn.forward(h, context.clone())
+            };
             eprintln!(
                 "burn_trellis: flow.block op=cross_attn done ({:.2} ms)",
                 start.elapsed().as_secs_f64() * 1000.0
             );
             x.add(out)
         } else {
-            let out = self.cross_attn.forward(h, context);
+            let out = if let Some(kv) = cross_attn_kv {
+                self.cross_attn.forward_from_projected_kv(h, kv)
+            } else {
+                self.cross_attn.forward(h, context)
+            };
             x.add(out)
         };
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         let cross_attn_ns = cross_attn_start
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
         record_sparse_flow_op(SparseFlowOpKind::CrossAttn, cross_attn_ns);
 
-        let h = layer_norm_no_affine(x.clone(), LAYER_NORM_EPS)
-            .mul(scale_mlp.add_scalar(1.0))
-            .add(shift_mlp);
+        let norm_start = Instant::now();
+        let h = layer_norm_modulated(x.clone(), scale_mlp, shift_mlp, LAYER_NORM_EPS);
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+        record_sparse_flow_detail(SparseFlowOpDetailKind::BlockNormMod, elapsed_ns(norm_start));
         let mlp_start = Instant::now();
         let h = if block_op_debug {
             let start = Instant::now();
@@ -2139,10 +3816,18 @@ where
         } else {
             self.mlp.forward(h)
         };
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         let mlp_ns = mlp_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         record_sparse_flow_op(SparseFlowOpKind::Mlp, mlp_ns);
+        let gate_start = Instant::now();
         let h = h.mul(gate_mlp);
-        x.add(h)
+        let x = x.add(h);
+        maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
+        record_sparse_flow_detail(
+            SparseFlowOpDetailKind::BlockGateResidual,
+            elapsed_ns(gate_start),
+        );
+        x
     }
 }
 
@@ -2150,6 +3835,9 @@ impl<B: Backend> SparseStructureFlowModel<B>
 where
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
 {
     pub fn new(device: &B::Device, config: SparseStructureFlowConfig) -> Self {
         let num_heads = config.num_heads();
@@ -2165,6 +3853,17 @@ where
         let input_layer = nn::LinearConfig::new(config.in_channels, config.model_channels)
             .with_bias(true)
             .init(device);
+        let attention_projection_f16 = {
+            #[cfg(feature = "runtime-model-wgpu")]
+            {
+                sparse_flow_wgpu_linear_f16_enabled()
+                    && attention_uses_non_fusion_module_kernel::<B>()
+            }
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            {
+                false
+            }
+        };
         let mut blocks = Vec::with_capacity(config.num_blocks);
         for _ in 0..config.num_blocks {
             blocks.push(ModulatedTransformerCrossBlock::new(
@@ -2177,6 +3876,7 @@ where
                 config.rope_freq,
                 config.qk_rms_norm,
                 config.qk_rms_norm_cross,
+                attention_projection_f16,
             ));
         }
         let out_layer = nn::LinearConfig::new(config.model_channels, config.out_channels)
@@ -2196,6 +3896,56 @@ where
         &self.config
     }
 
+    fn prewarm_fast_f16_params(&self, device: &B::Device) {
+        #[cfg(feature = "runtime-model-wgpu")]
+        {
+            if !(sparse_flow_wgpu_linear_f16_enabled()
+                && attention_uses_non_fusion_module_kernel::<B>())
+            {
+                return;
+            }
+            let mut cached = 0usize;
+            for block in &self.blocks {
+                if maybe_cache_linear_f16_wgpu(&block.self_attn.to_qkv) {
+                    cached += 1;
+                }
+                if maybe_cache_linear_f16_wgpu(&block.self_attn.to_out) {
+                    cached += 1;
+                }
+                if maybe_cache_linear_f16_wgpu(&block.cross_attn.to_q) {
+                    cached += 1;
+                }
+                if maybe_cache_linear_f16_wgpu(&block.cross_attn.to_kv) {
+                    cached += 1;
+                }
+                if maybe_cache_linear_f16_wgpu(&block.cross_attn.to_out) {
+                    cached += 1;
+                }
+                if maybe_cache_linear_f16_wgpu(&block.mlp.mlp_0) {
+                    cached += 1;
+                }
+                if maybe_cache_linear_f16_wgpu(&block.mlp.mlp_2) {
+                    cached += 1;
+                }
+            }
+            if cached > 0 {
+                let sync_start = Instant::now();
+                let _ = B::sync(device);
+                if sparse_flow_stage_debug_enabled() {
+                    eprintln!(
+                        "burn_trellis: sparse flow prewarmed {cached} f16 linear parameter sets ({:.2} ms)",
+                        sync_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        {
+            let _ = device;
+        }
+    }
+
+    #[allow(dead_code)]
     fn forward_tokens(
         &self,
         x: Tensor<B, 3>,
@@ -2203,6 +3953,18 @@ where
         cond: Tensor<B, 3>,
         resolution: usize,
         token_coords: Option<Tensor<B, 2, Int>>,
+    ) -> Tensor<B, 3> {
+        self.forward_tokens_with_cross_cache(x, t, cond, resolution, token_coords, None)
+    }
+
+    fn forward_tokens_with_cross_cache(
+        &self,
+        x: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: Tensor<B, 3>,
+        resolution: usize,
+        token_coords: Option<Tensor<B, 2, Int>>,
+        cross_kv_cache: Option<&CrossAttentionKvCache<B>>,
     ) -> Tensor<B, 3> {
         let [_batch, tokens, channels] = x.dims();
         assert_eq!(
@@ -2222,8 +3984,17 @@ where
                 "sparse flow token coords length mismatch"
             );
         }
+        if let Some(cache) = cross_kv_cache {
+            assert_eq!(
+                cache.len(),
+                self.blocks.len(),
+                "sparse flow cross-attention K/V cache block count mismatch"
+            );
+        }
 
-        let mut h = linear_forward_token_chunked(
+        let input_dtype: burn::tensor::FloatDType = x.dtype().into();
+        let model_io_start = Instant::now();
+        let mut h = linear_forward_input_token_chunked(
             &self.input_layer,
             x,
             sparse_flow_linear_chunk_tokens_for_backend::<B>(tokens),
@@ -2232,7 +4003,24 @@ where
         let t_emb = self
             .t_embedder
             .forward(t, self.config.frequency_embedding_size);
-        let mod_signal = linear_forward_stable_2d(&self.ada_ln_modulation, silu(t_emb));
+        let mut mod_signal =
+            linear_forward_stable_2d_reference(&self.ada_ln_modulation, silu(t_emb));
+        let mut cond = cond;
+        if let Some(torso_dtype) = sparse_flow_torso_dtype_for_backend::<B>() {
+            h = tensor_cast_float_3d_if_needed(h, torso_dtype);
+            mod_signal = tensor_cast_float_2d_if_needed(mod_signal, torso_dtype);
+            cond = tensor_cast_float_3d_if_needed(cond, torso_dtype);
+        }
+        let elapsed = elapsed_ns(model_io_start);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::ModelIo, elapsed);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::ModelInput, elapsed);
+
+        let finite_probe = sparse_flow_forward_finite_probe_enabled();
+        if finite_probe {
+            log_sparse_flow_forward_finite_probe("model.input_layer", h.clone());
+            log_sparse_flow_forward_finite_probe("model.mod_signal", mod_signal.clone());
+            log_sparse_flow_forward_finite_probe("model.cond", cond.clone());
+        }
 
         let block_debug = attention_debug_enabled() && tokens >= 131_072;
         for (block_idx, block) in self.blocks.iter().enumerate() {
@@ -2254,7 +4042,14 @@ where
                 cond.clone(),
                 resolution,
                 token_coords.clone(),
+                cross_kv_cache.and_then(|cache| cache.get(block_idx)),
             );
+            if finite_probe {
+                log_sparse_flow_forward_finite_probe(
+                    format!("model.block_{block_idx:02}.out").as_str(),
+                    h.clone(),
+                );
+            }
             if let Some(start) = block_start {
                 eprintln!(
                     "burn_trellis: flow.block {}/{} done ({:.2} ms)",
@@ -2265,15 +4060,65 @@ where
             }
         }
 
+        let model_io_start = Instant::now();
+        let h = tensor_cast_float_3d_if_needed(h, input_dtype);
         let h = layer_norm_no_affine(h, LAYER_NORM_EPS);
-        linear_forward_token_chunked(
+        if finite_probe {
+            log_sparse_flow_forward_finite_probe("model.norm_out", h.clone());
+        }
+        let out = linear_forward_token_chunked_reference(
             &self.out_layer,
             h,
             sparse_flow_linear_chunk_tokens_for_backend::<B>(tokens),
-        )
+        );
+        if finite_probe {
+            log_sparse_flow_forward_finite_probe("model.out", out.clone());
+        }
+        let elapsed = elapsed_ns(model_io_start);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::ModelIo, elapsed);
+        record_sparse_flow_detail(SparseFlowOpDetailKind::ModelOutput, elapsed);
+        out
+    }
+
+    fn project_cross_attention_cache(&self, cond: Tensor<B, 3>) -> CrossAttentionKvCache<B> {
+        let cond = if let Some(torso_dtype) = sparse_flow_torso_dtype_for_backend::<B>() {
+            tensor_cast_float_3d_if_needed(cond, torso_dtype)
+        } else {
+            cond
+        };
+        self.blocks
+            .iter()
+            .map(|block| block.cross_attn.project_context_kv(cond.clone()))
+            .collect()
+    }
+
+    fn cross_attention_cache_estimated_bytes(
+        &self,
+        cond_batches: usize,
+        cond_tokens: usize,
+        condition_count: usize,
+    ) -> usize {
+        cond_batches
+            .checked_mul(cond_tokens)
+            .and_then(|value| value.checked_mul(self.config.model_channels))
+            .and_then(|value| value.checked_mul(2))
+            .and_then(|value| value.checked_mul(self.blocks.len()))
+            .and_then(|value| value.checked_mul(condition_count.max(1)))
+            .and_then(|value| value.checked_mul(core::mem::size_of::<f32>()))
+            .unwrap_or(usize::MAX)
     }
 
     pub fn forward(&self, x: Tensor<B, 5>, t: Tensor<B, 1>, cond: Tensor<B, 3>) -> Tensor<B, 5> {
+        self.forward_with_cross_cache(x, t, cond, None)
+    }
+
+    fn forward_with_cross_cache(
+        &self,
+        x: Tensor<B, 5>,
+        t: Tensor<B, 1>,
+        cond: Tensor<B, 3>,
+        cross_kv_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Tensor<B, 5> {
         let [batch, channels, rx, ry, rz] = x.dims();
         assert_eq!(
             channels, self.config.in_channels,
@@ -2292,8 +4137,17 @@ where
             "sparse flow input resolution mismatch"
         );
         let tokens = self.config.resolution * self.config.resolution * self.config.resolution;
+        let device = x.device();
         let tokens_tensor = x.reshape([batch, channels, tokens]).swap_dims(1, 2);
-        let out_tokens = self.forward_tokens(tokens_tensor, t, cond, self.config.resolution, None);
+        let token_coords = dense_grid_token_coords(self.config.resolution, device);
+        let out_tokens = self.forward_tokens_with_cross_cache(
+            tokens_tensor,
+            t,
+            cond,
+            self.config.resolution,
+            Some(token_coords),
+            cross_kv_cache,
+        );
         out_tokens.swap_dims(1, 2).reshape([
             batch,
             self.config.out_channels,
@@ -2311,7 +4165,26 @@ where
         sparse_resolution: usize,
         token_coords: Tensor<B, 2, Int>,
     ) -> Tensor<B, 3> {
-        self.forward_tokens(x, t, cond, sparse_resolution.max(1), Some(token_coords))
+        self.forward_sparse_with_cross_cache(x, t, cond, sparse_resolution, token_coords, None)
+    }
+
+    fn forward_sparse_with_cross_cache(
+        &self,
+        x: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: Tensor<B, 3>,
+        sparse_resolution: usize,
+        token_coords: Tensor<B, 2, Int>,
+        cross_kv_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Tensor<B, 3> {
+        self.forward_tokens_with_cross_cache(
+            x,
+            t,
+            cond,
+            sparse_resolution.max(1),
+            Some(token_coords),
+            cross_kv_cache,
+        )
     }
 }
 
@@ -2321,6 +4194,9 @@ where
     B::Device: Default,
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
 {
     fn load_from_stem(
         weights_root: &Path,
@@ -2363,9 +4239,10 @@ where
             let mut model = SparseStructureFlowModel::<B>::new(&device, config.clone());
             match load_sparse_model_weights(&mut model, &weights_path) {
                 Ok(()) => {
-                    if sparse_flow_stage_debug_enabled() {
+                    if sparse_flow_weight_probe_enabled() {
                         log_sparse_flow_weight_probe(&model);
                     }
+                    model.prewarm_fast_f16_params(&device);
                     return Ok(Self {
                         config,
                         model,
@@ -2389,9 +4266,80 @@ impl<B: Backend> SparseStructureFlowRuntimeImpl<B>
 where
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
 {
     fn config(&self) -> &SparseStructureFlowConfig {
         &self.config
+    }
+
+    fn prepare_cross_attention_caches(
+        &self,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        sample_cfg: FlowEulerSampleConfig,
+        t_pairs: &[(f32, f32)],
+        stage_label: &str,
+    ) -> (
+        Option<CrossAttentionKvCache<B>>,
+        Option<CrossAttentionKvCache<B>>,
+    ) {
+        if !sparse_flow_cross_kv_cache_enabled_for_backend::<B>() {
+            return (None, None);
+        }
+        let budget = sparse_flow_cross_kv_cache_budget_bytes_for_backend::<B>();
+        if budget == 0 {
+            return (None, None);
+        }
+        let [cond_batches, cond_tokens, _] = cond.dims();
+        let cond_estimated =
+            self.model
+                .cross_attention_cache_estimated_bytes(cond_batches, cond_tokens, 1);
+        if cond_estimated > budget {
+            eprintln!(
+                "burn_trellis: {stage_label} cross-kv cache skipped (estimated={} MiB budget={} MiB)",
+                bytes_to_mib(cond_estimated),
+                bytes_to_mib(budget)
+            );
+            return (None, None);
+        }
+
+        let cache_start = Instant::now();
+        let cond_cache = self.model.project_cross_attention_cache(cond);
+        eprintln!(
+            "burn_trellis: {stage_label} cross-kv cache projected condition={} MiB blocks={} ({:.2} ms)",
+            bytes_to_mib(cond_estimated),
+            cond_cache.len(),
+            cache_start.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let neg_needed = sample_cfg_needs_negative_condition(sample_cfg, t_pairs);
+        let neg_cache = if neg_needed {
+            let total_estimated = cond_estimated.saturating_mul(2);
+            if total_estimated <= budget {
+                let neg_start = Instant::now();
+                let neg_cache = self.model.project_cross_attention_cache(neg_cond);
+                eprintln!(
+                    "burn_trellis: {stage_label} cross-kv cache projected negative={} MiB total={} MiB ({:.2} ms)",
+                    bytes_to_mib(cond_estimated),
+                    bytes_to_mib(total_estimated),
+                    neg_start.elapsed().as_secs_f64() * 1000.0
+                );
+                Some(neg_cache)
+            } else {
+                eprintln!(
+                    "burn_trellis: {stage_label} negative cross-kv cache skipped (total_estimated={} MiB budget={} MiB)",
+                    bytes_to_mib(total_estimated),
+                    bytes_to_mib(budget)
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        (Some(cond_cache), neg_cache)
     }
 
     fn prepare_condition(&self, cond: &[f32], cond_tokens: usize) -> Result<Tensor<B, 3>, String> {
@@ -2539,6 +4487,9 @@ where
             ])
         });
 
+        let mut step_0_pred_v: Option<Tensor<B, 5>> = None;
+        let mut step_0_pred_v_pos: Option<Tensor<B, 5>> = None;
+        let mut step_0_pred_v_neg: Option<Tensor<B, 5>> = None;
         let mut step_0_x_t: Option<Tensor<B, 5>> = None;
         let mut step_mid_x_t: Option<Tensor<B, 5>> = None;
         let mut step_last_x_t: Option<Tensor<B, 5>> = None;
@@ -2555,17 +4506,44 @@ where
             "burn_trellis: {stage_label} begin (steps={}, resolution={}, state_channels={}, concat_channels={})",
             sample_cfg.steps, self.config.resolution, state_channels, concat_channels
         );
+        let (cond_cache, neg_cache) = self.prepare_cross_attention_caches(
+            cond.clone(),
+            neg_cond.clone(),
+            sample_cfg,
+            t_pairs.as_slice(),
+            stage_label,
+        );
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
             let step_start = Instant::now();
-            let pred = self.predict_with_cfg_tensor(
-                x_t.clone(),
-                t,
-                sample_cfg,
-                sigma_min,
-                cond.clone(),
-                neg_cond.clone(),
-                concat_tensor.clone(),
-            )?;
+            let pred = if capture_snapshots && step_idx == 0 {
+                let parts = self.predict_with_cfg_tensor_parts_with_cache(
+                    x_t.clone(),
+                    t,
+                    sample_cfg,
+                    sigma_min,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    concat_tensor.clone(),
+                    cond_cache.as_ref(),
+                    neg_cache.as_ref(),
+                )?;
+                step_0_pred_v = Some(parts.guided.clone());
+                step_0_pred_v_pos = parts.pos;
+                step_0_pred_v_neg = parts.neg;
+                parts.guided
+            } else {
+                self.predict_with_cfg_tensor_with_cache(
+                    x_t.clone(),
+                    t,
+                    sample_cfg,
+                    sigma_min,
+                    cond.clone(),
+                    neg_cond.clone(),
+                    concat_tensor.clone(),
+                    cond_cache.as_ref(),
+                    neg_cache.as_ref(),
+                )?
+            };
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
             if capture_snapshots && step_idx == 0 {
@@ -2593,8 +4571,25 @@ where
         );
 
         let state_len = state_channels.saturating_mul(voxel);
-        let (samples, step_0_x_t, step_mid_x_t, step_last_x_t) = if capture_snapshots {
+        let (
+            samples,
+            step_0_pred_v,
+            step_0_pred_v_pos,
+            step_0_pred_v_neg,
+            step_0_x_t,
+            step_mid_x_t,
+            step_last_x_t,
+        ) = if capture_snapshots {
             let samples_t = x_t;
+            let step_0_pred_v_t = step_0_pred_v
+                .unwrap_or_else(|| samples_t.clone())
+                .reshape([state_len]);
+            let step_0_pred_v_pos_t = step_0_pred_v_pos
+                .unwrap_or_else(|| samples_t.clone())
+                .reshape([state_len]);
+            let step_0_pred_v_neg_t = step_0_pred_v_neg
+                .unwrap_or_else(|| samples_t.clone())
+                .reshape([state_len]);
             let step_0_t = step_0_x_t
                 .unwrap_or_else(|| samples_t.clone())
                 .reshape([state_len]);
@@ -2607,6 +4602,9 @@ where
             let merged = Tensor::cat(
                 vec![
                     samples_t.reshape([state_len]),
+                    step_0_pred_v_t,
+                    step_0_pred_v_pos_t,
+                    step_0_pred_v_neg_t,
                     step_0_t,
                     step_mid_t,
                     step_last_t,
@@ -2616,17 +4614,39 @@ where
             let merged = tensor_to_vec_1d(merged, "failed to read sparse trace tensor")?;
             let segment = state_len;
             let samples = merged[..segment].to_vec();
-            let step_0_x_t = merged[segment..segment * 2].to_vec();
-            let step_mid_x_t = merged[segment * 2..segment * 3].to_vec();
-            let step_last_x_t = merged[segment * 3..segment * 4].to_vec();
-            (samples, step_0_x_t, step_mid_x_t, step_last_x_t)
+            let step_0_pred_v = merged[segment..segment * 2].to_vec();
+            let step_0_pred_v_pos = merged[segment * 2..segment * 3].to_vec();
+            let step_0_pred_v_neg = merged[segment * 3..segment * 4].to_vec();
+            let step_0_x_t = merged[segment * 4..segment * 5].to_vec();
+            let step_mid_x_t = merged[segment * 5..segment * 6].to_vec();
+            let step_last_x_t = merged[segment * 6..segment * 7].to_vec();
+            (
+                samples,
+                step_0_pred_v,
+                step_0_pred_v_pos,
+                step_0_pred_v_neg,
+                step_0_x_t,
+                step_mid_x_t,
+                step_last_x_t,
+            )
         } else {
             let samples = tensor_to_vec(x_t)?;
-            (samples.clone(), samples.clone(), samples.clone(), samples)
+            (
+                samples.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                samples.clone(),
+                samples.clone(),
+                samples,
+            )
         };
 
         Ok(FlowEulerSampleTrace {
             steps: sample_cfg.steps,
+            step_0_pred_v,
+            step_0_pred_v_pos,
+            step_0_pred_v_neg,
             step_0_x_t,
             step_mid_x_t,
             step_last_x_t,
@@ -2708,9 +4728,16 @@ where
             "burn_trellis: {stage_label} begin (steps={}, resolution={}, state_channels={}, concat_channels={})",
             sample_cfg.steps, self.config.resolution, state_channels, concat_channels
         );
+        let (cond_cache, neg_cache) = self.prepare_cross_attention_caches(
+            cond.clone(),
+            neg_cond.clone(),
+            sample_cfg,
+            t_pairs.as_slice(),
+            stage_label,
+        );
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
             let step_start = Instant::now();
-            let pred = self.predict_with_cfg_tensor(
+            let pred = self.predict_with_cfg_tensor_with_cache(
                 x_t.clone(),
                 t,
                 sample_cfg,
@@ -2718,6 +4745,8 @@ where
                 cond.clone(),
                 neg_cond.clone(),
                 concat_tensor.clone(),
+                cond_cache.as_ref(),
+                neg_cache.as_ref(),
             )?;
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
@@ -2761,11 +4790,20 @@ where
                 steps: sample_cfg.steps,
                 row_channels: 0,
                 samples: Vec::new(),
+                step_0_pred_v: Vec::new(),
+                step_0_pred_v_pos: Vec::new(),
+                step_0_pred_v_neg: Vec::new(),
                 step_0_x_t: Vec::new(),
                 step_mid_x_t: Vec::new(),
                 step_last_x_t: Vec::new(),
                 #[cfg(feature = "runtime-model-wgpu")]
                 samples_wgpu: None,
+                #[cfg(feature = "runtime-model-wgpu")]
+                step_0_pred_v_wgpu: None,
+                #[cfg(feature = "runtime-model-wgpu")]
+                step_0_pred_v_pos_wgpu: None,
+                #[cfg(feature = "runtime-model-wgpu")]
+                step_0_pred_v_neg_wgpu: None,
                 #[cfg(feature = "runtime-model-wgpu")]
                 step_0_x_t_wgpu: None,
                 #[cfg(feature = "runtime-model-wgpu")]
@@ -2851,11 +4889,20 @@ where
                 steps: sample_cfg.steps,
                 row_channels: 0,
                 samples: Vec::new(),
+                step_0_pred_v: Vec::new(),
+                step_0_pred_v_pos: Vec::new(),
+                step_0_pred_v_neg: Vec::new(),
                 step_0_x_t: Vec::new(),
                 step_mid_x_t: Vec::new(),
                 step_last_x_t: Vec::new(),
                 #[cfg(feature = "runtime-model-wgpu")]
                 samples_wgpu: None,
+                #[cfg(feature = "runtime-model-wgpu")]
+                step_0_pred_v_wgpu: None,
+                #[cfg(feature = "runtime-model-wgpu")]
+                step_0_pred_v_pos_wgpu: None,
+                #[cfg(feature = "runtime-model-wgpu")]
+                step_0_pred_v_neg_wgpu: None,
                 #[cfg(feature = "runtime-model-wgpu")]
                 step_0_x_t_wgpu: None,
                 #[cfg(feature = "runtime-model-wgpu")]
@@ -2866,6 +4913,21 @@ where
         }
         let total_elements = row_count.saturating_mul(used_channels);
         let mut samples_batches: Vec<Tensor<B, 1>> = Vec::with_capacity(batch_count);
+        let mut step_0_pred_v_batches: Vec<Tensor<B, 1>> = if capture_snapshots {
+            Vec::with_capacity(batch_count)
+        } else {
+            Vec::new()
+        };
+        let mut step_0_pred_v_pos_batches: Vec<Tensor<B, 1>> = if capture_snapshots {
+            Vec::with_capacity(batch_count)
+        } else {
+            Vec::new()
+        };
+        let mut step_0_pred_v_neg_batches: Vec<Tensor<B, 1>> = if capture_snapshots {
+            Vec::with_capacity(batch_count)
+        } else {
+            Vec::new()
+        };
         let mut step_0_batches: Vec<Tensor<B, 1>> = if capture_snapshots {
             Vec::with_capacity(batch_count)
         } else {
@@ -2937,13 +4999,33 @@ where
                 batch_idx,
                 "negative condition",
             )?;
+            let (cond_cache, neg_cache) = self.prepare_cross_attention_caches(
+                cond_batch.clone(),
+                neg_cond_batch.clone(),
+                sample_cfg,
+                t_pairs.as_slice(),
+                stage_label,
+            );
+            let batched_cfg_cache = if sparse_flow_batched_cfg_enabled_for_backend::<B>() {
+                match (&cond_cache, &neg_cache) {
+                    (Some(pos_cache), Some(neg_cache)) => {
+                        concat_cross_kv_caches(pos_cache, neg_cache)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
+            let mut step_0_pred_v_rows: Option<Tensor<B, 3>> = None;
+            let mut step_0_pred_v_pos_rows: Option<Tensor<B, 3>> = None;
+            let mut step_0_pred_v_neg_rows: Option<Tensor<B, 3>> = None;
             let mut step_0_rows: Option<Tensor<B, 3>> = None;
             let mut step_mid_rows: Option<Tensor<B, 3>> = None;
             let mut step_last_rows: Option<Tensor<B, 3>> = None;
             for (step_idx, (t, t_prev)) in t_pairs.iter().copied().enumerate() {
                 let step_start = Instant::now();
-                let pred = self.predict_with_cfg_sparse_tensor(
+                let cfg_pred = self.predict_with_cfg_sparse_tensor_parts_with_cache(
                     x_t.clone(),
                     t,
                     sample_cfg,
@@ -2953,8 +5035,17 @@ where
                     concat_tensor.clone(),
                     sparse.sparse_resolution().max(1),
                     token_coords.clone(),
+                    cond_cache.as_ref(),
+                    neg_cache.as_ref(),
+                    batched_cfg_cache.as_ref(),
                 )?;
+                let pred = cfg_pred.guided;
                 let dt = t - t_prev;
+                if capture_snapshots && step_idx == 0 {
+                    step_0_pred_v_rows = Some(pred.clone());
+                    step_0_pred_v_pos_rows = cfg_pred.pos;
+                    step_0_pred_v_neg_rows = cfg_pred.neg;
+                }
                 x_t = x_t.sub(pred.mul_scalar(dt));
                 if capture_snapshots && step_idx == 0 {
                     step_0_rows = Some(x_t.clone());
@@ -2991,6 +5082,15 @@ where
             if capture_snapshots {
                 let samples_rows = x_t.clone();
                 samples_batches.push(to_rows_1d(samples_rows.clone()));
+                step_0_pred_v_batches.push(to_rows_1d(
+                    step_0_pred_v_rows.unwrap_or_else(|| samples_rows.clone()),
+                ));
+                step_0_pred_v_pos_batches.push(to_rows_1d(
+                    step_0_pred_v_pos_rows.unwrap_or_else(|| samples_rows.clone()),
+                ));
+                step_0_pred_v_neg_batches.push(to_rows_1d(
+                    step_0_pred_v_neg_rows.unwrap_or_else(|| samples_rows.clone()),
+                ));
                 step_0_batches.push(to_rows_1d(
                     step_0_rows.unwrap_or_else(|| samples_rows.clone()),
                 ));
@@ -3034,14 +5134,33 @@ where
         #[cfg(feature = "runtime-model-wgpu")]
         let samples_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
         #[cfg(feature = "runtime-model-wgpu")]
+        let step_0_pred_v_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
+        #[cfg(feature = "runtime-model-wgpu")]
+        let step_0_pred_v_pos_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
+        #[cfg(feature = "runtime-model-wgpu")]
+        let step_0_pred_v_neg_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
+        #[cfg(feature = "runtime-model-wgpu")]
         let step_0_x_t_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
         #[cfg(feature = "runtime-model-wgpu")]
         let step_mid_x_t_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
         #[cfg(feature = "runtime-model-wgpu")]
         let step_last_x_t_wgpu: Option<Tensor<WgpuRuntimeBackend, 2>>;
 
-        let (samples, step_0_x_t, step_mid_x_t, step_last_x_t) = if capture_snapshots {
+        let (
+            samples,
+            step_0_pred_v,
+            step_0_pred_v_pos,
+            step_0_pred_v_neg,
+            step_0_x_t,
+            step_mid_x_t,
+            step_last_x_t,
+        ) = if capture_snapshots {
             let samples_t = concat_batches(samples_batches, "samples")?;
+            let step_0_pred_v_t = concat_batches(step_0_pred_v_batches, "step_0_pred_v")?;
+            let step_0_pred_v_pos_t =
+                concat_batches(step_0_pred_v_pos_batches, "step_0_pred_v_pos")?;
+            let step_0_pred_v_neg_t =
+                concat_batches(step_0_pred_v_neg_batches, "step_0_pred_v_neg")?;
             let step_0_t = concat_batches(step_0_batches, "step_0_x_t")?;
             let step_mid_t = concat_batches(step_mid_batches, "step_mid_x_t")?;
             let step_last_t = concat_batches(step_last_batches, "step_last_x_t")?;
@@ -3049,6 +5168,19 @@ where
             {
                 samples_wgpu =
                     maybe_trace_rows_wgpu(samples_t.clone().reshape([row_count, used_channels]));
+                step_0_pred_v_wgpu = maybe_trace_rows_wgpu(
+                    step_0_pred_v_t.clone().reshape([row_count, used_channels]),
+                );
+                step_0_pred_v_pos_wgpu = maybe_trace_rows_wgpu(
+                    step_0_pred_v_pos_t
+                        .clone()
+                        .reshape([row_count, used_channels]),
+                );
+                step_0_pred_v_neg_wgpu = maybe_trace_rows_wgpu(
+                    step_0_pred_v_neg_t
+                        .clone()
+                        .reshape([row_count, used_channels]),
+                );
                 step_0_x_t_wgpu =
                     maybe_trace_rows_wgpu(step_0_t.clone().reshape([row_count, used_channels]));
                 step_mid_x_t_wgpu =
@@ -3061,7 +5193,18 @@ where
             #[cfg(not(feature = "runtime-model-wgpu"))]
             let host_rows_required = true;
             if host_rows_required {
-                let merged = Tensor::cat(vec![samples_t, step_0_t, step_mid_t, step_last_t], 0);
+                let merged = Tensor::cat(
+                    vec![
+                        samples_t,
+                        step_0_pred_v_t,
+                        step_0_pred_v_pos_t,
+                        step_0_pred_v_neg_t,
+                        step_0_t,
+                        step_mid_t,
+                        step_last_t,
+                    ],
+                    0,
+                );
                 let merged =
                     tensor_to_vec_1d(merged, "failed to read sparse-token row trace tensor")?;
                 let segment = total_elements;
@@ -3070,9 +5213,20 @@ where
                     merged[segment..segment * 2].to_vec(),
                     merged[segment * 2..segment * 3].to_vec(),
                     merged[segment * 3..segment * 4].to_vec(),
+                    merged[segment * 4..segment * 5].to_vec(),
+                    merged[segment * 5..segment * 6].to_vec(),
+                    merged[segment * 6..segment * 7].to_vec(),
                 )
             } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
         } else {
             let samples_t = concat_batches(samples_batches, "samples")?;
@@ -3080,6 +5234,9 @@ where
             {
                 samples_wgpu =
                     maybe_trace_rows_wgpu(samples_t.clone().reshape([row_count, used_channels]));
+                step_0_pred_v_wgpu = samples_wgpu.clone();
+                step_0_pred_v_pos_wgpu = samples_wgpu.clone();
+                step_0_pred_v_neg_wgpu = samples_wgpu.clone();
                 step_0_x_t_wgpu = samples_wgpu.clone();
                 step_mid_x_t_wgpu = samples_wgpu.clone();
                 step_last_x_t_wgpu = samples_wgpu.clone();
@@ -3091,9 +5248,25 @@ where
             if host_rows_required {
                 let samples =
                     tensor_to_vec_1d(samples_t, "failed to read sparse-token row tensor")?;
-                (samples.clone(), samples.clone(), samples.clone(), samples)
+                (
+                    samples.clone(),
+                    samples.clone(),
+                    samples.clone(),
+                    samples.clone(),
+                    samples.clone(),
+                    samples.clone(),
+                    samples,
+                )
             } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
         };
 
@@ -3101,11 +5274,20 @@ where
             steps: sample_cfg.steps,
             row_channels: used_channels,
             samples,
+            step_0_pred_v,
+            step_0_pred_v_pos,
+            step_0_pred_v_neg,
             step_0_x_t,
             step_mid_x_t,
             step_last_x_t,
             #[cfg(feature = "runtime-model-wgpu")]
             samples_wgpu,
+            #[cfg(feature = "runtime-model-wgpu")]
+            step_0_pred_v_wgpu,
+            #[cfg(feature = "runtime-model-wgpu")]
+            step_0_pred_v_pos_wgpu,
+            #[cfg(feature = "runtime-model-wgpu")]
+            step_0_pred_v_neg_wgpu,
             #[cfg(feature = "runtime-model-wgpu")]
             step_0_x_t_wgpu,
             #[cfg(feature = "runtime-model-wgpu")]
@@ -3121,67 +5303,215 @@ where
         x_t: Tensor<B, 3>,
         timestep: f32,
         config: FlowEulerSampleConfig,
-        _sigma_min: f32,
+        sigma_min: f32,
         cond: Tensor<B, 3>,
         neg_cond: Tensor<B, 3>,
         concat_cond: Option<Tensor<B, 3>>,
         sparse_resolution: usize,
         token_coords: Tensor<B, 2, Int>,
     ) -> Result<Tensor<B, 3>, String> {
-        let in_guidance_interval =
-            config.guidance_interval[0] <= timestep && timestep <= config.guidance_interval[1];
-        if !in_guidance_interval {
-            return self.predict_velocity_sparse_tensor(
+        Ok(self
+            .predict_with_cfg_sparse_tensor_parts(
+                x_t,
+                timestep,
+                config,
+                sigma_min,
+                cond,
+                neg_cond,
+                concat_cond,
+                sparse_resolution,
+                token_coords,
+            )?
+            .guided)
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn predict_with_cfg_sparse_tensor_parts(
+        &self,
+        x_t: Tensor<B, 3>,
+        timestep: f32,
+        config: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 3>>,
+        sparse_resolution: usize,
+        token_coords: Tensor<B, 2, Int>,
+    ) -> Result<SparseCfgPrediction<B>, String> {
+        self.predict_with_cfg_sparse_tensor_parts_with_cache(
+            x_t,
+            timestep,
+            config,
+            sigma_min,
+            cond,
+            neg_cond,
+            concat_cond,
+            sparse_resolution,
+            token_coords,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn predict_with_cfg_sparse_tensor_parts_with_cache(
+        &self,
+        x_t: Tensor<B, 3>,
+        timestep: f32,
+        config: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 3>>,
+        sparse_resolution: usize,
+        token_coords: Tensor<B, 2, Int>,
+        cond_cache: Option<&CrossAttentionKvCache<B>>,
+        neg_cache: Option<&CrossAttentionKvCache<B>>,
+        batched_cfg_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Result<SparseCfgPrediction<B>, String> {
+        if !guidance_interval_contains(timestep, config.guidance_interval) {
+            let guided = self.predict_velocity_sparse_tensor_with_cache(
                 x_t,
                 timestep,
                 cond,
                 concat_cond,
                 sparse_resolution,
                 token_coords,
-            );
+                cond_cache,
+            )?;
+            return Ok(SparseCfgPrediction {
+                guided: guided.clone(),
+                pos: Some(guided),
+                neg: None,
+            });
         }
 
         let w = config.guidance_strength;
         if (w - 1.0).abs() < f32::EPSILON {
-            return self.predict_velocity_sparse_tensor(
+            let guided = self.predict_velocity_sparse_tensor_with_cache(
                 x_t,
                 timestep,
                 cond,
                 concat_cond,
                 sparse_resolution,
                 token_coords,
-            );
+                cond_cache,
+            )?;
+            return Ok(SparseCfgPrediction {
+                guided: guided.clone(),
+                pos: Some(guided),
+                neg: None,
+            });
         }
         if w.abs() < f32::EPSILON {
-            return self.predict_velocity_sparse_tensor(
+            let guided = self.predict_velocity_sparse_tensor_with_cache(
                 x_t,
                 timestep,
                 neg_cond,
                 concat_cond,
                 sparse_resolution,
                 token_coords,
-            );
+                neg_cache,
+            )?;
+            return Ok(SparseCfgPrediction {
+                guided: guided.clone(),
+                pos: None,
+                neg: Some(guided),
+            });
         }
 
-        // Keep CFG as two explicit forwards. Pairing pos/neg into batch=2 looked
-        // attractive for throughput, but it regressed canonical WGPU numerics
-        // (sparse occupancy collapse in strict parity runs), so the fail-safe
-        // parity-preserving path remains the default.
-        let pos = self.predict_velocity_sparse_tensor(
+        if sparse_flow_batched_cfg_enabled_for_backend::<B>() {
+            let fallback_batched_cache;
+            let batched_cache = if let Some(cache) = batched_cfg_cache {
+                Some(cache)
+            } else if let (Some(pos_cache), Some(neg_cache)) = (cond_cache, neg_cache) {
+                fallback_batched_cache = concat_cross_kv_caches(pos_cache, neg_cache);
+                fallback_batched_cache.as_ref()
+            } else if cond_cache.is_none() && neg_cache.is_none() {
+                None
+            } else {
+                None
+            };
+            if (cond_cache.is_none() && neg_cache.is_none()) || batched_cache.is_some() {
+                let [sample_batches, tokens, row_channels] = x_t.dims();
+                if sparse_flow_batched_cfg_debug_enabled() {
+                    eprintln!(
+                        "burn_trellis: sparse flow batched CFG fast path selected backend={} batches={} tokens={} channels={} cache={}",
+                        std::any::type_name::<B>(),
+                        sample_batches,
+                        tokens,
+                        row_channels,
+                        batched_cache.is_some()
+                    );
+                }
+                let x_batched = Tensor::cat(vec![x_t.clone(), x_t.clone()], 0);
+                let cond_batched = if batched_cache.is_some() {
+                    // With a concatenated cross-attention K/V cache, transformer
+                    // blocks read the projected cache and ignore the raw context.
+                    // Keep a single context tensor here to avoid re-concatenating
+                    // the full positive/negative condition every sampled step.
+                    cond.clone()
+                } else {
+                    Tensor::cat(vec![cond.clone(), neg_cond.clone()], 0)
+                };
+                let concat_batched = concat_cond
+                    .clone()
+                    .map(|concat| Tensor::cat(vec![concat.clone(), concat], 0));
+                let pred_batched = self.predict_velocity_sparse_tensor_with_cache(
+                    x_batched,
+                    timestep,
+                    cond_batched,
+                    concat_batched,
+                    sparse_resolution,
+                    token_coords.clone(),
+                    batched_cache,
+                )?;
+                let pos =
+                    pred_batched
+                        .clone()
+                        .slice([0..sample_batches, 0..tokens, 0..row_channels]);
+                let neg = pred_batched.slice([
+                    sample_batches..sample_batches * 2,
+                    0..tokens,
+                    0..row_channels,
+                ]);
+                let guided = apply_cfg_sparse_tensor(
+                    x_t,
+                    timestep,
+                    pos.clone(),
+                    neg.clone(),
+                    w,
+                    config.guidance_rescale,
+                    sigma_min,
+                );
+                return Ok(SparseCfgPrediction {
+                    guided,
+                    pos: Some(pos),
+                    neg: Some(neg),
+                });
+            }
+        }
+
+        // Keep CFG as two explicit forwards, matching the upstream sampler and
+        // avoiding batch-order drift in strict parity runs.
+        let pos = self.predict_velocity_sparse_tensor_with_cache(
             x_t.clone(),
             timestep,
             cond,
             concat_cond.clone(),
             sparse_resolution,
             token_coords.clone(),
+            cond_cache,
         )?;
-        let neg = self.predict_velocity_sparse_tensor(
+        let neg = self.predict_velocity_sparse_tensor_with_cache(
             x_t.clone(),
             timestep,
             neg_cond,
             concat_cond,
             sparse_resolution,
             token_coords,
+            neg_cache,
         )?;
         if sparse_flow_stage_debug_enabled() {
             let probe_idx = CFG_POS_NEG_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3202,7 +5532,20 @@ where
                 );
             }
         }
-        Ok(pos.clone().add(pos.sub(neg).mul_scalar(w)))
+        let guided = apply_cfg_sparse_tensor(
+            x_t,
+            timestep,
+            pos.clone(),
+            neg.clone(),
+            w,
+            config.guidance_rescale,
+            sigma_min,
+        );
+        Ok(SparseCfgPrediction {
+            guided,
+            pos: Some(pos),
+            neg: Some(neg),
+        })
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -3215,7 +5558,29 @@ where
         sparse_resolution: usize,
         token_coords: Tensor<B, 2, Int>,
     ) -> Result<Tensor<B, 3>, String> {
-        let [_, tokens, state_channels] = x_t.dims();
+        self.predict_velocity_sparse_tensor_with_cache(
+            x_t,
+            timestep,
+            cond,
+            concat_cond,
+            sparse_resolution,
+            token_coords,
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn predict_velocity_sparse_tensor_with_cache(
+        &self,
+        x_t: Tensor<B, 3>,
+        timestep: f32,
+        cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 3>>,
+        sparse_resolution: usize,
+        token_coords: Tensor<B, 2, Int>,
+        cross_kv_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Result<Tensor<B, 3>, String> {
+        let [sample_batches, tokens, state_channels] = x_t.dims();
         let [coord_rows, coord_cols] = token_coords.dims();
         if coord_cols != 3 {
             return Err(format!(
@@ -3261,10 +5626,16 @@ where
         } else {
             x_t
         };
-        let t = Tensor::<B, 1>::from_floats([timestep * 1000.0], &self.device);
-        Ok(self
-            .model
-            .forward_sparse(sample, t, cond, sparse_resolution.max(1), token_coords))
+        let t_values = vec![timestep * 1000.0; sample_batches.max(1)];
+        let t = Tensor::<B, 1>::from_floats(t_values.as_slice(), &self.device);
+        Ok(self.model.forward_sparse_with_cross_cache(
+            sample,
+            t,
+            cond,
+            sparse_resolution.max(1),
+            token_coords,
+            cross_kv_cache,
+        ))
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -3273,30 +5644,139 @@ where
         x_t: Tensor<B, 5>,
         timestep: f32,
         config: FlowEulerSampleConfig,
-        _sigma_min: f32,
+        sigma_min: f32,
         cond: Tensor<B, 3>,
         neg_cond: Tensor<B, 3>,
         concat_cond: Option<Tensor<B, 5>>,
     ) -> Result<Tensor<B, 5>, String> {
-        let in_guidance_interval =
-            config.guidance_interval[0] <= timestep && timestep <= config.guidance_interval[1];
-        if !in_guidance_interval {
-            return self.predict_velocity_tensor(x_t, timestep, cond, concat_cond);
+        self.predict_with_cfg_tensor_with_cache(
+            x_t,
+            timestep,
+            config,
+            sigma_min,
+            cond,
+            neg_cond,
+            concat_cond,
+            None,
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn predict_with_cfg_tensor_parts_with_cache(
+        &self,
+        x_t: Tensor<B, 5>,
+        timestep: f32,
+        config: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 5>>,
+        cond_cache: Option<&CrossAttentionKvCache<B>>,
+        neg_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Result<DenseCfgPrediction<B>, String> {
+        if !guidance_interval_contains(timestep, config.guidance_interval) {
+            let guided = self.predict_velocity_tensor_with_cache(
+                x_t,
+                timestep,
+                cond,
+                concat_cond,
+                cond_cache,
+            )?;
+            return Ok(DenseCfgPrediction {
+                guided: guided.clone(),
+                pos: Some(guided),
+                neg: None,
+            });
         }
 
         let w = config.guidance_strength;
         if (w - 1.0).abs() < f32::EPSILON {
-            return self.predict_velocity_tensor(x_t, timestep, cond, concat_cond);
+            let guided = self.predict_velocity_tensor_with_cache(
+                x_t,
+                timestep,
+                cond,
+                concat_cond,
+                cond_cache,
+            )?;
+            return Ok(DenseCfgPrediction {
+                guided: guided.clone(),
+                pos: Some(guided),
+                neg: None,
+            });
         }
         if w.abs() < f32::EPSILON {
-            return self.predict_velocity_tensor(x_t, timestep, neg_cond, concat_cond);
+            let guided = self.predict_velocity_tensor_with_cache(
+                x_t,
+                timestep,
+                neg_cond,
+                concat_cond,
+                neg_cache,
+            )?;
+            return Ok(DenseCfgPrediction {
+                guided: guided.clone(),
+                pos: None,
+                neg: Some(guided),
+            });
         }
 
-        // Keep CFG as two explicit forwards for parity with current canonical
-        // WGPU behavior; batch-paired CFG caused unacceptable numeric drift.
-        let pos = self.predict_velocity_tensor(x_t.clone(), timestep, cond, concat_cond.clone())?;
-        let neg = self.predict_velocity_tensor(x_t.clone(), timestep, neg_cond, concat_cond)?;
-        if sparse_flow_stage_debug_enabled() {
+        let pos = self.predict_velocity_tensor_with_cache(
+            x_t.clone(),
+            timestep,
+            cond,
+            concat_cond.clone(),
+            cond_cache,
+        )?;
+        let neg = self.predict_velocity_tensor_with_cache(
+            x_t.clone(),
+            timestep,
+            neg_cond,
+            concat_cond,
+            neg_cache,
+        )?;
+        let guided = apply_cfg_tensor(
+            x_t,
+            timestep,
+            pos.clone(),
+            neg.clone(),
+            w,
+            config.guidance_rescale,
+            sigma_min,
+        );
+        Ok(DenseCfgPrediction {
+            guided,
+            pos: Some(pos),
+            neg: Some(neg),
+        })
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn predict_with_cfg_tensor_with_cache(
+        &self,
+        x_t: Tensor<B, 5>,
+        timestep: f32,
+        config: FlowEulerSampleConfig,
+        sigma_min: f32,
+        cond: Tensor<B, 3>,
+        neg_cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 5>>,
+        cond_cache: Option<&CrossAttentionKvCache<B>>,
+        neg_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Result<Tensor<B, 5>, String> {
+        let parts = self.predict_with_cfg_tensor_parts_with_cache(
+            x_t,
+            timestep,
+            config,
+            sigma_min,
+            cond,
+            neg_cond,
+            concat_cond,
+            cond_cache,
+            neg_cache,
+        )?;
+        if sparse_flow_stage_debug_enabled()
+            && let (Some(pos), Some(neg)) = (parts.pos.as_ref(), parts.neg.as_ref())
+        {
             let probe_idx = CFG_POS_NEG_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
             if probe_idx < 12 {
                 let (delta_mean_abs, delta_max_abs) =
@@ -3315,7 +5795,7 @@ where
                 );
             }
         }
-        Ok(pos.clone().add(pos.sub(neg).mul_scalar(w)))
+        Ok(parts.guided)
     }
 
     #[allow(dead_code)]
@@ -3326,7 +5806,19 @@ where
         cond: Tensor<B, 3>,
         concat_cond: Option<Tensor<B, 5>>,
     ) -> Result<Tensor<B, 5>, String> {
-        let [_, state_channels, rx, ry, rz] = x_t.dims();
+        self.predict_velocity_tensor_with_cache(x_t, timestep, cond, concat_cond, None)
+    }
+
+    #[allow(dead_code)]
+    fn predict_velocity_tensor_with_cache(
+        &self,
+        x_t: Tensor<B, 5>,
+        timestep: f32,
+        cond: Tensor<B, 3>,
+        concat_cond: Option<Tensor<B, 5>>,
+        cross_kv_cache: Option<&CrossAttentionKvCache<B>>,
+    ) -> Result<Tensor<B, 5>, String> {
+        let [sample_batches, state_channels, rx, ry, rz] = x_t.dims();
         let voxel = rx * ry * rz;
         if rx != self.config.resolution
             || ry != self.config.resolution
@@ -3374,8 +5866,11 @@ where
         } else {
             x_t
         };
-        let t = Tensor::<B, 1>::from_floats([timestep * 1000.0], &self.device);
-        Ok(self.model.forward(sample, t, cond))
+        let t_values = vec![timestep * 1000.0; sample_batches.max(1)];
+        let t = Tensor::<B, 1>::from_floats(t_values.as_slice(), &self.device);
+        Ok(self
+            .model
+            .forward_with_cross_cache(sample, t, cond, cross_kv_cache))
     }
 }
 
@@ -3896,6 +6391,37 @@ fn xstart_to_pred_tensor<B: Backend>(
     x_t.mul_scalar(keep).sub(x0).div_scalar(factor)
 }
 
+fn apply_cfg_tensor<B: Backend>(
+    x_t: Tensor<B, 5>,
+    timestep: f32,
+    pos: Tensor<B, 5>,
+    neg: Tensor<B, 5>,
+    guidance_strength: f32,
+    guidance_rescale: f32,
+    sigma_min: f32,
+) -> Tensor<B, 5> {
+    let mut pred = pos
+        .clone()
+        .mul_scalar(guidance_strength)
+        .add(neg.mul_scalar(1.0 - guidance_strength));
+    let guidance_rescale = guidance_rescale.max(0.0);
+    if guidance_rescale > 0.0 {
+        let [batch, _, _, _, _] = x_t.dims();
+        let x0_pos = pred_to_xstart_tensor(x_t.clone(), timestep, pos, sigma_min);
+        let x0_cfg = pred_to_xstart_tensor(x_t.clone(), timestep, pred.clone(), sigma_min);
+        let std_pos = tensor_std_tensor(x0_pos).reshape([batch, 1, 1, 1, 1]);
+        let std_cfg = tensor_std_tensor(x0_cfg.clone())
+            .reshape([batch, 1, 1, 1, 1])
+            .add_scalar(1.0e-12);
+        let x0_rescaled = x0_cfg.clone().mul(std_pos.div(std_cfg));
+        let x0 = x0_rescaled
+            .mul_scalar(guidance_rescale)
+            .add(x0_cfg.mul_scalar(1.0 - guidance_rescale));
+        pred = xstart_to_pred_tensor(x_t, timestep, x0, sigma_min);
+    }
+    pred
+}
+
 #[allow(dead_code)]
 fn pred_to_xstart_sparse_tensor<B: Backend>(
     x_t: Tensor<B, 3>,
@@ -3918,6 +6444,37 @@ fn xstart_to_pred_sparse_tensor<B: Backend>(
     let factor = sigma_min + (1.0 - sigma_min) * timestep;
     let keep = 1.0 - sigma_min;
     x_t.mul_scalar(keep).sub(x0).div_scalar(factor)
+}
+
+fn apply_cfg_sparse_tensor<B: Backend>(
+    x_t: Tensor<B, 3>,
+    timestep: f32,
+    pos: Tensor<B, 3>,
+    neg: Tensor<B, 3>,
+    guidance_strength: f32,
+    guidance_rescale: f32,
+    sigma_min: f32,
+) -> Tensor<B, 3> {
+    let mut pred = pos
+        .clone()
+        .mul_scalar(guidance_strength)
+        .add(neg.mul_scalar(1.0 - guidance_strength));
+    let guidance_rescale = guidance_rescale.max(0.0);
+    if guidance_rescale > 0.0 {
+        let [batch, _, _] = x_t.dims();
+        let x0_pos = pred_to_xstart_sparse_tensor(x_t.clone(), timestep, pos, sigma_min);
+        let x0_cfg = pred_to_xstart_sparse_tensor(x_t.clone(), timestep, pred.clone(), sigma_min);
+        let std_pos = tensor_std_sparse_tensor(x0_pos).reshape([batch, 1, 1]);
+        let std_cfg = tensor_std_sparse_tensor(x0_cfg.clone())
+            .reshape([batch, 1, 1])
+            .add_scalar(1.0e-12);
+        let x0_rescaled = x0_cfg.clone().mul(std_pos.div(std_cfg));
+        let x0 = x0_rescaled
+            .mul_scalar(guidance_rescale)
+            .add(x0_cfg.mul_scalar(1.0 - guidance_rescale));
+        pred = xstart_to_pred_sparse_tensor(x_t, timestep, x0, sigma_min);
+    }
+    pred
 }
 
 #[allow(dead_code)]
@@ -4106,6 +6663,40 @@ where
     centered.mul(var.add_scalar(eps).sqrt().recip())
 }
 
+fn layer_norm_modulated<B: Backend>(
+    x: Tensor<B, 3>,
+    scale: Tensor<B, 3>,
+    shift: Tensor<B, 3>,
+    eps: f32,
+) -> Tensor<B, 3>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+{
+    #[cfg(feature = "runtime-model-wgpu")]
+    if !sparse_flow_prefers_decomposed_modulated_layer_norm::<B>(&x) {
+        if let Some(y) =
+            maybe_layer_norm_modulated_wgpu(x.clone(), scale.clone(), shift.clone(), eps)
+        {
+            return y;
+        }
+    }
+    layer_norm_no_affine(x, eps)
+        .mul(scale.add_scalar(1.0))
+        .add(shift)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_prefers_decomposed_modulated_layer_norm<B: Backend>(x: &Tensor<B, 3>) -> bool {
+    if !attention_uses_non_fusion_module_kernel::<B>() {
+        return false;
+    }
+    let [batch, tokens, channels] = x.dims();
+    let dtype: burn::tensor::FloatDType = x.dtype().into();
+    dtype == burn::tensor::FloatDType::F32
+        && channels >= 1024
+        && batch.saturating_mul(tokens) >= 1024
+}
+
 fn layer_norm_affine_stable<B: Backend>(
     x: Tensor<B, 3>,
     norm: &nn::LayerNorm<B>,
@@ -4152,6 +6743,115 @@ fn sparse_flow_wgpu_max_peak_bytes() -> usize {
     3 * 1024 * 1024 * 1024
 }
 
+fn bytes_to_mib(bytes: usize) -> usize {
+    bytes / (1024 * 1024)
+}
+
+fn sample_cfg_needs_negative_condition(
+    sample_cfg: FlowEulerSampleConfig,
+    t_pairs: &[(f32, f32)],
+) -> bool {
+    if (sample_cfg.guidance_strength - 1.0).abs() < f32::EPSILON {
+        return false;
+    }
+    t_pairs
+        .iter()
+        .any(|(timestep, _)| guidance_interval_contains(*timestep, sample_cfg.guidance_interval))
+}
+
+fn sparse_flow_cross_kv_cache_enabled_for_backend<B: Backend>() -> bool {
+    attention_uses_non_fusion_module_kernel::<B>()
+}
+
+fn sparse_flow_cross_kv_cache_budget_bytes_for_backend<B: Backend>() -> usize {
+    if !sparse_flow_cross_kv_cache_enabled_for_backend::<B>() {
+        return 0;
+    }
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        sparse_flow_wgpu_max_peak_bytes()
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        0
+    }
+}
+
+fn sparse_flow_batched_cfg_enabled_for_backend<B: Backend>() -> bool {
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        attention_uses_non_fusion_module_kernel::<B>()
+            && sparse_flow_batched_cfg_experimental_enabled()
+            && sparse_flow_wgpu_module_attention_f16_enabled()
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_batched_cfg_experimental_enabled() -> bool {
+    std::env::var("TRELLIS2_SPARSE_FLOW_BATCHED_CFG")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn sparse_flow_batched_cfg_debug_enabled() -> bool {
+    std::env::var("TRELLIS2_SPARSE_FLOW_BATCHED_CFG_DEBUG")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn concat_cross_kv_caches<B: Backend>(
+    pos: &CrossAttentionKvCache<B>,
+    neg: &CrossAttentionKvCache<B>,
+) -> Option<CrossAttentionKvCache<B>> {
+    if pos.len() != neg.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pos.len());
+    for (pos_block, neg_block) in pos.iter().zip(neg.iter()) {
+        if pos_block.module_dtype != neg_block.module_dtype {
+            return None;
+        }
+        let module_k = match (&pos_block.module_k, &neg_block.module_k) {
+            (Some(pos_k), Some(neg_k)) => Some(Tensor::cat(vec![pos_k.clone(), neg_k.clone()], 0)),
+            (None, None) => None,
+            _ => return None,
+        };
+        let module_v = match (&pos_block.module_v, &neg_block.module_v) {
+            (Some(pos_v), Some(neg_v)) => Some(Tensor::cat(vec![pos_v.clone(), neg_v.clone()], 0)),
+            (None, None) => None,
+            _ => return None,
+        };
+        out.push(CrossAttentionProjectedKv {
+            k: Tensor::cat(vec![pos_block.k.clone(), neg_block.k.clone()], 0),
+            v: Tensor::cat(vec![pos_block.v.clone(), neg_block.v.clone()], 0),
+            module_k,
+            module_v,
+            module_dtype: pos_block.module_dtype,
+        });
+    }
+    Some(out)
+}
+
 #[cfg(feature = "runtime-model-wgpu")]
 fn sparse_flow_wgpu_estimated_peak_bytes(config: &SparseStructureFlowConfig) -> usize {
     let tokens = config
@@ -4184,7 +6884,152 @@ fn sparse_flow_stage_debug_enabled() -> bool {
     runtime_model_stage_debug_enabled()
 }
 
+fn sparse_flow_weight_probe_enabled() -> bool {
+    sparse_flow_stage_debug_enabled()
+        || std::env::var("TRELLIS2_SPARSE_FLOW_WEIGHT_PROBE")
+            .ok()
+            .and_then(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                match value.as_str() {
+                    "1" | "true" | "on" | "yes" => Some(true),
+                    "0" | "false" | "off" | "no" => Some(false),
+                    _ => None,
+                }
+            })
+            .unwrap_or(false)
+}
+
+fn sparse_flow_forward_finite_probe_enabled() -> bool {
+    std::env::var("TRELLIS2_SPARSE_FLOW_FORWARD_FINITE_PROBE")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn sparse_flow_forward_finite_probe_strict() -> bool {
+    std::env::var("TRELLIS2_SPARSE_FLOW_FORWARD_FINITE_PROBE_STRICT")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "1" | "true" | "on" | "yes" => Some(true),
+                "0" | "false" | "off" | "no" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn log_sparse_flow_forward_finite_probe<B: Backend, const D: usize>(
+    label: &str,
+    tensor: Tensor<B, D>,
+) {
+    let dims = tensor.dims();
+    let values = match tensor.into_data().convert::<f32>().to_vec::<f32>() {
+        Ok(values) => values,
+        Err(err) => {
+            eprintln!("burn_trellis: sparse flow finite probe {label}: readback failed: {err:?}");
+            return;
+        }
+    };
+    record_host_readback(values.len());
+    let mut non_finite = 0usize;
+    let mut first_non_finite = None;
+    let mut finite_min = f32::INFINITY;
+    let mut finite_max = f32::NEG_INFINITY;
+    for (index, value) in values.iter().copied().enumerate() {
+        if value.is_finite() {
+            finite_min = finite_min.min(value);
+            finite_max = finite_max.max(value);
+        } else {
+            non_finite += 1;
+            first_non_finite.get_or_insert((index, value));
+        }
+    }
+    let finite_min = if finite_min.is_finite() {
+        finite_min
+    } else {
+        f32::NAN
+    };
+    let finite_max = if finite_max.is_finite() {
+        finite_max
+    } else {
+        f32::NAN
+    };
+    let first_non_finite_text = first_non_finite
+        .map(|(index, value)| format!("{index}:{value:?}"))
+        .unwrap_or_else(|| "none".to_owned());
+    eprintln!(
+        "burn_trellis: sparse flow finite probe {label}: dims={dims:?} non_finite={non_finite} first_non_finite={first_non_finite_text} finite_min={finite_min:.9e} finite_max={finite_max:.9e}"
+    );
+    assert!(
+        !(sparse_flow_forward_finite_probe_strict() && non_finite > 0),
+        "sparse flow finite probe {label} produced {non_finite} non-finite values"
+    );
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_layer_norm_kernel_enabled() -> bool {
+    std::env::var("TRELLIS2_SPARSE_FLOW_WGPU_LAYER_NORM_KERNEL")
+        .ok()
+        .and_then(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "0" | "false" | "off" | "no" => Some(false),
+                "1" | "true" | "on" | "yes" => Some(true),
+                _ => None,
+            }
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_module_attention_enabled() -> bool {
+    runtime_model_sparse_flow_module_attention_enabled()
+}
+
+fn sparse_flow_wgpu_module_attention_f16_enabled() -> bool {
+    runtime_model_sparse_flow_module_attention_f16_enabled()
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_linear_f16_enabled() -> bool {
+    runtime_model_sparse_flow_linear_f16_enabled()
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn sparse_flow_wgpu_coord_rope_kernel_enabled() -> bool {
+    runtime_model_sparse_flow_coord_rope_kernel_enabled()
+}
+
 fn log_sparse_flow_weight_probe<B: Backend>(model: &SparseStructureFlowModel<B>) {
+    fn stats_1d<B: Backend>(tensor: Tensor<B, 1>) -> (f32, f32, f32) {
+        let values = tensor
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap_or_default();
+        if values.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum_v = 0.0f64;
+        for value in values.iter().copied() {
+            min_v = min_v.min(value);
+            max_v = max_v.max(value);
+            sum_v += value as f64;
+        }
+        (min_v, max_v, (sum_v / values.len() as f64) as f32)
+    }
+
     fn stats_2d<B: Backend>(tensor: Tensor<B, 2>) -> (f32, f32, f32) {
         let values = tensor
             .into_data()
@@ -4210,12 +7055,16 @@ fn log_sparse_flow_weight_probe<B: Backend>(model: &SparseStructureFlowModel<B>)
     if let Some(block0) = model.blocks.first() {
         let (kv_min, kv_max, kv_mean) = stats_2d(block0.cross_attn.to_kv.weight.val());
         let (q_min, q_max, q_mean) = stats_2d(block0.cross_attn.to_q.weight.val());
+        let (mod_min, mod_max, mod_mean) = stats_1d(block0.modulation.val());
         eprintln!(
-            "burn_trellis: sparse flow weight probe backend={} input_layer[min,max,mean]=[{:.6},{:.6},{:.6}] block0.cross_attn.to_q=[{:.6},{:.6},{:.6}] block0.cross_attn.to_kv=[{:.6},{:.6},{:.6}] out_layer=[{:.6},{:.6},{:.6}]",
+            "burn_trellis: sparse flow weight probe backend={} input_layer[min,max,mean]=[{:.6},{:.6},{:.6}] block0.modulation=[{:.6},{:.6},{:.6}] block0.cross_attn.to_q=[{:.6},{:.6},{:.6}] block0.cross_attn.to_kv=[{:.6},{:.6},{:.6}] out_layer=[{:.6},{:.6},{:.6}]",
             std::any::type_name::<B>(),
             in_min,
             in_max,
             in_mean,
+            mod_min,
+            mod_max,
+            mod_mean,
             q_min,
             q_max,
             q_mean,
@@ -4235,6 +7084,10 @@ fn log_sparse_flow_weight_probe<B: Backend>(model: &SparseStructureFlowModel<B>)
 }
 
 fn attention_uses_module_kernel<B: Backend>() -> bool {
+    #[cfg(feature = "runtime-model-wgpu")]
+    if !sparse_flow_wgpu_module_attention_enabled() {
+        return false;
+    }
     let backend = std::any::type_name::<B>();
     backend.contains("Wgpu") || backend.contains("cubecl_wgpu")
 }
@@ -4280,13 +7133,44 @@ fn sparse_flow_chunked_forward_for_backend<B: Backend>(tokens: usize) -> bool {
 }
 
 fn sparse_flow_module_attention_chunk_cap(tokens: usize) -> usize {
+    if tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV {
+        return SPARSE_FLOW_MODULE_ATTENTION_LONG_K_QUERY_CHUNK.min(tokens.max(1));
+    }
     if tokens >= 131_072 {
         16_384
     } else if tokens >= 16_384 {
-        8_192
+        #[cfg(target_arch = "wasm32")]
+        {
+            8_192
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            16_384
+        }
     } else {
         tokens.max(1)
     }
+}
+
+fn sparse_flow_module_attention_chunk_cap_for_shape(
+    _batch: usize,
+    _heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> usize {
+    if key_tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV {
+        let cap = if head_dim == 128 {
+            SPARSE_FLOW_MODULE_ATTENTION_LONG_K_HEAD_DIM_128_QUERY_CHUNK
+        } else {
+            SPARSE_FLOW_MODULE_ATTENTION_LONG_K_QUERY_CHUNK
+        };
+        return cap.min(query_tokens.max(1));
+    }
+    if query_tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV {
+        return SPARSE_FLOW_MODULE_ATTENTION_VERIFIED_LONG_QUERY_CHUNK.min(query_tokens.max(1));
+    }
+    sparse_flow_module_attention_chunk_cap(query_tokens)
 }
 
 fn sparse_flow_module_attention_query_chunk_cap(
@@ -4310,6 +7194,13 @@ fn sparse_flow_module_attention_prefers_full(tokens: usize) -> bool {
     // sparse-structure occupancy on representative runs.
     let _ = tokens;
     false
+}
+
+fn sparse_flow_module_attention_query_multiple() -> usize {
+    // CubeK's accelerated WGPU attention path requires the query length to be a
+    // multiple of the inferred stage width. Padding to 128 covers the current
+    // native blackbox candidates while adding at most 127 ignored query rows.
+    128
 }
 
 fn sparse_flow_stream_reuse_qkv_enabled(tokens: usize, channels: usize) -> bool {
@@ -4346,8 +7237,14 @@ fn sparse_flow_linear_chunk_tokens(tokens: usize) -> usize {
 fn sparse_flow_linear_chunk_tokens_for_backend<B: Backend>(tokens: usize) -> usize {
     let default = sparse_flow_linear_chunk_tokens(tokens);
     if attention_uses_non_fusion_module_kernel::<B>() && tokens >= 16_384 {
-        // Native WGPU module kernels sustain larger token chunks; raising this
-        // cap reduces chunk-splitting overhead in sparse-flow entry/exit linears.
+        // Native WGPU fast-f16 linears can run the canonical HR SLat token
+        // count in one matmul. Avoiding the extra slice/cat boundary removes
+        // launch overhead from the 23,816-row shape without changing math.
+        #[cfg(all(feature = "runtime-model-wgpu", not(target_arch = "wasm32")))]
+        if sparse_flow_wgpu_linear_f16_enabled() {
+            return 32_768usize.min(tokens.max(1)).max(default);
+        }
+        // Keep reference f32 and wasm on the previous conservative cap.
         return 16_384usize.min(tokens.max(1)).max(default);
     }
     default
@@ -4441,19 +7338,51 @@ fn sparse_flow_mlp_chunk_tokens_for_backend<B: Backend>(tokens: usize) -> usize 
     // Non-fusion WGPU module-attention path can tolerate wider MLP chunks.
     // This cuts launch/concatenation overhead while keeping canonical sparse
     // SLAT stages below common adapter allocation ceilings.
-    let widened = if tokens >= 65_536 {
+    let fast_linear_chunk = {
+        #[cfg(all(feature = "runtime-model-wgpu", not(target_arch = "wasm32")))]
+        {
+            if sparse_flow_wgpu_linear_f16_enabled() {
+                32_768usize
+            } else {
+                8_192usize
+            }
+        }
+        #[cfg(any(not(feature = "runtime-model-wgpu"), target_arch = "wasm32"))]
+        {
+            8_192usize
+        }
+    };
+    let widened = if tokens >= 16_384 {
+        fast_linear_chunk.min(tokens.max(1)).max(default)
+    } else if tokens >= 2_048 {
         8_192usize.min(tokens.max(1)).max(default)
-    } else if tokens >= 16_384 {
-        4_096usize.min(tokens.max(1)).max(default)
     } else {
         default
     };
     // Keep per-chunk hidden activations bounded for WGPU sparse-flow MLP.
-    // The 1024 shape_slat path (rows ~= 4_912, hidden ~= 8_192) can otherwise
-    // request a single ~161 MiB buffer and panic on adapters with ~128 MiB
-    // effective storage allocation limits.
     if attention_uses_module_kernel::<B>() {
-        widened.min(4_096usize).min(tokens.max(1))
+        let cap = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Browser adapters commonly expose lower effective storage
+                // allocation ceilings than native Vulkan.
+                4_096usize
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                #[cfg(feature = "runtime-model-wgpu")]
+                if sparse_flow_wgpu_linear_f16_enabled() {
+                    32_768usize
+                } else {
+                    8_192usize
+                }
+                #[cfg(not(feature = "runtime-model-wgpu"))]
+                {
+                    8_192usize
+                }
+            }
+        };
+        widened.min(cap).min(tokens.max(1))
     } else {
         widened
     }
@@ -4509,9 +7438,68 @@ fn sparse_flow_self_attn_kv_chunk_tokens(tokens: usize) -> usize {
     default.min(32_768).min(tokens.max(1))
 }
 
-fn linear_forward_stable_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2> {
+fn linear_forward_stable_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    linear_forward_stable_2d_with_policy(linear, x, true)
+}
+
+fn linear_forward_stable_2d_reference<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 2>,
+) -> Tensor<B, 2> {
+    linear_forward_stable_2d_reference_impl(linear, x)
+}
+
+fn linear_forward_stable_2d_with_policy<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 2>,
+    allow_fast_f16: bool,
+) -> Tensor<B, 2>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
     let x_dtype: burn::tensor::FloatDType = x.dtype().into();
+    let [rows, in_channels] = x.dims();
     let weight = linear.weight.val();
+    let [weight_in_channels, out_channels] = weight.dims();
+    if in_channels != weight_in_channels {
+        panic!(
+            "linear input/weight mismatch: input=[{rows},{in_channels}] weight=[{weight_in_channels},{out_channels}]"
+        );
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    if allow_fast_f16
+        && sparse_flow_wgpu_linear_f16_enabled()
+        && attention_uses_non_fusion_module_kernel::<B>()
+        && rows >= 1024
+        && in_channels >= 64
+        && out_channels >= 64
+    {
+        if let Some(output) = maybe_linear_f16_wgpu(linear, x.clone(), x_dtype) {
+            return output;
+        }
+    }
+
+    linear_forward_stable_2d_reference_impl(linear, x)
+}
+
+fn linear_forward_stable_2d_reference_impl<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 2>,
+) -> Tensor<B, 2> {
+    let x_dtype: burn::tensor::FloatDType = x.dtype().into();
+    let [rows, in_channels] = x.dims();
+    let weight = linear.weight.val();
+    let [weight_in_channels, out_channels] = weight.dims();
+    if in_channels != weight_in_channels {
+        panic!(
+            "linear input/weight mismatch: input=[{rows},{in_channels}] weight=[{weight_in_channels},{out_channels}]"
+        );
+    }
+
     let weight_dtype: burn::tensor::FloatDType = weight.dtype().into();
     // Keep linear operands in a single dtype to avoid mixed-dtype WGPU matmul
     // collapse on bf16 checkpoint weights (observed near-zero outputs in sparse flow).
@@ -4534,10 +7522,92 @@ fn linear_forward_stable_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>)
     output
 }
 
-fn linear_forward_stable_via_2d<B: Backend>(
-    linear: &nn::Linear<B>,
+fn sparse_flow_torso_dtype_for_backend<B: Backend>() -> Option<burn::tensor::FloatDType> {
+    if attention_uses_non_fusion_module_kernel::<B>()
+        && runtime_model_sparse_flow_torso_f16_enabled()
+    {
+        return Some(burn::tensor::FloatDType::F16);
+    }
+    None
+}
+
+fn feed_forward_f16_chain_enabled<B: Backend>(
+    mlp_0: &nn::Linear<B>,
+    mlp_2: &nn::Linear<B>,
+) -> bool {
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        let [in_channels, hidden_channels] = mlp_0.weight.val().dims();
+        let [hidden_in_channels, out_channels] = mlp_2.weight.val().dims();
+        sparse_flow_wgpu_linear_f16_enabled()
+            && attention_uses_non_fusion_module_kernel::<B>()
+            && in_channels >= 64
+            && hidden_channels >= 64
+            && hidden_in_channels == hidden_channels
+            && out_channels >= 64
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        let _ = (mlp_0, mlp_2);
+        false
+    }
+}
+
+fn linear_forward_f16_raw_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    let [rows, in_channels] = x.dims();
+    let weight = linear.weight.val();
+    let [weight_in_channels, out_channels] = weight.dims();
+    if in_channels != weight_in_channels {
+        panic!(
+            "linear input/weight mismatch: input=[{rows},{in_channels}] weight=[{weight_in_channels},{out_channels}]"
+        );
+    }
+
+    let f16 = burn::tensor::FloatDType::F16;
+    #[cfg(feature = "runtime-model-wgpu")]
+    if sparse_flow_wgpu_linear_f16_enabled()
+        && attention_uses_non_fusion_module_kernel::<B>()
+        && rows >= 1024
+        && in_channels >= 64
+        && out_channels >= 64
+    {
+        if let Some(output) = maybe_linear_f16_wgpu(linear, x.clone(), f16) {
+            return output;
+        }
+    }
+
+    let mut output =
+        tensor_cast_float_2d_if_needed(x, f16).matmul(tensor_cast_float_2d_if_needed(weight, f16));
+    if let Some(bias) = linear.bias.as_ref() {
+        output = output.add(tensor_cast_float_1d_if_needed(bias.val(), f16).unsqueeze::<2>());
+    }
+    output
+}
+
+fn feed_forward_f16_chain_via_2d<B: Backend>(
+    mlp_0: &nn::Linear<B>,
+    mlp_2: &nn::Linear<B>,
     x: Tensor<B, 3>,
-) -> Tensor<B, 3> {
+) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    let output_dtype: burn::tensor::FloatDType = x.dtype().into();
+    let [batch, tokens, channels] = x.dims();
+    let out_channels = mlp_2.weight.val().dims()[1];
+    let hidden = linear_forward_f16_raw_2d(mlp_0, x.reshape([batch * tokens, channels]));
+    linear_forward_f16_raw_2d(mlp_2, gelu(hidden))
+        .cast(output_dtype)
+        .reshape([batch, tokens, out_channels])
+}
+
+fn linear_forward_stable_via_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
     let [batch, tokens, channels] = x.dims();
     let out_channels = linear.weight.val().dims()[1];
     linear_forward_stable_2d(linear, x.reshape([batch * tokens, channels])).reshape([
@@ -4547,14 +7617,70 @@ fn linear_forward_stable_via_2d<B: Backend>(
     ])
 }
 
-fn linear_forward_token_chunked<B: Backend>(
+fn linear_forward_stable_via_2d_reference<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    let [batch, tokens, channels] = x.dims();
+    let out_channels = linear.weight.val().dims()[1];
+    linear_forward_stable_2d_reference(linear, x.reshape([batch * tokens, channels])).reshape([
+        batch,
+        tokens,
+        out_channels,
+    ])
+}
+
+fn linear_forward_attention<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 3>,
+    allow_f16_output: bool,
+) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        let [batch, tokens, channels] = x.dims();
+        let rows = batch.saturating_mul(tokens);
+        let [in_channels, out_channels] = linear.weight.val().dims();
+        if allow_f16_output
+            && sparse_flow_wgpu_linear_f16_enabled()
+            && attention_uses_non_fusion_module_kernel::<B>()
+            && rows >= 1024
+            && channels == in_channels
+            && in_channels >= 64
+            && out_channels >= 64
+        {
+            return linear_forward_f16_raw_2d(linear, x.reshape([rows, channels])).reshape([
+                batch,
+                tokens,
+                out_channels,
+            ]);
+        }
+    }
+    linear_forward_stable_via_2d(linear, x)
+}
+
+fn linear_forward_attention_to_dtype<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 3>,
+    dtype: burn::tensor::FloatDType,
+    allow_f16_output: bool,
+) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    tensor_cast_float_3d_if_needed(linear_forward_attention(linear, x, allow_f16_output), dtype)
+}
+
+fn linear_forward_token_chunked_reference<B: Backend>(
     linear: &nn::Linear<B>,
     x: Tensor<B, 3>,
     chunk_tokens: usize,
 ) -> Tensor<B, 3> {
     let [batch, tokens, channels] = x.dims();
     if chunk_tokens >= tokens {
-        return linear_forward_stable(linear, x);
+        return linear_forward_stable_via_2d_reference(linear, x);
     }
 
     let mut chunks = Vec::new();
@@ -4562,14 +7688,74 @@ fn linear_forward_token_chunked<B: Backend>(
     while start < tokens {
         let end = (start + chunk_tokens).min(tokens);
         let x_chunk = x.clone().slice([0..batch, start..end, 0..channels]);
-        chunks.push(linear_forward_stable(linear, x_chunk));
+        chunks.push(linear_forward_stable_via_2d_reference(linear, x_chunk));
         start = end;
     }
     Tensor::cat(chunks, 1)
 }
 
-fn linear_forward_stable<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
-    linear_forward_stable_via_2d(linear, x)
+fn linear_forward_input_token_chunked<B: Backend>(
+    linear: &nn::Linear<B>,
+    x: Tensor<B, 3>,
+    chunk_tokens: usize,
+) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+{
+    let [batch, tokens, channels] = x.dims();
+    let out_channels = linear.weight.val().dims()[1];
+    let output_dtype: burn::tensor::FloatDType = x.dtype().into();
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    let try_skinny = |x_2d: Tensor<B, 2>| -> Option<Tensor<B, 2>> {
+        let [rows, in_channels] = x_2d.dims();
+        if sparse_flow_wgpu_linear_f16_enabled()
+            && attention_uses_non_fusion_module_kernel::<B>()
+            && SPARSE_FLOW_INPUT_SKINNY_LINEAR_WGPU
+            && rows >= 1024
+            && in_channels <= 64
+            && out_channels >= 256
+        {
+            maybe_linear_skinny_wgpu(linear, x_2d, output_dtype)
+        } else {
+            None
+        }
+    };
+
+    if chunk_tokens >= tokens {
+        let x_2d = x.reshape([batch * tokens, channels]);
+        #[cfg(feature = "runtime-model-wgpu")]
+        if let Some(output) = try_skinny(x_2d.clone()) {
+            return output.reshape([batch, tokens, out_channels]);
+        }
+        return linear_forward_stable_2d_reference(linear, x_2d).reshape([
+            batch,
+            tokens,
+            out_channels,
+        ]);
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < tokens {
+        let end = (start + chunk_tokens).min(tokens);
+        let chunk_tokens_actual = end - start;
+        let x_chunk = x.clone().slice([0..batch, start..end, 0..channels]);
+        let x_2d = x_chunk.reshape([batch * chunk_tokens_actual, channels]);
+        #[cfg(feature = "runtime-model-wgpu")]
+        if let Some(output) = try_skinny(x_2d.clone()) {
+            chunks.push(output.reshape([batch, chunk_tokens_actual, out_channels]));
+            start = end;
+            continue;
+        }
+        chunks.push(linear_forward_stable_2d_reference(linear, x_2d).reshape([
+            batch,
+            chunk_tokens_actual,
+            out_channels,
+        ]));
+        start = end;
+    }
+    Tensor::cat(chunks, 1)
 }
 
 // Avoid 4D matmul layout expansion on fusion/cubecl backends by flattening batch*heads.
@@ -4611,7 +7797,15 @@ fn scaled_dot_product_attention<B: Backend>(
     let [batch, heads, query_tokens, _] = q.dims();
     let [_, _, key_tokens, _] = k.dims();
 
-    if attention_uses_module_kernel::<B>() {
+    if attention_uses_module_kernel::<B>()
+        && !sparse_flow_module_attention_cross_shape_requires_stream(
+            batch,
+            heads,
+            query_tokens,
+            key_tokens,
+            head_dim,
+        )
+    {
         let backend_name = std::any::type_name::<B>();
         let fusion_backend = backend_name.contains("Fusion<");
         let logits_budget = attention_logits_budget_bytes();
@@ -4630,14 +7824,27 @@ fn scaled_dot_product_attention<B: Backend>(
             attention_query_chunk(query_tokens, query_tokens)
                 .min(max_query_by_budget)
                 .max(1)
+        } else if sparse_flow_module_attention_long_k_requires_fallback(
+            batch, heads, key_tokens, head_dim,
+        ) {
+            SPARSE_FLOW_MODULE_ATTENTION_LONG_K_QUERY_CHUNK
+                .min(max_query_by_budget)
+                .min(query_tokens)
+                .max(1)
         } else {
             // Raw CubeBackend module attention should stay on flash-attn kernels.
             // Use the sparse-flow module cap instead of the global stream cap
             // (1024) to reduce cross-attention dispatch overhead on large token
             // counts while keeping chunking bounded for very large stages.
-            sparse_flow_module_attention_chunk_cap(query_tokens)
-                .min(query_tokens)
-                .max(1)
+            sparse_flow_module_attention_chunk_cap_for_shape(
+                batch,
+                heads,
+                query_tokens,
+                key_tokens,
+                head_dim,
+            )
+            .min(query_tokens)
+            .max(1)
         };
 
         if attention_debug_enabled() && query_tokens >= 1024 {
@@ -4647,7 +7854,7 @@ fn scaled_dot_product_attention<B: Backend>(
         }
 
         let out = if query_chunk >= query_tokens {
-            attention(q, k, v, None, None, AttentionModuleOptions::default())
+            sparse_flow_module_attention(q, k, v)
         } else {
             let mut chunks = Vec::new();
             let mut start = 0usize;
@@ -4657,14 +7864,7 @@ fn scaled_dot_product_attention<B: Backend>(
                     .clone()
                     .slice([0..batch, 0..heads, start..end, 0..head_dim])
                     .clone();
-                chunks.push(attention(
-                    q_chunk,
-                    k.clone(),
-                    v.clone(),
-                    None,
-                    None,
-                    AttentionModuleOptions::default(),
-                ));
+                chunks.push(sparse_flow_module_attention(q_chunk, k.clone(), v.clone()));
                 start = end;
             }
             Tensor::cat(chunks, 2)
@@ -4900,6 +8100,388 @@ fn scaled_dot_product_attention_stream_chunked_keys<B: Backend>(
     acc
 }
 
+fn sparse_flow_module_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    sparse_flow_module_attention_impl(q, k, v)
+}
+
+fn sparse_flow_module_attention_impl<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    let [batch, heads, query_tokens, head_dim] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
+    if sparse_flow_module_attention_batched_long_k_requires_stream(batch, key_tokens, head_dim) {
+        return scaled_dot_product_attention_stream(q, k, v, head_dim);
+    }
+    if let Some(query_cap) = sparse_flow_module_attention_safe_query_cap_for_shape(
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        head_dim,
+    ) {
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < query_tokens {
+            let end = (start + query_cap).min(query_tokens);
+            let q_chunk = q
+                .clone()
+                .slice([0..batch, 0..heads, start..end, 0..head_dim]);
+            chunks.push(sparse_flow_module_attention_impl(
+                q_chunk,
+                k.clone(),
+                v.clone(),
+            ));
+            start = end;
+        }
+        return Tensor::cat(chunks, 2);
+    }
+
+    sparse_flow_module_attention_direct_impl(q, k, v)
+}
+
+fn sparse_flow_module_attention_prepared<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    let [batch, heads, query_tokens, head_dim] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
+    if sparse_flow_module_attention_batched_long_k_requires_stream(batch, key_tokens, head_dim) {
+        return scaled_dot_product_attention_stream(q, k, v, head_dim);
+    }
+    if let Some(query_cap) = sparse_flow_module_attention_safe_query_cap_for_shape(
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        head_dim,
+    ) {
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < query_tokens {
+            let end = (start + query_cap).min(query_tokens);
+            let q_chunk = q
+                .clone()
+                .slice([0..batch, 0..heads, start..end, 0..head_dim]);
+            chunks.push(sparse_flow_module_attention_prepared(
+                q_chunk,
+                k.clone(),
+                v.clone(),
+            ));
+            start = end;
+        }
+        return Tensor::cat(chunks, 2);
+    }
+
+    sparse_flow_module_attention_prepared_direct_impl(q, k, v)
+}
+
+fn sparse_flow_module_attention_batched_long_k_requires_stream(
+    batch: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> bool {
+    // CubeK/Burn WGPU module attention currently diverges for TRELLIS.2 SLat
+    // batch>1 head_dim=128 calls. Batched CFG is still useful, but those
+    // attention calls must stay on the streamed reference path until the module
+    // primitive is fixed for batched HR SLat shapes.
+    let _ = key_tokens;
+    batch > 1 && head_dim == 128
+}
+
+#[allow(dead_code)]
+fn sparse_flow_module_attention_direct<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    sparse_flow_module_attention_direct_impl(q, k, v)
+}
+
+fn sparse_flow_module_attention_direct_impl<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    let [batch, heads, query_tokens, head_dim] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
+    if sparse_flow_module_attention_batched_long_k_requires_stream(batch, key_tokens, head_dim) {
+        panic!(
+            "direct sparse-flow module attention called with unverified batched long-key shape batch={batch} q={query_tokens} kv={key_tokens}; use streamed attention"
+        );
+    }
+    if let Some(query_cap) = sparse_flow_module_attention_safe_query_cap_for_shape(
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        head_dim,
+    ) {
+        panic!(
+            "direct sparse-flow module attention called with unverified long-key shape q={query_tokens} kv={key_tokens}; split into chunks <= {query_cap}"
+        );
+    }
+    let query_multiple = sparse_flow_module_attention_query_multiple();
+    let padded_query_tokens = query_tokens.div_ceil(query_multiple) * query_multiple;
+    let attention_dtype =
+        sparse_flow_module_attention_dtype_for_shape(batch, heads, key_tokens, head_dim);
+    let force_fallback =
+        sparse_flow_module_attention_long_k_requires_fallback(batch, heads, key_tokens, head_dim);
+    let cast_pad_start = Instant::now();
+    let q = tensor_cast_float_4d_if_needed(q, attention_dtype);
+    let k = tensor_cast_float_4d_if_needed(k, attention_dtype);
+    let v = tensor_cast_float_4d_if_needed(v, attention_dtype);
+    let q = if padded_query_tokens > query_tokens {
+        let pad = Tensor::<B, 4>::zeros(
+            [batch, heads, padded_query_tokens - query_tokens, head_dim],
+            &q.device(),
+        )
+        .cast(attention_dtype);
+        Tensor::cat(vec![q, pad], 2)
+    } else {
+        q
+    };
+    let q = force_contiguous_4d(q);
+    let k = force_contiguous_4d(k);
+    let v = force_contiguous_4d(v);
+    record_sparse_flow_detail(
+        SparseFlowOpDetailKind::ModuleCastPad,
+        elapsed_ns(cast_pad_start),
+    );
+
+    let attention_start = Instant::now();
+    let attention_options = if force_fallback {
+        AttentionModuleOptions {
+            scale: Some((head_dim as f64).powf(-0.5)),
+            ..Default::default()
+        }
+    } else {
+        AttentionModuleOptions::default()
+    };
+    let mut out = attention(q, k, v, None, None, attention_options);
+    record_sparse_flow_detail(
+        SparseFlowOpDetailKind::ModuleAttention,
+        elapsed_ns(attention_start),
+    );
+    let output_start = Instant::now();
+    if padded_query_tokens > query_tokens {
+        let value_dim = out.dims()[3];
+        out = out.slice([0..batch, 0..heads, 0..query_tokens, 0..value_dim]);
+    }
+    record_sparse_flow_detail(
+        SparseFlowOpDetailKind::ModuleOutput,
+        elapsed_ns(output_start),
+    );
+    out
+}
+
+fn sparse_flow_module_attention_prepared_direct_impl<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    let [batch, heads, query_tokens, head_dim] = q.dims();
+    let [_, _, key_tokens, _] = k.dims();
+    if sparse_flow_module_attention_batched_long_k_requires_stream(batch, key_tokens, head_dim) {
+        panic!(
+            "prepared sparse-flow module attention called with unverified batched long-key shape batch={batch} q={query_tokens} kv={key_tokens}; use streamed attention"
+        );
+    }
+    if let Some(query_cap) = sparse_flow_module_attention_safe_query_cap_for_shape(
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        head_dim,
+    ) {
+        panic!(
+            "prepared sparse-flow module attention called with unverified long-key shape q={query_tokens} kv={key_tokens}; split into chunks <= {query_cap}"
+        );
+    }
+    let query_multiple = sparse_flow_module_attention_query_multiple();
+    let padded_query_tokens = query_tokens.div_ceil(query_multiple) * query_multiple;
+    let force_fallback =
+        sparse_flow_module_attention_long_k_requires_fallback(batch, heads, key_tokens, head_dim);
+    let cast_pad_start = Instant::now();
+    let q_dtype: burn::tensor::FloatDType = q.dtype().into();
+    let q = if padded_query_tokens > query_tokens {
+        let pad = Tensor::<B, 4>::zeros(
+            [batch, heads, padded_query_tokens - query_tokens, head_dim],
+            &q.device(),
+        )
+        .cast(q_dtype);
+        Tensor::cat(vec![q, pad], 2)
+    } else {
+        q
+    };
+    let q = force_contiguous_4d(q);
+    record_sparse_flow_detail(
+        SparseFlowOpDetailKind::ModuleCastPad,
+        elapsed_ns(cast_pad_start),
+    );
+
+    let attention_start = Instant::now();
+    let attention_options = if force_fallback {
+        AttentionModuleOptions {
+            scale: Some((head_dim as f64).powf(-0.5)),
+            ..Default::default()
+        }
+    } else {
+        AttentionModuleOptions::default()
+    };
+    let mut out = attention(q, k, v, None, None, attention_options);
+    record_sparse_flow_detail(
+        SparseFlowOpDetailKind::ModuleAttention,
+        elapsed_ns(attention_start),
+    );
+    let output_start = Instant::now();
+    if padded_query_tokens > query_tokens {
+        let value_dim = out.dims()[3];
+        out = out.slice([0..batch, 0..heads, 0..query_tokens, 0..value_dim]);
+    }
+    record_sparse_flow_detail(
+        SparseFlowOpDetailKind::ModuleOutput,
+        elapsed_ns(output_start),
+    );
+    out
+}
+
+fn sparse_flow_module_attention_safe_query_cap_for_shape(
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> Option<usize> {
+    let cap = sparse_flow_module_attention_chunk_cap_for_shape(
+        batch,
+        heads,
+        query_tokens,
+        key_tokens,
+        head_dim,
+    );
+    if key_tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV && query_tokens > cap {
+        Some(cap)
+    } else {
+        None
+    }
+}
+
+fn sparse_flow_module_attention_long_k_requires_fallback(
+    batch: usize,
+    heads: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> bool {
+    batch.saturating_mul(heads) >= 16
+        && head_dim == 64
+        && key_tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV
+        && !sparse_flow_wgpu_module_attention_f16_enabled()
+}
+
+fn sparse_flow_module_attention_cross_shape_requires_stream(
+    batch: usize,
+    heads: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> bool {
+    // The TRELLIS.2 cross-attention shape [1, 12, sparse_tokens, 4101, 128]
+    // exposes a CubeK/Burn module f32 correctness gap on real model tensors: it
+    // collapses toward the value mean. The f16 module path matches the upstream
+    // Python BF16 SDPA hook, so keep only f32/reference mode on the streamed
+    // matmul path.
+    head_dim == 128
+        && query_tokens > key_tokens
+        && key_tokens <= 8_192
+        && sparse_flow_module_attention_dtype_for_shape(batch, heads, key_tokens, head_dim)
+            != burn::tensor::FloatDType::F16
+}
+
+fn force_contiguous_4d<B: Backend>(tensor: Tensor<B, 4>) -> Tensor<B, 4> {
+    let dims = tensor.dims();
+    let elements = dims.iter().product::<usize>();
+    tensor.reshape([elements]).reshape(dims)
+}
+
+fn sparse_flow_module_attention_dtype_for_shape(
+    batch: usize,
+    heads: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> burn::tensor::FloatDType {
+    let verified_long_k_f16_shape = (head_dim == 128 || head_dim == 64)
+        && key_tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV
+        && !sparse_flow_module_attention_long_k_requires_fallback(
+            batch, heads, key_tokens, head_dim,
+        );
+    if sparse_flow_wgpu_module_attention_f16_enabled()
+        && (key_tokens <= SPARSE_FLOW_MODULE_ATTENTION_F16_MAX_KEY_TOKENS
+            || verified_long_k_f16_shape)
+        && !sparse_flow_module_attention_long_k_requires_fallback(
+            batch, heads, key_tokens, head_dim,
+        )
+    {
+        burn::tensor::FloatDType::F16
+    } else {
+        burn::tensor::FloatDType::F32
+    }
+}
+
+fn tensor_cast_float_4d_if_needed<B: Backend>(
+    tensor: Tensor<B, 4>,
+    dtype: burn::tensor::FloatDType,
+) -> Tensor<B, 4> {
+    let tensor_dtype: burn::tensor::FloatDType = tensor.dtype().into();
+    if tensor_dtype == dtype {
+        tensor
+    } else {
+        tensor.cast(dtype)
+    }
+}
+
+fn tensor_cast_float_3d_if_needed<B: Backend>(
+    tensor: Tensor<B, 3>,
+    dtype: burn::tensor::FloatDType,
+) -> Tensor<B, 3> {
+    let tensor_dtype: burn::tensor::FloatDType = tensor.dtype().into();
+    if tensor_dtype == dtype {
+        tensor
+    } else {
+        tensor.cast(dtype)
+    }
+}
+
+fn tensor_cast_float_2d_if_needed<B: Backend>(
+    tensor: Tensor<B, 2>,
+    dtype: burn::tensor::FloatDType,
+) -> Tensor<B, 2> {
+    let tensor_dtype: burn::tensor::FloatDType = tensor.dtype().into();
+    if tensor_dtype == dtype {
+        tensor
+    } else {
+        tensor.cast(dtype)
+    }
+}
+
+fn tensor_cast_float_1d_if_needed<B: Backend>(
+    tensor: Tensor<B, 1>,
+    dtype: burn::tensor::FloatDType,
+) -> Tensor<B, 1> {
+    let tensor_dtype: burn::tensor::FloatDType = tensor.dtype().into();
+    if tensor_dtype == dtype {
+        tensor
+    } else {
+        tensor.cast(dtype)
+    }
+}
+
 fn attention_logits_bytes(
     batch: usize,
     heads: usize,
@@ -4953,21 +8535,150 @@ fn attention_key_chunk(tokens: usize) -> usize {
     128usize.min(max_chunk).min(tokens.max(1))
 }
 
-fn apply_rope<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
+#[cfg(feature = "runtime-model-wgpu")]
+#[allow(clippy::too_many_arguments)]
+fn maybe_apply_qk_rms_norm_and_rope_from_qkv<B: Backend>(
+    qkv: Tensor<B, 5>,
+    q_norm: Option<&MultiHeadRmsNorm<B>>,
+    k_norm: Option<&MultiHeadRmsNorm<B>>,
+    use_rope: bool,
+    rope_freq: [f32; 2],
+    token_coords: Option<Tensor<B, 2, Int>>,
+    token_start: usize,
+) -> Option<(Tensor<B, 4>, Tensor<B, 4>)>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+{
+    if !use_rope {
+        return None;
+    }
+    let (Some(q_norm), Some(k_norm), Some(coords)) = (q_norm, k_norm, token_coords) else {
+        return None;
+    };
+    let [_, tokens, _, _, head_dim] = qkv.dims();
+    if head_dim != 128 {
+        return None;
+    }
+    let [coord_rows, coord_cols] = coords.dims();
+    assert_eq!(
+        coord_cols, 3,
+        "sparse flow rope token coords must have 3 columns"
+    );
+    assert!(
+        token_start.saturating_add(tokens) <= coord_rows,
+        "sparse flow rope token range out of bounds"
+    );
+    let coord_slice = coords.slice([token_start..token_start + tokens, 0..3]);
+    maybe_qk_multihead_rms_norm_rope_coords_from_qkv_wgpu(
+        qkv,
+        q_norm.gamma.val(),
+        k_norm.gamma.val(),
+        coord_slice,
+        rope_freq,
+        q_norm.scale,
+        RMS_NORM_EPS,
+    )
+}
+
+fn maybe_apply_qkv_module_rms_norm_and_rope_from_qkv<B: Backend>(
+    qkv: Tensor<B, 5>,
+    q_norm: Option<&MultiHeadRmsNorm<B>>,
+    k_norm: Option<&MultiHeadRmsNorm<B>>,
+    use_rope: bool,
+    rope_freq: [f32; 2],
+    token_coords: Option<Tensor<B, 2, Int>>,
+    token_start: usize,
+) -> Option<(Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>)>
+where
+    RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
+{
+    if !use_rope {
+        return None;
+    }
+    let (Some(q_norm), Some(k_norm), Some(coords)) = (q_norm, k_norm, token_coords) else {
+        return None;
+    };
+    let [_, tokens, _, _, head_dim] = qkv.dims();
+    if head_dim != 128 {
+        return None;
+    }
+    let [coord_rows, coord_cols] = coords.dims();
+    assert_eq!(
+        coord_cols, 3,
+        "sparse flow rope token coords must have 3 columns"
+    );
+    assert!(
+        token_start.saturating_add(tokens) <= coord_rows,
+        "sparse flow rope token range out of bounds"
+    );
+    let coord_slice = coords.slice([token_start..token_start + tokens, 0..3]);
+    maybe_qkv_module_multihead_rms_norm_rope_coords_from_qkv_wgpu(
+        qkv,
+        q_norm.gamma.val(),
+        k_norm.gamma.val(),
+        coord_slice,
+        rope_freq,
+        q_norm.scale,
+        RMS_NORM_EPS,
+    )
+}
+
+fn apply_rms_norm_and_rope_single<B: Backend>(
+    x: Tensor<B, 4>,
+    norm: Option<&MultiHeadRmsNorm<B>>,
+    use_rope: bool,
     resolution: usize,
     head_dim: usize,
     rope_freq: [f32; 2],
     token_coords: Option<Tensor<B, 2, Int>>,
-) -> (Tensor<B, 4>, Tensor<B, 4>)
+    token_start: usize,
+) -> Tensor<B, 4>
 where
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
+    RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
 {
-    (
-        apply_rope_single(q, resolution, head_dim, rope_freq, token_coords.clone(), 0),
-        apply_rope_single(k, resolution, head_dim, rope_freq, token_coords, 0),
-    )
+    let mut x = if let Some(norm) = norm {
+        if use_rope {
+            if let Some(coords) = token_coords.clone() {
+                let [_, tokens, _, _] = x.dims();
+                let [coord_rows, coord_cols] = coords.dims();
+                assert_eq!(
+                    coord_cols, 3,
+                    "sparse flow rope token coords must have 3 columns"
+                );
+                assert!(
+                    token_start.saturating_add(tokens) <= coord_rows,
+                    "sparse flow rope token range out of bounds"
+                );
+                let coord_slice = coords.slice([token_start..token_start + tokens, 0..3]);
+                #[cfg(feature = "runtime-model-wgpu")]
+                if let Some(y) = maybe_multihead_rms_norm_rope_coords_wgpu(
+                    x.clone(),
+                    norm.gamma.val(),
+                    coord_slice,
+                    rope_freq,
+                    norm.scale,
+                    RMS_NORM_EPS,
+                ) {
+                    return y;
+                }
+            }
+        }
+        norm.forward(x)
+    } else {
+        x
+    };
+    if use_rope {
+        x = apply_rope_single(
+            x,
+            resolution,
+            head_dim,
+            rope_freq,
+            token_coords,
+            token_start,
+        );
+    }
+    x
 }
 
 fn apply_rope_single<B: Backend>(
@@ -4998,10 +8709,12 @@ where
         );
         let coord_slice = coords.slice([token_start..token_start + tokens, 0..3]);
         #[cfg(feature = "runtime-model-wgpu")]
-        if let Some(rotated) =
-            maybe_rotate_pairs_coords_wgpu(x.clone(), coord_slice.clone(), rope_freq)
-        {
-            return rotated;
+        if sparse_flow_wgpu_coord_rope_kernel_enabled() {
+            if let Some(rotated) =
+                maybe_rotate_pairs_coords_wgpu(x.clone(), coord_slice.clone(), rope_freq)
+            {
+                return rotated;
+            }
         }
         let phase = rope_phase_from_coord_tensor(coord_slice, pairs, rope_freq);
         let (cos, sin) = rope_cos_sin_from_phase_tensor(phase);
@@ -5381,28 +9094,49 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    #[cfg(feature = "runtime-model-wgpu")]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use burn::module::{Param, ParamId};
     use burn::prelude::Backend;
-    use burn::tensor::{Int, Tensor, TensorData};
+    use burn::tensor::{Int, Tensor, TensorData, module::attention, ops::AttentionModuleOptions};
     use burn_store::{BurnToPyTorchAdapter, BurnpackStore, ModuleSnapshot, SafetensorsStore};
 
+    use crate::hook_diff::{HookSnapshot, HookTensor, compute_stats};
+    #[cfg(feature = "runtime-model-wgpu")]
+    use crate::runtime_model::runtime_config::{
+        RuntimeModelDebugConfig, set_runtime_model_debug_config,
+    };
     use crate::sampler::FlowEulerSampleConfig;
 
+    #[cfg(feature = "runtime-model-wgpu")]
+    use super::WgpuRuntimeBackend;
     use super::{
-        BinaryBlob, BlobMetadata, CpuRuntimeBackend, SelfAttention, SparseStructureFlowConfig,
-        SparseStructureFlowModel, SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl,
-        SparseTensorOwned, VarLenTensorOwned, host_transfer_stats, metadata_path,
-        reset_host_transfer_stats, resolve_model_weight_candidates,
-        scaled_dot_product_attention_dense, scaled_dot_product_attention_stream,
-        sparse_flow_attention_logits_within_budget, sparse_flow_stream_chunk_plan,
+        BinaryBlob, BlobMetadata, CpuRuntimeBackend, SelfAttention, SparseFlowCondition,
+        SparseRuntimeTensorAccess, SparseStructureFlowConfig, SparseStructureFlowModel,
+        SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl, SparseTensorOwned,
+        VarLenTensorOwned, apply_rope_single, force_contiguous_4d, host_transfer_stats,
+        layer_norm_affine_stable, layer_norm_no_affine, linear_forward_attention,
+        linear_forward_stable_2d, linear_forward_token_chunked_reference, metadata_path,
+        reset_host_transfer_stats, reset_sparse_flow_op_telemetry, resolve_model_weight_candidates,
+        dense_grid_token_coords, scaled_dot_product_attention, scaled_dot_product_attention_dense,
+        scaled_dot_product_attention_stream, silu, sparse_flow_attention_logits_within_budget,
+        sparse_flow_linear_chunk_tokens_for_backend, sparse_flow_module_attention_chunk_cap,
+        sparse_flow_module_attention_chunk_cap_for_shape,
+        sparse_flow_module_attention_cross_shape_requires_stream,
+        sparse_flow_module_attention_dtype_for_shape,
+        sparse_flow_module_attention_long_k_requires_fallback,
+        sparse_flow_module_attention_safe_query_cap_for_shape, sparse_flow_op_telemetry,
+        sparse_flow_stream_chunk_plan,
     };
 
     static HOST_STATS_LOCK: Mutex<()> = Mutex::new(());
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(feature = "runtime-model-wgpu")]
+    static SLAT_DEBUG_FIRST_NONFINITE_REPORTED: AtomicBool = AtomicBool::new(false);
 
     #[test]
     fn parses_sparse_structure_flow_config_json() {
@@ -5431,6 +9165,24 @@ mod tests {
         assert!(parsed.share_mod);
     }
 
+    #[test]
+    fn dense_grid_token_coords_follow_dense_voxel_flatten_order() {
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
+        let coords = dense_grid_token_coords::<CpuRuntimeBackend>(2, device);
+        assert_eq!(coords.dims(), [8, 3]);
+        let values = coords
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("dense grid coords should read");
+        assert_eq!(
+            values,
+            vec![
+                0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1,
+            ]
+        );
+    }
+
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn varlen_device_owned_conversion_requires_device_tensor() {
@@ -5457,6 +9209,216 @@ mod tests {
         assert!(
             err.contains("host-only"),
             "expected host-only conversion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sparse_flow_module_attention_long_k_uses_small_chunks() {
+        assert_eq!(
+            sparse_flow_module_attention_chunk_cap_for_shape(2, 12, 23_816, 23_816, 64),
+            12_288,
+            "verified fast-f16 head_dim=64 long-key module attention should use the measured wide query cap"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_chunk_cap_for_shape(1, 12, 23_816, 23_816, 128),
+            12_288,
+            "Trellis HR self-attention with long keys should use the measured head_dim=128 query cap"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_chunk_cap_for_shape(1, 12, 23_816, 1_029, 128),
+            23_816,
+            "Trellis HR cross-attention has short keys and should run as one verified full-query chunk"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_safe_query_cap_for_shape(2, 12, 3_840, 23_816, 64),
+            None,
+            "verified fast-f16 long-key head_dim=64 module attention chunks within the wide cap should run directly"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_safe_query_cap_for_shape(2, 12, 3_712, 23_816, 64),
+            None,
+            "verified long-key head_dim=64 module attention chunks should run directly"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_safe_query_cap_for_shape(1, 12, 7_552, 23_816, 128),
+            None,
+            "head_dim=128 module attention calls inside the measured cap should run directly"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_safe_query_cap_for_shape(1, 12, 16_384, 23_816, 128),
+            Some(12_288),
+            "raw long-key head_dim=128 module attention calls above the verified cap must split internally"
+        );
+        assert!(super::sparse_flow_module_attention_batched_long_k_requires_stream(2, 23_816, 128));
+        assert!(
+            !super::sparse_flow_module_attention_batched_long_k_requires_stream(1, 23_816, 128)
+        );
+        assert_eq!(sparse_flow_module_attention_chunk_cap(8_192), 8_192);
+    }
+
+    #[test]
+    fn sparse_flow_cross_attention_uses_stream_for_python_mismatched_shape() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: false,
+            sparse_flow_linear_f16: false,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+        assert!(sparse_flow_module_attention_cross_shape_requires_stream(
+            1, 12, 23_816, 4_101, 128
+        ));
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: true,
+            sparse_flow_linear_f16: true,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+        assert!(
+            !sparse_flow_module_attention_cross_shape_requires_stream(1, 12, 23_816, 4_101, 128),
+            "fast-f16 cross attention should use the module path; f32/reference remains streamed"
+        );
+        assert!(!sparse_flow_module_attention_cross_shape_requires_stream(
+            1, 12, 23_816, 23_816, 128
+        ));
+        assert!(!sparse_flow_module_attention_cross_shape_requires_stream(
+            1, 12, 3_712, 23_816, 128
+        ));
+        set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    #[test]
+    fn sparse_flow_module_attention_f16_is_gated_by_verified_shape() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: true,
+            sparse_flow_linear_f16: true,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+
+        assert_eq!(
+            sparse_flow_module_attention_dtype_for_shape(1, 12, 5_768, 128),
+            burn::tensor::FloatDType::F16,
+            "moderate Trellis module-attention shapes should use the fast f16 path"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_dtype_for_shape(2, 12, 23_816, 64),
+            burn::tensor::FloatDType::F16,
+            "verified long-key head_dim=64 chunks should use the fast f16 path after query chunking"
+        );
+        assert_eq!(
+            sparse_flow_module_attention_dtype_for_shape(1, 12, 23_816, 128),
+            burn::tensor::FloatDType::F16,
+            "Trellis HR long-key head_dim=128 chunks should use the fast f16 path after query chunking"
+        );
+        assert!(!sparse_flow_module_attention_long_k_requires_fallback(
+            2, 12, 23_816, 64
+        ));
+        set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    #[test]
+    fn sparse_flow_batched_cfg_is_experimental_opt_in_and_streams_batched_hr_attention() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        unsafe {
+            std::env::remove_var("TRELLIS2_SPARSE_FLOW_BATCHED_CFG");
+        }
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: true,
+            sparse_flow_linear_f16: false,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+        assert!(
+            !super::sparse_flow_batched_cfg_enabled_for_backend::<super::WgpuRuntimeBackend>(),
+            "batched CFG remains opt-in until HR SLat batch>1 parity is fixed"
+        );
+        unsafe {
+            std::env::set_var("TRELLIS2_SPARSE_FLOW_BATCHED_CFG", "1");
+        }
+        assert!(
+            super::sparse_flow_batched_cfg_enabled_for_backend::<super::WgpuRuntimeBackend>(),
+            "diagnostic opt-in should still expose the batched CFG path"
+        );
+        assert!(super::sparse_flow_module_attention_batched_long_k_requires_stream(2, 4_101, 128));
+        assert!(super::sparse_flow_module_attention_batched_long_k_requires_stream(2, 10_717, 128));
+        assert!(
+            !super::sparse_flow_module_attention_batched_long_k_requires_stream(1, 10_717, 128)
+        );
+        assert!(!super::sparse_flow_module_attention_batched_long_k_requires_stream(2, 10_717, 64));
+        unsafe {
+            std::env::remove_var("TRELLIS2_SPARSE_FLOW_BATCHED_CFG");
+        }
+        set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
+    }
+
+    #[test]
+    fn cross_attention_kv_cache_matches_uncached_forward() {
+        let runtime = make_tiny_runtime_cpu();
+        let config = runtime.config().clone();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
+        let voxels = config.resolution * config.resolution * config.resolution;
+        let x_values = (0..(config.in_channels * voxels))
+            .map(|idx| {
+                let x = idx as f32 * 0.017 + 0.31;
+                x.sin() * 0.4 + x.cos() * 0.2
+            })
+            .collect::<Vec<_>>();
+        let cond_tokens = 5usize;
+        let cond_values = (0..(cond_tokens * config.cond_channels))
+            .map(|idx| {
+                let x = idx as f32 * 0.023 + 0.11;
+                x.sin() * 0.3 + x.cos() * 0.25
+            })
+            .collect::<Vec<_>>();
+        let x =
+            Tensor::<CpuRuntimeBackend, 1>::from_floats(x_values.as_slice(), &device).reshape([
+                1,
+                config.in_channels,
+                config.resolution,
+                config.resolution,
+                config.resolution,
+            ]);
+        let t = Tensor::<CpuRuntimeBackend, 1>::from_floats([123.0f32], &device);
+        let cond = Tensor::<CpuRuntimeBackend, 1>::from_floats(cond_values.as_slice(), &device)
+            .reshape([1, cond_tokens, config.cond_channels]);
+
+        let uncached = runtime.model.forward(x.clone(), t.clone(), cond.clone());
+        let cache = runtime.model.project_cross_attention_cache(cond.clone());
+        let cached = runtime
+            .model
+            .forward_with_cross_cache(x, t, cond, Some(&cache));
+
+        let uncached = tensor_to_vec5(uncached);
+        let cached = tensor_to_vec5(cached);
+        assert_eq!(uncached.len(), cached.len());
+        let max_abs = uncached
+            .iter()
+            .zip(cached.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 1.0e-6,
+            "cached cross-attention K/V path diverged from uncached path: max_abs={max_abs:.6e}"
         );
     }
 
@@ -5563,7 +9525,7 @@ mod tests {
         .expect("write config");
 
         let source_path = ckpts.join("flow_model.safetensors");
-        let device = <TestBackend as Backend>::Device::default();
+        let device = <TestBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let model = SparseStructureFlowModel::<TestBackend>::new(&device, config.clone());
         let mut source_store =
             SafetensorsStore::from_file(&source_path).with_to_adapter(BurnToPyTorchAdapter);
@@ -5573,7 +9535,7 @@ mod tests {
         let source_bytes = std::fs::read(&source_path).expect("read source safetensors");
 
         let burnpack_path = ckpts.join("flow_model.bpk");
-        let blob_device = <BlobBackend as Backend>::Device::default();
+        let blob_device = <BlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
             TensorData::new(source_bytes.clone(), [source_bytes.len()]),
             &blob_device,
@@ -5677,7 +9639,7 @@ mod tests {
         .expect("write config");
 
         let source_path = ckpts.join("flow_model.safetensors");
-        let device = <TestBackend as Backend>::Device::default();
+        let device = <TestBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let model = SparseStructureFlowModel::<TestBackend>::new(&device, config.clone());
         let mut source_store =
             SafetensorsStore::from_file(&source_path).with_to_adapter(BurnToPyTorchAdapter);
@@ -5687,7 +9649,7 @@ mod tests {
         let source_bytes = std::fs::read(&source_path).expect("read source safetensors");
 
         let burnpack_path = ckpts.join("flow_model.bpk");
-        let blob_device = <BlobBackend as Backend>::Device::default();
+        let blob_device = <BlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
             TensorData::new(source_bytes.clone(), [source_bytes.len()]),
             &blob_device,
@@ -5764,6 +9726,9 @@ mod tests {
     where
         super::RopeRotateWgpuBridgeImpl: super::RopeRotateWgpuBridge<B>,
         super::RopeRotateWgpuBridgeImpl: super::SparseFlowLayerNormWgpuBridge<B>,
+        super::RopeRotateWgpuBridgeImpl: super::SparseFlowRmsNormWgpuBridge<B>,
+        super::RopeRotateWgpuBridgeImpl: super::SparseFlowQkRmsNormWgpuBridge<B>,
+        super::SparseFlowLinearWgpuBridgeImpl: super::SparseFlowLinearWgpuBridge<B>,
     {
         let config = SparseStructureFlowConfig {
             resolution: 2,
@@ -5826,7 +9791,7 @@ mod tests {
             qk_rms_norm_cross: true,
             frequency_embedding_size: 8,
         };
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let model = SparseStructureFlowModel::<CpuRuntimeBackend>::new(&device, config.clone());
         SparseStructureFlowRuntimeImpl {
             config,
@@ -5836,7 +9801,7 @@ mod tests {
     }
 
     fn make_attention_tensor(
-        device: &<CpuRuntimeBackend as Backend>::Device,
+        device: &<CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device,
         tokens: usize,
         heads: usize,
         channels: usize,
@@ -5852,6 +9817,30 @@ mod tests {
     }
 
     fn tensor_to_vec4<B: Backend>(tensor: Tensor<B, 4>) -> Vec<f32> {
+        tensor
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("tensor should be readable")
+    }
+
+    fn tensor_to_vec3<B: Backend>(tensor: Tensor<B, 3>) -> Vec<f32> {
+        tensor
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("tensor should be readable")
+    }
+
+    fn tensor_to_vec2<B: Backend>(tensor: Tensor<B, 2>) -> Vec<f32> {
+        tensor
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("tensor should be readable")
+    }
+
+    fn tensor_to_vec5<B: Backend>(tensor: Tensor<B, 5>) -> Vec<f32> {
         tensor
             .into_data()
             .convert::<f32>()
@@ -5876,7 +9865,7 @@ mod tests {
 
     #[test]
     fn tensor_std_matches_batchwise_unbiased_reference() {
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let values = [
             0.0f32, 1.0, 2.0, 3.0, // batch 0
             2.0, 2.0, 2.0, 2.0, // batch 1
@@ -5907,6 +9896,95 @@ mod tests {
     }
 
     #[test]
+    fn cfg_tensor_matches_upstream_formula_and_rescale() {
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
+        let x_t = Tensor::<CpuRuntimeBackend, 1>::from_floats(
+            [0.1f32, -0.4, 0.7, -1.2].as_slice(),
+            &device,
+        )
+        .reshape([1, 1, 2, 1, 2]);
+        let pos = Tensor::<CpuRuntimeBackend, 1>::from_floats(
+            [1.0f32, 2.0, -1.0, -2.0].as_slice(),
+            &device,
+        )
+        .reshape([1, 1, 2, 1, 2]);
+        let neg = Tensor::<CpuRuntimeBackend, 1>::from_floats(
+            [0.25f32, -0.5, 0.75, -1.0].as_slice(),
+            &device,
+        )
+        .reshape([1, 1, 2, 1, 2]);
+
+        let pred =
+            super::apply_cfg_tensor(x_t.clone(), 0.5, pos.clone(), neg.clone(), 3.0, 0.0, 0.01);
+        let pred = tensor_to_vec5(pred);
+        let expected = [
+            3.0 * 1.0 + (1.0 - 3.0) * 0.25,
+            3.0 * 2.0 + (1.0 - 3.0) * -0.5,
+            3.0 * -1.0 + (1.0 - 3.0) * 0.75,
+            3.0 * -2.0 + (1.0 - 3.0) * -1.0,
+        ];
+        for (idx, (actual, expected)) in pred.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1.0e-6,
+                "cfg tensor mismatch at {idx}: got={actual} expected={expected}"
+            );
+        }
+
+        let rescaled = super::apply_cfg_tensor(x_t, 0.5, pos, neg, 3.0, 0.7, 0.01);
+        let rescaled = tensor_to_vec5(rescaled);
+        assert_ne!(rescaled, pred);
+        assert!(rescaled.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn cfg_sparse_tensor_matches_upstream_formula_and_rescale() {
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
+        let x_t = Tensor::<CpuRuntimeBackend, 1>::from_floats(
+            [0.1f32, -0.4, 0.7, -1.2].as_slice(),
+            &device,
+        )
+        .reshape([1, 2, 2]);
+        let pos = Tensor::<CpuRuntimeBackend, 1>::from_floats(
+            [1.0f32, 2.0, -1.0, -2.0].as_slice(),
+            &device,
+        )
+        .reshape([1, 2, 2]);
+        let neg = Tensor::<CpuRuntimeBackend, 1>::from_floats(
+            [0.25f32, -0.5, 0.75, -1.0].as_slice(),
+            &device,
+        )
+        .reshape([1, 2, 2]);
+
+        let pred = super::apply_cfg_sparse_tensor(
+            x_t.clone(),
+            0.5,
+            pos.clone(),
+            neg.clone(),
+            3.0,
+            0.0,
+            0.01,
+        );
+        let pred = tensor_to_vec3(pred);
+        let expected = [
+            3.0 * 1.0 + (1.0 - 3.0) * 0.25,
+            3.0 * 2.0 + (1.0 - 3.0) * -0.5,
+            3.0 * -1.0 + (1.0 - 3.0) * 0.75,
+            3.0 * -2.0 + (1.0 - 3.0) * -1.0,
+        ];
+        for (idx, (actual, expected)) in pred.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= 1.0e-6,
+                "cfg sparse tensor mismatch at {idx}: got={actual} expected={expected}"
+            );
+        }
+
+        let rescaled = super::apply_cfg_sparse_tensor(x_t, 0.5, pos, neg, 3.0, 0.7, 0.01);
+        let rescaled = tensor_to_vec3(rescaled);
+        assert_ne!(rescaled, pred);
+        assert!(rescaled.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn attention_stream_matches_dense_reference() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
@@ -5915,7 +9993,7 @@ mod tests {
             std::env::set_var("TRELLIS2_ATTN_KEY_CHUNK", "7");
             std::env::set_var("TRELLIS2_ATTN_KEY_CHUNK_MAX", "7");
         }
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let heads = 4usize;
         let head_dim = 8usize;
         let query_tokens = 32usize;
@@ -5961,7 +10039,7 @@ mod tests {
             return;
         }
 
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let heads = 8usize;
         let head_dim = 16usize;
         let query_tokens = 160usize;
@@ -6002,7 +10080,7 @@ mod tests {
     #[test]
     fn self_attention_chunked_matches_dense_reference() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let channels = 32usize;
         let heads = 4usize;
         let tokens = 32usize;
@@ -6014,6 +10092,7 @@ mod tests {
             true,
             [1.0, 10_000.0],
             true,
+            false,
         );
 
         let mut values = Vec::with_capacity(tokens.saturating_mul(channels));
@@ -6125,22 +10204,207 @@ mod tests {
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn sparse_flow_backend_chunk_tokens_wgpu_respect_memory_safe_chunks() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: false,
+            sparse_flow_linear_f16: false,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
         assert_eq!(
             super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(4_096),
-            2_048
+            4_096
         );
         assert_eq!(
             super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(8_192),
-            2_048
+            8_192
         );
         assert_eq!(
             super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(32_768),
-            4_096
+            8_192
         );
         assert_eq!(
             super::sparse_flow_linear_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(32_768,),
             16_384
         );
+        assert_eq!(
+            super::sparse_flow_torso_dtype_for_backend::<super::WgpuRuntimeBackend>(),
+            None
+        );
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: true,
+            sparse_flow_linear_f16: true,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+        assert_eq!(
+            super::sparse_flow_mlp_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(32_768),
+            32_768
+        );
+        assert_eq!(
+            super::sparse_flow_linear_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(32_768,),
+            32_768
+        );
+        set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    #[test]
+    fn wgpu_module_attention_probe_matches_stream_reference() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        if std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE").is_err() {
+            eprintln!(
+                "Skipping WGPU module attention probe: set TRELLIS2_WGPU_MODULE_ATTENTION_PROBE=1 to enable."
+            );
+            return;
+        }
+        let probe_f16 = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_F16").is_ok();
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: probe_f16,
+            sparse_flow_linear_f16: false,
+            sparse_flow_torso_f16: false,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+
+        let tokens = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(1);
+        let key_tokens = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_KEY_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(tokens)
+            .max(1);
+        let batch = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let heads = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_HEADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(16)
+            .max(1);
+        let head_dim = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_HEAD_DIM")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64)
+            .max(1);
+        let repeat = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_REPEAT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let device = <WgpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
+        let q_elem_count = batch
+            .saturating_mul(tokens)
+            .saturating_mul(heads)
+            .saturating_mul(head_dim);
+        let kv_elem_count = batch
+            .saturating_mul(key_tokens)
+            .saturating_mul(heads)
+            .saturating_mul(head_dim);
+        let mut q_values = Vec::with_capacity(q_elem_count);
+        let mut k_values = Vec::with_capacity(kv_elem_count);
+        let mut v_values = Vec::with_capacity(kv_elem_count);
+        for idx in 0..q_elem_count {
+            let x = idx as f32;
+            q_values.push((x * 0.013).sin() * 0.5 + (x * 0.007).cos() * 0.25);
+        }
+        for idx in 0..kv_elem_count {
+            let x = idx as f32;
+            k_values.push((x * 0.011 + 0.3).sin() * 0.4 + (x * 0.017).cos() * 0.2);
+            v_values.push((x * 0.019 + 0.7).sin() * 0.3 + (x * 0.005).cos() * 0.35);
+        }
+
+        let q_seq = Tensor::<WgpuRuntimeBackend, 1>::from_floats(q_values.as_slice(), &device)
+            .reshape([batch, tokens, heads, head_dim]);
+        let k_seq = Tensor::<WgpuRuntimeBackend, 1>::from_floats(k_values.as_slice(), &device)
+            .reshape([batch, key_tokens, heads, head_dim]);
+        let v_seq = Tensor::<WgpuRuntimeBackend, 1>::from_floats(v_values.as_slice(), &device)
+            .reshape([batch, key_tokens, heads, head_dim]);
+        let q = q_seq.swap_dims(1, 2);
+        let k = k_seq.swap_dims(1, 2);
+        let v = v_seq.swap_dims(1, 2);
+        let (q, k, v) = if probe_f16 {
+            (
+                q.cast(burn::tensor::FloatDType::F16),
+                k.cast(burn::tensor::FloatDType::F16),
+                v.cast(burn::tensor::FloatDType::F16),
+            )
+        } else {
+            (q, k, v)
+        };
+
+        let selected_dtype =
+            super::sparse_flow_module_attention_dtype_for_shape(batch, heads, key_tokens, head_dim);
+        let selected_fallback = super::sparse_flow_module_attention_long_k_requires_fallback(
+            batch, heads, key_tokens, head_dim,
+        );
+        let raw = std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_RAW").is_ok();
+        let run_module = || {
+            if raw {
+                super::sparse_flow_module_attention_direct(q.clone(), k.clone(), v.clone())
+            } else {
+                super::sparse_flow_module_attention(q.clone(), k.clone(), v.clone())
+            }
+        };
+        let _warm = tensor_to_vec4(run_module());
+        let module_start = Instant::now();
+        let mut module_values = Vec::new();
+        for _ in 0..repeat {
+            module_values = tensor_to_vec4(run_module());
+        }
+        let module_ms_total = module_start.elapsed().as_secs_f64() * 1_000.0;
+        let module_ms = module_ms_total / repeat as f64;
+        let stream_start = Instant::now();
+        let stream = scaled_dot_product_attention_stream(q, k, v, head_dim);
+        let stream_values = tensor_to_vec4(stream);
+        let stream_ms = stream_start.elapsed().as_secs_f64() * 1_000.0;
+        let module_finite =
+            finite_debug_probe_tensor("module_attention_probe.output", module_values.as_slice());
+        let stream_finite =
+            finite_debug_probe_tensor("module_attention_probe.stream", stream_values.as_slice());
+        let stats = compute_stats(module_values.as_slice(), stream_values.as_slice());
+        eprintln!(
+            "trellis2 wgpu module-attention probe: batch={batch} q_tokens={tokens} key_tokens={key_tokens} heads={heads} head_dim={head_dim} raw={raw} repeat={repeat} dtype={selected_dtype:?} fallback={selected_fallback} module_ms={module_ms:.2} stream_ms={stream_ms:.2} mean_abs={:.9e} max_abs={:.9e} rmse={:.9e}",
+            stats.mean_abs, stats.max_abs, stats.rmse
+        );
+        set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
+        assert!(
+            module_finite,
+            "WGPU module attention probe produced non-finite output"
+        );
+        assert!(
+            stream_finite,
+            "WGPU module attention stream reference produced non-finite output"
+        );
+
+        if std::env::var("TRELLIS2_WGPU_MODULE_ATTENTION_PROBE_STRICT").is_ok() {
+            assert!(
+                stats.mean_abs <= 1.0e-4,
+                "WGPU module attention mean_abs {:.6e} exceeded tolerance",
+                stats.mean_abs
+            );
+            assert!(
+                stats.max_abs <= 1.0e-3,
+                "WGPU module attention max_abs {:.6e} exceeded tolerance",
+                stats.max_abs
+            );
+        }
     }
 
     #[test]
@@ -6334,9 +10598,1237 @@ mod tests {
         assert_eq!(trace.step_last_x_t.len(), expected_len);
     }
 
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn required_hook_tensor<'a>(hook: &'a HookSnapshot, key: &str) -> &'a HookTensor {
+        hook.tensors
+            .get(key)
+            .unwrap_or_else(|| panic!("reference hook is missing required tensor '{key}'"))
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn hook_rows_f32(tensor: &HookTensor, channels: usize, label: &str) -> Vec<f32> {
+        assert_eq!(
+            tensor.shape.len(),
+            2,
+            "{label} must be a rank-2 row tensor, got {:?}",
+            tensor.shape
+        );
+        assert_eq!(
+            tensor.shape[1], channels,
+            "{label} channel mismatch: got {} expected {channels}",
+            tensor.shape[1]
+        );
+        assert_eq!(
+            tensor.data.len(),
+            tensor.shape[0] * channels,
+            "{label} data length mismatch"
+        );
+        tensor.data.clone()
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn hook_coords4(tensor: &HookTensor, label: &str) -> Vec<[u32; 4]> {
+        assert_eq!(
+            tensor.shape.len(),
+            2,
+            "{label} must be a rank-2 coord tensor, got {:?}",
+            tensor.shape
+        );
+        assert_eq!(
+            tensor.shape[1], 4,
+            "{label} coord tensor must have 4 columns, got {}",
+            tensor.shape[1]
+        );
+        let rows = tensor.shape[0];
+        assert_eq!(
+            tensor.data.len(),
+            rows * 4,
+            "{label} coord data length mismatch"
+        );
+        let mut coords = Vec::with_capacity(rows);
+        for row_idx in 0..rows {
+            let base = row_idx * 4;
+            coords.push([
+                tensor.data[base].round().max(0.0) as u32,
+                tensor.data[base + 1].round().max(0.0) as u32,
+                tensor.data[base + 2].round().max(0.0) as u32,
+                tensor.data[base + 3].round().max(0.0) as u32,
+            ]);
+        }
+        coords
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn grouped_layout_from_coords(coords: &[[u32; 4]]) -> Vec<std::ops::Range<usize>> {
+        assert!(
+            !coords.is_empty(),
+            "probe sparse tensor must contain at least one row"
+        );
+        let max_batch = coords
+            .iter()
+            .map(|coord| coord[0] as usize)
+            .max()
+            .expect("non-empty coords");
+        let mut layout = Vec::with_capacity(max_batch + 1);
+        let mut cursor = 0usize;
+        for batch_idx in 0..=max_batch {
+            let start = cursor;
+            while cursor < coords.len() && coords[cursor][0] as usize == batch_idx {
+                cursor += 1;
+            }
+            layout.push(start..cursor);
+        }
+        assert_eq!(
+            cursor,
+            coords.len(),
+            "probe coords must be grouped by batch id"
+        );
+        for (row_idx, coord) in coords.iter().enumerate().skip(cursor) {
+            panic!(
+                "probe coords are not grouped by batch id at row {row_idx}: {:?}",
+                coord
+            );
+        }
+        layout
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn hook_condition_values(
+        tensor: &HookTensor,
+        cond_channels: usize,
+        label: &str,
+    ) -> (Vec<f32>, usize) {
+        assert_eq!(
+            tensor.shape.len(),
+            3,
+            "{label} must be a rank-3 condition tensor, got {:?}",
+            tensor.shape
+        );
+        assert_eq!(
+            tensor.shape[0], 1,
+            "{label} probe expects a single condition batch"
+        );
+        assert_eq!(
+            tensor.shape[2], cond_channels,
+            "{label} condition channel mismatch: got {} expected {cond_channels}",
+            tensor.shape[2]
+        );
+        (tensor.data.clone(), tensor.shape[1])
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn sampler_sigma_min(hook: &HookSnapshot, key: &str) -> f32 {
+        let tensor = required_hook_tensor(hook, key);
+        assert!(
+            tensor.data.len() >= 7,
+            "{key} sampler config must contain sigma_min at index 6"
+        );
+        tensor.data[6]
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn sampler_config_from_hook(hook: &HookSnapshot, key: &str) -> FlowEulerSampleConfig {
+        let tensor = required_hook_tensor(hook, key);
+        assert!(
+            tensor.data.len() >= 6,
+            "{key} sampler config must contain steps/rescale/guidance fields"
+        );
+        FlowEulerSampleConfig {
+            steps: tensor.data[0].round().max(1.0) as usize,
+            rescale_t: tensor.data[1].max(f32::EPSILON),
+            guidance_strength: tensor.data[2],
+            guidance_rescale: tensor.data[3].max(0.0),
+            guidance_interval: [tensor.data[4], tensor.data[5]],
+        }
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn compare_probe_tensor(
+        label: &str,
+        actual: &[f32],
+        hook: &HookSnapshot,
+        key: &str,
+    ) -> Option<crate::hook_diff::MetricStats> {
+        let Some(reference) = hook.tensors.get(key) else {
+            eprintln!("trellis2 slat probe: reference key '{key}' missing; skipping {label}");
+            return None;
+        };
+        assert_eq!(
+            reference.data.len(),
+            actual.len(),
+            "{label} length mismatch for key '{key}'"
+        );
+        let stats = compute_stats(actual, reference.data.as_slice());
+        eprintln!(
+            "trellis2 slat probe {label}: key={key} mean_abs={:.9e} max_abs={:.9e} rmse={:.9e} non_finite={}",
+            stats.mean_abs, stats.max_abs, stats.rmse, stats.non_finite_count
+        );
+        Some(stats)
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn finite_debug_probe_tensor(label: &str, actual: &[f32]) -> bool {
+        let mut non_finite = 0usize;
+        let mut first_non_finite = None;
+        let mut finite_min = f32::INFINITY;
+        let mut finite_max = f32::NEG_INFINITY;
+        for (index, value) in actual.iter().copied().enumerate() {
+            if value.is_finite() {
+                finite_min = finite_min.min(value);
+                finite_max = finite_max.max(value);
+            } else {
+                non_finite += 1;
+                first_non_finite.get_or_insert((index, value));
+            }
+        }
+        let finite_min = if finite_min.is_finite() {
+            finite_min
+        } else {
+            f32::NAN
+        };
+        let finite_max = if finite_max.is_finite() {
+            finite_max
+        } else {
+            f32::NAN
+        };
+        let first_non_finite_text = first_non_finite
+            .map(|(index, value)| format!("{index}:{value:?}"))
+            .unwrap_or_else(|| "none".to_owned());
+        eprintln!(
+            "trellis2 slat finite {label}: len={} non_finite={} first_non_finite={} finite_min={:.9e} finite_max={:.9e}",
+            actual.len(),
+            non_finite,
+            first_non_finite_text,
+            finite_min,
+            finite_max
+        );
+        if let Some((index, value)) = first_non_finite {
+            if !SLAT_DEBUG_FIRST_NONFINITE_REPORTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "trellis2 slat first_nonfinite_stage: label={label} index={index} value={value:?} non_finite={non_finite}"
+                );
+            }
+        }
+        non_finite == 0
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn compare_debug_probe_tensor(
+        label: &str,
+        actual: &[f32],
+        hook: Option<&HookSnapshot>,
+        key: &str,
+    ) -> bool {
+        let finite = finite_debug_probe_tensor(label, actual);
+        let Some(hook) = hook else {
+            eprintln!("trellis2 slat debug {label}: no reference hook; finite-only");
+            return finite;
+        };
+        let Some(reference) = hook.tensors.get(key) else {
+            eprintln!("trellis2 slat debug {label}: reference key '{key}' missing; finite-only");
+            return finite;
+        };
+        if reference.data.len() != actual.len() {
+            eprintln!(
+                "trellis2 slat debug {label}: key={key} length mismatch actual={} reference={}; finite-only",
+                actual.len(),
+                reference.data.len()
+            );
+            return finite;
+        }
+        let stats = compute_stats(actual, reference.data.as_slice());
+        eprintln!(
+            "trellis2 slat debug {label}: key={key} mean_abs={:.9e} max_abs={:.9e} rmse={:.9e} non_finite={}",
+            stats.mean_abs, stats.max_abs, stats.rmse, stats.non_finite_count
+        );
+        if stats.max_abs > 1.0e-3 {
+            let len = actual.len().min(8);
+            eprintln!(
+                "trellis2 slat debug {label}: first{len} actual={:?} reference={:?}",
+                &actual[..len],
+                &reference.data[..len]
+            );
+        }
+        finite && stats.non_finite_count == 0
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn maybe_run_slat_block0_debug_probe(
+        runtime_impl: &SparseStructureFlowRuntimeImpl<WgpuRuntimeBackend>,
+        x_t: Tensor<WgpuRuntimeBackend, 3>,
+        timestep: f32,
+        cond: Tensor<WgpuRuntimeBackend, 3>,
+        token_coords: Tensor<WgpuRuntimeBackend, 2, Int>,
+        rows: usize,
+        debug_hook_path: &Path,
+    ) {
+        SLAT_DEBUG_FIRST_NONFINITE_REPORTED.store(false, Ordering::Relaxed);
+        let debug_hook = Some(
+            HookSnapshot::from_file(debug_hook_path).expect("load Python SLat debug hook snapshot"),
+        );
+        let config = runtime_impl.config();
+        let model = &runtime_impl.model;
+        let channels = config.model_channels;
+        let h = linear_forward_token_chunked_reference(
+            &model.input_layer,
+            x_t,
+            sparse_flow_linear_chunk_tokens_for_backend::<WgpuRuntimeBackend>(rows),
+        );
+        compare_debug_probe_tensor(
+            "input_layer",
+            tensor_to_vec3(h.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "input_layer",
+        );
+
+        let t =
+            Tensor::<WgpuRuntimeBackend, 1>::from_floats([timestep * 1000.0], &runtime_impl.device);
+        let t_emb = model.t_embedder.forward(t, config.frequency_embedding_size);
+        compare_debug_probe_tensor(
+            "t_embedder",
+            tensor_to_vec2(t_emb.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "t_embedder",
+        );
+        let mod_signal_base = linear_forward_stable_2d(&model.ada_ln_modulation, silu(t_emb));
+        compare_debug_probe_tensor(
+            "mod_signal",
+            tensor_to_vec2(mod_signal_base.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "mod_signal",
+        );
+        compare_debug_probe_tensor(
+            "cond_cast",
+            tensor_to_vec3(cond.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "cond_cast",
+        );
+
+        let block = &model.blocks[0];
+        let [batch, tokens, block_channels] = h.dims();
+        assert_eq!(block_channels, channels);
+        assert_eq!(tokens, rows, "block0 debug token count mismatch");
+
+        let mod_bias = block.modulation.val().reshape([1, channels * 6]);
+        let mod_signal_dtype: burn::tensor::FloatDType = mod_signal_base.dtype().into();
+        let mod_bias_dtype: burn::tensor::FloatDType = mod_bias.dtype().into();
+        let mod_bias = if mod_bias_dtype != mod_signal_dtype {
+            mod_bias.cast(mod_signal_dtype)
+        } else {
+            mod_bias
+        };
+        let mod_signal = mod_signal_base.clone().add(mod_bias);
+        let shift_msa = mod_signal
+            .clone()
+            .slice([0..batch, 0..channels])
+            .reshape([batch, 1, channels]);
+        let scale_msa = mod_signal
+            .clone()
+            .slice([0..batch, channels..(channels * 2)])
+            .reshape([batch, 1, channels]);
+        let gate_msa = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 2)..(channels * 3)])
+            .reshape([batch, 1, channels]);
+        let shift_mlp = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 3)..(channels * 4)])
+            .reshape([batch, 1, channels]);
+        let scale_mlp = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 4)..(channels * 5)])
+            .reshape([batch, 1, channels]);
+        let gate_mlp = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 5)..(channels * 6)])
+            .reshape([batch, 1, channels]);
+        compare_debug_probe_tensor(
+            "block0.shift_msa",
+            tensor_to_vec3(shift_msa.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.shift_msa",
+        );
+        compare_debug_probe_tensor(
+            "block0.scale_msa",
+            tensor_to_vec3(scale_msa.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.scale_msa",
+        );
+        compare_debug_probe_tensor(
+            "block0.gate_msa",
+            tensor_to_vec3(gate_msa.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.gate_msa",
+        );
+
+        let norm1 = layer_norm_no_affine(h.clone(), super::LAYER_NORM_EPS);
+        compare_debug_probe_tensor(
+            "block0.norm1",
+            tensor_to_vec3(norm1.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.norm1",
+        );
+        let norm1_mod = norm1.mul(scale_msa.add_scalar(1.0)).add(shift_msa);
+        compare_debug_probe_tensor(
+            "block0.norm1_mod",
+            tensor_to_vec3(norm1_mod.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.norm1_mod",
+        );
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_MOD_ONLY").is_ok() {
+            return;
+        }
+        let attn = &block.self_attn;
+        let qkv_linear = linear_forward_attention(&attn.to_qkv, norm1_mod.clone(), false);
+        compare_debug_probe_tensor(
+            "block0.self_attn.qkv_linear",
+            tensor_to_vec3(qkv_linear.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.qkv_linear",
+        );
+        let qkv = qkv_linear.reshape([batch, tokens, 3, attn.num_heads, attn.head_dim]);
+        compare_debug_probe_tensor(
+            "block0.self_attn.qkv_fused",
+            tensor_to_vec5(qkv.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.qkv_fused",
+        );
+        let q = qkv
+            .clone()
+            .slice([
+                0..batch,
+                0..tokens,
+                0..1,
+                0..attn.num_heads,
+                0..attn.head_dim,
+            ])
+            .reshape([batch, tokens, attn.num_heads, attn.head_dim]);
+        let k = qkv
+            .clone()
+            .slice([
+                0..batch,
+                0..tokens,
+                1..2,
+                0..attn.num_heads,
+                0..attn.head_dim,
+            ])
+            .reshape([batch, tokens, attn.num_heads, attn.head_dim]);
+        let v = qkv
+            .clone()
+            .slice([
+                0..batch,
+                0..tokens,
+                2..3,
+                0..attn.num_heads,
+                0..attn.head_dim,
+            ])
+            .reshape([batch, tokens, attn.num_heads, attn.head_dim]);
+        compare_debug_probe_tensor(
+            "block0.self_attn.q_pre_norm",
+            tensor_to_vec4(q.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.q_pre_norm",
+        );
+        compare_debug_probe_tensor(
+            "block0.self_attn.k_pre_norm",
+            tensor_to_vec4(k.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.k_pre_norm",
+        );
+        compare_debug_probe_tensor(
+            "block0.self_attn.v",
+            tensor_to_vec4(v.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.v",
+        );
+        let q = if let Some(norm) = attn.q_rms_norm.as_ref() {
+            norm.forward(q)
+        } else {
+            q
+        };
+        let k = if let Some(norm) = attn.k_rms_norm.as_ref() {
+            norm.forward(k)
+        } else {
+            k
+        };
+        compare_debug_probe_tensor(
+            "block0.self_attn.q_rms",
+            tensor_to_vec4(q.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.q_rms",
+        );
+        compare_debug_probe_tensor(
+            "block0.self_attn.k_rms",
+            tensor_to_vec4(k.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.k_rms",
+        );
+        let q = if attn.use_rope {
+            apply_rope_single(
+                q,
+                config.resolution,
+                attn.head_dim,
+                attn.rope_freq,
+                Some(token_coords.clone()),
+                0,
+            )
+        } else {
+            q
+        };
+        let k = if attn.use_rope {
+            apply_rope_single(
+                k,
+                config.resolution,
+                attn.head_dim,
+                attn.rope_freq,
+                Some(token_coords.clone()),
+                0,
+            )
+        } else {
+            k
+        };
+        compare_debug_probe_tensor(
+            "block0.self_attn.q_rope",
+            tensor_to_vec4(q.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.q_rope",
+        );
+        compare_debug_probe_tensor(
+            "block0.self_attn.k_rope",
+            tensor_to_vec4(k.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.k_rope",
+        );
+        let qkv_post = Tensor::stack(vec![q.clone(), k.clone(), v.clone()], 2);
+        compare_debug_probe_tensor(
+            "block0.self_attn.qkv_post",
+            tensor_to_vec5(qkv_post).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.qkv_post",
+        );
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_ATTENTION_PRE_ONLY").is_ok() {
+            return;
+        }
+        let sdpa = scaled_dot_product_attention(q.clone(), k.clone(), v.clone(), attn.head_dim);
+        compare_debug_probe_tensor(
+            "block0.self_attn.sdpa",
+            tensor_to_vec4(sdpa.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.sdpa",
+        );
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_ATTENTION_ALT_LAYOUT").is_ok() {
+            let q_alt = force_contiguous_4d(q.clone().permute([0, 2, 1, 3]));
+            let k_alt = force_contiguous_4d(k.clone().permute([0, 2, 1, 3]));
+            let v_alt = force_contiguous_4d(v.clone().permute([0, 2, 1, 3]));
+            let sdpa_alt = attention(
+                q_alt,
+                k_alt,
+                v_alt,
+                None,
+                None,
+                AttentionModuleOptions::default(),
+            )
+            .permute([0, 2, 1, 3]);
+            compare_debug_probe_tensor(
+                "block0.self_attn.sdpa_alt_layout",
+                tensor_to_vec4(sdpa_alt).as_slice(),
+                debug_hook.as_ref(),
+                "block0.self_attn.sdpa",
+            );
+        }
+        let sdpa_flat = sdpa.reshape([batch, tokens, channels]);
+        compare_debug_probe_tensor(
+            "block0.self_attn.sdpa_flat",
+            tensor_to_vec3(sdpa_flat.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn.sdpa_flat",
+        );
+        let self_attn_from_parts = linear_forward_attention(&attn.to_out, sdpa_flat, false);
+        compare_debug_probe_tensor(
+            "block0.self_attn.from_parts",
+            tensor_to_vec3(self_attn_from_parts).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn",
+        );
+        let self_attn =
+            block
+                .self_attn
+                .forward(norm1_mod, config.resolution, Some(token_coords.clone()));
+        compare_debug_probe_tensor(
+            "block0.self_attn",
+            tensor_to_vec3(self_attn.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.self_attn",
+        );
+        let after_self = h.clone().add(self_attn.mul(gate_msa));
+        compare_debug_probe_tensor(
+            "block0.after_self",
+            tensor_to_vec3(after_self.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.after_self",
+        );
+        let norm2 =
+            layer_norm_affine_stable(after_self.clone(), &block.norm2, super::LAYER_NORM_EPS);
+        compare_debug_probe_tensor(
+            "block0.norm2",
+            tensor_to_vec3(norm2.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.norm2",
+        );
+        let cross = &block.cross_attn;
+        let cross_q_linear = linear_forward_attention(&cross.to_q, norm2.clone(), false);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.q_linear",
+            tensor_to_vec3(cross_q_linear.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.q_linear",
+        );
+        let mut cross_q = cross_q_linear.reshape([batch, tokens, cross.num_heads, cross.head_dim]);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.q_reshaped",
+            tensor_to_vec4(cross_q.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.q_reshaped",
+        );
+        let [cond_batch, cond_tokens, _] = cond.dims();
+        let cross_kv_linear = linear_forward_attention(&cross.to_kv, cond.clone(), false);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.kv_linear",
+            tensor_to_vec3(cross_kv_linear.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.kv_linear",
+        );
+        let cross_kv =
+            cross_kv_linear.reshape([cond_batch, cond_tokens, 2, cross.num_heads, cross.head_dim]);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.kv_fused",
+            tensor_to_vec5(cross_kv.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.kv_fused",
+        );
+        let mut cross_k = cross_kv
+            .clone()
+            .slice([
+                0..cond_batch,
+                0..cond_tokens,
+                0..1,
+                0..cross.num_heads,
+                0..cross.head_dim,
+            ])
+            .reshape([cond_batch, cond_tokens, cross.num_heads, cross.head_dim]);
+        let cross_v = cross_kv
+            .slice([
+                0..cond_batch,
+                0..cond_tokens,
+                1..2,
+                0..cross.num_heads,
+                0..cross.head_dim,
+            ])
+            .reshape([cond_batch, cond_tokens, cross.num_heads, cross.head_dim]);
+        if let Some(norm) = cross.q_rms_norm.as_ref() {
+            cross_q = norm.forward(cross_q);
+        }
+        if let Some(norm) = cross.k_rms_norm.as_ref() {
+            cross_k = norm.forward(cross_k);
+        }
+        compare_debug_probe_tensor(
+            "block0.cross_attn.q_rms",
+            tensor_to_vec4(cross_q.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.q_rms",
+        );
+        compare_debug_probe_tensor(
+            "block0.cross_attn.k_rms",
+            tensor_to_vec4(cross_k.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.k_rms",
+        );
+        compare_debug_probe_tensor(
+            "block0.cross_attn.v",
+            tensor_to_vec4(cross_v.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.v",
+        );
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_CROSS_MODULE_COMPARE").is_ok() {
+            let q_heads = cross_q.clone().permute([0, 2, 1, 3]);
+            let k_heads = cross_k.clone().permute([0, 2, 1, 3]);
+            let v_heads = cross_v.clone().permute([0, 2, 1, 3]);
+            let module_f32 = attention(
+                q_heads.clone(),
+                k_heads.clone(),
+                v_heads.clone(),
+                None,
+                None,
+                AttentionModuleOptions::default(),
+            )
+            .permute([0, 2, 1, 3]);
+            compare_debug_probe_tensor(
+                "block0.cross_attn.sdpa_module_f32",
+                tensor_to_vec4(module_f32).as_slice(),
+                debug_hook.as_ref(),
+                "block0.cross_attn.sdpa",
+            );
+            let module_f16 = attention(
+                q_heads.cast(burn::tensor::FloatDType::F16),
+                k_heads.cast(burn::tensor::FloatDType::F16),
+                v_heads.cast(burn::tensor::FloatDType::F16),
+                None,
+                None,
+                AttentionModuleOptions::default(),
+            )
+            .permute([0, 2, 1, 3]);
+            compare_debug_probe_tensor(
+                "block0.cross_attn.sdpa_module_f16",
+                tensor_to_vec4(module_f16).as_slice(),
+                debug_hook.as_ref(),
+                "block0.cross_attn.sdpa",
+            );
+        }
+        let cross_sdpa = scaled_dot_product_attention(cross_q, cross_k, cross_v, cross.head_dim);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.sdpa",
+            tensor_to_vec4(cross_sdpa.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.sdpa",
+        );
+        let cross_sdpa_flat = cross_sdpa.reshape([batch, tokens, channels]);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.sdpa_flat",
+            tensor_to_vec3(cross_sdpa_flat.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.sdpa_flat",
+        );
+        let cross_attn = linear_forward_attention(&cross.to_out, cross_sdpa_flat, false);
+        compare_debug_probe_tensor(
+            "block0.cross_attn.from_parts",
+            tensor_to_vec3(cross_attn.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn.from_parts",
+        );
+        compare_debug_probe_tensor(
+            "block0.cross_attn",
+            tensor_to_vec3(cross_attn.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.cross_attn",
+        );
+        let after_cross = after_self.add(cross_attn);
+        compare_debug_probe_tensor(
+            "block0.after_cross",
+            tensor_to_vec3(after_cross.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.after_cross",
+        );
+        let norm3 = layer_norm_no_affine(after_cross.clone(), super::LAYER_NORM_EPS);
+        compare_debug_probe_tensor(
+            "block0.norm3",
+            tensor_to_vec3(norm3.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.norm3",
+        );
+        let norm3_mod = norm3.mul(scale_mlp.add_scalar(1.0)).add(shift_mlp);
+        compare_debug_probe_tensor(
+            "block0.norm3_mod",
+            tensor_to_vec3(norm3_mod.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.norm3_mod",
+        );
+        let mlp = block.mlp.forward(norm3_mod);
+        compare_debug_probe_tensor(
+            "block0.mlp",
+            tensor_to_vec3(mlp.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.mlp",
+        );
+        let block_out = after_cross.add(mlp.mul(gate_mlp));
+        compare_debug_probe_tensor(
+            "block0.out",
+            tensor_to_vec3(block_out.clone()).as_slice(),
+            debug_hook.as_ref(),
+            "block0.out",
+        );
+        let forward_out = block.forward(
+            h,
+            mod_signal_base,
+            cond,
+            config.resolution,
+            Some(token_coords),
+            None,
+        );
+        compare_debug_probe_tensor(
+            "block0.forward_out",
+            tensor_to_vec3(forward_out).as_slice(),
+            debug_hook.as_ref(),
+            "block0.forward_out",
+        );
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    #[test]
+    fn slat_first_forward_probe() {
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE").is_err() {
+            eprintln!(
+                "Skipping Trellis.2 SLat WGPU first-forward probe: set TRELLIS2_SLAT_FORWARD_PROBE=1 to enable."
+            );
+            return;
+        }
+
+        let hook_path = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_HOOK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(
+                    "tmp/runs/20260619T012716Z_trellis2_python_flow_f32_predv_posneg_slat_only/python_full_hook.safetensors",
+                )
+            });
+        assert!(
+            hook_path.exists(),
+            "TRELLIS2_SLAT_FORWARD_PROBE_HOOK does not exist: {}",
+            hook_path.display()
+        );
+        let weights_root = std::env::var("TRELLIS2_WEIGHTS_ROOT")
+            .map(PathBuf::from)
+            .expect("TRELLIS2_WEIGHTS_ROOT must point at the TRELLIS.2-4B weights root");
+        assert!(
+            weights_root.exists(),
+            "TRELLIS2_WEIGHTS_ROOT does not exist: {}",
+            weights_root.display()
+        );
+
+        let hook = HookSnapshot::from_file(&hook_path).expect("load Python SLat hook snapshot");
+        let hook_prefix = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_PREFIX")
+            .unwrap_or_else(|_| "sample_shape_slat".to_string());
+        let sampler_prefix = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_SAMPLER_PREFIX")
+            .unwrap_or_else(|_| "sample_shape_slat".to_string());
+        let cond_prefix = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_COND_PREFIX")
+            .unwrap_or_else(|_| "get_cond_512.out".to_string());
+        let model_stem = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_MODEL_STEM")
+            .unwrap_or_else(|_| "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16".to_string());
+        let fast_f16 = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_FAST_F16").is_ok();
+        let attention_f16 =
+            fast_f16 || std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_F16_ATTENTION").is_ok();
+        let linear_f16 = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_F16_LINEAR").is_ok();
+        let module_attention =
+            std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DISABLE_MODULE_ATTENTION").is_err();
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: false,
+            attention_debug: false,
+            sparse_flow_module_attention: module_attention,
+            sparse_flow_module_attention_f16: attention_f16,
+            sparse_flow_linear_f16: linear_f16,
+            sparse_flow_torso_f16: std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_TORSO_F16").is_ok(),
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+        let sampler_config_key = format!("{sampler_prefix}.sampler.config");
+        let sample_cfg = sampler_config_from_hook(&hook, sampler_config_key.as_str());
+        let probe_step = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_STEP")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        assert!(
+            probe_step < sample_cfg.steps,
+            "probe step {} out of range for {} sampler steps",
+            probe_step,
+            sample_cfg.steps
+        );
+        let step_prefix = format!(
+            "{hook_prefix}.sampler.step_{probe_step:03}_of_{:03}",
+            sample_cfg.steps
+        );
+        let input_key = if probe_step == 0 {
+            format!("{hook_prefix}.noise.feats")
+        } else {
+            format!(
+                "{hook_prefix}.sampler.step_{:03}_of_{:03}.x_t.feats",
+                probe_step - 1,
+                sample_cfg.steps
+            )
+        };
+        let coords_key = format!("{hook_prefix}.noise.coords");
+        let coords = hook_coords4(
+            required_hook_tensor(&hook, coords_key.as_str()),
+            coords_key.as_str(),
+        );
+        let row_channels = 32usize;
+        let input_rows = hook_rows_f32(
+            required_hook_tensor(&hook, input_key.as_str()),
+            row_channels,
+            input_key.as_str(),
+        );
+        assert_eq!(
+            coords.len() * row_channels,
+            input_rows.len(),
+            "input rows/channels must match coords"
+        );
+
+        let runtime = SparseStructureFlowRuntime::load_from_stem(
+            weights_root.as_path(),
+            None,
+            model_stem.as_str(),
+            true,
+            None,
+        )
+        .expect("load shape SLat flow runtime on WGPU");
+        assert_eq!(
+            runtime.backend_name(),
+            "wgpu",
+            "probe must execute on the WGPU backend"
+        );
+        let config = runtime.config().clone();
+        assert_eq!(config.out_channels, row_channels);
+
+        let cond_key = format!("{cond_prefix}.cond");
+        let neg_cond_key = format!("{cond_prefix}.neg_cond");
+        let (cond_values, cond_tokens) = hook_condition_values(
+            required_hook_tensor(&hook, cond_key.as_str()),
+            config.cond_channels,
+            cond_key.as_str(),
+        );
+        let (neg_values, neg_tokens) = hook_condition_values(
+            required_hook_tensor(&hook, neg_cond_key.as_str()),
+            config.cond_channels,
+            neg_cond_key.as_str(),
+        );
+        assert_eq!(cond_tokens, neg_tokens, "cond/neg token count mismatch");
+        let cond = runtime
+            .prepare_condition(cond_values.as_slice(), cond_tokens)
+            .expect("prepare positive condition");
+        let neg_cond = runtime
+            .prepare_condition(neg_values.as_slice(), neg_tokens)
+            .expect("prepare negative condition");
+
+        let layout = grouped_layout_from_coords(coords.as_slice());
+        let sparse = runtime
+            .sparse_tensor_from_host_layout(
+                coords,
+                input_rows,
+                layout,
+                row_channels,
+                config.resolution,
+            )
+            .expect("create WGPU sparse tensor from reference rows");
+        let t_pairs = super::timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
+        let (timestep, _) = t_pairs[probe_step];
+        let runtime_impl = match &runtime {
+            SparseStructureFlowRuntime::Wgpu(runtime_impl) => runtime_impl,
+            SparseStructureFlowRuntime::Cpu(_) => panic!("probe must run with WGPU runtime"),
+        };
+        let cond_tensor = match cond {
+            SparseFlowCondition::Wgpu(cond) => cond,
+            SparseFlowCondition::Cpu(_) => panic!("positive condition must be WGPU-backed"),
+        };
+        let neg_cond_tensor = match neg_cond {
+            SparseFlowCondition::Wgpu(cond) => cond,
+            SparseFlowCondition::Cpu(_) => panic!("negative condition must be WGPU-backed"),
+        };
+        let state_rows = runtime_impl
+            .build_state_rows_tensor(&sparse, sparse.rows(), row_channels)
+            .expect("build WGPU state rows from sparse tensor");
+        let coords_t = runtime_impl
+            .sparse_coords_tensor(&sparse, "shape SLat probe coords")
+            .expect("build WGPU coord tensor from sparse tensor");
+        let token_coords = coords_t.slice([0..sparse.rows(), 1..4]);
+        let x_t = state_rows.reshape([1, sparse.rows(), row_channels]);
+        if let Ok(debug_hook_path) = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_HOOK") {
+            maybe_run_slat_block0_debug_probe(
+                runtime_impl,
+                x_t.clone(),
+                timestep,
+                cond_tensor.clone(),
+                token_coords.clone(),
+                sparse.rows(),
+                Path::new(debug_hook_path.as_str()),
+            );
+            if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_ONLY").is_ok() {
+                return;
+            }
+        }
+        let use_cache = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_USE_CACHE").is_ok();
+        let (cond_cache, neg_cache) = if use_cache {
+            runtime_impl.prepare_cross_attention_caches(
+                cond_tensor.clone(),
+                neg_cond_tensor.clone(),
+                sample_cfg,
+                t_pairs.as_slice(),
+                "slat_forward_probe",
+            )
+        } else {
+            (None, None)
+        };
+        let batched_cfg_cache = if use_cache
+            && super::sparse_flow_batched_cfg_enabled_for_backend::<WgpuRuntimeBackend>()
+        {
+            match (&cond_cache, &neg_cache) {
+                (Some(pos_cache), Some(neg_cache)) => {
+                    super::concat_cross_kv_caches(pos_cache, neg_cache)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let probe_repeats = std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_REPEATS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let run_probe_once = || {
+            reset_sparse_flow_op_telemetry();
+            let start = Instant::now();
+            let pred = runtime_impl
+                .predict_with_cfg_sparse_tensor_parts_with_cache(
+                    x_t.clone(),
+                    timestep,
+                    sample_cfg,
+                    sampler_sigma_min(&hook, sampler_config_key.as_str()),
+                    cond_tensor.clone(),
+                    neg_cond_tensor.clone(),
+                    None,
+                    config.resolution,
+                    token_coords.clone(),
+                    cond_cache.as_ref(),
+                    neg_cache.as_ref(),
+                    batched_cfg_cache.as_ref(),
+                )
+                .expect("run direct shape SLat sparse flow prediction");
+            <WgpuRuntimeBackend as Backend>::sync(&runtime_impl.device)
+                .expect("sync direct shape SLat sparse flow prediction");
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            (pred, elapsed_ms, sparse_flow_op_telemetry())
+        };
+        let (mut cfg_pred, mut elapsed_ms, mut flow_ops) = run_probe_once();
+        if probe_repeats > 1 {
+            eprintln!(
+                "trellis2 slat repeat-forward probe: iter=1/{probe_repeats} elapsed={elapsed_ms:.2}ms"
+            );
+        }
+        for idx in 1..probe_repeats {
+            let (next_pred, next_elapsed_ms, next_flow_ops) = run_probe_once();
+            cfg_pred = next_pred;
+            elapsed_ms = next_elapsed_ms;
+            flow_ops = next_flow_ops;
+            eprintln!(
+                "trellis2 slat repeat-forward probe: iter={}/{probe_repeats} elapsed={elapsed_ms:.2}ms",
+                idx + 1,
+            );
+        }
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_COMPARE_BATCHED_CFG").is_ok()
+            && let (Some(pos_sep), Some(neg_sep)) = (cfg_pred.pos.as_ref(), cfg_pred.neg.as_ref())
+        {
+            reset_sparse_flow_op_telemetry();
+            let batched_start = Instant::now();
+            let x_batched = Tensor::cat(vec![x_t.clone(), x_t.clone()], 0);
+            let cond_batched = Tensor::cat(vec![cond_tensor.clone(), neg_cond_tensor.clone()], 0);
+            let pred_batched = runtime_impl
+                .predict_velocity_sparse_tensor_with_cache(
+                    x_batched,
+                    timestep,
+                    cond_batched,
+                    None,
+                    config.resolution,
+                    token_coords.clone(),
+                    None,
+                )
+                .expect("run batched CFG candidate prediction");
+            let batched_elapsed_ms = batched_start.elapsed().as_secs_f64() * 1_000.0;
+            let batched_ops = sparse_flow_op_telemetry();
+            let batched_pos = pred_batched
+                .clone()
+                .slice([0..1, 0..sparse.rows(), 0..row_channels]);
+            let batched_neg = pred_batched.slice([1..2, 0..sparse.rows(), 0..row_channels]);
+            let batched_guided = super::apply_cfg_sparse_tensor(
+                x_t.clone(),
+                timestep,
+                batched_pos.clone(),
+                batched_neg.clone(),
+                sample_cfg.guidance_strength,
+                sample_cfg.guidance_rescale,
+                sampler_sigma_min(&hook, sampler_config_key.as_str()),
+            );
+            let pos_sep_vec = tensor_to_vec3(pos_sep.clone());
+            let neg_sep_vec = tensor_to_vec3(neg_sep.clone());
+            let guided_sep_vec = tensor_to_vec3(cfg_pred.guided.clone());
+            let batched_pos_vec = tensor_to_vec3(batched_pos);
+            let batched_neg_vec = tensor_to_vec3(batched_neg);
+            let batched_guided_vec = tensor_to_vec3(batched_guided);
+            let pos_stats = compute_stats(batched_pos_vec.as_slice(), pos_sep_vec.as_slice());
+            let neg_stats = compute_stats(batched_neg_vec.as_slice(), neg_sep_vec.as_slice());
+            let guided_stats =
+                compute_stats(batched_guided_vec.as_slice(), guided_sep_vec.as_slice());
+            eprintln!(
+                "trellis2 slat batched-cfg probe: elapsed={batched_elapsed_ms:.2}ms separate_elapsed={elapsed_ms:.2}ms pos_mean_abs={:.9e} pos_max_abs={:.9e} neg_mean_abs={:.9e} neg_max_abs={:.9e} guided_mean_abs={:.9e} guided_max_abs={:.9e}",
+                pos_stats.mean_abs,
+                pos_stats.max_abs,
+                neg_stats.mean_abs,
+                neg_stats.max_abs,
+                guided_stats.mean_abs,
+                guided_stats.max_abs
+            );
+            eprintln!(
+                concat!(
+                    "trellis2 slat batched-cfg ops: ",
+                    "self_attn_ms={:.2} cross_attn_ms={:.2} mlp_ms={:.2} ",
+                    "self_kernel_ms={:.2} cross_kernel_ms={:.2} module_attention_ms={:.2}"
+                ),
+                batched_ops.self_attn_ns as f64 / 1_000_000.0,
+                batched_ops.cross_attn_ns as f64 / 1_000_000.0,
+                batched_ops.mlp_ns as f64 / 1_000_000.0,
+                batched_ops.self_kernel_ns as f64 / 1_000_000.0,
+                batched_ops.cross_kernel_ns as f64 / 1_000_000.0,
+                batched_ops.module_attention_ns as f64 / 1_000_000.0,
+            );
+            if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_BATCHED_CFG_STRICT").is_ok() {
+                assert!(
+                    pos_stats.mean_abs <= 1.0e-4 && pos_stats.max_abs <= 1.0e-3,
+                    "batched CFG pos drift too high: mean_abs={:.6e} max_abs={:.6e}",
+                    pos_stats.mean_abs,
+                    pos_stats.max_abs
+                );
+                assert!(
+                    neg_stats.mean_abs <= 1.0e-4 && neg_stats.max_abs <= 1.0e-3,
+                    "batched CFG neg drift too high: mean_abs={:.6e} max_abs={:.6e}",
+                    neg_stats.mean_abs,
+                    neg_stats.max_abs
+                );
+                assert!(
+                    guided_stats.mean_abs <= 1.0e-4 && guided_stats.max_abs <= 1.0e-3,
+                    "batched CFG guided drift too high: mean_abs={:.6e} max_abs={:.6e}",
+                    guided_stats.mean_abs,
+                    guided_stats.max_abs
+                );
+            }
+        }
+        let guided = tensor_to_vec3(cfg_pred.guided).reshape_to_rows_vec(row_channels);
+        let pos = cfg_pred.pos.map(tensor_to_vec3);
+        let neg = cfg_pred.neg.map(tensor_to_vec3);
+        let cache_label = if use_cache { "cached" } else { "direct" };
+        eprintln!(
+            "trellis2 slat {cache_label}-forward probe: step={}/{} timestep={:.9} rows={} channels={} elapsed={elapsed_ms:.2}ms",
+            probe_step,
+            sample_cfg.steps,
+            timestep,
+            sparse.rows(),
+            row_channels
+        );
+        eprintln!(
+            concat!(
+                "trellis2 slat direct-forward ops: ",
+                "self_attn_calls={} cross_attn_calls={} mlp_calls={} self_kernel_calls={} module_attention_calls={} fused_qk_calls={} fused_qkv_module_calls={} ",
+                "self_attn_total_ms={:.2} cross_attn_total_ms={:.2} mlp_total_ms={:.2} ",
+                "self_qkv_ms={:.2} self_norm_rope_ms={:.2} self_kernel_ms={:.2} self_out_ms={:.2} self_cat_ms={:.2} ",
+                "cross_q_ms={:.2} cross_kv_ms={:.2} cross_norm_ms={:.2} cross_kernel_ms={:.2} cross_out_ms={:.2} cross_cat_ms={:.2} ",
+                "mlp_ms={:.2} block_norm_mod_ms={:.2} block_norm_affine_ms={:.2} block_gate_residual_ms={:.2} model_io_ms={:.2} model_input_ms={:.2} model_output_ms={:.2} ",
+                "module_cast_pad_ms={:.2} module_attention_ms={:.2} module_output_ms={:.2}"
+            ),
+            flow_ops.self_attn_calls,
+            flow_ops.cross_attn_calls,
+            flow_ops.mlp_calls,
+            flow_ops.self_kernel_calls,
+            flow_ops.module_attention_calls,
+            flow_ops.self_norm_rope_fused_qk_calls,
+            flow_ops.self_norm_rope_fused_qkv_module_calls,
+            flow_ops.self_attn_ns as f64 / 1_000_000.0,
+            flow_ops.cross_attn_ns as f64 / 1_000_000.0,
+            flow_ops.mlp_ns as f64 / 1_000_000.0,
+            flow_ops.self_qkv_ns as f64 / 1_000_000.0,
+            flow_ops.self_norm_rope_ns as f64 / 1_000_000.0,
+            flow_ops.self_kernel_ns as f64 / 1_000_000.0,
+            flow_ops.self_out_ns as f64 / 1_000_000.0,
+            flow_ops.self_cat_ns as f64 / 1_000_000.0,
+            flow_ops.cross_q_ns as f64 / 1_000_000.0,
+            flow_ops.cross_kv_ns as f64 / 1_000_000.0,
+            flow_ops.cross_norm_ns as f64 / 1_000_000.0,
+            flow_ops.cross_kernel_ns as f64 / 1_000_000.0,
+            flow_ops.cross_out_ns as f64 / 1_000_000.0,
+            flow_ops.cross_cat_ns as f64 / 1_000_000.0,
+            flow_ops.mlp_ns as f64 / 1_000_000.0,
+            flow_ops.block_norm_mod_ns as f64 / 1_000_000.0,
+            flow_ops.block_norm_affine_ns as f64 / 1_000_000.0,
+            flow_ops.block_gate_residual_ns as f64 / 1_000_000.0,
+            flow_ops.model_io_ns as f64 / 1_000_000.0,
+            flow_ops.model_input_ns as f64 / 1_000_000.0,
+            flow_ops.model_output_ns as f64 / 1_000_000.0,
+            flow_ops.module_cast_pad_ns as f64 / 1_000_000.0,
+            flow_ops.module_attention_ns as f64 / 1_000_000.0,
+            flow_ops.module_output_ns as f64 / 1_000_000.0,
+        );
+
+        let mut strict_stats = Vec::new();
+        if let Some(stats) = compare_probe_tensor(
+            "guided",
+            guided.as_slice(),
+            &hook,
+            format!("{step_prefix}.pred_v.feats").as_str(),
+        ) {
+            strict_stats.push(("guided", stats));
+        }
+        if let Some(pos) = pos
+            && let Some(stats) = compare_probe_tensor(
+                "pos",
+                pos.as_slice(),
+                &hook,
+                format!("{step_prefix}.pred_v_pos.feats").as_str(),
+            )
+        {
+            strict_stats.push(("pos", stats));
+        }
+        if let Some(neg) = neg
+            && let Some(stats) = compare_probe_tensor(
+                "neg",
+                neg.as_slice(),
+                &hook,
+                format!("{step_prefix}.pred_v_neg.feats").as_str(),
+            )
+        {
+            strict_stats.push(("neg", stats));
+        }
+
+        if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_STRICT").is_ok() {
+            assert!(
+                !strict_stats.is_empty(),
+                "strict SLat probe did not compare any reference tensors"
+            );
+            for (label, stats) in strict_stats {
+                assert_eq!(
+                    stats.non_finite_count, 0,
+                    "SLat {label} step {probe_step} produced {} non-finite comparisons",
+                    stats.non_finite_count
+                );
+                assert!(
+                    stats.mean_abs <= 1.0e-3,
+                    "SLat {label} step {probe_step} mean_abs {:.6e} exceeded tolerance",
+                    stats.mean_abs
+                );
+                assert!(
+                    stats.max_abs <= 1.0e-2,
+                    "SLat {label} step {probe_step} max_abs {:.6e} exceeded tolerance",
+                    stats.max_abs
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    trait ProbeRowsVec {
+        fn reshape_to_rows_vec(self, channels: usize) -> Vec<f32>;
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    impl ProbeRowsVec for Vec<f32> {
+        fn reshape_to_rows_vec(self, channels: usize) -> Vec<f32> {
+            assert!(
+                self.len().is_multiple_of(channels.max(1)),
+                "probe tensor length {} is not divisible by channels {}",
+                self.len(),
+                channels
+            );
+            self
+        }
+    }
+
     #[test]
     fn tiny_sparse_flow_forward_cpu_backend() {
-        let device = <burn::backend::NdArray<f32> as Backend>::Device::default();
+        let device =
+            <burn::backend::NdArray<f32> as burn::tensor::backend::BackendTypes>::Device::default();
         run_tiny_forward::<burn::backend::NdArray<f32>>(&device);
     }
 

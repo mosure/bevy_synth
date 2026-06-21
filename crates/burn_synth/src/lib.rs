@@ -42,7 +42,7 @@ pub use runtime::{
     AssetOutput as RuntimeAssetOutput, AssetRequest, DinoBackend, ForegroundOutput,
     ForegroundRequest, InferenceBackend, MeshOutput as RuntimeMeshOutput, MeshRequest,
     RuntimeConfig, RuntimeError, SplatOutput as RuntimeSplatOutput, SplatRequest, SynthRuntime,
-    TrellisQuality,
+    TrellisComputeProfile, TrellisQuality,
 };
 
 #[cfg(feature = "triposg")]

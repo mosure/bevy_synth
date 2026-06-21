@@ -539,7 +539,7 @@ fn select_positive_coord_tensor<B: Backend>(
         .slice([0..selected_count, 0..1])
         .reshape([selected_count, 1]);
     let batch_col = Tensor::<B, 2, Int>::zeros([selected_count, 1], &device);
-    Ok(Tensor::cat(vec![batch_col, x_col, y_col, z_col], 1))
+    Ok(Tensor::cat(vec![batch_col, z_col, y_col, x_col], 1))
 }
 
 fn tensor_to_coords_u32<B: Backend>(
@@ -1145,8 +1145,19 @@ fn resolve_model_source_path(
         return weights_root.join(format!("{stem}.{ext}"));
     }
     if let Some((_, suffix)) = stem.split_once("/ckpts/") {
-        let image_large_root = image_large_root.unwrap_or(weights_root);
-        return image_large_root.join(format!("ckpts/{suffix}.{ext}"));
+        let relative = format!("ckpts/{suffix}.{ext}");
+        if let Some(image_large_root) = image_large_root {
+            let image_candidate = image_large_root.join(&relative);
+            if image_candidate.exists() {
+                return image_candidate;
+            }
+            let weights_candidate = weights_root.join(&relative);
+            if weights_candidate.exists() {
+                return weights_candidate;
+            }
+            return image_candidate;
+        }
+        return weights_root.join(relative);
     }
     weights_root.join(format!("{stem}.{ext}"))
 }
@@ -1176,10 +1187,13 @@ mod tests {
     use super::*;
     use crate::hook_diff::HookSnapshot;
     use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
+    #[cfg(feature = "runtime-model-wgpu")]
+    use crate::runtime_model::types::extraction::tensor_f32_to_vec;
+    use std::collections::BTreeSet;
 
     #[test]
     fn sparse_structure_coord_select_cap_boundary_parity() {
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let logits = Tensor::<CpuRuntimeBackend, 1>::from_floats(
             [-1.0, 0.9, 0.8, -0.2, 0.7, -0.3, 0.6, 0.5],
             &device,
@@ -1193,10 +1207,10 @@ mod tests {
         assert_eq!(
             coords_eq_host,
             vec![
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
                 [0, 0, 0, 1],
-                [0, 0, 1, 1],
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 1, 1, 0],
                 [0, 1, 1, 1],
             ]
         );
@@ -1207,7 +1221,7 @@ mod tests {
             .expect("coord tensor should materialize for test assertion");
         assert_eq!(
             coords_cap_host,
-            vec![[0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 1, 1]]
+            vec![[0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0], [0, 1, 1, 0]]
         );
     }
 
@@ -1219,7 +1233,7 @@ mod tests {
 
     #[test]
     fn sparse_structure_coord_select_empty_mask_returns_empty_coords() {
-        let device = <CpuRuntimeBackend as Backend>::Device::default();
+        let device = <CpuRuntimeBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let logits = Tensor::<CpuRuntimeBackend, 1>::from_floats(
             [-1.0, -0.9, -0.8, -0.7, -0.6, -0.5, -0.4, -0.3],
             &device,
@@ -1230,6 +1244,35 @@ mod tests {
         let [rows, cols] = coords.dims();
         assert_eq!(rows, 0);
         assert_eq!(cols, 4);
+    }
+
+    #[test]
+    fn image_large_stem_weight_candidates_fall_back_to_weights_root_source() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "burn_trellis_sparse_structure_decoder_candidates_{unique}"
+        ));
+        let weights_ckpts = root.join("weights/ckpts");
+        let image_ckpts = root.join("image/ckpts");
+        std::fs::create_dir_all(&weights_ckpts).expect("create weights ckpts");
+        std::fs::create_dir_all(&image_ckpts).expect("create image ckpts");
+        std::fs::write(weights_ckpts.join("ss_dec.safetensors"), b"safe")
+            .expect("write weights safetensors");
+        std::fs::write(image_ckpts.join("ss_dec.bpk"), b"stale image burnpack")
+            .expect("write stale image burnpack");
+
+        let candidates = resolve_model_weight_candidates(
+            "microsoft/TRELLIS-image-large/ckpts/ss_dec",
+            root.join("weights").as_path(),
+            Some(root.join("image").as_path()),
+        );
+
+        assert_eq!(candidates, vec![weights_ckpts.join("ss_dec.safetensors")]);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1308,5 +1351,403 @@ mod tests {
             rows, reference_rows,
             "decoded sparse coord row count mismatch vs reference hook"
         );
+    }
+
+    #[test]
+    fn sparse_structure_decoder_probe_current_reference_cpu_wgpu() {
+        if std::env::var("TRELLIS2_SPARSE_DECODER_PROBE").is_err() {
+            eprintln!(
+                "skipping: set TRELLIS2_SPARSE_DECODER_PROBE=1 and TRELLIS2_SPARSE_DECODER_PROBE_HOOK=<hook.safetensors> to compare sparse decoder coords"
+            );
+            return;
+        }
+
+        let hook_path = std::env::var("TRELLIS2_SPARSE_DECODER_PROBE_HOOK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets/hooks/trellis2_full_reference_alpha_512.safetensors")
+            });
+        if !hook_path.exists() {
+            panic!(
+                "TRELLIS2_SPARSE_DECODER_PROBE_HOOK does not exist: {}",
+                hook_path.display()
+            );
+        }
+
+        let snapshot = HookSnapshot::from_file(&hook_path)
+            .unwrap_or_else(|err| panic!("failed to load sparse decoder probe hook: {err}"));
+        let latent = snapshot
+            .tensors
+            .get("sample_sparse_structure.latent")
+            .expect("probe hook missing sample_sparse_structure.latent");
+        assert_eq!(
+            latent.shape.len(),
+            5,
+            "sample_sparse_structure.latent must be rank-5 [B,C,D,H,W]"
+        );
+        assert_eq!(
+            latent.shape[0], 1,
+            "sparse decoder probe expects batch=1 latent"
+        );
+        assert_eq!(
+            latent.shape[2], latent.shape[3],
+            "sparse decoder probe expects cubic latent"
+        );
+        assert_eq!(
+            latent.shape[2], latent.shape[4],
+            "sparse decoder probe expects cubic latent"
+        );
+        let latent_resolution = latent.shape[2];
+        let target_resolution = sparse_decoder_probe_target_resolution(&snapshot);
+        let reference_coords =
+            sparse_decoder_probe_reference_coords(&snapshot, "sample_sparse_structure.coords");
+
+        let weights_root =
+            sparse_decoder_probe_root("TRELLIS2_WEIGHTS_ROOT", resolve_trellis2_weights_root(None));
+        let image_large_root = sparse_decoder_probe_root(
+            "TRELLIS2_IMAGE_LARGE_ROOT",
+            resolve_trellis2_image_large_root(None),
+        );
+        if !weights_root.exists() || !image_large_root.exists() {
+            panic!(
+                "missing Trellis roots for sparse decoder probe (weights={} image_large={})",
+                weights_root.display(),
+                image_large_root.display()
+            );
+        }
+        let model_stem = std::env::var("TRELLIS2_SPARSE_DECODER_MODEL_STEM").unwrap_or_else(|_| {
+            "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16".to_string()
+        });
+
+        #[cfg(feature = "runtime-model-wgpu")]
+        let wgpu_coords_for_cpu_compare = {
+            let wgpu_runtime =
+                SparseStructureDecoderRuntimeImpl::<WgpuRuntimeBackend>::load_from_stem(
+                    weights_root.as_path(),
+                    Some(image_large_root.as_path()),
+                    model_stem.as_str(),
+                )
+                .unwrap_or_else(|err| panic!("failed to load WGPU sparse decoder runtime: {err}"));
+            let wgpu_coords_t = wgpu_runtime
+                .decode_to_coord_tensor(
+                    latent.data.as_slice(),
+                    latent_resolution,
+                    target_resolution,
+                    None,
+                )
+                .unwrap_or_else(|err| panic!("WGPU sparse decoder failed: {err}"));
+            let wgpu_coords = tensor_to_coords_u32(wgpu_coords_t, "probe WGPU sparse coords")
+                .unwrap_or_else(|err| panic!("failed to read WGPU sparse decoder coords: {err}"));
+            eprintln!(
+                "sparse decoder probe: wgpu rows={} latent_resolution={} target_resolution={} hook={}",
+                wgpu_coords.len(),
+                latent_resolution,
+                target_resolution,
+                hook_path.display()
+            );
+            if let Some(reference_coords) = reference_coords.as_ref() {
+                let report = sparse_decoder_probe_coord_report(reference_coords, &wgpu_coords);
+                let reduced_logits = sparse_decoder_probe_reduced_logits(
+                    &wgpu_runtime,
+                    latent.data.as_slice(),
+                    latent_resolution,
+                    target_resolution,
+                    "probe WGPU reduced sparse logits",
+                )
+                .unwrap_or_else(|err| panic!("failed to read WGPU reduced sparse logits: {err}"));
+                eprintln!(
+                    "sparse decoder probe: reference vs wgpu overlap={} missing={} extra={} first_missing={:?} first_extra={:?} missing_logits={:?} extra_logits={:?}",
+                    report.overlap,
+                    report.missing.len(),
+                    report.extra.len(),
+                    report.missing.first(),
+                    report.extra.first(),
+                    sparse_decoder_probe_logits_for_coords(
+                        &reduced_logits,
+                        target_resolution,
+                        &report.missing,
+                        8,
+                    ),
+                    sparse_decoder_probe_logits_for_coords(
+                        &reduced_logits,
+                        target_resolution,
+                        &report.extra,
+                        8,
+                    )
+                );
+                assert!(
+                    report.missing.is_empty() && report.extra.is_empty(),
+                    "WGPU sparse decoder coords differ from reference: reference={} actual={} overlap={} missing={} extra={} first_missing={:?} first_extra={:?}",
+                    report.reference_count,
+                    report.actual_count,
+                    report.overlap,
+                    report.missing.len(),
+                    report.extra.len(),
+                    report.missing.first(),
+                    report.extra.first()
+                );
+            }
+            Some(wgpu_coords)
+        };
+
+        let run_cpu = std::env::var("TRELLIS2_SPARSE_DECODER_PROBE_CPU").is_ok()
+            || cfg!(not(feature = "runtime-model-wgpu"));
+        if run_cpu {
+            let cpu_runtime =
+                SparseStructureDecoderRuntimeImpl::<CpuRuntimeBackend>::load_from_stem(
+                    weights_root.as_path(),
+                    Some(image_large_root.as_path()),
+                    model_stem.as_str(),
+                )
+                .unwrap_or_else(|err| panic!("failed to load CPU sparse decoder runtime: {err}"));
+            let cpu_coords_t = cpu_runtime
+                .decode_to_coord_tensor(
+                    latent.data.as_slice(),
+                    latent_resolution,
+                    target_resolution,
+                    None,
+                )
+                .unwrap_or_else(|err| panic!("CPU sparse decoder failed: {err}"));
+            let cpu_coords = tensor_to_coords_u32(cpu_coords_t, "probe CPU sparse coords")
+                .unwrap_or_else(|err| panic!("failed to read CPU sparse decoder coords: {err}"));
+            eprintln!(
+                "sparse decoder probe: cpu rows={} latent_resolution={} target_resolution={} hook={}",
+                cpu_coords.len(),
+                latent_resolution,
+                target_resolution,
+                hook_path.display()
+            );
+            if let Some(reference_coords) = reference_coords.as_ref() {
+                let report = sparse_decoder_probe_coord_report(reference_coords, &cpu_coords);
+                eprintln!(
+                    "sparse decoder probe: reference vs cpu overlap={} missing={} extra={} first_missing={:?} first_extra={:?}",
+                    report.overlap,
+                    report.missing.len(),
+                    report.extra.len(),
+                    report.missing.first(),
+                    report.extra.first()
+                );
+                assert!(
+                    report.missing.is_empty() && report.extra.is_empty(),
+                    "CPU sparse decoder coords differ from reference: reference={} actual={} overlap={} missing={} extra={} first_missing={:?} first_extra={:?}",
+                    report.reference_count,
+                    report.actual_count,
+                    report.overlap,
+                    report.missing.len(),
+                    report.extra.len(),
+                    report.missing.first(),
+                    report.extra.first()
+                );
+            }
+            #[cfg(feature = "runtime-model-wgpu")]
+            if let Some(wgpu_coords) = wgpu_coords_for_cpu_compare.as_ref() {
+                let cpu_wgpu = sparse_decoder_probe_coord_report(&cpu_coords, wgpu_coords);
+                eprintln!(
+                    "sparse decoder probe: cpu vs wgpu rows_cpu={} rows_wgpu={} overlap={} missing_in_wgpu={} extra_in_wgpu={} first_missing={:?} first_extra={:?}",
+                    cpu_coords.len(),
+                    wgpu_coords.len(),
+                    cpu_wgpu.overlap,
+                    cpu_wgpu.missing.len(),
+                    cpu_wgpu.extra.len(),
+                    cpu_wgpu.missing.first(),
+                    cpu_wgpu.extra.first()
+                );
+                assert!(
+                    cpu_wgpu.missing.is_empty() && cpu_wgpu.extra.is_empty(),
+                    "WGPU sparse decoder coords differ from CPU: cpu={} wgpu={} overlap={} missing_in_wgpu={} extra_in_wgpu={} first_missing={:?} first_extra={:?}",
+                    cpu_wgpu.reference_count,
+                    cpu_wgpu.actual_count,
+                    cpu_wgpu.overlap,
+                    cpu_wgpu.missing.len(),
+                    cpu_wgpu.extra.len(),
+                    cpu_wgpu.missing.first(),
+                    cpu_wgpu.extra.first()
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn sparse_decoder_probe_reduced_logits<B: Backend>(
+        runtime: &SparseStructureDecoderRuntimeImpl<B>,
+        latent: &[f32],
+        latent_resolution: usize,
+        target_resolution: usize,
+        context: &str,
+    ) -> Result<Vec<f32>, String> {
+        let latent_tensor = Tensor::<B, 1>::from_floats(latent, &runtime.device).reshape([
+            1,
+            runtime.latent_channels,
+            latent_resolution,
+            latent_resolution,
+            latent_resolution,
+        ]);
+        let logits = runtime.model.forward(latent_tensor);
+        let [batch, channels, depth, height, width] = logits.dims();
+        if batch != 1 || channels != 1 || depth != height || depth != width {
+            return Err(format!(
+                "{context}: unexpected decoder output shape [{batch},{channels},{depth},{height},{width}]"
+            ));
+        }
+        if depth < target_resolution || !depth.is_multiple_of(target_resolution) {
+            return Err(format!(
+                "{context}: cannot reduce decoder output resolution {depth} to target {target_resolution}"
+            ));
+        }
+        let ratio = (depth / target_resolution).max(1);
+        let reduced = if ratio > 1 {
+            logits
+                .reshape([
+                    target_resolution,
+                    ratio,
+                    target_resolution,
+                    ratio,
+                    target_resolution,
+                    ratio,
+                ])
+                .max_dim(5)
+                .max_dim(3)
+                .max_dim(1)
+                .reshape([target_resolution, target_resolution, target_resolution])
+        } else {
+            logits.reshape([depth, height, width])
+        };
+        tensor_f32_to_vec(
+            reduced.reshape([
+                target_resolution
+                    .saturating_mul(target_resolution)
+                    .saturating_mul(target_resolution),
+                1,
+            ]),
+            context,
+        )
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    fn sparse_decoder_probe_logits_for_coords(
+        reduced_logits: &[f32],
+        resolution: usize,
+        coords: &[[u32; 4]],
+        limit: usize,
+    ) -> Vec<([u32; 4], f32)> {
+        coords
+            .iter()
+            .take(limit)
+            .filter_map(|coord| {
+                let z = usize::try_from(coord[1]).ok()?;
+                let y = usize::try_from(coord[2]).ok()?;
+                let x = usize::try_from(coord[3]).ok()?;
+                if z >= resolution || y >= resolution || x >= resolution {
+                    return None;
+                }
+                let idx = z
+                    .saturating_mul(resolution)
+                    .saturating_mul(resolution)
+                    .saturating_add(y.saturating_mul(resolution))
+                    .saturating_add(x);
+                reduced_logits
+                    .get(idx)
+                    .copied()
+                    .map(|value| (*coord, value))
+            })
+            .collect()
+    }
+
+    fn sparse_decoder_probe_root(env_key: &str, fallback: PathBuf) -> PathBuf {
+        std::env::var_os(env_key)
+            .map(PathBuf::from)
+            .unwrap_or(fallback)
+    }
+
+    fn sparse_decoder_probe_target_resolution(snapshot: &HookSnapshot) -> usize {
+        if let Ok(value) = std::env::var("TRELLIS2_SPARSE_DECODER_TARGET_RESOLUTION")
+            && let Ok(parsed) = value.parse::<usize>()
+            && parsed > 0
+        {
+            return parsed;
+        }
+        if let Some(tensor) = snapshot.tensors.get("run.sparse_structure_resolution")
+            && let Some(value) = tensor.data.first()
+        {
+            let rounded = value.round();
+            if rounded > 0.0 {
+                return rounded as usize;
+            }
+        }
+        if let Some(value) = snapshot.metadata.get("sparse_resolution")
+            && let Ok(parsed) = value.parse::<usize>()
+            && parsed > 0
+        {
+            return parsed;
+        }
+        32
+    }
+
+    fn sparse_decoder_probe_reference_coords(
+        snapshot: &HookSnapshot,
+        key: &str,
+    ) -> Option<Vec<[u32; 4]>> {
+        let tensor = snapshot.tensors.get(key)?;
+        assert_eq!(
+            tensor.shape.len(),
+            2,
+            "{key} must be rank-2 coordinate tensor"
+        );
+        assert_eq!(tensor.shape[1], 4, "{key} must be [N,4]");
+        let rows = tensor.shape[0];
+        assert_eq!(
+            tensor.data.len(),
+            rows.saturating_mul(4),
+            "{key} data length mismatch"
+        );
+        let mut coords = Vec::with_capacity(rows);
+        for row_idx in 0..rows {
+            let base = row_idx.saturating_mul(4);
+            let mut row = [0u32; 4];
+            for col in 0..4 {
+                let value = tensor.data[base + col];
+                let rounded = value.round();
+                assert!(
+                    (value - rounded).abs() <= 1.0e-3 && rounded >= 0.0,
+                    "{key} coordinate value must be a non-negative integer, got {value} at row {row_idx} col {col}"
+                );
+                row[col] = rounded as u32;
+            }
+            coords.push(row);
+        }
+        Some(coords)
+    }
+
+    #[derive(Debug)]
+    struct SparseDecoderProbeCoordReport {
+        reference_count: usize,
+        actual_count: usize,
+        overlap: usize,
+        missing: Vec<[u32; 4]>,
+        extra: Vec<[u32; 4]>,
+    }
+
+    fn sparse_decoder_probe_coord_report(
+        reference: &[[u32; 4]],
+        actual: &[[u32; 4]],
+    ) -> SparseDecoderProbeCoordReport {
+        let reference_set = reference.iter().copied().collect::<BTreeSet<_>>();
+        let actual_set = actual.iter().copied().collect::<BTreeSet<_>>();
+        let missing = reference_set
+            .difference(&actual_set)
+            .copied()
+            .collect::<Vec<_>>();
+        let extra = actual_set
+            .difference(&reference_set)
+            .copied()
+            .collect::<Vec<_>>();
+        SparseDecoderProbeCoordReport {
+            reference_count: reference_set.len(),
+            actual_count: actual_set.len(),
+            overlap: reference_set.intersection(&actual_set).count(),
+            missing,
+            extra,
+        }
     }
 }

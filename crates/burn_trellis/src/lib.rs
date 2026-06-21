@@ -38,7 +38,7 @@ pub(crate) mod blob_burnpack;
 #[cfg(feature = "runtime-model")]
 pub mod runtime_model;
 
-pub use config::{TrellisQuality, TrellisQualitySettings};
+pub use config::{TrellisComputeProfile, TrellisQuality, TrellisQualitySettings};
 pub use mesh::{
     Mesh, MeshMaterial, MeshPbrTextures, MeshTexture, load_obj_mesh, write_glb_mesh, write_obj_mesh,
 };

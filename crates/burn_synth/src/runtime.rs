@@ -127,6 +127,13 @@ pub enum TrellisQuality {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrellisComputeProfile {
+    #[default]
+    ReferenceF32,
+    WgpuFastF16,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub model_selection: ModelSelection,
@@ -157,6 +164,8 @@ pub struct RuntimeConfig {
     pub trellis_max_sparse_coords: Option<usize>,
     /// Trellis high-level quality selection.
     pub trellis_quality: TrellisQuality,
+    /// Trellis runtime compute profile.
+    pub trellis_compute_profile: TrellisComputeProfile,
     pub bg_weights_root: Option<PathBuf>,
     pub num_steps: usize,
     pub num_tokens: usize,
@@ -192,6 +201,7 @@ impl Default for RuntimeConfig {
             trellis_noise_overrides_hook: None,
             trellis_max_sparse_coords: None,
             trellis_quality: TrellisQuality::Medium,
+            trellis_compute_profile: TrellisComputeProfile::ReferenceF32,
             bg_weights_root: None,
             num_steps: DEFAULT_NUM_STEPS,
             num_tokens: DEFAULT_NUM_TOKENS,
@@ -991,6 +1001,7 @@ impl SynthRuntime {
         let options = TrellisRunOptions {
             quality: map_trellis_quality(self.config.trellis_quality),
             device: trellis_device,
+            compute_profile: map_trellis_compute_profile(self.config.trellis_compute_profile),
             seed: self.config.seed,
             hook_output: None,
             noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
@@ -1000,6 +1011,7 @@ impl SynthRuntime {
             runtime_attention_debug: false,
             runtime_decoder_conv_telemetry: false,
             runtime_stage_fence: false,
+            sampler_overrides: Default::default(),
         };
         progress.stage_started(
             "trellis.infer",
@@ -2162,6 +2174,16 @@ fn map_trellis_quality(value: TrellisQuality) -> burn_trellis::TrellisQuality {
         TrellisQuality::Low => burn_trellis::TrellisQuality::Low,
         TrellisQuality::Medium => burn_trellis::TrellisQuality::Medium,
         TrellisQuality::High => burn_trellis::TrellisQuality::High,
+    }
+}
+
+#[cfg(feature = "trellis")]
+fn map_trellis_compute_profile(
+    value: TrellisComputeProfile,
+) -> burn_trellis::TrellisComputeProfile {
+    match value {
+        TrellisComputeProfile::ReferenceF32 => burn_trellis::TrellisComputeProfile::ReferenceF32,
+        TrellisComputeProfile::WgpuFastF16 => burn_trellis::TrellisComputeProfile::WgpuFastF16,
     }
 }
 

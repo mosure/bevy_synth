@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
+#[cfg(feature = "runtime-model-wgpu")]
+use crate::runtime_model::runtime_config::runtime_model_sparse_decoder_conv_f16_enabled;
 use crate::time::Instant;
 #[cfg(feature = "runtime-model-wgpu")]
 use burn::tensor::TensorData;
@@ -21,6 +23,8 @@ use burn_flex_gmm::wgpu::{
     DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
     layer_norm_affine_forward_wgpu, layer_norm_affine_silu_forward_wgpu,
     linear_skinny_forward_wgpu, neighbor_rows_tensor_from_coords_tensor,
+    sparse_subm_conv_forward_wgpu_im2col_matmul,
+    sparse_subm_conv_forward_wgpu_im2col_matmul_fast_f16,
     sparse_subm_conv_forward_wgpu_with_config,
 };
 use burn_flex_gmm::{
@@ -171,6 +175,24 @@ impl Default for DecoderRuntimeConfig {
             force_fp32: false,
             subdivision_threshold: 0.0,
             subdivision_child_thresholds: [f32::NAN; 8],
+        }
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DecoderRuntimeKind {
+    Shape,
+    Texture,
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl DecoderRuntimeKind {
+    pub(crate) fn from_model_metadata(model_name: &str, out_channels: usize) -> Self {
+        if model_name == "FlexiDualGridVaeDecoder" || out_channels >= 7 {
+            Self::Shape
+        } else {
+            Self::Texture
         }
     }
 }
@@ -647,6 +669,7 @@ struct VectorTensorCacheKey {
 #[derive(Debug)]
 struct DecoderWgpuConvContext {
     device: WgpuDevice,
+    decoder_kind: DecoderRuntimeKind,
     weight_tensors: HashMap<LayerTensorCacheKey, Tensor<DefaultWgpuBackend, 5>>,
     bias_tensors: HashMap<LayerTensorCacheKey, Tensor<DefaultWgpuBackend, 1>>,
     neighbor_tensors: HashMap<NeighborRowsCacheKey, Tensor<DefaultWgpuBackend, 2, Int>>,
@@ -658,11 +681,12 @@ struct DecoderWgpuConvContext {
 
 #[cfg(feature = "runtime-model-wgpu")]
 impl DecoderWgpuConvContext {
-    fn new() -> Result<Self, String> {
+    fn new(decoder_kind: DecoderRuntimeKind) -> Result<Self, String> {
         let device = WgpuDevice::default();
         let _ = Tensor::<DefaultWgpuBackend, 1>::zeros([1], &device);
         Ok(Self {
             device,
+            decoder_kind,
             weight_tensors: HashMap::new(),
             bias_tensors: HashMap::new(),
             neighbor_tensors: HashMap::new(),
@@ -978,7 +1002,8 @@ impl DecoderWgpuConvContext {
         // Early-aborting here prevents valid chunked execution during decode upsample stages.
         let kernel_rows = kernel_rows(config)?;
         let neighbor_start = Instant::now();
-        let neighbor_t = neighbor_rows_tensor_from_coords_tensor(config, coords_t)?;
+        let neighbor_t = neighbor_rows_tensor_from_coords_tensor(config, coords_t.clone())?;
+        decoder_wgpu_neighbor_parity_check(config, coords_t, neighbor_t.clone(), context)?;
         let neighbor_ms = neighbor_start.elapsed().as_secs_f64() * 1000.0;
         let conv_start = Instant::now();
         let output = self.forward_with_neighbor_tensor_tensor(
@@ -1098,6 +1123,47 @@ impl DecoderWgpuConvContext {
             input_bytes,
             weight_t,
             bias_t,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_sparse_conv_dispatch_tensor(
+        &mut self,
+        config: &FlexConvConfig,
+        input_t: Tensor<DefaultWgpuBackend, 2>,
+        neighbor_t: Tensor<DefaultWgpuBackend, 2, Int>,
+        weight_t: Tensor<DefaultWgpuBackend, 5>,
+        bias_t: Tensor<DefaultWgpuBackend, 1>,
+        forward_cfg: SparseWgpuForwardConfig,
+        dispatch_rows: usize,
+        kernel_rows: usize,
+        context: &str,
+    ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
+        if decoder_wgpu_use_im2col_matmul(config, dispatch_rows, kernel_rows) {
+            if decoder_conv_debug_enabled() {
+                eprintln!(
+                    "burn_trellis: sparse conv '{}' using im2col matmul rows={} in_channels={} out_channels={} kernel_rows={}",
+                    context, dispatch_rows, config.in_channels, config.out_channels, kernel_rows
+                );
+            }
+            if runtime_model_sparse_decoder_conv_f16_enabled()
+                && self.decoder_kind == DecoderRuntimeKind::Texture
+            {
+                return sparse_subm_conv_forward_wgpu_im2col_matmul_fast_f16(
+                    config, input_t, neighbor_t, weight_t, bias_t,
+                );
+            }
+            return sparse_subm_conv_forward_wgpu_im2col_matmul(
+                config, input_t, neighbor_t, weight_t, bias_t,
+            );
+        }
+        sparse_subm_conv_forward_wgpu_with_config(
+            config,
+            input_t,
+            neighbor_t,
+            weight_t,
+            bias_t,
+            forward_cfg,
         )
     }
 
@@ -1294,13 +1360,16 @@ impl DecoderWgpuConvContext {
         let forward_cfg =
             decoder_wgpu_forward_config_for_call(config, rows, output_bytes, max_output_bytes);
         if output_bytes <= max_output_bytes {
-            match sparse_subm_conv_forward_wgpu_with_config(
+            match self.forward_sparse_conv_dispatch_tensor(
                 config,
                 input_t.clone(),
                 neighbor_t.clone(),
                 weight_t.clone(),
                 bias_t.clone(),
                 forward_cfg,
+                rows,
+                kernel_rows,
+                context,
             ) {
                 Ok(output) => {
                     telemetry_record_wgpu_success(
@@ -1312,6 +1381,15 @@ impl DecoderWgpuConvContext {
                         output_bytes,
                         rows.saturating_mul(kernel_rows),
                     );
+                    decoder_wgpu_sparse_conv_parity_check(
+                        config,
+                        input_t.clone(),
+                        neighbor_t.clone(),
+                        weight_t.clone(),
+                        bias_t.clone(),
+                        output.clone(),
+                        context,
+                    )?;
                     return Ok(output);
                 }
                 Err(err) => {
@@ -1344,16 +1422,20 @@ impl DecoderWgpuConvContext {
         while start < rows {
             let end = (start + chunk_rows).min(rows);
             let chunk_neighbor_t = neighbor_t.clone().slice([start..end, 0..kernel_rows]);
-            match sparse_subm_conv_forward_wgpu_with_config(
+            let chunk_rows_count = end - start;
+            match self.forward_sparse_conv_dispatch_tensor(
                 config,
                 input_t.clone(),
                 chunk_neighbor_t,
                 weight_t.clone(),
                 bias_t.clone(),
                 forward_cfg,
+                chunk_rows_count,
+                kernel_rows,
+                context,
             ) {
                 Ok(chunk_out) => {
-                    max_success_chunk_rows = max_success_chunk_rows.max(end - start);
+                    max_success_chunk_rows = max_success_chunk_rows.max(chunk_rows_count);
                     chunk_tensors.push(chunk_out);
                     start = end;
                     dispatches = dispatches.saturating_add(1);
@@ -1385,16 +1467,23 @@ impl DecoderWgpuConvContext {
             output_bytes,
             rows.saturating_mul(kernel_rows),
         );
-        if chunk_tensors.is_empty() {
-            return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
-                [rows, config.out_channels],
-                &self.device,
-            ));
-        }
-        if chunk_tensors.len() == 1 {
-            return Ok(chunk_tensors.remove(0));
-        }
-        Ok(Tensor::cat(chunk_tensors, 0))
+        let output = if chunk_tensors.is_empty() {
+            Tensor::<DefaultWgpuBackend, 2>::zeros([rows, config.out_channels], &self.device)
+        } else if chunk_tensors.len() == 1 {
+            chunk_tensors.remove(0)
+        } else {
+            Tensor::cat(chunk_tensors, 0)
+        };
+        decoder_wgpu_sparse_conv_parity_check(
+            config,
+            input_t,
+            neighbor_t,
+            weight_t,
+            bias_t,
+            output.clone(),
+            context,
+        )?;
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1502,13 +1591,16 @@ impl DecoderWgpuConvContext {
                 &self.device,
             )
             .reshape([chunk_rows_count, kernel_rows]);
-            match sparse_subm_conv_forward_wgpu_with_config(
+            match self.forward_sparse_conv_dispatch_tensor(
                 config,
                 input_t.clone(),
                 chunk_neighbor_t,
                 weight_t.clone(),
                 bias_t.clone(),
                 forward_cfg,
+                chunk_rows_count,
+                kernel_rows,
+                context,
             ) {
                 Ok(chunk_out) => {
                     max_success_chunk_rows = max_success_chunk_rows.max(chunk_rows_count);
@@ -1566,8 +1658,10 @@ impl DecoderWgpuConvContext {
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
-fn create_wgpu_decoder_context() -> Option<Arc<Mutex<DecoderWgpuConvContext>>> {
-    let context = std::panic::catch_unwind(DecoderWgpuConvContext::new)
+fn create_wgpu_decoder_context(
+    decoder_kind: DecoderRuntimeKind,
+) -> Option<Arc<Mutex<DecoderWgpuConvContext>>> {
+    let context = std::panic::catch_unwind(|| DecoderWgpuConvContext::new(decoder_kind))
         .ok()?
         .ok()?;
     Some(Arc::new(Mutex::new(context)))

@@ -58,6 +58,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliTrellisQuality::Medium)]
     trellis_quality: CliTrellisQuality,
 
+    #[arg(long, value_enum, default_value_t = CliTrellisComputeProfile::ReferenceF32)]
+    trellis_compute_profile: CliTrellisComputeProfile,
+
     /// Quality preset (fast, balanced, full). Individual flags override this preset.
     #[arg(long, value_enum, default_value_t = CliQuality::Balanced)]
     quality: CliQuality,
@@ -217,6 +220,13 @@ enum CliTrellisQuality {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum CliTrellisComputeProfile {
+    ReferenceF32,
+    WgpuFastF16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
 enum CliQuality {
     Fast,
@@ -345,6 +355,7 @@ fn run(cli: Cli) -> Result<(), String> {
         trellis_noise_overrides_hook: cli.trellis_noise_overrides_hook,
         trellis_max_sparse_coords: cli.trellis_max_sparse_coords,
         trellis_quality: cli.trellis_quality.into(),
+        trellis_compute_profile: cli.trellis_compute_profile.into(),
         bg_weights_root: cli.bg_weights_root,
         num_steps: cli.num_steps.unwrap_or(if uses_triposplat {
             triposplat_profile_settings.steps
@@ -880,6 +891,15 @@ impl From<CliTrellisQuality> for burn_synth::TrellisQuality {
             CliTrellisQuality::Low => Self::Low,
             CliTrellisQuality::Medium => Self::Medium,
             CliTrellisQuality::High => Self::High,
+        }
+    }
+}
+
+impl From<CliTrellisComputeProfile> for burn_synth::TrellisComputeProfile {
+    fn from(value: CliTrellisComputeProfile) -> Self {
+        match value {
+            CliTrellisComputeProfile::ReferenceF32 => Self::ReferenceF32,
+            CliTrellisComputeProfile::WgpuFastF16 => Self::WgpuFastF16,
         }
     }
 }

@@ -1,10 +1,6 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "runtime-model")]
-use burn_trellis::hook_diff::HookSnapshot;
-#[cfg(feature = "runtime-model")]
-use burn_trellis::mesh::load_obj_mesh;
 use burn_trellis::pipeline::{Trellis2Pipeline, Trellis2PipelineConfig, TrellisRunOptions};
 use image::{ImageBuffer, Rgba};
 
@@ -75,19 +71,15 @@ fn native_pipeline_writes_mesh_and_preprocess_hook() {
 
     #[cfg(feature = "runtime-model")]
     {
-        result.expect("native pipeline should emit a mesh");
-
-        assert!(output.exists(), "mesh output was not emitted");
-        assert!(hook.exists(), "hook file was not emitted");
-
-        let mesh = load_obj_mesh(&output).expect("failed to parse output OBJ");
-        assert!(!mesh.vertices.is_empty(), "output mesh has no vertices");
-        assert!(!mesh.faces.is_empty(), "output mesh has no faces");
-
-        let snapshot = HookSnapshot::from_file(&hook).expect("failed to read hook");
+        let err = result.expect_err("fake runtime assets should fail before synthetic fallback");
         assert!(
-            snapshot.tensors.contains_key("preprocess_image.output"),
-            "preprocess hook tensor missing"
+            err.to_string()
+                .contains("missing TRELLIS image conditioning"),
+            "unexpected runtime-model fake-asset error: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "runtime-model fake assets must not emit a placeholder mesh"
         );
     }
 

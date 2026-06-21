@@ -1,4 +1,6 @@
 #[cfg(feature = "runtime-model-wgpu")]
+use crate::runtime_model::types::extraction::tensor_i32_to_vec;
+#[cfg(feature = "runtime-model-wgpu")]
 use crate::sampler::FlowEulerSampleTrace;
 
 #[allow(clippy::too_many_arguments)]
@@ -193,6 +195,9 @@ fn sample_sparse_structure_with_model(
             FlowEulerSampleTrace {
                 steps: sample_cfg.steps,
                 samples: Vec::new(),
+                step_0_pred_v: Vec::new(),
+                step_0_pred_v_pos: Vec::new(),
+                step_0_pred_v_neg: Vec::new(),
                 step_0_x_t: Vec::new(),
                 step_mid_x_t: Vec::new(),
                 step_last_x_t: Vec::new(),
@@ -233,6 +238,7 @@ fn sample_sparse_structure_with_model(
     };
     let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
     let flow_ops = sparse_flow_op_telemetry();
+    let flow_ops_summary = current_sparse_flow_op_timing_summary();
     trellis_stage_log!(
         "burn_trellis: sparse flow op telemetry [sparse_runtime] self_attn_calls={} self_attn_ms={:.2} cross_attn_calls={} cross_attn_ms={:.2} mlp_calls={} mlp_ms={:.2}",
         flow_ops.self_attn_calls,
@@ -438,6 +444,9 @@ fn sample_sparse_structure_with_model(
         flow_resolution,
         flow_channels: channels,
         noise,
+        step_0_pred_v: trace.step_0_pred_v,
+        step_0_pred_v_pos: trace.step_0_pred_v_pos,
+        step_0_pred_v_neg: trace.step_0_pred_v_neg,
         step_0_x_t: trace.step_0_x_t,
         step_mid_x_t: trace.step_mid_x_t,
         step_last_x_t: trace.step_last_x_t,
@@ -450,6 +459,7 @@ fn sample_sparse_structure_with_model(
             cond_prepare_ms,
             sample_ms,
             postprocess_ms,
+            flow_ops: flow_ops_summary,
         }),
     })
 }
@@ -591,6 +601,56 @@ fn build_sparse_runtime_noise_rows_only(
     Ok(noise)
 }
 
+#[cfg(feature = "runtime-model")]
+fn sparse_row_noise_override_rows(override_rows: &SparseRowNoiseOverride) -> usize {
+    override_rows.coords.len().min(override_rows.feats.len())
+}
+
+#[cfg(feature = "runtime-model")]
+fn require_sparse_row_noise_override_rows<'a>(
+    override_rows: Option<&'a SparseRowNoiseOverride>,
+    rows: usize,
+    stage: &str,
+) -> Result<Option<&'a SparseRowNoiseOverride>, String> {
+    let Some(override_rows) = override_rows else {
+        return Ok(None);
+    };
+    let override_len = sparse_row_noise_override_rows(override_rows);
+    if override_rows.coords.len() != override_rows.feats.len() {
+        return Err(format!(
+            "burn_trellis: {stage} sparse-row noise override has mismatched coords/feats rows (coords={}, feats={})",
+            override_rows.coords.len(),
+            override_rows.feats.len()
+        ));
+    }
+    if override_len != rows {
+        return Err(format!(
+            "burn_trellis: {stage} sparse-row noise override rows ({override_len}) must match runtime sparse rows ({rows})"
+        ));
+    }
+    Ok(Some(override_rows))
+}
+
+#[cfg(feature = "runtime-model")]
+fn optional_sparse_row_noise_override_for_rows<'a>(
+    override_rows: Option<&'a SparseRowNoiseOverride>,
+    rows: usize,
+    stage: &str,
+) -> Option<&'a SparseRowNoiseOverride> {
+    let override_rows = override_rows?;
+    let override_len = sparse_row_noise_override_rows(override_rows);
+    if override_len == rows && override_rows.coords.len() == override_rows.feats.len() {
+        return Some(override_rows);
+    }
+    if runtime_stage_debug_enabled() {
+        trellis_stage_log!(
+            "burn_trellis: skipping generic {stage} sparse-row noise override rows={} for runtime sparse rows={rows}",
+            override_len
+        );
+    }
+    None
+}
+
 fn sparse_layout_from_batch_ids(
     batch_ids: &[usize],
     context: &str,
@@ -711,11 +771,15 @@ fn sample_shape_slat_with_model(
             dense_noise: capture_sampler_trace.then_some(Vec::new()),
             features: Vec::new(),
             noise: Vec::new(),
+            step_0_pred_v: Vec::new(),
+            step_0_pred_v_pos: Vec::new(),
+            step_0_pred_v_neg: Vec::new(),
             step_0_x_t: Vec::new(),
             step_mid_x_t: Vec::new(),
             step_last_x_t: Vec::new(),
             coords: Vec::new(),
             layout: Vec::new(),
+            flow_ops: SparseFlowOpTimingSummary::default(),
             #[cfg(feature = "runtime-model-wgpu")]
             coords_wgpu: None,
             #[cfg(feature = "runtime-model-wgpu")]
@@ -738,12 +802,30 @@ fn sample_shape_slat_with_model(
         "shape_slat_runtime layout validation",
     )?;
     let dense_resolution = config.resolution.max(1);
+    #[cfg(feature = "runtime-model-wgpu")]
+    let coords_for_noise_storage;
+    #[cfg(feature = "runtime-model-wgpu")]
+    let coords_for_noise = if use_device_coords && coords.is_empty() && noise_dense_override.is_some()
+    {
+        let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
+            "burn_trellis: shape slat dense noise override requires device coords".to_string()
+        })?;
+        coords_for_noise_storage = coords_wgpu_tensor_to_host(
+            coords_t.clone(),
+            "burn_trellis: shape slat coord materialization for dense noise",
+        )?;
+        coords_for_noise_storage.as_slice()
+    } else {
+        coords
+    };
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let coords_for_noise = coords;
     let noise = if use_device_coords {
-        if !coords.is_empty() && (noise_dense_override.is_some() || noise_override.is_some()) {
+        if !coords_for_noise.is_empty() && (noise_dense_override.is_some() || noise_override.is_some()) {
             build_sparse_runtime_noise(
                 rng,
                 config.out_channels,
-                coords,
+                coords_for_noise,
                 noise_dense_override,
                 noise_override,
                 sparse_resolution,
@@ -903,6 +985,7 @@ fn sample_shape_slat_with_model(
         }
     };
     let flow_ops = sparse_flow_op_telemetry();
+    let flow_ops_summary = current_sparse_flow_op_timing_summary();
     trellis_stage_log!(
         "burn_trellis: sparse flow op telemetry [shape_slat] self_attn_calls={} self_attn_ms={:.2} cross_attn_calls={} cross_attn_ms={:.2} mlp_calls={} mlp_ms={:.2}",
         flow_ops.self_attn_calls,
@@ -919,6 +1002,21 @@ fn sample_shape_slat_with_model(
         0
     });
     let mut noise_rows = Vec::with_capacity(if materialize_host_rows {
+        sparse_row_count
+    } else {
+        0
+    });
+    let mut step_0_pred_v_rows = Vec::with_capacity(if materialize_host_rows {
+        sparse_row_count
+    } else {
+        0
+    });
+    let mut step_0_pred_v_pos_rows = Vec::with_capacity(if materialize_host_rows {
+        sparse_row_count
+    } else {
+        0
+    });
+    let mut step_0_pred_v_neg_rows = Vec::with_capacity(if materialize_host_rows {
         sparse_row_count
     } else {
         0
@@ -945,6 +1043,9 @@ fn sample_shape_slat_with_model(
             let noise_base = row_idx.saturating_mul(config.out_channels);
             let mut row = [0.0f32; 32];
             let mut noise_row = [0.0f32; 32];
+            let mut step_0_pred_v_row = [0.0f32; 32];
+            let mut step_0_pred_v_pos_row = [0.0f32; 32];
+            let mut step_0_pred_v_neg_row = [0.0f32; 32];
             let mut step_0_row = [0.0f32; 32];
             let mut step_mid_row = [0.0f32; 32];
             let mut step_last_row = [0.0f32; 32];
@@ -959,12 +1060,18 @@ fn sample_shape_slat_with_model(
                 let sampled = trace.samples[gathered_base + ch];
                 row[ch] = sampled * std + mean;
                 noise_row[ch] = noise[noise_base + ch];
+                step_0_pred_v_row[ch] = trace.step_0_pred_v[gathered_base + ch];
+                step_0_pred_v_pos_row[ch] = trace.step_0_pred_v_pos[gathered_base + ch];
+                step_0_pred_v_neg_row[ch] = trace.step_0_pred_v_neg[gathered_base + ch];
                 step_0_row[ch] = trace.step_0_x_t[gathered_base + ch];
                 step_mid_row[ch] = trace.step_mid_x_t[gathered_base + ch];
                 step_last_row[ch] = trace.step_last_x_t[gathered_base + ch];
             }
             features.push(row);
             noise_rows.push(noise_row);
+            step_0_pred_v_rows.push(step_0_pred_v_row);
+            step_0_pred_v_pos_rows.push(step_0_pred_v_pos_row);
+            step_0_pred_v_neg_rows.push(step_0_pred_v_neg_row);
             step_0_rows.push(step_0_row);
             step_mid_rows.push(step_mid_row);
             step_last_rows.push(step_last_row);
@@ -973,8 +1080,10 @@ fn sample_shape_slat_with_model(
     #[cfg(feature = "runtime-model-wgpu")]
     let coords_out = if use_device_coords && !materialize_host_rows {
         Vec::new()
-    } else {
+    } else if !coords.is_empty() {
         coords.to_vec()
+    } else {
+        coords_for_noise.to_vec()
     };
     #[cfg(feature = "runtime-model-wgpu")]
     let features_wgpu = if shape_flow.backend_name() == "wgpu" {
@@ -1001,11 +1110,15 @@ fn sample_shape_slat_with_model(
         dense_noise: None,
         features,
         noise: noise_rows,
+        step_0_pred_v: step_0_pred_v_rows,
+        step_0_pred_v_pos: step_0_pred_v_pos_rows,
+        step_0_pred_v_neg: step_0_pred_v_neg_rows,
         step_0_x_t: step_0_rows,
         step_mid_x_t: step_mid_rows,
         step_last_x_t: step_last_rows,
         coords: coords_out,
         layout: sparse_layout,
+        flow_ops: flow_ops_summary,
         #[cfg(feature = "runtime-model-wgpu")]
         coords_wgpu: if shape_flow.backend_name() == "wgpu" {
             coords_wgpu
@@ -1071,12 +1184,16 @@ fn sample_tex_slat_with_model(
             dense_noise: capture_sampler_trace.then_some(Vec::new()),
             features: Vec::new(),
             noise: Vec::new(),
+            step_0_pred_v: Vec::new(),
+            step_0_pred_v_pos: Vec::new(),
+            step_0_pred_v_neg: Vec::new(),
             step_0_x_t: Vec::new(),
             step_mid_x_t: Vec::new(),
             step_last_x_t: Vec::new(),
             shape_slat_cond: Vec::new(),
             coords: Vec::new(),
             layout: Vec::new(),
+            flow_ops: SparseFlowOpTimingSummary::default(),
             #[cfg(feature = "runtime-model-wgpu")]
             coords_wgpu: None,
             #[cfg(feature = "runtime-model-wgpu")]
@@ -1142,14 +1259,34 @@ fn sample_tex_slat_with_model(
         build_shape_concat_rows_host(rows, concat_channels, shape_normalization)
     };
     let shape_cond_rows_host = shape_rows_host.map(|rows| build_shape_cond_rows_host(rows, shape_normalization));
+    #[cfg(feature = "runtime-model-wgpu")]
+    let coords_for_noise_storage;
+    #[cfg(feature = "runtime-model-wgpu")]
+    let coords_for_noise = if use_device_coords
+        && shape_slat.coords.is_empty()
+        && noise_dense_override.is_some()
+    {
+        let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
+            "burn_trellis: tex slat dense noise override requires device coords".to_string()
+        })?;
+        coords_for_noise_storage = coords_wgpu_tensor_to_host(
+            coords_t.clone(),
+            "burn_trellis: tex slat coord materialization for dense noise",
+        )?;
+        coords_for_noise_storage.as_slice()
+    } else {
+        shape_slat.coords.as_slice()
+    };
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let coords_for_noise = shape_slat.coords.as_slice();
     let noise = if use_device_coords {
-        if !shape_slat.coords.is_empty()
+        if !coords_for_noise.is_empty()
             && (noise_dense_override.is_some() || noise_override.is_some())
         {
             build_sparse_runtime_noise(
                 rng,
                 config.out_channels,
-                shape_slat.coords.as_slice(),
+                coords_for_noise,
                 noise_dense_override,
                 noise_override,
                 sparse_resolution,
@@ -1338,6 +1475,7 @@ fn sample_tex_slat_with_model(
         }
     };
     let flow_ops = sparse_flow_op_telemetry();
+    let flow_ops_summary = current_sparse_flow_op_timing_summary();
     trellis_stage_log!(
         "burn_trellis: sparse flow op telemetry [tex_slat] self_attn_calls={} self_attn_ms={:.2} cross_attn_calls={} cross_attn_ms={:.2} mlp_calls={} mlp_ms={:.2}",
         flow_ops.self_attn_calls,
@@ -1354,6 +1492,21 @@ fn sample_tex_slat_with_model(
         0
     });
     let mut noise_rows = Vec::with_capacity(if materialize_host_rows {
+        sparse_row_count
+    } else {
+        0
+    });
+    let mut step_0_pred_v_rows = Vec::with_capacity(if materialize_host_rows {
+        sparse_row_count
+    } else {
+        0
+    });
+    let mut step_0_pred_v_pos_rows = Vec::with_capacity(if materialize_host_rows {
+        sparse_row_count
+    } else {
+        0
+    });
+    let mut step_0_pred_v_neg_rows = Vec::with_capacity(if materialize_host_rows {
         sparse_row_count
     } else {
         0
@@ -1385,6 +1538,9 @@ fn sample_tex_slat_with_model(
             let noise_base = idx.saturating_mul(config.out_channels);
             let mut row = [0.0f32; 32];
             let mut noise_row = [0.0f32; 32];
+            let mut step_0_pred_v_row = [0.0f32; 32];
+            let mut step_0_pred_v_pos_row = [0.0f32; 32];
+            let mut step_0_pred_v_neg_row = [0.0f32; 32];
             let mut step_0_row = [0.0f32; 32];
             let mut step_mid_row = [0.0f32; 32];
             let mut step_last_row = [0.0f32; 32];
@@ -1404,12 +1560,18 @@ fn sample_tex_slat_with_model(
                 let sampled = trace.samples[gathered_base + ch];
                 row[ch] = sampled * std + mean;
                 noise_row[ch] = noise[noise_base + ch];
+                step_0_pred_v_row[ch] = trace.step_0_pred_v[gathered_base + ch];
+                step_0_pred_v_pos_row[ch] = trace.step_0_pred_v_pos[gathered_base + ch];
+                step_0_pred_v_neg_row[ch] = trace.step_0_pred_v_neg[gathered_base + ch];
                 step_0_row[ch] = trace.step_0_x_t[gathered_base + ch];
                 step_mid_row[ch] = trace.step_mid_x_t[gathered_base + ch];
                 step_last_row[ch] = trace.step_last_x_t[gathered_base + ch];
             }
             features.push(row);
             noise_rows.push(noise_row);
+            step_0_pred_v_rows.push(step_0_pred_v_row);
+            step_0_pred_v_pos_rows.push(step_0_pred_v_pos_row);
+            step_0_pred_v_neg_rows.push(step_0_pred_v_neg_row);
             step_0_rows.push(step_0_row);
             step_mid_rows.push(step_mid_row);
             step_last_rows.push(step_last_row);
@@ -1420,8 +1582,10 @@ fn sample_tex_slat_with_model(
     #[cfg(feature = "runtime-model-wgpu")]
     let coords_out = if use_device_coords && !materialize_host_rows {
         Vec::new()
-    } else {
+    } else if !shape_slat.coords.is_empty() {
         shape_slat.coords.clone()
+    } else {
+        coords_for_noise.to_vec()
     };
     #[cfg(feature = "runtime-model-wgpu")]
     let features_wgpu = if tex_flow.backend_name() == "wgpu" {
@@ -1449,12 +1613,16 @@ fn sample_tex_slat_with_model(
         dense_noise: None,
         features,
         noise: noise_rows,
+        step_0_pred_v: step_0_pred_v_rows,
+        step_0_pred_v_pos: step_0_pred_v_pos_rows,
+        step_0_pred_v_neg: step_0_pred_v_neg_rows,
         step_0_x_t: step_0_rows,
         step_mid_x_t: step_mid_rows,
         step_last_x_t: step_last_rows,
         shape_slat_cond: shape_cond_rows,
         coords: coords_out,
         layout: sparse_layout,
+        flow_ops: flow_ops_summary,
         #[cfg(feature = "runtime-model-wgpu")]
         coords_wgpu: if tex_flow.backend_name() == "wgpu" {
             coords_wgpu
@@ -1559,11 +1727,15 @@ fn sample_shape_slat(
             dense_noise,
             features: features.clone(),
             noise: noise_rows,
+            step_0_pred_v: features.clone(),
+            step_0_pred_v_pos: features.clone(),
+            step_0_pred_v_neg: features.clone(),
             step_0_x_t: features.clone(),
             step_mid_x_t: features.clone(),
             step_last_x_t: features,
             coords: override_rows.coords.clone(),
             layout: override_layout,
+            flow_ops: SparseFlowOpTimingSummary::default(),
             #[cfg(feature = "runtime-model-wgpu")]
             coords_wgpu: None,
             #[cfg(feature = "runtime-model-wgpu")]
@@ -1735,12 +1907,16 @@ fn sample_tex_slat(
             dense_noise,
             features: features.clone(),
             noise: noise_rows,
+            step_0_pred_v: features.clone(),
+            step_0_pred_v_pos: features.clone(),
+            step_0_pred_v_neg: features.clone(),
             step_0_x_t: features.clone(),
             step_mid_x_t: features.clone(),
             step_last_x_t: features,
             shape_slat_cond,
             coords: override_rows.coords.clone(),
             layout: override_layout,
+            flow_ops: SparseFlowOpTimingSummary::default(),
             #[cfg(feature = "runtime-model-wgpu")]
             coords_wgpu: None,
             #[cfg(feature = "runtime-model-wgpu")]
@@ -1818,7 +1994,7 @@ fn sample_shape_slat_cascade_runtime(
     shape_flow_512: Option<&SparseStructureFlowRuntime>,
     shape_flow_1024: Option<&SparseStructureFlowRuntime>,
     shape_decoder: Option<&FdgDecoderRuntime>,
-) -> Result<(ShapeSLatSample, usize, usize), String> {
+) -> Result<(ShapeSLatSample, Option<ShapeSLatSample>, usize, usize), String> {
     let shape_flow_512 = shape_flow_512.ok_or_else(|| {
         "burn_trellis: cascade pipeline requires shape_slat_flow_model_512 runtime".to_string()
     })?;
@@ -1842,13 +2018,33 @@ fn sample_shape_slat_cascade_runtime(
         return Err("burn_trellis: cascade max_num_tokens must be > 0".to_string());
     }
 
+    #[cfg(feature = "runtime-model-wgpu")]
+    let lr_sparse_rows = coords_wgpu
+        .as_ref()
+        .map(|coords_t| coords_t.dims()[0])
+        .unwrap_or(coords.len());
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let lr_sparse_rows = coords.len();
+    let explicit_lr_noise_override = require_sparse_row_noise_override_rows(
+        cond_overrides.and_then(|overrides| overrides.shape_noise_lr.as_ref()),
+        lr_sparse_rows,
+        "shape_slat_lr_runtime",
+    )?;
+    let lr_noise_override = explicit_lr_noise_override.or_else(|| {
+        optional_sparse_row_noise_override_for_rows(
+            noise_override,
+            lr_sparse_rows,
+            "shape_slat_lr_runtime",
+        )
+    });
+
     let shape_lr = sample_shape_slat(
         preprocess,
         coords,
         sparse_layout,
         None,
         rng,
-        noise_override,
+        lr_noise_override,
         noise_dense_override,
         cond_overrides,
         sampler_config,
@@ -1936,16 +2132,42 @@ fn sample_shape_slat_cascade_runtime(
             effective_resolution = effective_resolution.saturating_sub(128).max(1024);
         };
         let effective_sparse_resolution = (effective_resolution / 16).max(1);
-        // Canonical runtime path is single-image/single-batch; avoid host coord
-        // extraction for layout and keep cascade handoff fully device-resident.
-        let hr_layout = vec![0..hr_coords_quantized_t.dims()[0]];
+        let hr_noise_override = require_sparse_row_noise_override_rows(
+            cond_overrides.and_then(|overrides| overrides.shape_noise_hr.as_ref()),
+            hr_coords_quantized_t.dims()[0],
+            "shape_slat_hr_runtime",
+        )?
+        .or_else(|| {
+            optional_sparse_row_noise_override_for_rows(
+                noise_override,
+                hr_coords_quantized_t.dims()[0],
+                "shape_slat_hr_runtime",
+            )
+        });
+        let hr_coords_quantized_host =
+            if noise_dense_override.is_some() || hr_noise_override.is_some() {
+                coords_wgpu_tensor_to_host(
+                    hr_coords_quantized_t.clone(),
+                    "burn_trellis: cascade quantized coord materialization for dense noise",
+                )?
+            } else {
+                Vec::new()
+            };
+        let hr_layout = if !hr_coords_quantized_host.is_empty() {
+            sparse_layout_from_coords(hr_coords_quantized_host.as_slice())?
+        } else {
+            // Canonical runtime path is single-image/single-batch; avoid host
+            // coord extraction for layout when no coordinate-indexed override
+            // needs it, keeping cascade handoff fully device-resident.
+            vec![0..hr_coords_quantized_t.dims()[0]]
+        };
         let shape_hr = sample_shape_slat(
             preprocess,
-            &[],
+            hr_coords_quantized_host.as_slice(),
             hr_layout.as_slice(),
             None,
             rng,
-            noise_override,
+            hr_noise_override,
             noise_dense_override,
             cond_overrides,
             sampler_config,
@@ -1957,7 +2179,12 @@ fn sample_shape_slat_cascade_runtime(
             Some(hr_coords_quantized_t),
             Some(shape_flow_1024),
         )?;
-        return Ok((shape_hr, effective_sparse_resolution, effective_resolution));
+        return Ok((
+            shape_hr,
+            Some(shape_lr),
+            effective_sparse_resolution,
+            effective_resolution,
+        ));
     }
 
     let hr_coords = hr_coords_sparse
@@ -1992,13 +2219,25 @@ fn sample_shape_slat_cascade_runtime(
     };
     let effective_sparse_resolution = (effective_resolution / 16).max(1);
     let hr_layout = sparse_layout_from_coords(hr_coords_quantized.as_slice())?;
+    let hr_noise_override = require_sparse_row_noise_override_rows(
+        cond_overrides.and_then(|overrides| overrides.shape_noise_hr.as_ref()),
+        hr_coords_quantized.len(),
+        "shape_slat_hr_runtime",
+    )?
+    .or_else(|| {
+        optional_sparse_row_noise_override_for_rows(
+            noise_override,
+            hr_coords_quantized.len(),
+            "shape_slat_hr_runtime",
+        )
+    });
     let shape_hr = sample_shape_slat(
         preprocess,
         hr_coords_quantized.as_slice(),
         hr_layout.as_slice(),
         None,
         rng,
-        noise_override,
+        hr_noise_override,
         noise_dense_override,
         cond_overrides,
         sampler_config,
@@ -2011,7 +2250,12 @@ fn sample_shape_slat_cascade_runtime(
         None,
         Some(shape_flow_1024),
     )?;
-    Ok((shape_hr, effective_sparse_resolution, effective_resolution))
+    Ok((
+        shape_hr,
+        Some(shape_lr),
+        effective_sparse_resolution,
+        effective_resolution,
+    ))
 }
 
 #[cfg(feature = "runtime-model")]
@@ -2232,6 +2476,40 @@ fn coords_u32_to_wgpu_tensor(
         &device,
     )
     .reshape([coords.len(), 4]))
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+fn coords_wgpu_tensor_to_host(
+    coords_t: Tensor<SparseFlowWgpuBackend, 2, Int>,
+    context: &str,
+) -> Result<Vec<[u32; 4]>, String> {
+    let [rows, cols] = coords_t.dims();
+    if cols != 4 {
+        return Err(format!("{context}: coord tensor must have 4 columns, got {cols}"));
+    }
+    let values = tensor_i32_to_vec(coords_t, context)?;
+    if values.len() != rows.saturating_mul(4) {
+        return Err(format!(
+            "{context}: coord tensor length mismatch: got={} expected={}",
+            values.len(),
+            rows.saturating_mul(4)
+        ));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        let base = row_idx.saturating_mul(4);
+        let to_u32 = |value: i32| -> Result<u32, String> {
+            u32::try_from(value)
+                .map_err(|_| format!("{context}: negative coordinate value {value} at row {row_idx}"))
+        };
+        out.push([
+            to_u32(values[base])?,
+            to_u32(values[base + 1])?,
+            to_u32(values[base + 2])?,
+            to_u32(values[base + 3])?,
+        ]);
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "runtime-model-wgpu")]

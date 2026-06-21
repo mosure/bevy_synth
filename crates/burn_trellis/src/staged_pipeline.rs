@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::TrellisComputeProfile;
 use crate::mesh::{Mesh, MeshMaterial, MeshPbrTextures, MeshTexture};
 use crate::preprocess::PreprocessOutput;
 #[cfg(feature = "runtime-model")]
@@ -34,7 +35,8 @@ use crate::runtime_model::sparse_structure_decoder::SparseStructureDecoderRuntim
 use crate::runtime_model::sparse_structure_flow::WgpuRuntimeBackend as SparseFlowWgpuBackend;
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_structure_flow::{
-    SparseStructureFlowRuntime, reset_sparse_flow_op_telemetry, sparse_flow_op_telemetry,
+    SparseFlowOpTelemetry, SparseStructureFlowRuntime, reset_sparse_flow_op_telemetry,
+    sparse_flow_op_telemetry,
 };
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_unet_vae_decoder::{
@@ -147,10 +149,129 @@ fn canonical_pipeline_type(pipeline_type: &str) -> &str {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+pub struct SparseFlowOpTimingSummary {
+    pub self_attn_calls: u64,
+    pub self_attn_ns: u64,
+    pub cross_attn_calls: u64,
+    pub cross_attn_ns: u64,
+    pub mlp_calls: u64,
+    pub mlp_ns: u64,
+    pub self_qkv_calls: u64,
+    pub self_qkv_ns: u64,
+    pub self_norm_rope_calls: u64,
+    pub self_norm_rope_ns: u64,
+    pub self_norm_rope_fused_qk_calls: u64,
+    pub self_norm_rope_fused_qkv_module_calls: u64,
+    pub self_kernel_calls: u64,
+    pub self_kernel_ns: u64,
+    pub self_out_calls: u64,
+    pub self_out_ns: u64,
+    pub self_cat_calls: u64,
+    pub self_cat_ns: u64,
+    pub cross_q_calls: u64,
+    pub cross_q_ns: u64,
+    pub cross_kv_calls: u64,
+    pub cross_kv_ns: u64,
+    pub cross_norm_calls: u64,
+    pub cross_norm_ns: u64,
+    pub cross_kernel_calls: u64,
+    pub cross_kernel_ns: u64,
+    pub cross_out_calls: u64,
+    pub cross_out_ns: u64,
+    pub cross_cat_calls: u64,
+    pub cross_cat_ns: u64,
+    pub module_cast_pad_calls: u64,
+    pub module_cast_pad_ns: u64,
+    pub module_attention_calls: u64,
+    pub module_attention_ns: u64,
+    pub module_output_calls: u64,
+    pub module_output_ns: u64,
+    pub block_norm_mod_calls: u64,
+    pub block_norm_mod_ns: u64,
+    pub block_norm_affine_calls: u64,
+    pub block_norm_affine_ns: u64,
+    pub block_gate_residual_calls: u64,
+    pub block_gate_residual_ns: u64,
+    pub model_io_calls: u64,
+    pub model_io_ns: u64,
+    pub model_input_calls: u64,
+    pub model_input_ns: u64,
+    pub model_output_calls: u64,
+    pub model_output_ns: u64,
+}
+
+#[cfg(feature = "runtime-model")]
+impl From<SparseFlowOpTelemetry> for SparseFlowOpTimingSummary {
+    fn from(value: SparseFlowOpTelemetry) -> Self {
+        Self {
+            self_attn_calls: value.self_attn_calls,
+            self_attn_ns: value.self_attn_ns,
+            cross_attn_calls: value.cross_attn_calls,
+            cross_attn_ns: value.cross_attn_ns,
+            mlp_calls: value.mlp_calls,
+            mlp_ns: value.mlp_ns,
+            self_qkv_calls: value.self_qkv_calls,
+            self_qkv_ns: value.self_qkv_ns,
+            self_norm_rope_calls: value.self_norm_rope_calls,
+            self_norm_rope_ns: value.self_norm_rope_ns,
+            self_norm_rope_fused_qk_calls: value.self_norm_rope_fused_qk_calls,
+            self_norm_rope_fused_qkv_module_calls: value.self_norm_rope_fused_qkv_module_calls,
+            self_kernel_calls: value.self_kernel_calls,
+            self_kernel_ns: value.self_kernel_ns,
+            self_out_calls: value.self_out_calls,
+            self_out_ns: value.self_out_ns,
+            self_cat_calls: value.self_cat_calls,
+            self_cat_ns: value.self_cat_ns,
+            cross_q_calls: value.cross_q_calls,
+            cross_q_ns: value.cross_q_ns,
+            cross_kv_calls: value.cross_kv_calls,
+            cross_kv_ns: value.cross_kv_ns,
+            cross_norm_calls: value.cross_norm_calls,
+            cross_norm_ns: value.cross_norm_ns,
+            cross_kernel_calls: value.cross_kernel_calls,
+            cross_kernel_ns: value.cross_kernel_ns,
+            cross_out_calls: value.cross_out_calls,
+            cross_out_ns: value.cross_out_ns,
+            cross_cat_calls: value.cross_cat_calls,
+            cross_cat_ns: value.cross_cat_ns,
+            module_cast_pad_calls: value.module_cast_pad_calls,
+            module_cast_pad_ns: value.module_cast_pad_ns,
+            module_attention_calls: value.module_attention_calls,
+            module_attention_ns: value.module_attention_ns,
+            module_output_calls: value.module_output_calls,
+            module_output_ns: value.module_output_ns,
+            block_norm_mod_calls: value.block_norm_mod_calls,
+            block_norm_mod_ns: value.block_norm_mod_ns,
+            block_norm_affine_calls: value.block_norm_affine_calls,
+            block_norm_affine_ns: value.block_norm_affine_ns,
+            block_gate_residual_calls: value.block_gate_residual_calls,
+            block_gate_residual_ns: value.block_gate_residual_ns,
+            model_io_calls: value.model_io_calls,
+            model_io_ns: value.model_io_ns,
+            model_input_calls: value.model_input_calls,
+            model_input_ns: value.model_input_ns,
+            model_output_calls: value.model_output_calls,
+            model_output_ns: value.model_output_ns,
+        }
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn current_sparse_flow_op_timing_summary() -> SparseFlowOpTimingSummary {
+    sparse_flow_op_telemetry().into()
+}
+
+#[cfg(not(feature = "runtime-model"))]
+fn current_sparse_flow_op_timing_summary() -> SparseFlowOpTimingSummary {
+    SparseFlowOpTimingSummary::default()
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SparseStructureRuntimeProfile {
     pub cond_prepare_ms: f64,
     pub sample_ms: f64,
     pub postprocess_ms: f64,
+    pub flow_ops: SparseFlowOpTimingSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +284,9 @@ pub struct SparseStructureSample {
     pub flow_resolution: usize,
     pub flow_channels: usize,
     pub noise: Vec<f32>,
+    pub step_0_pred_v: Vec<f32>,
+    pub step_0_pred_v_pos: Vec<f32>,
+    pub step_0_pred_v_neg: Vec<f32>,
     pub step_0_x_t: Vec<f32>,
     pub step_mid_x_t: Vec<f32>,
     pub step_last_x_t: Vec<f32>,
@@ -212,11 +336,15 @@ pub struct ShapeSLatSample {
     pub dense_noise: Option<Vec<f32>>,
     pub features: Vec<[f32; 32]>,
     pub noise: Vec<[f32; 32]>,
+    pub step_0_pred_v: Vec<[f32; 32]>,
+    pub step_0_pred_v_pos: Vec<[f32; 32]>,
+    pub step_0_pred_v_neg: Vec<[f32; 32]>,
     pub step_0_x_t: Vec<[f32; 32]>,
     pub step_mid_x_t: Vec<[f32; 32]>,
     pub step_last_x_t: Vec<[f32; 32]>,
     pub coords: Vec<[u32; 4]>,
     pub layout: Vec<std::ops::Range<usize>>,
+    pub flow_ops: SparseFlowOpTimingSummary,
     #[cfg(feature = "runtime-model-wgpu")]
     pub coords_wgpu: Option<Tensor<SparseFlowWgpuBackend, 2, Int>>,
     #[cfg(feature = "runtime-model-wgpu")]
@@ -233,12 +361,16 @@ pub struct TexSLatSample {
     pub dense_noise: Option<Vec<f32>>,
     pub features: Vec<[f32; 32]>,
     pub noise: Vec<[f32; 32]>,
+    pub step_0_pred_v: Vec<[f32; 32]>,
+    pub step_0_pred_v_pos: Vec<[f32; 32]>,
+    pub step_0_pred_v_neg: Vec<[f32; 32]>,
     pub step_0_x_t: Vec<[f32; 32]>,
     pub step_mid_x_t: Vec<[f32; 32]>,
     pub step_last_x_t: Vec<[f32; 32]>,
     pub shape_slat_cond: Vec<[f32; 32]>,
     pub coords: Vec<[u32; 4]>,
     pub layout: Vec<std::ops::Range<usize>>,
+    pub flow_ops: SparseFlowOpTimingSummary,
     #[cfg(feature = "runtime-model-wgpu")]
     pub coords_wgpu: Option<Tensor<SparseFlowWgpuBackend, 2, Int>>,
     #[cfg(feature = "runtime-model-wgpu")]
@@ -257,6 +389,7 @@ pub struct TrellisStageConditioning {
 pub struct TrellisStageOutput {
     pub sparse: SparseStructureSample,
     pub shape_slat: ShapeSLatSample,
+    pub shape_slat_lr: Option<ShapeSLatSample>,
     pub tex_slat: TexSLatSample,
     pub conditioning: TrellisStageConditioning,
     pub decode_shape_input: Option<SparseRowNoiseOverride>,
@@ -336,8 +469,11 @@ pub struct TrellisStageTimings {
     pub sparse_cond_ms: f64,
     pub sparse_sample_ms: f64,
     pub sparse_post_ms: f64,
+    pub sparse_flow_ops: SparseFlowOpTimingSummary,
     pub shape_slat_ms: f64,
+    pub shape_slat_flow_ops: SparseFlowOpTimingSummary,
     pub tex_slat_ms: f64,
+    pub tex_slat_flow_ops: SparseFlowOpTimingSummary,
     pub decode_ms: f64,
     pub decode_stage_fenced: bool,
     pub decode_shape_decoder_ms: f64,
@@ -365,6 +501,7 @@ pub struct TrellisStageRunConfig {
     pub max_sparse_coords: Option<usize>,
     pub max_num_tokens: Option<usize>,
     pub target_faces: Option<usize>,
+    pub compute_profile: TrellisComputeProfile,
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
@@ -405,6 +542,8 @@ pub struct TrellisNoiseOverrides {
     pub sparse_noise: Option<Vec<f32>>,
     pub sparse_coords: Option<Vec<[u32; 4]>>,
     pub shape_noise: Option<SparseRowNoiseOverride>,
+    pub shape_noise_lr: Option<SparseRowNoiseOverride>,
+    pub shape_noise_hr: Option<SparseRowNoiseOverride>,
     pub tex_noise: Option<SparseRowNoiseOverride>,
     pub shape_slat: Option<SparseRowNoiseOverride>,
     pub tex_slat: Option<SparseRowNoiseOverride>,
@@ -436,6 +575,8 @@ impl TrellisNoiseOverrides {
         self.sparse_noise.is_none()
             && self.sparse_coords.is_none()
             && self.shape_noise.is_none()
+            && self.shape_noise_lr.is_none()
+            && self.shape_noise_hr.is_none()
             && self.tex_noise.is_none()
             && self.shape_slat.is_none()
             && self.tex_slat.is_none()
@@ -1322,6 +1463,14 @@ impl TrellisStageRuntime {
         set_runtime_model_debug_config(RuntimeModelDebugConfig {
             stage_debug: run_config.runtime_stage_debug,
             attention_debug: run_config.runtime_attention_debug,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: run_config
+                .compute_profile
+                .wgpu_module_attention_f16(),
+            sparse_flow_linear_f16: run_config.compute_profile.wgpu_linear_f16(),
+            sparse_flow_torso_f16: run_config.compute_profile.wgpu_flow_torso_f16(),
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: run_config.compute_profile.wgpu_decoder_conv_f16(),
         });
         let parity_strict = runtime_parity_strict();
         let max_sparse_coords_override = run_config.max_sparse_coords.filter(|limit| *limit > 0);
@@ -1413,7 +1562,10 @@ impl TrellisStageRuntime {
         };
         #[cfg(not(feature = "runtime-model-wgpu"))]
         let sparse_requires_host_coords = cascade_requires_decoder_upsample;
-        let sparse_materialize_host_coords = sparse_requires_host_coords || capture_sampler_trace;
+        let sparse_materialize_host_coords = sparse_requires_host_coords
+            || capture_sampler_trace
+            || shape_noise_dense_override.is_some()
+            || tex_noise_dense_override.is_some();
         #[cfg(feature = "runtime-model")]
         let sparse_flow_runtime = self.sparse_flow_runtime();
         #[cfg(feature = "runtime-model")]
@@ -1460,23 +1612,23 @@ impl TrellisStageRuntime {
             "burn_trellis: stage sparse complete ({sparse_ms:.2} ms, coords={})",
             sparse_rows
         );
+        let sparse_flow_ops = sparse
+            .runtime_profile
+            .map(|profile| profile.flow_ops)
+            .unwrap_or_default();
 
         #[cfg(feature = "runtime-model")]
-        let shape_flow_runtime = self.shape_flow_runtime();
-        #[cfg(feature = "runtime-model")]
-        let shape_flow_runtime_512 = self.shape_flow_runtime_512();
-        #[cfg(feature = "runtime-model")]
-        let shape_flow_runtime_1024 = self.shape_flow_runtime_1024();
-        #[cfg(feature = "runtime-model")]
-        let shape_decoder_runtime_for_cascade = self.shape_decoder_runtime();
+        let is_cascade_shape_pipeline =
+            matches!(self.pipeline_type(), "1024_cascade" | "1536_cascade");
         let shape_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage shape_slat begin");
-        let (shape_slat, shape_slat_sparse_resolution, shape_slat_decode_resolution) = {
+        let (shape_slat, shape_slat_lr, shape_slat_sparse_resolution, shape_slat_decode_resolution) = {
             #[cfg(feature = "runtime-model")]
             {
-                if shape_slat_override.is_none()
-                    && matches!(self.pipeline_type(), "1024_cascade" | "1536_cascade")
-                {
+                if shape_slat_override.is_none() && is_cascade_shape_pipeline {
+                    let shape_flow_runtime_512 = self.shape_flow_runtime_512();
+                    let shape_flow_runtime_1024 = self.shape_flow_runtime_1024();
+                    let shape_decoder_runtime_for_cascade = self.shape_decoder_runtime();
                     let target_decode_resolution = match self.pipeline_type() {
                         "1024_cascade" => 1024usize,
                         "1536_cascade" => 1536usize,
@@ -1512,6 +1664,7 @@ impl TrellisStageRuntime {
                         shape_decoder_runtime_for_cascade,
                     )?
                 } else {
+                    let shape_flow_runtime = self.shape_flow_runtime();
                     (
                         sample_shape_slat(
                             preprocess,
@@ -1532,6 +1685,7 @@ impl TrellisStageRuntime {
                             sparse.coords_wgpu.clone(),
                             shape_flow_runtime,
                         )?,
+                        None,
                         sparse.resolution,
                         final_resolution_for_pipeline(self.pipeline_type()),
                     )
@@ -1558,6 +1712,7 @@ impl TrellisStageRuntime {
                         #[cfg(feature = "runtime-model-wgpu")]
                         sparse.coords_wgpu.clone(),
                     )?,
+                    None,
                     sparse.resolution,
                     final_resolution_for_pipeline(self.pipeline_type()),
                 )
@@ -1584,6 +1739,7 @@ impl TrellisStageRuntime {
             "burn_trellis: stage shape_slat complete ({shape_slat_ms:.2} ms, rows={})",
             shape_rows
         );
+        let shape_slat_flow_ops = shape_slat.flow_ops;
 
         #[cfg(feature = "runtime-model")]
         let tex_flow_runtime = self.tex_flow_runtime();
@@ -1634,6 +1790,7 @@ impl TrellisStageRuntime {
             "burn_trellis: stage tex_slat complete ({tex_slat_ms:.2} ms, rows={})",
             tex_rows
         );
+        let tex_slat_flow_ops = tex_slat.flow_ops;
 
         let decode_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage decode begin");
@@ -1685,6 +1842,7 @@ impl TrellisStageRuntime {
         let output = TrellisStageOutput {
             sparse,
             shape_slat,
+            shape_slat_lr,
             tex_slat,
             conditioning: stage_conditioning,
             decode_shape_input: decode_shape_input_override,
@@ -1700,8 +1858,11 @@ impl TrellisStageRuntime {
             sparse_cond_ms: sparse_runtime_profile.cond_prepare_ms,
             sparse_sample_ms: sparse_runtime_profile.sample_ms,
             sparse_post_ms: sparse_runtime_profile.postprocess_ms,
+            sparse_flow_ops,
             shape_slat_ms,
+            shape_slat_flow_ops,
             tex_slat_ms,
+            tex_slat_flow_ops,
             decode_ms,
             decode_stage_fenced: decoded.timings.stage_fenced,
             decode_shape_decoder_ms: decoded.timings.shape_decoder_ms,

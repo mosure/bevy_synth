@@ -2743,6 +2743,7 @@ dependencies = [
  "burn-cuda",
  "burn-wgpu",
  "criterion",
+ "half",
  "matrixmultiply",
 ]
 

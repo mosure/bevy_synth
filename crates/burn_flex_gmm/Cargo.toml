@@ -13,9 +13,8 @@ readme = "README.md"
 
 [features]
 default = []
-# The pre-0.21 sparse-conv WGPU stage tools are kept out of the 0.21
-# patchify feature path until those kernels are ported to the current CubeCL
-# launch API.
+# Compatibility alias retained for older local commands; the ported CubeCL
+# sparse kernels are enabled by `wgpu-kernel`.
 legacy-wgpu-kernel = []
 wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
 cuda-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-cuda"]
@@ -23,6 +22,7 @@ cuda-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-cuda"]
 [dependencies]
 matrixmultiply = "0.3"
 burn = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+half = "2.4"
 # Keep CubeCL deterministic on the canonical WGPU path: avoid default
 # `autotune` so runtime doesn't select vecmat kernels that require
 # unavailable plane-wide ops on some adapters.
@@ -61,9 +61,9 @@ harness = false
 [[bin]]
 name = "neighbor_stage_bench"
 path = "tool/neighbor_stage_bench.rs"
-required-features = ["wgpu-kernel", "legacy-wgpu-kernel"]
+required-features = ["wgpu-kernel"]
 
 [[bin]]
 name = "sparse_conv_stage_bench"
 path = "tool/sparse_conv_stage_bench.rs"
-required-features = ["wgpu-kernel", "legacy-wgpu-kernel"]
+required-features = ["wgpu-kernel"]

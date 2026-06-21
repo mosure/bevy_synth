@@ -1,10 +1,63 @@
 use crate::{attention::extended::utils::tiling_scheme_ops::*, attention::launcher::test_launch};
-use cubecl::{ir::AddressType, {Runtime, TestRuntime}};
+use cubecl::{
+    ir::AddressType,
+    {Runtime, TestRuntime},
+};
 use cubek_attention::definition::{
     AccumulatorPrecision, AttentionDims, AttentionOptions, AttentionPartitionSize,
     AttentionProblem, AttentionStageSize, AttentionTilingScheme, HypercubeBlueprint,
 };
 use cubek_attention::routines::DeviceSettings;
+
+#[test]
+fn check_bounds_tracks_problem_tails() {
+    let tiling_scheme = AttentionTilingScheme {
+        tile_size: AttentionTileSize {
+            seq_q: 16,
+            seq_kv: 16,
+            head_dim: 16,
+            val_dim: 16,
+        },
+        partition_size: AttentionPartitionSize {
+            seq_q: 1,
+            seq_kv: 1,
+            head_dim: 8,
+            val_dim: 8,
+        },
+        stage_size: AttentionStageSize { seq_q: 768 },
+    };
+
+    let stage_q = elements_in_stage_seq_q(&tiling_scheme);
+    let partition_kv = elements_in_partition_seq_kv(&tiling_scheme);
+    let partition_head = elements_in_partition_head_dim(&tiling_scheme);
+    let partition_value = elements_in_partition_val_dim(&tiling_scheme);
+
+    let aligned = tiling_scheme.check_bounds(&AttentionDims {
+        batch: 2,
+        num_heads: 12,
+        seq_q: stage_q * 2,
+        seq_kv: partition_kv * 1489,
+        head_dim: partition_head * 2,
+        val_dim: partition_value * 2,
+    });
+    assert!(!aligned.seq_q);
+    assert!(!aligned.seq_kv);
+    assert!(!aligned.head_dim);
+    assert!(!aligned.val_dim);
+
+    let tail = tiling_scheme.check_bounds(&AttentionDims {
+        batch: 2,
+        num_heads: 12,
+        seq_q: stage_q * 2 + 1,
+        seq_kv: partition_kv * 1489 + 1,
+        head_dim: partition_head * 2 + 1,
+        val_dim: partition_value * 2 + 1,
+    });
+    assert!(tail.seq_q);
+    assert!(tail.seq_kv);
+    assert!(tail.head_dim);
+    assert!(tail.val_dim);
+}
 
 #[test]
 fn one_tile_simple() {

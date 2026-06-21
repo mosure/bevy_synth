@@ -8,6 +8,21 @@ use crate::{SparsePatchify3dConfig, validate_sparse_patchify3d_config};
 /// Default WGPU backend type used by the sparse patchify tensor wrapper.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
 
+trait LaunchUncheckedResultExt {
+    fn map_err<F>(self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(()) -> String;
+}
+
+impl LaunchUncheckedResultExt for () {
+    fn map_err<F>(self, _f: F) -> Result<(), String>
+    where
+        F: FnOnce(()) -> String,
+    {
+        Ok(())
+    }
+}
+
 #[cube(launch_unchecked)]
 fn sparse_patchify3d_kernel(
     input: &Array<f32>,
@@ -171,21 +186,21 @@ pub fn sparse_patchify3d_forward_wgpu(
             &client,
             cube_count,
             cube_dim,
-            input_p.as_array_arg::<f32>(1),
-            coords_p.as_array_arg::<i32>(1),
-            weight_p.as_array_arg::<f32>(1),
-            bias_p.as_array_arg::<f32>(1),
-            output.as_array_arg::<f32>(1),
-            ScalarArg::new(rows),
-            ScalarArg::new(batch),
-            ScalarArg::new(config.in_channels),
-            ScalarArg::new(config.out_channels),
-            ScalarArg::new(config.frames),
-            ScalarArg::new(config.height),
-            ScalarArg::new(config.width),
-            ScalarArg::new(config.tubelet_size),
-            ScalarArg::new(config.patch_h),
-            ScalarArg::new(config.patch_w),
+            input_p.clone().into_array_arg(),
+            coords_p.clone().into_array_arg(),
+            weight_p.clone().into_array_arg(),
+            bias_p.clone().into_array_arg(),
+            output.clone().into_array_arg(),
+            rows,
+            batch,
+            config.in_channels,
+            config.out_channels,
+            config.frames,
+            config.height,
+            config.width,
+            config.tubelet_size,
+            config.patch_h,
+            config.patch_w,
         )
         .map_err(|err| format!("sparse_patchify3d_kernel launch failed: {err:?}"))?;
     }
