@@ -223,6 +223,13 @@ enum CliTrellisQuality {
 #[value(rename_all = "kebab-case")]
 enum CliTrellisComputeProfile {
     ReferenceF32,
+    WgpuFastMixedF16,
+    WgpuFastSparseSelfF16,
+    WgpuFastSparseCrossF16,
+    WgpuFastF16Tail1F32,
+    WgpuFastF16Tail2F32,
+    WgpuFastF16Tail4F32,
+    WgpuFastF16Tail6F32,
     WgpuFastF16,
 }
 
@@ -899,6 +906,13 @@ impl From<CliTrellisComputeProfile> for burn_synth::TrellisComputeProfile {
     fn from(value: CliTrellisComputeProfile) -> Self {
         match value {
             CliTrellisComputeProfile::ReferenceF32 => Self::ReferenceF32,
+            CliTrellisComputeProfile::WgpuFastMixedF16 => Self::WgpuFastMixedF16,
+            CliTrellisComputeProfile::WgpuFastSparseSelfF16 => Self::WgpuFastSparseSelfF16,
+            CliTrellisComputeProfile::WgpuFastSparseCrossF16 => Self::WgpuFastSparseCrossF16,
+            CliTrellisComputeProfile::WgpuFastF16Tail1F32 => Self::WgpuFastF16Tail1F32,
+            CliTrellisComputeProfile::WgpuFastF16Tail2F32 => Self::WgpuFastF16Tail2F32,
+            CliTrellisComputeProfile::WgpuFastF16Tail4F32 => Self::WgpuFastF16Tail4F32,
+            CliTrellisComputeProfile::WgpuFastF16Tail6F32 => Self::WgpuFastF16Tail6F32,
             CliTrellisComputeProfile::WgpuFastF16 => Self::WgpuFastF16,
         }
     }

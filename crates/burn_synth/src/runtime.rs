@@ -131,6 +131,13 @@ pub enum TrellisQuality {
 pub enum TrellisComputeProfile {
     #[default]
     ReferenceF32,
+    WgpuFastMixedF16,
+    WgpuFastSparseSelfF16,
+    WgpuFastSparseCrossF16,
+    WgpuFastF16Tail1F32,
+    WgpuFastF16Tail2F32,
+    WgpuFastF16Tail4F32,
+    WgpuFastF16Tail6F32,
     WgpuFastF16,
 }
 
@@ -1007,6 +1014,7 @@ impl SynthRuntime {
             noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
             max_sparse_coords: self.config.trellis_max_sparse_coords,
             target_faces: self.config.target_faces,
+            decode_output_mode: Default::default(),
             runtime_stage_debug: false,
             runtime_attention_debug: false,
             runtime_decoder_conv_telemetry: false,
@@ -2183,6 +2191,27 @@ fn map_trellis_compute_profile(
 ) -> burn_trellis::TrellisComputeProfile {
     match value {
         TrellisComputeProfile::ReferenceF32 => burn_trellis::TrellisComputeProfile::ReferenceF32,
+        TrellisComputeProfile::WgpuFastMixedF16 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastMixedF16
+        }
+        TrellisComputeProfile::WgpuFastSparseSelfF16 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastSparseSelfF16
+        }
+        TrellisComputeProfile::WgpuFastSparseCrossF16 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastSparseCrossF16
+        }
+        TrellisComputeProfile::WgpuFastF16Tail1F32 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastF16Tail1F32
+        }
+        TrellisComputeProfile::WgpuFastF16Tail2F32 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastF16Tail2F32
+        }
+        TrellisComputeProfile::WgpuFastF16Tail4F32 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastF16Tail4F32
+        }
+        TrellisComputeProfile::WgpuFastF16Tail6F32 => {
+            burn_trellis::TrellisComputeProfile::WgpuFastF16Tail6F32
+        }
         TrellisComputeProfile::WgpuFastF16 => burn_trellis::TrellisComputeProfile::WgpuFastF16,
     }
 }

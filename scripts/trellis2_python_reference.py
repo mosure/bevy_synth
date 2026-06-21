@@ -611,6 +611,42 @@ def main() -> int:
                 params,
             )
             orig_sampler_sample = pipe.sparse_structure_sampler.sample
+            orig_sampler_sample_once = getattr(
+                pipe.sparse_structure_sampler, "sample_once", None
+            )
+            sparse_step_counter = {"step": 0}
+            sparse_step_count = int(params.get("steps", 0) or 0)
+
+            def sparse_sampler_sample_once_wrapper(
+                model: Any,
+                x_t: torch.Tensor,
+                t: float,
+                t_prev: float,
+                cond: Any = None,
+                **sample_once_kwargs: Any,
+            ) -> Any:
+                out = orig_sampler_sample_once(
+                    model, x_t, t, t_prev, cond, **sample_once_kwargs
+                )
+                pred_x_prev = getattr(out, "pred_x_prev", None)
+                step_idx = sparse_step_counter["step"]
+                sparse_step_counter["step"] += 1
+                if (
+                    isinstance(pred_x_prev, torch.Tensor)
+                    and isinstance(x_t, torch.Tensor)
+                    and sparse_step_count > 0
+                    and t != t_prev
+                ):
+                    pred_v = (x_t - pred_x_prev) / float(t - t_prev)
+                    captures[
+                        f"sample_sparse_structure.sampler.step_{step_idx:03}_of_{sparse_step_count:03}.pred_v"
+                    ] = to_cpu_tensor(pred_v, torch.float32)
+                return out
+
+            if orig_sampler_sample_once is not None:
+                pipe.sparse_structure_sampler.sample_once = (
+                    sparse_sampler_sample_once_wrapper
+                )
 
             def sparse_sampler_capture_wrapper(*sample_args: Any, **sample_kwargs: Any) -> Any:
                 sampled = orig_sampler_sample(*sample_args, **sample_kwargs)
@@ -644,6 +680,8 @@ def main() -> int:
         finally:
             if orig_sampler_sample is not None:
                 pipe.sparse_structure_sampler.sample = orig_sampler_sample
+            if capture_enabled and orig_sampler_sample_once is not None:
+                pipe.sparse_structure_sampler.sample_once = orig_sampler_sample_once
         runtime_shapes["sparse_coords"] = int(out.shape[0]) if out.ndim > 0 else 0
         if capture_enabled:
             captures["sample_sparse_structure.coords"] = to_cpu_tensor(out, torch.float32)

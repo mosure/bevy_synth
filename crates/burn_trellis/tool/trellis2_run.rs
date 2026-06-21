@@ -7,12 +7,10 @@ use std::process::Command;
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
-use burn_trellis::staged_pipeline::TrellisSamplerRuntimeOverrides;
+use burn_trellis::staged_pipeline::{TrellisDecodeOutputMode, TrellisSamplerRuntimeOverrides};
 use burn_trellis::{TrellisComputeProfile, TrellisQuality};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde_json::json;
-
-const OVOXEL_MIN_SOURCE_VERTICES: usize = 1_000_000;
 
 fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
@@ -188,6 +186,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     runtime_decoder_conv_telemetry: bool,
 
+    /// GLB export path. `ovoxel` uses the upstream o_voxel postprocess from hook tensors.
+    #[arg(long = "glb-export-mode", value_enum, default_value_t = GlbExportMode::Native)]
+    glb_export_mode: GlbExportMode,
+
     /// Export GLB via canonical o_voxel postprocess using hook tensors.
     #[arg(long, default_value_t = false)]
     ovoxel_postprocess_from_hook: bool,
@@ -221,6 +223,31 @@ struct Args {
     ovoxel_extension_webp: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+enum GlbExportMode {
+    #[default]
+    Native,
+    #[value(alias = "ovxl", alias = "ovoxel-hook")]
+    Ovoxel,
+}
+
+impl GlbExportMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Ovoxel => "ovoxel",
+        }
+    }
+}
+
+fn effective_glb_export_mode(args: &Args) -> GlbExportMode {
+    if args.ovoxel_postprocess_from_hook {
+        GlbExportMode::Ovoxel
+    } else {
+        args.glb_export_mode
+    }
+}
+
 fn validate_benchmark_args(args: &Args) -> Result<(), String> {
     if args.strict_benchmark && args.runtime_stage_debug {
         return Err(
@@ -234,16 +261,17 @@ fn validate_benchmark_args(args: &Args) -> Result<(), String> {
 fn run() -> Result<(), String> {
     let args = Args::parse();
     validate_benchmark_args(&args)?;
+    let glb_export_mode = effective_glb_export_mode(&args);
     let output_glb = args
         .output
         .as_ref()
         .map(|path| resolve_glb_output_path(path.as_path(), args.input.as_path()));
-    if args.ovoxel_postprocess_from_hook && output_glb.is_none() {
+    if matches!(glb_export_mode, GlbExportMode::Ovoxel) && output_glb.is_none() {
         return Err(
             "ovoxel postprocess export requires --output/--output-glb to be provided".to_string(),
         );
     }
-    if args.ovoxel_postprocess_from_hook && args.hook_output.is_none() {
+    if matches!(glb_export_mode, GlbExportMode::Ovoxel) && args.hook_output.is_none() {
         return Err("ovoxel postprocess export requires --hook-output".to_string());
     }
 
@@ -274,6 +302,11 @@ fn run() -> Result<(), String> {
             noise_overrides_hook: args.noise_overrides_hook.clone(),
             max_sparse_coords: args.max_sparse_coords,
             target_faces: None,
+            decode_output_mode: if matches!(glb_export_mode, GlbExportMode::Ovoxel) {
+                TrellisDecodeOutputMode::OvoxelHookExport
+            } else {
+                TrellisDecodeOutputMode::NativePbr
+            },
             runtime_stage_debug: args.runtime_stage_debug,
             runtime_attention_debug: args.runtime_attention_debug,
             runtime_decoder_conv_telemetry: args.runtime_decoder_conv_telemetry,
@@ -336,18 +369,17 @@ fn run() -> Result<(), String> {
         .last()
         .ok_or_else(|| "no inference runs were produced".to_string())?;
     let mut ovoxel_postprocess_applied = false;
-    let mut ovoxel_postprocess_skipped_reason: Option<String> = None;
+    let ovoxel_postprocess_skipped_reason: Option<String> = None;
     if let Some(obj_path) = args.output_obj.as_ref() {
         burn_trellis::write_obj_mesh(obj_path, &profiled.mesh).map_err(|err| err.to_string())?;
     }
     if let Some(glb_path) = output_glb.as_ref() {
-        if args.ovoxel_postprocess_from_hook {
-            if let Some(reason) = ovoxel_skip_reason(profiled.mesh.vertices.len()) {
-                eprintln!("burn_trellis: {reason}; writing runtime GLB output instead.");
+        match glb_export_mode {
+            GlbExportMode::Native => {
                 burn_trellis::write_glb_mesh(glb_path, &profiled.mesh)
                     .map_err(|err| err.to_string())?;
-                ovoxel_postprocess_skipped_reason = Some(reason);
-            } else {
+            }
+            GlbExportMode::Ovoxel => {
                 let hook_path = args
                     .hook_output
                     .as_ref()
@@ -355,9 +387,6 @@ fn run() -> Result<(), String> {
                 run_ovoxel_postprocess(&args, hook_path.as_path(), glb_path.as_path())?;
                 ovoxel_postprocess_applied = true;
             }
-        } else {
-            burn_trellis::write_glb_mesh(glb_path, &profiled.mesh)
-                .map_err(|err| err.to_string())?;
         }
     }
 
@@ -441,6 +470,8 @@ fn run() -> Result<(), String> {
                 "tex_steps": args.tex_steps,
             },
             "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
+            "glb_export_mode": glb_export_mode.as_str(),
+            "decode_output_mode": profiled.decode_output_mode.as_str(),
             "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
             "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
             "sparse_source": profiled.sparse_source.as_str(),
@@ -471,6 +502,7 @@ fn run() -> Result<(), String> {
                     "faces": run.mesh.faces.len(),
                     "sparse_source": run.sparse_source.as_str(),
                     "decode_source": run.decode_source.as_str(),
+                    "decode_output_mode": run.decode_output_mode.as_str(),
                     "shapes": shapes_json(run),
                     "timings_ms": timings_json(run),
                 })
@@ -508,6 +540,8 @@ fn run() -> Result<(), String> {
                 "tex_steps": args.tex_steps,
             },
             "ovoxel_postprocess_from_hook": args.ovoxel_postprocess_from_hook,
+            "glb_export_mode": glb_export_mode.as_str(),
+            "decode_output_mode": profiled.decode_output_mode.as_str(),
             "ovoxel_postprocess_applied": ovoxel_postprocess_applied,
             "ovoxel_postprocess_skipped_reason": ovoxel_postprocess_skipped_reason,
             "summary": {
@@ -520,6 +554,7 @@ fn run() -> Result<(), String> {
                 "elapsed_ms": profiled.timings.total_ms,
                 "sparse_source": profiled.sparse_source.as_str(),
                 "decode_source": profiled.decode_source.as_str(),
+                "decode_output_mode": profiled.decode_output_mode.as_str(),
                 "shapes": shapes_json(profiled),
                 "timings_ms": timings_json(profiled),
             },
@@ -547,16 +582,6 @@ fn run() -> Result<(), String> {
     }
     println!("{report}");
     Ok(())
-}
-
-fn ovoxel_skip_reason(source_vertices: usize) -> Option<String> {
-    if source_vertices < OVOXEL_MIN_SOURCE_VERTICES {
-        return Some(format!(
-            "o_voxel postprocess skipped for low-detail runtime mesh (source_vertices={} < {}), because this regime is prone to chair regressions (monochrome PBR + high boundary-hole ratio)",
-            source_vertices, OVOXEL_MIN_SOURCE_VERTICES
-        ));
-    }
-    None
 }
 
 fn run_ovoxel_postprocess(args: &Args, hook_path: &Path, output_glb: &Path) -> Result<(), String> {
@@ -749,11 +774,35 @@ mod tests {
             "0.0",
         ]);
         assert!(args.ovoxel_postprocess_from_hook);
+        assert!(matches!(
+            effective_glb_export_mode(&args),
+            GlbExportMode::Ovoxel
+        ));
         assert_eq!(args.ovoxel_python_bin, "python3");
         assert_eq!(args.ovoxel_decimation_target, 1_000_000);
         assert_eq!(args.ovoxel_texture_size, 4096);
         assert_eq!(args.ovoxel_remesh_band, 1.0);
         assert_eq!(args.ovoxel_remesh_project, 0.0);
+    }
+
+    #[test]
+    fn accepts_explicit_ovoxel_glb_export_mode() {
+        let args = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--output",
+            "out.glb",
+            "--hook-output",
+            "out_hook.safetensors",
+            "--glb-export-mode",
+            "ovxl",
+        ]);
+        assert!(!args.ovoxel_postprocess_from_hook);
+        assert!(matches!(
+            effective_glb_export_mode(&args),
+            GlbExportMode::Ovoxel
+        ));
     }
 
     #[test]
@@ -807,20 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn ovoxel_skip_reason_rejects_low_detail_meshes() {
-        let reason = ovoxel_skip_reason(907_499)
-            .expect("low-detail source mesh should skip o_voxel postprocess");
-        assert!(
-            reason.contains("source_vertices=907499"),
-            "unexpected skip reason: {reason}"
-        );
-    }
-
-    #[test]
-    fn ovoxel_skip_reason_allows_dense_meshes() {
-        assert!(
-            ovoxel_skip_reason(4_497_407).is_none(),
-            "dense source mesh should allow o_voxel postprocess"
-        );
+    fn native_glb_export_is_default() {
+        let args = Args::parse_from(["trellis2_run", "--input", "input.png"]);
+        assert!(matches!(
+            effective_glb_export_mode(&args),
+            GlbExportMode::Native
+        ));
     }
 }

@@ -420,6 +420,7 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 noise_overrides_hook: Some(reference_hook.clone()),
                 max_sparse_coords: None,
                 target_faces: None,
+                decode_output_mode: Default::default(),
                 runtime_stage_debug: false,
                 runtime_attention_debug: false,
                 runtime_decoder_conv_telemetry: false,

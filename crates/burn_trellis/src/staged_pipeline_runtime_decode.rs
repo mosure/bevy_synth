@@ -23,6 +23,7 @@ fn decode_latent_to_outputs(
     parity_strict: bool,
     capture_debug_artifacts: bool,
     decode_overrides: DecodeHookOverrides<'_>,
+    decode_output_mode: TrellisDecodeOutputMode,
     #[cfg(feature = "runtime-model")] runtime_decoders: RuntimeDecodeModels<'_>,
 ) -> Result<DecodedLatentOutput, String> {
     let has_decode_override = decode_overrides.decode_shape_subs.is_some()
@@ -60,6 +61,7 @@ fn decode_latent_to_outputs(
                 target_faces,
                 parity_strict,
                 capture_debug_artifacts,
+                decode_output_mode,
                 shape_decoder,
                 tex_decoder,
                 shape_guide_subdivisions: None,
@@ -81,6 +83,7 @@ fn decode_latent_to_outputs(
             parity_strict,
             capture_debug_artifacts,
             decode_overrides,
+            decode_output_mode,
         );
         Err("burn_trellis: TRELLIS decode requires `runtime-model` feature".to_string())
     }
@@ -259,6 +262,7 @@ struct RuntimeDecodeRequest<'a> {
     target_faces: Option<usize>,
     parity_strict: bool,
     capture_debug_artifacts: bool,
+    decode_output_mode: TrellisDecodeOutputMode,
     shape_decoder: &'a FdgDecoderRuntime,
     tex_decoder: &'a SparseUnetVaeDecoderRuntime,
     shape_guide_subdivisions: Option<&'a [SparseSubdivisionLogits]>,
@@ -276,6 +280,7 @@ fn decode_latent_with_runtime_decoders(
         target_faces,
         parity_strict,
         capture_debug_artifacts,
+        decode_output_mode,
         shape_decoder,
         tex_decoder,
         shape_guide_subdivisions,
@@ -802,31 +807,43 @@ fn decode_latent_with_runtime_decoders(
             ));
         }
     }
-    trellis_stage_log!("burn_trellis: stage decode.pbr begin");
-    let pbr_start = Instant::now();
-    #[cfg(feature = "runtime-model-wgpu")]
-    // Canonical device decode should keep decode/PBR sampling on-device whenever
-    // tensor-native decode inputs are active; CPU PBR sampling remains available
-    // only for explicit host decode mode.
-    let prefer_wgpu_sampling = using_device_decode_inputs;
-    #[cfg(not(feature = "runtime-model-wgpu"))]
-    let prefer_wgpu_sampling = false;
-    let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels_with_options(
-        vertices.as_slice(),
-        faces.as_slice(),
-        coords.as_slice(),
-        voxel_attrs.as_slice(),
-        final_resolution as u32,
-        capture_debug_artifacts,
-        prefer_wgpu_sampling,
-    )
-    .map_err(|err| format!("runtime decode pbr bake failed: {err}"))?;
-    let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
-    trellis_stage_log!("burn_trellis: stage decode.pbr complete ({pbr_ms:.2} ms)");
-    if stage_debug {
-        trellis_stage_log!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
-    }
-    if parity_strict && (pbr_textures.is_none() || uvs.len() != vertices.len()) {
+    let (uvs, pbr_textures, pbr_debug, pbr_ms) = if decode_output_mode.needs_native_pbr() {
+        trellis_stage_log!("burn_trellis: stage decode.pbr begin");
+        let pbr_start = Instant::now();
+        #[cfg(feature = "runtime-model-wgpu")]
+        // Canonical device decode should keep decode/PBR sampling on-device whenever
+        // tensor-native decode inputs are active; CPU PBR sampling remains available
+        // only for explicit host decode mode.
+        let prefer_wgpu_sampling = using_device_decode_inputs;
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        let prefer_wgpu_sampling = false;
+        let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels_with_options(
+            vertices.as_slice(),
+            faces.as_slice(),
+            coords.as_slice(),
+            voxel_attrs.as_slice(),
+            final_resolution as u32,
+            capture_debug_artifacts,
+            prefer_wgpu_sampling,
+        )
+        .map_err(|err| format!("runtime decode pbr bake failed: {err}"))?;
+        let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
+        trellis_stage_log!("burn_trellis: stage decode.pbr complete ({pbr_ms:.2} ms)");
+        if stage_debug {
+            trellis_stage_log!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
+        }
+        (uvs, pbr_textures, pbr_debug, pbr_ms)
+    } else {
+        trellis_stage_log!(
+            "burn_trellis: stage decode.pbr skipped (decode_output_mode={})",
+            decode_output_mode.as_str()
+        );
+        (Vec::new(), None, None, 0.0)
+    };
+    if parity_strict
+        && decode_output_mode.needs_native_pbr()
+        && (pbr_textures.is_none() || uvs.len() != vertices.len())
+    {
         return Err(format!(
             "parity strict mode: runtime decode pbr mismatch (textures_present={} uvs={} vertices={})",
             pbr_textures.is_some(),

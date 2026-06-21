@@ -12,16 +12,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::chunked_blob_safetensors::{
     ChunkedBlobSafetensorsStore, chunked_blob_parts_manifest_exists,
 };
+#[cfg(feature = "runtime-model-wgpu")]
+use super::runtime_config::{
+    clear_runtime_model_sparse_flow_sampler_step,
+    runtime_model_sparse_flow_coord_rope_kernel_enabled,
+    runtime_model_sparse_flow_cross_attention_f16_enabled,
+    runtime_model_sparse_flow_linear_f16_enabled,
+    runtime_model_sparse_flow_module_attention_enabled,
+    runtime_model_sparse_flow_self_attention_f16_enabled,
+    runtime_model_sparse_flow_torso_f16_enabled, set_runtime_model_sparse_flow_sampler_step,
+};
 use super::runtime_config::{
     runtime_model_attention_debug_enabled, runtime_model_sparse_flow_module_attention_f16_enabled,
     runtime_model_stage_debug_enabled,
-};
-#[cfg(feature = "runtime-model-wgpu")]
-use super::runtime_config::{
-    runtime_model_sparse_flow_coord_rope_kernel_enabled,
-    runtime_model_sparse_flow_linear_f16_enabled,
-    runtime_model_sparse_flow_module_attention_enabled,
-    runtime_model_sparse_flow_torso_f16_enabled,
 };
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
@@ -1279,8 +1282,7 @@ pub fn sparse_flow_op_telemetry() -> SparseFlowOpTelemetry {
         self_qkv_ns: FLOW_SELF_QKV_NS.load(Ordering::Relaxed),
         self_norm_rope_calls: FLOW_SELF_NORM_ROPE_CALLS.load(Ordering::Relaxed),
         self_norm_rope_ns: FLOW_SELF_NORM_ROPE_NS.load(Ordering::Relaxed),
-        self_norm_rope_fused_qk_calls: FLOW_SELF_NORM_ROPE_FUSED_QK_CALLS
-            .load(Ordering::Relaxed),
+        self_norm_rope_fused_qk_calls: FLOW_SELF_NORM_ROPE_FUSED_QK_CALLS.load(Ordering::Relaxed),
         self_norm_rope_fused_qkv_module_calls: FLOW_SELF_NORM_ROPE_FUSED_QKV_MODULE_CALLS
             .load(Ordering::Relaxed),
         self_kernel_calls: FLOW_SELF_KERNEL_CALLS.load(Ordering::Relaxed),
@@ -1436,6 +1438,18 @@ enum SparseFlowOpDetailKind {
 
 fn runtime_sample_progress_interval(steps: usize) -> usize {
     if steps <= 16 { 1 } else { (steps / 8).max(1) }
+}
+
+fn set_sparse_flow_sampler_step_for_attention(step_idx: usize, step_count: usize) {
+    #[cfg(feature = "runtime-model-wgpu")]
+    set_runtime_model_sparse_flow_sampler_step(step_idx, step_count);
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    let _ = (step_idx, step_count);
+}
+
+fn clear_sparse_flow_sampler_step_for_attention() {
+    #[cfg(feature = "runtime-model-wgpu")]
+    clear_runtime_model_sparse_flow_sampler_step();
 }
 
 #[derive(Clone, Debug)]
@@ -2482,6 +2496,7 @@ where
         let qkv = linear_forward_attention(&self.to_qkv, x, self.attention_projection_f16)
             .reshape([batch, tokens, 3, self.num_heads, self.head_dim]);
         record_sparse_flow_detail(SparseFlowOpDetailKind::SelfQkv, elapsed_ns(qkv_start));
+
         let v = qkv
             .clone()
             .slice([
@@ -2687,7 +2702,7 @@ where
         }
 
         let module_attention_dtype = if module_kernel {
-            Some(sparse_flow_module_attention_dtype_for_shape(
+            Some(sparse_flow_self_module_attention_dtype_for_shape(
                 batch,
                 self.num_heads,
                 tokens,
@@ -3090,7 +3105,7 @@ where
             } else {
                 Tensor::cat(v_chunks.clone(), 2)
             };
-            let attention_dtype = sparse_flow_module_attention_dtype_for_shape(
+            let attention_dtype = sparse_flow_self_module_attention_dtype_for_shape(
                 batch,
                 self.num_heads,
                 tokens,
@@ -3382,7 +3397,7 @@ where
             k
         };
         let (module_k, module_v, module_dtype) = if attention_uses_module_kernel::<B>() {
-            let dtype = sparse_flow_module_attention_dtype_for_shape(
+            let dtype = sparse_flow_cross_module_attention_dtype_for_shape(
                 batch,
                 self.num_heads,
                 ctx_tokens,
@@ -3510,7 +3525,7 @@ where
 
         let kv_layout_start = Instant::now();
         let attention_dtype = kv.module_dtype.unwrap_or_else(|| {
-            sparse_flow_module_attention_dtype_for_shape(
+            sparse_flow_cross_module_attention_dtype_for_shape(
                 batch,
                 self.num_heads,
                 ctx_tokens,
@@ -4493,6 +4508,16 @@ where
         let mut step_0_x_t: Option<Tensor<B, 5>> = None;
         let mut step_mid_x_t: Option<Tensor<B, 5>> = None;
         let mut step_last_x_t: Option<Tensor<B, 5>> = None;
+        let mut step_pred_v = if capture_snapshots {
+            Vec::with_capacity(sample_cfg.steps)
+        } else {
+            Vec::new()
+        };
+        let mut step_x_t = if capture_snapshots {
+            Vec::with_capacity(sample_cfg.steps)
+        } else {
+            Vec::new()
+        };
         let mid_step = mid_snapshot_step(sample_cfg.steps);
         let t_pairs = timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
         let sample_start = Instant::now();
@@ -4515,8 +4540,9 @@ where
         );
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
             let step_start = Instant::now();
-            let pred = if capture_snapshots && step_idx == 0 {
-                let parts = self.predict_with_cfg_tensor_parts_with_cache(
+            set_sparse_flow_sampler_step_for_attention(step_idx, sample_cfg.steps);
+            let pred_result = if capture_snapshots && step_idx == 0 {
+                let parts = match self.predict_with_cfg_tensor_parts_with_cache(
                     x_t.clone(),
                     t,
                     sample_cfg,
@@ -4526,11 +4552,17 @@ where
                     concat_tensor.clone(),
                     cond_cache.as_ref(),
                     neg_cache.as_ref(),
-                )?;
+                ) {
+                    Ok(parts) => parts,
+                    Err(err) => {
+                        clear_sparse_flow_sampler_step_for_attention();
+                        return Err(err);
+                    }
+                };
                 step_0_pred_v = Some(parts.guided.clone());
                 step_0_pred_v_pos = parts.pos;
                 step_0_pred_v_neg = parts.neg;
-                parts.guided
+                Ok(parts.guided)
             } else {
                 self.predict_with_cfg_tensor_with_cache(
                     x_t.clone(),
@@ -4542,10 +4574,23 @@ where
                     concat_tensor.clone(),
                     cond_cache.as_ref(),
                     neg_cache.as_ref(),
-                )?
+                )
             };
+            let pred = match pred_result {
+                Ok(pred) => pred,
+                Err(err) => {
+                    clear_sparse_flow_sampler_step_for_attention();
+                    return Err(err);
+                }
+            };
+            if capture_snapshots {
+                step_pred_v.push(pred.clone());
+            }
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
+            if capture_snapshots {
+                step_x_t.push(x_t.clone());
+            }
             if capture_snapshots && step_idx == 0 {
                 step_0_x_t = Some(x_t.clone());
             }
@@ -4565,6 +4610,7 @@ where
                 );
             }
         }
+        clear_sparse_flow_sampler_step_for_attention();
         eprintln!(
             "burn_trellis: {stage_label} complete ({:.2} ms)",
             sample_start.elapsed().as_secs_f64() * 1000.0
@@ -4579,6 +4625,8 @@ where
             step_0_x_t,
             step_mid_x_t,
             step_last_x_t,
+            step_pred_v,
+            step_x_t,
         ) = if capture_snapshots {
             let samples_t = x_t;
             let step_0_pred_v_t = step_0_pred_v
@@ -4599,18 +4647,24 @@ where
             let step_last_t = step_last_x_t
                 .unwrap_or_else(|| samples_t.clone())
                 .reshape([state_len]);
-            let merged = Tensor::cat(
-                vec![
-                    samples_t.reshape([state_len]),
-                    step_0_pred_v_t,
-                    step_0_pred_v_pos_t,
-                    step_0_pred_v_neg_t,
-                    step_0_t,
-                    step_mid_t,
-                    step_last_t,
-                ],
-                0,
-            );
+            let mut tensors = vec![
+                samples_t.reshape([state_len]),
+                step_0_pred_v_t,
+                step_0_pred_v_pos_t,
+                step_0_pred_v_neg_t,
+                step_0_t,
+                step_mid_t,
+                step_last_t,
+            ];
+            let step_pred_v_count = step_pred_v.len();
+            for tensor in step_pred_v {
+                tensors.push(tensor.reshape([state_len]));
+            }
+            let step_x_t_count = step_x_t.len();
+            for tensor in step_x_t {
+                tensors.push(tensor.reshape([state_len]));
+            }
+            let merged = Tensor::cat(tensors, 0);
             let merged = tensor_to_vec_1d(merged, "failed to read sparse trace tensor")?;
             let segment = state_len;
             let samples = merged[..segment].to_vec();
@@ -4620,6 +4674,17 @@ where
             let step_0_x_t = merged[segment * 4..segment * 5].to_vec();
             let step_mid_x_t = merged[segment * 5..segment * 6].to_vec();
             let step_last_x_t = merged[segment * 6..segment * 7].to_vec();
+            let mut cursor = segment * 7;
+            let mut step_pred_v_values = Vec::with_capacity(step_pred_v_count);
+            for _ in 0..step_pred_v_count {
+                step_pred_v_values.push(merged[cursor..cursor + segment].to_vec());
+                cursor += segment;
+            }
+            let mut step_x_t_values = Vec::with_capacity(step_x_t_count);
+            for _ in 0..step_x_t_count {
+                step_x_t_values.push(merged[cursor..cursor + segment].to_vec());
+                cursor += segment;
+            }
             (
                 samples,
                 step_0_pred_v,
@@ -4628,6 +4693,8 @@ where
                 step_0_x_t,
                 step_mid_x_t,
                 step_last_x_t,
+                step_pred_v_values,
+                step_x_t_values,
             )
         } else {
             let samples = tensor_to_vec(x_t)?;
@@ -4639,6 +4706,8 @@ where
                 samples.clone(),
                 samples.clone(),
                 samples,
+                Vec::new(),
+                Vec::new(),
             )
         };
 
@@ -4650,6 +4719,8 @@ where
             step_0_x_t,
             step_mid_x_t,
             step_last_x_t,
+            step_pred_v,
+            step_x_t,
             samples,
         })
     }
@@ -4737,7 +4808,8 @@ where
         );
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
             let step_start = Instant::now();
-            let pred = self.predict_with_cfg_tensor_with_cache(
+            set_sparse_flow_sampler_step_for_attention(step_idx, sample_cfg.steps);
+            let pred = match self.predict_with_cfg_tensor_with_cache(
                 x_t.clone(),
                 t,
                 sample_cfg,
@@ -4747,7 +4819,13 @@ where
                 concat_tensor.clone(),
                 cond_cache.as_ref(),
                 neg_cache.as_ref(),
-            )?;
+            ) {
+                Ok(pred) => pred,
+                Err(err) => {
+                    clear_sparse_flow_sampler_step_for_attention();
+                    return Err(err);
+                }
+            };
             let dt = t - t_prev;
             x_t = x_t.sub(pred.mul_scalar(dt));
             let step_done = step_idx + 1;
@@ -4760,6 +4838,7 @@ where
                 );
             }
         }
+        clear_sparse_flow_sampler_step_for_attention();
         eprintln!(
             "burn_trellis: {stage_label} complete ({:.2} ms)",
             sample_start.elapsed().as_secs_f64() * 1000.0
@@ -5025,7 +5104,8 @@ where
             let mut step_last_rows: Option<Tensor<B, 3>> = None;
             for (step_idx, (t, t_prev)) in t_pairs.iter().copied().enumerate() {
                 let step_start = Instant::now();
-                let cfg_pred = self.predict_with_cfg_sparse_tensor_parts_with_cache(
+                set_sparse_flow_sampler_step_for_attention(step_idx, sample_cfg.steps);
+                let cfg_pred = match self.predict_with_cfg_sparse_tensor_parts_with_cache(
                     x_t.clone(),
                     t,
                     sample_cfg,
@@ -5038,7 +5118,13 @@ where
                     cond_cache.as_ref(),
                     neg_cache.as_ref(),
                     batched_cfg_cache.as_ref(),
-                )?;
+                ) {
+                    Ok(pred) => pred,
+                    Err(err) => {
+                        clear_sparse_flow_sampler_step_for_attention();
+                        return Err(err);
+                    }
+                };
                 let pred = cfg_pred.guided;
                 let dt = t - t_prev;
                 if capture_snapshots && step_idx == 0 {
@@ -5068,6 +5154,7 @@ where
                     );
                 }
             }
+            clear_sparse_flow_sampler_step_for_attention();
 
             let to_rows_1d = |tensor: Tensor<B, 3>| -> Tensor<B, 1> {
                 if used_channels == state_channels {
@@ -6999,6 +7086,28 @@ fn sparse_flow_wgpu_module_attention_f16_enabled() -> bool {
     runtime_model_sparse_flow_module_attention_f16_enabled()
 }
 
+fn sparse_flow_wgpu_self_attention_f16_enabled() -> bool {
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        runtime_model_sparse_flow_self_attention_f16_enabled()
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        runtime_model_sparse_flow_module_attention_f16_enabled()
+    }
+}
+
+fn sparse_flow_wgpu_cross_attention_f16_enabled() -> bool {
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        runtime_model_sparse_flow_cross_attention_f16_enabled()
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        runtime_model_sparse_flow_module_attention_f16_enabled()
+    }
+}
+
 #[cfg(feature = "runtime-model-wgpu")]
 fn sparse_flow_wgpu_linear_f16_enabled() -> bool {
     runtime_model_sparse_flow_linear_f16_enabled()
@@ -7500,11 +7609,17 @@ fn linear_forward_stable_2d_reference_impl<B: Backend>(
         );
     }
 
+    let matmul_dtype = if matches!(x_dtype, burn::tensor::FloatDType::BF16) {
+        burn::tensor::FloatDType::F32
+    } else {
+        x_dtype
+    };
+    let x = tensor_cast_float_2d_if_needed(x, matmul_dtype);
     let weight_dtype: burn::tensor::FloatDType = weight.dtype().into();
     // Keep linear operands in a single dtype to avoid mixed-dtype WGPU matmul
     // collapse on bf16 checkpoint weights (observed near-zero outputs in sparse flow).
-    let weight = if weight_dtype != x_dtype {
-        weight.cast(x_dtype)
+    let weight = if weight_dtype != matmul_dtype {
+        weight.cast(matmul_dtype)
     } else {
         weight
     };
@@ -7519,14 +7634,19 @@ fn linear_forward_stable_2d_reference_impl<B: Backend>(
         };
         output = output.add(bias.unsqueeze::<2>());
     }
-    output
+    tensor_cast_float_2d_if_needed(output, x_dtype)
 }
 
 fn sparse_flow_torso_dtype_for_backend<B: Backend>() -> Option<burn::tensor::FloatDType> {
-    if attention_uses_non_fusion_module_kernel::<B>()
-        && runtime_model_sparse_flow_torso_f16_enabled()
     {
-        return Some(burn::tensor::FloatDType::F16);
+        #[cfg(feature = "runtime-model-wgpu")]
+        {
+            if attention_uses_non_fusion_module_kernel::<B>()
+                && runtime_model_sparse_flow_torso_f16_enabled()
+            {
+                return Some(burn::tensor::FloatDType::F16);
+            }
+        }
     }
     None
 }
@@ -8229,8 +8349,7 @@ fn sparse_flow_module_attention_direct_impl<B: Backend>(
     }
     let query_multiple = sparse_flow_module_attention_query_multiple();
     let padded_query_tokens = query_tokens.div_ceil(query_multiple) * query_multiple;
-    let attention_dtype =
-        sparse_flow_module_attention_dtype_for_shape(batch, heads, key_tokens, head_dim);
+    let attention_dtype: burn::tensor::FloatDType = q.dtype().into();
     let force_fallback =
         sparse_flow_module_attention_long_k_requires_fallback(batch, heads, key_tokens, head_dim);
     let cast_pad_start = Instant::now();
@@ -8400,7 +8519,7 @@ fn sparse_flow_module_attention_cross_shape_requires_stream(
     head_dim == 128
         && query_tokens > key_tokens
         && key_tokens <= 8_192
-        && sparse_flow_module_attention_dtype_for_shape(batch, heads, key_tokens, head_dim)
+        && sparse_flow_cross_module_attention_dtype_for_shape(batch, heads, key_tokens, head_dim)
             != burn::tensor::FloatDType::F16
 }
 
@@ -8410,18 +8529,65 @@ fn force_contiguous_4d<B: Backend>(tensor: Tensor<B, 4>) -> Tensor<B, 4> {
     tensor.reshape([elements]).reshape(dims)
 }
 
+#[cfg(test)]
 fn sparse_flow_module_attention_dtype_for_shape(
     batch: usize,
     heads: usize,
     key_tokens: usize,
     head_dim: usize,
 ) -> burn::tensor::FloatDType {
+    sparse_flow_module_attention_dtype_for_shape_with_policy(
+        batch,
+        heads,
+        key_tokens,
+        head_dim,
+        sparse_flow_wgpu_module_attention_f16_enabled(),
+    )
+}
+
+fn sparse_flow_self_module_attention_dtype_for_shape(
+    batch: usize,
+    heads: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> burn::tensor::FloatDType {
+    sparse_flow_module_attention_dtype_for_shape_with_policy(
+        batch,
+        heads,
+        key_tokens,
+        head_dim,
+        sparse_flow_wgpu_self_attention_f16_enabled(),
+    )
+}
+
+fn sparse_flow_cross_module_attention_dtype_for_shape(
+    batch: usize,
+    heads: usize,
+    key_tokens: usize,
+    head_dim: usize,
+) -> burn::tensor::FloatDType {
+    sparse_flow_module_attention_dtype_for_shape_with_policy(
+        batch,
+        heads,
+        key_tokens,
+        head_dim,
+        sparse_flow_wgpu_cross_attention_f16_enabled(),
+    )
+}
+
+fn sparse_flow_module_attention_dtype_for_shape_with_policy(
+    batch: usize,
+    heads: usize,
+    key_tokens: usize,
+    head_dim: usize,
+    f16_enabled: bool,
+) -> burn::tensor::FloatDType {
     let verified_long_k_f16_shape = (head_dim == 128 || head_dim == 64)
         && key_tokens > SPARSE_FLOW_MODULE_ATTENTION_LONG_K_FALLBACK_SEQ_KV
         && !sparse_flow_module_attention_long_k_requires_fallback(
             batch, heads, key_tokens, head_dim,
         );
-    if sparse_flow_wgpu_module_attention_f16_enabled()
+    if f16_enabled
         && (key_tokens <= SPARSE_FLOW_MODULE_ATTENTION_F16_MAX_KEY_TOKENS
             || verified_long_k_f16_shape)
         && !sparse_flow_module_attention_long_k_requires_fallback(
@@ -8611,16 +8777,24 @@ where
         token_start.saturating_add(tokens) <= coord_rows,
         "sparse flow rope token range out of bounds"
     );
-    let coord_slice = coords.slice([token_start..token_start + tokens, 0..3]);
-    maybe_qkv_module_multihead_rms_norm_rope_coords_from_qkv_wgpu(
-        qkv,
-        q_norm.gamma.val(),
-        k_norm.gamma.val(),
-        coord_slice,
-        rope_freq,
-        q_norm.scale,
-        RMS_NORM_EPS,
-    )
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        let coord_slice = coords.slice([token_start..token_start + tokens, 0..3]);
+        maybe_qkv_module_multihead_rms_norm_rope_coords_from_qkv_wgpu(
+            qkv,
+            q_norm.gamma.val(),
+            k_norm.gamma.val(),
+            coord_slice,
+            rope_freq,
+            q_norm.scale,
+            RMS_NORM_EPS,
+        )
+    }
+    #[cfg(not(feature = "runtime-model-wgpu"))]
+    {
+        let _ = (qkv, q_norm, k_norm, coords, rope_freq, token_start);
+        None
+    }
 }
 
 fn apply_rms_norm_and_rope_single<B: Backend>(
@@ -9118,14 +9292,14 @@ mod tests {
         BinaryBlob, BlobMetadata, CpuRuntimeBackend, SelfAttention, SparseFlowCondition,
         SparseRuntimeTensorAccess, SparseStructureFlowConfig, SparseStructureFlowModel,
         SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl, SparseTensorOwned,
-        VarLenTensorOwned, apply_rope_single, force_contiguous_4d, host_transfer_stats,
-        layer_norm_affine_stable, layer_norm_no_affine, linear_forward_attention,
-        linear_forward_stable_2d, linear_forward_token_chunked_reference, metadata_path,
-        reset_host_transfer_stats, reset_sparse_flow_op_telemetry, resolve_model_weight_candidates,
-        dense_grid_token_coords, scaled_dot_product_attention, scaled_dot_product_attention_dense,
-        scaled_dot_product_attention_stream, silu, sparse_flow_attention_logits_within_budget,
-        sparse_flow_linear_chunk_tokens_for_backend, sparse_flow_module_attention_chunk_cap,
-        sparse_flow_module_attention_chunk_cap_for_shape,
+        VarLenTensorOwned, apply_rope_single, dense_grid_token_coords, force_contiguous_4d,
+        host_transfer_stats, layer_norm_affine_stable, layer_norm_no_affine,
+        linear_forward_attention, linear_forward_stable_2d, linear_forward_token_chunked_reference,
+        metadata_path, reset_host_transfer_stats, reset_sparse_flow_op_telemetry,
+        resolve_model_weight_candidates, scaled_dot_product_attention,
+        scaled_dot_product_attention_dense, scaled_dot_product_attention_stream, silu,
+        sparse_flow_attention_logits_within_budget, sparse_flow_linear_chunk_tokens_for_backend,
+        sparse_flow_module_attention_chunk_cap, sparse_flow_module_attention_chunk_cap_for_shape,
         sparse_flow_module_attention_cross_shape_requires_stream,
         sparse_flow_module_attention_dtype_for_shape,
         sparse_flow_module_attention_long_k_requires_fallback,
@@ -10252,6 +10426,10 @@ mod tests {
         assert_eq!(
             super::sparse_flow_linear_chunk_tokens_for_backend::<super::WgpuRuntimeBackend>(32_768,),
             32_768
+        );
+        assert_eq!(
+            super::sparse_flow_torso_dtype_for_backend::<super::WgpuRuntimeBackend>(),
+            None
         );
         set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
     }

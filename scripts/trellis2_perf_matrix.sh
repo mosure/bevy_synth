@@ -19,6 +19,24 @@ python_bin="${TRELLIS2_PYTHON_BIN:-${HOME}/.venvs/torch/bin/python3}"
 timeout_s="${TRELLIS2_TIMEOUT_S:-3600}"
 gpu_sample_ms="${TRELLIS2_GPU_SAMPLE_MS:-1000}"
 ratio_limit="${TRELLIS2_RATIO_LIMIT:-2.0}"
+render_psnr="${TRELLIS2_RENDER_PSNR:-0}"
+output_glb="${TRELLIS2_OUTPUT_GLB:-${render_psnr}}"
+burn_glb_export_mode="${TRELLIS2_GLB_EXPORT_MODE:-native}"
+render_burn_mode="${TRELLIS2_RENDER_BURN_MODE:-runtime}"
+render_psnr_resolution="${TRELLIS2_RENDER_PSNR_RESOLUTION:-512}"
+render_fail_min_psnr="${TRELLIS2_RENDER_FAIL_MIN_PSNR:-28}"
+render_fail_min_mask_iou="${TRELLIS2_RENDER_FAIL_MIN_MASK_IOU:-}"
+decimation_target="${TRELLIS2_DECIMATION_TARGET:-1000000}"
+texture_size="${TRELLIS2_TEXTURE_SIZE:-1024}"
+python_glb="${TRELLIS2_PYTHON_GLB:-${run_dir}/python/reference.glb}"
+python_summary_path="${TRELLIS2_PYTHON_SUMMARY:-}"
+burn_glb="${TRELLIS2_BURN_GLB:-${run_dir}/burn/burn.glb}"
+render_burn_hook="${TRELLIS2_RENDER_BURN_HOOK:-${run_dir}/burn_render/hook.safetensors}"
+render_burn_glb="${TRELLIS2_RENDER_BURN_GLB:-${run_dir}/burn_render/burn_ovoxel.glb}"
+render_actual_glb="${burn_glb}"
+if [[ "${render_burn_mode}" == "ovoxel-hook" ]]; then
+  render_actual_glb="${render_burn_glb}"
+fi
 
 case "${quality}" in
   low)
@@ -52,12 +70,27 @@ cat > "${run_dir}/config.json" <<JSON
   "ratio_limit": ${ratio_limit},
   "capture_reference_hook": ${capture_reference_hook},
   "capture_row_noise": ${capture_row_noise},
-  "reference_hook": "${reference_hook}"
+  "reference_hook": "${reference_hook}",
+  "output_glb": ${output_glb},
+  "burn_glb_export_mode": "${burn_glb_export_mode}",
+  "render_psnr": ${render_psnr},
+  "render_burn_mode": "${render_burn_mode}",
+  "render_psnr_resolution": ${render_psnr_resolution},
+  "render_fail_min_psnr": "${render_fail_min_psnr}",
+  "render_fail_min_mask_iou": "${render_fail_min_mask_iou}",
+  "decimation_target": ${decimation_target},
+  "texture_size": ${texture_size},
+  "python_glb": "${python_glb}",
+  "python_summary": "${python_summary_path}",
+  "burn_glb": "${burn_glb}",
+  "render_burn_hook": "${render_burn_hook}",
+  "render_burn_glb": "${render_burn_glb}",
+  "render_actual_glb": "${render_actual_glb}"
 }
 JSON
 
 gpu_monitor_pid=""
-if [[ "${run_python}" != "1" && "${run_burn}" != "1" ]]; then
+if [[ "${run_python}" != "1" && "${run_burn}" != "1" && "${render_psnr}" != "1" ]]; then
   :
 elif command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=timestamp,index,name,driver_version,memory.used,memory.total,utilization.gpu,utilization.memory --format=csv > "${run_dir}/gpu_info.csv" || true
@@ -93,8 +126,8 @@ if [[ "${run_python}" == "1" ]]; then
       --pipeline-type "${pipeline_type}" \
       --max-num-tokens "${max_num_tokens}" \
       --seed "${seed}" \
-      --texture-size 1024 \
-      --decimation-target 1000000 \
+      --texture-size "${texture_size}" \
+      --decimation-target "${decimation_target}" \
       "${reference_hook_args[@]}" \
       > "${run_dir}/python/reference_stdout.log" \
       2> "${run_dir}/python/reference_stderr.log"
@@ -109,15 +142,22 @@ if [[ "${run_python}" == "1" ]]; then
     fi
   fi
   set +e
-  timeout "${timeout_s}s" "${python_bin}" scripts/trellis2_python_reference.py \
+  python_args=(
+    scripts/trellis2_python_reference.py \
     --input "${input}" \
     --artifacts-dir "${run_dir}/python/artifacts" \
     --pipeline-type "${pipeline_type}" \
     --max-num-tokens "${max_num_tokens}" \
     --seed "${seed}" \
-    --texture-size 1024 \
-    --decimation-target 1000000 \
-    --skip-hook-capture \
+    --texture-size "${texture_size}" \
+    --decimation-target "${decimation_target}" \
+    --skip-hook-capture
+  )
+  if [[ "${output_glb}" == "1" ]]; then
+    python_args+=(--output-glb "${python_glb}")
+  fi
+  timeout "${timeout_s}s" "${python_bin}" \
+    "${python_args[@]}" \
     > "${run_dir}/python/stdout.log" \
     2> "${run_dir}/python/stderr.log"
   status="$?"
@@ -149,6 +189,20 @@ if [[ "${run_burn}" == "1" ]]; then
   if [[ -n "${reference_hook}" ]]; then
     burn_args+=(--noise-overrides-hook "${reference_hook}")
   fi
+  if [[ "${output_glb}" == "1" ]]; then
+    burn_args+=(--output "${burn_glb}")
+    burn_args+=(--glb-export-mode "${burn_glb_export_mode}")
+    case "${burn_glb_export_mode}" in
+      ovoxel | ovxl | ovoxel-hook)
+        burn_args+=(
+          --hook-output "${run_dir}/burn/hook.safetensors"
+          --ovoxel-python-bin "${python_bin}"
+          --ovoxel-decimation-target "${decimation_target}"
+          --ovoxel-texture-size "${texture_size}"
+        )
+        ;;
+    esac
+  fi
   set +e
   timeout "${timeout_s}s" target/release/trellis2_run "${burn_args[@]}" \
     > "${run_dir}/burn/stdout.log" \
@@ -158,6 +212,80 @@ if [[ "${run_burn}" == "1" ]]; then
   printf '%s\n' "${status}" > "${run_dir}/burn/status.txt"
   if [[ "${status}" != "0" ]]; then
     echo "Burn run failed; see ${run_dir}/burn/stderr.log" >&2
+    if [[ "${strict}" == "1" ]]; then
+      exit "${status}"
+    fi
+  fi
+fi
+
+if [[ "${render_psnr}" == "1" && "${render_burn_mode}" == "ovoxel-hook" ]]; then
+  mkdir -p "${run_dir}/burn_render"
+  if [[ "${run_burn}" != "1" ]]; then
+    cargo build --release -p burn_trellis --features runtime-model-wgpu --bin trellis2_run \
+      > "${run_dir}/burn_render/build.log" \
+      2> "${run_dir}/burn_render/build.err"
+  fi
+  render_burn_args=(
+    --input "${input}" \
+    --backend "${backend}" \
+    --quality "${quality}" \
+    --compute-profile "${compute_profile}" \
+    --seed "${seed}" \
+    --repeat 1 \
+    --require-runtime-model \
+    --report-json "${run_dir}/burn_render/report.json" \
+    --hook-output "${render_burn_hook}" \
+    --output "${render_burn_glb}" \
+    --glb-export-mode ovxl \
+    --ovoxel-python-bin "${python_bin}" \
+    --ovoxel-decimation-target "${decimation_target}" \
+    --ovoxel-texture-size "${texture_size}"
+  )
+  if [[ -n "${reference_hook}" ]]; then
+    render_burn_args+=(--noise-overrides-hook "${reference_hook}")
+  fi
+  set +e
+  timeout "${timeout_s}s" target/release/trellis2_run "${render_burn_args[@]}" \
+    > "${run_dir}/burn_render/stdout.log" \
+    2> "${run_dir}/burn_render/stderr.log"
+  status="$?"
+  set -e
+  printf '%s\n' "${status}" > "${run_dir}/burn_render/status.txt"
+  if [[ "${status}" != "0" ]]; then
+    echo "Burn render-validation run failed; see ${run_dir}/burn_render/stderr.log" >&2
+    if [[ "${strict}" == "1" ]]; then
+      exit "${status}"
+    fi
+  fi
+elif [[ "${render_psnr}" == "1" && "${render_burn_mode}" != "runtime" ]]; then
+  echo "unsupported TRELLIS2_RENDER_BURN_MODE='${render_burn_mode}'" >&2
+  exit 2
+fi
+
+if [[ "${render_psnr}" == "1" ]]; then
+  mkdir -p "${run_dir}/render_psnr"
+  render_args=(
+    scripts/trellis2_render_psnr.py \
+    --reference "${python_glb}" \
+    --actual "${render_actual_glb}" \
+    --out-dir "${run_dir}/render_psnr" \
+    --resolution "${render_psnr_resolution}"
+  )
+  if [[ -n "${render_fail_min_psnr}" ]]; then
+    render_args+=(--fail-min-psnr "${render_fail_min_psnr}")
+  fi
+  if [[ -n "${render_fail_min_mask_iou}" ]]; then
+    render_args+=(--fail-min-mask-iou "${render_fail_min_mask_iou}")
+  fi
+  set +e
+  timeout "${timeout_s}s" "${python_bin}" "${render_args[@]}" \
+    > "${run_dir}/render_psnr/stdout.log" \
+    2> "${run_dir}/render_psnr/stderr.log"
+  status="$?"
+  set -e
+  printf '%s\n' "${status}" > "${run_dir}/render_psnr/status.txt"
+  if [[ "${status}" != "0" ]]; then
+    echo "Render PSNR failed; see ${run_dir}/render_psnr/stderr.log" >&2
     if [[ "${strict}" == "1" ]]; then
       exit "${status}"
     fi
@@ -228,16 +356,29 @@ def max_gpu_sample(path: Path) -> dict[str, Any]:
     return {"available": True, "samples": rows, "max_gpu_util_percent": max_util, "max_memory_mib": max_mem}
 
 config = load_json(run_dir / "config.json") or {}
+py_summary_path = Path(str(config.get("python_summary") or ""))
 py_summary = load_json(run_dir / "python/artifacts/python_reference_summary.json")
+if py_summary is None and str(py_summary_path):
+    py_summary = load_json(py_summary_path)
 burn_report = load_json(run_dir / "burn/report.json")
+render_burn_report = load_json(run_dir / "burn_render/report.json")
+render_summary = load_json(run_dir / "render_psnr/render_psnr.json")
 py_status = load_status(run_dir / "python/status.txt")
 burn_status = load_status(run_dir / "burn/status.txt")
+render_burn_status = load_status(run_dir / "burn_render/status.txt")
+render_status = load_status(run_dir / "render_psnr/status.txt")
 
 issues: list[str] = []
 if py_status not in (None, 0):
     issues.append(f"python_status={py_status}")
 if burn_status not in (None, 0):
     issues.append(f"burn_status={burn_status}")
+if render_burn_status not in (None, 0):
+    issues.append(f"burn_render_status={render_burn_status}")
+if render_status not in (None, 0):
+    issues.append(f"render_psnr_status={render_status}")
+if config.get("render_psnr") == 1 and render_summary is None:
+    issues.append("render_psnr missing")
 
 shape_checks: dict[str, dict[str, Any]] = {}
 if py_summary is not None and burn_report is not None:
@@ -277,6 +418,13 @@ if py_summary is not None and burn_report is not None:
     burn_timings = burn_report.get("timings_ms", {})
     if "last" in burn_report:
         burn_timings = get_path(burn_report, "last", "timings_ms") or burn_timings
+    burn_decode_ms = ms(burn_timings.get("decode"))
+    burn_decode_pbr_ms = ms(burn_timings.get("decode_pbr")) or 0.0
+    burn_decode_latent_ms = (
+        None
+        if burn_decode_ms is None
+        else max(0.0, burn_decode_ms - burn_decode_pbr_ms)
+    )
     comparisons = {
         "preprocess": (ms(burn_timings.get("preprocess")), py_stage.get("preprocess")),
         "conditioning": (
@@ -294,7 +442,9 @@ if py_summary is not None and burn_report is not None:
         "tex_slat": (ms(burn_timings.get("tex_slat")), py_stage.get("tex_slat")),
         "decode_shape": (ms(burn_timings.get("decode_shape_decoder")), py_stage.get("decode_shape")),
         "decode_tex": (ms(burn_timings.get("decode_tex_decoder")), py_stage.get("decode_tex")),
-        "decode_total": (ms(burn_timings.get("decode")), py_stage.get("decode_latent_total")),
+        "decode_latent_total": (burn_decode_latent_ms, py_stage.get("decode_latent_total")),
+        "decode_native_pbr": (ms(burn_timings.get("decode_pbr")), None),
+        "decode_runtime_total": (burn_decode_ms, None),
         "total": (ms(burn_timings.get("total")), get_path(py_summary, "timing_seconds", "infer")),
     }
     for name, (burn_ms, python_s) in comparisons.items():
@@ -313,12 +463,17 @@ summary = {
     "config": config,
     "python_status": py_status,
     "burn_status": burn_status,
+    "burn_render_status": render_burn_status,
+    "render_psnr_status": render_status,
     "shape_checks": shape_checks,
     "stage_ratios": stage_ratios,
+    "render_psnr": render_summary,
     "gpu": max_gpu_sample(run_dir / "gpu_samples.csv"),
     "issues": issues,
-    "python_summary": str(run_dir / "python/artifacts/python_reference_summary.json") if py_summary else None,
+    "python_summary": str(py_summary_path if str(py_summary_path) else run_dir / "python/artifacts/python_reference_summary.json") if py_summary else None,
     "burn_report": str(run_dir / "burn/report.json") if burn_report else None,
+    "burn_render_report": str(run_dir / "burn_render/report.json") if render_burn_report else None,
+    "render_psnr_report": str(run_dir / "render_psnr/render_psnr.json") if render_summary else None,
 }
 (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -343,6 +498,13 @@ for name, row in stage_ratios.items():
 lines.append("")
 lines.append("## GPU")
 lines.append(f"- {summary['gpu']}")
+if render_summary is not None:
+    render = render_summary.get("summary", {})
+    lines.append("")
+    lines.append("## Render PSNR")
+    lines.append(
+        f"- min_psnr_rgb={render.get('min_psnr_rgb')} mean_psnr_rgb={render.get('mean_psnr_rgb')} min_mask_iou={render.get('min_mask_iou')}"
+    )
 if issues:
     lines.append("")
     lines.append("## Issues")

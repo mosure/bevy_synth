@@ -24,6 +24,8 @@ pub struct FlowEulerSampleTrace {
     pub step_0_x_t: Vec<f32>,
     pub step_mid_x_t: Vec<f32>,
     pub step_last_x_t: Vec<f32>,
+    pub step_pred_v: Vec<Vec<f32>>,
+    pub step_x_t: Vec<Vec<f32>>,
 }
 
 impl FlowEulerGuidanceIntervalSampler {
@@ -82,6 +84,16 @@ impl FlowEulerGuidanceIntervalSampler {
         let mut step_0_x_t: Option<Vec<f32>> = None;
         let mut step_mid_x_t: Option<Vec<f32>> = None;
         let mut step_last_x_t: Option<Vec<f32>> = None;
+        let mut step_pred_v = if capture_snapshots {
+            Vec::with_capacity(config.steps)
+        } else {
+            Vec::new()
+        };
+        let mut step_x_t = if capture_snapshots {
+            Vec::with_capacity(config.steps)
+        } else {
+            Vec::new()
+        };
         let t_pairs = timestep_pairs(config.steps, config.rescale_t);
         let mid_step = mid_snapshot_step(config.steps);
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
@@ -89,9 +101,15 @@ impl FlowEulerGuidanceIntervalSampler {
             if capture_snapshots && step_idx == 0 {
                 step_0_pred_v = Some(pred_v.clone());
             }
+            if capture_snapshots {
+                step_pred_v.push(pred_v.clone());
+            }
             let dt = t - t_prev;
             for (idx, value) in sample.iter_mut().enumerate() {
                 *value -= dt * pred_v[idx];
+            }
+            if capture_snapshots {
+                step_x_t.push(sample.clone());
             }
             if capture_snapshots && step_idx == 0 {
                 step_0_x_t = Some(sample.clone());
@@ -116,6 +134,8 @@ impl FlowEulerGuidanceIntervalSampler {
             step_0_x_t,
             step_mid_x_t,
             step_last_x_t,
+            step_pred_v,
+            step_x_t,
         }
     }
 

@@ -23,6 +23,7 @@ use crate::runtime_model::image_conditioning::TrellisImageConditioningRuntime;
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::runtime_config::{
     RuntimeModelDebugConfig, set_runtime_model_debug_config,
+    set_runtime_model_sparse_flow_attention_policy,
 };
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_decoder::{
@@ -88,6 +89,52 @@ fn set_runtime_debug_toggles(run_config: TrellisStageRunConfig) {
     RUNTIME_DECODER_CONV_TELEMETRY
         .store(run_config.runtime_decoder_conv_telemetry, Ordering::Relaxed);
     RUNTIME_STAGE_FENCE.store(run_config.runtime_stage_fence, Ordering::Relaxed);
+}
+
+#[cfg(feature = "runtime-model")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeFlowStage {
+    SparseStructure,
+    SLat,
+}
+
+#[cfg(feature = "runtime-model")]
+fn set_runtime_model_debug_config_for_stage(
+    run_config: TrellisStageRunConfig,
+    stage: RuntimeFlowStage,
+) {
+    let module_attention_f16 = match stage {
+        RuntimeFlowStage::SparseStructure => run_config
+            .compute_profile
+            .wgpu_sparse_module_attention_f16(),
+        RuntimeFlowStage::SLat => run_config.compute_profile.wgpu_slat_module_attention_f16(),
+    };
+    set_runtime_model_debug_config(RuntimeModelDebugConfig {
+        stage_debug: run_config.runtime_stage_debug,
+        attention_debug: run_config.runtime_attention_debug,
+        sparse_flow_module_attention: true,
+        sparse_flow_module_attention_f16: module_attention_f16,
+        sparse_flow_linear_f16: run_config.compute_profile.wgpu_linear_f16(),
+        sparse_flow_torso_f16: run_config.compute_profile.wgpu_flow_torso_f16(),
+        sparse_flow_coord_rope_kernel: true,
+        sparse_decoder_conv_f16: run_config.compute_profile.wgpu_decoder_conv_f16(),
+    });
+    let (self_attention_f16, cross_attention_f16, final_f32_steps) = match stage {
+        RuntimeFlowStage::SparseStructure => (
+            run_config.compute_profile.wgpu_sparse_self_attention_f16(),
+            run_config.compute_profile.wgpu_sparse_cross_attention_f16(),
+            run_config.compute_profile.wgpu_sparse_final_f32_steps(),
+        ),
+        RuntimeFlowStage::SLat => {
+            let f16 = run_config.compute_profile.wgpu_slat_module_attention_f16();
+            (f16, f16, 0)
+        }
+    };
+    set_runtime_model_sparse_flow_attention_policy(
+        self_attention_f16,
+        cross_attention_f16,
+        final_f32_steps,
+    );
 }
 
 fn runtime_stage_debug_enabled() -> bool {
@@ -290,6 +337,8 @@ pub struct SparseStructureSample {
     pub step_0_x_t: Vec<f32>,
     pub step_mid_x_t: Vec<f32>,
     pub step_last_x_t: Vec<f32>,
+    pub step_pred_v: Vec<Vec<f32>>,
+    pub step_x_t: Vec<Vec<f32>>,
     pub latent: Vec<f32>,
     pub coords: Vec<[u32; 4]>,
     pub layout: Vec<std::ops::Range<usize>>,
@@ -502,10 +551,31 @@ pub struct TrellisStageRunConfig {
     pub max_num_tokens: Option<usize>,
     pub target_faces: Option<usize>,
     pub compute_profile: TrellisComputeProfile,
+    pub decode_output_mode: TrellisDecodeOutputMode,
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
     pub runtime_stage_fence: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum TrellisDecodeOutputMode {
+    #[default]
+    NativePbr,
+    OvoxelHookExport,
+}
+
+impl TrellisDecodeOutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NativePbr => "native-pbr",
+            Self::OvoxelHookExport => "ovoxel-hook-export",
+        }
+    }
+
+    pub fn needs_native_pbr(self) -> bool {
+        matches!(self, Self::NativePbr)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1459,19 +1529,6 @@ impl TrellisStageRuntime {
     ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
         let total_start = Instant::now();
         set_runtime_debug_toggles(run_config);
-        #[cfg(feature = "runtime-model")]
-        set_runtime_model_debug_config(RuntimeModelDebugConfig {
-            stage_debug: run_config.runtime_stage_debug,
-            attention_debug: run_config.runtime_attention_debug,
-            sparse_flow_module_attention: true,
-            sparse_flow_module_attention_f16: run_config
-                .compute_profile
-                .wgpu_module_attention_f16(),
-            sparse_flow_linear_f16: run_config.compute_profile.wgpu_linear_f16(),
-            sparse_flow_torso_f16: run_config.compute_profile.wgpu_flow_torso_f16(),
-            sparse_flow_coord_rope_kernel: true,
-            sparse_decoder_conv_f16: run_config.compute_profile.wgpu_decoder_conv_f16(),
-        });
         let parity_strict = runtime_parity_strict();
         let max_sparse_coords_override = run_config.max_sparse_coords.filter(|limit| *limit > 0);
         #[cfg(feature = "runtime-model")]
@@ -1572,6 +1629,8 @@ impl TrellisStageRuntime {
         let sparse_structure_decoder_runtime = self.sparse_structure_decoder_runtime();
         let sparse_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage sparse begin");
+        #[cfg(feature = "runtime-model")]
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SparseStructure);
         let sparse = sample_sparse_structure(
             preprocess,
             sparse_resolution,
@@ -1622,6 +1681,8 @@ impl TrellisStageRuntime {
             matches!(self.pipeline_type(), "1024_cascade" | "1536_cascade");
         let shape_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage shape_slat begin");
+        #[cfg(feature = "runtime-model")]
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
         let (shape_slat, shape_slat_lr, shape_slat_sparse_resolution, shape_slat_decode_resolution) = {
             #[cfg(feature = "runtime-model")]
             {
@@ -1745,6 +1806,8 @@ impl TrellisStageRuntime {
         let tex_flow_runtime = self.tex_flow_runtime();
         let tex_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage tex_slat begin");
+        #[cfg(feature = "runtime-model")]
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
         let tex_slat = sample_tex_slat(
             preprocess,
             &shape_slat,
@@ -1795,6 +1858,8 @@ impl TrellisStageRuntime {
         let decode_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage decode begin");
         #[cfg(feature = "runtime-model")]
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+        #[cfg(feature = "runtime-model")]
         let shape_decoder_runtime = self.shape_decoder_runtime();
         #[cfg(feature = "runtime-model")]
         let tex_decoder_runtime = self.tex_decoder_runtime();
@@ -1813,6 +1878,7 @@ impl TrellisStageRuntime {
             parity_strict,
             capture_sampler_trace,
             decode_overrides,
+            run_config.decode_output_mode,
             #[cfg(feature = "runtime-model")]
             RuntimeDecodeModels {
                 shape_decoder: shape_decoder_runtime,

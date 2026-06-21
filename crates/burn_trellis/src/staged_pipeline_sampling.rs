@@ -201,6 +201,8 @@ fn sample_sparse_structure_with_model(
                 step_0_x_t: Vec::new(),
                 step_mid_x_t: Vec::new(),
                 step_last_x_t: Vec::new(),
+                step_pred_v: Vec::new(),
+                step_x_t: Vec::new(),
             },
             Vec::new(),
             Some(latent_tensor),
@@ -268,7 +270,8 @@ fn sample_sparse_structure_with_model(
         );
     }
     #[cfg(feature = "runtime-model-wgpu")]
-    if runtime_stage_debug_enabled() && latent.is_empty()
+    if runtime_stage_debug_enabled()
+        && latent.is_empty()
         && let Some(latent_t) = latent_tensor_wgpu.as_ref()
     {
         let [batch, channels, depth, height, width] = latent_t.dims();
@@ -323,7 +326,9 @@ fn sample_sparse_structure_with_model(
                     max_sparse_coords,
                 )
                 .map_err(|err| {
-                    format!("burn_trellis: sparse structure decoder failed after flow sampling ({err})")
+                    format!(
+                        "burn_trellis: sparse structure decoder failed after flow sampling ({err})"
+                    )
                 })?
         };
         if sampled.rows() == 0 {
@@ -450,6 +455,8 @@ fn sample_sparse_structure_with_model(
         step_0_x_t: trace.step_0_x_t,
         step_mid_x_t: trace.step_mid_x_t,
         step_last_x_t: trace.step_last_x_t,
+        step_pred_v: trace.step_pred_v,
+        step_x_t: trace.step_x_t,
         latent,
         coords,
         layout,
@@ -574,11 +581,8 @@ fn build_sparse_runtime_noise_rows_only(
                 ));
             }
             for (row_idx, coord) in override_rows.coords.iter().enumerate() {
-                let dense_idx = map_coord_to_dense_flat(
-                    *coord,
-                    sparse_resolution.max(1),
-                    dense_res,
-                );
+                let dense_idx =
+                    map_coord_to_dense_flat(*coord, sparse_resolution.max(1), dense_res);
                 let row_base = row_idx.saturating_mul(channels);
                 for ch in 0..channels {
                     noise[row_base + ch] = values[ch * voxel_count + dense_idx];
@@ -672,8 +676,7 @@ fn sparse_layout_from_batch_ids(
         let offending_batch = batch_ids[cursor];
         return Err(format!(
             "{context}: sparse coords must be grouped by non-decreasing batch id from 0..N; first offending row={} batch={}",
-            cursor,
-            offending_batch
+            cursor, offending_batch
         ));
     }
     Ok(layout)
@@ -805,23 +808,25 @@ fn sample_shape_slat_with_model(
     #[cfg(feature = "runtime-model-wgpu")]
     let coords_for_noise_storage;
     #[cfg(feature = "runtime-model-wgpu")]
-    let coords_for_noise = if use_device_coords && coords.is_empty() && noise_dense_override.is_some()
-    {
-        let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
-            "burn_trellis: shape slat dense noise override requires device coords".to_string()
-        })?;
-        coords_for_noise_storage = coords_wgpu_tensor_to_host(
-            coords_t.clone(),
-            "burn_trellis: shape slat coord materialization for dense noise",
-        )?;
-        coords_for_noise_storage.as_slice()
-    } else {
-        coords
-    };
+    let coords_for_noise =
+        if use_device_coords && coords.is_empty() && noise_dense_override.is_some() {
+            let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
+                "burn_trellis: shape slat dense noise override requires device coords".to_string()
+            })?;
+            coords_for_noise_storage = coords_wgpu_tensor_to_host(
+                coords_t.clone(),
+                "burn_trellis: shape slat coord materialization for dense noise",
+            )?;
+            coords_for_noise_storage.as_slice()
+        } else {
+            coords
+        };
     #[cfg(not(feature = "runtime-model-wgpu"))]
     let coords_for_noise = coords;
     let noise = if use_device_coords {
-        if !coords_for_noise.is_empty() && (noise_dense_override.is_some() || noise_override.is_some()) {
+        if !coords_for_noise.is_empty()
+            && (noise_dense_override.is_some() || noise_override.is_some())
+        {
             build_sparse_runtime_noise(
                 rng,
                 config.out_channels,
@@ -909,11 +914,9 @@ fn sample_shape_slat_with_model(
     reset_sparse_flow_op_telemetry();
     #[cfg(feature = "runtime-model-wgpu")]
     let trace = if shape_flow.backend_name() == "wgpu" {
-        let coords_t = coords_wgpu
-            .as_ref()
-            .ok_or_else(|| {
-                "burn_trellis: shape slat canonical wgpu path missing device coords".to_string()
-            })?;
+        let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
+            "burn_trellis: shape slat canonical wgpu path missing device coords".to_string()
+        })?;
         let device = coords_t.device();
         let noise_t = Tensor::<SparseFlowWgpuBackend, 1>::from_floats(noise.as_slice(), &device)
             .reshape([sparse_row_count, config.out_channels]);
@@ -940,7 +943,9 @@ fn sample_shape_slat_with_model(
                 config.out_channels,
                 sparse_resolution.max(1),
             )
-            .map_err(|err| format!("burn_trellis: shape slat sparse tensor assembly failed ({err})"))?;
+            .map_err(|err| {
+                format!("burn_trellis: shape slat sparse tensor assembly failed ({err})")
+            })?;
         shape_flow.sample_sparse_rows_with_trace(
             &sparse_noise,
             sample_cfg,
@@ -963,7 +968,9 @@ fn sample_shape_slat_with_model(
                 config.out_channels,
                 sparse_resolution.max(1),
             )
-            .map_err(|err| format!("burn_trellis: shape slat sparse tensor assembly failed ({err})"))?;
+            .map_err(|err| {
+                format!("burn_trellis: shape slat sparse tensor assembly failed ({err})")
+            })?;
         shape_flow.sample_sparse_rows_with_trace(
             &sparse_noise,
             sample_cfg,
@@ -1258,25 +1265,24 @@ fn sample_tex_slat_with_model(
         })?;
         build_shape_concat_rows_host(rows, concat_channels, shape_normalization)
     };
-    let shape_cond_rows_host = shape_rows_host.map(|rows| build_shape_cond_rows_host(rows, shape_normalization));
+    let shape_cond_rows_host =
+        shape_rows_host.map(|rows| build_shape_cond_rows_host(rows, shape_normalization));
     #[cfg(feature = "runtime-model-wgpu")]
     let coords_for_noise_storage;
     #[cfg(feature = "runtime-model-wgpu")]
-    let coords_for_noise = if use_device_coords
-        && shape_slat.coords.is_empty()
-        && noise_dense_override.is_some()
-    {
-        let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
-            "burn_trellis: tex slat dense noise override requires device coords".to_string()
-        })?;
-        coords_for_noise_storage = coords_wgpu_tensor_to_host(
-            coords_t.clone(),
-            "burn_trellis: tex slat coord materialization for dense noise",
-        )?;
-        coords_for_noise_storage.as_slice()
-    } else {
-        shape_slat.coords.as_slice()
-    };
+    let coords_for_noise =
+        if use_device_coords && shape_slat.coords.is_empty() && noise_dense_override.is_some() {
+            let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
+                "burn_trellis: tex slat dense noise override requires device coords".to_string()
+            })?;
+            coords_for_noise_storage = coords_wgpu_tensor_to_host(
+                coords_t.clone(),
+                "burn_trellis: tex slat coord materialization for dense noise",
+            )?;
+            coords_for_noise_storage.as_slice()
+        } else {
+            shape_slat.coords.as_slice()
+        };
     #[cfg(not(feature = "runtime-model-wgpu"))]
     let coords_for_noise = shape_slat.coords.as_slice();
     let noise = if use_device_coords {
@@ -1370,11 +1376,9 @@ fn sample_tex_slat_with_model(
     reset_sparse_flow_op_telemetry();
     #[cfg(feature = "runtime-model-wgpu")]
     let trace = if tex_flow.backend_name() == "wgpu" {
-        let coords_t = coords_wgpu
-            .as_ref()
-            .ok_or_else(|| {
-                "burn_trellis: tex slat canonical wgpu path missing device coords".to_string()
-            })?;
+        let coords_t = coords_wgpu.as_ref().ok_or_else(|| {
+            "burn_trellis: tex slat canonical wgpu path missing device coords".to_string()
+        })?;
         let device = coords_t.device();
         let noise_t = Tensor::<SparseFlowWgpuBackend, 1>::from_floats(noise.as_slice(), &device)
             .reshape([sparse_row_count, config.out_channels]);
@@ -1415,14 +1419,18 @@ fn sample_tex_slat_with_model(
                 config.out_channels,
                 sparse_resolution.max(1),
             )
-            .map_err(|err| format!("burn_trellis: tex slat sparse tensor assembly failed ({err})"))?;
+            .map_err(|err| {
+                format!("burn_trellis: tex slat sparse tensor assembly failed ({err})")
+            })?;
         let concat_owned = tex_flow
             .varlen_tensor_from_host_layout(
                 concat_rows.clone(),
                 sparse_layout.clone(),
                 concat_channels,
             )
-            .map_err(|err| format!("burn_trellis: tex slat concat tensor assembly failed ({err})"))?;
+            .map_err(|err| {
+                format!("burn_trellis: tex slat concat tensor assembly failed ({err})")
+            })?;
         tex_flow.sample_sparse_rows_with_trace(
             &sparse_noise,
             sample_cfg,
@@ -1446,14 +1454,18 @@ fn sample_tex_slat_with_model(
                 config.out_channels,
                 sparse_resolution.max(1),
             )
-            .map_err(|err| format!("burn_trellis: tex slat sparse tensor assembly failed ({err})"))?;
+            .map_err(|err| {
+                format!("burn_trellis: tex slat sparse tensor assembly failed ({err})")
+            })?;
         let concat_owned = tex_flow
             .varlen_tensor_from_host_layout(
                 concat_rows.to_vec(),
                 sparse_layout.clone(),
                 concat_channels,
             )
-            .map_err(|err| format!("burn_trellis: tex slat concat tensor assembly failed ({err})"))?;
+            .map_err(|err| {
+                format!("burn_trellis: tex slat concat tensor assembly failed ({err})")
+            })?;
         tex_flow.sample_sparse_rows_with_trace(
             &sparse_noise,
             sample_cfg,
@@ -2068,7 +2080,11 @@ fn sample_shape_slat_cascade_runtime(
             "burn_trellis: cascade canonical wgpu path requires device shape row tensor from low-resolution shape stage"
                 .to_string()
         })?;
-        shape_decoder.upsample_coords_result_with_tensors(shape_coords_t.clone(), shape_rows_t.clone(), 4)?
+        shape_decoder.upsample_coords_result_with_tensors(
+            shape_coords_t.clone(),
+            shape_rows_t.clone(),
+            4,
+        )?
     } else if let Some(shape_coords_t) = shape_lr.coords_wgpu.as_ref() {
         let shape_rows_t = shape_lr.features_wgpu.as_ref().ok_or_else(|| {
             "burn_trellis: cascade tensor-coord upsample path requires device shape rows; host completion fallback is disabled"
@@ -2080,11 +2096,18 @@ fn sample_shape_slat_cascade_runtime(
             4,
         )?
     } else {
-        shape_decoder.upsample_coords_result(shape_lr.coords.as_slice(), shape_lr.features.as_slice(), 4)?
+        shape_decoder.upsample_coords_result(
+            shape_lr.coords.as_slice(),
+            shape_lr.features.as_slice(),
+            4,
+        )?
     };
     #[cfg(not(feature = "runtime-model-wgpu"))]
-    let hr_coords_sparse =
-        shape_decoder.upsample_coords_result(shape_lr.coords.as_slice(), shape_lr.features.as_slice(), 4)?;
+    let hr_coords_sparse = shape_decoder.upsample_coords_result(
+        shape_lr.coords.as_slice(),
+        shape_lr.features.as_slice(),
+        4,
+    )?;
     if hr_coords_sparse.rows() == 0 {
         return Err("burn_trellis: cascade decoder upsample produced zero coordinates".to_string());
     }
@@ -2098,8 +2121,11 @@ fn sample_shape_slat_cascade_runtime(
         let mut effective_resolution = target_resolution;
         let hr_coords_quantized_t = loop {
             let sparse_resolution = (effective_resolution / 16).max(1);
-            let quantized_t =
-                quantize_cascade_coords_wgpu(hr_coords_t.clone(), lr_resolution, sparse_resolution)?;
+            let quantized_t = quantize_cascade_coords_wgpu(
+                hr_coords_t.clone(),
+                lr_resolution,
+                sparse_resolution,
+            )?;
             let [num_tokens, coord_cols] = quantized_t.dims();
             if coord_cols != 4 {
                 return Err(format!(
@@ -2355,7 +2381,10 @@ fn denormalize_and_pad_trace_rows_wgpu(
 ) -> Result<Tensor<SparseFlowWgpuBackend, 2>, String> {
     let [rows, channels] = rows_t.dims();
     if channels == 0 {
-        return Ok(Tensor::<SparseFlowWgpuBackend, 2>::zeros([rows, 32], &rows_t.device()));
+        return Ok(Tensor::<SparseFlowWgpuBackend, 2>::zeros(
+            [rows, 32],
+            &rows_t.device(),
+        ));
     }
     if channels > 32 {
         return Err(format!(
@@ -2379,8 +2408,8 @@ fn denormalize_and_pad_trace_rows_wgpu(
     }
     let mean_t = Tensor::<SparseFlowWgpuBackend, 1>::from_floats(mean.as_slice(), &device)
         .reshape([1, channels]);
-    let std_t =
-        Tensor::<SparseFlowWgpuBackend, 1>::from_floats(std.as_slice(), &device).reshape([1, channels]);
+    let std_t = Tensor::<SparseFlowWgpuBackend, 1>::from_floats(std.as_slice(), &device)
+        .reshape([1, channels]);
     let denorm = rows_t.mul(std_t).add(mean_t);
     if channels == 32 {
         return Ok(denorm);
@@ -2417,7 +2446,10 @@ fn build_shape_concat_tensor_wgpu(
     };
     let used_channels = concat_channels.min(32);
     if used_channels == 0 {
-        return Ok(Tensor::<SparseFlowWgpuBackend, 2>::zeros([rows, concat_channels], &shape_rows_t.device()));
+        return Ok(Tensor::<SparseFlowWgpuBackend, 2>::zeros(
+            [rows, concat_channels],
+            &shape_rows_t.device(),
+        ));
     }
     let device = shape_rows_t.device();
     let shape_used_t = if used_channels == 32 {
@@ -2485,7 +2517,9 @@ fn coords_wgpu_tensor_to_host(
 ) -> Result<Vec<[u32; 4]>, String> {
     let [rows, cols] = coords_t.dims();
     if cols != 4 {
-        return Err(format!("{context}: coord tensor must have 4 columns, got {cols}"));
+        return Err(format!(
+            "{context}: coord tensor must have 4 columns, got {cols}"
+        ));
     }
     let values = tensor_i32_to_vec(coords_t, context)?;
     if values.len() != rows.saturating_mul(4) {
@@ -2499,8 +2533,9 @@ fn coords_wgpu_tensor_to_host(
     for row_idx in 0..rows {
         let base = row_idx.saturating_mul(4);
         let to_u32 = |value: i32| -> Result<u32, String> {
-            u32::try_from(value)
-                .map_err(|_| format!("{context}: negative coordinate value {value} at row {row_idx}"))
+            u32::try_from(value).map_err(|_| {
+                format!("{context}: negative coordinate value {value} at row {row_idx}")
+            })
         };
         out.push([
             to_u32(values[base])?,
@@ -2533,7 +2568,10 @@ fn quantize_cascade_coords_wgpu(
     }
     let device = hr_coords_t.device();
     if rows == 0 {
-        return Ok(Tensor::<SparseFlowWgpuBackend, 2, Int>::zeros([0, 4], &device));
+        return Ok(Tensor::<SparseFlowWgpuBackend, 2, Int>::zeros(
+            [0, 4],
+            &device,
+        ));
     }
     let scale = i32::try_from(target_sparse_resolution).map_err(|_| {
         format!(
@@ -2594,7 +2632,10 @@ fn quantize_cascade_coords_wgpu(
         ));
     }
     if keep_rows == 0 {
-        return Ok(Tensor::<SparseFlowWgpuBackend, 2, Int>::zeros([0, 4], &device));
+        return Ok(Tensor::<SparseFlowWgpuBackend, 2, Int>::zeros(
+            [0, 4],
+            &device,
+        ));
     }
     let idx_col = Tensor::<SparseFlowWgpuBackend, 1, Int>::from_ints([0], &device);
     let keep_idx = keep_idx_rows.select(1, idx_col).squeeze_dim(1);

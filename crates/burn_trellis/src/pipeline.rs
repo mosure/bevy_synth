@@ -25,8 +25,8 @@ use crate::sampler::{FlowEulerSampleConfig, timestep_pairs};
 use crate::staged_pipeline::{
     DecodeStageSource, SamplerConfigOverride, ShapeSLatSample, SparseFlowOpTimingSummary,
     SparseRowNoiseOverride, SparseStructureSample, SparseStructureStageSource, TexSLatSample,
-    TrellisNoiseOverrides, TrellisSamplerRuntimeOverrides, TrellisStageOutput,
-    TrellisStageRunConfig, TrellisStageRuntime,
+    TrellisDecodeOutputMode, TrellisNoiseOverrides, TrellisSamplerRuntimeOverrides,
+    TrellisStageOutput, TrellisStageRunConfig, TrellisStageRuntime,
 };
 use crate::time::Instant;
 use crate::trellis_config::{TrellisPipelineArgs, TrellisPipelineConfig};
@@ -119,6 +119,7 @@ pub struct TrellisRunOptions {
     pub noise_overrides_hook: Option<PathBuf>,
     pub max_sparse_coords: Option<usize>,
     pub target_faces: Option<usize>,
+    pub decode_output_mode: TrellisDecodeOutputMode,
     pub runtime_stage_debug: bool,
     pub runtime_attention_debug: bool,
     pub runtime_decoder_conv_telemetry: bool,
@@ -193,6 +194,7 @@ pub struct TrellisInferenceProfile {
     pub timings: TrellisPipelineTimings,
     pub sparse_source: SparseStructureStageSource,
     pub decode_source: DecodeStageSource,
+    pub decode_output_mode: TrellisDecodeOutputMode,
     pub step_counts: TrellisPipelineStepCounts,
     pub shapes: TrellisPipelineShapes,
 }
@@ -469,6 +471,7 @@ impl Trellis2Pipeline {
                     max_num_tokens: options.quality.settings().max_num_tokens,
                     target_faces: options.target_faces.filter(|limit| *limit > 0),
                     compute_profile: options.compute_profile,
+                    decode_output_mode: options.decode_output_mode,
                     runtime_stage_debug: options.runtime_stage_debug,
                     runtime_attention_debug: options.runtime_attention_debug,
                     runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
@@ -544,6 +547,7 @@ impl Trellis2Pipeline {
         Ok(TrellisInferenceProfile {
             sparse_source: stage_output.sparse.source,
             decode_source: stage_output.decode_source,
+            decode_output_mode: options.decode_output_mode,
             mesh: stage_output.mesh,
             timings,
             step_counts,
@@ -584,6 +588,7 @@ impl Trellis2Pipeline {
                     max_num_tokens: options.quality.settings().max_num_tokens,
                     target_faces: options.target_faces.filter(|limit| *limit > 0),
                     compute_profile: options.compute_profile,
+                    decode_output_mode: options.decode_output_mode,
                     runtime_stage_debug: options.runtime_stage_debug,
                     runtime_attention_debug: options.runtime_attention_debug,
                     runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
@@ -1059,7 +1064,19 @@ impl Trellis2Pipeline {
             .map_err(TrellisRuntimeError::new)?;
             let sparse_step_count = stage_output.sparse.step_count.max(1);
             let sparse_state_len: usize = sparse_shape.iter().product();
-            if stage_output.sparse.step_0_pred_v.len() == sparse_state_len {
+            let inserted_sparse_step_pred_v = insert_sparse_step_tensor_hooks(
+                &mut trace,
+                "sample_sparse_structure.sampler",
+                sparse_step_count,
+                "pred_v",
+                sparse_shape.as_slice(),
+                sparse_state_len,
+                stage_output.sparse.step_pred_v.as_slice(),
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            if !inserted_sparse_step_pred_v
+                && stage_output.sparse.step_0_pred_v.len() == sparse_state_len
+            {
                 trace
                     .insert_f32(
                         format!(
@@ -1092,20 +1109,32 @@ impl Trellis2Pipeline {
                     )
                     .map_err(TrellisRuntimeError::new)?;
             }
-            for step_idx in
-                sampler_snapshot_steps(stage_output.sparse.step_count, HOOK_SAMPLER_SNAPSHOTS)
-            {
-                let key = format!(
-                    "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.x_t",
-                    stage_output.sparse.step_count.max(1)
-                );
-                trace
-                    .insert_f32(
-                        key,
-                        sparse_shape.clone(),
-                        sparse_step_values(&stage_output.sparse, step_idx),
-                    )
-                    .map_err(TrellisRuntimeError::new)?;
+            let inserted_sparse_step_x_t = insert_sparse_step_tensor_hooks(
+                &mut trace,
+                "sample_sparse_structure.sampler",
+                sparse_step_count,
+                "x_t",
+                sparse_shape.as_slice(),
+                sparse_state_len,
+                stage_output.sparse.step_x_t.as_slice(),
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            if !inserted_sparse_step_x_t {
+                for step_idx in
+                    sampler_snapshot_steps(stage_output.sparse.step_count, HOOK_SAMPLER_SNAPSHOTS)
+                {
+                    let key = format!(
+                        "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.x_t",
+                        stage_output.sparse.step_count.max(1)
+                    );
+                    trace
+                        .insert_f32(
+                            key,
+                            sparse_shape.clone(),
+                            sparse_step_values(&stage_output.sparse, step_idx),
+                        )
+                        .map_err(TrellisRuntimeError::new)?;
+                }
             }
             trace
                 .insert_f32(
@@ -1933,6 +1962,36 @@ fn insert_sparse_trace_rows(
         ],
     )?;
     Ok(())
+}
+
+fn insert_sparse_step_tensor_hooks(
+    trace: &mut HookTrace,
+    prefix: &str,
+    step_count: usize,
+    suffix: &str,
+    shape: &[usize],
+    expected_len: usize,
+    values: &[Vec<f32>],
+) -> Result<bool, String> {
+    if values.is_empty() {
+        return Ok(false);
+    }
+    let mut inserted = false;
+    for (step_idx, step_values) in values.iter().enumerate() {
+        if step_idx >= step_count {
+            break;
+        }
+        if step_values.len() != expected_len {
+            continue;
+        }
+        trace.insert_f32(
+            format!("{prefix}.step_{step_idx:03}_of_{step_count:03}.{suffix}"),
+            shape.to_vec(),
+            step_values.clone(),
+        )?;
+        inserted = true;
+    }
+    Ok(inserted)
 }
 
 fn sparse_step_values(

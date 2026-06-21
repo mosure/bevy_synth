@@ -15,6 +15,13 @@ pub enum TrellisQuality {
 pub enum TrellisComputeProfile {
     #[default]
     ReferenceF32,
+    WgpuFastMixedF16,
+    WgpuFastSparseSelfF16,
+    WgpuFastSparseCrossF16,
+    WgpuFastF16Tail1F32,
+    WgpuFastF16Tail2F32,
+    WgpuFastF16Tail4F32,
+    WgpuFastF16Tail6F32,
     WgpuFastF16,
 }
 
@@ -22,12 +29,63 @@ impl TrellisComputeProfile {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReferenceF32 => "reference-f32",
+            Self::WgpuFastMixedF16 => "wgpu-fast-mixed-f16",
+            Self::WgpuFastSparseSelfF16 => "wgpu-fast-sparse-self-f16",
+            Self::WgpuFastSparseCrossF16 => "wgpu-fast-sparse-cross-f16",
+            Self::WgpuFastF16Tail1F32 => "wgpu-fast-f16-tail1-f32",
+            Self::WgpuFastF16Tail2F32 => "wgpu-fast-f16-tail2-f32",
+            Self::WgpuFastF16Tail4F32 => "wgpu-fast-f16-tail4-f32",
+            Self::WgpuFastF16Tail6F32 => "wgpu-fast-f16-tail6-f32",
             Self::WgpuFastF16 => "wgpu-fast-f16",
         }
     }
 
     pub fn wgpu_module_attention_f16(self) -> bool {
-        matches!(self, Self::WgpuFastF16)
+        self.wgpu_sparse_self_attention_f16()
+            || self.wgpu_sparse_cross_attention_f16()
+            || self.wgpu_slat_module_attention_f16()
+    }
+
+    pub fn wgpu_sparse_module_attention_f16(self) -> bool {
+        self.wgpu_sparse_self_attention_f16() || self.wgpu_sparse_cross_attention_f16()
+    }
+
+    pub fn wgpu_sparse_self_attention_f16(self) -> bool {
+        matches!(
+            self,
+            Self::WgpuFastSparseSelfF16
+                | Self::WgpuFastF16Tail1F32
+                | Self::WgpuFastF16Tail2F32
+                | Self::WgpuFastF16Tail4F32
+                | Self::WgpuFastF16Tail6F32
+                | Self::WgpuFastF16
+        )
+    }
+
+    pub fn wgpu_sparse_cross_attention_f16(self) -> bool {
+        matches!(
+            self,
+            Self::WgpuFastSparseCrossF16
+                | Self::WgpuFastF16Tail1F32
+                | Self::WgpuFastF16Tail2F32
+                | Self::WgpuFastF16Tail4F32
+                | Self::WgpuFastF16Tail6F32
+                | Self::WgpuFastF16
+        )
+    }
+
+    pub fn wgpu_sparse_final_f32_steps(self) -> usize {
+        match self {
+            Self::WgpuFastF16Tail1F32 => 1,
+            Self::WgpuFastF16Tail2F32 => 2,
+            Self::WgpuFastF16Tail4F32 => 4,
+            Self::WgpuFastF16Tail6F32 => 6,
+            _ => 0,
+        }
+    }
+
+    pub fn wgpu_slat_module_attention_f16(self) -> bool {
+        !matches!(self, Self::ReferenceF32)
     }
 
     pub fn wgpu_linear_f16(self) -> bool {
@@ -42,7 +100,7 @@ impl TrellisComputeProfile {
     }
 
     pub fn wgpu_decoder_conv_f16(self) -> bool {
-        matches!(self, Self::WgpuFastF16)
+        !matches!(self, Self::ReferenceF32)
     }
 }
 
@@ -150,6 +208,50 @@ mod tests {
     #[test]
     fn wgpu_fast_f16_keeps_linear_f16_disabled_until_parity_is_fixed() {
         assert!(TrellisComputeProfile::WgpuFastF16.wgpu_module_attention_f16());
+        assert!(TrellisComputeProfile::WgpuFastF16.wgpu_sparse_module_attention_f16());
+        assert!(TrellisComputeProfile::WgpuFastF16.wgpu_slat_module_attention_f16());
         assert!(!TrellisComputeProfile::WgpuFastF16.wgpu_linear_f16());
+        assert!(!TrellisComputeProfile::WgpuFastF16.wgpu_flow_torso_f16());
+    }
+
+    #[test]
+    fn wgpu_fast_mixed_f16_keeps_sparse_structure_attention_f32() {
+        assert!(TrellisComputeProfile::WgpuFastMixedF16.wgpu_module_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastMixedF16.wgpu_sparse_module_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastMixedF16.wgpu_sparse_self_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastMixedF16.wgpu_sparse_cross_attention_f16());
+        assert!(TrellisComputeProfile::WgpuFastMixedF16.wgpu_slat_module_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastMixedF16.wgpu_linear_f16());
+        assert!(!TrellisComputeProfile::WgpuFastMixedF16.wgpu_flow_torso_f16());
+    }
+
+    #[test]
+    fn diagnostic_sparse_f16_profiles_are_split() {
+        assert!(TrellisComputeProfile::WgpuFastSparseSelfF16.wgpu_sparse_self_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastSparseSelfF16.wgpu_sparse_cross_attention_f16());
+        assert!(!TrellisComputeProfile::WgpuFastSparseCrossF16.wgpu_sparse_self_attention_f16());
+        assert!(TrellisComputeProfile::WgpuFastSparseCrossF16.wgpu_sparse_cross_attention_f16());
+    }
+
+    #[test]
+    fn diagnostic_f16_tail_profiles_keep_final_steps_f32() {
+        assert_eq!(
+            TrellisComputeProfile::WgpuFastF16Tail1F32.wgpu_sparse_final_f32_steps(),
+            1
+        );
+        assert_eq!(
+            TrellisComputeProfile::WgpuFastF16Tail2F32.wgpu_sparse_final_f32_steps(),
+            2
+        );
+        assert_eq!(
+            TrellisComputeProfile::WgpuFastF16Tail4F32.wgpu_sparse_final_f32_steps(),
+            4
+        );
+        assert_eq!(
+            TrellisComputeProfile::WgpuFastF16Tail6F32.wgpu_sparse_final_f32_steps(),
+            6
+        );
+        assert!(TrellisComputeProfile::WgpuFastF16Tail4F32.wgpu_sparse_self_attention_f16());
+        assert!(TrellisComputeProfile::WgpuFastF16Tail4F32.wgpu_sparse_cross_attention_f16());
     }
 }
