@@ -356,6 +356,91 @@ pub struct SplatOutput {
 }
 
 #[derive(Debug, Clone)]
+pub struct AssetBatchItem {
+    pub id: String,
+    pub image: ImageSource,
+}
+
+impl AssetBatchItem {
+    pub fn new(id: impl Into<String>, image: ImageSource) -> Self {
+        Self {
+            id: id.into(),
+            image,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeBatchPolicy {
+    pub max_items: Option<usize>,
+    pub vram_budget_mb: Option<u64>,
+    pub vram_fraction: f32,
+    pub force_tensor_batch: bool,
+}
+
+impl Default for RuntimeBatchPolicy {
+    fn default() -> Self {
+        Self {
+            max_items: None,
+            vram_budget_mb: None,
+            vram_fraction: 0.70,
+            force_tensor_batch: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetBatchRequest {
+    pub items: Vec<AssetBatchItem>,
+    pub foreground_model: Option<ForegroundModel>,
+    pub synthesis_models: Option<Vec<SynthesisModel>>,
+    pub backend: Option<InferenceBackend>,
+    pub dry_run: bool,
+    pub policy: RuntimeBatchPolicy,
+}
+
+#[derive(Debug)]
+pub struct AssetBatchItemOutput {
+    pub id: String,
+    pub chunk_index: usize,
+    pub item_index: usize,
+    pub output: Result<AssetOutput, RuntimeError>,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBatchExecutionMode {
+    SerialReuse,
+    TensorBatch,
+}
+
+impl RuntimeBatchExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialReuse => "serial_reuse",
+            Self::TensorBatch => "tensor_batch",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeBatchStats {
+    pub total_items: usize,
+    pub chunk_size: usize,
+    pub chunks: usize,
+    pub execution_mode: RuntimeBatchExecutionMode,
+    pub vram_budget_mb: Option<u64>,
+    pub estimated_item_mb: Option<u64>,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug)]
+pub struct AssetBatchOutput {
+    pub items: Vec<AssetBatchItemOutput>,
+    pub stats: RuntimeBatchStats,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeError {
     message: String,
 }
@@ -649,6 +734,81 @@ impl SynthRuntime {
             synthesis_models: mesh_output.synthesis_models,
             synthesis_backend: mesh_output.synthesis_backend,
             backend: mesh_output.backend,
+        })
+    }
+
+    pub fn synthesize_assets_batch(
+        &mut self,
+        request: AssetBatchRequest,
+    ) -> RuntimeResult<AssetBatchOutput> {
+        if request.policy.force_tensor_batch {
+            return Err(RuntimeError::new(
+                "force_tensor_batch is not supported until per-pipeline tensor batch parity is verified",
+            ));
+        }
+        let total_items = request.items.len();
+        let selected_synthesis = request
+            .synthesis_models
+            .clone()
+            .map(sanitize_synthesis_models)
+            .unwrap_or_else(|| self.config.model_selection.synthesis_models.clone());
+        let selected_backend = request.backend.unwrap_or(self.config.backend);
+        let preferred_synthesis = selected_synthesis
+            .first()
+            .copied()
+            .unwrap_or(SynthesisModel::Triposg);
+        let vram_budget_mb = resolve_batch_vram_budget_mb(&request.policy);
+        let estimated_item_mb = estimate_asset_batch_item_mb(
+            preferred_synthesis,
+            selected_backend,
+            request.dry_run,
+            &self.config,
+        );
+        let chunk_size = plan_asset_batch_chunk_size(
+            total_items,
+            request.policy,
+            vram_budget_mb,
+            estimated_item_mb,
+        );
+        let chunks = if total_items == 0 {
+            0
+        } else {
+            total_items.div_ceil(chunk_size.max(1))
+        };
+        let batch_start = Instant::now();
+        let mut outputs = Vec::with_capacity(total_items);
+
+        for (chunk_index, chunk) in request.items.chunks(chunk_size.max(1)).enumerate() {
+            for (offset, item) in chunk.iter().enumerate() {
+                let item_start = Instant::now();
+                let output = self.synthesize_asset(AssetRequest {
+                    image: item.image.clone(),
+                    foreground_model: request.foreground_model,
+                    synthesis_models: Some(selected_synthesis.clone()),
+                    backend: Some(selected_backend),
+                    dry_run: request.dry_run,
+                });
+                outputs.push(AssetBatchItemOutput {
+                    id: item.id.clone(),
+                    chunk_index,
+                    item_index: chunk_index * chunk_size.max(1) + offset,
+                    output,
+                    elapsed_ms: item_start.elapsed().as_secs_f64() * 1000.0,
+                });
+            }
+        }
+
+        Ok(AssetBatchOutput {
+            items: outputs,
+            stats: RuntimeBatchStats {
+                total_items,
+                chunk_size: chunk_size.max(1),
+                chunks,
+                execution_mode: RuntimeBatchExecutionMode::SerialReuse,
+                vram_budget_mb,
+                estimated_item_mb,
+                elapsed_ms: batch_start.elapsed().as_secs_f64() * 1000.0,
+            },
         })
     }
 
@@ -2177,9 +2337,9 @@ fn resolve_trellis_runtime_roots(
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        return resolve_or_bootstrap_trellis_roots(true).map_err(|err| {
+        resolve_or_bootstrap_trellis_roots(true).map_err(|err| {
             RuntimeError::new(format!("failed to prepare Trellis2 cache bootstrap: {err}"))
-        });
+        })
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -2339,6 +2499,107 @@ fn triposplat_splats_detail(splats: &[GaussianSplatCloud]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("splats=[{counts}]")
+}
+
+fn estimate_asset_batch_item_mb(
+    synthesis: SynthesisModel,
+    backend: InferenceBackend,
+    dry_run: bool,
+    config: &RuntimeConfig,
+) -> Option<u64> {
+    if dry_run {
+        return Some(64);
+    }
+    if matches!(backend, InferenceBackend::Cpu) {
+        return None;
+    }
+    let estimate = match synthesis {
+        SynthesisModel::Triposg => {
+            if config.num_tokens <= 512 {
+                2048
+            } else if config.num_tokens <= 1024 {
+                3072
+            } else {
+                4096
+            }
+        }
+        SynthesisModel::Trellis => {
+            let quality_mb = match config.trellis_quality {
+                TrellisQuality::Low => 4096,
+                TrellisQuality::Medium => 6144,
+                TrellisQuality::High => 8192,
+            };
+            if config.trellis_pbr_enabled {
+                quality_mb + 2048
+            } else {
+                quality_mb
+            }
+        }
+        SynthesisModel::Triposplat => {
+            if config.triposplat_num_gaussians <= 65_536 {
+                4096
+            } else if config.triposplat_num_gaussians <= 262_144 {
+                6144
+            } else {
+                8192
+            }
+        }
+    };
+    Some(estimate)
+}
+
+fn plan_asset_batch_chunk_size(
+    total_items: usize,
+    policy: RuntimeBatchPolicy,
+    vram_budget_mb: Option<u64>,
+    estimated_item_mb: Option<u64>,
+) -> usize {
+    if total_items == 0 {
+        return 1;
+    }
+    let explicit_cap = policy.max_items.filter(|value| *value > 0);
+    let vram_cap = vram_budget_mb
+        .zip(estimated_item_mb)
+        .and_then(|(budget, item)| (item > 0).then_some((budget / item).max(1) as usize));
+    match (explicit_cap, vram_cap) {
+        (Some(explicit), Some(vram)) => explicit.min(vram).max(1).min(total_items),
+        (Some(explicit), None) => explicit.max(1).min(total_items),
+        (None, Some(vram)) => vram.max(1).min(total_items),
+        (None, None) => 1,
+    }
+}
+
+fn resolve_batch_vram_budget_mb(policy: &RuntimeBatchPolicy) -> Option<u64> {
+    if let Some(explicit) = policy.vram_budget_mb.filter(|value| *value > 0) {
+        return Some(explicit);
+    }
+    let fraction = if policy.vram_fraction.is_finite() {
+        policy.vram_fraction.clamp(0.05, 1.0)
+    } else {
+        RuntimeBatchPolicy::default().vram_fraction
+    };
+    probe_nvidia_free_vram_mb().map(|free| ((free as f32) * fraction).floor().max(1.0) as u64)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn probe_nvidia_free_vram_mb() -> Option<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .max()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn probe_nvidia_free_vram_mb() -> Option<u64> {
+    None
 }
 
 fn triposplat_latent_cache_key(
@@ -3043,6 +3304,68 @@ mod tests {
     #[test]
     fn cuda_backend_alias_uses_burn_fusion() {
         assert_backend_type_uses_fusion::<CudaBackend>("CUDA backend");
+    }
+
+    #[test]
+    fn asset_batch_planner_uses_smallest_explicit_or_vram_cap() {
+        let policy = RuntimeBatchPolicy {
+            max_items: Some(3),
+            vram_budget_mb: Some(4096),
+            ..RuntimeBatchPolicy::default()
+        };
+        assert_eq!(
+            plan_asset_batch_chunk_size(10, policy, policy.vram_budget_mb, Some(2048)),
+            2
+        );
+    }
+
+    #[test]
+    fn asset_batch_planner_falls_back_to_single_when_capacity_is_unknown() {
+        assert_eq!(
+            plan_asset_batch_chunk_size(4, RuntimeBatchPolicy::default(), None, None),
+            1
+        );
+    }
+
+    #[test]
+    fn asset_batch_dry_run_processes_all_items_and_reports_chunks() {
+        let mut runtime = SynthRuntime::new(RuntimeConfig::default());
+        let output = runtime
+            .synthesize_assets_batch(AssetBatchRequest {
+                items: vec![
+                    AssetBatchItem::new("first", ImageSource::from_path("first.png")),
+                    AssetBatchItem::new("second", ImageSource::from_path("second.png")),
+                    AssetBatchItem::new("third", ImageSource::from_path("third.png")),
+                ],
+                foreground_model: Some(ForegroundModel::Rmbg14),
+                synthesis_models: Some(vec![SynthesisModel::Triposg]),
+                backend: Some(InferenceBackend::Cpu),
+                dry_run: true,
+                policy: RuntimeBatchPolicy {
+                    max_items: Some(2),
+                    vram_budget_mb: None,
+                    ..RuntimeBatchPolicy::default()
+                },
+            })
+            .expect("dry-run asset batch should succeed");
+
+        assert_eq!(output.items.len(), 3);
+        assert_eq!(output.stats.total_items, 3);
+        assert_eq!(output.stats.chunk_size, 2);
+        assert_eq!(output.stats.chunks, 2);
+        assert_eq!(
+            output.stats.execution_mode,
+            RuntimeBatchExecutionMode::SerialReuse
+        );
+        for item in output.items {
+            assert!(
+                matches!(
+                    item.output.expect("dry-run item should succeed").asset,
+                    SynthesisAsset::Mesh(_)
+                ),
+                "mesh dry-run should emit meshes"
+            );
+        }
     }
 
     #[cfg(feature = "wgpu")]

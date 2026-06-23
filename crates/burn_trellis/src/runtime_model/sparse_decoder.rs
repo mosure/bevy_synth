@@ -777,10 +777,7 @@ impl DecoderWgpuConvContext {
         }
     }
 
-    fn sparse_layer_weight_bias<'a>(
-        layer: &'a SparseConvLayer,
-        compute_fp16: bool,
-    ) -> (&'a [f32], &'a [f32]) {
+    fn sparse_layer_weight_bias(layer: &SparseConvLayer, compute_fp16: bool) -> (&[f32], &[f32]) {
         if compute_fp16 {
             (layer.weight_fp16.as_slice(), layer.bias_fp16.as_slice())
         } else {
@@ -788,10 +785,7 @@ impl DecoderWgpuConvContext {
         }
     }
 
-    fn linear_layer_weight_bias<'a>(
-        layer: &'a LinearLayer,
-        compute_fp16: bool,
-    ) -> (&'a [f32], &'a [f32]) {
+    fn linear_layer_weight_bias(layer: &LinearLayer, compute_fp16: bool) -> (&[f32], &[f32]) {
         if compute_fp16 {
             (layer.weight_fp16.as_slice(), layer.bias_fp16.as_slice())
         } else {

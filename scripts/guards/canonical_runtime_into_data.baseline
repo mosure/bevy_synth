@@ -1,3 +1,6 @@
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#1
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#2
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#3
 crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#1
 crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#2
 crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#3
@@ -6,3 +9,5 @@ crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#5
 crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#6
 crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#7
 crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#8
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#9
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#10

@@ -36,6 +36,11 @@ impl Instant {
 
 /// Default WGPU backend type used by the tensor convenience wrappers.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+type ModuleQkvRmsNormRopeOutput = (
+    BurnTensor<DefaultWgpuBackend, 4>,
+    BurnTensor<DefaultWgpuBackend, 4>,
+    BurnTensor<DefaultWgpuBackend, 4>,
+);
 
 fn cast_float_tensor_if_needed<const D: usize>(
     tensor: BurnTensor<DefaultWgpuBackend, D>,
@@ -337,6 +342,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_kernel(
     input: &Array<f32>,
@@ -381,6 +387,7 @@ fn sparse_subm_conv_kernel(
     output[out_idx] = acc;
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_single_group_kernel(
     input: &Array<f32>,
@@ -421,6 +428,7 @@ fn sparse_subm_conv_single_group_kernel(
     output[out_idx] = acc;
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_fused_oc4_kernel(
     input: &Array<f32>,
@@ -552,6 +560,7 @@ fn sparse_subm_conv_fused_oc4_kernel(
     }
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_single_group_fused_oc4_kernel(
     input: &Array<f32>,
@@ -669,6 +678,7 @@ fn sparse_subm_conv_single_group_fused_oc4_kernel(
     }
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_splitk_partial_kernel(
     input: &Array<f32>,
@@ -724,6 +734,7 @@ fn sparse_subm_conv_splitk_partial_kernel(
     partial[partial_idx] = acc;
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_splitk_partial_single_group_kernel(
     input: &Array<f32>,
@@ -775,6 +786,7 @@ fn sparse_subm_conv_splitk_partial_single_group_kernel(
     partial[partial_idx] = acc;
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_splitk_partial_fused_oc4_kernel(
     input: &Array<f32>,
@@ -909,6 +921,7 @@ fn sparse_subm_conv_splitk_partial_fused_oc4_kernel(
     }
 }
 
+#[allow(clippy::useless_conversion)]
 #[cube(launch_unchecked)]
 fn sparse_subm_conv_splitk_partial_single_group_fused_oc4_kernel(
     input: &Array<f32>,
@@ -1051,6 +1064,7 @@ fn sparse_subm_conv_splitk_finalize_kernel(
     output[out_idx] = acc;
 }
 
+#[allow(clippy::eq_op)]
 #[cube(launch_unchecked)]
 fn neighbor_rows_from_coords_kernel(
     coords: &Array<i32>,
@@ -3927,14 +3941,7 @@ pub fn multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu(
     rope_freq: [f32; 2],
     scale: f32,
     eps: f32,
-) -> Result<
-    (
-        BurnTensor<DefaultWgpuBackend, 4>,
-        BurnTensor<DefaultWgpuBackend, 4>,
-        BurnTensor<DefaultWgpuBackend, 4>,
-    ),
-    String,
-> {
+) -> Result<ModuleQkvRmsNormRopeOutput, String> {
     let input_dtype: burn::tensor::FloatDType = input.dtype().into();
     let input = cast_float_tensor_if_needed(input, burn::tensor::FloatDType::F32);
     let q_gamma = cast_float_tensor_if_needed(q_gamma, burn::tensor::FloatDType::F32);
@@ -4364,8 +4371,9 @@ fn resolve_split_k(
     {
         split = 1;
     }
-    if rows >= DEFAULT_SPARSE_WGPU_SPLIT_CAP_VERY_HIGH_OC_MIN_ROWS
-        && rows < DEFAULT_SPARSE_WGPU_SPLIT_CAP_HIGH_OC_ROWS
+    if (DEFAULT_SPARSE_WGPU_SPLIT_CAP_VERY_HIGH_OC_MIN_ROWS
+        ..DEFAULT_SPARSE_WGPU_SPLIT_CAP_HIGH_OC_ROWS)
+        .contains(&rows)
         && config.out_channels_per_group >= DEFAULT_SPARSE_WGPU_SPLIT_CAP_VERY_HIGH_OC_GROUP
     {
         split = 1;
@@ -4563,7 +4571,7 @@ fn resolve_neighbor_hash_table_size(rows: usize) -> usize {
 fn resolve_neighbor_hash_max_probe(table_size: usize) -> usize {
     // Keep probe work bounded for the current kernel form; the loop-break form
     // triggers cubecl-opt uniformity panics in this path.
-    table_size.min(DEFAULT_NEIGHBOR_HASH_MAX_PROBE).max(1)
+    table_size.clamp(1, DEFAULT_NEIGHBOR_HASH_MAX_PROBE)
 }
 
 fn resolve_neighbor_bucket_hash_bucket_size(rows: usize) -> usize {

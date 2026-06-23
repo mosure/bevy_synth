@@ -14,8 +14,8 @@ use burn_synth::progress::{
     log_progress_event,
 };
 use burn_synth::runtime::{
-    AssetRequest, DinoBackend as RuntimeDinoBackend, InferenceBackend, RuntimeConfig, SynthRuntime,
-    TrellisQuality as RuntimeTrellisQuality,
+    AssetBatchItem, AssetBatchRequest, DinoBackend as RuntimeDinoBackend, InferenceBackend,
+    RuntimeBatchPolicy, RuntimeConfig, SynthRuntime, TrellisQuality as RuntimeTrellisQuality,
 };
 use burn_synth::set_bootstrap_status_callback;
 use burn_synth::{
@@ -281,26 +281,30 @@ pub(crate) fn worker_loop_shared_runtime(
             WorkerCommand::Warmup => {}
             WorkerCommand::Infer(requests) => {
                 let started = Instant::now();
-                let mut results = Vec::with_capacity(requests.len());
-                for request in requests.iter() {
-                    if let Some(err) = terminal_worker_error.as_ref() {
-                        results.push(Err(format!(
+                let results = if let Some(err) = terminal_worker_error.as_ref() {
+                    vec![
+                        Err(format!(
                             "synthesis worker stopped after prior panic; restart the app before retrying: {err}"
-                        )));
-                        continue;
+                        ));
+                        requests.len()
+                    ]
+                } else {
+                    let context = format!(
+                        "while processing native batch of {} request(s)",
+                        requests.len()
+                    );
+                    match catch_worker_unwind(&context, || {
+                        infer_request_batch(&mut runtime, &args, &requests)
+                    }) {
+                        Ok(results) => results,
+                        Err(err) => {
+                            if err.starts_with(WORKER_PANIC_PREFIX) {
+                                terminal_worker_error = Some(err.clone());
+                            }
+                            vec![Err(err); requests.len()]
+                        }
                     }
-                    let context = format!("while processing {}", request.image_path.display());
-                    let result = catch_worker_unwind(&context, || {
-                        infer_one_request(&mut runtime, &args, request)
-                    });
-                    if let Err(err) = &result
-                        && err.starts_with(WORKER_PANIC_PREFIX)
-                    {
-                        terminal_worker_error = Some(err.clone());
-                    }
-                    let result = result.map(Some);
-                    results.push(result);
-                }
+                };
                 let sent = event_tx.send(WorkerEvent {
                     requests,
                     results,
@@ -433,11 +437,90 @@ fn runtime_config_from_args(
     Ok(config)
 }
 
-fn infer_one_request(
+fn infer_request_batch(
     runtime: &mut SynthRuntime,
     args: &AppArgs,
-    request: &InferenceRequest,
-) -> Result<SynthAsset, String> {
+    requests: &[InferenceRequest],
+) -> Result<Vec<Result<Option<SynthAsset>, String>>, String> {
+    let mut results = Vec::with_capacity(requests.len());
+    let mut start = 0;
+    while start < requests.len() {
+        let mut end = start + 1;
+        while end < requests.len()
+            && requests_compatible_for_batch(args, &requests[start], &requests[end])
+        {
+            end += 1;
+        }
+        results.extend(infer_homogeneous_request_batch(
+            runtime,
+            args,
+            &requests[start..end],
+        )?);
+        start = end;
+    }
+    Ok(results)
+}
+
+fn requests_compatible_for_batch(
+    args: &AppArgs,
+    lhs: &InferenceRequest,
+    rhs: &InferenceRequest,
+) -> bool {
+    lhs.settings == rhs.settings
+        && effective_synthesis_models(args, lhs) == effective_synthesis_models(args, rhs)
+}
+
+fn infer_homogeneous_request_batch(
+    runtime: &mut SynthRuntime,
+    args: &AppArgs,
+    requests: &[InferenceRequest],
+) -> Result<Vec<Result<Option<SynthAsset>, String>>, String> {
+    let Some(first) = requests.first() else {
+        return Ok(Vec::new());
+    };
+    apply_request_settings(runtime, args, first);
+    let synthesis_models = effective_synthesis_models(args, first);
+    let batch = runtime
+        .synthesize_assets_batch(AssetBatchRequest {
+            items: requests
+                .iter()
+                .map(|request| {
+                    let image = request
+                        .image_contents
+                        .as_ref()
+                        .map(|bytes| ImageSource::from_bytes(bytes.clone()))
+                        .unwrap_or_else(|| ImageSource::from_path(request.image_path.clone()));
+                    AssetBatchItem::new(request.id.to_string(), image)
+                })
+                .collect(),
+            foreground_model: Some(map_foreground_model(args.rmbg_model)),
+            synthesis_models: Some(
+                synthesis_models
+                    .iter()
+                    .copied()
+                    .map(map_synthesis_model)
+                    .collect(),
+            ),
+            backend: Some(map_backend(&args.backend)),
+            dry_run: false,
+            policy: RuntimeBatchPolicy {
+                max_items: Some(requests.len().max(1)),
+                ..RuntimeBatchPolicy::default()
+            },
+        })
+        .map_err(|err| format!("synthesis batch inference failed: {err}"))?;
+    Ok(batch
+        .items
+        .into_iter()
+        .map(|item| {
+            item.output
+                .map(|output| Some(runtime_asset_to_synth_asset(output.asset)))
+                .map_err(|err| format!("synthesis inference failed: {err}"))
+        })
+        .collect())
+}
+
+fn apply_request_settings(runtime: &mut SynthRuntime, args: &AppArgs, request: &InferenceRequest) {
     {
         let request_model = request
             .synthesis_models
@@ -462,37 +545,17 @@ fn infer_one_request(
         config.trellis_pbr_enabled = request.settings.trellis_pbr_enabled;
         config.trellis_pbr_texture_size = request.settings.trellis_pbr_texture_size;
     }
+}
 
-    let image = request
-        .image_contents
-        .as_ref()
-        .map(|bytes| ImageSource::from_bytes(bytes.clone()))
-        .unwrap_or_else(|| ImageSource::from_path(request.image_path.clone()));
-
-    let synthesis_models = if request.synthesis_models.is_empty() {
+fn effective_synthesis_models(
+    args: &AppArgs,
+    request: &InferenceRequest,
+) -> Vec<crate::args::SynthesisModel> {
+    if request.synthesis_models.is_empty() {
         args.synthesis_models.clone()
     } else {
         request.synthesis_models.clone()
-    };
-
-    let request = AssetRequest {
-        image,
-        foreground_model: Some(map_foreground_model(args.rmbg_model)),
-        synthesis_models: Some(
-            synthesis_models
-                .iter()
-                .copied()
-                .map(map_synthesis_model)
-                .collect(),
-        ),
-        backend: Some(map_backend(&args.backend)),
-        dry_run: false,
-    };
-
-    let output = runtime
-        .synthesize_asset(request)
-        .map_err(|err| format!("synthesis inference failed: {err}"))?;
-    Ok(runtime_asset_to_synth_asset(output.asset))
+    }
 }
 
 fn runtime_asset_to_synth_asset(asset: RuntimeSynthesisAsset) -> SynthAsset {

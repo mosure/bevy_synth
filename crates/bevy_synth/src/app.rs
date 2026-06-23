@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use bevy::app::AppExit;
-use bevy::asset::RenderAssetUsages;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::io::web::WebAssetPlugin;
 #[cfg(target_arch = "wasm32")]
-use bevy::asset::{AssetMetaCheck, AssetMode, AssetPlugin, UnapprovedPathMode};
+use bevy::asset::{AssetMetaCheck, AssetMode};
+use bevy::asset::{AssetPlugin, RenderAssetUsages, UnapprovedPathMode};
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -39,6 +39,8 @@ use bevy::render::renderer::{
 };
 #[cfg(target_arch = "wasm32")]
 use bevy::render::settings::{Backends, WgpuSettings};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(target_arch = "wasm32")]
 use bevy::window::{Window, WindowPlugin};
@@ -73,7 +75,7 @@ use bevy_synth_ui::bevy_transform_gizmos::{
 };
 use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::args::BackendKind;
@@ -84,6 +86,8 @@ use bevy_synth_runtime::args::{QualityPreset, RmbgModel, TripoSplatProfile, Weig
 use bevy_synth_runtime::cache::{
     CachedCameraState, CachedMeshMetadata, CachedWorldItem, MeshCache,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::io::mesh_from_glb_bytes;
 use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
 use bevy_synth_runtime::state::{
@@ -230,6 +234,7 @@ impl Default for WorldCachePersistence {
 #[derive(Resource, Default)]
 struct McpSceneControl {
     path: Option<PathBuf>,
+    status_path: Option<PathBuf>,
     last_modified: Option<SystemTime>,
 }
 
@@ -264,8 +269,13 @@ impl Default for WasmWarmupKickoff {
 #[cfg(not(target_arch = "wasm32"))]
 impl McpSceneControl {
     fn from_args(args: &AppArgs) -> Self {
+        let status_path = args
+            .mcp_scene_control_path
+            .as_ref()
+            .map(|path| path.with_extension("status.json"));
         Self {
             path: args.mcp_scene_control_path.clone(),
+            status_path,
             last_modified: None,
         }
     }
@@ -558,6 +568,10 @@ pub(crate) fn should_share_wgpu_inference_device_for_platform(
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Deserialize)]
 struct McpSceneCommandEnvelope {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    sequence: Option<u64>,
     commands: Vec<McpSceneCommand>,
 }
 
@@ -576,9 +590,23 @@ enum McpSceneCommand {
         #[serde(default)]
         select: bool,
     },
+    SpawnPath {
+        path: PathBuf,
+        #[serde(default)]
+        cache_key: Option<String>,
+        #[serde(default)]
+        translation: Option<[f32; 3]>,
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+        #[serde(default)]
+        scale: Option<[f32; 3]>,
+        #[serde(default)]
+        select: bool,
+    },
     DeleteByCacheKey {
         cache_key: String,
     },
+    ClearScene,
     DeleteSelected,
     ClearSelection,
     SetCamera {
@@ -593,7 +621,39 @@ enum McpSceneCommand {
         #[serde(default)]
         radius: Option<f32>,
     },
+    CaptureScreenshot {
+        path: PathBuf,
+    },
     SaveCache,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize)]
+struct McpSceneStatus {
+    session_id: Option<String>,
+    last_sequence: Option<u64>,
+    ok: bool,
+    message: String,
+    requested_commands: usize,
+    applied_commands: usize,
+    command_results: Vec<McpSceneCommandResult>,
+    cache_entries: Vec<CachedMeshMetadata>,
+    world_items: Vec<CachedWorldItem>,
+    camera: Option<CachedCameraState>,
+    screenshots: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize)]
+struct McpSceneCommandResult {
+    index: usize,
+    command_type: &'static str,
+    applied: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 #[derive(SystemParam)]
@@ -964,7 +1024,12 @@ fn configure_mesh_picking(mut settings: ResMut<MeshPickingSettings>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn add_default_plugins(app: &mut App) {
-    app.add_plugins(DefaultPlugins);
+    app.add_plugins(DefaultPlugins.set(AssetPlugin {
+        // Native users and MCP agents spawn generated assets from tmp/run dirs,
+        // desktop file pickers, and cache paths outside Bevy's asset root.
+        unapproved_path_mode: UnapprovedPathMode::Allow,
+        ..default()
+    }));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1333,7 +1398,16 @@ fn initialize_interactive_scene(
 
     if let Some(mesh_path) = args.mesh.as_ref() {
         if mesh_path.exists() {
-            spawn_mesh_asset(commands, asset_server, materials, mesh_path.clone());
+            if let Err(err) = spawn_mesh_asset(
+                commands,
+                asset_server,
+                meshes,
+                images,
+                materials,
+                mesh_path.clone(),
+            ) {
+                warn!("failed to load mesh path {}: {err}", mesh_path.display());
+            }
         } else {
             warn!("mesh path {:?} does not exist; skipping", mesh_path);
         }
@@ -2194,6 +2268,8 @@ fn handle_file_dialog_loads(
     mut events: MessageReader<DialogFileLoaded<ImagePickDialog>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut queue: ResMut<InferenceQueue>,
     args: Res<AppArgs>,
@@ -2215,6 +2291,8 @@ fn handle_file_dialog_loads(
             &mut catalog,
             &mut commands,
             &asset_server,
+            &mut meshes,
+            &mut images,
             &mut materials,
             "selected file",
         );
@@ -2230,6 +2308,8 @@ fn handle_dropped_files(
     mut events: MessageReader<DialogFileDropped<ImagePickDialog>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut queue: ResMut<InferenceQueue>,
     args: Res<AppArgs>,
@@ -2251,6 +2331,8 @@ fn handle_dropped_files(
             &mut catalog,
             &mut commands,
             &asset_server,
+            &mut meshes,
+            &mut images,
             &mut materials,
             "dropped file",
         );
@@ -2270,6 +2352,8 @@ fn ingest_candidate_file(
     catalog: &mut CatalogState,
     commands: &mut Commands,
     asset_server: &AssetServer,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     source_label: &str,
 ) -> usize {
@@ -2281,8 +2365,17 @@ fn ingest_candidate_file(
             return 1;
         }
         if is_mesh_file(path) {
-            spawn_mesh_asset(commands, asset_server, materials, path.to_path_buf());
-            info!("loaded mesh asset {}", path.display());
+            match spawn_mesh_asset(
+                commands,
+                asset_server,
+                meshes,
+                images,
+                materials,
+                path.to_path_buf(),
+            ) {
+                Ok(_) => info!("loaded mesh asset {}", path.display()),
+                Err(err) => warn!("failed to load mesh asset {}: {err}", path.display()),
+            }
             return 0;
         }
         warn!(
@@ -2331,6 +2424,7 @@ fn virtual_upload_path(file_name: &str, request_id: u32) -> PathBuf {
 fn poll_mcp_scene_control(
     mut control: ResMut<McpSceneControl>,
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -2372,8 +2466,8 @@ fn poll_mcp_scene_control(
     }
     control.last_modified = Some(modified);
 
-    let commands_to_apply = match read_mcp_scene_commands(&path) {
-        Ok(commands_to_apply) => commands_to_apply,
+    let envelope = match read_mcp_scene_commands(&path) {
+        Ok(envelope) => envelope,
         Err(err) => {
             warn!(
                 "Failed to parse MCP scene control file {}: {err}",
@@ -2382,13 +2476,22 @@ fn poll_mcp_scene_control(
             return;
         }
     };
+    let session_id = envelope.session_id.clone();
+    let sequence = envelope.sequence;
+    let commands_to_apply = envelope.commands;
     if commands_to_apply.is_empty() {
         return;
     }
+    let requested_commands = commands_to_apply.len();
 
     let mut scene_changed = false;
     let mut force_cache_flush = false;
-    for command in commands_to_apply {
+    let mut screenshots = Vec::new();
+    let mut predicted_world_items = Vec::new();
+    let mut deleted_cache_keys = Vec::new();
+    let mut cleared_scene = false;
+    let mut command_results = Vec::with_capacity(requested_commands);
+    for (command_index, command) in commands_to_apply.into_iter().enumerate() {
         match command {
             McpSceneCommand::SpawnCached {
                 cache_key,
@@ -2401,16 +2504,40 @@ fn poll_mcp_scene_control(
                     Ok(Some(asset)) => asset,
                     Ok(None) => {
                         warn!("MCP spawn_cached skipped: cache key {cache_key} not found");
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "spawn_cached",
+                            false,
+                            format!("cache key {cache_key} not found"),
+                            Some(cache_key),
+                            None,
+                        ));
                         continue;
                     }
                     Err(err) => {
                         warn!("MCP spawn_cached failed for {cache_key}: {err}");
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "spawn_cached",
+                            false,
+                            format!("cache load failed: {err}"),
+                            Some(cache_key),
+                            None,
+                        ));
                         continue;
                     }
                 };
                 let Some(transform) = transform_from_optional_parts(translation, rotation, scale)
                 else {
                     warn!("MCP spawn_cached skipped due to invalid transform values");
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_cached",
+                        false,
+                        "invalid transform values",
+                        Some(cache_key),
+                        None,
+                    ));
                     continue;
                 };
                 let metadata = cache
@@ -2438,17 +2565,126 @@ fn poll_mcp_scene_control(
                     &mut materials,
                     &mut gaussian_clouds,
                 ) else {
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_cached",
+                        false,
+                        "failed to prepare cached asset handles",
+                        Some(cache_key),
+                        None,
+                    ));
                     continue;
                 };
+                let predicted_item =
+                    cached_world_item_from_transform(cache_key.clone(), &transform);
                 let entity = spawn_cached_asset_instance(
                     &mut commands,
                     &handles,
                     transform,
-                    Some(cache_key),
+                    Some(cache_key.clone()),
                 );
                 if select {
                     selection.set(entity);
                 }
+                predicted_world_items.push(predicted_item);
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "spawn_cached",
+                    true,
+                    "spawned cached asset",
+                    Some(cache_key),
+                    None,
+                ));
+                scene_changed = true;
+            }
+            McpSceneCommand::SpawnPath {
+                path,
+                cache_key,
+                translation,
+                rotation,
+                scale,
+                select,
+            } => {
+                if !path.exists() {
+                    warn!("MCP spawn_path skipped: path {} not found", path.display());
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_path",
+                        false,
+                        "path not found",
+                        cache_key,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                }
+                if !is_mesh_file(path.as_path()) {
+                    warn!(
+                        "MCP spawn_path skipped: {} is not a supported mesh file",
+                        path.display()
+                    );
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_path",
+                        false,
+                        "unsupported mesh file",
+                        cache_key,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                }
+                let Some(transform) = transform_from_optional_parts(translation, rotation, scale)
+                else {
+                    warn!("MCP spawn_path skipped due to invalid transform values");
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_path",
+                        false,
+                        "invalid transform values",
+                        cache_key,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                };
+                let cache_key = cache_key.unwrap_or_else(|| format!("path:{}", path.display()));
+                let path_label = path.display().to_string();
+                let predicted_item =
+                    cached_world_item_from_transform(cache_key.clone(), &transform);
+                let entity = match spawn_mesh_asset_with_transform(
+                    &mut commands,
+                    &asset_server,
+                    &mut meshes,
+                    &mut images,
+                    &mut materials,
+                    path.clone(),
+                    transform,
+                    Some(cache_key.clone()),
+                ) {
+                    Ok(entity) => entity,
+                    Err(err) => {
+                        warn!("MCP spawn_path failed for {}: {err}", path.display());
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "spawn_path",
+                            false,
+                            format!("failed to load mesh path: {err}"),
+                            Some(cache_key),
+                            Some(path.display().to_string()),
+                        ));
+                        continue;
+                    }
+                };
+                if select {
+                    selection.set(entity);
+                }
+                predicted_world_items.push(predicted_item);
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "spawn_path",
+                    true,
+                    "spawned mesh path",
+                    Some(cache_key),
+                    Some(path_label),
+                ));
                 scene_changed = true;
             }
             McpSceneCommand::DeleteByCacheKey { cache_key } => {
@@ -2462,24 +2698,80 @@ fn poll_mcp_scene_control(
                         }
                     })
                     .collect();
+                let deleted = !to_despawn.is_empty();
                 for entity in to_despawn {
                     commands.entity(entity).despawn();
                     scene_changed = true;
                 }
+                deleted_cache_keys.push(cache_key);
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "delete_by_cache_key",
+                    deleted,
+                    if deleted {
+                        "deleted cached instances"
+                    } else {
+                        "no cached instances matched"
+                    },
+                    deleted_cache_keys.last().cloned(),
+                    None,
+                ));
+            }
+            McpSceneCommand::ClearScene => {
+                let to_despawn = cached_instances
+                    .iter()
+                    .map(|(entity, _)| entity)
+                    .collect::<Vec<_>>();
+                let deleted = to_despawn.len();
+                for entity in to_despawn {
+                    commands.entity(entity).despawn();
+                }
+                selection.clear();
+                cleared_scene = true;
+                scene_changed = true;
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "clear_scene",
+                    true,
+                    format!("cleared {deleted} cached scene item(s)"),
+                    None,
+                    None,
+                ));
             }
             McpSceneCommand::DeleteSelected => {
                 let to_despawn: Vec<Entity> = selection
                     .iter()
                     .filter(|entity| transformables.contains(*entity))
                     .collect();
+                let deleted = !to_despawn.is_empty();
                 for entity in to_despawn {
                     commands.entity(entity).despawn();
                     scene_changed = true;
                 }
                 selection.clear();
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "delete_selected",
+                    true,
+                    if deleted {
+                        "deleted selected transformables"
+                    } else {
+                        "selection cleared; no transformables selected"
+                    },
+                    None,
+                    None,
+                ));
             }
             McpSceneCommand::ClearSelection => {
                 selection.clear();
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "clear_selection",
+                    true,
+                    "selection cleared",
+                    None,
+                    None,
+                ));
             }
             McpSceneCommand::SetCamera {
                 translation,
@@ -2526,12 +2818,78 @@ fn poll_mcp_scene_control(
                             orbit.radius = Some(radius);
                             orbit.target_radius = radius;
                         }
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "set_camera",
+                            true,
+                            "camera updated",
+                            None,
+                            None,
+                        ));
                         scene_changed = true;
+                    } else {
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "set_camera",
+                            false,
+                            "camera transform was not finite",
+                            None,
+                            None,
+                        ));
                     }
+                } else {
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "set_camera",
+                        false,
+                        "main camera not found",
+                        None,
+                        None,
+                    ));
                 }
+            }
+            McpSceneCommand::CaptureScreenshot { path } => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(err) = fs::create_dir_all(parent)
+                {
+                    warn!(
+                        "MCP capture_screenshot could not create {}: {err}",
+                        parent.display()
+                    );
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "capture_screenshot",
+                        false,
+                        format!("could not create parent directory: {err}"),
+                        None,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                }
+                screenshots.push(path.display().to_string());
+                commands
+                    .spawn(Screenshot::primary_window())
+                    .observe(save_to_disk(path));
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "capture_screenshot",
+                    true,
+                    "screenshot requested",
+                    None,
+                    screenshots.last().cloned(),
+                ));
             }
             McpSceneCommand::SaveCache => {
                 force_cache_flush = true;
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "save_cache",
+                    true,
+                    "cache flush requested",
+                    None,
+                    None,
+                ));
             }
         }
     }
@@ -2554,6 +2912,52 @@ fn poll_mcp_scene_control(
     } else if scene_changed {
         world_cache.dirty = true;
         world_cache.timer.reset();
+    }
+
+    if let Some(status_path) = control.status_path.as_deref() {
+        let camera_state = {
+            let main_camera = query_set.p0();
+            main_camera
+                .single()
+                .ok()
+                .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit))
+        };
+        let cached_query = query_set.p1();
+        let mut world_items = if cleared_scene {
+            Vec::new()
+        } else {
+            collect_cached_world_items(&cached_query)
+        };
+        if !deleted_cache_keys.is_empty() {
+            world_items.retain(|item| !deleted_cache_keys.contains(&item.cache_key));
+        }
+        world_items.extend(predicted_world_items);
+        let status = McpSceneStatus {
+            session_id,
+            last_sequence: sequence,
+            ok: command_results.iter().all(|result| result.applied),
+            message: if command_results.iter().all(|result| result.applied) {
+                "applied".to_string()
+            } else {
+                "partially_applied".to_string()
+            },
+            requested_commands,
+            applied_commands: command_results
+                .iter()
+                .filter(|result| result.applied)
+                .count(),
+            command_results,
+            cache_entries: cache.cache.asset_entries().to_vec(),
+            world_items,
+            camera: camera_state,
+            screenshots,
+        };
+        if let Err(err) = write_mcp_scene_status(status_path, &status) {
+            warn!(
+                "Failed to write MCP scene status {}: {err}",
+                status_path.display()
+            );
+        }
     }
 }
 
@@ -3296,16 +3700,122 @@ fn update_status_message(args: &AppArgs, queue: &InferenceQueue, status: &mut Ui
 fn spawn_mesh_asset(
     commands: &mut Commands,
     asset_server: &AssetServer,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     mesh_path: PathBuf,
-) {
+) -> Result<Entity, String> {
+    spawn_mesh_asset_with_transform(
+        commands,
+        asset_server,
+        meshes,
+        images,
+        materials,
+        mesh_path,
+        Transform::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_mesh_asset_with_transform(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+    mesh_path: PathBuf,
+    transform: Transform,
+    cache_key: Option<String>,
+) -> Result<Entity, String> {
+    #[cfg(target_arch = "wasm32")]
+    let _ = (&mut *meshes, &mut *images);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if is_glb_file(&mesh_path) {
+        let (mesh_handle, material) =
+            load_generated_glb_mesh_asset(&mesh_path, meshes, images, materials)?;
+        return Ok(spawn_mesh_instance(
+            commands,
+            mesh_handle,
+            material,
+            transform,
+            cache_key,
+        ));
+    }
+
+    if is_gltf_file(&mesh_path) {
+        let mesh_handle: Handle<BevyMesh> = asset_server.load(
+            GltfAssetLabel::Primitive {
+                mesh: 0,
+                primitive: 0,
+            }
+            .from_asset(mesh_path),
+        );
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.82, 0.82, 0.9),
+            cull_mode: None,
+            ..default()
+        });
+        return Ok(spawn_mesh_instance(
+            commands,
+            mesh_handle,
+            material,
+            transform,
+            cache_key,
+        ));
+    }
+
     let mesh_handle: Handle<BevyMesh> = asset_server.load(mesh_path);
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.82, 0.82, 0.9),
         cull_mode: None,
         ..default()
     });
-    spawn_mesh_instance(commands, mesh_handle, material, Transform::default(), None);
+    Ok(spawn_mesh_instance(
+        commands,
+        mesh_handle,
+        material,
+        transform,
+        cache_key,
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn load_generated_glb_mesh_asset(
+    path: &Path,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Result<(Handle<BevyMesh>, Handle<StandardMaterial>), String> {
+    let bytes =
+        std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mesh = mesh_from_glb_bytes(bytes.as_slice())
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
+    let material = materials.add(standard_material_for_inference(&mesh, images));
+    Ok((mesh_handle, material))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_glb_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("glb")
+    )
+}
+
+fn is_gltf_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("glb" | "gltf")
+    )
 }
 
 pub(crate) fn spawn_mesh_instance(
@@ -3468,19 +3978,45 @@ fn collect_cached_world_items(
 ) -> Vec<CachedWorldItem> {
     let mut world_items = Vec::new();
     for (cached, transform) in query.iter() {
-        let rotation = if transform.rotation.length_squared() > 0.0 {
-            transform.rotation.normalize()
-        } else {
-            Quat::IDENTITY
-        };
-        world_items.push(CachedWorldItem {
-            cache_key: cached.cache_key.clone(),
-            translation: transform.translation.to_array(),
-            rotation: rotation.to_array(),
-            scale: transform.scale.to_array(),
-        });
+        world_items.push(cached_world_item_from_transform(
+            cached.cache_key.clone(),
+            transform,
+        ));
     }
     world_items
+}
+
+fn cached_world_item_from_transform(cache_key: String, transform: &Transform) -> CachedWorldItem {
+    let rotation = if transform.rotation.length_squared() > 0.0 {
+        transform.rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    CachedWorldItem {
+        cache_key,
+        translation: transform.translation.to_array(),
+        rotation: rotation.to_array(),
+        scale: transform.scale.to_array(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mcp_scene_command_result(
+    index: usize,
+    command_type: &'static str,
+    applied: bool,
+    message: impl Into<String>,
+    cache_key: Option<String>,
+    path: Option<String>,
+) -> McpSceneCommandResult {
+    McpSceneCommandResult {
+        index,
+        command_type,
+        applied,
+        message: message.into(),
+        cache_key,
+        path,
+    }
 }
 
 fn flush_world_cache_now(
@@ -3500,29 +4036,54 @@ fn flush_world_cache_now(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn read_mcp_scene_commands(path: &std::path::Path) -> Result<Vec<McpSceneCommand>, io::Error> {
+fn read_mcp_scene_commands(path: &std::path::Path) -> Result<McpSceneCommandEnvelope, io::Error> {
     let content = fs::read_to_string(path)?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(McpSceneCommandEnvelope {
+            session_id: None,
+            sequence: None,
+            commands: Vec::new(),
+        });
     }
     if trimmed.starts_with('[') {
-        return serde_json::from_str::<Vec<McpSceneCommand>>(trimmed).map_err(|err| {
+        let commands = serde_json::from_str::<Vec<McpSceneCommand>>(trimmed).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid command array JSON: {err}"),
             )
+        })?;
+        return Ok(McpSceneCommandEnvelope {
+            session_id: None,
+            sequence: None,
+            commands,
         });
     }
 
-    serde_json::from_str::<McpSceneCommandEnvelope>(trimmed)
-        .map(|envelope| envelope.commands)
-        .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid command envelope JSON: {err}"),
-            )
-        })
+    serde_json::from_str::<McpSceneCommandEnvelope>(trimmed).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid command envelope JSON: {err}"),
+        )
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_mcp_scene_status(path: &std::path::Path, status: &McpSceneStatus) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("status.json.tmp");
+    let bytes = serde_json::to_vec_pretty(status).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize MCP scene status: {err}"),
+        )
+    })?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

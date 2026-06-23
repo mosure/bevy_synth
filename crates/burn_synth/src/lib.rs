@@ -40,10 +40,12 @@ pub use progress::{
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{
+    AssetBatchItem, AssetBatchItemOutput, AssetBatchOutput, AssetBatchRequest,
     AssetOutput as RuntimeAssetOutput, AssetRequest, DinoBackend, ForegroundOutput,
     ForegroundRequest, InferenceBackend, MeshOutput as RuntimeMeshOutput, MeshRequest,
-    RuntimeConfig, RuntimeError, SplatOutput as RuntimeSplatOutput, SplatRequest, SynthRuntime,
-    TrellisComputeProfile, TrellisQuality,
+    RuntimeBatchExecutionMode, RuntimeBatchPolicy, RuntimeBatchStats, RuntimeConfig, RuntimeError,
+    SplatOutput as RuntimeSplatOutput, SplatRequest, SynthRuntime, TrellisComputeProfile,
+    TrellisQuality,
 };
 
 #[cfg(feature = "triposg")]

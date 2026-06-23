@@ -2,14 +2,16 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use burn_synth::{
-    AssetRequest, DinoBackend, ForegroundRequest, ImageSource, MeshRequest, ModelSelection,
-    ProgressVerbosity, RuntimeConfig, RuntimeProgressObserver, RuntimeSplatOutput, SplatRequest,
-    SynthRuntime, SynthesisAsset, default_log_progress_callback,
+    AssetBatchItem, AssetBatchRequest, DinoBackend, ForegroundRequest, ImageSource, ModelSelection,
+    ProgressVerbosity, RuntimeBatchPolicy, RuntimeBatchStats, RuntimeConfig,
+    RuntimeProgressObserver, SplatRequest, SynthRuntime, SynthesisAsset,
+    default_log_progress_callback,
     quality::{DEFAULT_TRELLIS_TARGET_FACES, DEFAULT_TRIPOSG_TARGET_FACES, RuntimeQualityPreset},
     triposplat::TripoSplatBurnpackPrecision,
     write_glb_mesh,
 };
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -131,6 +133,18 @@ struct Cli {
 
     #[arg(long, default_value_t = 1, global = true)]
     progress_every: usize,
+
+    /// Batch chunk size for repeated --input values. Use "auto" to bound chunks by detected free VRAM.
+    #[arg(long, default_value = "auto", value_parser = parse_cli_batch_size, global = true)]
+    batch_size: CliBatchSize,
+
+    /// Explicit VRAM budget in MB for auto batch planning.
+    #[arg(long, global = true)]
+    batch_vram_mb: Option<u64>,
+
+    /// Optional machine-readable batch report path.
+    #[arg(long, global = true)]
+    batch_report_json: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -173,6 +187,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CliBatchSize {
+    Auto,
+    Fixed(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -396,6 +416,9 @@ fn run(cli: Cli) -> Result<(), String> {
         );
     }
     let mut runtime = SynthRuntime::new(runtime_config);
+    let batch_policy = runtime_batch_policy(cli.batch_size, cli.batch_vram_mb);
+    let batch_report_path = cli.batch_report_json.clone();
+    let mut batch_report_entries = Vec::new();
 
     match cli.command {
         Command::Foreground { inputs, output } => {
@@ -435,34 +458,77 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             ensure_inputs_exist(inputs.as_slice())?;
             let input_count = inputs.len();
-            for input in inputs.iter() {
-                let command_start = Instant::now();
-                let output =
-                    resolve_glb_output_path(output.as_deref(), input.as_path(), input_count)?;
-                let result = runtime
-                    .synthesize_mesh(MeshRequest {
-                        image: ImageSource::from_path(input.clone()),
-                        foreground_model: Some(cli.rmbg_model.into()),
-                        synthesis_models: Some(
-                            synthesis_models.iter().copied().map(Into::into).collect(),
-                        ),
-                        backend: Some(cli.backend.into()),
-                        dry_run,
-                    })
-                    .map_err(|err| err.to_string())?;
-                write_glb_mesh(output.as_path(), &result.mesh)?;
+            let output_paths = inputs
+                .iter()
+                .map(|input| {
+                    resolve_glb_output_path(output.as_deref(), input.as_path(), input_count)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let batch_start = Instant::now();
+            let batch = runtime
+                .synthesize_assets_batch(AssetBatchRequest {
+                    items: inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, input)| {
+                            AssetBatchItem::new(
+                                format!("mesh_{index}"),
+                                ImageSource::from_path(input.clone()),
+                            )
+                        })
+                        .collect(),
+                    foreground_model: Some(cli.rmbg_model.into()),
+                    synthesis_models: Some(
+                        synthesis_models.iter().copied().map(Into::into).collect(),
+                    ),
+                    backend: Some(cli.backend.into()),
+                    dry_run,
+                    policy: batch_policy,
+                })
+                .map_err(|err| err.to_string())?;
+            for (item, (input, output)) in batch
+                .items
+                .iter()
+                .zip(inputs.iter().zip(output_paths.iter()))
+            {
+                let result = item.output.as_ref().map_err(|err| err.to_string())?;
+                let mesh = match &result.asset {
+                    SynthesisAsset::Mesh(mesh) => mesh,
+                    SynthesisAsset::GaussianSplat(_) => {
+                        return Err(
+                            "internal output mismatch: mesh command returned Gaussian splats"
+                                .to_string(),
+                        );
+                    }
+                };
+                write_glb_mesh(output.as_path(), mesh)?;
                 println!(
-                    "mesh saved: {} (vertices={}, faces={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
+                    "mesh saved: {} (vertices={}, faces={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, chunk={}, item_ms={:.1})",
                     output.display(),
-                    result.mesh.vertices.len(),
-                    result.mesh.faces.len(),
+                    mesh.vertices.len(),
+                    mesh.faces.len(),
                     foreground_model_name(result.foreground_model),
                     synthesis_model_name(result.synthesis_backend),
                     backend_name(result.backend),
                     dry_run,
-                    command_start.elapsed().as_secs_f64() * 1000.0
+                    item.chunk_index,
+                    item.elapsed_ms
                 );
+                batch_report_entries.push(json!({
+                    "command": "mesh",
+                    "input": input.display().to_string(),
+                    "output": output.display().to_string(),
+                    "chunk_index": item.chunk_index,
+                    "item_index": item.item_index,
+                    "elapsed_ms": item.elapsed_ms,
+                    "vertices": mesh.vertices.len(),
+                    "faces": mesh.faces.len(),
+                    "backend": backend_name(result.backend),
+                    "synthesis_backend": synthesis_model_name(result.synthesis_backend),
+                    "dry_run": dry_run,
+                }));
             }
+            push_batch_stats_report(&mut batch_report_entries, "mesh", batch_start, &batch.stats);
         }
         Command::Splat {
             inputs,
@@ -471,21 +537,53 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             ensure_inputs_exist(inputs.as_slice())?;
             let input_count = inputs.len();
-            for input in inputs.iter() {
-                let command_start = Instant::now();
-                let result = if triposplat_counts.len() == 1 {
-                    let output = runtime
-                        .synthesize_asset(AssetRequest {
-                            image: ImageSource::from_path(input.clone()),
-                            foreground_model: Some(cli.rmbg_model.into()),
-                            synthesis_models: Some(
-                                synthesis_models.iter().copied().map(Into::into).collect(),
-                            ),
-                            backend: Some(cli.backend.into()),
-                            dry_run,
+            if triposplat_counts.len() == 1 {
+                let output_paths = inputs
+                    .iter()
+                    .map(|input| {
+                        resolve_splat_output_paths(
+                            output.as_deref(),
+                            input.as_path(),
+                            &triposplat_counts,
+                            input_count,
+                        )
+                        .and_then(|paths| {
+                            paths
+                                .into_iter()
+                                .next()
+                                .ok_or_else(|| "internal empty splat output path list".to_string())
                         })
-                        .map_err(|err| err.to_string())?;
-                    let splats = match output.asset {
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let batch_start = Instant::now();
+                let batch = runtime
+                    .synthesize_assets_batch(AssetBatchRequest {
+                        items: inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(index, input)| {
+                                AssetBatchItem::new(
+                                    format!("splat_{index}"),
+                                    ImageSource::from_path(input.clone()),
+                                )
+                            })
+                            .collect(),
+                        foreground_model: Some(cli.rmbg_model.into()),
+                        synthesis_models: Some(
+                            synthesis_models.iter().copied().map(Into::into).collect(),
+                        ),
+                        backend: Some(cli.backend.into()),
+                        dry_run,
+                        policy: batch_policy,
+                    })
+                    .map_err(|err| err.to_string())?;
+                for (item, (input, output)) in batch
+                    .items
+                    .iter()
+                    .zip(inputs.iter().zip(output_paths.iter()))
+                {
+                    let result = item.output.as_ref().map_err(|err| err.to_string())?;
+                    let splats = match &result.asset {
                         SynthesisAsset::GaussianSplat(splats) => splats,
                         SynthesisAsset::Mesh(_) => {
                             return Err(
@@ -494,15 +592,44 @@ fn run(cli: Cli) -> Result<(), String> {
                             );
                         }
                     };
-                    RuntimeSplatOutput {
-                        splats: vec![splats],
-                        num_gaussians: triposplat_counts.clone(),
-                        foreground_model: output.foreground_model,
-                        synthesis_backend: output.synthesis_backend,
-                        backend: output.backend,
-                    }
-                } else {
-                    runtime
+                    write_splat_output(output.as_path(), splats)?;
+                    println!(
+                        "splat saved: {} (gaussians={}, splats={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, chunk={}, item_ms={:.1})",
+                        output.display(),
+                        triposplat_counts[0],
+                        splats.len(),
+                        foreground_model_name(result.foreground_model),
+                        synthesis_model_name(result.synthesis_backend),
+                        backend_name(result.backend),
+                        dry_run,
+                        item.chunk_index,
+                        item.elapsed_ms
+                    );
+                    batch_report_entries.push(json!({
+                        "command": "splat",
+                        "input": input.display().to_string(),
+                        "output": output.display().to_string(),
+                        "chunk_index": item.chunk_index,
+                        "item_index": item.item_index,
+                        "elapsed_ms": item.elapsed_ms,
+                        "gaussians": triposplat_counts[0],
+                        "splats": splats.len(),
+                        "backend": backend_name(result.backend),
+                        "synthesis_backend": synthesis_model_name(result.synthesis_backend),
+                        "dry_run": dry_run,
+                    }));
+                }
+                push_batch_stats_report(
+                    &mut batch_report_entries,
+                    "splat",
+                    batch_start,
+                    &batch.stats,
+                );
+            } else {
+                let batch_start = Instant::now();
+                for input in inputs.iter() {
+                    let command_start = Instant::now();
+                    let result = runtime
                         .synthesize_splats(SplatRequest {
                             image: ImageSource::from_path(input.clone()),
                             foreground_model: Some(cli.rmbg_model.into()),
@@ -510,45 +637,137 @@ fn run(cli: Cli) -> Result<(), String> {
                             num_gaussians: triposplat_counts.clone(),
                             dry_run,
                         })
-                        .map_err(|err| err.to_string())?
-                };
-                let outputs = resolve_splat_output_paths(
-                    output.as_deref(),
-                    input.as_path(),
-                    &result.num_gaussians,
-                    input_count,
-                )?;
-                if outputs.len() != result.splats.len() {
-                    return Err(format!(
-                        "internal TripoSplat output mismatch: {} paths for {} splat clouds",
-                        outputs.len(),
-                        result.splats.len()
-                    ));
+                        .map_err(|err| err.to_string())?;
+                    let outputs = resolve_splat_output_paths(
+                        output.as_deref(),
+                        input.as_path(),
+                        &result.num_gaussians,
+                        input_count,
+                    )?;
+                    if outputs.len() != result.splats.len() {
+                        return Err(format!(
+                            "internal TripoSplat output mismatch: {} paths for {} splat clouds",
+                            outputs.len(),
+                            result.splats.len()
+                        ));
+                    }
+                    let total_ms = command_start.elapsed().as_secs_f64() * 1000.0;
+                    for ((output, splats), count) in outputs
+                        .iter()
+                        .zip(result.splats.iter())
+                        .zip(result.num_gaussians.iter())
+                    {
+                        write_splat_output(output.as_path(), splats)?;
+                        println!(
+                            "splat saved: {} (gaussians={}, splats={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
+                            output.display(),
+                            count,
+                            splats.len(),
+                            foreground_model_name(result.foreground_model),
+                            synthesis_model_name(result.synthesis_backend),
+                            backend_name(result.backend),
+                            dry_run,
+                            total_ms
+                        );
+                        batch_report_entries.push(json!({
+                            "command": "splat",
+                            "input": input.display().to_string(),
+                            "output": output.display().to_string(),
+                            "elapsed_ms": total_ms,
+                            "gaussians": count,
+                            "splats": splats.len(),
+                            "backend": backend_name(result.backend),
+                            "synthesis_backend": synthesis_model_name(result.synthesis_backend),
+                            "dry_run": dry_run,
+                            "execution_mode": "serial_reuse_multi_density",
+                        }));
+                    }
                 }
-                let total_ms = command_start.elapsed().as_secs_f64() * 1000.0;
-                for ((output, splats), count) in outputs
-                    .iter()
-                    .zip(result.splats.iter())
-                    .zip(result.num_gaussians.iter())
-                {
-                    write_splat_output(output.as_path(), splats)?;
-                    println!(
-                        "splat saved: {} (gaussians={}, splats={}, fg_model={}, synth_backend={}, backend={}, dry_run={}, total_ms={:.1})",
-                        output.display(),
-                        count,
-                        splats.len(),
-                        foreground_model_name(result.foreground_model),
-                        synthesis_model_name(result.synthesis_backend),
-                        backend_name(result.backend),
-                        dry_run,
-                        total_ms
-                    );
-                }
+                batch_report_entries.push(json!({
+                    "command": "splat",
+                    "type": "batch_stats",
+                    "total_items": inputs.len(),
+                    "chunk_size": 1,
+                    "chunks": inputs.len(),
+                    "execution_mode": "serial_reuse_multi_density",
+                    "vram_budget_mb": null,
+                    "estimated_item_mb": null,
+                    "runtime_elapsed_ms": null,
+                    "wall_elapsed_ms": batch_start.elapsed().as_secs_f64() * 1000.0,
+                }));
             }
         }
     }
 
+    if let Some(report_path) = batch_report_path.as_deref() {
+        write_batch_report(report_path, &batch_report_entries)?;
+    }
+
     Ok(())
+}
+
+fn parse_cli_batch_size(value: &str) -> Result<CliBatchSize, String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(CliBatchSize::Auto);
+    }
+    let size = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid batch size '{value}': {err}"))?;
+    if size == 0 {
+        return Err("batch size must be 'auto' or a positive integer".to_string());
+    }
+    Ok(CliBatchSize::Fixed(size))
+}
+
+fn runtime_batch_policy(
+    batch_size: CliBatchSize,
+    vram_budget_mb: Option<u64>,
+) -> RuntimeBatchPolicy {
+    RuntimeBatchPolicy {
+        max_items: match batch_size {
+            CliBatchSize::Auto => None,
+            CliBatchSize::Fixed(size) => Some(size),
+        },
+        vram_budget_mb,
+        ..RuntimeBatchPolicy::default()
+    }
+}
+
+fn push_batch_stats_report(
+    entries: &mut Vec<serde_json::Value>,
+    command: &str,
+    start: Instant,
+    stats: &RuntimeBatchStats,
+) {
+    entries.push(json!({
+        "command": command,
+        "type": "batch_stats",
+        "total_items": stats.total_items,
+        "chunk_size": stats.chunk_size,
+        "chunks": stats.chunks,
+        "execution_mode": stats.execution_mode.as_str(),
+        "vram_budget_mb": stats.vram_budget_mb,
+        "estimated_item_mb": stats.estimated_item_mb,
+        "runtime_elapsed_ms": stats.elapsed_ms,
+        "wall_elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
+    }));
+}
+
+fn write_batch_report(path: &Path, entries: &[serde_json::Value]) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let report = json!({
+        "schema": "burn_synth.batch_report.v1",
+        "entries": entries,
+    });
+    let bytes = serde_json::to_vec_pretty(&report)
+        .map_err(|err| format!("failed to serialize batch report: {err}"))?;
+    std::fs::write(path, bytes)
+        .map_err(|err| format!("failed to write batch report {}: {err}", path.display()))
 }
 
 fn init_logging() {
@@ -969,6 +1188,8 @@ mod tests {
     fn mesh_cli_accepts_repeated_inputs_for_one_runtime_invocation() {
         let cli = Cli::parse_from([
             "burn_synth",
+            "--batch-size",
+            "2",
             "mesh",
             "--input",
             "first.png",
@@ -978,10 +1199,19 @@ mod tests {
         let Command::Mesh { inputs, .. } = cli.command else {
             panic!("expected mesh command");
         };
+        assert_eq!(cli.batch_size, CliBatchSize::Fixed(2));
         assert_eq!(
             inputs,
             vec![PathBuf::from("first.png"), PathBuf::from("second.png")]
         );
+    }
+
+    #[test]
+    fn cli_batch_size_defaults_to_auto() {
+        let cli = Cli::parse_from(["burn_synth", "mesh", "--input", "input.png"]);
+        assert_eq!(cli.batch_size, CliBatchSize::Auto);
+        assert_eq!(parse_cli_batch_size("4").unwrap(), CliBatchSize::Fixed(4));
+        assert!(parse_cli_batch_size("0").is_err());
     }
 
     #[test]
@@ -1172,6 +1402,7 @@ mod tests {
     fn splat_cli_dry_run_processes_repeated_inputs_with_one_runtime() {
         let root = unique_test_dir("splat_cli_dry_run_batch");
         let output_root = root.join("out");
+        let report = root.join("batch_report.json");
         fs::create_dir_all(&output_root).expect("failed to create temp test directory");
         let first = root.join("first.png");
         let second = root.join("second.png");
@@ -1184,6 +1415,10 @@ mod tests {
             "cpu",
             "--progress",
             "off",
+            "--batch-size",
+            "2",
+            "--batch-report-json",
+            report.to_str().expect("utf-8 report path"),
             "--gaussians",
             "32768",
             "splat",
@@ -1202,6 +1437,16 @@ mod tests {
             let metadata = fs::metadata(&output).expect("splat batch output should exist");
             assert!(metadata.len() > 0);
         }
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("batch report should be written"))
+                .expect("batch report should parse");
+        let entries = report["entries"].as_array().expect("entries array");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["type"].as_str() == Some("batch_stats")
+                    && entry["chunk_size"].as_u64() == Some(2))
+        );
         fs::remove_dir_all(root).expect("failed to remove temp test directory");
     }
 

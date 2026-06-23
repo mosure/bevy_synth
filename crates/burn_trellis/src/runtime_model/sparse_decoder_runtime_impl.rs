@@ -289,6 +289,10 @@ impl SparseUnetDecoderRuntime {
         .await
     }
 
+    // The decoder serializes access to the shared WGPU sparse-conv context while
+    // issuing async GPU readback/selection work; do not silently unlock and race
+    // the cache/context until the runtime has an async-aware ownership model.
+    #[allow(clippy::await_holding_lock)]
     async fn decode_internal(
         &self,
         coords: Option<&[[u32; 4]]>,

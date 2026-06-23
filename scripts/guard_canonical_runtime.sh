@@ -18,14 +18,29 @@ CANONICAL_FILES=(
 )
 
 collect_occurrences() {
-  local pattern="$1"
+  local needle="$1"
   local output_path="$2"
   local search_output
-  if command -v rg >/dev/null 2>&1; then
-    search_output="$(rg -n --no-heading "${pattern}" "${CANONICAL_FILES[@]}" || true)"
-  else
-    search_output="$(grep -n -E "${pattern}" "${CANONICAL_FILES[@]}" || true)"
-  fi
+  local search_path
+  search_output="$(
+    for search_path in "${CANONICAL_FILES[@]}"; do
+      awk -v file="${search_path}" -v needle="${needle}" '
+        /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ {
+          pending_test_cfg = 1
+          next
+        }
+        pending_test_cfg && /^[[:space:]]*mod tests[[:space:]]*\{/ {
+          exit
+        }
+        {
+          pending_test_cfg = 0
+        }
+        index($0, needle) > 0 {
+          printf "%s:%d:%s\n", file, NR, $0
+        }
+      ' "${search_path}"
+    done
+  )"
   if [[ -z "${search_output}" ]]; then
     : > "${output_path}"
     return 0
@@ -57,12 +72,12 @@ check_baseline() {
 
 check_baseline \
   "into_data" \
-  "\\.into_data\\(" \
+  ".into_data(" \
   "${BASELINE_DIR}/canonical_runtime_into_data.baseline"
 
 check_baseline \
   "std::env::var" \
-  "std::env::var\\(" \
+  "std::env::var(" \
   "${BASELINE_DIR}/canonical_runtime_env_var.baseline"
 
 run_strict_benchmark_invariants_if_configured() {

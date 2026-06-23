@@ -1022,9 +1022,7 @@ impl SparseFlowLinearWgpuBridge<WgpuRuntimeBackend> for SparseFlowLinearWgpuBrid
         if rows == 0 || in_channels == 0 || out_channels == 0 {
             return None;
         }
-        let Some(bias) = linear.bias.as_ref() else {
-            return None;
-        };
+        let bias = linear.bias.as_ref()?;
 
         let key = LinearF16CacheKey {
             weight_id: linear.weight.id.val(),
@@ -3656,7 +3654,6 @@ where
             let (q_module, q_dense) = if use_module_attention {
                 if let Some(norm) = self.q_rms_norm.as_ref() {
                     q = norm.forward(q);
-                } else {
                 }
                 (
                     Some(tensor_cast_float_4d_if_needed(
@@ -5619,8 +5616,6 @@ where
             } else if let (Some(pos_cache), Some(neg_cache)) = (cond_cache, neg_cache) {
                 fallback_batched_cache = concat_cross_kv_caches(pos_cache, neg_cache);
                 fallback_batched_cache.as_ref()
-            } else if cond_cache.is_none() && neg_cache.is_none() {
-                None
             } else {
                 None
             };

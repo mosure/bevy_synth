@@ -24,7 +24,7 @@ use crate::app::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
-    InferenceDispatchGate, should_pause_render_during_inference,
+    InferenceDispatchGate, load_generated_glb_mesh_asset, should_pause_render_during_inference,
     should_wait_before_inference_dispatch,
 };
 use bevy_synth_runtime::args::{
@@ -32,6 +32,8 @@ use bevy_synth_runtime::args::{
     RmbgBackend, RmbgModel, SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
 };
 use bevy_synth_runtime::cache::MeshCache;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::io::write_glb;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceWorker, UiStatus, WorkerCommand, WorkerEvent,
 };
@@ -102,6 +104,32 @@ fn dummy_mesh() -> SynthMesh {
         vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         faces: vec![[0, 1, 2]],
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_glb_path_loader_uses_runtime_mesh_parser() {
+    let dir = isolated_cache_root();
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("generated.glb");
+    write_glb(&path, &dummy_mesh()).expect("write generated glb");
+
+    let mut meshes = Assets::<BevyMesh>::default();
+    let mut images = Assets::<Image>::default();
+    let mut materials = Assets::<StandardMaterial>::default();
+    let (mesh_handle, material_handle) =
+        load_generated_glb_mesh_asset(&path, &mut meshes, &mut images, &mut materials)
+            .expect("load generated glb");
+
+    assert!(
+        meshes.get(&mesh_handle).is_some(),
+        "generated GLB should produce a Bevy mesh handle"
+    );
+    assert!(
+        materials.get(&material_handle).is_some(),
+        "generated GLB should produce a Bevy material handle"
+    );
+    std::fs::remove_dir_all(dir).expect("remove temp dir");
 }
 
 fn isolated_cache_root() -> PathBuf {

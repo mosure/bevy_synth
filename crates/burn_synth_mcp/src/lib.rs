@@ -1,19 +1,29 @@
 #![recursion_limit = "256"]
 
-use std::borrow::Cow;
+mod scene_layout;
+
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use burn_synth::{
-    ForegroundRequest, ImageSource, Mesh, MeshRequest, ModelSelection, RuntimeConfig, SynthRuntime,
+    AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, ModelSelection,
+    RuntimeBatchPolicy, RuntimeConfig, SynthRuntime, SynthesisAsset, write_glb_mesh,
 };
 use clap::{Parser, ValueEnum};
-use image::ImageEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use scene_layout::{
+    SceneComposeArgs, SceneComposePlan, SceneValidateArgs, compose_scene_layout,
+    validate_scene_layout,
+};
+
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+static NEXT_SCENE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +37,7 @@ pub enum ForegroundModel {
 pub enum SynthesisModel {
     Triposg,
     Trellis,
+    Triposplat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -106,6 +117,15 @@ pub enum MeshOutputFormat {
     Glb,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetOutputFormat {
+    Auto,
+    Glb,
+    Splat,
+    Ply,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "burn_synth_mcp",
@@ -161,6 +181,26 @@ pub struct ServerArgs {
 
     #[arg(long)]
     pub guidance_scale: Option<f32>,
+
+    /// Batch chunk size for image generation tools. Use 0 for auto.
+    #[arg(long, default_value_t = 0)]
+    pub batch_size: usize,
+
+    /// Explicit VRAM budget in MB for auto batch planning.
+    #[arg(long)]
+    pub batch_vram_mb: Option<u64>,
+
+    /// Bevy scene command file path for scene_* tools.
+    #[arg(long)]
+    pub scene_control_path: Option<PathBuf>,
+
+    /// Bevy scene status file path. Defaults to <scene-control-path>.status.json.
+    #[arg(long)]
+    pub scene_status_path: Option<PathBuf>,
+
+    /// Timeout for scene command acknowledgements.
+    #[arg(long, default_value_t = 5000)]
+    pub scene_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +223,11 @@ pub struct ServerConfig {
     pub flash_min_resolution: usize,
     pub flash_mini_grid_num: usize,
     pub flash_num_chunks: usize,
+    pub batch_size: Option<usize>,
+    pub batch_vram_mb: Option<u64>,
+    pub scene_control_path: Option<PathBuf>,
+    pub scene_status_path: Option<PathBuf>,
+    pub scene_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -208,6 +253,15 @@ impl ServerConfig {
             flash_min_resolution: defaults.flash_min_resolution,
             flash_mini_grid_num: defaults.flash_mini_grid_num,
             flash_num_chunks: defaults.flash_num_chunks,
+            batch_size: (args.batch_size > 0).then_some(args.batch_size),
+            batch_vram_mb: args.batch_vram_mb,
+            scene_status_path: args.scene_status_path.or_else(|| {
+                args.scene_control_path
+                    .as_ref()
+                    .map(|path| path.with_extension("status.json"))
+            }),
+            scene_control_path: args.scene_control_path,
+            scene_timeout: Duration::from_millis(args.scene_timeout_ms.max(1)),
         }
     }
 
@@ -373,6 +427,132 @@ impl McpServer {
                     }
                 }
             }
+            "image_to_splat" => {
+                let args: Result<SplatToolArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_image_to_splat(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for image_to_splat: {err}"))
+                    }
+                }
+            }
+            "images_to_assets" => {
+                let args: Result<ImagesToAssetsToolArgs, _> =
+                    serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_images_to_assets(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for images_to_assets: {err}"))
+                    }
+                }
+            }
+            "scene_status" => match self.call_scene_status() {
+                Ok(value) => success_tool_result(value),
+                Err(err) => error_tool_result(err),
+            },
+            "scene_list_assets" => match self.call_scene_list_assets() {
+                Ok(value) => success_tool_result(value),
+                Err(err) => error_tool_result(err),
+            },
+            "scene_spawn_cached" => {
+                let args: Result<SceneSpawnCachedArgs, _> =
+                    serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_spawn_cached(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_spawn_cached: {err}"
+                    )),
+                }
+            }
+            "scene_spawn_path" => {
+                let args: Result<SceneSpawnPathArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_spawn_path(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_spawn_path: {err}"))
+                    }
+                }
+            }
+            "scene_delete" => {
+                let args: Result<SceneDeleteArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_delete(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_delete: {err}"))
+                    }
+                }
+            }
+            "scene_clear" => match self.call_scene_clear() {
+                Ok(value) => success_tool_result(value),
+                Err(err) => error_tool_result(err),
+            },
+            "scene_set_camera" => {
+                let args: Result<SceneSetCameraArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_set_camera(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_set_camera: {err}"))
+                    }
+                }
+            }
+            "scene_save" => match self.send_scene_commands(vec![json!({ "type": "save_cache" })]) {
+                Ok(value) => success_tool_result(value),
+                Err(err) => error_tool_result(err),
+            },
+            "scene_capture" => {
+                let args: Result<SceneCaptureArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_capture(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_capture: {err}"))
+                    }
+                }
+            }
+            "scene_compose_assets" => {
+                let args: Result<SceneComposeArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_compose_assets(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_compose_assets: {err}"
+                    )),
+                }
+            }
+            "scene_validate_layout" => {
+                let args: Result<SceneValidateArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_validate_layout(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_validate_layout: {err}"
+                    )),
+                }
+            }
             other => error_tool_result(format!("unknown tool '{other}'")),
         }
     }
@@ -452,8 +632,90 @@ impl McpServer {
                 output_format.as_str()
             ));
         }
-        let output_path = resolve_glb_output_path(args.output_mesh_path, &input_path);
-        ensure_parent_dir(&output_path).map_err(|err| err.to_string())?;
+        let assets = self.call_images_to_assets(ImagesToAssetsToolArgs {
+            input_image_paths: vec![input_path],
+            output_dir: None,
+            output_paths: args.output_mesh_path.map(|path| vec![path]),
+            output_format: Some(AssetOutputFormat::Glb),
+            rmbg_model: args.rmbg_model,
+            synthesis_models: args.synthesis_models,
+            backend: args.backend,
+            target_faces: args.target_faces,
+            batch_size: Some(1),
+            batch_vram_mb: None,
+            dry_run: args.dry_run,
+        })?;
+        let item = assets["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .ok_or_else(|| "image_to_mesh produced no asset item".to_string())?;
+        Ok(json!({
+            "tool": "image_to_mesh",
+            "input_image_path": item["input_image_path"].clone(),
+            "output_mesh_path": item["output_path"].clone(),
+            "output_format": "glb",
+            "vertices": item["vertices"].clone(),
+            "faces": item["faces"].clone(),
+            "target_faces": item["target_faces"].clone(),
+            "material": item["material"].clone(),
+            "rmbg_model": assets["rmbg_model"].clone(),
+            "synthesis_models": assets["synthesis_models"].clone(),
+            "backend": assets["backend"].clone(),
+            "dry_run": assets["dry_run"].clone(),
+        }))
+    }
+
+    fn call_image_to_splat(&mut self, args: SplatToolArgs) -> Result<Value, String> {
+        let assets = self.call_images_to_assets(ImagesToAssetsToolArgs {
+            input_image_paths: vec![args.input_image_path],
+            output_dir: None,
+            output_paths: args.output_splat_path.map(|path| vec![path]),
+            output_format: args.output_format.or(Some(AssetOutputFormat::Splat)),
+            rmbg_model: args.rmbg_model,
+            synthesis_models: Some(vec![SynthesisModel::Triposplat]),
+            backend: args.backend,
+            target_faces: None,
+            batch_size: Some(1),
+            batch_vram_mb: None,
+            dry_run: args.dry_run,
+        })?;
+        let item = assets["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .ok_or_else(|| "image_to_splat produced no asset item".to_string())?;
+        Ok(json!({
+            "tool": "image_to_splat",
+            "input_image_path": item["input_image_path"].clone(),
+            "output_splat_path": item["output_path"].clone(),
+            "output_format": item["output_format"].clone(),
+            "gaussians": item["gaussians"].clone(),
+            "rmbg_model": assets["rmbg_model"].clone(),
+            "synthesis_models": assets["synthesis_models"].clone(),
+            "backend": assets["backend"].clone(),
+            "dry_run": assets["dry_run"].clone(),
+        }))
+    }
+
+    fn call_images_to_assets(&mut self, args: ImagesToAssetsToolArgs) -> Result<Value, String> {
+        if args.input_image_paths.is_empty() {
+            return Err("input_image_paths must not be empty".to_string());
+        }
+        for input in &args.input_image_paths {
+            if !input.exists() {
+                return Err(format!("input image does not exist: {}", input.display()));
+            }
+        }
+        if let Some(output_paths) = args.output_paths.as_ref()
+            && output_paths.len() != args.input_image_paths.len()
+        {
+            return Err(format!(
+                "output_paths length ({}) must match input_image_paths length ({})",
+                output_paths.len(),
+                args.input_image_paths.len()
+            ));
+        }
 
         let selected_rmbg = args.rmbg_model.unwrap_or(self.config.default_rmbg_model);
         let selected_backend = args.backend.unwrap_or(self.config.default_backend);
@@ -461,11 +723,26 @@ impl McpServer {
             .synthesis_models
             .map(sanitize_synthesis_models)
             .unwrap_or_else(|| self.config.default_synthesis_models.clone());
+        let policy = RuntimeBatchPolicy {
+            max_items: args.batch_size.or(self.config.batch_size),
+            vram_budget_mb: args.batch_vram_mb.or(self.config.batch_vram_mb),
+            ..RuntimeBatchPolicy::default()
+        };
 
-        let mut mesh_output = self
+        let batch = self
             .runtime
-            .synthesize_mesh(MeshRequest {
-                image: ImageSource::from_path(input_path.clone()),
+            .synthesize_assets_batch(AssetBatchRequest {
+                items: args
+                    .input_image_paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        AssetBatchItem::new(
+                            format!("asset_{index}"),
+                            ImageSource::from_path(input.clone()),
+                        )
+                    })
+                    .collect(),
                 foreground_model: Some(selected_rmbg.into()),
                 synthesis_models: Some(
                     selected_synthesis_models
@@ -476,43 +753,248 @@ impl McpServer {
                 ),
                 backend: Some(selected_backend.into()),
                 dry_run: args.dry_run,
+                policy,
             })
             .map_err(|err| err.to_string())?;
 
-        mesh_output.mesh = apply_mesh_decimation(mesh_output.mesh, args.target_faces)
-            .map_err(|err| format!("mesh decimation failed: {err}"))?;
-        let vertices = mesh_output.mesh.vertices.len();
-        let faces = mesh_output.mesh.faces.len();
-        write_glb(&output_path, &mesh_output.mesh).map_err(|err| {
-            format!(
-                "failed to write GLB output {}: {err}",
-                output_path.display()
-            )
-        })?;
-        let material = mesh_output.mesh.material;
+        let mut items = Vec::with_capacity(batch.items.len());
+        for (batch_item, input_path) in batch.items.into_iter().zip(args.input_image_paths.iter()) {
+            let output = batch_item.output.map_err(|err| err.to_string())?;
+            let item = write_asset_output(
+                input_path,
+                args.output_dir.as_deref(),
+                args.output_paths
+                    .as_ref()
+                    .and_then(|paths| paths.get(batch_item.item_index).cloned()),
+                args.output_format.unwrap_or(AssetOutputFormat::Auto),
+                output.asset,
+                args.target_faces,
+            )?;
+            items.push(json!({
+                "id": batch_item.id,
+                "input_image_path": input_path.display().to_string(),
+                "chunk_index": batch_item.chunk_index,
+                "item_index": batch_item.item_index,
+                "elapsed_ms": batch_item.elapsed_ms,
+                "foreground_model": runtime_foreground_model_str(output.foreground_model),
+                "synthesis_backend": runtime_synthesis_model_str(output.synthesis_backend),
+                "backend": runtime_backend_str(output.backend),
+                "output_path": item.output_path.display().to_string(),
+                "output_format": item.output_format.as_str(),
+                "asset_kind": item.asset_kind,
+                "vertices": item.vertices,
+                "faces": item.faces,
+                "gaussians": item.gaussians,
+                "target_faces": args.target_faces.filter(|value| *value > 0),
+                "material": item.material,
+            }));
+        }
 
         Ok(json!({
-            "tool": "image_to_mesh",
-            "input_image_path": input_path.display().to_string(),
-            "output_mesh_path": output_path.display().to_string(),
-            "output_format": "glb",
-            "vertices": vertices,
-            "faces": faces,
-            "target_faces": args.target_faces.filter(|value| *value > 0),
-            "material": material.map(|value| {
-                json!({
-                    "base_color": value.base_color,
-                    "metallic": value.metallic,
-                    "roughness": value.roughness,
-                    "alpha": value.alpha,
-                })
-            }),
+            "tool": "images_to_assets",
+            "items": items,
+            "stats": {
+                "total_items": batch.stats.total_items,
+                "chunk_size": batch.stats.chunk_size,
+                "chunks": batch.stats.chunks,
+                "execution_mode": batch.stats.execution_mode.as_str(),
+                "vram_budget_mb": batch.stats.vram_budget_mb,
+                "estimated_item_mb": batch.stats.estimated_item_mb,
+                "elapsed_ms": batch.stats.elapsed_ms,
+            },
             "rmbg_model": selected_rmbg.as_str(),
             "synthesis_models": selected_synthesis_models.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
             "backend": selected_backend.as_str(),
             "dry_run": args.dry_run,
         }))
     }
+
+    fn call_scene_status(&self) -> Result<Value, String> {
+        let status_path = self
+            .config
+            .scene_status_path
+            .as_ref()
+            .ok_or_else(|| "scene_status_path is not configured".to_string())?;
+        read_scene_status(status_path)
+    }
+
+    fn call_scene_list_assets(&self) -> Result<Value, String> {
+        let status = self.call_scene_status()?;
+        Ok(json!({
+            "tool": "scene_list_assets",
+            "cache_entries": status["cache_entries"].clone(),
+            "world_items": status["world_items"].clone(),
+        }))
+    }
+
+    fn call_scene_spawn_cached(&self, args: SceneSpawnCachedArgs) -> Result<Value, String> {
+        self.send_scene_commands(vec![json!({
+            "type": "spawn_cached",
+            "cache_key": args.cache_key,
+            "translation": args.translation,
+            "rotation": args.rotation,
+            "scale": args.scale,
+            "select": args.select,
+        })])
+    }
+
+    fn call_scene_spawn_path(&self, args: SceneSpawnPathArgs) -> Result<Value, String> {
+        self.send_scene_commands(vec![json!({
+            "type": "spawn_path",
+            "path": args.path,
+            "translation": args.translation,
+            "rotation": args.rotation,
+            "scale": args.scale,
+            "select": args.select,
+        })])
+    }
+
+    fn call_scene_delete(&self, args: SceneDeleteArgs) -> Result<Value, String> {
+        if let Some(cache_key) = args.cache_key {
+            return self.send_scene_commands(vec![json!({
+                "type": "delete_by_cache_key",
+                "cache_key": cache_key,
+            })]);
+        }
+        if args.selected {
+            return self.send_scene_commands(vec![json!({ "type": "delete_selected" })]);
+        }
+        self.send_scene_commands(vec![json!({ "type": "clear_selection" })])
+    }
+
+    fn call_scene_clear(&self) -> Result<Value, String> {
+        self.send_scene_commands(vec![json!({ "type": "clear_scene" })])
+    }
+
+    fn call_scene_set_camera(&self, args: SceneSetCameraArgs) -> Result<Value, String> {
+        self.send_scene_commands(vec![json!({
+            "type": "set_camera",
+            "translation": args.translation,
+            "rotation": args.rotation,
+            "focus": args.focus,
+            "yaw": args.yaw,
+            "pitch": args.pitch,
+            "radius": args.radius,
+        })])
+    }
+
+    fn call_scene_capture(&self, args: SceneCaptureArgs) -> Result<Value, String> {
+        let path = args.output_path;
+        let response = self.send_scene_commands(vec![json!({
+            "type": "capture_screenshot",
+            "path": path.display().to_string(),
+        })])?;
+        let timeout = self.config.scene_timeout;
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if path
+                .metadata()
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+            {
+                return Ok(json!({
+                    "tool": "scene_capture",
+                    "output_path": path.display().to_string(),
+                    "acknowledgement": response,
+                }));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Err(format!(
+            "scene_capture timed out waiting for screenshot {}",
+            path.display()
+        ))
+    }
+
+    fn call_scene_compose_assets(&self, args: SceneComposeArgs) -> Result<Value, String> {
+        let plan = compose_scene_layout(args)?;
+        let mut response =
+            serde_json::to_value(&plan).map_err(|err| format!("serialize layout plan: {err}"))?;
+        if plan.apply {
+            let acknowledgement = self.send_scene_commands(scene_commands_from_plan(&plan)?)?;
+            response["acknowledgement"] = acknowledgement;
+        }
+        Ok(response)
+    }
+
+    fn call_scene_validate_layout(&self, mut args: SceneValidateArgs) -> Result<Value, String> {
+        if args.scene_status.is_none() {
+            args.scene_status = Some(self.call_scene_status()?);
+        }
+        validate_scene_layout(args)
+    }
+
+    fn send_scene_commands(&self, commands: Vec<Value>) -> Result<Value, String> {
+        if commands.is_empty() {
+            return Err("scene command list must not be empty".to_string());
+        }
+        let control_path = self
+            .config
+            .scene_control_path
+            .as_ref()
+            .ok_or_else(|| "scene_control_path is not configured".to_string())?;
+        let sequence = next_scene_sequence();
+        let session_id = format!("burn_synth_mcp-{}", std::process::id());
+        let envelope = json!({
+            "session_id": session_id,
+            "sequence": sequence,
+            "commands": commands,
+        });
+        atomic_write_json(control_path, &envelope)?;
+
+        let Some(status_path) = self.config.scene_status_path.as_ref() else {
+            return Ok(json!({
+                "tool": "scene_command",
+                "command_path": control_path.display().to_string(),
+                "sequence": sequence,
+                "acknowledged": false,
+            }));
+        };
+        let status = wait_scene_status(status_path, sequence, self.config.scene_timeout)?;
+        Ok(json!({
+            "tool": "scene_command",
+            "command_path": control_path.display().to_string(),
+            "status_path": status_path.display().to_string(),
+            "sequence": sequence,
+            "acknowledged": true,
+            "status": status,
+        }))
+    }
+}
+
+fn scene_commands_from_plan(plan: &SceneComposePlan) -> Result<Vec<Value>, String> {
+    let mut commands = Vec::with_capacity(plan.placements.len());
+    if plan.clear_existing {
+        commands.push(json!({ "type": "clear_scene" }));
+    }
+    for placement in &plan.placements {
+        if let Some(path) = placement.path.as_ref() {
+            commands.push(json!({
+                "type": "spawn_path",
+                "path": path,
+                "cache_key": placement.cache_key,
+                "translation": placement.translation,
+                "rotation": placement.rotation,
+                "scale": placement.scale,
+                "select": placement.select,
+            }));
+        } else if let Some(cache_key) = placement.cache_key.as_ref() {
+            commands.push(json!({
+                "type": "spawn_cached",
+                "cache_key": cache_key,
+                "translation": placement.translation,
+                "rotation": placement.rotation,
+                "scale": placement.scale,
+                "select": placement.select,
+            }));
+        } else {
+            return Err(format!(
+                "placement for '{}' has neither path nor cache_key",
+                placement.label
+            ));
+        }
+    }
+    Ok(commands)
 }
 
 fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel> {
@@ -537,374 +1019,126 @@ fn default_output_path(input: &Path, suffix: &str, ext: &str) -> PathBuf {
     parent.join(format!("{stem}{suffix}.{ext}"))
 }
 
-fn resolve_glb_output_path(output_mesh_path: Option<PathBuf>, input_path: &Path) -> PathBuf {
-    let Some(path) = output_mesh_path else {
-        return default_output_path(input_path, "_mesh", "glb");
-    };
-    if path.extension().is_none() || path.is_dir() {
+#[derive(Debug)]
+struct WrittenAsset {
+    output_path: PathBuf,
+    output_format: AssetOutputFormat,
+    asset_kind: &'static str,
+    vertices: Option<usize>,
+    faces: Option<usize>,
+    gaussians: Option<usize>,
+    material: Option<Value>,
+}
+
+fn write_asset_output(
+    input_path: &Path,
+    output_dir: Option<&Path>,
+    explicit_output: Option<PathBuf>,
+    requested_format: AssetOutputFormat,
+    asset: SynthesisAsset,
+    target_faces: Option<usize>,
+) -> Result<WrittenAsset, String> {
+    match asset {
+        SynthesisAsset::Mesh(mesh) => {
+            if matches!(
+                requested_format,
+                AssetOutputFormat::Splat | AssetOutputFormat::Ply
+            ) {
+                return Err(format!(
+                    "mesh synthesis cannot be written as {}",
+                    requested_format.as_str()
+                ));
+            }
+            let mesh = apply_mesh_decimation(mesh, target_faces)
+                .map_err(|err| format!("mesh decimation failed: {err}"))?;
+            let output_path =
+                resolve_asset_output_path(input_path, output_dir, explicit_output, "_mesh", "glb");
+            write_glb_mesh(output_path.as_path(), &mesh)?;
+            let material = mesh.material.map(|value| {
+                json!({
+                    "base_color": value.base_color,
+                    "metallic": value.metallic,
+                    "roughness": value.roughness,
+                    "alpha": value.alpha,
+                })
+            });
+            Ok(WrittenAsset {
+                output_path,
+                output_format: AssetOutputFormat::Glb,
+                asset_kind: "mesh",
+                vertices: Some(mesh.vertices.len()),
+                faces: Some(mesh.faces.len()),
+                gaussians: None,
+                material,
+            })
+        }
+        SynthesisAsset::GaussianSplat(splats) => {
+            if matches!(requested_format, AssetOutputFormat::Glb) {
+                return Err("Gaussian splats cannot be written as glb".to_string());
+            }
+            let output_format = match requested_format {
+                AssetOutputFormat::Ply => AssetOutputFormat::Ply,
+                _ => AssetOutputFormat::Splat,
+            };
+            let output_path = resolve_asset_output_path(
+                input_path,
+                output_dir,
+                explicit_output,
+                "_splat",
+                output_format.as_str(),
+            );
+            write_splat_asset(output_path.as_path(), &splats, output_format)?;
+            Ok(WrittenAsset {
+                output_path,
+                output_format,
+                asset_kind: "gaussian_splat",
+                vertices: None,
+                faces: None,
+                gaussians: Some(splats.len()),
+                material: None,
+            })
+        }
+    }
+}
+
+fn resolve_asset_output_path(
+    input_path: &Path,
+    output_dir: Option<&Path>,
+    explicit_output: Option<PathBuf>,
+    suffix: &str,
+    ext: &str,
+) -> PathBuf {
+    if let Some(path) = explicit_output {
+        if path.extension().is_none() || path.is_dir() {
+            let stem = input_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("asset");
+            return path.join(format!("{stem}{suffix}.{ext}"));
+        }
+        return path;
+    }
+    if let Some(dir) = output_dir {
         let stem = input_path
             .file_stem()
             .and_then(|value| value.to_str())
-            .unwrap_or("mesh");
-        return path.join(format!("{stem}_mesh.glb"));
+            .unwrap_or("asset");
+        return dir.join(format!("{stem}{suffix}.{ext}"));
     }
-    if path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("glb"))
-        .unwrap_or(false)
-    {
-        path
-    } else {
-        path.with_extension("glb")
-    }
+    default_output_path(input_path, suffix, ext)
 }
 
-#[derive(Clone, Debug)]
-struct MeshBinaryLayout {
-    buffer: Vec<u8>,
-    positions_byte_offset: usize,
-    positions_byte_length: usize,
-    indices_byte_offset: usize,
-    indices_byte_length: usize,
-    uvs_byte_offset: Option<usize>,
-    uvs_byte_length: Option<usize>,
-    base_color_image_view: Option<(usize, usize)>,
-    metallic_roughness_image_view: Option<(usize, usize)>,
-    normal_image_view: Option<(usize, usize)>,
-    emissive_image_view: Option<(usize, usize)>,
-    occlusion_image_view: Option<(usize, usize)>,
-    min: [f32; 3],
-    max: [f32; 3],
-}
-
-fn write_glb(path: &Path, mesh: &Mesh) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn write_splat_asset(
+    path: &Path,
+    splats: &burn_synth::triposplat::GaussianSplatCloud,
+    format: AssetOutputFormat,
+) -> Result<(), String> {
+    ensure_parent_dir(path).map_err(|err| err.to_string())?;
+    match format {
+        AssetOutputFormat::Ply => splats.write_ply(path),
+        AssetOutputFormat::Splat | AssetOutputFormat::Auto => splats.write_splat(path),
+        AssetOutputFormat::Glb => Err("Gaussian splats cannot be written as glb".to_string()),
     }
-    let glb = mesh_to_glb_bytes(mesh)?;
-    fs::write(path, glb)?;
-    Ok(())
-}
-
-fn mesh_to_glb_bytes(mesh: &Mesh) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let layout = build_mesh_binary_layout(mesh)?;
-    let gltf = gltf_json(mesh, &layout);
-    let json_bytes = serde_json::to_vec(&gltf)?;
-    let glb = gltf::Glb {
-        header: gltf::binary::Header {
-            magic: *b"glTF",
-            version: 2,
-            length: 0,
-        },
-        json: Cow::Owned(json_bytes),
-        bin: Some(Cow::Owned(layout.buffer)),
-    }
-    .to_vec()?;
-    Ok(glb)
-}
-
-fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, Box<dyn std::error::Error>> {
-    if mesh.vertices.is_empty() {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot export empty mesh",
-        )));
-    }
-
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    for vertex in &mesh.vertices {
-        for axis in 0..3 {
-            min[axis] = min[axis].min(vertex[axis]);
-            max[axis] = max[axis].max(vertex[axis]);
-        }
-    }
-
-    let mut buffer = Vec::with_capacity(mesh.vertices.len() * 12 + mesh.faces.len() * 12 + 8192);
-    let positions_byte_offset = buffer.len();
-    for vertex in &mesh.vertices {
-        for component in vertex {
-            buffer.extend_from_slice(&component.to_le_bytes());
-        }
-    }
-    let positions_byte_length = buffer.len();
-
-    let mut uvs_byte_offset = None;
-    let mut uvs_byte_length = None;
-    if mesh.uvs.len() == mesh.vertices.len() && !mesh.uvs.is_empty() {
-        pad_buffer_4(&mut buffer);
-        let offset = buffer.len();
-        for uv in &mesh.uvs {
-            buffer.extend_from_slice(&uv[0].to_le_bytes());
-            buffer.extend_from_slice(&uv[1].to_le_bytes());
-        }
-        uvs_byte_offset = Some(offset);
-        uvs_byte_length = Some(buffer.len() - offset);
-    }
-
-    pad_buffer_4(&mut buffer);
-    let indices_byte_offset = buffer.len();
-    for face in &mesh.faces {
-        for index in face {
-            buffer.extend_from_slice(&index.to_le_bytes());
-        }
-    }
-    let indices_byte_length = buffer.len() - indices_byte_offset;
-
-    let mut base_color_image_view = None;
-    let mut metallic_roughness_image_view = None;
-    let mut normal_image_view = None;
-    let mut emissive_image_view = None;
-    let mut occlusion_image_view = None;
-    if let Some(pbr) = mesh.pbr_textures.as_ref() {
-        let base_png = encode_rgba_texture_png(&pbr.base_color)?;
-        let mr_png = encode_rgba_texture_png(&pbr.metallic_roughness)?;
-        pad_buffer_4(&mut buffer);
-        let base_offset = buffer.len();
-        buffer.extend_from_slice(base_png.as_slice());
-        base_color_image_view = Some((base_offset, base_png.len()));
-        pad_buffer_4(&mut buffer);
-        let mr_offset = buffer.len();
-        buffer.extend_from_slice(mr_png.as_slice());
-        metallic_roughness_image_view = Some((mr_offset, mr_png.len()));
-        if let Some(normal) = pbr.normal.as_ref() {
-            let normal_png = encode_rgba_texture_png(normal)?;
-            pad_buffer_4(&mut buffer);
-            let normal_offset = buffer.len();
-            buffer.extend_from_slice(normal_png.as_slice());
-            normal_image_view = Some((normal_offset, normal_png.len()));
-        }
-        if let Some(emissive) = pbr.emissive.as_ref() {
-            let emissive_png = encode_rgba_texture_png(emissive)?;
-            pad_buffer_4(&mut buffer);
-            let emissive_offset = buffer.len();
-            buffer.extend_from_slice(emissive_png.as_slice());
-            emissive_image_view = Some((emissive_offset, emissive_png.len()));
-        }
-        if let Some(occlusion) = pbr.occlusion.as_ref() {
-            let occlusion_png = encode_rgba_texture_png(occlusion)?;
-            pad_buffer_4(&mut buffer);
-            let occlusion_offset = buffer.len();
-            buffer.extend_from_slice(occlusion_png.as_slice());
-            occlusion_image_view = Some((occlusion_offset, occlusion_png.len()));
-        }
-    }
-
-    Ok(MeshBinaryLayout {
-        buffer,
-        positions_byte_offset,
-        positions_byte_length,
-        indices_byte_offset,
-        indices_byte_length,
-        uvs_byte_offset,
-        uvs_byte_length,
-        base_color_image_view,
-        metallic_roughness_image_view,
-        normal_image_view,
-        emissive_image_view,
-        occlusion_image_view,
-        min,
-        max,
-    })
-}
-
-fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
-    let mut primitive = json!({
-        "attributes": {
-            "POSITION": 0
-        },
-        "indices": 1,
-        "mode": 4
-    });
-    if mesh.uvs.len() == mesh.vertices.len() && !mesh.uvs.is_empty() {
-        primitive["attributes"]["TEXCOORD_0"] = json!(2);
-    }
-
-    let buffers = vec![json!({
-        "byteLength": layout.buffer.len(),
-    })];
-
-    let mut buffer_views = Vec::new();
-    buffer_views.push(json!({
-        "buffer": 0,
-        "byteOffset": layout.positions_byte_offset,
-        "byteLength": layout.positions_byte_length,
-        "target": 34962
-    }));
-    buffer_views.push(json!({
-        "buffer": 0,
-        "byteOffset": layout.indices_byte_offset,
-        "byteLength": layout.indices_byte_length,
-        "target": 34963
-    }));
-    if let (Some(uv_offset), Some(uv_len)) = (layout.uvs_byte_offset, layout.uvs_byte_length) {
-        buffer_views.push(json!({
-            "buffer": 0,
-            "byteOffset": uv_offset,
-            "byteLength": uv_len,
-            "target": 34962
-        }));
-    }
-
-    let mut accessors = Vec::new();
-    accessors.push(json!({
-        "bufferView": 0,
-        "componentType": 5126,
-        "count": mesh.vertices.len(),
-        "type": "VEC3",
-        "min": layout.min,
-        "max": layout.max
-    }));
-    accessors.push(json!({
-        "bufferView": 1,
-        "componentType": 5125,
-        "count": mesh.faces.len() * 3,
-        "type": "SCALAR"
-    }));
-    if mesh.uvs.len() == mesh.vertices.len() && !mesh.uvs.is_empty() {
-        accessors.push(json!({
-            "bufferView": 2,
-            "componentType": 5126,
-            "count": mesh.uvs.len(),
-            "type": "VEC2"
-        }));
-    }
-
-    let mut images = Vec::new();
-    let mut textures = Vec::new();
-    let mut materials = Vec::new();
-    let mut pbr_mr = json!({});
-    let mut push_texture_image = |byte_offset: usize, byte_length: usize| -> usize {
-        let view_index = buffer_views.len();
-        buffer_views.push(json!({
-            "buffer": 0,
-            "byteOffset": byte_offset,
-            "byteLength": byte_length
-        }));
-        let image_index = images.len();
-        images.push(json!({
-            "bufferView": view_index,
-            "mimeType": "image/png"
-        }));
-        let texture_index = textures.len();
-        textures.push(json!({ "source": image_index }));
-        texture_index
-    };
-    if let Some(material) = mesh.material {
-        pbr_mr = json!({
-            "baseColorFactor": [
-                material.base_color[0],
-                material.base_color[1],
-                material.base_color[2],
-                material.alpha.clamp(0.0, 1.0)
-            ],
-            "metallicFactor": material.metallic.clamp(0.0, 1.0),
-            "roughnessFactor": material.roughness.clamp(0.0, 1.0)
-        });
-    }
-    if let Some((base_offset, base_len)) = layout.base_color_image_view {
-        let texture_index = push_texture_image(base_offset, base_len);
-        pbr_mr["baseColorTexture"] = json!({ "index": texture_index });
-    }
-    if let Some((mr_offset, mr_len)) = layout.metallic_roughness_image_view {
-        let texture_index = push_texture_image(mr_offset, mr_len);
-        pbr_mr["metallicRoughnessTexture"] = json!({ "index": texture_index });
-    }
-
-    if mesh.material.is_some() || mesh.pbr_textures.is_some() {
-        let alpha = mesh
-            .material
-            .map(|value| value.alpha)
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        let material_index = materials.len();
-        let mut material = json!({
-            "pbrMetallicRoughness": pbr_mr,
-            "alphaMode": if alpha < 0.995 { "BLEND" } else { "OPAQUE" },
-            "doubleSided": true
-        });
-        if let Some((normal_offset, normal_len)) = layout.normal_image_view {
-            let texture_index = push_texture_image(normal_offset, normal_len);
-            material["normalTexture"] = json!({ "index": texture_index });
-        }
-        if let Some((emissive_offset, emissive_len)) = layout.emissive_image_view {
-            let texture_index = push_texture_image(emissive_offset, emissive_len);
-            material["emissiveTexture"] = json!({ "index": texture_index });
-            material["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
-        }
-        if let Some((occlusion_offset, occlusion_len)) = layout.occlusion_image_view {
-            let texture_index = push_texture_image(occlusion_offset, occlusion_len);
-            material["occlusionTexture"] = json!({ "index": texture_index });
-        }
-        materials.push(material);
-        primitive["material"] = json!(material_index);
-    }
-
-    let mut gltf = json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "burn_synth_mcp"
-        },
-        "scene": 0,
-        "scenes": [
-            { "nodes": [0] }
-        ],
-        "nodes": [
-            { "mesh": 0 }
-        ],
-        "meshes": [
-            {
-                "primitives": [
-                    primitive
-                ]
-            }
-        ],
-        "buffers": buffers,
-        "bufferViews": buffer_views,
-        "accessors": accessors
-    });
-    if !materials.is_empty() {
-        gltf["materials"] = Value::Array(materials);
-    }
-    if !images.is_empty() {
-        gltf["images"] = Value::Array(images);
-    }
-    if !textures.is_empty() {
-        gltf["textures"] = Value::Array(textures);
-    }
-    gltf
-}
-
-fn pad_buffer_4(buffer: &mut Vec<u8>) {
-    while !buffer.len().is_multiple_of(4) {
-        buffer.push(0);
-    }
-}
-
-fn encode_rgba_texture_png(
-    texture: &burn_synth::MeshTexture,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let expected = texture.width as usize * texture.height as usize * 4;
-    if texture.rgba8.len() != expected {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "texture byte length mismatch: expected {}, got {}",
-                expected,
-                texture.rgba8.len()
-            ),
-        )));
-    }
-    let mut out = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut out);
-    encoder.write_image(
-        texture.rgba8.as_slice(),
-        texture.width,
-        texture.height,
-        image::ColorType::Rgba8.into(),
-    )?;
-    Ok(out)
 }
 
 fn apply_mesh_decimation(mesh: Mesh, target_faces: Option<usize>) -> Result<Mesh, String> {
@@ -993,6 +1227,76 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn next_scene_sequence() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let mut current = NEXT_SCENE_SEQUENCE.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(current.saturating_add(1));
+        match NEXT_SCENE_SEQUENCE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(value) => current = value,
+        }
+    }
+}
+
+fn atomic_write_json(path: &Path, value: &Value) -> Result<(), String> {
+    ensure_parent_dir(path).map_err(|err| err.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| format!("failed to serialize scene command: {err}"))?;
+    fs::write(&tmp, bytes).map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|err| {
+        format!(
+            "failed to atomically replace scene command file {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn read_scene_status(path: &Path) -> Result<Value, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|err| format!("failed to parse scene status {}: {err}", path.display()))
+}
+
+fn wait_scene_status(path: &Path, sequence: u64, timeout: Duration) -> Result<Value, String> {
+    let started = Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < timeout {
+        match read_scene_status(path) {
+            Ok(status) => {
+                let acknowledged = status
+                    .get("last_sequence")
+                    .and_then(Value::as_u64)
+                    .map(|last| last >= sequence)
+                    .unwrap_or(false);
+                if acknowledged {
+                    return Ok(status);
+                }
+            }
+            Err(err) => last_error = Some(err),
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "timed out waiting for scene status {} to acknowledge sequence {sequence}{}",
+        path.display(),
+        last_error
+            .map(|err| format!("; last read error: {err}"))
+            .unwrap_or_default()
+    ))
+}
+
 fn success_response(id: Option<Value>, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -1064,12 +1368,246 @@ fn tool_defs() -> Vec<Value> {
                     "input_image_path": { "type": "string", "description": "Path to input image file." },
                     "output_mesh_path": { "type": "string", "description": "Optional output GLB path (defaults to *_mesh.glb)." },
                     "rmbg_model": { "type": "string", "enum": ["rmbg14", "rmbg2"], "description": "Optional RMBG model override." },
-                    "synthesis_models": { "type": "array", "items": { "type": "string", "enum": ["triposg", "trellis"] }, "description": "Optional synthesis model list override, ordered by preference." },
+                    "synthesis_models": { "type": "array", "items": { "type": "string", "enum": ["triposg", "trellis"] }, "description": "Optional mesh synthesis model list override, ordered by preference." },
                     "backend": { "type": "string", "enum": ["cpu", "wgpu", "cuda"], "description": "Optional backend override." },
                     "target_faces": { "type": "integer", "description": "Optional target face count for mesh simplification." },
                     "dry_run": { "type": "boolean", "description": "Skip model inference and emit a canonical cube mesh." }
                 },
                 "required": ["input_image_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "image_to_splat",
+            "description": "Run TripoSplat image-to-Gaussian-splat synthesis and write a .splat or .ply output.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input_image_path": { "type": "string", "description": "Path to input image file." },
+                    "output_splat_path": { "type": "string", "description": "Optional output path (defaults to *_splat.splat)." },
+                    "output_format": { "type": "string", "enum": ["splat", "ply"], "description": "Optional splat output format." },
+                    "rmbg_model": { "type": "string", "enum": ["rmbg14", "rmbg2"], "description": "Optional RMBG model override." },
+                    "backend": { "type": "string", "enum": ["cpu", "wgpu", "cuda"], "description": "Optional backend override." },
+                    "dry_run": { "type": "boolean", "description": "Skip model inference and emit a canonical debug splat cloud." }
+                },
+                "required": ["input_image_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "images_to_assets",
+            "description": "Run batched image-to-asset synthesis over multiple images with shared model loading and chunk planning.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input_image_paths": { "type": "array", "items": { "type": "string" }, "description": "Input image paths to process in one batch request." },
+                    "output_dir": { "type": "string", "description": "Optional output directory for per-input output names." },
+                    "output_paths": { "type": "array", "items": { "type": "string" }, "description": "Optional explicit output path per input." },
+                    "output_format": { "type": "string", "enum": ["auto", "glb", "splat", "ply"], "description": "Optional output format. Auto writes GLB for meshes and .splat for Gaussian splats." },
+                    "rmbg_model": { "type": "string", "enum": ["rmbg14", "rmbg2"], "description": "Optional RMBG model override." },
+                    "synthesis_models": { "type": "array", "items": { "type": "string", "enum": ["triposg", "trellis", "triposplat"] }, "description": "Optional synthesis model list override, ordered by preference." },
+                    "backend": { "type": "string", "enum": ["cpu", "wgpu", "cuda"], "description": "Optional backend override." },
+                    "target_faces": { "type": "integer", "description": "Optional target face count for mesh simplification." },
+                    "batch_size": { "type": "integer", "description": "Optional explicit chunk size; omit for server default/auto." },
+                    "batch_vram_mb": { "type": "integer", "description": "Optional VRAM budget in MB for auto chunking." },
+                    "dry_run": { "type": "boolean", "description": "Skip model inference and emit canonical debug assets." }
+                },
+                "required": ["input_image_paths"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_status",
+            "description": "Read the latest Bevy scene bridge status, including cache entries, world items, camera, and screenshots.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_list_assets",
+            "description": "List cached assets and spawned world items from the latest Bevy scene bridge status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_spawn_cached",
+            "description": "Spawn an asset already present in the Bevy mesh/splat cache.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cache_key": { "type": "string", "description": "Cache key to spawn." },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "select": { "type": "boolean", "description": "Select the spawned entity." }
+                },
+                "required": ["cache_key"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_spawn_path",
+            "description": "Spawn a GLB mesh asset file directly into the Bevy scene.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "GLB mesh path to spawn." },
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                    "scale": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "select": { "type": "boolean", "description": "Select the spawned entity." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_delete",
+            "description": "Delete a spawned cached asset by cache key, delete the selection, or clear selection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cache_key": { "type": "string", "description": "Cache key to delete." },
+                    "selected": { "type": "boolean", "description": "Delete the current selection when true; clear selection when false and no cache key is provided." }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_clear",
+            "description": "Clear all spawned cache-backed scene items from the Bevy scene.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_set_camera",
+            "description": "Set the Bevy scene camera transform and optional orbit state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "translation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                    "focus": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "yaw": { "type": "number" },
+                    "pitch": { "type": "number" },
+                    "radius": { "type": "number" }
+                },
+                "required": ["translation", "rotation"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_save",
+            "description": "Flush the Bevy scene cache/world state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_capture",
+            "description": "Capture a screenshot from the Bevy primary window and wait for the image file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "output_path": { "type": "string", "description": "Screenshot path to write." }
+                },
+                "required": ["output_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_compose_assets",
+            "description": "Create deterministic Bevy placements from source-image object boxes and generated asset bindings; optionally apply them to the live scene.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reference_objects": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "aliases": { "type": "array", "items": { "type": "string" } },
+                                "bbox": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Normalized source-image box [x_min, y_min, x_max, y_max]." }
+                            },
+                            "required": ["label", "bbox"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "assets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference_id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "aliases": { "type": "array", "items": { "type": "string" } },
+                                "path": { "type": "string" },
+                                "cache_key": { "type": "string" },
+                                "select": { "type": "boolean" }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+            "apply": { "type": "boolean", "description": "When true, send spawn commands to the configured Bevy scene bridge." },
+                    "clear_existing": { "type": "boolean", "description": "When true, clear existing scene instances before placing generated assets." },
+                    "layout_width": { "type": "number" },
+                    "layout_depth": { "type": "number" },
+                    "y": { "type": "number" },
+                    "min_scale": { "type": "number" },
+                    "scale_multiplier": { "type": "number" }
+                },
+                "required": ["reference_objects", "assets"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_validate_layout",
+            "description": "Validate a composed Bevy scene against source-image object boxes using semantic label matching, object counts, normalized layout, and optional screenshot image similarity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reference_objects": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "aliases": { "type": "array", "items": { "type": "string" } },
+                                "bbox": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                            },
+                            "required": ["label", "bbox"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "scene_status": { "type": "object", "description": "Optional scene status JSON. Omit to read the configured scene_status_path." },
+                    "source_image_path": { "type": "string" },
+                    "rendered_image_path": { "type": "string" },
+                    "thresholds": {
+                        "type": "object",
+                        "properties": {
+                            "min_semantic_score": { "type": "number" },
+                            "min_layout_score": { "type": "number" },
+                            "min_overall_score": { "type": "number" },
+                            "max_extra_objects": { "type": "integer" },
+                            "min_image_similarity": { "type": "number" }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["reference_objects"],
                 "additionalProperties": false
             }
         }),
@@ -1192,6 +1730,102 @@ struct MeshToolArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct SplatToolArgs {
+    #[serde(alias = "image_path")]
+    pub input_image_path: PathBuf,
+    #[serde(default, alias = "output_path")]
+    pub output_splat_path: Option<PathBuf>,
+    #[serde(default)]
+    pub output_format: Option<AssetOutputFormat>,
+    #[serde(default)]
+    pub rmbg_model: Option<ForegroundModel>,
+    #[serde(default)]
+    pub backend: Option<InferenceBackend>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImagesToAssetsToolArgs {
+    #[serde(default, alias = "image_paths")]
+    pub input_image_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub output_paths: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    pub output_format: Option<AssetOutputFormat>,
+    #[serde(default)]
+    pub rmbg_model: Option<ForegroundModel>,
+    #[serde(default)]
+    pub synthesis_models: Option<Vec<SynthesisModel>>,
+    #[serde(default)]
+    pub backend: Option<InferenceBackend>,
+    #[serde(default)]
+    pub target_faces: Option<usize>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub batch_vram_mb: Option<u64>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneSpawnCachedArgs {
+    pub cache_key: String,
+    #[serde(default)]
+    pub translation: Option<[f32; 3]>,
+    #[serde(default)]
+    pub rotation: Option<[f32; 4]>,
+    #[serde(default)]
+    pub scale: Option<[f32; 3]>,
+    #[serde(default)]
+    pub select: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneSpawnPathArgs {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub translation: Option<[f32; 3]>,
+    #[serde(default)]
+    pub rotation: Option<[f32; 4]>,
+    #[serde(default)]
+    pub scale: Option<[f32; 3]>,
+    #[serde(default)]
+    pub select: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SceneDeleteArgs {
+    #[serde(default)]
+    pub cache_key: Option<String>,
+    #[serde(default)]
+    pub selected: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneSetCameraArgs {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    #[serde(default)]
+    pub focus: Option<[f32; 3]>,
+    #[serde(default)]
+    pub yaw: Option<f32>,
+    #[serde(default)]
+    pub pitch: Option<f32>,
+    #[serde(default)]
+    pub radius: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneCaptureArgs {
+    #[serde(alias = "path")]
+    pub output_path: PathBuf,
+}
+
 impl ForegroundModel {
     fn as_str(self) -> &'static str {
         match self {
@@ -1206,6 +1840,7 @@ impl SynthesisModel {
         match self {
             SynthesisModel::Triposg => "triposg",
             SynthesisModel::Trellis => "trellis",
+            SynthesisModel::Triposplat => "triposplat",
         }
     }
 }
@@ -1230,6 +1865,40 @@ impl MeshOutputFormat {
     }
 }
 
+impl AssetOutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            AssetOutputFormat::Auto => "auto",
+            AssetOutputFormat::Glb => "glb",
+            AssetOutputFormat::Splat => "splat",
+            AssetOutputFormat::Ply => "ply",
+        }
+    }
+}
+
+fn runtime_foreground_model_str(value: burn_synth::ForegroundModel) -> &'static str {
+    match value {
+        burn_synth::ForegroundModel::Rmbg14 => "rmbg14",
+        burn_synth::ForegroundModel::Rmbg2 => "rmbg2",
+    }
+}
+
+fn runtime_synthesis_model_str(value: burn_synth::SynthesisModel) -> &'static str {
+    match value {
+        burn_synth::SynthesisModel::Triposg => "triposg",
+        burn_synth::SynthesisModel::Trellis => "trellis",
+        burn_synth::SynthesisModel::Triposplat => "triposplat",
+    }
+}
+
+fn runtime_backend_str(value: burn_synth::InferenceBackend) -> &'static str {
+    match value {
+        burn_synth::InferenceBackend::Cpu => "cpu",
+        burn_synth::InferenceBackend::Wgpu => "wgpu",
+        burn_synth::InferenceBackend::Cuda => "cuda",
+    }
+}
+
 impl From<ForegroundModel> for burn_synth::ForegroundModel {
     fn from(value: ForegroundModel) -> Self {
         match value {
@@ -1244,6 +1913,7 @@ impl From<SynthesisModel> for burn_synth::SynthesisModel {
         match value {
             SynthesisModel::Triposg => Self::Triposg,
             SynthesisModel::Trellis => Self::Trellis,
+            SynthesisModel::Triposplat => Self::Triposplat,
         }
     }
 }
@@ -1272,61 +1942,6 @@ impl From<TrellisQuality> for burn_synth::TrellisQuality {
 mod tests {
     use super::*;
     use clap::Parser;
-
-    fn test_texture(width: u32, height: u32, rgba: [u8; 4]) -> burn_synth::MeshTexture {
-        let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
-        for _ in 0..(width as usize * height as usize) {
-            bytes.extend_from_slice(&rgba);
-        }
-        burn_synth::MeshTexture {
-            width,
-            height,
-            rgba8: bytes,
-        }
-    }
-
-    fn sample_mesh_with_pbr() -> Mesh {
-        Mesh {
-            vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.8, 0.0]],
-            faces: vec![[0, 1, 2]],
-            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
-            material: Some(burn_synth::MeshMaterial {
-                base_color: [1.0, 1.0, 1.0],
-                metallic: 1.0,
-                roughness: 1.0,
-                alpha: 1.0,
-            }),
-            pbr_textures: Some(burn_synth::MeshPbrTextures {
-                base_color: test_texture(2, 2, [220, 200, 180, 255]),
-                metallic_roughness: test_texture(2, 2, [0, 140, 60, 255]),
-                normal: None,
-                emissive: None,
-                occlusion: None,
-            }),
-        }
-    }
-
-    #[test]
-    fn gltf_json_embeds_pbr_textures() {
-        let mesh = sample_mesh_with_pbr();
-        let layout = build_mesh_binary_layout(&mesh).expect("mesh layout");
-        let gltf = gltf_json(&mesh, &layout);
-        let materials = gltf["materials"].as_array().expect("materials array");
-        assert_eq!(materials.len(), 1);
-        let pbr = &materials[0]["pbrMetallicRoughness"];
-        assert!(pbr.get("baseColorTexture").is_some());
-        assert!(pbr.get("metallicRoughnessTexture").is_some());
-        assert!(
-            gltf["textures"]
-                .as_array()
-                .is_some_and(|value| !value.is_empty())
-        );
-        assert!(
-            gltf["images"]
-                .as_array()
-                .is_some_and(|value| !value.is_empty())
-        );
-    }
 
     #[test]
     fn server_args_default_to_balanced_quality_defaults() {
@@ -1371,5 +1986,130 @@ mod tests {
         assert_eq!(runtime.flash_extract.min_resolution, 31);
         assert_eq!(runtime.flash_extract.mini_grid_num, 2);
         assert_eq!(runtime.flash_extract.num_chunks, 4096);
+    }
+
+    #[test]
+    fn tool_list_includes_batch_splat_and_scene_tools() {
+        let tools = tool_defs();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "images_to_assets",
+            "image_to_splat",
+            "scene_status",
+            "scene_spawn_cached",
+            "scene_spawn_path",
+            "scene_clear",
+            "scene_capture",
+            "scene_compose_assets",
+            "scene_validate_layout",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+    }
+
+    #[test]
+    fn scene_compose_plan_generates_spawn_commands_with_validation_keys() {
+        let plan = compose_scene_layout(SceneComposeArgs {
+            reference_objects: vec![scene_layout::SceneReferenceObject {
+                id: Some("chair_1".to_string()),
+                label: "chair".to_string(),
+                aliases: Vec::new(),
+                bbox: [0.1, 0.2, 0.3, 0.6],
+            }],
+            assets: vec![scene_layout::SceneAssetBinding {
+                reference_id: Some("chair_1".to_string()),
+                label: Some("chair".to_string()),
+                aliases: Vec::new(),
+                path: Some(PathBuf::from("/tmp/chair.glb")),
+                cache_key: None,
+                select: true,
+            }],
+            apply: false,
+            clear_existing: true,
+            layout_width: 6.0,
+            layout_depth: 4.0,
+            y: 0.0,
+            min_scale: 0.35,
+            scale_multiplier: 1.0,
+        })
+        .expect("compose plan");
+        let commands = scene_commands_from_plan(&plan).expect("scene commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["type"], "clear_scene");
+        assert_eq!(commands[1]["type"], "spawn_path");
+        assert_eq!(commands[1]["cache_key"], "path:/tmp/chair.glb");
+        assert_eq!(commands[1]["select"], true);
+    }
+
+    #[test]
+    fn scene_sequence_is_strictly_monotonic() {
+        let first = next_scene_sequence();
+        let second = next_scene_sequence();
+        assert!(second > first);
+    }
+
+    #[test]
+    fn scene_command_waits_for_matching_status_sequence() {
+        let root = unique_test_dir("scene_bridge");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let command_path = root.join("scene_commands.json");
+        let status_path = command_path.with_extension("status.json");
+        let config = ServerConfig {
+            scene_control_path: Some(command_path.clone()),
+            scene_status_path: Some(status_path.clone()),
+            scene_timeout: Duration::from_secs(1),
+            ..ServerConfig::from_args(ServerArgs::parse_from(["burn_synth_mcp"]))
+        };
+        let server = McpServer::new(config);
+        let status_path_for_thread = status_path.clone();
+        let command_path_for_thread = command_path.clone();
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            loop {
+                if command_path_for_thread.exists() {
+                    let command = read_scene_status(&command_path_for_thread)
+                        .expect("command JSON should parse");
+                    let sequence = command["sequence"].as_u64().expect("sequence");
+                    atomic_write_json(
+                        &status_path_for_thread,
+                        &json!({
+                            "last_sequence": sequence,
+                            "ok": true,
+                            "cache_entries": [],
+                            "world_items": [],
+                            "camera": null,
+                            "screenshots": [],
+                        }),
+                    )
+                    .expect("write status");
+                    return;
+                }
+                assert!(started.elapsed() < Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let response = server
+            .send_scene_commands(vec![json!({ "type": "clear_selection" })])
+            .expect("scene command should be acknowledged");
+        handle.join().expect("status writer thread");
+        assert_eq!(response["acknowledged"], true);
+        assert!(response["status"]["last_sequence"].as_u64().is_some());
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "burn_synth_mcp_{label}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
     }
 }

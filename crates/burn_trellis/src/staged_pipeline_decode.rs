@@ -1753,19 +1753,19 @@ pub(super) fn build_uv_raster_domain(
 
     let mut components = Vec::<UvAtlasComponent>::new();
     let mut root_to_component = fast_hash_map_with_capacity::<usize, usize>(atlas_faces.len());
-    for face_idx in 0..atlas_faces.len() {
+    for (face_idx, atlas_face) in atlas_faces.iter_mut().enumerate() {
         let root = uv_atlas_find(parents.as_mut_slice(), face_idx);
+        let chart = atlas_face.chart;
         let component_idx = *root_to_component.entry(root).or_insert_with(|| {
             let idx = components.len();
-            components.push(UvAtlasComponent::new(atlas_faces[face_idx].chart));
+            components.push(UvAtlasComponent::new(chart));
             idx
         });
-        atlas_faces[face_idx].component = component_idx;
-        let face = atlas_faces[face_idx].source;
+        atlas_face.component = component_idx;
+        let face = atlas_face.source;
         components[component_idx].faces.push(face_idx);
         for vertex_idx in face {
-            let projected =
-                box_atlas_project(atlas_faces[face_idx].chart, vertices[vertex_idx as usize]);
+            let projected = box_atlas_project(chart, vertices[vertex_idx as usize]);
             components[component_idx].include(projected);
         }
     }
@@ -1811,10 +1811,9 @@ fn assign_chart_atlas_components(
 ) -> Vec<UvAtlasComponent> {
     let mut components = Vec::<UvAtlasComponent>::new();
     let mut chart_to_component = [usize::MAX; 6];
-    for face_idx in 0..atlas_faces.len() {
-        let chart = atlas_faces[face_idx]
-            .chart
-            .min(chart_to_component.len() - 1);
+    for (face_idx, atlas_face) in atlas_faces.iter_mut().enumerate() {
+        let face_chart = atlas_face.chart;
+        let chart = face_chart.min(chart_to_component.len() - 1);
         let component_idx = if chart_to_component[chart] == usize::MAX {
             let idx = components.len();
             chart_to_component[chart] = idx;
@@ -1823,11 +1822,11 @@ fn assign_chart_atlas_components(
         } else {
             chart_to_component[chart]
         };
-        atlas_faces[face_idx].component = component_idx;
+        atlas_face.component = component_idx;
         components[component_idx].faces.push(face_idx);
-        for vertex_idx in atlas_faces[face_idx].source {
+        for vertex_idx in atlas_face.source {
             if let Some(vertex) = vertices.get(vertex_idx as usize) {
-                let projected = box_atlas_project(atlas_faces[face_idx].chart, *vertex);
+                let projected = box_atlas_project(face_chart, *vertex);
                 components[component_idx].include(projected);
             }
         }

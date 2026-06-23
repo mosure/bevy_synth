@@ -161,14 +161,12 @@ pub fn sparse_patchify3d_forward_wgpu(
 
     let input_p = input.into_primitive().tensor();
     let coords_p = coords.reshape([rows * 4]).into_primitive();
-    let weight_p = weight
-        .reshape([config.out_channels
-            * config.in_channels
-            * config.tubelet_size
-            * config.patch_h
-            * config.patch_w])
-        .into_primitive()
-        .tensor();
+    let weight_elements = config.out_channels
+        * config.in_channels
+        * config.tubelet_size
+        * config.patch_h
+        * config.patch_w;
+    let weight_p = weight.reshape([weight_elements]).into_primitive().tensor();
     let bias_p = bias.into_primitive().tensor();
     let output = CubeTensor::new_contiguous(
         input_p.client.clone(),

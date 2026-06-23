@@ -58,7 +58,7 @@ fn load_blob_bytes_from_burnpack_parts(
     burnpack_path: &Path,
     manifest_path: &Path,
 ) -> Result<Vec<u8>, String> {
-    let manifest_bytes = virtual_fs::read(&manifest_path).map_err(|err| {
+    let manifest_bytes = virtual_fs::read(manifest_path).map_err(|err| {
         format!(
             "failed to read burnpack parts manifest '{}': {err}",
             manifest_path.display()
@@ -92,9 +92,9 @@ fn load_blob_bytes_from_burnpack_parts(
     }
 
     let mut merged = Vec::new();
-    let manifest_source_url = virtual_fs::source_url(&manifest_path);
+    let manifest_source_url = virtual_fs::source_url(manifest_path);
     for (index, part) in manifest.parts.iter().enumerate() {
-        let part_path = resolve_manifest_part_path(&manifest_path, part.path.as_str())?;
+        let part_path = resolve_manifest_part_path(manifest_path, part.path.as_str())?;
         let part_file_size = if virtual_fs::has_virtual_file(&part_path) || part_path.exists() {
             virtual_fs::metadata_len(&part_path).map_err(|err| {
                 format!(

@@ -71,12 +71,13 @@ impl Default for WasmInferencePreset {
 impl WasmInferencePreset {
     pub fn triposplat_default() -> Self {
         let settings = burn_triposplat::TripoSplatProfile::Balanced.settings();
-        let mut preset = Self::default();
-        preset.synthesis_model = "triposplat";
-        preset.num_steps = settings.steps;
-        preset.guidance_scale = settings.guidance_scale;
-        preset.triposplat_num_gaussians = settings.num_gaussians;
-        preset
+        Self {
+            synthesis_model: "triposplat",
+            num_steps: settings.steps,
+            guidance_scale: settings.guidance_scale,
+            triposplat_num_gaussians: settings.num_gaussians,
+            ..Self::default()
+        }
     }
 
     /// Build CLI-style args consumed by runtime argument parsing.
