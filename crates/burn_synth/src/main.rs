@@ -5,9 +5,11 @@ use burn_synth::{
     AssetRequest, DinoBackend, ForegroundRequest, ImageSource, MeshRequest, ModelSelection,
     ProgressVerbosity, RuntimeConfig, RuntimeProgressObserver, RuntimeSplatOutput, SplatRequest,
     SynthRuntime, SynthesisAsset, default_log_progress_callback,
-    triposplat::TripoSplatBurnpackPrecision, write_glb_mesh,
+    quality::{DEFAULT_TRELLIS_TARGET_FACES, DEFAULT_TRIPOSG_TARGET_FACES, RuntimeQualityPreset},
+    triposplat::TripoSplatBurnpackPrecision,
+    write_glb_mesh,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,7 +57,15 @@ struct Cli {
     #[arg(long)]
     trellis_max_sparse_coords: Option<usize>,
 
-    #[arg(long, value_enum, default_value_t = CliTrellisQuality::Medium)]
+    /// Native Trellis PBR texture size for Rust GLB export. Use 0 for runtime default.
+    #[arg(long)]
+    trellis_pbr_texture_size: Option<usize>,
+
+    /// Enable native Trellis PBR texture baking. Pass `--trellis-pbr true` for textured GLB output.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    trellis_pbr: bool,
+
+    #[arg(long, value_enum, default_value_t = CliTrellisQuality::Low)]
     trellis_quality: CliTrellisQuality,
 
     #[arg(long, value_enum, default_value_t = CliTrellisComputeProfile::ReferenceF32)]
@@ -241,47 +251,18 @@ enum CliQuality {
     Full,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CliQualityDefaults {
-    num_steps: usize,
-    num_tokens: usize,
-    guidance_scale: f32,
-    flash_octree_depth: usize,
-    flash_num_chunks: usize,
-    flash_min_resolution: usize,
-    flash_mini_grid_num: usize,
+impl CliQuality {
+    fn defaults(self) -> burn_synth::quality::RuntimeQualityDefaults {
+        RuntimeQualityPreset::from(self).defaults()
+    }
 }
 
-impl CliQuality {
-    fn defaults(self) -> CliQualityDefaults {
-        match self {
-            Self::Fast => CliQualityDefaults {
-                num_steps: 12,
-                num_tokens: 512,
-                guidance_scale: 7.0,
-                flash_octree_depth: 7,
-                flash_num_chunks: 4096,
-                flash_min_resolution: 31,
-                flash_mini_grid_num: 2,
-            },
-            Self::Balanced => CliQualityDefaults {
-                num_steps: 20,
-                num_tokens: 1024,
-                guidance_scale: 7.0,
-                flash_octree_depth: 8,
-                flash_num_chunks: 8192,
-                flash_min_resolution: 31,
-                flash_mini_grid_num: 4,
-            },
-            Self::Full => CliQualityDefaults {
-                num_steps: 50,
-                num_tokens: 2048,
-                guidance_scale: 7.0,
-                flash_octree_depth: 9,
-                flash_num_chunks: 10_000,
-                flash_min_resolution: 63,
-                flash_mini_grid_num: 4,
-            },
+impl From<CliQuality> for RuntimeQualityPreset {
+    fn from(value: CliQuality) -> Self {
+        match value {
+            CliQuality::Fast => Self::Fast,
+            CliQuality::Balanced => Self::Balanced,
+            CliQuality::Full => Self::Full,
         }
     }
 }
@@ -335,10 +316,14 @@ fn run(cli: Cli) -> Result<(), String> {
             .is_some_and(|model| matches!(model, CliSynthesisModel::Triposplat));
     let triposplat_profile_settings =
         burn_synth::triposplat::TripoSplatProfile::from(cli.triposplat_profile).settings();
+    let uses_trellis = synthesis_models
+        .iter()
+        .any(|model| matches!(model, CliSynthesisModel::Trellis));
     let target_faces = match cli.faces {
         Some(0) => None,
         Some(value) => Some(value),
-        None => Some(10_000),
+        None if uses_trellis => Some(DEFAULT_TRELLIS_TARGET_FACES),
+        None => Some(DEFAULT_TRIPOSG_TARGET_FACES),
     };
     let triposplat_counts =
         normalize_cli_gaussian_counts(&cli.gaussians, triposplat_profile_settings.num_gaussians)?;
@@ -346,6 +331,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let triposplat_guidance_scale = cli
         .guidance_scale
         .unwrap_or(triposplat_profile_settings.guidance_scale);
+    let default_runtime_config = RuntimeConfig::default();
     let mut runtime_config = RuntimeConfig {
         model_selection: ModelSelection::new(
             synthesis_models.iter().copied().map(Into::into),
@@ -361,6 +347,11 @@ fn run(cli: Cli) -> Result<(), String> {
         trellis_bridge_script: cli.trellis_bridge_script,
         trellis_noise_overrides_hook: cli.trellis_noise_overrides_hook,
         trellis_max_sparse_coords: cli.trellis_max_sparse_coords,
+        trellis_pbr_texture_size: cli
+            .trellis_pbr_texture_size
+            .filter(|size| *size > 0)
+            .or(default_runtime_config.trellis_pbr_texture_size),
+        trellis_pbr_enabled: cli.trellis_pbr,
         trellis_quality: cli.trellis_quality.into(),
         trellis_compute_profile: cli.trellis_compute_profile.into(),
         bg_weights_root: cli.bg_weights_root,
@@ -380,10 +371,10 @@ fn run(cli: Cli) -> Result<(), String> {
         triposplat_shift: cli.triposplat_shift.unwrap_or(3.0),
         triposplat_num_gaussians: triposplat_counts[0],
         triposplat_erode_radius: cli.triposplat_erode_radius.unwrap_or(1),
-        seed: cli.seed.or(RuntimeConfig::default().seed),
+        seed: cli.seed.or(default_runtime_config.seed),
         dino_backend: cli.dino_backend.into(),
         target_faces,
-        ..RuntimeConfig::default()
+        ..default_runtime_config
     };
     runtime_config.flash_extract.octree_depth = cli
         .flash_octree_depth
@@ -957,6 +948,24 @@ mod tests {
     }
 
     #[test]
+    fn trellis_cli_defaults_to_reference_f32_profile() {
+        let cli = Cli::parse_from([
+            "burn_synth",
+            "--synthesis-models",
+            "trellis",
+            "mesh",
+            "--input",
+            "input.png",
+        ]);
+        assert_eq!(cli.trellis_quality, CliTrellisQuality::Low);
+        assert!(!cli.trellis_pbr);
+        assert_eq!(
+            cli.trellis_compute_profile,
+            CliTrellisComputeProfile::ReferenceF32
+        );
+    }
+
+    #[test]
     fn mesh_cli_accepts_repeated_inputs_for_one_runtime_invocation() {
         let cli = Cli::parse_from([
             "burn_synth",
@@ -992,6 +1001,34 @@ mod tests {
         assert_eq!(cli.quality, CliQuality::Fast);
         assert_eq!(cli.num_steps, Some(18));
         assert_eq!(cli.flash_min_resolution, Some(47));
+    }
+
+    #[test]
+    fn trellis_cli_accepts_pbr_and_quality_settings() {
+        let cli = Cli::parse_from([
+            "burn_synth",
+            "--synthesis-models",
+            "trellis",
+            "--trellis-quality",
+            "high",
+            "--trellis-pbr",
+            "true",
+            "--trellis-pbr-texture-size",
+            "2048",
+            "--faces",
+            "500000",
+            "mesh",
+            "--input",
+            "input.png",
+        ]);
+        assert_eq!(cli.trellis_quality, CliTrellisQuality::High);
+        assert!(cli.trellis_pbr);
+        assert_eq!(cli.trellis_pbr_texture_size, Some(2048));
+        assert_eq!(cli.faces, Some(500_000));
+        assert_eq!(
+            resolve_cli_synthesis_models(&cli).unwrap(),
+            vec![CliSynthesisModel::Trellis]
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use burn::prelude::Backend;
-use burn::tensor::{Bytes, DType, TensorData};
+use burn::tensor::{BoolStore, Bytes, DType, Shape, TensorData};
 use burn_store::{
     KeyRemapper, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, TensorSnapshot,
     TensorSnapshotError,
@@ -16,6 +16,8 @@ use serde_json::Value;
 use super::weight_parts::burnpack_parts_manifest_path;
 use crate::blob_burnpack::load_blob_bytes_from_burnpack_bytes;
 use crate::virtual_fs;
+
+const BURNPACK_PART_ALIGNMENT: u64 = 256;
 
 #[derive(Debug, Deserialize)]
 struct BurnpackPartEntry {
@@ -59,7 +61,10 @@ struct PartPayloadCache {
 }
 
 impl PartPayloadCache {
-    const MAX_ENTRIES: usize = 4;
+    // TRELLIS web burnpacks currently shard as high as 77 parts. Keep one full
+    // component resident during lazy snapshot application to avoid synchronous
+    // browser re-fetch loops, while still bounding multi-component cache growth.
+    const MAX_ENTRIES: usize = 96;
 
     fn get(&mut self, index: usize) -> Option<Arc<Vec<u8>>> {
         let payload = self.entries.get(&index)?.clone();
@@ -183,19 +188,25 @@ impl BlobPartsArchive {
             PartSource::Path(path) => virtual_fs::read(&path).map_err(|err| {
                 format!("failed to read burnpack part '{}': {err}", path.display())
             })?,
-            PartSource::Url(url) => virtual_fs::fetch_url(url.as_str())
-                .map_err(|err| format!("failed to fetch burnpack part '{url}': {err}"))?,
+            PartSource::Url(url) => {
+                return Err(format!(
+                    "burnpack part URL '{url}' was not preloaded; async wasm loaders must download and register shard bytes before materialization"
+                ));
+            }
         };
 
-        if descriptor.declared_file_bytes > 0
-            && burnpack_bytes.len() as u64 != descriptor.declared_file_bytes
-        {
-            return Err(format!(
-                "burnpack part {} file-size mismatch: manifest={} actual={}",
-                index,
-                descriptor.declared_file_bytes,
-                burnpack_bytes.len()
-            ));
+        if descriptor.declared_file_bytes > 0 {
+            let actual_file_bytes = burnpack_bytes.len() as u64;
+            let matches_declared = actual_file_bytes == descriptor.declared_file_bytes;
+            let matches_padded = actual_file_bytes >= descriptor.declared_file_bytes
+                && actual_file_bytes.saturating_sub(descriptor.declared_file_bytes)
+                    <= BURNPACK_PART_ALIGNMENT;
+            if !matches_declared && !matches_padded {
+                return Err(format!(
+                    "burnpack part {} file-size mismatch: manifest={} actual={}",
+                    index, descriptor.declared_file_bytes, actual_file_bytes
+                ));
+            }
         }
 
         let payload = load_blob_bytes_from_burnpack_bytes(&burnpack_bytes).map_err(|err| {
@@ -444,7 +455,8 @@ fn build_snapshots_from_header(
 
         let entry: SafetensorsHeaderEntry = serde_json::from_value(entry_value.clone())
             .map_err(|err| format!("invalid safetensors tensor metadata for '{name}': {err}"))?;
-        let dtype = parse_safetensors_dtype(&entry.dtype)?;
+        let source_dtype = parse_safetensors_dtype(&entry.dtype)?;
+        let dtype = chunked_snapshot_dtype(source_dtype);
         let [offset_start, offset_end] = entry.data_offsets;
         if offset_end < offset_start {
             return Err(format!(
@@ -468,20 +480,22 @@ fn build_snapshots_from_header(
             ));
         }
 
-        let shape = entry.shape;
+        let shape: Shape = entry.shape.into();
         let shape_for_data = shape.clone();
         let archive_for_data = archive.clone();
+        let source_dtype_for_data = source_dtype;
         let dtype_for_data = dtype;
         let name_for_data = name.clone();
         let data_fn = Rc::new(move || {
             let bytes = archive_for_data
                 .read_range(absolute_start, absolute_end)
                 .map_err(TensorSnapshotError::IoError)?;
-            Ok(TensorData {
+            let data = TensorData {
                 bytes: Bytes::from_bytes_vec(bytes),
                 shape: shape_for_data.clone(),
-                dtype: dtype_for_data,
-            })
+                dtype: source_dtype_for_data,
+            };
+            Ok(promote_chunked_tensor_data_if_needed(data, dtype_for_data))
         });
 
         let path_stack = name_for_data
@@ -518,8 +532,26 @@ fn parse_safetensors_dtype(value: &str) -> Result<DType, String> {
         "U64" => Ok(DType::U64),
         "U32" => Ok(DType::U32),
         "U8" => Ok(DType::U8),
-        "BOOL" => Ok(DType::Bool),
+        "BOOL" => Ok(DType::Bool(BoolStore::Native)),
         other => Err(format!("unsupported safetensors dtype '{other}'")),
+    }
+}
+
+fn chunked_snapshot_dtype(dtype: DType) -> DType {
+    match dtype {
+        #[cfg(target_arch = "wasm32")]
+        DType::F16 | DType::BF16 => DType::F32,
+        other => other,
+    }
+}
+
+fn promote_chunked_tensor_data_if_needed(data: TensorData, target_dtype: DType) -> TensorData {
+    if data.dtype == target_dtype {
+        return data;
+    }
+    match target_dtype {
+        DType::F32 => data.convert::<f32>(),
+        _ => data,
     }
 }
 

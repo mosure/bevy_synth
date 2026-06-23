@@ -216,25 +216,64 @@ impl SparseUnetDecoderRuntime {
         self.voxel_margin
     }
 
+    fn compute_fp16_enabled(&self) -> bool {
+        self.compute_fp16 && runtime_model_sparse_decoder_conv_f16_enabled()
+    }
+
     pub fn decode(
         &self,
         coords: &[[u32; 4]],
         rows: &[[f32; 32]],
         guide_subdivisions: Option<&[SparseSubdivisionLogits]>,
     ) -> Result<SparseDecodeResult, String> {
-        self.decode_internal(
-            Some(coords),
-            #[cfg(feature = "runtime-model-wgpu")]
-            None,
-            Some(rows),
-            #[cfg(feature = "runtime-model-wgpu")]
-            None,
-            guide_subdivisions,
-        )
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(self.decode_internal(
+                Some(coords),
+                #[cfg(feature = "runtime-model-wgpu")]
+                None,
+                Some(rows),
+                #[cfg(feature = "runtime-model-wgpu")]
+                None,
+                guide_subdivisions,
+            ))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (coords, rows, guide_subdivisions);
+            Err("decoder sync decode is unsupported on wasm; use the async runtime path".to_string())
+        }
     }
 
     #[cfg(feature = "runtime-model-wgpu")]
     pub fn decode_with_tensors(
+        &self,
+        coords_wgpu: Tensor<DefaultWgpuBackend, 2, Int>,
+        rows_wgpu: Tensor<DefaultWgpuBackend, 2>,
+        guide_subdivisions: Option<&[SparseSubdivisionLogits]>,
+    ) -> Result<SparseDecodeResult, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(self.decode_internal(
+                None,
+                Some(coords_wgpu),
+                None,
+                Some(rows_wgpu),
+                guide_subdivisions,
+            ))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (coords_wgpu, rows_wgpu, guide_subdivisions);
+            Err(
+                "decoder sync tensor decode is unsupported on wasm; use decode_with_tensors_async"
+                    .to_string(),
+            )
+        }
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub async fn decode_with_tensors_async(
         &self,
         coords_wgpu: Tensor<DefaultWgpuBackend, 2, Int>,
         rows_wgpu: Tensor<DefaultWgpuBackend, 2>,
@@ -247,9 +286,10 @@ impl SparseUnetDecoderRuntime {
             Some(rows_wgpu),
             guide_subdivisions,
         )
+        .await
     }
 
-    fn decode_internal(
+    async fn decode_internal(
         &self,
         coords: Option<&[[u32; 4]]>,
         #[cfg(feature = "runtime-model-wgpu")] coords_wgpu: Option<
@@ -322,6 +362,15 @@ impl SparseUnetDecoderRuntime {
         if count == 0 {
             return Ok(SparseDecodeResult::empty(self.out_channels));
         }
+        decoder_wasm_log(
+            format!(
+                "burn_trellis: decoder.shape internal begin rows={count} stages={} device_coords={} device_rows={}",
+                self.stages.len(),
+                using_device_coords,
+                using_device_rows
+            )
+            .as_str(),
+        );
 
         let mut state_coords = if let Some(coords_host) = coords {
             coords_host[..count].to_vec()
@@ -390,7 +439,7 @@ impl SparseUnetDecoderRuntime {
         };
         #[cfg(feature = "runtime-model-wgpu")]
         let canonical_wgpu =
-            decoder_wgpu_device_math_enabled() && (!self.compute_fp16 || decoder_wgpu_device_math_allow_fp16());
+            decoder_wgpu_device_math_enabled() && (!self.compute_fp16_enabled() || decoder_wgpu_device_math_allow_fp16());
         #[cfg(feature = "runtime-model-wgpu")]
         let mut final_output_preprojected_wgpu = false;
         #[cfg(feature = "runtime-model-wgpu")]
@@ -414,18 +463,25 @@ impl SparseUnetDecoderRuntime {
             && let Some(context_gpu) = wgpu_context.as_deref_mut()
             && let Some(state_t) = state_feats_wgpu.take()
         {
+            decoder_wasm_log(
+                format!("burn_trellis: decoder.shape from_latent begin rows={count}").as_str(),
+            );
             let mut state_t = linear_forward_wgpu(
                 context_gpu,
                 state_t,
                 &self.from_latent,
+                false,
                 "from_latent(wgpu_math)",
             )?;
-            if self.compute_fp16 {
+            if self.compute_fp16_enabled() {
                 state_t = quantize_f16_tensor_wgpu(state_t);
             }
             state_feats_wgpu = Some(state_t);
             from_latent_completed_on_device = true;
             state_feats.clear();
+            decoder_wasm_log(
+                format!("burn_trellis: decoder.shape from_latent complete rows={count}").as_str(),
+            );
         }
         #[cfg(feature = "runtime-model-wgpu")]
         if !from_latent_completed_on_device {
@@ -441,7 +497,7 @@ impl SparseUnetDecoderRuntime {
                 &self.from_latent,
                 "from_latent",
             )?;
-            if self.compute_fp16 {
+            if self.compute_fp16_enabled() {
                 quantize_f16_inplace(state_feats.as_mut_slice());
             }
         }
@@ -453,7 +509,7 @@ impl SparseUnetDecoderRuntime {
                 &self.from_latent,
                 "from_latent",
             )?;
-            if self.compute_fp16 {
+            if self.compute_fp16_enabled() {
                 quantize_f16_inplace(state_feats.as_mut_slice());
             }
         }
@@ -461,6 +517,14 @@ impl SparseUnetDecoderRuntime {
         let mut subdivisions = Vec::new();
         for (stage_idx, stage) in self.stages.iter().enumerate() {
             let stage_channels = self.model_channels[stage_idx];
+            decoder_wasm_log(
+                format!(
+                    "burn_trellis: decoder.shape stage {stage_idx} begin channels={stage_channels} convnext_blocks={} has_upsample={}",
+                    stage.convnext_blocks.len(),
+                    stage.upsample_block.is_some()
+                )
+                .as_str(),
+            );
             #[allow(unused_mut)]
             // Stages with no ConvNeXt blocks are a device no-op and should not
             // fall into host-completion error guards in canonical WGPU mode.
@@ -486,6 +550,12 @@ impl SparseUnetDecoderRuntime {
                     .saturating_mul(stage_channels)
                     .saturating_mul(core::mem::size_of::<f32>());
                 if state_bytes <= decoder_wgpu_device_math_max_state_bytes() {
+                    decoder_wasm_log(
+                        format!(
+                            "burn_trellis: decoder.shape stage {stage_idx} convnext begin rows={row_count} bytes={state_bytes}"
+                        )
+                        .as_str(),
+                    );
                     let state_coords_t = if let Some(coords_t) = state_coords_wgpu.as_ref() {
                         let [rows_device, cols_device] = coords_t.dims();
                         if rows_device == row_count && cols_device == 4 {
@@ -545,14 +615,20 @@ impl SparseUnetDecoderRuntime {
                                 stage_idx,
                                 stage_channels,
                                 stage.convnext_blocks.as_slice(),
-                                self.compute_fp16,
+                                self.compute_fp16_enabled(),
                             )
                         }));
                     match convnext_result {
-                                Ok(Ok(next_state_feats)) => {
-                                    state_feats_wgpu = Some(next_state_feats);
-                                    convnext_device_complete = true;
-                                }
+                        Ok(Ok(next_state_feats)) => {
+                            state_feats_wgpu = Some(next_state_feats);
+                            convnext_device_complete = true;
+                            decoder_wasm_log(
+                                format!(
+                                    "burn_trellis: decoder.shape stage {stage_idx} convnext complete rows={row_count}"
+                                )
+                                .as_str(),
+                            );
+                        }
                         Ok(Err(err)) => {
                             if err.contains("BufferTooBig") {
                                 context_gpu.wgpu_failed = true;
@@ -622,7 +698,7 @@ impl SparseUnetDecoderRuntime {
                             #[cfg(feature = "runtime-model-wgpu")]
                             wgpu_context.as_deref_mut(),
                         )?;
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(h.as_mut_slice());
                         }
                         layer_norm_inplace(
@@ -634,7 +710,7 @@ impl SparseUnetDecoderRuntime {
                             LAYER_NORM32_EPS,
                             format!("stage {stage_idx} block {block_idx} layer_norm").as_str(),
                         )?;
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(h.as_mut_slice());
                         }
                         h = linear_forward(
@@ -643,14 +719,14 @@ impl SparseUnetDecoderRuntime {
                             &block.mlp_0,
                             format!("stage {stage_idx} block {block_idx} mlp_0").as_str(),
                         )?;
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(h.as_mut_slice());
                         }
                         silu_inplace(
                             h.as_mut_slice(),
                             format!("stage {stage_idx} block {block_idx} silu").as_str(),
                         );
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(h.as_mut_slice());
                         }
                         h = linear_forward(
@@ -659,7 +735,7 @@ impl SparseUnetDecoderRuntime {
                             &block.mlp_2,
                             format!("stage {stage_idx} block {block_idx} mlp_2").as_str(),
                         )?;
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(h.as_mut_slice());
                         }
                         add_inplace(
@@ -667,7 +743,7 @@ impl SparseUnetDecoderRuntime {
                             residual.as_slice(),
                             format!("stage {stage_idx} block {block_idx} residual_add").as_str(),
                         );
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(h.as_mut_slice());
                         }
                         state_feats = h;
@@ -682,6 +758,10 @@ impl SparseUnetDecoderRuntime {
                 if canonical_wgpu
                     && let Some(context_gpu) = wgpu_context.as_deref_mut()
                 {
+                    decoder_wasm_log(
+                        format!("burn_trellis: decoder.shape stage {stage_idx} upsample begin")
+                            .as_str(),
+                    );
                     let parent_coords_t = if let Some(coords_t) = state_coords_wgpu.take() {
                         coords_t
                     } else {
@@ -701,6 +781,12 @@ impl SparseUnetDecoderRuntime {
                         ));
                     }
                     if parent_rows == 0 {
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} upsample empty-parent"
+                            )
+                            .as_str(),
+                        );
                         state_feats_wgpu = Some(Tensor::<DefaultWgpuBackend, 2>::zeros(
                             [0, up.out_channels],
                             &context_gpu.device,
@@ -708,6 +794,13 @@ impl SparseUnetDecoderRuntime {
                         state_coords_wgpu = Some(parent_coords_t);
                         upsample_device_complete = true;
                     } else {
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} upsample parent rows={parent_rows} in_channels={}",
+                                up.in_channels
+                            )
+                            .as_str(),
+                        );
                         let parent_feats_t = if let Some(state_t) = state_feats_wgpu.take() {
                             let [rows_device, channels_device] = state_t.dims();
                             if rows_device != parent_rows || channels_device != up.in_channels {
@@ -745,6 +838,13 @@ impl SparseUnetDecoderRuntime {
                         };
 
                         let guide = guide_subdivisions.and_then(|levels| levels.get(stage_idx));
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} subdivision logits begin guide={}",
+                                guide.is_some()
+                            )
+                            .as_str(),
+                        );
                         let mut subdiv_logits_t = if let Some(guide) = guide {
                             guide_subdivision_logits_tensor_for_parent_wgpu(
                                 parent_coords_t.clone(),
@@ -757,6 +857,7 @@ impl SparseUnetDecoderRuntime {
                                 context_gpu,
                                 parent_feats_t.clone(),
                                 to_subdiv,
+                                self.compute_fp16_enabled(),
                                 format!("stage {stage_idx} to_subdiv(wgpu_math)").as_str(),
                             )?
                         } else {
@@ -764,13 +865,19 @@ impl SparseUnetDecoderRuntime {
                                 "decoder stage {stage_idx} requires guide_subdivisions but none were provided"
                             ));
                         };
-                        if self.compute_fp16 && guide.is_none() {
+                        if self.compute_fp16_enabled() && guide.is_none() {
                             subdiv_logits_t = quantize_f16_tensor_wgpu(subdiv_logits_t);
                         }
                         if self.runtime_config.center_subdivision_logits {
                             let mean = subdiv_logits_t.clone().mean_dim(1);
                             subdiv_logits_t = subdiv_logits_t.sub(mean);
                         }
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} active-index begin"
+                            )
+                            .as_str(),
+                        );
                         let active_indices_t = if let Some(guide) = guide {
                             guide_subdivision_active_indices_tensor_for_parent_wgpu(
                                 parent_rows,
@@ -778,12 +885,26 @@ impl SparseUnetDecoderRuntime {
                                 stage_idx,
                             )?
                         } else {
-                            subdivision_active_indices_wgpu(
+                            subdivision_active_indices_wgpu_async(
                                 subdiv_logits_t.clone(),
                                 false,
                                 &self.runtime_config,
-                            )?
+                            )
+                            .await?
                         };
+                        let [active_rows, active_cols] = active_indices_t.dims();
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} active-index complete rows={active_rows} cols={active_cols}"
+                            )
+                            .as_str(),
+                        );
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} child-expand begin"
+                            )
+                            .as_str(),
+                        );
                         let (child_coords_t, linear_idx_t) = if let Some(guide) = guide {
                             guide_subdivision_child_tensors_for_parent_wgpu(
                                 parent_rows,
@@ -808,6 +929,12 @@ impl SparseUnetDecoderRuntime {
                             );
                         }
                         let [child_rows, child_coord_cols] = child_coords_t.dims();
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} child-expand complete rows={child_rows}"
+                            )
+                            .as_str(),
+                        );
                         if child_coord_cols != 4 {
                             return Err(format!(
                                 "burn_trellis: decoder stage {} child coords tensor must have 4 columns, got {}",
@@ -822,6 +949,12 @@ impl SparseUnetDecoderRuntime {
                                 self.stages.as_slice(),
                                 stage_idx,
                             ) {
+                                decoder_wasm_log(
+                                    format!(
+                                        "burn_trellis: decoder.shape stage {stage_idx} streamed-output begin child_rows={child_rows} bytes={child_state_bytes}"
+                                    )
+                                    .as_str(),
+                                );
                                 let streamed_output_t = upsample_stage_to_output_chunks_wgpu(
                                     context_gpu,
                                     stage_idx,
@@ -831,9 +964,10 @@ impl SparseUnetDecoderRuntime {
                                     child_coords_t.clone(),
                                     active_indices_t.clone(),
                                     linear_idx_t,
-                                    self.compute_fp16,
+                                    self.compute_fp16_enabled(),
                                     &self.output_layer,
-                                )?;
+                                )
+                                .await?;
                                 state_feats_wgpu = Some(streamed_output_t);
                                 state_coords_wgpu = Some(child_coords_t);
                                 state_spatial_shape = if child_rows == 0 {
@@ -846,6 +980,12 @@ impl SparseUnetDecoderRuntime {
                                     ]
                                 };
                                 final_output_preprojected_wgpu = true;
+                                decoder_wasm_log(
+                                    format!(
+                                        "burn_trellis: decoder.shape stage {stage_idx} streamed-output complete child_rows={child_rows}"
+                                    )
+                                    .as_str(),
+                                );
                                 continue;
                             }
                             return Err(format!(
@@ -856,15 +996,27 @@ impl SparseUnetDecoderRuntime {
                             ));
                         }
 
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} norm1_silu begin"
+                            )
+                            .as_str(),
+                        );
                         let h_norm_t = layer_norm_silu_wgpu_with_fp16_fences(
                             context_gpu,
                             parent_feats_t.clone(),
                             Some(up.norm1_weight.as_slice()),
                             Some(up.norm1_bias.as_slice()),
                             LAYER_NORM32_EPS,
-                            self.compute_fp16,
+                            self.compute_fp16_enabled(),
                             format!("stage {stage_idx} up norm1_silu(wgpu_math)").as_str(),
                         )?;
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} conv1-select begin child_rows={child_rows}"
+                            )
+                            .as_str(),
+                        );
                         let h_up_t = if child_rows == 0 {
                             Tensor::<DefaultWgpuBackend, 2>::zeros(
                                 [0, up.out_channels],
@@ -880,12 +1032,20 @@ impl SparseUnetDecoderRuntime {
                                 active_indices_t.clone(),
                                 linear_idx_t.clone(),
                                 child_rows,
-                            )?;
-                            if self.compute_fp16 {
+                                self.compute_fp16_enabled(),
+                            )
+                            .await?;
+                            if self.compute_fp16_enabled() {
                                 h_up_t = quantize_f16_tensor_wgpu(h_up_t);
                             }
                             h_up_t
                         };
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} conv1-select complete child_rows={child_rows}"
+                            )
+                            .as_str(),
+                        );
 
                         let skip_in_channels = up.in_channels / 8;
                         if skip_in_channels == 0 || up.out_channels % skip_in_channels != 0 {
@@ -916,27 +1076,46 @@ impl SparseUnetDecoderRuntime {
                                 &context_gpu.device,
                             )
                         } else {
+                            decoder_wasm_log(
+                                format!(
+                                    "burn_trellis: decoder.shape stage {stage_idx} conv2 norm begin child_rows={child_rows}"
+                                )
+                                .as_str(),
+                            );
                             let h_up_t = layer_norm_silu_wgpu_with_fp16_fences(
                                 context_gpu,
                                 h_up_t,
                                 None,
                                 None,
                                 LAYER_NORM32_EPS,
-                                self.compute_fp16,
+                                self.compute_fp16_enabled(),
                                 format!("stage {stage_idx} up layer_norm_silu(wgpu_math)")
                                     .as_str(),
                             )?;
+                            decoder_wasm_log(
+                                format!(
+                                    "burn_trellis: decoder.shape stage {stage_idx} conv2 sparse-conv begin child_rows={child_rows}"
+                                )
+                                .as_str(),
+                            );
                             let conv2_config = flex_config_for_layer(&up.conv2);
                             let mut h_t = context_gpu.forward_with_coords_tensor_device(
                                 &conv2_config,
                                 &up.conv2,
                                 h_up_t,
+                                self.compute_fp16_enabled(),
                                 format!("stage {stage_idx} up conv2(wgpu_math)").as_str(),
                                 child_coords_t.clone(),
                             )?;
-                            if self.compute_fp16 {
+                            if self.compute_fp16_enabled() {
                                 h_t = quantize_f16_tensor_wgpu(h_t);
                             }
+                            decoder_wasm_log(
+                                format!(
+                                    "burn_trellis: decoder.shape stage {stage_idx} conv2 sparse-conv complete child_rows={child_rows}"
+                                )
+                                .as_str(),
+                            );
                             // Preserve TRELLIS channel semantics without materializing a full
                             // repeated skip tensor: add skip channels via grouped broadcast.
                             let h_grouped = h_t.reshape([
@@ -948,9 +1127,15 @@ impl SparseUnetDecoderRuntime {
                             let mut next_state_t = h_grouped
                                 .add(skip_grouped)
                                 .reshape([child_rows, up.out_channels]);
-                            if self.compute_fp16 {
+                            if self.compute_fp16_enabled() {
                                 next_state_t = quantize_f16_tensor_wgpu(next_state_t);
                             }
+                            decoder_wasm_log(
+                                format!(
+                                    "burn_trellis: decoder.shape stage {stage_idx} conv2+skip complete child_rows={child_rows}"
+                                )
+                                .as_str(),
+                            );
                             next_state_t
                         };
                         decoder_wgpu_upsample_parity_check(
@@ -973,6 +1158,12 @@ impl SparseUnetDecoderRuntime {
                             ]
                         };
                         upsample_device_complete = true;
+                        decoder_wasm_log(
+                            format!(
+                                "burn_trellis: decoder.shape stage {stage_idx} upsample complete child_rows={child_rows}"
+                            )
+                            .as_str(),
+                        );
                     }
                 }
 
@@ -1008,7 +1199,7 @@ impl SparseUnetDecoderRuntime {
                             to_subdiv,
                             format!("stage {stage_idx} to_subdiv").as_str(),
                         )?;
-                        if self.compute_fp16 {
+                        if self.compute_fp16_enabled() {
                             quantize_f16_inplace(logits.as_mut_slice());
                         }
                         if self.runtime_config.center_subdivision_logits {
@@ -1049,14 +1240,14 @@ impl SparseUnetDecoderRuntime {
                         LAYER_NORM32_EPS,
                         format!("stage {stage_idx} up norm1").as_str(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h_norm.as_mut_slice());
                     }
                     silu_inplace(
                         h_norm.as_mut_slice(),
                         format!("stage {stage_idx} up silu1").as_str(),
                     );
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h_norm.as_mut_slice());
                     }
                     let h_conv1 = sparse_subm_conv_forward(
@@ -1069,7 +1260,7 @@ impl SparseUnetDecoderRuntime {
                         wgpu_context.as_deref_mut(),
                     )?;
                     let mut h_conv1 = h_conv1;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h_conv1.as_mut_slice());
                     }
                     let (child_coords, mut h_up) = channel2spatial(
@@ -1117,14 +1308,14 @@ impl SparseUnetDecoderRuntime {
                         LAYER_NORM32_EPS,
                         format!("stage {stage_idx} up layer_norm").as_str(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h_up.as_mut_slice());
                     }
                     silu_inplace(
                         h_up.as_mut_slice(),
                         format!("stage {stage_idx} up silu2").as_str(),
                     );
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h_up.as_mut_slice());
                     }
                     let mut h = sparse_subm_conv_forward(
@@ -1136,7 +1327,7 @@ impl SparseUnetDecoderRuntime {
                         #[cfg(feature = "runtime-model-wgpu")]
                         wgpu_context.as_deref_mut(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     add_inplace(
@@ -1144,7 +1335,7 @@ impl SparseUnetDecoderRuntime {
                         skip.as_slice(),
                         format!("stage {stage_idx} up skip_add").as_str(),
                     );
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     state_feats = h;
@@ -1171,6 +1362,7 @@ impl SparseUnetDecoderRuntime {
 
         #[cfg(feature = "runtime-model-wgpu")]
         let final_coords_tensor = state_coords_wgpu.take();
+        decoder_wasm_log("burn_trellis: decoder.shape output-layer prepare");
         let rows_final = {
             #[cfg(feature = "runtime-model-wgpu")]
             {
@@ -1206,6 +1398,12 @@ impl SparseUnetDecoderRuntime {
                 } else if let Some(state_t) = state_feats_wgpu.take() {
                     if canonical_wgpu {
                         if let Some(context_gpu) = wgpu_context.as_deref_mut() {
+                            decoder_wasm_log(
+                                format!(
+                                    "burn_trellis: decoder.shape output-layer begin rows={rows_final} channels={final_channels}"
+                                )
+                                .as_str(),
+                            );
                             let output_layer_start = crate::time::Instant::now();
                             if decoder_conv_debug_enabled() {
                                 eprintln!(
@@ -1228,6 +1426,7 @@ impl SparseUnetDecoderRuntime {
                                             context_gpu,
                                             state_t,
                                             &self.output_layer,
+                                            false,
                                             "output_layer(wgpu_math)",
                                         )?;
                                         Ok(state_t)
@@ -1244,6 +1443,12 @@ impl SparseUnetDecoderRuntime {
                                         );
                                     }
                                     final_feats_tensor = Some(output_t);
+                                    decoder_wasm_log(
+                                        format!(
+                                            "burn_trellis: decoder.shape output-layer complete rows={rows_final}"
+                                        )
+                                        .as_str(),
+                                    );
                                     Vec::new()
                                 }
                                 Ok(Err(err)) => {
@@ -1458,6 +1663,32 @@ impl SparseUnetDecoderRuntime {
         rows_wgpu: Tensor<DefaultWgpuBackend, 2>,
         upsample_times: usize,
     ) -> Result<SparseUpsampledCoords, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (coords_wgpu, rows_wgpu, upsample_times);
+            return Err(
+                "decoder sync tensor upsample is unsupported on wasm; use upsample_coords_result_with_tensors_async"
+                    .to_string(),
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(self.upsample_coords_result_with_tensors_async(
+                coords_wgpu,
+                rows_wgpu,
+                upsample_times,
+            ))
+        }
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn upsample_coords_result_with_tensors_async(
+        &self,
+        coords_wgpu: Tensor<DefaultWgpuBackend, 2, Int>,
+        rows_wgpu: Tensor<DefaultWgpuBackend, 2>,
+        upsample_times: usize,
+    ) -> Result<SparseUpsampledCoords, String> {
         let [coord_rows, coord_cols] = coords_wgpu.dims();
         if coord_cols != 4 {
             return Err(format!(
@@ -1487,7 +1718,9 @@ impl SparseUnetDecoderRuntime {
             return Ok(SparseUpsampledCoords::from_wgpu_tensor(current_coords_t));
         }
 
-        let decoded = self.decode_with_tensors(current_coords_t.clone(), rows_wgpu, None)?;
+        let decoded = self
+            .decode_with_tensors_async(current_coords_t.clone(), rows_wgpu, None)
+            .await?;
         if decoded.subdivisions.len() < upsample_times {
             return Err(format!(
                 "decoder upsample requested {} levels but only {} subdivision levels are available",
@@ -1593,7 +1826,7 @@ impl SparseUnetDecoderRuntime {
         };
         #[cfg(feature = "runtime-model-wgpu")]
         let canonical_wgpu =
-            decoder_wgpu_device_math_enabled() && (!self.compute_fp16 || decoder_wgpu_device_math_allow_fp16());
+            decoder_wgpu_device_math_enabled() && (!self.compute_fp16_enabled() || decoder_wgpu_device_math_allow_fp16());
         #[cfg(feature = "runtime-model-wgpu")]
         if canonical_wgpu && wgpu_context.is_none() {
             return Err(
@@ -1607,7 +1840,7 @@ impl SparseUnetDecoderRuntime {
             &self.from_latent,
             "from_latent(stage0)",
         )?;
-        if self.compute_fp16 {
+        if self.compute_fp16_enabled() {
             quantize_f16_inplace(state_feats.as_mut_slice());
         }
 
@@ -1655,7 +1888,7 @@ impl SparseUnetDecoderRuntime {
                             0,
                             stage_channels,
                             stage.convnext_blocks.as_slice(),
-                            self.compute_fp16,
+                            self.compute_fp16_enabled(),
                         )
                     }));
                 match convnext_result {
@@ -1730,7 +1963,7 @@ impl SparseUnetDecoderRuntime {
                         #[cfg(feature = "runtime-model-wgpu")]
                         wgpu_context.as_deref_mut(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     layer_norm_inplace(
@@ -1742,7 +1975,7 @@ impl SparseUnetDecoderRuntime {
                         LAYER_NORM32_EPS,
                         format!("stage0 block {block_idx} layer_norm(stage0)").as_str(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     h = linear_forward(
@@ -1751,14 +1984,14 @@ impl SparseUnetDecoderRuntime {
                         &block.mlp_0,
                         format!("stage0 block {block_idx} mlp_0(stage0)").as_str(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     silu_inplace(
                         h.as_mut_slice(),
                         format!("stage0 block {block_idx} silu(stage0)").as_str(),
                     );
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     h = linear_forward(
@@ -1767,7 +2000,7 @@ impl SparseUnetDecoderRuntime {
                         &block.mlp_2,
                         format!("stage0 block {block_idx} mlp_2(stage0)").as_str(),
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     add_inplace(
@@ -1775,7 +2008,7 @@ impl SparseUnetDecoderRuntime {
                         residual.as_slice(),
                         format!("stage0 block {block_idx} residual_add(stage0)").as_str(),
                     );
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         quantize_f16_inplace(h.as_mut_slice());
                     }
                     state_feats = h;
@@ -1811,9 +2044,10 @@ impl SparseUnetDecoderRuntime {
                         context_gpu,
                         state_t.clone(),
                         to_subdiv,
+                        self.compute_fp16_enabled(),
                         "stage0 to_subdiv(wgpu_math)",
                     )?;
-                    if self.compute_fp16 {
+                    if self.compute_fp16_enabled() {
                         logits_t = quantize_f16_tensor_wgpu(logits_t);
                     }
                     if self.runtime_config.center_subdivision_logits {
@@ -1868,7 +2102,7 @@ impl SparseUnetDecoderRuntime {
             to_subdiv,
             "stage0 to_subdiv",
         )?;
-        if self.compute_fp16 {
+        if self.compute_fp16_enabled() {
             quantize_f16_inplace(subdiv_logits.as_mut_slice());
         }
         if self.runtime_config.center_subdivision_logits {
@@ -1896,17 +2130,19 @@ impl SparseUnetDecoderRuntime {
 
 #[cfg(feature = "runtime-model-wgpu")]
 fn decoder_can_stream_final_stage_output(stages: &[DecoderStage], stage_idx: usize) -> bool {
-    if stage_idx + 2 != stages.len() {
-        return false;
-    }
-    let Some(last_stage) = stages.last() else {
-        return false;
-    };
-    last_stage.convnext_blocks.is_empty() && last_stage.upsample_block.is_none()
+    // This shortcut used to stream sparse rows through the final upsample stage by
+    // slicing parent/child coords before sparse convs. That changes TRELLIS.2
+    // submanifold-conv semantics: sparse rows are compact storage for active
+    // voxel cells, and neighbor lookup must see the full active coordinate set.
+    //
+    // Keep this disabled until the streamed path computes query chunks against a
+    // full-coordinate child-neighbor map or an explicit halo.
+    let _ = (stages, stage_idx);
+    false
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
-fn upsample_stage_to_output_chunks_wgpu(
+async fn upsample_stage_to_output_chunks_wgpu(
     context_gpu: &mut DecoderWgpuConvContext,
     stage_idx: usize,
     up: &C2SUpsampleBlock,
@@ -1918,267 +2154,26 @@ fn upsample_stage_to_output_chunks_wgpu(
     compute_fp16: bool,
     output_layer: &LinearLayer,
 ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
-    let [parent_rows, parent_channels] = parent_feats_t.dims();
-    if parent_channels != up.in_channels {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed upsample parent feature channels mismatch: got={} expected={}",
-            stage_idx, parent_channels, up.in_channels
-        ));
-    }
-    let [parent_coord_rows, parent_coord_cols] = parent_coords_t.dims();
-    if parent_coord_rows != parent_rows || parent_coord_cols != 4 {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed upsample parent coord tensor mismatch: got=[{},{}] expected=[{},4]",
-            stage_idx, parent_coord_rows, parent_coord_cols, parent_rows
-        ));
-    }
-    let [child_rows, child_coord_cols] = child_coords_t.dims();
-    if child_coord_cols != 4 {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed upsample child coord tensor must have 4 columns, got {}",
-            stage_idx, child_coord_cols
-        ));
-    }
-    let [linear_rows] = linear_idx_t.dims();
-    if linear_rows != child_rows {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed upsample linear index rows mismatch: got={} expected={}",
-            stage_idx, linear_rows, child_rows
-        ));
-    }
-    if child_rows == 0 {
-        return Ok(Tensor::<DefaultWgpuBackend, 2>::zeros(
-            [0, output_layer.out_channels],
-            &context_gpu.device,
-        ));
-    }
-
-    let skip_in_channels = up.in_channels / 8;
-    if skip_in_channels == 0 || up.out_channels % skip_in_channels != 0 {
-        return Err(format!(
-            "decoder stage {stage_idx} invalid skip channel ratio (in={}, out={})",
-            up.in_channels, up.out_channels
-        ));
-    }
-    let repeat_factor = up.out_channels / skip_in_channels;
-    let parent_flat = parent_feats_t.clone().reshape([
-        parent_rows.checked_mul(8).ok_or_else(|| {
-            "decoder upsample parent_rows*8 overflow".to_string()
-        })?,
-        skip_in_channels,
-    ]);
-    let h_norm_t = layer_norm_silu_wgpu_with_fp16_fences(
+    let _ = (
         context_gpu,
+        stage_idx,
+        up,
         parent_feats_t,
-        Some(up.norm1_weight.as_slice()),
-        Some(up.norm1_bias.as_slice()),
-        LAYER_NORM32_EPS,
+        parent_coords_t,
+        child_coords_t,
+        active_indices_t,
+        linear_idx_t,
         compute_fp16,
-        format!("stage {stage_idx} up norm1_silu(wgpu_math/streamed)").as_str(),
-    )?;
-    let conv1_config = flex_config_for_layer(&up.conv1);
-    let conv2_config = flex_config_for_layer(&up.conv2);
-
-    // Stream final upsample stage in parent-row chunks to avoid materializing
-    // the oversized [child_rows, final_channels] tensor on WGPU.
-    let bytes_per_parent_row = up
-        .conv1
-        .out_channels
-        .checked_mul(core::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            format!(
-                "burn_trellis: decoder stage {} streamed upsample bytes-per-row overflow",
-                stage_idx
-            )
-        })?;
-    let max_tensor_bytes = decoder_wgpu_max_tensor_bytes();
-    let max_conv1_stream_bytes =
-        decoder_wgpu_upsample_conv1_max_output_bytes().min(max_tensor_bytes);
-    let mut parent_chunk_rows =
-        decoder_wgpu_chunk_rows(parent_rows, bytes_per_parent_row, max_conv1_stream_bytes).max(1);
-    let idx_col = Tensor::<DefaultWgpuBackend, 1, Int>::from_ints([0], &context_gpu.device);
-    let [active_rows, active_cols] = active_indices_t.dims();
-    if active_rows != child_rows || active_cols != 2 {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed upsample active-index tensor mismatch: got=[{},{}] expected=[{},2]",
-            stage_idx, active_rows, active_cols, child_rows
-        ));
-    }
-    let linear_parent_idx_t = active_indices_t
-        .clone()
-        .select(1, idx_col.clone())
-        .squeeze_dim::<1>(1);
-    let mut chunk_positions_t: Vec<Tensor<DefaultWgpuBackend, 1, Int>> = Vec::new();
-    let mut chunk_outputs_t: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
-    let mut start = 0usize;
-    while start < parent_rows {
-        let end = (start + parent_chunk_rows).min(parent_rows);
-        if end <= start {
-            return Err(format!(
-                "burn_trellis: decoder stage {} streamed upsample produced invalid chunk bounds start={} end={}",
-                stage_idx, start, end
-            ));
-        }
-        let end_minus_one = end.saturating_sub(1);
-        let start_i32 = i32::try_from(start).map_err(|_| {
-            format!(
-                "burn_trellis: decoder stage {} streamed upsample start exceeds i32 range ({})",
-                stage_idx, start
-            )
-        })?;
-        let end_minus_one_i32 = i32::try_from(end_minus_one).map_err(|_| {
-            format!(
-                "burn_trellis: decoder stage {} streamed upsample end exceeds i32 range ({})",
-                stage_idx, end_minus_one
-            )
-        })?;
-        let keep_mask = linear_parent_idx_t
-            .clone()
-            .clamp(start_i32, end_minus_one_i32)
-            .equal(linear_parent_idx_t.clone());
-        let keep_idx_rows = keep_mask.argwhere();
-        let [keep_rows, keep_cols] = keep_idx_rows.dims();
-        if keep_cols != 1 {
-            return Err(format!(
-                "burn_trellis: decoder stage {} streamed upsample keep-index tensor must have 1 column, got {}",
-                stage_idx, keep_cols
-            ));
-        }
-        if keep_rows == 0 {
-            start = end;
-            continue;
-        }
-        let keep_idx_t = keep_idx_rows.select(1, idx_col.clone()).squeeze_dim(1);
-        let global_linear_t = linear_idx_t.clone().select(0, keep_idx_t.clone());
-        let chunk_linear_base = start.checked_mul(8).ok_or_else(|| {
-            format!(
-                "burn_trellis: decoder stage {} streamed upsample linear base overflow",
-                stage_idx
-            )
-        })?;
-        let chunk_linear_base_i32 = i32::try_from(chunk_linear_base).map_err(|_| {
-            format!(
-                "burn_trellis: decoder stage {} streamed upsample linear base exceeds i32 range ({})",
-                stage_idx, chunk_linear_base
-            )
-        })?;
-        let local_linear_t = global_linear_t.sub_scalar(chunk_linear_base_i32);
-
-        let chunk_h_norm_t = h_norm_t.clone().slice([start..end, 0..up.in_channels]);
-        let chunk_parent_coords_t = parent_coords_t.clone().slice([start..end, 0..4]);
-        let mut h_conv1_chunk_t = context_gpu.forward_with_coords_tensor_device(
-            &conv1_config,
-            &up.conv1,
-            chunk_h_norm_t,
-            format!("stage {stage_idx} up conv1(wgpu_math/streamed)").as_str(),
-            chunk_parent_coords_t,
-        )?;
-        if compute_fp16 {
-            h_conv1_chunk_t = quantize_f16_tensor_wgpu(h_conv1_chunk_t);
-        }
-        let h_conv1_chunk_flat_t = h_conv1_chunk_t.reshape([
-            (end - start).checked_mul(8).ok_or_else(|| {
-                "decoder upsample parent_rows*8 overflow".to_string()
-            })?,
-            up.out_channels,
-        ]);
-        let h_up_chunk_t = h_conv1_chunk_flat_t.select(0, local_linear_t.clone());
-
-        let parent_flat_start = start.checked_mul(8).ok_or_else(|| {
-            "decoder upsample parent_flat start overflow".to_string()
-        })?;
-        let parent_flat_end = end.checked_mul(8).ok_or_else(|| {
-            "decoder upsample parent_flat end overflow".to_string()
-        })?;
-        let chunk_parent_flat_t =
-            parent_flat
-                .clone()
-                .slice([parent_flat_start..parent_flat_end, 0..skip_in_channels]);
-        let x_up_chunk_t = chunk_parent_flat_t.select(0, local_linear_t);
-        let child_coords_chunk_t = child_coords_t.clone().select(0, keep_idx_t.clone());
-
-        let h_up_chunk_t = layer_norm_silu_wgpu_with_fp16_fences(
-            context_gpu,
-            h_up_chunk_t,
-            None,
-            None,
-            LAYER_NORM32_EPS,
-            compute_fp16,
-            format!("stage {stage_idx} up layer_norm_silu(wgpu_math/streamed)").as_str(),
-        )?;
-        let mut h_chunk_t = context_gpu.forward_with_coords_tensor_device(
-            &conv2_config,
-            &up.conv2,
-            h_up_chunk_t,
-            format!("stage {stage_idx} up conv2(wgpu_math/streamed)").as_str(),
-            child_coords_chunk_t,
-        )?;
-        if compute_fp16 {
-            h_chunk_t = quantize_f16_tensor_wgpu(h_chunk_t);
-        }
-        let h_grouped = h_chunk_t.reshape([keep_rows, skip_in_channels, repeat_factor]);
-        let skip_grouped = x_up_chunk_t.unsqueeze_dim::<3>(2);
-        let mut stage_out_chunk_t = h_grouped
-            .add(skip_grouped)
-            .reshape([keep_rows, up.out_channels]);
-        if compute_fp16 {
-            stage_out_chunk_t = quantize_f16_tensor_wgpu(stage_out_chunk_t);
-        }
-        let stage_out_chunk_t = layer_norm_wgpu(
-            context_gpu,
-            stage_out_chunk_t,
-            None,
-            None,
-            F_LAYER_NORM_EPS,
-            format!("stage {stage_idx} output_layer_norm(wgpu_math/streamed)").as_str(),
-        )?;
-        let output_chunk_t = linear_forward_wgpu(
-            context_gpu,
-            stage_out_chunk_t,
-            output_layer,
-            format!("stage {stage_idx} output_layer(wgpu_math/streamed)").as_str(),
-        )?;
-        chunk_positions_t.push(keep_idx_t);
-        chunk_outputs_t.push(output_chunk_t);
-        start = end;
-        if start < parent_rows {
-            let next_rows = (parent_rows - start).min(parent_chunk_rows);
-            if next_rows == 0 {
-                break;
-            }
-            parent_chunk_rows = next_rows.max(1);
-        }
-    }
-
-    if chunk_positions_t.is_empty() || chunk_outputs_t.is_empty() {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed upsample produced no output chunks",
-            stage_idx
-        ));
-    }
-    let selected_positions_t = if chunk_positions_t.len() == 1 {
-        chunk_positions_t.remove(0)
-    } else {
-        Tensor::cat(chunk_positions_t, 0)
-    };
-    let selected_outputs_t = if chunk_outputs_t.len() == 1 {
-        chunk_outputs_t.remove(0)
-    } else {
-        Tensor::cat(chunk_outputs_t, 0)
-    };
-    let [selected_rows, selected_cols] = selected_outputs_t.dims();
-    if selected_rows != child_rows || selected_cols != output_layer.out_channels {
-        return Err(format!(
-            "burn_trellis: decoder stage {} streamed output tensor mismatch: got=[{},{}] expected=[{},{}]",
-            stage_idx, selected_rows, selected_cols, child_rows, output_layer.out_channels
-        ));
-    }
-    let _ = selected_positions_t;
-    Ok(selected_outputs_t)
+        output_layer,
+    );
+    Err(
+        "burn_trellis: streamed final-stage decoder output is disabled because sparse conv neighborhoods require full active-cell coordinate context"
+            .to_string(),
+    )
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
-fn upsample_conv1_select_children_wgpu(
+async fn upsample_conv1_select_children_wgpu(
     context_gpu: &mut DecoderWgpuConvContext,
     up: &C2SUpsampleBlock,
     stage_idx: usize,
@@ -2187,6 +2182,7 @@ fn upsample_conv1_select_children_wgpu(
     active_indices_t: Tensor<DefaultWgpuBackend, 2, Int>,
     linear_idx_t: Tensor<DefaultWgpuBackend, 1, Int>,
     child_rows: usize,
+    compute_fp16: bool,
 ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
     let [parent_rows, parent_channels] = parent_feats_norm_t.dims();
     if parent_channels != up.in_channels {
@@ -2242,6 +2238,7 @@ fn upsample_conv1_select_children_wgpu(
             &conv1_config,
             &up.conv1,
             parent_feats_norm_t.clone(),
+            compute_fp16,
             format!("stage {stage_idx} up conv1(wgpu_math)").as_str(),
             parent_coords_t.clone(),
         )?;
@@ -2290,6 +2287,12 @@ fn upsample_conv1_select_children_wgpu(
     let linear_parent_idx_t = active_indices_t
         .select(1, idx_col.clone())
         .squeeze_dim::<1>(1);
+    #[cfg(target_arch = "wasm32")]
+    let linear_parent_idx_host = tensor_to_vec_i32_async(
+        linear_parent_idx_t.clone().reshape([child_rows, 1]),
+        format!("stage {stage_idx} up conv1 streamed parent-index async readback").as_str(),
+    )
+    .await?;
     let parent_chunk_rows =
         decoder_wgpu_chunk_rows(parent_rows, bytes_per_parent_row, max_conv1_direct_bytes).max(1);
     eprintln!(
@@ -2303,6 +2306,9 @@ fn upsample_conv1_select_children_wgpu(
         selected_output_bytes
     );
 
+    let conv1_kernel_rows = kernel_rows(&conv1_config)?;
+    let conv1_neighbor_t =
+        neighbor_rows_tensor_from_coords_tensor(&conv1_config, parent_coords_t.clone())?;
     let mut selected_chunks: Vec<Tensor<DefaultWgpuBackend, 2>> = Vec::new();
     let mut start = 0usize;
     while start < parent_rows {
@@ -2326,23 +2332,35 @@ fn upsample_conv1_select_children_wgpu(
                 stage_idx, end_minus_one
             )
         })?;
-        let keep_mask = linear_parent_idx_t
-            .clone()
-            .clamp(start_i32, end_minus_one_i32)
-            .equal(linear_parent_idx_t.clone());
-        let keep_idx_rows = keep_mask.argwhere();
-        let [keep_rows, keep_cols] = keep_idx_rows.dims();
-        if keep_cols != 1 {
-            return Err(format!(
-                "burn_trellis: decoder stage {} up conv1 streamed selection keep-index tensor must have 1 column, got {}",
-                stage_idx, keep_cols
-            ));
-        }
+        #[cfg(target_arch = "wasm32")]
+        let keep_idx_t = keep_indices_tensor_from_parent_index_host(
+            linear_parent_idx_host.as_slice(),
+            start_i32,
+            end_minus_one_i32,
+            &context_gpu.device,
+            format!("stage {stage_idx} up conv1 streamed keep-index").as_str(),
+        )?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let keep_idx_t = {
+            let keep_mask = linear_parent_idx_t
+                .clone()
+                .clamp(start_i32, end_minus_one_i32)
+                .equal(linear_parent_idx_t.clone());
+            let keep_idx_rows = keep_mask.argwhere_async().await;
+            let [_keep_rows, keep_cols] = keep_idx_rows.dims();
+            if keep_cols != 1 {
+                return Err(format!(
+                    "burn_trellis: decoder stage {} up conv1 streamed selection keep-index tensor must have 1 column, got {}",
+                    stage_idx, keep_cols
+                ));
+            }
+            keep_idx_rows.select(1, idx_col.clone()).squeeze_dim(1)
+        };
+        let [keep_rows] = keep_idx_t.dims();
         if keep_rows == 0 {
             start = end;
             continue;
         }
-        let keep_idx_t = keep_idx_rows.select(1, idx_col.clone()).squeeze_dim(1);
         let global_linear_t = linear_idx_t.clone().select(0, keep_idx_t);
         let chunk_linear_base = start.checked_mul(8).ok_or_else(|| {
             format!(
@@ -2358,19 +2376,22 @@ fn upsample_conv1_select_children_wgpu(
         })?;
         let local_linear_t = global_linear_t.sub_scalar(chunk_linear_base_i32);
 
-        let chunk_feats_t = parent_feats_norm_t
+        let chunk_rows_count = end - start;
+        let chunk_neighbor_t = conv1_neighbor_t
             .clone()
-            .slice([start..end, 0..up.in_channels]);
-        let chunk_coords_t = parent_coords_t.clone().slice([start..end, 0..4]);
-        let h_conv1_chunk_t = context_gpu.forward_with_coords_tensor_device(
+            .slice([start..end, 0..conv1_kernel_rows]);
+        let h_conv1_chunk_t = context_gpu.forward_with_neighbor_tensor_tensor(
             &conv1_config,
             &up.conv1,
-            chunk_feats_t,
+            parent_feats_norm_t.clone(),
+            compute_fp16,
             format!("stage {stage_idx} up conv1(wgpu_math/selected_stream)").as_str(),
-            chunk_coords_t,
+            chunk_rows_count,
+            conv1_kernel_rows,
+            chunk_neighbor_t,
         )?;
         let h_conv1_chunk_flat_t = h_conv1_chunk_t.reshape([
-            (end - start).checked_mul(8).ok_or_else(|| {
+            chunk_rows_count.checked_mul(8).ok_or_else(|| {
                 "decoder upsample streamed parent_rows*8 overflow".to_string()
             })?,
             up.out_channels,

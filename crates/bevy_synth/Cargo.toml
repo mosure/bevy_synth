@@ -13,9 +13,10 @@ repository.workspace = true
 readme = "README.md"
 
 [features]
-default = ["wgpu", "triposg"]
+default = ["wgpu", "triposg", "trellis-native-pbr"]
 triposg = ["bevy_synth_runtime/triposg", "bevy_synth_runtime/shared-runtime", "bevy_synth_ui/triposg"]
 trellis = ["bevy_synth_runtime/trellis", "bevy_synth_runtime/shared-runtime", "bevy_synth_ui/trellis"]
+trellis-native-pbr = ["trellis", "bevy_synth_runtime/trellis-native-pbr"]
 wgpu = ["bevy_synth_runtime/wgpu", "bevy_synth_runtime/shared-runtime"]
 cuda = ["bevy_synth_runtime/cuda", "bevy_synth_runtime/shared-runtime"]
 solari = []

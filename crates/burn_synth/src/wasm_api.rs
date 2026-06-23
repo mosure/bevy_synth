@@ -18,9 +18,13 @@ use burn_foreground::rmbg14::import::{
 use burn_foreground::rmbg14::set_rmbg_strict_interp_override;
 use burn_synth_import::parts::normalize_burnpack_part_bytes;
 #[cfg(feature = "trellis")]
+use burn_trellis::TrellisComputeProfile;
+#[cfg(feature = "trellis")]
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
+#[cfg(feature = "trellis")]
+use burn_trellis::staged_pipeline::{TrellisDecodeOutputMode, TrellisSamplerRuntimeOverrides};
 #[cfg(feature = "trellis")]
 use burn_trellis::trellis_config::TrellisPipelineConfig;
 #[cfg(feature = "trellis")]
@@ -115,6 +119,8 @@ struct WasmTripoSplatPipelineState<BTripoSplat: Backend, BRmbg: Backend> {
 #[cfg(feature = "trellis")]
 struct WasmTrellisPipelineState {
     trellis: Trellis2Pipeline,
+    #[cfg(feature = "wasm-api-wgpu")]
+    adapter_profile: WebGpuAdapterProfile,
 }
 
 #[cfg(feature = "wasm-api-wgpu")]
@@ -197,6 +203,9 @@ pub struct WasmInferOptions {
     triposplat_erode_radius: Option<u32>,
     resolution: u32,
     faces: Option<u32>,
+    trellis_max_sparse_coords: Option<u32>,
+    trellis_pbr_enabled: Option<bool>,
+    trellis_pbr_texture_size: Option<u32>,
     seed: Option<u64>,
     backend: Option<String>,
     dino_backend: Option<String>,
@@ -287,6 +296,30 @@ impl WasmInferOptions {
         self.faces = None;
     }
 
+    pub fn set_trellis_max_sparse_coords(&mut self, value: u32) {
+        self.trellis_max_sparse_coords = Some(value);
+    }
+
+    pub fn clear_trellis_max_sparse_coords(&mut self) {
+        self.trellis_max_sparse_coords = None;
+    }
+
+    pub fn set_trellis_pbr_enabled(&mut self, value: bool) {
+        self.trellis_pbr_enabled = Some(value);
+    }
+
+    pub fn clear_trellis_pbr_enabled(&mut self) {
+        self.trellis_pbr_enabled = None;
+    }
+
+    pub fn set_trellis_pbr_texture_size(&mut self, value: u32) {
+        self.trellis_pbr_texture_size = Some(value);
+    }
+
+    pub fn clear_trellis_pbr_texture_size(&mut self) {
+        self.trellis_pbr_texture_size = None;
+    }
+
     pub fn set_seed(&mut self, value: u64) {
         self.seed = Some(value);
     }
@@ -342,6 +375,9 @@ impl WasmInferOptions {
             triposplat_erode_radius: Some(preset.triposplat_erode_radius as u32),
             resolution: preset.resolution as u32,
             faces: Some(preset.faces as u32),
+            trellis_max_sparse_coords: Some(preset.trellis_max_sparse_coords as u32),
+            trellis_pbr_enabled: Some(preset.trellis_pbr_enabled),
+            trellis_pbr_texture_size: Some(preset.trellis_pbr_texture_size as u32),
             seed: Some(preset.seed),
             backend: Some(preset.backend.to_string()),
             dino_backend: Some(preset.dino_backend.to_string()),
@@ -361,6 +397,15 @@ impl WasmInferOptions {
                 || value.eq_ignore_ascii_case("tripo-splat")
                 || value.eq_ignore_ascii_case("splat")
             {
+                if self.num_steps == 0 {
+                    preset.num_steps = burn_triposplat::DEFAULT_NUM_STEPS;
+                }
+                if self.guidance_scale.is_none() {
+                    preset.guidance_scale = burn_triposplat::DEFAULT_GUIDANCE_SCALE;
+                }
+                if self.triposplat_num_gaussians.is_none() {
+                    preset.triposplat_num_gaussians = burn_triposplat::DEFAULT_NUM_GAUSSIANS;
+                }
                 "triposplat"
             } else {
                 "triposg"
@@ -421,6 +466,15 @@ impl WasmInferOptions {
         }
         if let Some(value) = self.faces {
             preset.faces = value as usize;
+        }
+        if let Some(value) = self.trellis_max_sparse_coords {
+            preset.trellis_max_sparse_coords = value as usize;
+        }
+        if let Some(value) = self.trellis_pbr_enabled {
+            preset.trellis_pbr_enabled = value;
+        }
+        if let Some(value) = self.trellis_pbr_texture_size {
+            preset.trellis_pbr_texture_size = value as usize;
         }
         if let Some(value) = self.seed {
             preset.seed = value;
@@ -509,16 +563,9 @@ fn validate_wasm_preset_supported(preset: &WasmInferencePreset) -> Result<(), St
 
     if !triposg && !trellis && !triposplat {
         return Err(format!(
-            "unsupported wasm synthesis model '{}'; expected triposg or triposplat",
+            "unsupported wasm synthesis model '{}'; expected triposg, trellis, or triposplat",
             preset.synthesis_model
         ));
-    }
-
-    if trellis {
-        return Err(
-            "Trellis wasm loading is disabled until the chunked model loader is fully async; use TripoSG wasm or native Trellis."
-                .to_string(),
-        );
     }
 
     if !preset.rmbg_model.eq_ignore_ascii_case("rmbg14") && !wasm_preset_skips_rmbg(preset) {
@@ -879,8 +926,7 @@ pub async fn infer_splat_from_image_bytes_with_options(
     PANIC_HOOK_ONCE.call_once(console_error_panic_hook::set_once);
 
     web_sys::console::log_1(&"burn_synth wasm TripoSplat infer entry: build preset".into());
-    let mut preset = WasmInferencePreset::default();
-    preset.synthesis_model = "triposplat";
+    let mut preset = WasmInferencePreset::triposplat_default();
     if let Some(options) = options.as_ref() {
         options.apply_to_preset(&mut preset);
     }
@@ -908,8 +954,7 @@ pub async fn infer_ply_from_image_bytes_with_options(
 ) -> Result<Uint8Array, JsValue> {
     PANIC_HOOK_ONCE.call_once(console_error_panic_hook::set_once);
 
-    let mut preset = WasmInferencePreset::default();
-    preset.synthesis_model = "triposplat";
+    let mut preset = WasmInferencePreset::triposplat_default();
     if let Some(options) = options.as_ref() {
         options.apply_to_preset(&mut preset);
     }
@@ -1297,6 +1342,36 @@ fn trellis_quality_from_wasm_preset(preset: &WasmInferencePreset) -> burn_trelli
     }
 }
 
+#[cfg(feature = "trellis")]
+fn trellis_sampler_overrides_from_wasm_preset(
+    preset: &WasmInferencePreset,
+) -> TrellisSamplerRuntimeOverrides {
+    let defaults = WasmInferencePreset::default();
+    let step_override = (preset.num_steps > 0 && preset.num_steps != defaults.num_steps)
+        .then_some(preset.num_steps);
+    let guidance_override = (preset.guidance_scale.is_finite()
+        && preset.guidance_scale > 0.0
+        && (preset.guidance_scale - defaults.guidance_scale).abs() > f32::EPSILON)
+        .then_some(preset.guidance_scale);
+    TrellisSamplerRuntimeOverrides {
+        sparse_steps: step_override,
+        shape_steps: step_override,
+        tex_steps: step_override,
+        sparse_guidance_strength: guidance_override,
+        shape_guidance_strength: guidance_override,
+        // TRELLIS texture guidance defaults to 1.0 upstream; keep it stable unless
+        // a future wasm option exposes a texture-specific control.
+        tex_guidance_strength: None,
+    }
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn trellis_compute_profile_for_wasm(
+    _adapter_profile: &WebGpuAdapterProfile,
+) -> Result<TrellisComputeProfile, String> {
+    Ok(TrellisComputeProfile::ReferenceF32)
+}
+
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
 async fn warmup_trellis_pipeline_for_preset_with_status<F>(
     preset: &WasmInferencePreset,
@@ -1305,12 +1380,21 @@ async fn warmup_trellis_pipeline_for_preset_with_status<F>(
 where
     F: FnMut(String),
 {
-    let Some(_adapter_profile) = wasm_webgpu_adapter_profile().await else {
+    let Some(adapter_profile) = wasm_webgpu_adapter_profile().await else {
         return Err(
             "WebGPU is unavailable in this browser/runtime; CPU fallback is disabled for Trellis wasm."
                 .to_string(),
         );
     };
+    on_status(format!(
+        "Trellis WebGPU adapter profile: shader-f16={}.",
+        adapter_profile.shader_f16_supported
+    ));
+    let compute_profile = trellis_compute_profile_for_wasm(&adapter_profile)?;
+    on_status(format!(
+        "Trellis wasm compute profile: {}.",
+        compute_profile.as_str()
+    ));
     initialize_wgpu_runtime_for_wasm().await?;
 
     let cache_hit = CACHED_WASM_TRELLIS_PIPELINE.with(|cache| {
@@ -1324,7 +1408,7 @@ where
         return Ok(());
     }
 
-    let state = load_trellis_pipeline_state_wasm(preset, &mut on_status).await?;
+    let state = load_trellis_pipeline_state_wasm(preset, &mut on_status, adapter_profile).await?;
     CACHED_WASM_TRELLIS_PIPELINE.with(|cache| {
         *cache.borrow_mut() = Some((preset.clone(), state));
     });
@@ -1332,9 +1416,18 @@ where
 }
 
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+struct TrellisWasmComponentLoad {
+    component_key: &'static str,
+    label: String,
+    candidate_urls: Vec<String>,
+    candidate_virtuals: Vec<String>,
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
 async fn load_trellis_pipeline_state_wasm<F>(
-    _preset: &WasmInferencePreset,
+    preset: &WasmInferencePreset,
     on_status: &mut F,
+    adapter_profile: WebGpuAdapterProfile,
 ) -> Result<WasmTrellisPipelineState, String>
 where
     F: FnMut(String),
@@ -1354,27 +1447,52 @@ where
 
     let mut totals = DownloadTotals::default();
     let mut host_ram_budget = WasmHostMemoryBudget::new(web_max_host_ram_bytes());
+    let mut load_ctx = WasmLoadContext {
+        totals: &mut totals,
+        host_ram_budget: &mut host_ram_budget,
+        on_status,
+    };
 
     let pipeline_url = join_web_path(&weights_root_url, "pipeline.json");
     let pipeline_bytes = download_binary_with_status(
         &pipeline_url,
         "Trellis pipeline config",
         16 * 1024 * 1024,
-        &mut totals,
-        &mut host_ram_budget,
-        on_status,
+        load_ctx.totals,
+        load_ctx.host_ram_budget,
+        load_ctx.on_status,
     )
     .await?;
     let pipeline_virtual_path = weights_root.join("pipeline.json");
-    trellis_virtual_fs::register_virtual_file(&pipeline_virtual_path, pipeline_bytes.clone());
     let pipeline = TrellisPipelineConfig::from_json_bytes(&pipeline_bytes).map_err(|err| {
         format!(
             "failed to parse Trellis pipeline config '{}': {err}",
             pipeline_url
         )
     })?;
+    trellis_register_virtual_file_bytes(
+        &pipeline_virtual_path,
+        pipeline_bytes,
+        "Trellis pipeline config",
+        &mut load_ctx,
+    )?;
 
-    for (model_key, model_stem) in pipeline.args.models.iter() {
+    let quality = trellis_quality_from_wasm_preset(preset);
+    let decode_output_mode = trellis_decode_output_mode_from_wasm_preset(preset);
+    let required_model_keys = trellis_required_model_keys_for_quality(quality, decode_output_mode);
+    load_ctx.status(format!(
+        "Loading Trellis {} model set ({} model components)...",
+        quality.as_str(),
+        required_model_keys.len()
+    ));
+    let mut component_loads = Vec::new();
+    for model_key in required_model_keys.iter().copied() {
+        let model_stem = pipeline.args.models.get(model_key).ok_or_else(|| {
+            format!(
+                "Trellis pipeline config is missing required model key '{model_key}' for quality '{}'",
+                quality.as_str()
+            )
+        })?;
         let config_url = trellis_resolve_model_url(
             model_stem,
             "json",
@@ -1387,7 +1505,14 @@ where
             weights_root.as_path(),
             image_large_root.as_path(),
         );
-        trellis_virtual_fs::register_virtual_url(&config_virtual_path, config_url.clone());
+        trellis_download_and_register_virtual_file(
+            &config_url,
+            &config_virtual_path,
+            &format!("Trellis {model_key} config"),
+            16 * 1024 * 1024,
+            &mut load_ctx,
+        )
+        .await?;
 
         let safetensors_url = trellis_resolve_model_url(
             model_stem,
@@ -1402,32 +1527,18 @@ where
             image_large_root.as_path(),
         );
 
-        let prefer_f16 = trellis_model_prefers_f16(model_key.as_str());
+        let prefer_f16 = trellis_model_prefers_f16(model_key);
         let candidate_urls = candidate_burnpack_names(&safetensors_url, prefer_f16);
         let candidate_virtuals = candidate_burnpack_names(
             safetensors_virtual_path.to_string_lossy().as_ref(),
             prefer_f16,
         );
-        let mut manifest_found = false;
-        for (candidate_url, candidate_virtual) in
-            candidate_urls.iter().zip(candidate_virtuals.iter())
-        {
-            let manifest_url = format!("{candidate_url}.parts.json");
-            if fetch_optional_text(&manifest_url).await?.is_none() {
-                continue;
-            }
-            let manifest_virtual_path =
-                std::path::PathBuf::from(format!("{candidate_virtual}.parts.json"));
-            trellis_virtual_fs::register_virtual_url(&manifest_virtual_path, manifest_url);
-            manifest_found = true;
-            break;
-        }
-        if !manifest_found {
-            return Err(format!(
-                "missing Trellis burnpack parts manifest for model key '{}' (stem '{}')",
-                model_key, model_stem
-            ));
-        }
+        component_loads.push(TrellisWasmComponentLoad {
+            component_key: model_key,
+            label: format!("Trellis {model_key} weights"),
+            candidate_urls,
+            candidate_virtuals,
+        });
     }
 
     if let Some(image_cond_model) = pipeline.args.image_cond_model.as_ref() {
@@ -1439,7 +1550,14 @@ where
             );
             let config_virtual =
                 weights_root.join(std::path::Path::new(model_name).join("config.json"));
-            trellis_virtual_fs::register_virtual_url(config_virtual, config_url);
+            trellis_download_and_register_virtual_file(
+                &config_url,
+                &config_virtual,
+                &format!("Trellis image conditioning {model_name} config"),
+                16 * 1024 * 1024,
+                &mut load_ctx,
+            )
+            .await?;
 
             let model_safetensors_url = join_web_path(
                 &weights_root_url,
@@ -1452,26 +1570,12 @@ where
                 model_safetensors_virtual.to_string_lossy().as_ref(),
                 false,
             );
-            let mut manifest_found = false;
-            for (candidate_url, candidate_virtual) in
-                candidate_urls.iter().zip(candidate_virtuals.iter())
-            {
-                let manifest_url = format!("{candidate_url}.parts.json");
-                if fetch_optional_text(&manifest_url).await?.is_none() {
-                    continue;
-                }
-                let manifest_virtual =
-                    std::path::PathBuf::from(format!("{candidate_virtual}.parts.json"));
-                trellis_virtual_fs::register_virtual_url(manifest_virtual, manifest_url);
-                manifest_found = true;
-                break;
-            }
-            if !manifest_found {
-                return Err(format!(
-                    "missing Trellis image-conditioning burnpack parts manifest for '{}'",
-                    model_name
-                ));
-            }
+            component_loads.push(TrellisWasmComponentLoad {
+                component_key: "image_conditioning",
+                label: format!("Trellis image conditioning {model_name} weights"),
+                candidate_urls,
+                candidate_virtuals,
+            });
         }
     }
 
@@ -1480,11 +1584,104 @@ where
         image_large_root: Some(image_large_root),
     })
     .map_err(|err| format!("failed to initialize Trellis2 pipeline: {err}"))?;
-    trellis
-        .validate_runtime()
-        .map_err(|err| format!("failed to validate Trellis2 runtime assets: {err}"))?;
+    let warm_options = trellis_run_options_from_wasm_preset(preset, &adapter_profile)?;
+    for component in component_loads {
+        load_ctx.status(format!(
+            "Loading {} into Trellis runtime...",
+            component.label
+        ));
+        let preloaded = preload_trellis_burnpack_parts_wasm(
+            &component.candidate_urls,
+            &component.candidate_virtuals,
+            component.label.as_str(),
+            &mut load_ctx,
+        )
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to preload Trellis component '{}' ({}): {err}",
+                component.component_key, component.label
+            )
+        })?;
+        let warm_result = trellis
+            .warm_runtime_component(&warm_options, component.component_key)
+            .map_err(|err| {
+                format!(
+                    "failed to materialize Trellis component '{}' after preload: {err}",
+                    component.component_key
+                )
+            });
+        release_trellis_preloaded_burnpack_parts(preloaded, &mut load_ctx);
+        warm_result?;
+        load_ctx.status(format!(
+            "Loaded {} into Trellis runtime and released temporary shard bytes.",
+            component.label
+        ));
+    }
 
-    Ok(WasmTrellisPipelineState { trellis })
+    Ok(WasmTrellisPipelineState {
+        trellis,
+        adapter_profile,
+    })
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn trellis_required_model_keys_for_quality(
+    quality: burn_trellis::TrellisQuality,
+    decode_output_mode: TrellisDecodeOutputMode,
+) -> Vec<&'static str> {
+    let mut keys = match quality.settings().pipeline_type {
+        "512" | "512_base" => vec![
+            "sparse_structure_decoder",
+            "sparse_structure_flow_model",
+            "shape_slat_decoder",
+            "shape_slat_flow_model_512",
+            "tex_slat_decoder",
+            "tex_slat_flow_model_512",
+        ],
+        "1024_cascade" | "1536_cascade" => vec![
+            "sparse_structure_decoder",
+            "sparse_structure_flow_model",
+            "shape_slat_decoder",
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_decoder",
+            "tex_slat_flow_model_1024",
+        ],
+        "1024" | "1024_single" => vec![
+            "sparse_structure_decoder",
+            "sparse_structure_flow_model",
+            "shape_slat_decoder",
+            "shape_slat_flow_model_1024",
+            "tex_slat_decoder",
+            "tex_slat_flow_model_1024",
+        ],
+        _ => vec![
+            "sparse_structure_decoder",
+            "sparse_structure_flow_model",
+            "shape_slat_decoder",
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_decoder",
+            "tex_slat_flow_model_512",
+            "tex_slat_flow_model_1024",
+        ],
+    };
+    if !decode_output_mode.needs_native_pbr() {
+        keys.retain(|key| !key.starts_with("tex_slat_") && *key != "tex_slat_decoder");
+    }
+    keys
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn trellis_decode_output_mode_from_wasm_preset(
+    preset: &WasmInferencePreset,
+) -> TrellisDecodeOutputMode {
+    if preset.trellis_pbr_enabled {
+        TrellisDecodeOutputMode::NativePbr
+    } else {
+        TrellisDecodeOutputMode::NativeMesh
+    }
 }
 
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
@@ -1525,6 +1722,238 @@ fn trellis_model_prefers_f16(model_key: &str) -> bool {
 }
 
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn trellis_register_virtual_file_bytes<F>(
+    path: &std::path::Path,
+    bytes: Vec<u8>,
+    label: &str,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<(), String>
+where
+    F: FnMut(String),
+{
+    let len = bytes.len() as u64;
+    load_ctx
+        .host_ram_budget
+        .reserve_retained(len, &format!("retaining {label}"))?;
+    trellis_virtual_fs::register_virtual_file(path, bytes);
+    load_ctx.status(format!(
+        "Registered {label} in Trellis virtual filesystem ({}).",
+        crate::wasm_loader::format_mebibytes(len)
+    ));
+    Ok(())
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+async fn trellis_download_and_register_virtual_file<F>(
+    url: &str,
+    virtual_path: &std::path::Path,
+    label: &str,
+    max_bytes: u64,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<(), String>
+where
+    F: FnMut(String),
+{
+    let bytes = download_binary_with_status(
+        url,
+        label,
+        max_bytes,
+        load_ctx.totals,
+        load_ctx.host_ram_budget,
+        load_ctx.on_status,
+    )
+    .await?;
+    trellis_register_virtual_file_bytes(virtual_path, bytes, label, load_ctx)
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn trellis_resolve_manifest_part_virtual_path(
+    manifest_virtual_path: &std::path::Path,
+    entry_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let entry = std::path::Path::new(entry_path);
+    if entry.is_absolute() {
+        return Ok(entry.to_path_buf());
+    }
+    manifest_virtual_path
+        .parent()
+        .map(|parent| parent.join(entry))
+        .ok_or_else(|| {
+            format!(
+                "invalid Trellis burnpack manifest virtual path '{}'",
+                manifest_virtual_path.display()
+            )
+        })
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+struct TrellisPreloadedBurnpack {
+    manifest_path: std::path::PathBuf,
+    part_paths: Vec<std::path::PathBuf>,
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn release_trellis_preloaded_burnpack_parts<F>(
+    preloaded: TrellisPreloadedBurnpack,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) where
+    F: FnMut(String),
+{
+    let mut released_bytes = 0u64;
+    let mut released_parts = 0usize;
+    for part_path in preloaded.part_paths {
+        if let Some(bytes) = trellis_virtual_fs::remove_virtual_file(&part_path) {
+            released_bytes = released_bytes.saturating_add(bytes as u64);
+            released_parts += 1;
+        }
+    }
+    load_ctx.host_ram_budget.release_retained(released_bytes);
+    load_ctx.status(format!(
+        "Released {} temporary Trellis burnpack part(s) for {} ({}).",
+        released_parts,
+        preloaded.manifest_path.display(),
+        crate::wasm_loader::format_mebibytes(released_bytes)
+    ));
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+async fn preload_trellis_burnpack_parts_wasm<F>(
+    candidate_urls: &[String],
+    candidate_virtuals: &[String],
+    label: &str,
+    load_ctx: &mut WasmLoadContext<'_, F>,
+) -> Result<TrellisPreloadedBurnpack, String>
+where
+    F: FnMut(String),
+{
+    let checked = candidate_urls
+        .iter()
+        .map(|candidate| format!("{candidate}.parts.json"))
+        .collect::<Vec<_>>();
+    for (candidate_url, candidate_virtual) in candidate_urls.iter().zip(candidate_virtuals.iter()) {
+        let manifest_url = format!("{candidate_url}.parts.json");
+        load_ctx.status(format!("Checking {label} manifest {manifest_url}..."));
+        let Some(manifest_text) = fetch_optional_text(&manifest_url).await? else {
+            load_ctx.status(format!(
+                "Missing {label} manifest {manifest_url}; trying next candidate."
+            ));
+            continue;
+        };
+
+        let manifest_virtual_path =
+            std::path::PathBuf::from(format!("{candidate_virtual}.parts.json"));
+        let manifest_bytes = manifest_text.into_bytes();
+        let manifest = parse_parts_manifest_bytes(&manifest_bytes, &manifest_url)?;
+        if manifest.parts.is_empty() {
+            return Err(format!(
+                "burnpack parts manifest {manifest_url} contains no parts"
+            ));
+        }
+        let declared_part_bytes = manifest
+            .parts
+            .iter()
+            .fold(0u64, |total, part| total.saturating_add(part.bytes));
+        let component_preload_cap = web_max_host_ram_bytes() / 2;
+        if declared_part_bytes > component_preload_cap {
+            return Err(format!(
+                "{label} declares {} of burnpack parts, which exceeds the default wasm safe component preload cap of {}. \
+This avoids browser hangs while materializing large TRELLIS checkpoints; rebuild with a larger BURN_SYNTH_WEB_MAX_HOST_RAM_BYTES only on browsers verified to handle the peak.",
+                crate::wasm_loader::format_mebibytes(declared_part_bytes),
+                crate::wasm_loader::format_mebibytes(component_preload_cap)
+            ));
+        }
+        trellis_register_virtual_file_bytes(
+            &manifest_virtual_path,
+            manifest_bytes,
+            &format!("{label} manifest"),
+            load_ctx,
+        )?;
+
+        load_ctx.status(format!(
+            "Loading {label} from {} Trellis burnpack parts...",
+            manifest.parts.len()
+        ));
+        let max_bytes = web_max_burnpack_bytes();
+        let mut part_paths = Vec::with_capacity(manifest.parts.len());
+        for (index, part) in manifest.parts.iter().enumerate() {
+            let part_url = resolve_manifest_entry_uri(&manifest_url, &part.path);
+            let part_virtual_path =
+                trellis_resolve_manifest_part_virtual_path(&manifest_virtual_path, &part.path)?;
+            let part_label = format!("{label} part {}/{}", index + 1, manifest.parts.len());
+            let raw_bytes = download_binary_with_status(
+                &part_url,
+                &part_label,
+                max_bytes,
+                load_ctx.totals,
+                load_ctx.host_ram_budget,
+                load_ctx.on_status,
+            )
+            .await?;
+            if part.bytes > 0 && raw_bytes.len() as u64 != part.bytes {
+                return Err(format!(
+                    "{label} part {} expected {} bytes but downloaded {} bytes",
+                    part.path,
+                    part.bytes,
+                    raw_bytes.len()
+                ));
+            }
+            let bytes = normalize_burnpack_part_bytes(&part_url, raw_bytes).map_err(|err| {
+                format!(
+                    "{label} part {}/{} ({}) failed integrity validation: {err}",
+                    index + 1,
+                    manifest.parts.len(),
+                    part_url
+                )
+            })?;
+            let verify_part_checksum = should_verify_wasm_part_checksums();
+            if verify_part_checksum && !part.sha256.trim().is_empty() {
+                load_ctx.status(format!(
+                    "Verifying checksum for {label} part {}/{}...",
+                    index + 1,
+                    manifest.parts.len()
+                ));
+                let actual_sha = sha256_hex(&bytes);
+                if !actual_sha.eq_ignore_ascii_case(part.sha256.trim()) {
+                    return Err(format!(
+                        "{label} part {} checksum mismatch: expected {}, got {}",
+                        part.path,
+                        part.sha256.trim(),
+                        actual_sha
+                    ));
+                }
+                load_ctx.status(format!(
+                    "Verified checksum for {label} part {}/{}",
+                    index + 1,
+                    manifest.parts.len()
+                ));
+            } else if !verify_part_checksum {
+                load_ctx.status(format!(
+                    "Skipping checksum verification for {label} part {}/{} in release wasm build",
+                    index + 1,
+                    manifest.parts.len()
+                ));
+            }
+            trellis_register_virtual_file_bytes(&part_virtual_path, bytes, &part_label, load_ctx)?;
+            part_paths.push(part_virtual_path);
+        }
+        load_ctx.status(format!(
+            "Registered {label} manifest and {} async-loaded parts.",
+            manifest.parts.len()
+        ));
+
+        return Ok(TrellisPreloadedBurnpack {
+            manifest_path: manifest_virtual_path,
+            part_paths,
+        });
+    }
+
+    Err(format!(
+        "{label} wasm loader requires burnpack parts manifests; checked {}",
+        checked.join(", ")
+    ))
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
 async fn infer_trellis_glb_from_image_bytes_with_preset_cached(
     image_bytes: &[u8],
     preset: &WasmInferencePreset,
@@ -1549,27 +1978,63 @@ async fn infer_trellis_glb_from_image_bytes_with_preset_cached(
 }
 
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
+fn trellis_run_options_from_wasm_preset(
+    preset: &WasmInferencePreset,
+    adapter_profile: &WebGpuAdapterProfile,
+) -> Result<TrellisRunOptions, String> {
+    Ok(TrellisRunOptions {
+        quality: trellis_quality_from_wasm_preset(preset),
+        device: TrellisDevice::Wgpu,
+        compute_profile: trellis_compute_profile_for_wasm(adapter_profile)?,
+        seed: Some(preset.seed),
+        max_sparse_coords: (preset.trellis_max_sparse_coords > 0)
+            .then_some(preset.trellis_max_sparse_coords),
+        target_faces: (preset.faces > 0).then_some(preset.faces),
+        pbr_texture_size: preset
+            .trellis_pbr_enabled
+            .then_some(preset.trellis_pbr_texture_size)
+            .filter(|size| *size > 0),
+        decode_output_mode: trellis_decode_output_mode_from_wasm_preset(preset),
+        sampler_overrides: trellis_sampler_overrides_from_wasm_preset(preset),
+        ..TrellisRunOptions::default()
+    })
+}
+
+#[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
 async fn run_trellis_inference_once(
     state: &mut WasmTrellisPipelineState,
     image_bytes: &[u8],
     preset: &WasmInferencePreset,
 ) -> Result<Vec<u8>, String> {
+    web_sys::console::log_1(&"burn_synth wasm trellis: decode input image start".into());
     let source = image::load_from_memory(image_bytes)
         .map_err(|err| format!("failed to decode image bytes for Trellis: {err}"))?
         .to_rgba8();
+    web_sys::console::log_1(&"burn_synth wasm trellis: decode input image done".into());
 
-    let options = TrellisRunOptions {
-        quality: trellis_quality_from_wasm_preset(preset),
-        device: TrellisDevice::Wgpu,
-        seed: Some(preset.seed),
-        target_faces: (preset.faces > 0).then_some(preset.faces),
-        ..TrellisRunOptions::default()
-    };
+    let options = trellis_run_options_from_wasm_preset(preset, &state.adapter_profile)?;
+    web_sys::console::log_1(
+        &format!(
+            "burn_synth wasm trellis: options quality={} steps={} guidance={} max_sparse_coords={} target_faces={} shader-f16={} compute_profile={}",
+            preset.quality,
+            preset.num_steps,
+            preset.guidance_scale,
+            options.max_sparse_coords.unwrap_or_default(),
+            options.target_faces.unwrap_or_default(),
+            state.adapter_profile.shader_f16_supported,
+            options.compute_profile.as_str()
+        )
+        .into(),
+    );
+    web_sys::console::log_1(&"burn_synth wasm trellis: infer_mesh_from_image start".into());
     let mesh = state
         .trellis
-        .infer_mesh_from_image(image::DynamicImage::ImageRgba8(source), &options)
+        .infer_mesh_from_image_async(image::DynamicImage::ImageRgba8(source), &options)
+        .await
         .map_err(|err| format!("Trellis2 wasm inference failed: {err}"))?;
+    web_sys::console::log_1(&"burn_synth wasm trellis: infer_mesh_from_image done".into());
     let mesh: Mesh = mesh.into();
+    web_sys::console::log_1(&"burn_synth wasm trellis: serialize_glb start".into());
     mesh_to_glb_bytes(&mesh).map_err(|err| format!("failed to serialize Trellis GLB: {err}"))
 }
 

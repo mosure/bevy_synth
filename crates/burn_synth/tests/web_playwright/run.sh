@@ -49,7 +49,7 @@ done
 LOCK_FALLBACK_HELD=1
 
 echo "[web-e2e] build burn_synth wasm (wasm-api + wasm-api-wgpu)"
-burn_synth_features="wasm-api,wasm-api-wgpu"
+burn_synth_features="wasm-api,wasm-api-wgpu,trellis-wgpu"
 MODEL_BASE_URL=assets/models \
 cargo build \
   -p burn_synth \
@@ -72,14 +72,14 @@ echo "[web-e2e] wasm-bindgen burn_synth"
   --no-typescript
 
 if [[ "${BURN_SYNTH_WEB_SKIP_BEVY_BUILD:-0}" != "1" ]]; then
-  echo "[web-e2e] build bevy_synth wasm (triposg wasm runtime)"
+  echo "[web-e2e] build bevy_synth wasm (triposg + trellis wasm runtime)"
   MODEL_BASE_URL=assets/models \
   cargo build \
     -p bevy_synth \
     --target wasm32-unknown-unknown \
     --profile wasm-release \
     --no-default-features \
-    --features triposg,wgpu
+    --features triposg,trellis,wgpu
 
   echo "[web-e2e] wasm-bindgen bevy_synth"
   "${WASM_BINDGEN_BIN}" \

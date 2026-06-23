@@ -54,6 +54,31 @@ pub fn register_virtual_file(path: impl AsRef<Path>, bytes: Vec<u8>) {
 pub fn register_virtual_file(_path: impl AsRef<Path>, _bytes: Vec<u8>) {}
 
 #[cfg(target_arch = "wasm32")]
+pub fn register_virtual_file_with_source_url(
+    path: impl AsRef<Path>,
+    bytes: Vec<u8>,
+    source_url: impl Into<String>,
+) {
+    VIRTUAL_FILES.with(|files| {
+        files.borrow_mut().insert(
+            path.as_ref().to_path_buf(),
+            VirtualEntry {
+                bytes: Some(bytes),
+                source_url: Some(source_url.into()),
+            },
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn register_virtual_file_with_source_url(
+    _path: impl AsRef<Path>,
+    _bytes: Vec<u8>,
+    _source_url: impl Into<String>,
+) {
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn register_virtual_url(path: impl AsRef<Path>, source_url: impl Into<String>) {
     VIRTUAL_FILES.with(|files| {
         files.borrow_mut().insert(
@@ -68,6 +93,21 @@ pub fn register_virtual_url(path: impl AsRef<Path>, source_url: impl Into<String
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn register_virtual_url(_path: impl AsRef<Path>, _source_url: impl Into<String>) {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn remove_virtual_file(path: &Path) -> Option<usize> {
+    VIRTUAL_FILES.with(|files| {
+        files
+            .borrow_mut()
+            .remove(path)
+            .and_then(|entry| entry.bytes.map(|bytes| bytes.len()))
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn remove_virtual_file(_path: &Path) -> Option<usize> {
+    None
+}
 
 #[cfg(target_arch = "wasm32")]
 pub fn has_virtual_file(path: &Path) -> bool {
@@ -129,21 +169,6 @@ fn io_error(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn fetch_url(source_url: &str) -> Result<Vec<u8>, std::io::Error> {
-    Err(io_error(format!(
-        "virtual_fs URL fetch is intentionally disabled on wasm for '{}'; preload bytes asynchronously before registering virtual files",
-        source_url
-    )))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn fetch_url(source_url: &str) -> Result<Vec<u8>, std::io::Error> {
-    Err(std::io::Error::other(format!(
-        "virtual_fs URL fetch is unavailable on non-wasm targets ({source_url})"
-    )))
-}
-
 pub fn read(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -153,7 +178,10 @@ pub fn read(path: &Path) -> Result<Vec<u8>, std::io::Error> {
                 return Ok(bytes);
             }
             if let Some(url) = entry.source_url {
-                return fetch_url(&url);
+                return Err(io_error(format!(
+                    "virtual file '{}' was registered as lazy URL '{url}', but synchronous wasm URL fetch is disabled; preload it with bytes",
+                    path.display()
+                )));
             }
             return Err(io_error(format!(
                 "virtual file entry for '{}' has no bytes/url",
@@ -179,8 +207,10 @@ pub fn metadata_len(path: &Path) -> Result<u64, std::io::Error> {
                 return Ok(bytes.len() as u64);
             }
             if let Some(url) = entry.source_url {
-                let bytes = fetch_url(&url)?;
-                return Ok(bytes.len() as u64);
+                return Err(io_error(format!(
+                    "virtual file '{}' was registered as lazy URL '{url}', but metadata_len cannot synchronously fetch on wasm",
+                    path.display()
+                )));
             }
         }
     }

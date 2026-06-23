@@ -4,9 +4,13 @@ use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
+#[cfg(target_arch = "wasm32")]
+use burn::module::ParamId;
 #[cfg(test)]
 use burn::module::{Module, Param};
 use burn::nn;
@@ -14,12 +18,20 @@ use burn::prelude::Backend;
 #[cfg(test)]
 use burn::tensor::Int;
 use burn::tensor::Tensor;
+#[cfg(target_arch = "wasm32")]
+use burn::tensor::{DType, TensorData};
 use burn_dino::model::dino::{DinoVisionTransformer, DinoVisionTransformerConfig};
+#[cfg(target_arch = "wasm32")]
+use burn_store::{ApplyResult, ModuleStore, TensorSnapshot, TensorSnapshotError};
 use burn_store::{ModuleSnapshot, SafetensorsStore};
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors, serialize};
 use serde::Deserialize;
 
+#[cfg(target_arch = "wasm32")]
+use super::chunked_blob_safetensors::{
+    ChunkedBlobSafetensorsStore, chunked_blob_parts_manifest_exists,
+};
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
 use crate::preprocess::PreprocessOutput;
@@ -124,6 +136,23 @@ impl TrellisImageConditioningRuntime {
             Self::Wgpu(runtime) => runtime.extract_condition(preprocess, resolution),
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn extract_condition_async(
+        &self,
+        preprocess: &PreprocessOutput,
+        resolution: usize,
+    ) -> Result<TrellisImageConditioningOutput, String> {
+        match self {
+            Self::Cpu(runtime) => runtime.extract_condition(preprocess, resolution),
+            #[cfg(feature = "runtime-model-wgpu")]
+            Self::Wgpu(runtime) => {
+                runtime
+                    .extract_condition_async(preprocess, resolution)
+                    .await
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,10 +177,31 @@ where
         let parsed_config = load_dinov3_config(assets.config_json.as_deref())?;
         let config = build_dinov3_config(parsed_config.as_ref());
         let source_label = assets.model_weights.path().display().to_string();
-        let source_bytes = load_image_conditioning_weight_bytes(&assets.model_weights)?;
 
         let device = B::Device::default();
         let mut model = DinoVisionTransformer::<B>::new(&device, config.clone());
+        #[cfg(target_arch = "wasm32")]
+        if let ImageConditioningWeights::Burnpack(path) = &assets.model_weights
+            && chunked_blob_parts_manifest_exists(path)
+        {
+            let mut store = LazyDinoV3Store::from_burnpack_parts(path, &config)?;
+            model.load_from(&mut store).map_err(|err| {
+                format!(
+                    "failed to load DINOv3 image-conditioning weights '{}' from chunked wasm store: {err}",
+                    source_label
+                )
+            })?;
+
+            return Ok(Self {
+                model,
+                device,
+                patch_size: config.patch_size.max(1),
+                register_token_count: config.register_token_count,
+                embedding_dim: config.embedding_dimension,
+            });
+        }
+
+        let source_bytes = load_image_conditioning_weight_bytes(&assets.model_weights)?;
         let converted = convert_hf_dinov3(source_bytes.as_slice(), &config)?;
         let mut store = SafetensorsStore::from_bytes(Some(converted))
             .allow_partial(false)
@@ -177,6 +227,49 @@ where
         preprocess: &PreprocessOutput,
         resolution: usize,
     ) -> Result<TrellisImageConditioningOutput, String> {
+        let (tokens, dims) = self.conditioning_tokens(preprocess, resolution)?;
+        let values = tokens
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|err| format!("failed to read DINOv3 conditioning output: {err:?}"))?;
+
+        Ok(TrellisImageConditioningOutput {
+            resolution,
+            token_count: dims[1],
+            channels: dims[2],
+            values,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn extract_condition_async(
+        &self,
+        preprocess: &PreprocessOutput,
+        resolution: usize,
+    ) -> Result<TrellisImageConditioningOutput, String> {
+        let (tokens, dims) = self.conditioning_tokens(preprocess, resolution)?;
+        let values = tokens
+            .into_data_async()
+            .await
+            .map_err(|err| format!("failed async DINOv3 conditioning readback: {err:?}"))?
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|err| format!("failed to decode DINOv3 conditioning output: {err:?}"))?;
+
+        Ok(TrellisImageConditioningOutput {
+            resolution,
+            token_count: dims[1],
+            channels: dims[2],
+            values,
+        })
+    }
+
+    fn conditioning_tokens(
+        &self,
+        preprocess: &PreprocessOutput,
+        resolution: usize,
+    ) -> Result<(Tensor<B, 3>, [usize; 3]), String> {
         if resolution == 0 {
             return Err("DINOv3 conditioning resolution must be > 0".to_string());
         }
@@ -222,18 +315,7 @@ where
             ));
         }
 
-        let values = tokens
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|err| format!("failed to read DINOv3 conditioning output: {err:?}"))?;
-
-        Ok(TrellisImageConditioningOutput {
-            resolution,
-            token_count: dims[1],
-            channels: dims[2],
-            values,
-        })
+        Ok((tokens, dims))
     }
 }
 
@@ -848,6 +930,504 @@ fn convert_hf_dinov3(
 
     serialize(views, None)
         .map_err(|err| format!("failed to serialize converted DINOv3 weights: {err}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct LazyQkvSnapshotParts {
+    q_weight: Option<TensorSnapshot>,
+    k_weight: Option<TensorSnapshot>,
+    v_weight: Option<TensorSnapshot>,
+    q_bias: Option<TensorSnapshot>,
+    k_bias: Option<TensorSnapshot>,
+    v_bias: Option<TensorSnapshot>,
+    out_dim: Option<usize>,
+    in_dim: Option<usize>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct LazyDinoV3Store {
+    snapshots: BTreeMap<String, TensorSnapshot>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl LazyDinoV3Store {
+    fn from_burnpack_parts(
+        path: &Path,
+        config: &DinoVisionTransformerConfig,
+    ) -> Result<Self, String> {
+        let mut source = ChunkedBlobSafetensorsStore::from_blob_burnpack_parts(path, &[])?;
+        let source_snapshots = source.get_all_snapshots()?.clone();
+        let mut snapshots = BTreeMap::<String, TensorSnapshot>::new();
+        let mut qkv_parts = BTreeMap::<usize, LazyQkvSnapshotParts>::new();
+        let mut skipped = Vec::<String>::new();
+        let mut saw_pos_embed = false;
+
+        for (name, snapshot) in source_snapshots.iter() {
+            if let Some(mapped) = lazy_direct_snapshot(name, snapshot)? {
+                if mapped.full_path() == "pos_embed" {
+                    saw_pos_embed = true;
+                }
+                snapshots.insert(mapped.full_path(), mapped);
+                continue;
+            }
+
+            if lazy_map_layer_snapshot(name, snapshot, &mut snapshots, &mut qkv_parts)? {
+                continue;
+            }
+
+            skipped.push(name.clone());
+        }
+
+        for (layer, parts) in qkv_parts {
+            let weight = lazy_qkv_weight_snapshot(layer, &parts)?;
+            snapshots.insert(weight.full_path(), weight);
+            let bias = lazy_qkv_bias_snapshot(layer, &parts)?;
+            snapshots.insert(bias.full_path(), bias);
+        }
+
+        if !saw_pos_embed {
+            let grid = (config.image_size / config.patch_size.max(1)).max(1);
+            let patch_tokens = grid.saturating_mul(grid);
+            let token_count = 1 + config.register_token_count + patch_tokens;
+            let shape = vec![1, token_count, config.embedding_dimension];
+            let values = vec![0.0f32; token_count.saturating_mul(config.embedding_dimension)];
+            snapshots.insert(
+                "pos_embed".to_string(),
+                tensor_snapshot_from_f32_values("pos_embed", shape, values),
+            );
+        }
+
+        if !skipped.is_empty() {
+            skipped.sort();
+            let preview = skipped
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if skipped.len() > 12 {
+                format!(", ... ({} total)", skipped.len())
+            } else {
+                format!(" ({} total)", skipped.len())
+            };
+            return Err(format!(
+                "unsupported DINOv3 tensor keys encountered during lazy wasm conversion: {}{}",
+                preview, suffix
+            ));
+        }
+
+        Ok(Self { snapshots })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ModuleStore for LazyDinoV3Store {
+    type Error = String;
+
+    fn collect_from<B: Backend, M: ModuleSnapshot<B>>(
+        &mut self,
+        _module: &M,
+    ) -> Result<(), Self::Error> {
+        Err("lazy DINOv3 wasm store does not support save/collect".to_string())
+    }
+
+    fn apply_to<B: Backend, M: ModuleSnapshot<B>>(
+        &mut self,
+        module: &mut M,
+    ) -> Result<ApplyResult, Self::Error> {
+        let snapshots = self.snapshots.values().cloned().collect::<Vec<_>>();
+        let result = module.apply(snapshots, None, None, false);
+        if !result.errors.is_empty() {
+            return Err(format!("Import errors: {:?}", result.errors));
+        }
+        if !result.missing.is_empty() {
+            return Err(format!("\n{result}"));
+        }
+        Ok(result)
+    }
+
+    fn get_snapshot(&mut self, name: &str) -> Result<Option<&TensorSnapshot>, Self::Error> {
+        Ok(self.snapshots.get(name))
+    }
+
+    fn get_all_snapshots(&mut self) -> Result<&BTreeMap<String, TensorSnapshot>, Self::Error> {
+        Ok(&self.snapshots)
+    }
+
+    fn keys(&mut self) -> Result<Vec<String>, Self::Error> {
+        Ok(self.snapshots.keys().cloned().collect())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_direct_snapshot(
+    name: &str,
+    snapshot: &TensorSnapshot,
+) -> Result<Option<TensorSnapshot>, String> {
+    let mapped = match name {
+        "embeddings.cls_token" => Some(("cls_token", None)),
+        "embeddings.mask_token" => {
+            let shape =
+                if snapshot.shape.len() == 3 && snapshot.shape[0] == 1 && snapshot.shape[1] == 1 {
+                    Some(vec![1, snapshot.shape[2]])
+                } else {
+                    None
+                };
+            Some(("mask_token", shape))
+        }
+        "embeddings.register_tokens" => Some(("register_tokens", None)),
+        "embeddings.patch_embeddings.weight" => Some(("patch_embed.proj.weight", None)),
+        "embeddings.patch_embeddings.bias" => Some(("patch_embed.proj.bias", None)),
+        "embeddings.position_embeddings" => Some(("pos_embed", None)),
+        "norm.weight" => Some(("norm.gamma", None)),
+        "norm.bias" => Some(("norm.beta", None)),
+        _ => None,
+    };
+
+    let Some((mapped, shape_override)) = mapped else {
+        return Ok(None);
+    };
+    Ok(Some(lazy_f32_snapshot(
+        mapped,
+        snapshot.clone(),
+        shape_override.unwrap_or_else(|| snapshot.shape.to_vec()),
+    )))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_map_layer_snapshot(
+    name: &str,
+    snapshot: &TensorSnapshot,
+    snapshots: &mut BTreeMap<String, TensorSnapshot>,
+    qkv_parts: &mut BTreeMap<usize, LazyQkvSnapshotParts>,
+) -> Result<bool, String> {
+    let Some(rest) = name.strip_prefix("layer.") else {
+        return Ok(false);
+    };
+    let Some((layer_str, tail)) = rest.split_once('.') else {
+        return Ok(false);
+    };
+    let layer: usize = layer_str
+        .parse()
+        .map_err(|_| format!("invalid DINOv3 layer index in tensor key '{name}'"))?;
+
+    let mapped = match tail {
+        "norm1.weight" => Some(format!("blocks.{layer}.norm1.gamma")),
+        "norm1.bias" => Some(format!("blocks.{layer}.norm1.beta")),
+        "norm2.weight" => Some(format!("blocks.{layer}.norm2.gamma")),
+        "norm2.bias" => Some(format!("blocks.{layer}.norm2.beta")),
+        "mlp.up_proj.bias" => Some(format!("blocks.{layer}.mlp.fc1.bias")),
+        "mlp.down_proj.bias" => Some(format!("blocks.{layer}.mlp.fc2.bias")),
+        "layer_scale1.lambda1" => Some(format!("blocks.{layer}.ls1.gamma")),
+        "layer_scale2.lambda1" => Some(format!("blocks.{layer}.ls2.gamma")),
+        "attention.o_proj.bias" => Some(format!("blocks.{layer}.attn.proj.bias")),
+        _ => None,
+    };
+    if let Some(mapped) = mapped {
+        let snapshot = lazy_f32_snapshot(&mapped, snapshot.clone(), snapshot.shape.to_vec());
+        snapshots.insert(mapped, snapshot);
+        return Ok(true);
+    }
+
+    let transposed = match tail {
+        "mlp.up_proj.weight" => Some(format!("blocks.{layer}.mlp.fc1.weight")),
+        "mlp.down_proj.weight" => Some(format!("blocks.{layer}.mlp.fc2.weight")),
+        "attention.o_proj.weight" => Some(format!("blocks.{layer}.attn.proj.weight")),
+        _ => None,
+    };
+    if let Some(mapped) = transposed {
+        let snapshot = lazy_transposed_2d_snapshot(&mapped, snapshot.clone(), name)?;
+        snapshots.insert(mapped, snapshot);
+        return Ok(true);
+    }
+
+    match tail {
+        "attention.q_proj.weight"
+        | "attention.k_proj.weight"
+        | "attention.v_proj.weight"
+        | "attention.q_proj.bias"
+        | "attention.k_proj.bias"
+        | "attention.v_proj.bias" => {
+            lazy_assign_qkv_snapshot(qkv_parts.entry(layer).or_default(), name, snapshot)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_assign_qkv_snapshot(
+    parts: &mut LazyQkvSnapshotParts,
+    name: &str,
+    snapshot: &TensorSnapshot,
+) -> Result<(), String> {
+    if name.ends_with(".weight") {
+        if snapshot.shape.len() != 2 {
+            return Err(format!(
+                "invalid qkv weight shape for '{name}': expected rank-2, got {:?}",
+                snapshot.shape
+            ));
+        }
+        let out_dim = snapshot.shape[0];
+        let in_dim = snapshot.shape[1];
+        if let Some(existing) = parts.out_dim
+            && existing != out_dim
+        {
+            return Err(format!(
+                "qkv out_dim mismatch for '{name}': {} vs {}",
+                existing, out_dim
+            ));
+        }
+        if let Some(existing) = parts.in_dim
+            && existing != in_dim
+        {
+            return Err(format!(
+                "qkv in_dim mismatch for '{name}': {} vs {}",
+                existing, in_dim
+            ));
+        }
+        parts.out_dim = Some(out_dim);
+        parts.in_dim = Some(in_dim);
+    }
+
+    if name.ends_with("attention.q_proj.weight") {
+        parts.q_weight = Some(snapshot.clone());
+    } else if name.ends_with("attention.k_proj.weight") {
+        parts.k_weight = Some(snapshot.clone());
+    } else if name.ends_with("attention.v_proj.weight") {
+        parts.v_weight = Some(snapshot.clone());
+    } else if name.ends_with("attention.q_proj.bias") {
+        parts.q_bias = Some(snapshot.clone());
+    } else if name.ends_with("attention.k_proj.bias") {
+        parts.k_bias = Some(snapshot.clone());
+    } else if name.ends_with("attention.v_proj.bias") {
+        parts.v_bias = Some(snapshot.clone());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_qkv_weight_snapshot(
+    layer: usize,
+    parts: &LazyQkvSnapshotParts,
+) -> Result<TensorSnapshot, String> {
+    let out_dim = parts
+        .out_dim
+        .ok_or_else(|| format!("missing qkv out_dim for DINOv3 layer {layer}"))?;
+    let in_dim = parts
+        .in_dim
+        .ok_or_else(|| format!("missing qkv in_dim for DINOv3 layer {layer}"))?;
+    let q = parts
+        .q_weight
+        .clone()
+        .ok_or_else(|| format!("missing q_proj.weight for DINOv3 layer {layer}"))?;
+    let k = parts
+        .k_weight
+        .clone()
+        .ok_or_else(|| format!("missing k_proj.weight for DINOv3 layer {layer}"))?;
+    let v = parts
+        .v_weight
+        .clone()
+        .ok_or_else(|| format!("missing v_proj.weight for DINOv3 layer {layer}"))?;
+    let name = format!("blocks.{layer}.attn.qkv.weight");
+    let shape = vec![in_dim, out_dim * 3];
+    let path_stack = path_stack_from_name(&name);
+    let name_for_error = name.clone();
+    let data_fn = Rc::new(move || {
+        let q = snapshot_f32_values(&q, format!("{name_for_error}.q").as_str())?;
+        let k = snapshot_f32_values(&k, format!("{name_for_error}.k").as_str())?;
+        let v = snapshot_f32_values(&v, format!("{name_for_error}.v").as_str())?;
+        let expected_weight = out_dim.saturating_mul(in_dim);
+        if q.len() != expected_weight || k.len() != expected_weight || v.len() != expected_weight {
+            return Err(TensorSnapshotError::IoError(format!(
+                "invalid qkv weight lengths in DINOv3 layer {layer}: q={} k={} v={} expected={}",
+                q.len(),
+                k.len(),
+                v.len(),
+                expected_weight
+            )));
+        }
+        let mut qkv = Vec::with_capacity(expected_weight * 3);
+        qkv.extend_from_slice(q.as_slice());
+        qkv.extend_from_slice(k.as_slice());
+        qkv.extend_from_slice(v.as_slice());
+        let transposed = transpose_2d_f32(qkv.as_slice(), out_dim * 3, in_dim)
+            .map_err(TensorSnapshotError::IoError)?;
+        Ok(TensorData::from_bytes_vec(
+            f32_values_to_bytes(transposed.as_slice()),
+            vec![in_dim, out_dim * 3],
+            DType::F32,
+        ))
+    });
+    Ok(TensorSnapshot::from_closure(
+        data_fn,
+        DType::F32,
+        shape.into(),
+        path_stack,
+        Vec::new(),
+        ParamId::new(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_qkv_bias_snapshot(
+    layer: usize,
+    parts: &LazyQkvSnapshotParts,
+) -> Result<TensorSnapshot, String> {
+    let out_dim = parts
+        .out_dim
+        .ok_or_else(|| format!("missing qkv out_dim for DINOv3 layer {layer}"))?;
+    let q = parts.q_bias.clone();
+    let k = parts.k_bias.clone();
+    let v = parts.v_bias.clone();
+    let name = format!("blocks.{layer}.attn.qkv.bias");
+    let shape = vec![out_dim * 3];
+    let path_stack = path_stack_from_name(&name);
+    let data_fn = Rc::new(move || {
+        let zero = vec![0.0f32; out_dim];
+        let q = optional_snapshot_f32_values(q.as_ref(), &zero, "qkv.q_bias")?;
+        let k = optional_snapshot_f32_values(k.as_ref(), &zero, "qkv.k_bias")?;
+        let v = optional_snapshot_f32_values(v.as_ref(), &zero, "qkv.v_bias")?;
+        if q.len() != out_dim || k.len() != out_dim || v.len() != out_dim {
+            return Err(TensorSnapshotError::IoError(format!(
+                "invalid qkv bias lengths in DINOv3 layer {layer}: q={} k={} v={} expected={}",
+                q.len(),
+                k.len(),
+                v.len(),
+                out_dim
+            )));
+        }
+        let mut qkv = Vec::with_capacity(out_dim * 3);
+        qkv.extend_from_slice(q.as_slice());
+        qkv.extend_from_slice(k.as_slice());
+        qkv.extend_from_slice(v.as_slice());
+        Ok(TensorData::from_bytes_vec(
+            f32_values_to_bytes(qkv.as_slice()),
+            vec![out_dim * 3],
+            DType::F32,
+        ))
+    });
+    Ok(TensorSnapshot::from_closure(
+        data_fn,
+        DType::F32,
+        shape.into(),
+        path_stack,
+        Vec::new(),
+        ParamId::new(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_f32_snapshot(name: &str, source: TensorSnapshot, shape: Vec<usize>) -> TensorSnapshot {
+    let path_stack = path_stack_from_name(name);
+    let name_for_error = name.to_string();
+    let data_shape = shape.clone();
+    let data_fn = Rc::new(move || {
+        let values = snapshot_f32_values(&source, name_for_error.as_str())?;
+        Ok(TensorData::from_bytes_vec(
+            f32_values_to_bytes(values.as_slice()),
+            data_shape.clone(),
+            DType::F32,
+        ))
+    });
+    TensorSnapshot::from_closure(
+        data_fn,
+        DType::F32,
+        shape.into(),
+        path_stack,
+        Vec::new(),
+        ParamId::new(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lazy_transposed_2d_snapshot(
+    name: &str,
+    source: TensorSnapshot,
+    source_name: &str,
+) -> Result<TensorSnapshot, String> {
+    if source.shape.len() != 2 {
+        return Err(format!(
+            "invalid linear weight shape for '{source_name}': expected rank-2, got {:?}",
+            source.shape
+        ));
+    }
+    let out_dim = source.shape[0];
+    let in_dim = source.shape[1];
+    let shape = vec![in_dim, out_dim];
+    let path_stack = path_stack_from_name(name);
+    let name_for_error = name.to_string();
+    let data_fn = Rc::new(move || {
+        let values = snapshot_f32_values(&source, name_for_error.as_str())?;
+        let transposed = transpose_2d_f32(values.as_slice(), out_dim, in_dim)
+            .map_err(TensorSnapshotError::IoError)?;
+        Ok(TensorData::from_bytes_vec(
+            f32_values_to_bytes(transposed.as_slice()),
+            vec![in_dim, out_dim],
+            DType::F32,
+        ))
+    });
+    Ok(TensorSnapshot::from_closure(
+        data_fn,
+        DType::F32,
+        shape.into(),
+        path_stack,
+        Vec::new(),
+        ParamId::new(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn tensor_snapshot_from_f32_values(
+    name: &str,
+    shape: Vec<usize>,
+    values: Vec<f32>,
+) -> TensorSnapshot {
+    TensorSnapshot::from_data(
+        TensorData::from_bytes_vec(
+            f32_values_to_bytes(values.as_slice()),
+            shape.clone(),
+            DType::F32,
+        ),
+        path_stack_from_name(name),
+        Vec::new(),
+        ParamId::new(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn snapshot_f32_values(
+    snapshot: &TensorSnapshot,
+    name: &str,
+) -> Result<Vec<f32>, TensorSnapshotError> {
+    let data = snapshot.to_data()?;
+    let values = data.iter::<f32>().collect::<Vec<_>>();
+    if values.len() != data.num_elements() {
+        return Err(TensorSnapshotError::IoError(format!(
+            "failed to decode tensor '{name}': expected {} elements, got {}",
+            data.num_elements(),
+            values.len()
+        )));
+    }
+    Ok(values)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn optional_snapshot_f32_values(
+    snapshot: Option<&TensorSnapshot>,
+    default: &[f32],
+    name: &str,
+) -> Result<Vec<f32>, TensorSnapshotError> {
+    match snapshot {
+        Some(snapshot) => snapshot_f32_values(snapshot, name),
+        None => Ok(default.to_vec()),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn path_stack_from_name(name: &str) -> Vec<String> {
+    name.split('.').map(|segment| segment.to_string()).collect()
 }
 
 fn map_direct_tensor(name: &str, view: &TensorView<'_>) -> Result<Option<OwnedTensor>, String> {

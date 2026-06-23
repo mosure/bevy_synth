@@ -1,10 +1,10 @@
 # bevy_synth web 🕊️🔥🎛️🎹
 
 - build `bevy_synth` wasm with the canonical web profile:
-  - `cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release --features wgpu,triposg`
+  - `cargo build -p bevy_synth --target wasm32-unknown-unknown --profile wasm-release --features wgpu,triposg,trellis`
   - `wasm-bindgen --out-dir ./www/out --target web --no-typescript target/wasm32-unknown-unknown/wasm-release/bevy_synth.wasm`
 - build `burn_synth` wasm api with the canonical web profile:
-  - `cargo build -p burn_synth --lib --no-default-features --target wasm32-unknown-unknown --profile wasm-release --features wasm-api,wasm-api-wgpu`
+  - `cargo build -p burn_synth --lib --no-default-features --target wasm32-unknown-unknown --profile wasm-release --features wasm-api,wasm-api-wgpu,trellis-wgpu`
   - `wasm-bindgen --out-dir ./www/out --target web --no-typescript target/wasm32-unknown-unknown/wasm-release/burn_synth.wasm`
 - do not use `target/wasm32-unknown-unknown/release/*.wasm` for web pages; web validation and tests use `wasm-release` artifacts.
 - run full `burn_synth` wasm integration (build + bindgen + playwright parts-based inference):

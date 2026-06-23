@@ -134,7 +134,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     quality: TrellisQuality,
 
-    /// Runtime compute profile. Use reference-f32 for strict parity and wgpu-fast-f16 for parity-checked WGPU f16 attention.
+    /// Runtime compute profile. Defaults to reference-f32 for correctness; use the wgpu-fast-* profiles for opt-in performance diagnostics.
     #[arg(long = "compute-profile", value_enum, default_value_t = TrellisComputeProfile::ReferenceF32)]
     compute_profile: TrellisComputeProfile,
 
@@ -260,6 +260,25 @@ fn validate_benchmark_args(args: &Args) -> Result<(), String> {
     if args.strict_benchmark && args.runtime_stage_debug {
         return Err(
             "--strict-benchmark cannot be combined with --runtime-stage-debug; stage debug enables probe readbacks and invalidates timing"
+                .to_string(),
+        );
+    }
+    if args.strict_benchmark && matches!(args.backend, TrellisDevice::Auto) {
+        return Err(
+            "--strict-benchmark requires an explicit --backend so reports cannot hide backend fallback"
+                .to_string(),
+        );
+    }
+    if args.strict_benchmark && args.compute_profile.is_diagnostic() {
+        return Err(format!(
+            "--strict-benchmark cannot use diagnostic compute profile '{}'; use '{}' for opt-in fast WGPU candidate benchmarking or reference-f32 for parity diagnostics",
+            args.compute_profile.as_str(),
+            TrellisComputeProfile::FAST_WGPU_BENCHMARK_CANDIDATE.as_str()
+        ));
+    }
+    if args.strict_benchmark && args.hook_output.is_some() {
+        return Err(
+            "--strict-benchmark cannot be combined with --hook-output; hook capture adds timing overhead"
                 .to_string(),
         );
     }
@@ -418,6 +437,7 @@ fn run() -> Result<(), String> {
             "decode_tex_decoder": profiled.timings.decode_tex_decoder_ms,
             "decode_attr_merge": profiled.timings.decode_attr_merge_ms,
             "decode_mesh": profiled.timings.decode_mesh_ms,
+            "decode_pre_pbr_decimate": profiled.timings.decode_pre_pbr_decimate_ms,
             "decode_pbr": profiled.timings.decode_pbr_ms,
             "decode_shape_conv_calls": profiled.timings.decode_shape_conv_calls,
             "decode_tex_conv_calls": profiled.timings.decode_tex_conv_calls,
@@ -449,6 +469,15 @@ fn run() -> Result<(), String> {
     };
     let settings = args.quality.settings();
     let effective_steps = |configured: Option<usize>, preset: usize| configured.unwrap_or(preset);
+    let compute_profile_json = || {
+        json!({
+            "name": args.compute_profile.as_str(),
+            "parity_reference": args.compute_profile.is_parity_reference(),
+            "fast_candidate": args.compute_profile.is_fast_candidate(),
+            "diagnostic": args.compute_profile.is_diagnostic(),
+            "requires_render_or_hook_parity_gate": args.compute_profile.requires_render_or_hook_parity_gate(),
+        })
+    };
 
     let report = if repeat == 1 {
         json!({
@@ -460,6 +489,7 @@ fn run() -> Result<(), String> {
             "device": args.backend.as_str(),
             "quality": args.quality.as_str(),
             "compute_profile": args.compute_profile.as_str(),
+            "compute_profile_class": compute_profile_json(),
             "strict_benchmark": args.strict_benchmark,
             "repeat": repeat,
             "effective_config": {
@@ -532,6 +562,7 @@ fn run() -> Result<(), String> {
             "device": args.backend.as_str(),
             "quality": args.quality.as_str(),
             "compute_profile": args.compute_profile.as_str(),
+            "compute_profile_class": compute_profile_json(),
             "strict_benchmark": args.strict_benchmark,
             "repeat": repeat,
             "effective_config": {
@@ -858,6 +889,12 @@ mod tests {
     }
 
     #[test]
+    fn defaults_to_reference_f32_compute_profile() {
+        let args = Args::parse_from(["trellis2_run", "--input", "input.png"]);
+        assert_eq!(args.compute_profile, TrellisComputeProfile::ReferenceF32);
+    }
+
+    #[test]
     fn strict_benchmark_rejects_stage_debug_probe_path() {
         let args = Args::parse_from([
             "trellis2_run",
@@ -872,6 +909,31 @@ mod tests {
             err.contains("--runtime-stage-debug"),
             "unexpected validation error: {err}"
         );
+    }
+
+    #[test]
+    fn strict_benchmark_requires_explicit_backend_and_non_diagnostic_profile() {
+        let missing_backend =
+            Args::parse_from(["trellis2_run", "--input", "input.png", "--strict-benchmark"]);
+        let err = validate_benchmark_args(&missing_backend)
+            .expect_err("strict benchmark should require explicit backend");
+        assert!(err.contains("explicit --backend"));
+
+        let diagnostic_profile = Args::parse_from([
+            "trellis2_run",
+            "--input",
+            "input.png",
+            "--backend",
+            "wgpu",
+            "--strict-benchmark",
+            "--compute-profile",
+            "wgpu-fast-f16",
+        ]);
+        let err = validate_benchmark_args(&diagnostic_profile)
+            .expect_err("strict benchmark should reject diagnostic profiles");
+        assert!(err.contains("diagnostic compute profile"));
+        assert!(err.contains("fast WGPU candidate benchmarking"));
+        assert!(!err.contains("validated"));
     }
 
     #[test]

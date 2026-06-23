@@ -47,6 +47,9 @@ optional = true
 default-features = false
 features = ["std", "webgpu"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
 

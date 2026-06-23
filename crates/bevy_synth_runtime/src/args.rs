@@ -1,6 +1,11 @@
 use std::path::PathBuf;
 
 use bevy::prelude::Resource;
+use burn_synth::quality::{
+    DEFAULT_CHUNK_SIZE as CORE_DEFAULT_CHUNK_SIZE, DEFAULT_SEED as CORE_DEFAULT_SEED,
+    DEFAULT_TRELLIS_TARGET_FACES as CORE_DEFAULT_TRELLIS_TARGET_FACES,
+    DEFAULT_TRIPOSG_TARGET_FACES as CORE_DEFAULT_TRIPOSG_TARGET_FACES, RuntimeQualityPreset,
+};
 use burn_triposplat::{
     MAX_NUM_GAUSSIANS, MIN_NUM_GAUSSIANS, TRIPOSPLAT_GAUSSIANS_PER_POINT,
     TripoSplatProfile as CoreTripoSplatProfile, TripoSplatProfileSettings, normalize_num_gaussians,
@@ -52,8 +57,24 @@ pub struct Args {
     pub trellis_bridge_script: Option<PathBuf>,
 
     /// Trellis quality preset (low, medium, high).
-    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Low)]
     pub trellis_quality: TrellisQuality,
+
+    /// Enable native Trellis PBR texture baking. Pass `--trellis-pbr true` for textured output.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub trellis_pbr: bool,
+
+    /// Native Trellis PBR texture size. Use 0 for the runtime default.
+    #[arg(long, default_value_t = DEFAULT_TRELLIS_PBR_TEXTURE_SIZE)]
+    pub trellis_pbr_texture_size: usize,
+
+    /// Trellis target face count. Use 0 to disable Trellis decimation.
+    #[arg(long)]
+    pub trellis_faces: Option<usize>,
+
+    /// Optional sparse-coordinate cap for Trellis decode. Use 0 to disable the explicit cap.
+    #[arg(long)]
+    pub trellis_max_sparse_coords: Option<usize>,
 
     /// Optional weights root for TripoSG-scribble pipeline.
     #[arg(long)]
@@ -309,77 +330,28 @@ pub enum MeshMode {
     Flash,
 }
 
-pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
-pub const DEFAULT_SEED: u64 = 42;
+pub const DEFAULT_CHUNK_SIZE: usize = CORE_DEFAULT_CHUNK_SIZE;
+pub const DEFAULT_SEED: u64 = CORE_DEFAULT_SEED;
+pub const DEFAULT_TRIPOSG_TARGET_FACES: usize = CORE_DEFAULT_TRIPOSG_TARGET_FACES;
+pub const DEFAULT_TRELLIS_TARGET_FACES: usize = CORE_DEFAULT_TRELLIS_TARGET_FACES;
+pub const DEFAULT_TRELLIS_PBR_TEXTURE_SIZE: usize =
+    burn_synth::runtime::DEFAULT_TRELLIS_PBR_TEXTURE_SIZE;
 pub const TRIPOSPLAT_MIN_NUM_GAUSSIANS: usize = MIN_NUM_GAUSSIANS;
 pub const TRIPOSPLAT_MAX_NUM_GAUSSIANS: usize = MAX_NUM_GAUSSIANS;
 pub const TRIPOSPLAT_GAUSSIAN_STEP: usize = TRIPOSPLAT_GAUSSIANS_PER_POINT * 1024;
 
-#[derive(Clone, Copy, Debug)]
-pub struct QualityDefaults {
-    pub num_steps: usize,
-    pub num_tokens: usize,
-    pub guidance_scale: f32,
-    pub resolution: usize,
-    pub chunk_size: usize,
-    pub dense_octree_depth: usize,
-    pub hierarchical_octree_depth: usize,
-    pub band_threshold: f32,
-    pub flash_octree_depth: usize,
-    pub flash_min_resolution: usize,
-    pub flash_mini_grid_num: usize,
-    pub flash_num_chunks: usize,
-    pub flash_mc_level: f32,
+impl QualityPreset {
+    pub fn defaults(self) -> burn_synth::quality::RuntimeQualityDefaults {
+        RuntimeQualityPreset::from(self).defaults()
+    }
 }
 
-impl QualityPreset {
-    pub fn defaults(self) -> QualityDefaults {
-        match self {
-            QualityPreset::Fast => QualityDefaults {
-                num_steps: 12,
-                num_tokens: 512,
-                guidance_scale: 7.0,
-                resolution: 128,
-                chunk_size: DEFAULT_CHUNK_SIZE,
-                dense_octree_depth: 6,
-                hierarchical_octree_depth: 7,
-                band_threshold: 1.0,
-                flash_octree_depth: 7,
-                flash_min_resolution: 31,
-                flash_mini_grid_num: 2,
-                flash_num_chunks: 4096,
-                flash_mc_level: 0.0,
-            },
-            QualityPreset::Balanced => QualityDefaults {
-                num_steps: 20,
-                num_tokens: 1024,
-                guidance_scale: 7.0,
-                resolution: 192,
-                chunk_size: DEFAULT_CHUNK_SIZE,
-                dense_octree_depth: 7,
-                hierarchical_octree_depth: 8,
-                band_threshold: 1.0,
-                flash_octree_depth: 8,
-                flash_min_resolution: 31,
-                flash_mini_grid_num: 4,
-                flash_num_chunks: 8192,
-                flash_mc_level: 0.0,
-            },
-            QualityPreset::Full => QualityDefaults {
-                num_steps: 50,
-                num_tokens: 2048,
-                guidance_scale: 7.0,
-                resolution: 256,
-                chunk_size: DEFAULT_CHUNK_SIZE,
-                dense_octree_depth: 8,
-                hierarchical_octree_depth: 9,
-                band_threshold: 1.0,
-                flash_octree_depth: 9,
-                flash_min_resolution: 63,
-                flash_mini_grid_num: 4,
-                flash_num_chunks: DEFAULT_CHUNK_SIZE,
-                flash_mc_level: 0.0,
-            },
+impl From<QualityPreset> for RuntimeQualityPreset {
+    fn from(value: QualityPreset) -> Self {
+        match value {
+            QualityPreset::Fast => Self::Fast,
+            QualityPreset::Balanced => Self::Balanced,
+            QualityPreset::Full => Self::Full,
         }
     }
 }
@@ -397,6 +369,10 @@ pub struct AppArgs {
     pub trellis_python_bin: Option<PathBuf>,
     pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
+    pub trellis_pbr_enabled: bool,
+    pub trellis_pbr_texture_size: Option<usize>,
+    pub trellis_target_faces: Option<usize>,
+    pub trellis_max_sparse_coords: Option<usize>,
     pub scribble_weights_root: Option<PathBuf>,
     pub quality: QualityPreset,
     pub triposplat_profile: TripoSplatProfile,
@@ -455,7 +431,16 @@ pub fn build_app_args(args: Args) -> AppArgs {
     let target_faces = match args.faces {
         Some(0) => None,
         Some(value) => Some(value),
-        None => Some(10_000),
+        None => Some(DEFAULT_TRIPOSG_TARGET_FACES),
+    };
+    let trellis_target_faces = match args.trellis_faces.or(args.faces) {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(DEFAULT_TRELLIS_TARGET_FACES),
+    };
+    let trellis_max_sparse_coords = match args.trellis_max_sparse_coords {
+        Some(0) | None => None,
+        Some(value) => Some(value),
     };
     AppArgs {
         image: args.image,
@@ -469,6 +454,11 @@ pub fn build_app_args(args: Args) -> AppArgs {
         trellis_python_bin: args.trellis_python_bin,
         trellis_bridge_script: args.trellis_bridge_script,
         trellis_quality: args.trellis_quality,
+        trellis_pbr_enabled: args.trellis_pbr,
+        trellis_pbr_texture_size: (args.trellis_pbr_texture_size > 0)
+            .then_some(args.trellis_pbr_texture_size),
+        trellis_target_faces,
+        trellis_max_sparse_coords,
         scribble_weights_root: args.scribble_weights_root,
         quality,
         triposplat_profile,
@@ -576,7 +566,11 @@ fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel>
 }
 
 fn default_available_synthesis_models() -> Vec<SynthesisModel> {
-    vec![SynthesisModel::Triposg, SynthesisModel::Triposplat]
+    vec![
+        SynthesisModel::Triposg,
+        SynthesisModel::Trellis,
+        SynthesisModel::Triposplat,
+    ]
 }
 
 #[cfg(test)]
@@ -584,8 +578,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, QualityPreset, RmbgModel, SynthesisModel,
-        TripoSplatProfile, WeightPrecision, build_app_args,
+        Args, DEFAULT_CHUNK_SIZE, DEFAULT_SEED, DEFAULT_TRELLIS_PBR_TEXTURE_SIZE,
+        DEFAULT_TRELLIS_TARGET_FACES, DEFAULT_TRIPOSG_TARGET_FACES, QualityPreset, RmbgModel,
+        SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision, build_app_args,
     };
 
     #[test]
@@ -596,7 +591,11 @@ mod tests {
         assert_eq!(app_args.synthesis_models, vec![SynthesisModel::Triposg]);
         assert_eq!(
             app_args.available_synthesis_models,
-            vec![SynthesisModel::Triposg, SynthesisModel::Triposplat]
+            vec![
+                SynthesisModel::Triposg,
+                SynthesisModel::Trellis,
+                SynthesisModel::Triposplat
+            ]
         );
         assert_eq!(app_args.max_batch_size, 1);
     }
@@ -662,6 +661,72 @@ mod tests {
         assert_eq!(defaults.num_tokens, 1024);
         assert_eq!(defaults.flash_octree_depth, 8);
         assert_eq!(defaults.flash_min_resolution, 31);
+    }
+
+    #[test]
+    fn trellis_settings_have_pipeline_specific_defaults_and_overrides() {
+        let defaults = build_app_args(Args::parse_from(["bevy_synth"]));
+        assert_eq!(defaults.trellis_quality, TrellisQuality::Low);
+        assert!(!defaults.trellis_pbr_enabled);
+        assert_eq!(
+            defaults.trellis_pbr_texture_size,
+            Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE)
+        );
+        assert_eq!(defaults.target_faces, Some(DEFAULT_TRIPOSG_TARGET_FACES));
+        assert_eq!(
+            defaults.trellis_target_faces,
+            Some(DEFAULT_TRELLIS_TARGET_FACES)
+        );
+        assert_eq!(defaults.trellis_max_sparse_coords, None);
+
+        let custom = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "trellis",
+            "--trellis-quality",
+            "high",
+            "--trellis-pbr",
+            "true",
+            "--trellis-pbr-texture-size",
+            "2048",
+            "--trellis-faces",
+            "500000",
+            "--trellis-max-sparse-coords",
+            "4096",
+        ]));
+        assert_eq!(custom.trellis_quality, TrellisQuality::High);
+        assert!(custom.trellis_pbr_enabled);
+        assert_eq!(custom.trellis_pbr_texture_size, Some(2048));
+        assert_eq!(custom.trellis_target_faces, Some(500_000));
+        assert_eq!(custom.trellis_max_sparse_coords, Some(4096));
+
+        let face_budget_only = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "trellis",
+            "--trellis-faces",
+            "250000",
+        ]));
+        assert_eq!(face_budget_only.trellis_target_faces, Some(250_000));
+        assert_eq!(
+            face_budget_only.trellis_max_sparse_coords, None,
+            "Trellis face budget must not be reused as a sparse-coordinate cap"
+        );
+
+        let disabled_faces = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "trellis",
+            "--trellis-faces",
+            "0",
+            "--trellis-max-sparse-coords",
+            "0",
+            "--trellis-pbr-texture-size",
+            "0",
+        ]));
+        assert_eq!(disabled_faces.trellis_target_faces, None);
+        assert_eq!(disabled_faces.trellis_max_sparse_coords, None);
+        assert_eq!(disabled_faces.trellis_pbr_texture_size, None);
     }
 
     #[test]

@@ -14,7 +14,9 @@ use serde_json::Value;
 use crate::config::{TrellisComputeProfile, TrellisQuality};
 use crate::hook_diff::{HookSnapshot, HookTensor};
 use crate::hook_trace::HookTrace;
-use crate::mesh::{Mesh, write_obj_mesh};
+use crate::mesh::{
+    Mesh, orient_mesh_faces_to_positive_volume, remap_mesh_to_python_glb_frame, write_obj_mesh,
+};
 use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use crate::preprocess::{
     PreprocessConfig, PreprocessOutput, preprocess_image, preprocess_image_path,
@@ -36,6 +38,14 @@ const HOOK_MAX_ROWS: usize = usize::MAX;
 const HOOK_MAX_DENSE_ELEMENTS: usize = usize::MAX;
 const HOOK_SAMPLER_SNAPSHOTS: usize = 3;
 const STAGE_RUNTIME_CACHE_MAX: usize = 2;
+
+#[cfg(target_arch = "wasm32")]
+fn trellis_wasm_log(message: &str) {
+    web_sys::console::log_1(&message.into());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn trellis_wasm_log(_message: &str) {}
 
 #[cfg(feature = "runtime-model")]
 fn reset_runtime_transfer_stats() {
@@ -153,6 +163,7 @@ pub struct TrellisPipelineTimings {
     pub decode_tex_decoder_ms: f64,
     pub decode_attr_merge_ms: f64,
     pub decode_mesh_ms: f64,
+    pub decode_pre_pbr_decimate_ms: f64,
     pub decode_pbr_ms: f64,
     pub decode_shape_conv_calls: u64,
     pub decode_tex_conv_calls: u64,
@@ -488,6 +499,7 @@ impl Trellis2Pipeline {
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
         let hook_capture_ms = hook_capture_start.elapsed().as_secs_f64() * 1000.0;
         remap_mesh_to_python_glb_frame(&mut stage_output.mesh);
+        orient_mesh_faces_to_positive_volume(&mut stage_output.mesh);
         let step_counts = TrellisPipelineStepCounts {
             sparse: stage_output.sparse.step_count,
             shape_slat: stage_output.shape_slat.step_count,
@@ -528,6 +540,7 @@ impl Trellis2Pipeline {
             decode_tex_decoder_ms: stage_timings.decode_tex_decoder_ms,
             decode_attr_merge_ms: stage_timings.decode_attr_merge_ms,
             decode_mesh_ms: stage_timings.decode_mesh_ms,
+            decode_pre_pbr_decimate_ms: stage_timings.decode_pre_pbr_decimate_ms,
             decode_pbr_ms: stage_timings.decode_pbr_ms,
             decode_shape_conv_calls: stage_timings.decode_shape_conv_calls,
             decode_tex_conv_calls: stage_timings.decode_tex_conv_calls,
@@ -573,12 +586,19 @@ impl Trellis2Pipeline {
         image: DynamicImage,
         options: &TrellisRunOptions,
     ) -> Result<Mesh, TrellisRuntimeError> {
+        trellis_wasm_log("burn_trellis wasm: preprocess start");
         let preprocess = preprocess_image(image, PreprocessConfig::default())
             .map_err(|err| TrellisRuntimeError::new(format!("preprocess failed: {err}")))?;
+        trellis_wasm_log("burn_trellis wasm: preprocess done");
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime start");
         let runtime = self.load_stage_runtime(options)?;
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime done");
         let seed = options.seed.unwrap_or(42);
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides start");
         let noise_overrides = self.load_noise_overrides(options)?;
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides done");
         reset_runtime_transfer_stats();
+        trellis_wasm_log("burn_trellis wasm: staged runtime start");
         let stage_output = runtime
             .run_profiled_with_overrides(
                 &preprocess,
@@ -602,7 +622,74 @@ impl Trellis2Pipeline {
                 TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
             })?
             .0;
+        trellis_wasm_log("burn_trellis wasm: staged runtime done");
+        trellis_wasm_log("burn_trellis wasm: capture hook start");
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
+        trellis_wasm_log("burn_trellis wasm: capture hook done");
+        Ok(stage_output.mesh)
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "runtime-model"))]
+    pub async fn infer_mesh_from_image_async(
+        &self,
+        image: DynamicImage,
+        options: &TrellisRunOptions,
+    ) -> Result<Mesh, TrellisRuntimeError> {
+        trellis_wasm_log("burn_trellis wasm: preprocess start");
+        let preprocess = preprocess_image(image, PreprocessConfig::default())
+            .map_err(|err| TrellisRuntimeError::new(format!("preprocess failed: {err}")))?;
+        trellis_wasm_log("burn_trellis wasm: preprocess done");
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime start");
+        let runtime = self.load_stage_runtime(options)?;
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime done");
+        let seed = options.seed.unwrap_or(42);
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides start");
+        let mut noise_overrides = self.load_noise_overrides(options)?.unwrap_or_default();
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides done");
+        trellis_wasm_log("burn_trellis wasm: resolve conditioning async start");
+        let conditioning = runtime
+            .resolve_runtime_conditioning_async(&preprocess, Some(&noise_overrides))
+            .await
+            .map_err(|err| {
+                TrellisRuntimeError::new(format!(
+                    "trellis async conditioning extraction failed: {err}"
+                ))
+            })?;
+        noise_overrides.cond_512 = Some(conditioning.cond_512);
+        noise_overrides.neg_cond_512 = Some(conditioning.neg_cond_512);
+        noise_overrides.cond_1024 = conditioning.cond_1024;
+        noise_overrides.neg_cond_1024 = conditioning.neg_cond_1024;
+        trellis_wasm_log("burn_trellis wasm: resolve conditioning async done");
+        reset_runtime_transfer_stats();
+        trellis_wasm_log("burn_trellis wasm: staged runtime start");
+        let stage_output = runtime
+            .run_profiled_with_overrides_async(
+                &preprocess,
+                seed,
+                Some(&noise_overrides),
+                options.hook_output.is_some(),
+                TrellisStageRunConfig {
+                    max_sparse_coords: options.max_sparse_coords,
+                    max_num_tokens: options.quality.settings().max_num_tokens,
+                    target_faces: options.target_faces.filter(|limit| *limit > 0),
+                    pbr_texture_size: options.pbr_texture_size.filter(|size| *size > 0),
+                    compute_profile: options.compute_profile,
+                    decode_output_mode: options.decode_output_mode,
+                    runtime_stage_debug: options.runtime_stage_debug,
+                    runtime_attention_debug: options.runtime_attention_debug,
+                    runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
+                    runtime_stage_fence: options.runtime_stage_fence,
+                },
+            )
+            .await
+            .map_err(|err| {
+                TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
+            })?
+            .0;
+        trellis_wasm_log("burn_trellis wasm: staged runtime done");
+        trellis_wasm_log("burn_trellis wasm: capture hook start");
+        self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
+        trellis_wasm_log("burn_trellis wasm: capture hook done");
         Ok(stage_output.mesh)
     }
 
@@ -652,6 +739,18 @@ impl Trellis2Pipeline {
             cache.insert(cache_key, runtime.clone());
         }
         Ok(runtime)
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "runtime-model"))]
+    pub fn warm_runtime_component(
+        &self,
+        options: &TrellisRunOptions,
+        component_key: &str,
+    ) -> Result<(), TrellisRuntimeError> {
+        let runtime = self.load_stage_runtime(options)?;
+        runtime
+            .warm_runtime_component(component_key)
+            .map_err(TrellisRuntimeError::new)
     }
 
     fn pipeline_args(&self) -> Result<&TrellisPipelineArgs, TrellisRuntimeError> {
@@ -1887,13 +1986,6 @@ fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
         "1024" | "1024_single" | "1024_cascade" => 1024,
         "1536_cascade" => 1536,
         _ => 512,
-    }
-}
-
-fn remap_mesh_to_python_glb_frame(mesh: &mut Mesh) {
-    for vertex in mesh.vertices.iter_mut() {
-        let [x, y, z] = *vertex;
-        *vertex = [x, z, -y];
     }
 }
 

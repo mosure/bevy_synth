@@ -34,12 +34,16 @@ fn load_linear(
     }
 
     let weight = w_data;
+    let weight_fp16 = round_vec_to_f16(weight.as_slice());
+    let bias_fp16 = round_vec_to_f16(bias.as_slice());
 
     Ok(LinearLayer {
         in_channels,
         out_channels,
         weight,
         bias,
+        weight_fp16,
+        bias_fp16,
     })
 }
 
@@ -73,12 +77,16 @@ fn load_linear_dynamic(
     }
 
     let weight = w_data;
+    let weight_fp16 = round_vec_to_f16(weight.as_slice());
+    let bias_fp16 = round_vec_to_f16(bias.as_slice());
 
     Ok(LinearLayer {
         in_channels,
         out_channels,
         weight,
         bias,
+        weight_fp16,
+        bias_fp16,
     })
 }
 
@@ -155,19 +163,24 @@ fn load_sparse_conv(
         ));
     }
 
-    let flex_pack_config = FlexConvConfig {
-        in_channels,
-        out_channels,
-        kernel_d: kd,
-        kernel_h: kh,
-        kernel_w: kw,
-        in_channels_per_group,
-        out_channels_per_group,
-        groups,
-        axis_order: [0, 1, 2],
-        axis_sign: [1, 1, 1],
+    #[cfg(target_arch = "wasm32")]
+    let flex_packed_weight = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let flex_packed_weight = {
+        let flex_pack_config = FlexConvConfig {
+            in_channels,
+            out_channels,
+            kernel_d: kd,
+            kernel_h: kh,
+            kernel_w: kw,
+            in_channels_per_group,
+            out_channels_per_group,
+            groups,
+            axis_order: [0, 1, 2],
+            axis_sign: [1, 1, 1],
+        };
+        Some(pack_flex_weight(&flex_pack_config, weight.as_slice())?)
     };
-    let flex_packed_weight = Some(pack_flex_weight(&flex_pack_config, weight.as_slice())?);
 
     Ok(SparseConvLayer {
         in_channels,
@@ -178,10 +191,20 @@ fn load_sparse_conv(
         in_channels_per_group,
         out_channels_per_group,
         groups,
+        weight_fp16: round_vec_to_f16(weight.as_slice()),
+        bias_fp16: round_vec_to_f16(bias.as_slice()),
         weight,
         bias,
         flex_packed_weight,
     })
+}
+
+fn round_vec_to_f16(values: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .copied()
+        .map(|value| f16::from_f32(value).to_f32())
+        .collect()
 }
 
 fn load_vector(

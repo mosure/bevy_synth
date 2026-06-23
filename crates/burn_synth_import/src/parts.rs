@@ -53,6 +53,9 @@ pub struct BurnpackPartsReport {
 pub struct BurnpackPartIntegrity {
     pub actual_bytes: u64,
     pub required_bytes: u64,
+    pub metadata_end: u64,
+    pub aligned_data_start: u64,
+    pub inferred_data_start: u64,
     pub tensors: usize,
     pub trailing_padding_bytes: u64,
 }
@@ -461,6 +464,26 @@ fn pad_legacy_short_tail_burnpack_part(
     }
     let required_len = usize::try_from(integrity.required_bytes)
         .map_err(|_| "required burnpack part length exceeds usize".to_string())?;
+    if integrity.inferred_data_start == integrity.metadata_end
+        && integrity.aligned_data_start > integrity.metadata_end
+    {
+        let metadata_end = usize::try_from(integrity.metadata_end)
+            .map_err(|_| "burnpack metadata end exceeds usize".to_string())?;
+        let padding = usize::try_from(integrity.aligned_data_start - integrity.metadata_end)
+            .map_err(|_| "burnpack metadata alignment padding exceeds usize".to_string())?;
+        bytes.splice(
+            metadata_end..metadata_end,
+            std::iter::repeat_n(0u8, padding),
+        );
+        if bytes.len() != required_len {
+            return Err(format!(
+                "legacy burnpack part normalization produced {} bytes, expected {}",
+                bytes.len(),
+                required_len
+            ));
+        }
+        return Ok(());
+    }
     bytes.resize(required_len, 0);
     Ok(())
 }
@@ -493,7 +516,9 @@ fn validate_burnpack_part_integrity_reader<R: Read + Seek>(
         max_data_end = max_data_end.max(end);
     }
 
-    let required_bytes = aligned_data_section_start(metadata_size as usize)
+    let metadata_end = HEADER_SIZE as u64 + metadata_size as u64;
+    let aligned_data_start = aligned_data_section_start(metadata_size as usize);
+    let required_bytes = aligned_data_start
         .checked_add(max_data_end)
         .ok_or_else(|| {
             format!(
@@ -501,6 +526,7 @@ fn validate_burnpack_part_integrity_reader<R: Read + Seek>(
                 path.display()
             )
         })?;
+    let inferred_data_start = actual_bytes.saturating_sub(max_data_end);
     let trailing_padding_bytes = required_bytes.saturating_sub(actual_bytes);
     if trailing_padding_bytes > TENSOR_ALIGNMENT {
         return Err(format!(
@@ -515,6 +541,9 @@ fn validate_burnpack_part_integrity_reader<R: Read + Seek>(
     Ok(BurnpackPartIntegrity {
         actual_bytes,
         required_bytes,
+        metadata_end,
+        aligned_data_start,
+        inferred_data_start,
         tensors: metadata.tensors.len(),
         trailing_padding_bytes,
     })

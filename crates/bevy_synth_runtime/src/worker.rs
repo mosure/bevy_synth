@@ -428,7 +428,14 @@ fn app_args_to_wasm_preset(
         triposplat_num_gaussians: args.triposplat_num_gaussians,
         triposplat_erode_radius: args.triposplat_erode_radius,
         resolution: args.flash_min_resolution.max(2),
-        faces: args.target_faces.unwrap_or(0),
+        faces: if matches!(synthesis_model, "trellis") {
+            args.trellis_target_faces.unwrap_or(0)
+        } else {
+            args.target_faces.unwrap_or(0)
+        },
+        trellis_max_sparse_coords: args.trellis_max_sparse_coords.unwrap_or(0),
+        trellis_pbr_enabled: args.trellis_pbr_enabled,
+        trellis_pbr_texture_size: args.trellis_pbr_texture_size.unwrap_or(0),
         flash_octree_depth: args.flash_octree_depth.max(1),
         flash_num_chunks: args.flash_num_chunks.max(1),
         flash_mini_grid_num: args.flash_mini_grid_num.max(1),
@@ -444,7 +451,7 @@ fn app_args_to_wasm_preset(
 #[cfg(target_arch = "wasm32")]
 fn wasm_preset_key(preset: &WasmInferencePreset) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         preset.synthesis_model,
         preset.backend,
         preset.rmbg_model,
@@ -452,7 +459,8 @@ fn wasm_preset_key(preset: &WasmInferencePreset) -> String {
         preset.dino_backend,
         preset.weights_precision,
         preset.rmbg_weights_precision,
-        preset.seed
+        preset.seed,
+        preset.trellis_pbr_enabled
     )
 }
 

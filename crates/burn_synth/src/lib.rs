@@ -8,6 +8,7 @@ mod native_model_bootstrap;
 pub mod pipeline;
 #[cfg(feature = "runtime")]
 pub mod progress;
+pub mod quality;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 #[cfg(any(feature = "runtime", all(target_arch = "wasm32", feature = "wasm-api")))]

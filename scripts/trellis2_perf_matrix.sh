@@ -6,7 +6,7 @@ run_dir="${RUN_DIR:-tmp/runs/${run_id}}"
 input="${TRELLIS2_INPUT:-docs/output_chair_bg_removed.png}"
 quality="${TRELLIS2_QUALITY:-medium}"
 backend="${TRELLIS2_BACKEND:-wgpu}"
-compute_profile="${TRELLIS2_COMPUTE_PROFILE:-wgpu-fast-f16}"
+compute_profile="${TRELLIS2_COMPUTE_PROFILE:-reference-f32}"
 seed="${TRELLIS2_SEED:-42}"
 repeat="${TRELLIS2_REPEAT:-1}"
 strict="${TRELLIS2_STRICT:-1}"
@@ -38,6 +38,9 @@ render_burn_glb="${TRELLIS2_RENDER_BURN_GLB:-${run_dir}/burn_render/burn_ovoxel.
 render_actual_glb="${burn_glb}"
 if [[ "${render_burn_mode}" == "ovoxel-hook" ]]; then
   render_actual_glb="${render_burn_glb}"
+fi
+if [[ "${run_python}" == "1" && "${capture_reference_hook}" == "1" && -z "${reference_hook}" ]]; then
+  reference_hook="${run_dir}/python/reference_hook.safetensors"
 fi
 
 case "${quality}" in
@@ -117,7 +120,6 @@ if [[ "${run_python}" == "1" ]]; then
     exit 2
   fi
   if [[ "${capture_reference_hook}" == "1" ]]; then
-    reference_hook="${run_dir}/python/reference_hook.safetensors"
     reference_hook_args=()
     if [[ "${capture_row_noise}" != "1" ]]; then
       reference_hook_args+=(--skip-row-noise-capture)
@@ -316,7 +318,7 @@ strict = sys.argv[3] == "1"
 enforce_stage_ratios = sys.argv[4] == "1"
 
 def load_json(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
+    if not path.exists() or path.is_dir():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -365,9 +367,10 @@ def max_gpu_sample(path: Path) -> dict[str, Any]:
     return {"available": True, "samples": rows, "max_gpu_util_percent": max_util, "max_memory_mib": max_mem}
 
 config = load_json(run_dir / "config.json") or {}
-py_summary_path = Path(str(config.get("python_summary") or ""))
+py_summary_config = str(config.get("python_summary") or "")
+py_summary_path = Path(py_summary_config) if py_summary_config else None
 py_summary = load_json(run_dir / "python/artifacts/python_reference_summary.json")
-if py_summary is None and str(py_summary_path):
+if py_summary is None and py_summary_path is not None:
     py_summary = load_json(py_summary_path)
 burn_report = load_json(run_dir / "burn/report.json")
 render_burn_report = load_json(run_dir / "burn_render/report.json")
@@ -388,6 +391,38 @@ if render_status not in (None, 0):
     issues.append(f"render_psnr_status={render_status}")
 if config.get("render_psnr") == 1 and render_summary is None:
     issues.append("render_psnr missing")
+
+profile_name = str(config.get("compute_profile") or "")
+profile_class = {}
+if burn_report is not None:
+    profile_class = burn_report.get("compute_profile_class") or {}
+if not profile_class:
+    profile_class = {
+        "name": profile_name,
+        "parity_reference": profile_name == "reference-f32",
+        "fast_candidate": profile_name in {
+            "wgpu-fast-mixed-f16",
+            "wgpu-fast-f16-tail1-f32",
+            "wgpu-fast-f16-tail2-f32",
+            "wgpu-fast-f16-tail4-f32",
+            "wgpu-fast-f16-tail6-f32",
+        },
+        "diagnostic": profile_name in {
+            "stock-bf16-emulated",
+            "wgpu-fast-sparse-self-f16",
+            "wgpu-fast-sparse-cross-f16",
+            "wgpu-fast-f16",
+        },
+        "requires_render_or_hook_parity_gate": profile_name != "reference-f32",
+    }
+if (
+    strict
+    and profile_class.get("requires_render_or_hook_parity_gate")
+    and render_summary is None
+):
+    issues.append(
+        f"compute profile '{profile_class.get('name')}' requires render PSNR evidence in strict matrix mode"
+    )
 
 shape_checks: dict[str, dict[str, Any]] = {}
 if py_summary is not None and burn_report is not None:
@@ -429,10 +464,11 @@ if py_summary is not None and burn_report is not None:
         burn_timings = get_path(burn_report, "last", "timings_ms") or burn_timings
     burn_decode_ms = ms(burn_timings.get("decode"))
     burn_decode_pbr_ms = ms(burn_timings.get("decode_pbr")) or 0.0
+    burn_decode_pre_pbr_decimate_ms = ms(burn_timings.get("decode_pre_pbr_decimate")) or 0.0
     burn_decode_latent_ms = (
         None
         if burn_decode_ms is None
-        else max(0.0, burn_decode_ms - burn_decode_pbr_ms)
+        else max(0.0, burn_decode_ms - burn_decode_pbr_ms - burn_decode_pre_pbr_decimate_ms)
     )
     comparisons = {
         "preprocess": (ms(burn_timings.get("preprocess")), py_stage.get("preprocess")),
@@ -452,6 +488,7 @@ if py_summary is not None and burn_report is not None:
         "decode_shape": (ms(burn_timings.get("decode_shape_decoder")), py_stage.get("decode_shape")),
         "decode_tex": (ms(burn_timings.get("decode_tex_decoder")), py_stage.get("decode_tex")),
         "decode_latent_total": (burn_decode_latent_ms, py_stage.get("decode_latent_total")),
+        "decode_pre_pbr_decimate": (ms(burn_timings.get("decode_pre_pbr_decimate")), None),
         "decode_native_pbr": (ms(burn_timings.get("decode_pbr")), None),
         "decode_runtime_total": (burn_decode_ms, None),
         "total": (ms(burn_timings.get("total")), get_path(py_summary, "timing_seconds", "infer")),
@@ -474,13 +511,14 @@ summary = {
     "burn_status": burn_status,
     "burn_render_status": render_burn_status,
     "render_psnr_status": render_status,
+    "compute_profile_class": profile_class,
     "shape_checks": shape_checks,
     "stage_ratios": stage_ratios,
     "render_psnr": render_summary,
     "enforce_stage_ratios": enforce_stage_ratios,
     "gpu": max_gpu_sample(run_dir / "gpu_samples.csv"),
     "issues": issues,
-    "python_summary": str(py_summary_path if str(py_summary_path) else run_dir / "python/artifacts/python_reference_summary.json") if py_summary else None,
+    "python_summary": str(py_summary_path if py_summary_path is not None else run_dir / "python/artifacts/python_reference_summary.json") if py_summary else None,
     "burn_report": str(run_dir / "burn/report.json") if burn_report else None,
     "burn_render_report": str(run_dir / "burn_render/report.json") if render_burn_report else None,
     "render_psnr_report": str(run_dir / "render_psnr/render_psnr.json") if render_summary else None,
@@ -493,6 +531,7 @@ lines.append(f"- run_dir: `{run_dir}`")
 lines.append(f"- input: `{config.get('input')}`")
 lines.append(f"- quality: `{config.get('quality')}`")
 lines.append(f"- backend/profile: `{config.get('backend')}` / `{config.get('compute_profile')}`")
+lines.append(f"- profile_class: `{profile_class}`")
 lines.append("")
 lines.append("## Shape Checks")
 for name, row in shape_checks.items():

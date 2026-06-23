@@ -59,10 +59,28 @@ fn linear_forward(
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
+fn linear_matmul_wgpu(
+    input: Tensor<DefaultWgpuBackend, 2>,
+    weight: Tensor<DefaultWgpuBackend, 2>,
+    context: &str,
+) -> Tensor<DefaultWgpuBackend, 2> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        super::wgpu_safe_ops::matmul_2d_naive(input, weight, context)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = context;
+        input.matmul(weight)
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
 fn linear_forward_wgpu(
     context_gpu: &mut DecoderWgpuConvContext,
     input: Tensor<DefaultWgpuBackend, 2>,
     layer: &LinearLayer,
+    compute_fp16_weights: bool,
     context: &str,
 ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
     let op_start = Instant::now();
@@ -98,8 +116,8 @@ fn linear_forward_wgpu(
                     context, rows, in_channels, layer.out_channels
                 );
             }
-            let weight_t = context_gpu.linear_weight_tensor(layer);
-            let bias_t = context_gpu.linear_bias_tensor(layer);
+            let weight_t = context_gpu.linear_weight_tensor(layer, compute_fp16_weights);
+            let bias_t = context_gpu.linear_bias_tensor(layer, compute_fp16_weights);
             let output = linear_skinny_forward_wgpu(input.clone(), weight_t, bias_t)
                 .map_err(|err| format!("{context}: skinny linear kernel path failed: {err}"))?;
             decoder_wgpu_linear_parity_check(input, output.clone(), layer, context)?;
@@ -125,13 +143,15 @@ fn linear_forward_wgpu(
         // decoder path; proactively chunk very large row counts.
         let linear_chunk_rows_cap = 16_384usize;
 
-        let weight_t = context_gpu.linear_weight_tensor(layer).swap_dims(0, 1);
+        let weight_t = context_gpu
+            .linear_weight_tensor(layer, compute_fp16_weights)
+            .swap_dims(0, 1);
         let bias_t = context_gpu
-            .linear_bias_tensor(layer)
+            .linear_bias_tensor(layer, compute_fp16_weights)
             .reshape([1, layer.out_channels]);
 
         if output_bytes <= max_output_bytes && rows <= linear_chunk_rows_cap {
-            let output = input.clone().matmul(weight_t).add(bias_t);
+            let output = linear_matmul_wgpu(input.clone(), weight_t, context).add(bias_t);
             decoder_wgpu_linear_parity_check(input, output.clone(), layer, context)?;
             return Ok(output);
         }
@@ -170,7 +190,8 @@ fn linear_forward_wgpu(
             chunk_idx += 1;
             let chunk_start = Instant::now();
             let input_chunk = input.clone().slice([start..end, 0..in_channels]);
-            let output_chunk = input_chunk.matmul(weight_t.clone()).add(bias_t.clone());
+            let output_chunk =
+                linear_matmul_wgpu(input_chunk, weight_t.clone(), context).add(bias_t.clone());
             if decoder_conv_debug_enabled() {
                 let chunk_ms = chunk_start.elapsed().as_secs_f64() * 1000.0;
                 eprintln!(
@@ -427,6 +448,7 @@ fn convnext_block_mlp_forward_wgpu(
             context_gpu,
             input_chunk,
             &block.mlp_0,
+            compute_fp16,
             format!("stage {stage_idx} block {block_idx} mlp_0(wgpu_math chunk[{start}:{end}])")
                 .as_str(),
         )?;
@@ -445,6 +467,7 @@ fn convnext_block_mlp_forward_wgpu(
             context_gpu,
             hidden_chunk,
             &block.mlp_2,
+            compute_fp16,
             format!("stage {stage_idx} block {block_idx} mlp_2(wgpu_math chunk[{start}:{end}])")
                 .as_str(),
         )?;
@@ -480,12 +503,42 @@ fn tensor_to_vec_f32(
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
+async fn tensor_to_vec_f32_async(
+    tensor: Tensor<DefaultWgpuBackend, 2>,
+    context: &str,
+) -> Result<Vec<f32>, String> {
+    let op_start = Instant::now();
+    let result =
+        crate::runtime_model::types::extraction::tensor_f32_to_vec_async(tensor, context).await;
+    telemetry_record_op_duration(context, op_start.elapsed().as_secs_f64() * 1000.0);
+    if let Ok(values) = result.as_ref() {
+        telemetry_record_readback(values.len());
+    }
+    result
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
 fn tensor_to_vec_i32(
     tensor: Tensor<DefaultWgpuBackend, 2, Int>,
     context: &str,
 ) -> Result<Vec<i32>, String> {
     let op_start = Instant::now();
     let result = crate::runtime_model::types::extraction::tensor_i32_to_vec(tensor, context);
+    telemetry_record_op_duration(context, op_start.elapsed().as_secs_f64() * 1000.0);
+    if let Ok(values) = result.as_ref() {
+        telemetry_record_readback(values.len());
+    }
+    result
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+async fn tensor_to_vec_i32_async(
+    tensor: Tensor<DefaultWgpuBackend, 2, Int>,
+    context: &str,
+) -> Result<Vec<i32>, String> {
+    let op_start = Instant::now();
+    let result =
+        crate::runtime_model::types::extraction::tensor_i32_to_vec_async(tensor, context).await;
     telemetry_record_op_duration(context, op_start.elapsed().as_secs_f64() * 1000.0);
     if let Ok(values) = result.as_ref() {
         telemetry_record_readback(values.len());
@@ -505,6 +558,43 @@ fn tensor_to_coords_u32(
         ));
     }
     let flat = tensor_to_vec_i32(tensor, context)?;
+    if flat.len() != rows.saturating_mul(4) {
+        return Err(format!(
+            "{context}: coord tensor length mismatch: len={} expected={}",
+            flat.len(),
+            rows.saturating_mul(4)
+        ));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        let base = row_idx.saturating_mul(4);
+        let to_u32 = |value: i32| -> Result<u32, String> {
+            u32::try_from(value).map_err(|_| {
+                format!("{context}: negative coordinate value {value} at row {row_idx}")
+            })
+        };
+        out.push([
+            to_u32(flat[base])?,
+            to_u32(flat[base + 1])?,
+            to_u32(flat[base + 2])?,
+            to_u32(flat[base + 3])?,
+        ]);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+async fn tensor_to_coords_u32_async(
+    tensor: Tensor<DefaultWgpuBackend, 2, Int>,
+    context: &str,
+) -> Result<Vec<[u32; 4]>, String> {
+    let [rows, cols] = tensor.dims();
+    if cols != 4 {
+        return Err(format!(
+            "{context}: coord tensor must have 4 columns, got {cols}"
+        ));
+    }
+    let flat = tensor_to_vec_i32_async(tensor, context).await?;
     if flat.len() != rows.saturating_mul(4) {
         return Err(format!(
             "{context}: coord tensor length mismatch: len={} expected={}",
@@ -553,6 +643,30 @@ fn coords_tensor_from_u32_slice(
         device,
     )
     .reshape([rows, 4]))
+}
+
+#[cfg(all(feature = "runtime-model-wgpu", target_arch = "wasm32"))]
+fn keep_indices_tensor_from_parent_index_host(
+    parent_indices: &[i32],
+    start_i32: i32,
+    end_i32: i32,
+    device: &WgpuDevice,
+    context: &str,
+) -> Result<Tensor<DefaultWgpuBackend, 1, Int>, String> {
+    let mut keep = Vec::<i32>::new();
+    for (row_idx, parent_idx) in parent_indices.iter().copied().enumerate() {
+        if parent_idx >= start_i32 && parent_idx <= end_i32 {
+            let row_idx = i32::try_from(row_idx).map_err(|_| {
+                format!("{context}: keep-index row exceeds i32 range ({row_idx})")
+            })?;
+            keep.push(row_idx);
+        }
+    }
+    let rows = keep.len();
+    Ok(Tensor::<DefaultWgpuBackend, 1, Int>::from_data(
+        TensorData::new(keep, [rows]),
+        device,
+    ))
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -773,6 +887,16 @@ fn subdivision_active_indices_wgpu(
     enforce_non_empty: bool,
     runtime_config: &DecoderRuntimeConfig,
 ) -> Result<Tensor<DefaultWgpuBackend, 2, Int>, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (logits_t, enforce_non_empty, runtime_config);
+        return Err(
+            "decoder sync subdivision active-index extraction is unsupported on wasm; use subdivision_active_indices_wgpu_async"
+                .to_string(),
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     if enforce_non_empty {
         return Err(
             "decoder subdivision enforce_non_empty is unsupported on canonical device path"
@@ -797,6 +921,75 @@ fn subdivision_active_indices_wgpu(
             .reshape([1, 8]);
     let mask_t = logits_t.sub(threshold_t).greater_elem(0.0);
     Ok(mask_t.argwhere())
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+async fn subdivision_active_indices_wgpu_async(
+    logits_t: Tensor<DefaultWgpuBackend, 2>,
+    enforce_non_empty: bool,
+    runtime_config: &DecoderRuntimeConfig,
+) -> Result<Tensor<DefaultWgpuBackend, 2, Int>, String> {
+    if enforce_non_empty {
+        return Err(
+            "decoder subdivision enforce_non_empty is unsupported on canonical device path"
+                .to_string(),
+        );
+    }
+    let [rows, cols] = logits_t.dims();
+    if cols != 8 {
+        return Err(format!(
+            "decoder subdivision logits tensor must have 8 columns, got {cols}"
+        ));
+    }
+    if let Some(limit) = decoder_max_children_per_parent(rows) {
+        return Err(format!(
+            "decoder subdivision child cap ({limit}) is unsupported on canonical device path"
+        ));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let device = logits_t.device();
+        let child_thresholds = decoder_subdivision_child_thresholds(runtime_config);
+        let logits = tensor_to_vec_f32_async(
+            logits_t,
+            "decoder subdivision active-index async logits readback",
+        )
+        .await?;
+        let expected = rows.saturating_mul(cols);
+        if logits.len() != expected {
+            return Err(format!(
+                "decoder subdivision logits readback length mismatch: len={} expected={expected}",
+                logits.len()
+            ));
+        }
+        let mut active = Vec::<i32>::new();
+        for row_idx in 0..rows {
+            let row_base = row_idx * cols;
+            for child_idx in 0..cols {
+                if logits[row_base + child_idx] > child_thresholds[child_idx] {
+                    active.push(row_idx as i32);
+                    active.push(child_idx as i32);
+                }
+            }
+        }
+        let active_rows = active.len() / 2;
+        return Ok(Tensor::<DefaultWgpuBackend, 1, Int>::from_data(
+            TensorData::new(active, [active_rows.saturating_mul(2)]),
+            &device,
+        )
+        .reshape([active_rows, 2]));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+    let device = logits_t.device();
+    let child_thresholds = decoder_subdivision_child_thresholds(runtime_config);
+    let threshold_t =
+        Tensor::<DefaultWgpuBackend, 1>::from_floats(child_thresholds.as_slice(), &device)
+            .reshape([1, 8]);
+    let mask_t = logits_t.sub(threshold_t).greater_elem(0.0);
+    Ok(mask_t.argwhere_async().await)
+    }
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -934,6 +1127,7 @@ fn convnext_blocks_forward_wgpu_tensor(
             &config,
             &block.conv,
             state_t,
+            compute_fp16,
             format!("stage {stage_idx} block {block_idx} conv(wgpu_math)").as_str(),
             rows,
             kernel_rows,
@@ -1672,6 +1866,13 @@ fn decoder_wgpu_use_im2col_matmul(
     rows: usize,
     kernel_rows: usize,
 ) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (config, rows, kernel_rows);
+        return false;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     if config.groups != 1
         || config.in_channels_per_group != config.in_channels
         || config.out_channels_per_group != config.out_channels
@@ -1694,6 +1895,7 @@ fn decoder_wgpu_use_im2col_matmul(
     };
     let im2col_bytes = im2col_elements.saturating_mul(core::mem::size_of::<f32>());
     im2col_bytes <= decoder_wgpu_im2col_max_bytes()
+    }
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -1738,6 +1940,9 @@ fn decoder_wgpu_chunk_rows(rows: usize, bytes_per_row: usize, max_output_bytes: 
         return rows;
     }
     let by_bytes = (max_output_bytes / bytes_per_row).max(1).min(rows);
+    if by_bytes == rows {
+        return rows;
+    }
     let aligned = by_bytes - (by_bytes % 64);
     if aligned > 0 { aligned } else { by_bytes }
 }
@@ -2304,4 +2509,19 @@ fn spatial_shape_from_coords(coords: &[[u32; 4]]) -> [u32; 3] {
         max_y.saturating_add(1),
         max_z.saturating_add(1),
     ]
+}
+
+#[cfg(all(test, feature = "runtime-model-wgpu"))]
+mod sparse_decoder_wgpu_ops_tests {
+    use super::decoder_wgpu_chunk_rows;
+
+    #[test]
+    fn decoder_wgpu_chunk_rows_keeps_exact_fit_without_tail_chunk() {
+        assert_eq!(decoder_wgpu_chunk_rows(11_242, 48_000, 11_242 * 48_000), 11_242);
+    }
+
+    #[test]
+    fn decoder_wgpu_chunk_rows_aligns_only_when_byte_cap_forces_chunking() {
+        assert_eq!(decoder_wgpu_chunk_rows(11_242, 48_000, 11_200 * 48_000), 11_200);
+    }
 }

@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_burnpack_or_parts};
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
-#[cfg(feature = "runtime-model-wgpu")]
 use crate::runtime_model::runtime_config::runtime_model_sparse_decoder_conv_f16_enabled;
 use crate::time::Instant;
 #[cfg(feature = "runtime-model-wgpu")]
@@ -18,6 +17,8 @@ use burn::tensor::activation::sigmoid;
 use burn::tensor::{Int, Tensor};
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::kernel_rows;
+#[cfg(not(target_arch = "wasm32"))]
+use burn_flex_gmm::pack_flex_weight;
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::wgpu::{
     DefaultWgpuBackend, SparseWgpuForwardConfig, SparseWgpuKernelVariant,
@@ -29,7 +30,7 @@ use burn_flex_gmm::wgpu::{
 };
 use burn_flex_gmm::{
     SparseSubmConvConfig as FlexConvConfig, SparseSubmConvWeights, build_neighbor_rows,
-    pack_flex_weight, sparse_subm_conv_forward_flex_precomputed,
+    sparse_subm_conv_forward_flex_precomputed,
 };
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_wgpu::WgpuDevice;
@@ -44,6 +45,16 @@ const F_LAYER_NORM_EPS: f32 = 1.0e-5;
 const DECODER_NEIGHBOR_CACHE_MAX: usize = 128;
 #[cfg(feature = "runtime-model-wgpu")]
 const DECODER_WGPU_TENSOR_CACHE_MAX: usize = 128;
+
+#[cfg(target_arch = "wasm32")]
+fn decoder_wasm_log(message: &str) {
+    if option_env!("TRELLIS2_WASM_DECODER_TRACE").is_some() {
+        web_sys::console::log_1(&message.into());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decoder_wasm_log(_message: &str) {}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecoderConvBlockTelemetry {
@@ -199,6 +210,7 @@ impl DecoderRuntimeKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SparseSubdivisionLogits {
+    #[allow(dead_code)]
     pub spatial_shape: [u32; 3],
     pub coords: Vec<[u32; 4]>,
     pub logits: Vec<f32>,
@@ -342,6 +354,7 @@ impl SparseSubdivisionLogits {
         })
     }
 
+    #[allow(dead_code)]
     pub fn coords_host(&self, context: &str) -> Result<Vec<[u32; 4]>, String> {
         if !self.coords.is_empty() {
             return Ok(self.coords.clone());
@@ -444,6 +457,19 @@ impl SparseDecodeResult {
         ))
     }
 
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub async fn coords_host_async(&self, context: &str) -> Result<Vec<[u32; 4]>, String> {
+        if let Some(coords) = self.coords.as_ref() {
+            return Ok(coords.clone());
+        }
+        if let Some(coords_t) = self.coords_tensor.as_ref() {
+            return tensor_to_coords_u32_async(coords_t.clone(), context).await;
+        }
+        Err(format!(
+            "{context}: sparse decode result has no host coords and no device coord tensor"
+        ))
+    }
+
     pub fn feats_host(&self, context: &str) -> Result<Vec<f32>, String> {
         if let Some(feats) = self.feats.as_ref() {
             return Ok(feats.clone());
@@ -451,6 +477,19 @@ impl SparseDecodeResult {
         #[cfg(feature = "runtime-model-wgpu")]
         if let Some(feats_t) = self.feats_tensor.as_ref() {
             return tensor_to_vec_f32(feats_t.clone(), context);
+        }
+        Err(format!(
+            "{context}: sparse decode result has no host feats and no device feat tensor"
+        ))
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub async fn feats_host_async(&self, context: &str) -> Result<Vec<f32>, String> {
+        if let Some(feats) = self.feats.as_ref() {
+            return Ok(feats.clone());
+        }
+        if let Some(feats_t) = self.feats_tensor.as_ref() {
+            return tensor_to_vec_f32_async(feats_t.clone(), context).await;
         }
         Err(format!(
             "{context}: sparse decode result has no host feats and no device feat tensor"
@@ -504,6 +543,7 @@ impl SparseUpsampledCoords {
         0
     }
 
+    #[allow(dead_code)]
     pub fn coords_host(&self, context: &str) -> Result<Vec<[u32; 4]>, String> {
         if let Some(coords) = self.coords.as_ref() {
             return Ok(coords.clone());
@@ -511,6 +551,19 @@ impl SparseUpsampledCoords {
         #[cfg(feature = "runtime-model-wgpu")]
         if let Some(coords_t) = self.coords_tensor.as_ref() {
             return tensor_to_coords_u32(coords_t.clone(), context);
+        }
+        Err(format!(
+            "{context}: sparse upsample result has no host coords and no device coord tensor"
+        ))
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub async fn coords_host_async(&self, context: &str) -> Result<Vec<[u32; 4]>, String> {
+        if let Some(coords) = self.coords.as_ref() {
+            return Ok(coords.clone());
+        }
+        if let Some(coords_t) = self.coords_tensor.as_ref() {
+            return tensor_to_coords_u32_async(coords_t.clone(), context).await;
         }
         Err(format!(
             "{context}: sparse upsample result has no host coords and no device coord tensor"
@@ -573,6 +626,8 @@ struct LinearLayer {
     // Row-major [out, in] as stored by PyTorch linear layers.
     weight: Vec<f32>,
     bias: Vec<f32>,
+    weight_fp16: Vec<f32>,
+    bias_fp16: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +643,8 @@ struct SparseConvLayer {
     // Row-major [out, kd, kh, kw, in_per_group]
     weight: Vec<f32>,
     bias: Vec<f32>,
+    weight_fp16: Vec<f32>,
+    bias_fp16: Vec<f32>,
     flex_packed_weight: Option<Vec<f32>>,
 }
 
@@ -697,17 +754,17 @@ impl DecoderWgpuConvContext {
         })
     }
 
-    fn layer_key(layer: &SparseConvLayer) -> LayerTensorCacheKey {
+    fn layer_key_from(weight: &[f32], bias: &[f32]) -> LayerTensorCacheKey {
         LayerTensorCacheKey {
-            weight_ptr: layer.weight.as_ptr() as usize,
-            bias_ptr: layer.bias.as_ptr() as usize,
+            weight_ptr: weight.as_ptr() as usize,
+            bias_ptr: bias.as_ptr() as usize,
         }
     }
 
-    fn linear_key(layer: &LinearLayer) -> LinearTensorCacheKey {
+    fn linear_key_from(weight: &[f32], bias: &[f32], layer: &LinearLayer) -> LinearTensorCacheKey {
         LinearTensorCacheKey {
-            weight_ptr: layer.weight.as_ptr() as usize,
-            bias_ptr: layer.bias.as_ptr() as usize,
+            weight_ptr: weight.as_ptr() as usize,
+            bias_ptr: bias.as_ptr() as usize,
             in_channels: layer.in_channels,
             out_channels: layer.out_channels,
         }
@@ -720,13 +777,36 @@ impl DecoderWgpuConvContext {
         }
     }
 
-    fn weight_tensor(&mut self, layer: &SparseConvLayer) -> Tensor<DefaultWgpuBackend, 5> {
+    fn sparse_layer_weight_bias<'a>(
+        layer: &'a SparseConvLayer,
+        compute_fp16: bool,
+    ) -> (&'a [f32], &'a [f32]) {
+        if compute_fp16 {
+            (layer.weight_fp16.as_slice(), layer.bias_fp16.as_slice())
+        } else {
+            (layer.weight.as_slice(), layer.bias.as_slice())
+        }
+    }
+
+    fn linear_layer_weight_bias<'a>(
+        layer: &'a LinearLayer,
+        compute_fp16: bool,
+    ) -> (&'a [f32], &'a [f32]) {
+        if compute_fp16 {
+            (layer.weight_fp16.as_slice(), layer.bias_fp16.as_slice())
+        } else {
+            (layer.weight.as_slice(), layer.bias.as_slice())
+        }
+    }
+
+    fn weight_tensor(
+        &mut self,
+        layer: &SparseConvLayer,
+        compute_fp16: bool,
+    ) -> Tensor<DefaultWgpuBackend, 5> {
+        let (weight, bias) = Self::sparse_layer_weight_bias(layer, compute_fp16);
         if !decoder_wgpu_use_tensor_cache() {
-            return Tensor::<DefaultWgpuBackend, 1>::from_floats(
-                layer.weight.as_slice(),
-                &self.device,
-            )
-            .reshape([
+            return Tensor::<DefaultWgpuBackend, 1>::from_floats(weight, &self.device).reshape([
                 layer.out_channels,
                 layer.kernel_d,
                 layer.kernel_h,
@@ -734,51 +814,52 @@ impl DecoderWgpuConvContext {
                 layer.in_channels_per_group,
             ]);
         }
-        let key = Self::layer_key(layer);
+        let key = Self::layer_key_from(weight, bias);
         if let Some(tensor) = self.weight_tensors.get(&key) {
             return tensor.clone();
         }
         trim_hashmap(&mut self.weight_tensors, decoder_wgpu_tensor_cache_max());
-        let tensor =
-            Tensor::<DefaultWgpuBackend, 1>::from_floats(layer.weight.as_slice(), &self.device)
-                .reshape([
-                    layer.out_channels,
-                    layer.kernel_d,
-                    layer.kernel_h,
-                    layer.kernel_w,
-                    layer.in_channels_per_group,
-                ]);
+        let tensor = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight, &self.device).reshape([
+            layer.out_channels,
+            layer.kernel_d,
+            layer.kernel_h,
+            layer.kernel_w,
+            layer.in_channels_per_group,
+        ]);
         self.weight_tensors.insert(key, tensor.clone());
         tensor
     }
 
-    fn bias_tensor(&mut self, layer: &SparseConvLayer) -> Tensor<DefaultWgpuBackend, 1> {
+    fn bias_tensor(
+        &mut self,
+        layer: &SparseConvLayer,
+        compute_fp16: bool,
+    ) -> Tensor<DefaultWgpuBackend, 1> {
+        let (weight, bias) = Self::sparse_layer_weight_bias(layer, compute_fp16);
         if !decoder_wgpu_use_tensor_cache() {
-            return Tensor::<DefaultWgpuBackend, 1>::from_floats(
-                layer.bias.as_slice(),
-                &self.device,
-            );
+            return Tensor::<DefaultWgpuBackend, 1>::from_floats(bias, &self.device);
         }
-        let key = Self::layer_key(layer);
+        let key = Self::layer_key_from(weight, bias);
         if let Some(tensor) = self.bias_tensors.get(&key) {
             return tensor.clone();
         }
         trim_hashmap(&mut self.bias_tensors, decoder_wgpu_tensor_cache_max());
-        let tensor =
-            Tensor::<DefaultWgpuBackend, 1>::from_floats(layer.bias.as_slice(), &self.device);
+        let tensor = Tensor::<DefaultWgpuBackend, 1>::from_floats(bias, &self.device);
         self.bias_tensors.insert(key, tensor.clone());
         tensor
     }
 
-    fn linear_weight_tensor(&mut self, layer: &LinearLayer) -> Tensor<DefaultWgpuBackend, 2> {
+    fn linear_weight_tensor(
+        &mut self,
+        layer: &LinearLayer,
+        compute_fp16: bool,
+    ) -> Tensor<DefaultWgpuBackend, 2> {
+        let (weight, bias) = Self::linear_layer_weight_bias(layer, compute_fp16);
         if !decoder_wgpu_use_tensor_cache() {
-            return Tensor::<DefaultWgpuBackend, 1>::from_floats(
-                layer.weight.as_slice(),
-                &self.device,
-            )
-            .reshape([layer.out_channels, layer.in_channels]);
+            return Tensor::<DefaultWgpuBackend, 1>::from_floats(weight, &self.device)
+                .reshape([layer.out_channels, layer.in_channels]);
         }
-        let key = Self::linear_key(layer);
+        let key = Self::linear_key_from(weight, bias, layer);
         if let Some(tensor) = self.linear_weight_tensors.get(&key) {
             return tensor.clone();
         }
@@ -786,21 +867,22 @@ impl DecoderWgpuConvContext {
             &mut self.linear_weight_tensors,
             decoder_wgpu_tensor_cache_max(),
         );
-        let tensor =
-            Tensor::<DefaultWgpuBackend, 1>::from_floats(layer.weight.as_slice(), &self.device)
-                .reshape([layer.out_channels, layer.in_channels]);
+        let tensor = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight, &self.device)
+            .reshape([layer.out_channels, layer.in_channels]);
         self.linear_weight_tensors.insert(key, tensor.clone());
         tensor
     }
 
-    fn linear_bias_tensor(&mut self, layer: &LinearLayer) -> Tensor<DefaultWgpuBackend, 1> {
+    fn linear_bias_tensor(
+        &mut self,
+        layer: &LinearLayer,
+        compute_fp16: bool,
+    ) -> Tensor<DefaultWgpuBackend, 1> {
+        let (weight, bias) = Self::linear_layer_weight_bias(layer, compute_fp16);
         if !decoder_wgpu_use_tensor_cache() {
-            return Tensor::<DefaultWgpuBackend, 1>::from_floats(
-                layer.bias.as_slice(),
-                &self.device,
-            );
+            return Tensor::<DefaultWgpuBackend, 1>::from_floats(bias, &self.device);
         }
-        let key = Self::linear_key(layer);
+        let key = Self::linear_key_from(weight, bias, layer);
         if let Some(tensor) = self.linear_bias_tensors.get(&key) {
             return tensor.clone();
         }
@@ -808,8 +890,7 @@ impl DecoderWgpuConvContext {
             &mut self.linear_bias_tensors,
             decoder_wgpu_tensor_cache_max(),
         );
-        let tensor =
-            Tensor::<DefaultWgpuBackend, 1>::from_floats(layer.bias.as_slice(), &self.device);
+        let tensor = Tensor::<DefaultWgpuBackend, 1>::from_floats(bias, &self.device);
         self.linear_bias_tensors.insert(key, tensor.clone());
         tensor
     }
@@ -916,6 +997,14 @@ impl DecoderWgpuConvContext {
             kernel_rows,
             neighbor_rows,
         )?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = output;
+            return Err(format!(
+                "{context}: synchronous wgpu sparse conv output readback is unsupported on wasm"
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         output
             .into_data()
             .convert::<f32>()
@@ -954,8 +1043,16 @@ impl DecoderWgpuConvContext {
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input, &self.device)
             .reshape([rows, config.in_channels]);
         let coords_t = coords_tensor_from_u32_slice(coords, &self.device)?;
-        let output =
-            self.forward_with_coords_tensor_device(config, layer, input_t, context, coords_t)?;
+        let output = self
+            .forward_with_coords_tensor_device(config, layer, input_t, false, context, coords_t)?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = output;
+            return Err(format!(
+                "{context}: synchronous wgpu sparse conv coord output readback is unsupported on wasm"
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         output
             .into_data()
             .convert::<f32>()
@@ -968,6 +1065,7 @@ impl DecoderWgpuConvContext {
         config: &FlexConvConfig,
         layer: &SparseConvLayer,
         input_t: Tensor<DefaultWgpuBackend, 2>,
+        compute_fp16_weights: bool,
         context: &str,
         coords_t: Tensor<DefaultWgpuBackend, 2, Int>,
     ) -> Result<Tensor<DefaultWgpuBackend, 2>, String> {
@@ -1002,19 +1100,36 @@ impl DecoderWgpuConvContext {
         // Early-aborting here prevents valid chunked execution during decode upsample stages.
         let kernel_rows = kernel_rows(config)?;
         let neighbor_start = Instant::now();
+        decoder_wasm_log(
+            format!("burn_trellis: wgpu sparse conv '{context}' neighbor-build begin rows={rows} krows={kernel_rows}")
+                .as_str(),
+        );
         let neighbor_t = neighbor_rows_tensor_from_coords_tensor(config, coords_t.clone())?;
+        decoder_wasm_log(
+            format!("burn_trellis: wgpu sparse conv '{context}' neighbor-build complete rows={rows} krows={kernel_rows}")
+                .as_str(),
+        );
         decoder_wgpu_neighbor_parity_check(config, coords_t, neighbor_t.clone(), context)?;
         let neighbor_ms = neighbor_start.elapsed().as_secs_f64() * 1000.0;
         let conv_start = Instant::now();
+        decoder_wasm_log(
+            format!("burn_trellis: wgpu sparse conv '{context}' dispatch begin rows={rows} krows={kernel_rows} in_channels={} out_channels={}", config.in_channels, config.out_channels)
+                .as_str(),
+        );
         let output = self.forward_with_neighbor_tensor_tensor(
             config,
             layer,
             input_t,
+            compute_fp16_weights,
             context,
             rows,
             kernel_rows,
             neighbor_t,
         )?;
+        decoder_wasm_log(
+            format!("burn_trellis: wgpu sparse conv '{context}' dispatch complete rows={rows}")
+                .as_str(),
+        );
         let conv_ms = conv_start.elapsed().as_secs_f64() * 1000.0;
         let total_ms = call_start.elapsed().as_secs_f64() * 1000.0;
         if decoder_conv_debug_enabled() {
@@ -1043,11 +1158,20 @@ impl DecoderWgpuConvContext {
             config,
             layer,
             input_t,
+            false,
             context,
             rows,
             kernel_rows,
             neighbor_t,
         )?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = output;
+            return Err(format!(
+                "{context}: synchronous wgpu sparse conv neighbor output readback is unsupported on wasm"
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         output
             .into_data()
             .convert::<f32>()
@@ -1061,6 +1185,7 @@ impl DecoderWgpuConvContext {
         config: &FlexConvConfig,
         layer: &SparseConvLayer,
         input_t: Tensor<DefaultWgpuBackend, 2>,
+        compute_fp16_weights: bool,
         context: &str,
         rows: usize,
         kernel_rows: usize,
@@ -1078,7 +1203,8 @@ impl DecoderWgpuConvContext {
                 neighbor_kernel_rows, kernel_rows
             ));
         }
-        let input_elements = rows
+        let [input_rows, input_channels] = input_t.dims();
+        let input_elements = input_rows
             .checked_mul(config.in_channels)
             .ok_or_else(|| "wgpu sparse conv input-element overflow".to_string())?;
         let input_bytes = input_elements
@@ -1091,10 +1217,9 @@ impl DecoderWgpuConvContext {
                 input_bytes, max_input_bytes
             ));
         }
-        let [input_rows, input_channels] = input_t.dims();
-        if input_rows != rows || input_channels != config.in_channels {
+        if input_rows < rows || input_channels != config.in_channels {
             return Err(format!(
-                "wgpu sparse conv tensor dims mismatch: got=[{},{}] expected=[{},{}]",
+                "wgpu sparse conv tensor dims mismatch: got=[{},{}] expected at least [{},{}]",
                 input_rows, input_channels, rows, config.in_channels
             ));
         }
@@ -1103,6 +1228,7 @@ impl DecoderWgpuConvContext {
                 config,
                 layer,
                 input_t,
+                compute_fp16_weights,
                 context,
                 rows,
                 kernel_rows,
@@ -1111,8 +1237,8 @@ impl DecoderWgpuConvContext {
                 chunk_out_channels,
             );
         }
-        let weight_t = self.weight_tensor(layer);
-        let bias_t = self.bias_tensor(layer);
+        let weight_t = self.weight_tensor(layer, compute_fp16_weights);
+        let bias_t = self.bias_tensor(layer, compute_fp16_weights);
         self.forward_with_neighbor_tensor_tensor_with_weight_bias(
             config,
             input_t,
@@ -1216,6 +1342,7 @@ impl DecoderWgpuConvContext {
     fn chunk_weight_bias_tensors_single_group(
         &self,
         layer: &SparseConvLayer,
+        compute_fp16_weights: bool,
         out_start: usize,
         out_end: usize,
     ) -> Result<(Tensor<DefaultWgpuBackend, 5>, Tensor<DefaultWgpuBackend, 1>), String> {
@@ -1238,12 +1365,20 @@ impl DecoderWgpuConvContext {
         let weight_end = out_end
             .checked_mul(per_output_values)
             .ok_or_else(|| "wgpu sparse conv weight slice end overflow".to_string())?;
-        let weight_slice = layer
-            .weight
+        let weight = if compute_fp16_weights {
+            layer.weight_fp16.as_slice()
+        } else {
+            layer.weight.as_slice()
+        };
+        let bias = if compute_fp16_weights {
+            layer.bias_fp16.as_slice()
+        } else {
+            layer.bias.as_slice()
+        };
+        let weight_slice = weight
             .get(weight_start..weight_end)
             .ok_or_else(|| "wgpu sparse conv weight slice out of bounds".to_string())?;
-        let bias_slice = layer
-            .bias
+        let bias_slice = bias
             .get(out_start..out_end)
             .ok_or_else(|| "wgpu sparse conv bias slice out of bounds".to_string())?;
 
@@ -1266,6 +1401,7 @@ impl DecoderWgpuConvContext {
         config: &FlexConvConfig,
         layer: &SparseConvLayer,
         input_t: Tensor<DefaultWgpuBackend, 2>,
+        compute_fp16_weights: bool,
         context: &str,
         rows: usize,
         kernel_rows: usize,
@@ -1297,8 +1433,12 @@ impl DecoderWgpuConvContext {
                 axis_order: config.axis_order,
                 axis_sign: config.axis_sign,
             };
-            let (weight_t, bias_t) =
-                self.chunk_weight_bias_tensors_single_group(layer, out_start, out_end)?;
+            let (weight_t, bias_t) = self.chunk_weight_bias_tensors_single_group(
+                layer,
+                compute_fp16_weights,
+                out_start,
+                out_end,
+            )?;
             let chunk_context = format!("{context} oc_chunk[{out_start}:{out_end})");
             let chunk_output = self.forward_with_neighbor_tensor_tensor_with_weight_bias(
                 &chunk_config,
@@ -1565,8 +1705,8 @@ impl DecoderWgpuConvContext {
             );
         }
 
-        let weight_t = self.weight_tensor(layer);
-        let bias_t = self.bias_tensor(layer);
+        let weight_t = self.weight_tensor(layer, false);
+        let bias_t = self.bias_tensor(layer, false);
         let forward_cfg =
             decoder_wgpu_forward_config_for_call(config, rows, output_bytes, max_output_bytes);
 

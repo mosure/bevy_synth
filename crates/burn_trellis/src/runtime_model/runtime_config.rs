@@ -8,6 +8,7 @@ pub struct RuntimeModelDebugConfig {
     pub sparse_flow_module_attention_f16: bool,
     pub sparse_flow_linear_f16: bool,
     pub sparse_flow_torso_f16: bool,
+    pub sparse_flow_stock_bf16_emulation: bool,
     pub sparse_flow_coord_rope_kernel: bool,
     pub sparse_decoder_conv_f16: bool,
 }
@@ -23,6 +24,7 @@ static SPARSE_FLOW_CURRENT_STEP: AtomicUsize = AtomicUsize::new(usize::MAX);
 static SPARSE_FLOW_CURRENT_STEP_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SPARSE_FLOW_LINEAR_F16: AtomicBool = AtomicBool::new(false);
 static SPARSE_FLOW_TORSO_F16: AtomicBool = AtomicBool::new(false);
+static SPARSE_FLOW_STOCK_BF16_EMULATION: AtomicBool = AtomicBool::new(false);
 static SPARSE_FLOW_COORD_ROPE_KERNEL: AtomicBool = AtomicBool::new(true);
 static SPARSE_DECODER_CONV_F16: AtomicBool = AtomicBool::new(false);
 
@@ -40,6 +42,8 @@ pub fn set_runtime_model_debug_config(config: RuntimeModelDebugConfig) {
     clear_runtime_model_sparse_flow_sampler_step();
     SPARSE_FLOW_LINEAR_F16.store(config.sparse_flow_linear_f16, Ordering::Relaxed);
     SPARSE_FLOW_TORSO_F16.store(config.sparse_flow_torso_f16, Ordering::Relaxed);
+    SPARSE_FLOW_STOCK_BF16_EMULATION
+        .store(config.sparse_flow_stock_bf16_emulation, Ordering::Relaxed);
     SPARSE_FLOW_COORD_ROPE_KERNEL.store(config.sparse_flow_coord_rope_kernel, Ordering::Relaxed);
     SPARSE_DECODER_CONV_F16.store(config.sparse_decoder_conv_f16, Ordering::Relaxed);
 }
@@ -118,6 +122,10 @@ pub fn runtime_model_sparse_flow_linear_f16_enabled() -> bool {
 
 pub fn runtime_model_sparse_flow_torso_f16_enabled() -> bool {
     SPARSE_FLOW_TORSO_F16.load(Ordering::Relaxed)
+}
+
+pub fn runtime_model_sparse_flow_stock_bf16_emulation_enabled() -> bool {
+    SPARSE_FLOW_STOCK_BF16_EMULATION.load(Ordering::Relaxed)
 }
 
 pub fn runtime_model_sparse_flow_coord_rope_kernel_enabled() -> bool {

@@ -28,8 +28,8 @@ use crate::app::{
     should_wait_before_inference_dispatch,
 };
 use bevy_synth_runtime::args::{
-    AppArgs, BackendKind, DinoBackend, MeshMode, QualityPreset, RmbgBackend, RmbgModel,
-    SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
+    AppArgs, BackendKind, DEFAULT_TRELLIS_PBR_TEXTURE_SIZE, DinoBackend, MeshMode, QualityPreset,
+    RmbgBackend, RmbgModel, SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
 };
 use bevy_synth_runtime::cache::MeshCache;
 use bevy_synth_runtime::state::{
@@ -52,7 +52,11 @@ fn test_args() -> AppArgs {
         trellis_image_large_root: None,
         trellis_python_bin: None,
         trellis_bridge_script: None,
-        trellis_quality: TrellisQuality::Medium,
+        trellis_quality: TrellisQuality::Low,
+        trellis_pbr_enabled: false,
+        trellis_pbr_texture_size: Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE),
+        trellis_target_faces: None,
+        trellis_max_sparse_coords: None,
         scribble_weights_root: None,
         quality: QualityPreset::Full,
         triposplat_profile: TripoSplatProfile::Balanced,

@@ -11,9 +11,10 @@ use super::decoder_wgpu_neighbor_from_coords;
 #[cfg(not(feature = "runtime-model-wgpu"))]
 use super::sparse_subm_conv_forward_legacy;
 use super::{
-    decoder_conv_impl, linear_forward, logits_to_mask, resolve_model_weight_candidates,
-    sparse_subm_conv_forward, DecoderConvCache, DecoderConvImpl, DecoderRuntimeConfig, LinearLayer,
-    SparseConvLayer,
+    build_neighbor_rows, decoder_conv_impl, linear_forward, logits_to_mask,
+    resolve_model_weight_candidates, round_vec_to_f16, sparse_subm_conv_forward,
+    sparse_subm_conv_forward_flex_precomputed, DecoderConvCache, DecoderConvImpl,
+    DecoderRuntimeConfig, LinearLayer, SparseConvLayer, SparseSubmConvWeights,
 };
 #[cfg(feature = "runtime-model-wgpu")]
 use super::{
@@ -149,6 +150,8 @@ fn decoder_guide_subdivision_tensor_handoff_parity() {
 }
 
 fn make_unit_conv_3x1x1(weight: [f32; 3]) -> SparseConvLayer {
+    let weight = weight.to_vec();
+    let bias = vec![0.0];
     SparseConvLayer {
         in_channels: 1,
         out_channels: 1,
@@ -158,8 +161,10 @@ fn make_unit_conv_3x1x1(weight: [f32; 3]) -> SparseConvLayer {
         in_channels_per_group: 1,
         out_channels_per_group: 1,
         groups: 1,
-        weight: weight.to_vec(),
-        bias: vec![0.0],
+        weight_fp16: round_vec_to_f16(weight.as_slice()),
+        bias_fp16: round_vec_to_f16(bias.as_slice()),
+        weight,
+        bias,
         flex_packed_weight: None,
     }
 }
@@ -231,6 +236,62 @@ fn sparse_conv_uses_neighbor_voxels() {
 }
 
 #[test]
+fn sparse_conv_query_chunks_keep_global_cell_neighbors() {
+    let _guard = env_lock_guard();
+    unsafe {
+        std::env::remove_var("TRELLIS2_PARITY_STRICT");
+        std::env::set_var("TRELLIS2_CONV_AXIS_ORDER", "xyz");
+        std::env::set_var("TRELLIS2_CONV_AXIS_SIGN", "+++");
+    }
+    let layer = make_unit_conv_3x1x1([10.0, 1.0, 100.0]);
+    let config = super::flex_config_for_layer(&layer);
+    let coords = vec![[0, 0, 0, 0], [0, 1, 0, 0]];
+
+    let full_neighbors = build_neighbor_rows(&config, coords.as_slice()).expect("full neighbors");
+    let chunk_neighbors = build_neighbor_rows(&config, &coords[0..1]).expect("chunk neighbors");
+
+    assert_eq!(full_neighbors.len(), 6);
+    assert_eq!(chunk_neighbors.len(), 3);
+    assert_eq!(
+        &full_neighbors[0..3],
+        &[-1, 0, 1],
+        "query row 0 must still see row 1 from the full active-cell coordinate domain"
+    );
+    assert_eq!(
+        chunk_neighbors.as_slice(),
+        &[-1, 0, -1],
+        "rebuilding from a row chunk loses cross-boundary active-cell neighbors"
+    );
+
+    let input = vec![1.0f32, 2.0f32];
+    let weights = SparseSubmConvWeights {
+        weight: layer.weight.as_slice(),
+        bias: layer.bias.as_slice(),
+    };
+    let full_output = sparse_subm_conv_forward_flex_precomputed(
+        &config,
+        weights,
+        input.as_slice(),
+        full_neighbors.as_slice(),
+        None,
+    )
+    .expect("full sparse conv");
+    let query_output = sparse_subm_conv_forward_flex_precomputed(
+        &config,
+        weights,
+        input.as_slice(),
+        &full_neighbors[0..3],
+        None,
+    )
+    .expect("query sparse conv against full input");
+    assert_eq!(query_output, full_output[0..1]);
+    unsafe {
+        std::env::remove_var("TRELLIS2_CONV_AXIS_ORDER");
+        std::env::remove_var("TRELLIS2_CONV_AXIS_SIGN");
+    }
+}
+
+#[test]
 fn sparse_conv_flex_matches_legacy_path() {
     let _guard = env_lock_guard();
     unsafe {
@@ -240,6 +301,8 @@ fn sparse_conv_flex_matches_legacy_path() {
         std::env::set_var("TRELLIS2_DECODER_CONV_IMPL", "flex_gmm");
     }
     let mut rng = Lcg::new(123);
+    let weight: Vec<f32> = (0..(6 * 3 * 2)).map(|_| rng.next_f32()).collect();
+    let bias: Vec<f32> = (0..6).map(|_| rng.next_f32()).collect();
     let layer = SparseConvLayer {
         in_channels: 4,
         out_channels: 6,
@@ -249,8 +312,10 @@ fn sparse_conv_flex_matches_legacy_path() {
         in_channels_per_group: 2,
         out_channels_per_group: 3,
         groups: 2,
-        weight: (0..(6 * 3 * 2)).map(|_| rng.next_f32()).collect(),
-        bias: (0..6).map(|_| rng.next_f32()).collect(),
+        weight_fp16: round_vec_to_f16(weight.as_slice()),
+        bias_fp16: round_vec_to_f16(bias.as_slice()),
+        weight,
+        bias,
         flex_packed_weight: None,
     };
     let coords: Vec<[u32; 4]> = (0..32u32).map(|x| [0, x, 0, 0]).collect();
@@ -302,6 +367,25 @@ fn sparse_conv_flex_matches_legacy_path() {
     }
 }
 
+#[cfg(feature = "runtime-model-wgpu")]
+#[test]
+fn decoder_final_stage_streaming_is_disabled_until_global_child_neighbors_are_preserved() {
+    let stages = vec![
+        super::DecoderStage {
+            convnext_blocks: Vec::new(),
+            upsample_block: None,
+        },
+        super::DecoderStage {
+            convnext_blocks: Vec::new(),
+            upsample_block: None,
+        },
+    ];
+    assert!(
+        !super::decoder_can_stream_final_stage_output(stages.as_slice(), 0),
+        "final-stage streamed decode must stay disabled until conv2 query chunks use full child-cell neighbor context"
+    );
+}
+
 #[test]
 fn decoder_neighbor_cache_reuses_across_coord_allocations() {
     let _guard = env_lock_guard();
@@ -344,6 +428,10 @@ fn decoder_neighbor_cache_reuse_reduces_repeated_conv_time() {
         std::env::set_var("TRELLIS2_CONV_AXIS_SIGN", "+++");
     }
     let mut rng = Lcg::new(991);
+    let weight: Vec<f32> = (0..(128 * 3 * 3 * 3 * 64))
+        .map(|_| rng.next_f32())
+        .collect();
+    let bias: Vec<f32> = (0..128).map(|_| rng.next_f32()).collect();
     let layer = SparseConvLayer {
         in_channels: 64,
         out_channels: 128,
@@ -353,10 +441,10 @@ fn decoder_neighbor_cache_reuse_reduces_repeated_conv_time() {
         in_channels_per_group: 64,
         out_channels_per_group: 128,
         groups: 1,
-        weight: (0..(128 * 3 * 3 * 3 * 64))
-            .map(|_| rng.next_f32())
-            .collect(),
-        bias: (0..128).map(|_| rng.next_f32()).collect(),
+        weight_fp16: round_vec_to_f16(weight.as_slice()),
+        bias_fp16: round_vec_to_f16(bias.as_slice()),
+        weight,
+        bias,
         flex_packed_weight: None,
     };
     let coords: Vec<[u32; 4]> = (0..4096u32).map(|x| [0, x, 0, 0]).collect();
@@ -747,6 +835,14 @@ fn linear_forward_matches_naive_matmul() {
             -1.0, 0.5, 4.0, // out1
         ],
         bias: vec![0.25, -0.5],
+        weight_fp16: round_vec_to_f16(
+            [
+                1.0, 2.0, 3.0, // out0
+                -1.0, 0.5, 4.0, // out1
+            ]
+            .as_slice(),
+        ),
+        bias_fp16: round_vec_to_f16([0.25, -0.5].as_slice()),
     };
     let input = vec![
         2.0, -1.0, 0.5, // row0

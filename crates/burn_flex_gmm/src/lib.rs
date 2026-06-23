@@ -272,14 +272,18 @@ pub fn sparse_subm_conv_forward_flex_precomputed(
         ));
     }
     let rows = neighbor_rows.len().checked_div(kernel.rows).unwrap_or(0);
-    let expected_input = rows
-        .checked_mul(config.in_channels)
-        .ok_or_else(|| "sparse conv input size overflow".to_string())?;
-    if input.len() != expected_input {
+    if config.in_channels == 0 || !input.len().is_multiple_of(config.in_channels) {
         return Err(format!(
-            "sparse conv input len mismatch: got {} expected {}",
+            "sparse conv input len mismatch: got {} expected a multiple of {}",
             input.len(),
-            expected_input
+            config.in_channels
+        ));
+    }
+    let input_rows = input.len() / config.in_channels;
+    if input_rows < rows {
+        return Err(format!(
+            "sparse conv input row mismatch: got {} expected at least {}",
+            input_rows, rows
         ));
     }
     if rows == 0 {
@@ -297,7 +301,6 @@ pub fn sparse_subm_conv_forward_flex_precomputed(
         .checked_mul(k_in)
         .and_then(|value| value.checked_mul(n))
         .ok_or_else(|| "sparse conv packed weight size overflow".to_string())?;
-    let trust_neighbor_rows = packed_weight.is_some();
     let owned_packed;
     let packed = if let Some(packed_weight) = packed_weight {
         if packed_weight.len() != expected_packed {
@@ -329,19 +332,13 @@ pub fn sparse_subm_conv_forward_flex_precomputed(
                 if in_row == INVALID_NEIGHBOR_ROW {
                     continue;
                 }
-                let in_row = if trust_neighbor_rows {
-                    in_row as usize
-                } else {
-                    let in_row = usize::try_from(in_row).map_err(|_| {
-                        format!("sparse conv neighbor row index is negative: {in_row}")
-                    })?;
-                    if in_row >= rows {
-                        return Err(format!(
-                            "sparse conv neighbor row index out of bounds: {in_row} >= {rows}"
-                        ));
-                    }
-                    in_row
-                };
+                let in_row = usize::try_from(in_row)
+                    .map_err(|_| format!("sparse conv neighbor row index is negative: {in_row}"))?;
+                if in_row >= input_rows {
+                    return Err(format!(
+                        "sparse conv neighbor row index out of bounds: {in_row} >= {input_rows}"
+                    ));
+                }
                 let src_base = in_row * config.in_channels + in_group_base;
                 let dst_base = out_row * k_in + kernel_idx * config.in_channels_per_group;
                 gathered[dst_base..dst_base + config.in_channels_per_group]

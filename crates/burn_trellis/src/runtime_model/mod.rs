@@ -18,3 +18,5 @@ pub mod sparse_unet_vae_decoder;
 pub mod types;
 #[cfg(feature = "runtime-model")]
 pub(crate) mod weight_parts;
+#[cfg(all(feature = "runtime-model-wgpu", target_arch = "wasm32"))]
+pub(crate) mod wgpu_safe_ops;

@@ -368,6 +368,12 @@ fn runtime_config_from_args(
             .map(map_synthesis_model),
         map_foreground_model(args.rmbg_model),
     );
+    let primary_model = args.synthesis_models.first().copied();
+    let target_faces = if matches!(primary_model, Some(crate::args::SynthesisModel::Trellis)) {
+        args.trellis_target_faces
+    } else {
+        args.target_faces
+    };
     let mut config = RuntimeConfig {
         model_selection,
         backend: map_backend(&args.backend),
@@ -387,6 +393,9 @@ fn runtime_config_from_args(
             RuntimeConfig::default().triposplat_weights_precision
         },
         trellis_quality: map_trellis_quality(args.trellis_quality),
+        trellis_max_sparse_coords: args.trellis_max_sparse_coords,
+        trellis_pbr_enabled: args.trellis_pbr_enabled,
+        trellis_pbr_texture_size: args.trellis_pbr_texture_size,
         bg_weights_root: args.bg_weights_root.clone(),
         num_steps: args.num_steps,
         num_tokens: args.num_tokens,
@@ -398,7 +407,7 @@ fn runtime_config_from_args(
         triposplat_erode_radius: args.triposplat_erode_radius,
         seed: args.seed.or(RuntimeConfig::default().seed),
         dino_backend: map_dino_backend(args.dino_backend),
-        target_faces: args.target_faces,
+        target_faces,
         ..RuntimeConfig::default()
     };
     config.progress = RuntimeProgressObserver::with_callback(
@@ -430,14 +439,28 @@ fn infer_one_request(
     request: &InferenceRequest,
 ) -> Result<SynthAsset, String> {
     {
+        let request_model = request
+            .synthesis_models
+            .first()
+            .copied()
+            .or_else(|| args.synthesis_models.first().copied());
+        let trellis_request = matches!(request_model, Some(crate::args::SynthesisModel::Trellis));
         let config = runtime.config_mut();
         config.num_steps = request.settings.num_steps;
         config.num_tokens = request.settings.num_tokens;
         config.guidance_scale = request.settings.guidance_scale;
-        config.target_faces = request.settings.target_faces;
+        config.target_faces = if trellis_request {
+            request.settings.trellis_target_faces
+        } else {
+            request.settings.target_faces
+        };
         config.triposplat_num_steps = request.settings.num_steps;
         config.triposplat_guidance_scale = request.settings.guidance_scale;
         config.triposplat_num_gaussians = request.settings.triposplat_num_gaussians;
+        config.trellis_quality = map_trellis_quality(request.settings.trellis_quality);
+        config.trellis_max_sparse_coords = request.settings.trellis_max_sparse_coords;
+        config.trellis_pbr_enabled = request.settings.trellis_pbr_enabled;
+        config.trellis_pbr_texture_size = request.settings.trellis_pbr_texture_size;
     }
 
     let image = request
@@ -597,8 +620,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        WORKER_PANIC_PREFIX, catch_worker_unwind, format_runtime_progress_for_ui, parse_bounds,
-        runtime_config_from_args, validate_canonical_runtime_args,
+        RuntimeTrellisQuality, WORKER_PANIC_PREFIX, catch_worker_unwind,
+        format_runtime_progress_for_ui, parse_bounds, runtime_config_from_args,
+        validate_canonical_runtime_args,
     };
     use crate::args::{Args, BackendKind, MeshMode, SynthesisModel, build_app_args};
     use burn_triposplat::TripoSplatBurnpackPrecision;
@@ -675,6 +699,48 @@ mod tests {
         assert_eq!(
             f32_config.triposplat_weights_precision,
             Some(TripoSplatBurnpackPrecision::F32)
+        );
+    }
+
+    #[test]
+    fn runtime_config_maps_trellis_settings_from_app_args() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let args = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "trellis",
+            "--trellis-quality",
+            "high",
+            "--trellis-pbr",
+            "false",
+            "--trellis-pbr-texture-size",
+            "2048",
+            "--trellis-faces",
+            "500000",
+        ]));
+        let config = runtime_config_from_args(&args, None, event_tx)
+            .expect("runtime config should preserve trellis settings");
+        assert_eq!(config.trellis_quality, RuntimeTrellisQuality::High);
+        assert!(!config.trellis_pbr_enabled);
+        assert_eq!(config.trellis_pbr_texture_size, Some(2048));
+        assert_eq!(config.target_faces, Some(500_000));
+        assert_eq!(config.trellis_max_sparse_coords, None);
+    }
+
+    #[test]
+    fn runtime_config_does_not_cap_trellis_sparse_coords_by_default() {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let args = build_app_args(Args::parse_from([
+            "bevy_synth",
+            "--synthesis-models",
+            "trellis",
+        ]));
+        let config = runtime_config_from_args(&args, None, event_tx)
+            .expect("runtime config should preserve trellis defaults");
+
+        assert_eq!(
+            config.trellis_max_sparse_coords, None,
+            "UI/runtime defaults must not destructively cap TRELLIS sparse coordinates"
         );
     }
 

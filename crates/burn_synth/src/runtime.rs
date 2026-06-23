@@ -21,6 +21,8 @@ use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_we
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
 };
+#[cfg(feature = "trellis")]
+use burn_trellis::staged_pipeline::TrellisDecodeOutputMode;
 use burn_tripo::model::triposg::image_encoder::DinoImageProcessor;
 use burn_tripo::model::triposg::image_encoder::import::{
     load_dinov2_processor, load_triposg_dinov2_with_policy,
@@ -55,18 +57,23 @@ use crate::pipeline::{
     ForegroundModel, ModelSelection, SynthesisAsset, SynthesisModel, sanitize_synthesis_models,
 };
 use crate::progress::{RuntimeProgressEvent, RuntimeProgressObserver};
+use crate::quality::{
+    DEFAULT_SEED as QUALITY_DEFAULT_SEED, DEFAULT_TRIPOSG_GUIDANCE_SCALE,
+    DEFAULT_TRIPOSG_TARGET_FACES,
+};
 use crate::triposplat_preprocess::{TRIPOSPLAT_CANVAS_SIZE, triposplat_prepare_image_config};
 
 const DEFAULT_BOUNDS: [f32; 6] = [-1.005, -1.005, -1.005, 1.005, 1.005, 1.005];
 const DEFAULT_NUM_STEPS: usize = 50;
 const DEFAULT_NUM_TOKENS: usize = 2048;
-const DEFAULT_GUIDANCE_SCALE: f32 = 7.0;
+const DEFAULT_GUIDANCE_SCALE: f32 = DEFAULT_TRIPOSG_GUIDANCE_SCALE;
 const DEFAULT_FLASH_OCTREE_DEPTH: usize = 9;
 const DEFAULT_FLASH_MIN_RESOLUTION: usize = 63;
 const DEFAULT_FLASH_MINI_GRID_NUM: usize = 4;
 const DEFAULT_FLASH_NUM_CHUNKS: usize = 10_000;
-const DEFAULT_SEED: u64 = 42;
-const DEFAULT_TARGET_FACES: usize = 10_000;
+const DEFAULT_SEED: u64 = QUALITY_DEFAULT_SEED;
+const DEFAULT_TARGET_FACES: usize = DEFAULT_TRIPOSG_TARGET_FACES;
+pub const DEFAULT_TRELLIS_PBR_TEXTURE_SIZE: usize = 1024;
 const DEFAULT_TRIPOSPLAT_NUM_GAUSSIANS: usize = 262_144;
 const DEFAULT_TRIPOSPLAT_SHIFT: f32 = 3.0;
 const DEFAULT_TRIPOSPLAT_ERODE_RADIUS: usize = 1;
@@ -169,6 +176,10 @@ pub struct RuntimeConfig {
     pub trellis_noise_overrides_hook: Option<PathBuf>,
     /// Optional explicit sparse-coordinate cap for Trellis decode.
     pub trellis_max_sparse_coords: Option<usize>,
+    /// Optional native Trellis PBR texture size for Rust GLB export.
+    pub trellis_pbr_texture_size: Option<usize>,
+    /// Whether Trellis should bake UVs/material textures in the native GLB path.
+    pub trellis_pbr_enabled: bool,
     /// Trellis high-level quality selection.
     pub trellis_quality: TrellisQuality,
     /// Trellis runtime compute profile.
@@ -207,8 +218,10 @@ impl Default for RuntimeConfig {
             trellis_bridge_script: None,
             trellis_noise_overrides_hook: None,
             trellis_max_sparse_coords: None,
-            trellis_quality: TrellisQuality::Medium,
-            trellis_compute_profile: TrellisComputeProfile::ReferenceF32,
+            trellis_pbr_texture_size: Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE),
+            trellis_pbr_enabled: false,
+            trellis_quality: TrellisQuality::Low,
+            trellis_compute_profile: TrellisComputeProfile::default(),
             bg_weights_root: None,
             num_steps: DEFAULT_NUM_STEPS,
             num_tokens: DEFAULT_NUM_TOKENS,
@@ -477,6 +490,15 @@ pub struct SynthRuntime {
     config: RuntimeConfig,
     foreground: ForegroundRuntime,
     synthesis: SynthesisRuntime,
+}
+
+#[cfg(feature = "trellis")]
+fn trellis_decode_output_mode(pbr_enabled: bool) -> TrellisDecodeOutputMode {
+    if pbr_enabled {
+        TrellisDecodeOutputMode::NativePbr
+    } else {
+        TrellisDecodeOutputMode::NativeMesh
+    }
 }
 
 impl SynthRuntime {
@@ -1014,8 +1036,8 @@ impl SynthRuntime {
             noise_overrides_hook: self.config.trellis_noise_overrides_hook.clone(),
             max_sparse_coords: self.config.trellis_max_sparse_coords,
             target_faces: self.config.target_faces,
-            pbr_texture_size: None,
-            decode_output_mode: Default::default(),
+            pbr_texture_size: self.config.trellis_pbr_texture_size,
+            decode_output_mode: trellis_decode_output_mode(self.config.trellis_pbr_enabled),
             runtime_stage_debug: false,
             runtime_attention_debug: false,
             runtime_decoder_conv_telemetry: false,
@@ -3480,6 +3502,14 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_defaults_to_reference_trellis_profile() {
+        assert_eq!(
+            RuntimeConfig::default().trellis_compute_profile,
+            TrellisComputeProfile::ReferenceF32
+        );
+    }
+
+    #[test]
     fn triposplat_precision_explicit_f16_is_respected() {
         let root = fake_triposplat_root(&[
             TripoSplatBurnpackPrecision::F16,
@@ -4349,6 +4379,19 @@ mod tests {
     fn trellis_runtime_source_validation_accepts_runtime_wgpu() {
         validate_trellis_runtime_sources(TrellisDevice::Wgpu, "runtime_model_wgpu", "runtime")
             .expect("runtime wgpu sources should be accepted");
+    }
+
+    #[cfg(feature = "trellis")]
+    #[test]
+    fn trellis_pbr_off_uses_native_mesh_postprocess_not_hook_export() {
+        assert_eq!(
+            trellis_decode_output_mode(false),
+            TrellisDecodeOutputMode::NativeMesh
+        );
+        assert_eq!(
+            trellis_decode_output_mode(true),
+            TrellisDecodeOutputMode::NativePbr
+        );
     }
 
     #[test]

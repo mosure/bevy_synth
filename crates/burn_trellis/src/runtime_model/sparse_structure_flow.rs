@@ -20,6 +20,7 @@ use super::runtime_config::{
     runtime_model_sparse_flow_linear_f16_enabled,
     runtime_model_sparse_flow_module_attention_enabled,
     runtime_model_sparse_flow_self_attention_f16_enabled,
+    runtime_model_sparse_flow_stock_bf16_emulation_enabled,
     runtime_model_sparse_flow_torso_f16_enabled, set_runtime_model_sparse_flow_sampler_step,
 };
 use super::runtime_config::{
@@ -38,16 +39,14 @@ use burn::tensor::module::attention;
 use burn::tensor::{Int, Tensor, TensorData, ops::AttentionModuleOptions};
 #[cfg(feature = "runtime-model-wgpu")]
 use burn_flex_gmm::wgpu::{
-    layer_norm_affine_forward_wgpu, layer_norm_modulated_forward_wgpu, linear_skinny_forward_wgpu,
-    multihead_qk_rms_norm_rope_from_qkv_coords_wgpu,
+    bf16_round_to_f32_wgpu, layer_norm_affine_forward_wgpu, layer_norm_modulated_forward_wgpu,
+    linear_skinny_forward_wgpu, multihead_qk_rms_norm_rope_from_qkv_coords_wgpu,
     multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu, multihead_rms_norm_forward_wgpu,
     multihead_rms_norm_rope_from_coords_wgpu, rope_rotate_pairs_from_coords_wgpu,
     rope_rotate_pairs_wgpu,
 };
 use burn_store::{KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use serde::Deserialize;
-#[cfg(test)]
-use serde::Serialize;
 
 use crate::sampler::{
     FlowEulerSampleConfig, FlowEulerSampleTrace, guidance_interval_contains, mid_snapshot_step,
@@ -193,6 +192,51 @@ where
     SparseFlowTraceWgpuBridgeImpl: SparseFlowTraceWgpuBridge<B>,
 {
     SparseFlowTraceWgpuBridgeImpl::into_wgpu_rows(tensor)
+}
+
+pub trait SparseFlowBf16EmulationBridge<B: Backend> {
+    fn round<const D: usize>(tensor: Tensor<B, D>) -> Tensor<B, D>;
+}
+
+pub struct SparseFlowBf16EmulationBridgeImpl;
+
+impl SparseFlowBf16EmulationBridge<CpuRuntimeBackend> for SparseFlowBf16EmulationBridgeImpl {
+    fn round<const D: usize>(tensor: Tensor<CpuRuntimeBackend, D>) -> Tensor<CpuRuntimeBackend, D> {
+        tensor
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowBf16EmulationBridge<WgpuRuntimeBackend> for SparseFlowBf16EmulationBridgeImpl {
+    fn round<const D: usize>(
+        tensor: Tensor<WgpuRuntimeBackend, D>,
+    ) -> Tensor<WgpuRuntimeBackend, D> {
+        bf16_round_to_f32_wgpu(tensor)
+    }
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+impl SparseFlowBf16EmulationBridge<burn_wgpu::Wgpu<f32, i32, u32>>
+    for SparseFlowBf16EmulationBridgeImpl
+{
+    fn round<const D: usize>(
+        tensor: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, D>,
+    ) -> Tensor<burn_wgpu::Wgpu<f32, i32, u32>, D> {
+        tensor
+    }
+}
+
+fn sparse_flow_stock_bf16_round<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Tensor<B, D>
+where
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
+{
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        if runtime_model_sparse_flow_stock_bf16_emulation_enabled() {
+            return SparseFlowBf16EmulationBridgeImpl::round(tensor);
+        }
+    }
+    tensor
 }
 
 pub trait RopeRotateWgpuBridge<B: Backend> {
@@ -347,6 +391,8 @@ pub trait SparseFlowQkRmsNormWgpuBridge<B: Backend> {
 }
 
 pub trait SparseFlowLinearWgpuBridge<B: Backend> {
+    fn safe_matmul_2d(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>, context: &str) -> Option<Tensor<B, 2>>;
+
     fn f16_linear(
         linear: &nn::Linear<B>,
         x: Tensor<B, 2>,
@@ -443,6 +489,14 @@ impl SparseFlowQkRmsNormWgpuBridge<CpuRuntimeBackend> for RopeRotateWgpuBridgeIm
 }
 
 impl SparseFlowLinearWgpuBridge<CpuRuntimeBackend> for SparseFlowLinearWgpuBridgeImpl {
+    fn safe_matmul_2d(
+        _lhs: Tensor<CpuRuntimeBackend, 2>,
+        _rhs: Tensor<CpuRuntimeBackend, 2>,
+        _context: &str,
+    ) -> Option<Tensor<CpuRuntimeBackend, 2>> {
+        None
+    }
+
     fn f16_linear(
         _linear: &nn::Linear<CpuRuntimeBackend>,
         _x: Tensor<CpuRuntimeBackend, 2>,
@@ -550,6 +604,14 @@ impl SparseFlowQkRmsNormWgpuBridge<burn_wgpu::Wgpu<f32, i32, u32>> for RopeRotat
 
 #[cfg(feature = "runtime-model-wgpu")]
 impl SparseFlowLinearWgpuBridge<burn_wgpu::Wgpu<f32, i32, u32>> for SparseFlowLinearWgpuBridgeImpl {
+    fn safe_matmul_2d(
+        _lhs: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _rhs: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
+        _context: &str,
+    ) -> Option<Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>> {
+        None
+    }
+
     fn f16_linear(
         _linear: &nn::Linear<burn_wgpu::Wgpu<f32, i32, u32>>,
         _x: Tensor<burn_wgpu::Wgpu<f32, i32, u32>, 2>,
@@ -892,6 +954,22 @@ impl SparseFlowQkRmsNormWgpuBridge<WgpuRuntimeBackend> for RopeRotateWgpuBridgeI
 
 #[cfg(feature = "runtime-model-wgpu")]
 impl SparseFlowLinearWgpuBridge<WgpuRuntimeBackend> for SparseFlowLinearWgpuBridgeImpl {
+    fn safe_matmul_2d(
+        lhs: Tensor<WgpuRuntimeBackend, 2>,
+        rhs: Tensor<WgpuRuntimeBackend, 2>,
+        context: &str,
+    ) -> Option<Tensor<WgpuRuntimeBackend, 2>> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Some(super::wgpu_safe_ops::matmul_2d_naive(lhs, rhs, context));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (lhs, rhs, context);
+            None
+        }
+    }
+
     fn f16_linear(
         linear: &nn::Linear<WgpuRuntimeBackend>,
         x: Tensor<WgpuRuntimeBackend, 2>,
@@ -1007,6 +1085,7 @@ fn maybe_layer_norm_modulated_wgpu<B: Backend>(
 ) -> Option<Tensor<B, 3>>
 where
     RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     RopeRotateWgpuBridgeImpl::modulated(x, scale, shift, eps)
 }
@@ -1172,18 +1251,6 @@ pub struct SparseFlowOpTelemetry {
     pub model_input_ns: u64,
     pub model_output_calls: u64,
     pub model_output_ns: u64,
-}
-
-#[cfg(test)]
-#[derive(Module, Debug)]
-struct BinaryBlob<B: Backend> {
-    bytes: Param<Tensor<B, 1, Int>>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Deserialize, Serialize)]
-struct BlobMetadata {
-    bytes_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1965,6 +2032,7 @@ pub struct TimestepEmbedder<B: Backend> {
 impl<B: Backend> TimestepEmbedder<B>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     pub fn new(device: &B::Device, frequency_embedding_size: usize, hidden_size: usize) -> Self {
         let mlp_0 = nn::LinearConfig::new(frequency_embedding_size, hidden_size)
@@ -1979,7 +2047,8 @@ where
     pub fn forward(&self, t: Tensor<B, 1>, frequency_embedding_size: usize) -> Tensor<B, 2> {
         let emb = timestep_embedding(t, frequency_embedding_size);
         let hidden = linear_forward_stable_2d(&self.mlp_0, emb);
-        linear_forward_stable_2d(&self.mlp_2, silu(hidden))
+        let hidden = silu(hidden);
+        linear_forward_stable_2d(&self.mlp_2, hidden)
     }
 }
 
@@ -2001,6 +2070,7 @@ impl<B: Backend> MultiHeadRmsNorm<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4>
     where
         RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+        SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
     {
         let [_, _, heads, head_dim] = x.dims();
         #[cfg(feature = "runtime-model-wgpu")]
@@ -2009,7 +2079,7 @@ impl<B: Backend> MultiHeadRmsNorm<B> {
             if let Some(y) =
                 maybe_multihead_rms_norm_wgpu(x.clone(), gamma, self.scale, RMS_NORM_EPS)
             {
-                return y;
+                return sparse_flow_stock_bf16_round(y);
             }
         }
         let rms = x
@@ -2027,7 +2097,7 @@ impl<B: Backend> MultiHeadRmsNorm<B> {
         } else {
             gamma
         };
-        x.mul(gamma)
+        sparse_flow_stock_bf16_round(x.mul(gamma))
     }
 }
 
@@ -2040,6 +2110,7 @@ pub struct FeedForwardNet<B: Backend> {
 impl<B: Backend> FeedForwardNet<B>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     pub fn new(device: &B::Device, channels: usize, mlp_ratio: f32) -> Self {
         let hidden = ((channels as f32) * mlp_ratio).round().max(1.0) as usize;
@@ -2062,8 +2133,9 @@ where
             return if use_f16_chain {
                 feed_forward_f16_chain_via_2d(&self.mlp_0, &self.mlp_2, x)
             } else {
-                let hidden = linear_forward_stable_via_2d(&self.mlp_0, x);
-                linear_forward_stable_via_2d(&self.mlp_2, gelu(hidden))
+                let hidden = linear_forward_block_via_2d(&self.mlp_0, x);
+                let hidden = sparse_flow_stock_bf16_round(gelu(hidden));
+                linear_forward_block_via_2d(&self.mlp_2, hidden)
             };
         }
 
@@ -2116,7 +2188,7 @@ where
                 let hidden = if use_f16_chain {
                     linear_forward_f16_raw_2d(&self.mlp_0, x_chunk)
                 } else {
-                    linear_forward_stable_2d(&self.mlp_0, x_chunk)
+                    linear_forward_block_2d(&self.mlp_0, x_chunk)
                 };
                 if let Some(stage_start) = mlp_0_start {
                     eprintln!(
@@ -2136,7 +2208,7 @@ where
                 } else {
                     None
                 };
-                let hidden = gelu(hidden);
+                let hidden = sparse_flow_stock_bf16_round(gelu(hidden));
                 if let Some(stage_start) = gelu_start {
                     eprintln!(
                         "burn_trellis: mlp.chunk {}/{} gelu done ({:.2} ms)",
@@ -2148,7 +2220,7 @@ where
                 let chunk_out = if use_f16_chain {
                     linear_forward_f16_raw_2d(&self.mlp_2, hidden).cast(output_dtype)
                 } else {
-                    linear_forward_stable_2d(&self.mlp_2, hidden)
+                    linear_forward_block_2d(&self.mlp_2, hidden)
                 };
                 if let Some(stage_start) = mlp_2_start {
                     eprintln!(
@@ -2441,6 +2513,7 @@ where
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     pub fn new(
         device: &B::Device,
@@ -2615,7 +2688,8 @@ where
         );
 
         let kernel_start = Instant::now();
-        let out = scaled_dot_product_attention(q, k, v, self.head_dim);
+        let out =
+            sparse_flow_stock_bf16_round(scaled_dot_product_attention(q, k, v, self.head_dim));
         record_sparse_flow_detail(SparseFlowOpDetailKind::SelfKernel, elapsed_ns(kernel_start));
         let out_start = Instant::now();
         let out = linear_forward_attention_to_dtype(
@@ -3321,6 +3395,7 @@ impl<B: Backend> CrossAttention<B>
 where
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     pub fn new(
         device: &B::Device,
@@ -3449,7 +3524,12 @@ where
         record_sparse_flow_detail(SparseFlowOpDetailKind::CrossNorm, elapsed_ns(norm_start));
 
         let kernel_start = Instant::now();
-        let out = scaled_dot_product_attention(q, kv.k.clone(), kv.v.clone(), self.head_dim);
+        let out = sparse_flow_stock_bf16_round(scaled_dot_product_attention(
+            q,
+            kv.k.clone(),
+            kv.v.clone(),
+            self.head_dim,
+        ));
         record_sparse_flow_detail(
             SparseFlowOpDetailKind::CrossKernel,
             elapsed_ns(kernel_start),
@@ -3645,6 +3725,7 @@ where
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -3704,6 +3785,7 @@ where
         RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
         RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
         SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+        SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
     {
         let [batch, tokens, channels] = x.dims();
         let sync_profile_device = if sparse_flow_sync_profile_enabled() && tokens >= 1024 {
@@ -3720,7 +3802,7 @@ where
         } else {
             mod_bias
         };
-        let mod_signal = mod_signal.add(mod_bias);
+        let mod_signal = sparse_flow_stock_bf16_round(mod_signal.add(mod_bias));
         let shift_msa = mod_signal
             .clone()
             .slice([0..batch, 0..channels])
@@ -3747,7 +3829,12 @@ where
             .reshape([batch, 1, channels]);
 
         let norm_start = Instant::now();
-        let h = layer_norm_modulated(x.clone(), scale_msa, shift_msa, LAYER_NORM_EPS);
+        let h = sparse_flow_stock_bf16_round(layer_norm_modulated(
+            x.clone(),
+            scale_msa,
+            shift_msa,
+            LAYER_NORM_EPS,
+        ));
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         record_sparse_flow_detail(SparseFlowOpDetailKind::BlockNormMod, elapsed_ns(norm_start));
         let self_attn_start = Instant::now();
@@ -3763,6 +3850,7 @@ where
         } else {
             self.self_attn.forward(h, resolution, token_coords.clone())
         };
+        let h = sparse_flow_stock_bf16_round(h);
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         let self_attn_ns = self_attn_start
             .elapsed()
@@ -3770,8 +3858,8 @@ where
             .min(u128::from(u64::MAX)) as u64;
         record_sparse_flow_op(SparseFlowOpKind::SelfAttn, self_attn_ns);
         let gate_start = Instant::now();
-        let h = h.mul(gate_msa);
-        let x = x.add(h);
+        let h = sparse_flow_stock_bf16_round(h.mul(gate_msa));
+        let x = sparse_flow_stock_bf16_round(x.add(h));
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         record_sparse_flow_detail(
             SparseFlowOpDetailKind::BlockGateResidual,
@@ -3779,7 +3867,11 @@ where
         );
 
         let norm_start = Instant::now();
-        let h = layer_norm_affine_stable(x.clone(), &self.norm2, LAYER_NORM_EPS);
+        let h = sparse_flow_stock_bf16_round(layer_norm_affine_stable(
+            x.clone(),
+            &self.norm2,
+            LAYER_NORM_EPS,
+        ));
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         record_sparse_flow_detail(
             SparseFlowOpDetailKind::BlockNormAffine,
@@ -3798,14 +3890,14 @@ where
                 "burn_trellis: flow.block op=cross_attn done ({:.2} ms)",
                 start.elapsed().as_secs_f64() * 1000.0
             );
-            x.add(out)
+            sparse_flow_stock_bf16_round(x.add(sparse_flow_stock_bf16_round(out)))
         } else {
             let out = if let Some(kv) = cross_attn_kv {
                 self.cross_attn.forward_from_projected_kv(h, kv)
             } else {
                 self.cross_attn.forward(h, context)
             };
-            x.add(out)
+            sparse_flow_stock_bf16_round(x.add(sparse_flow_stock_bf16_round(out)))
         };
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         let cross_attn_ns = cross_attn_start
@@ -3815,7 +3907,12 @@ where
         record_sparse_flow_op(SparseFlowOpKind::CrossAttn, cross_attn_ns);
 
         let norm_start = Instant::now();
-        let h = layer_norm_modulated(x.clone(), scale_mlp, shift_mlp, LAYER_NORM_EPS);
+        let h = sparse_flow_stock_bf16_round(layer_norm_modulated(
+            x.clone(),
+            scale_mlp,
+            shift_mlp,
+            LAYER_NORM_EPS,
+        ));
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         record_sparse_flow_detail(SparseFlowOpDetailKind::BlockNormMod, elapsed_ns(norm_start));
         let mlp_start = Instant::now();
@@ -3831,12 +3928,13 @@ where
         } else {
             self.mlp.forward(h)
         };
+        let h = sparse_flow_stock_bf16_round(h);
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         let mlp_ns = mlp_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         record_sparse_flow_op(SparseFlowOpKind::Mlp, mlp_ns);
         let gate_start = Instant::now();
-        let h = h.mul(gate_mlp);
-        let x = x.add(h);
+        let h = sparse_flow_stock_bf16_round(h.mul(gate_mlp));
+        let x = sparse_flow_stock_bf16_round(x.add(h));
         maybe_sync_sparse_flow_profile::<B>(sync_profile_device.as_ref());
         record_sparse_flow_detail(
             SparseFlowOpDetailKind::BlockGateResidual,
@@ -3853,6 +3951,7 @@ where
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     pub fn new(device: &B::Device, config: SparseStructureFlowConfig) -> Self {
         let num_heads = config.num_heads();
@@ -4021,6 +4120,9 @@ where
         let mut mod_signal =
             linear_forward_stable_2d_reference(&self.ada_ln_modulation, silu(t_emb));
         let mut cond = cond;
+        h = sparse_flow_stock_bf16_round(h);
+        mod_signal = sparse_flow_stock_bf16_round(mod_signal);
+        cond = sparse_flow_stock_bf16_round(cond);
         if let Some(torso_dtype) = sparse_flow_torso_dtype_for_backend::<B>() {
             h = tensor_cast_float_3d_if_needed(h, torso_dtype);
             mod_signal = tensor_cast_float_2d_if_needed(mod_signal, torso_dtype);
@@ -4212,6 +4314,7 @@ where
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     fn load_from_stem(
         weights_root: &Path,
@@ -4284,6 +4387,7 @@ where
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowQkRmsNormWgpuBridge<B>,
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     fn config(&self) -> &SparseStructureFlowConfig {
         &self.config
@@ -6758,6 +6862,7 @@ fn layer_norm_modulated<B: Backend>(
 ) -> Tensor<B, 3>
 where
     RopeRotateWgpuBridgeImpl: SparseFlowLayerNormWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     #[cfg(feature = "runtime-model-wgpu")]
     if !sparse_flow_prefers_decomposed_modulated_layer_norm::<B>(&x) {
@@ -6767,9 +6872,10 @@ where
             return y;
         }
     }
-    layer_norm_no_affine(x, eps)
-        .mul(scale.add_scalar(1.0))
-        .add(shift)
+    let y = layer_norm_no_affine(x, eps);
+    let scale = sparse_flow_stock_bf16_round(scale.add_scalar(1.0));
+    let y = sparse_flow_stock_bf16_round(y.mul(scale));
+    sparse_flow_stock_bf16_round(y.add(shift))
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -7550,24 +7656,39 @@ fn sparse_flow_self_attn_kv_chunk_tokens(tokens: usize) -> usize {
 fn linear_forward_stable_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
-    linear_forward_stable_2d_with_policy(linear, x, true)
+    linear_forward_stable_2d_with_policy(linear, x, true, false)
+}
+
+fn linear_forward_block_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
+{
+    linear_forward_stable_2d_with_policy(linear, x, true, true)
 }
 
 fn linear_forward_stable_2d_reference<B: Backend>(
     linear: &nn::Linear<B>,
     x: Tensor<B, 2>,
-) -> Tensor<B, 2> {
-    linear_forward_stable_2d_reference_impl(linear, x)
+) -> Tensor<B, 2>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
+{
+    linear_forward_stable_2d_reference_impl(linear, x, false)
 }
 
 fn linear_forward_stable_2d_with_policy<B: Backend>(
     linear: &nn::Linear<B>,
     x: Tensor<B, 2>,
     allow_fast_f16: bool,
+    emulate_bf16_block: bool,
 ) -> Tensor<B, 2>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     let x_dtype: burn::tensor::FloatDType = x.dtype().into();
     let [rows, in_channels] = x.dims();
@@ -7592,16 +7713,21 @@ where
         }
     }
 
-    linear_forward_stable_2d_reference_impl(linear, x)
+    linear_forward_stable_2d_reference_impl(linear, x, emulate_bf16_block)
 }
 
 fn linear_forward_stable_2d_reference_impl<B: Backend>(
     linear: &nn::Linear<B>,
     x: Tensor<B, 2>,
-) -> Tensor<B, 2> {
+    emulate_bf16_block: bool,
+) -> Tensor<B, 2>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
+{
     let x_dtype: burn::tensor::FloatDType = x.dtype().into();
     let [rows, in_channels] = x.dims();
-    let weight = linear.weight.val();
+    let mut weight = linear.weight.val();
     let [weight_in_channels, out_channels] = weight.dims();
     if in_channels != weight_in_channels {
         panic!(
@@ -7615,6 +7741,9 @@ fn linear_forward_stable_2d_reference_impl<B: Backend>(
         x_dtype
     };
     let x = tensor_cast_float_2d_if_needed(x, matmul_dtype);
+    if emulate_bf16_block {
+        weight = sparse_flow_stock_bf16_round(weight);
+    }
     let weight_dtype: burn::tensor::FloatDType = weight.dtype().into();
     // Keep linear operands in a single dtype to avoid mixed-dtype WGPU matmul
     // collapse on bf16 checkpoint weights (observed near-zero outputs in sparse flow).
@@ -7623,17 +7752,31 @@ fn linear_forward_stable_2d_reference_impl<B: Backend>(
     } else {
         weight
     };
-    let mut output = x.matmul(weight);
+    let mut output = SparseFlowLinearWgpuBridgeImpl::safe_matmul_2d(
+        x.clone(),
+        weight.clone(),
+        "sparse-flow.linear",
+    )
+    .unwrap_or_else(|| x.matmul(weight));
     if let Some(bias) = linear.bias.as_ref() {
         let output_dtype: burn::tensor::FloatDType = output.dtype().into();
+        let mut bias = bias.val();
+        if emulate_bf16_block {
+            bias = sparse_flow_stock_bf16_round(bias);
+        }
         let bias_dtype: burn::tensor::FloatDType = bias.dtype().into();
         let bias = if bias_dtype != output_dtype {
-            bias.val().cast(output_dtype)
+            bias.cast(output_dtype)
         } else {
-            bias.val()
+            bias
         };
         output = output.add(bias.unsqueeze::<2>());
     }
+    let output = if emulate_bf16_block {
+        sparse_flow_stock_bf16_round(output)
+    } else {
+        output
+    };
     tensor_cast_float_2d_if_needed(output, x_dtype)
 }
 
@@ -7676,6 +7819,7 @@ fn feed_forward_f16_chain_enabled<B: Backend>(
 fn linear_forward_f16_raw_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     let [rows, in_channels] = x.dims();
     let weight = linear.weight.val();
@@ -7714,6 +7858,7 @@ fn feed_forward_f16_chain_via_2d<B: Backend>(
 ) -> Tensor<B, 3>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     let output_dtype: burn::tensor::FloatDType = x.dtype().into();
     let [batch, tokens, channels] = x.dims();
@@ -7724,13 +7869,14 @@ where
         .reshape([batch, tokens, out_channels])
 }
 
-fn linear_forward_stable_via_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3>
+fn linear_forward_block_via_2d<B: Backend>(linear: &nn::Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     let [batch, tokens, channels] = x.dims();
     let out_channels = linear.weight.val().dims()[1];
-    linear_forward_stable_2d(linear, x.reshape([batch * tokens, channels])).reshape([
+    linear_forward_block_2d(linear, x.reshape([batch * tokens, channels])).reshape([
         batch,
         tokens,
         out_channels,
@@ -7740,7 +7886,11 @@ where
 fn linear_forward_stable_via_2d_reference<B: Backend>(
     linear: &nn::Linear<B>,
     x: Tensor<B, 3>,
-) -> Tensor<B, 3> {
+) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
+{
     let [batch, tokens, channels] = x.dims();
     let out_channels = linear.weight.val().dims()[1];
     linear_forward_stable_2d_reference(linear, x.reshape([batch * tokens, channels])).reshape([
@@ -7757,6 +7907,7 @@ fn linear_forward_attention<B: Backend>(
 ) -> Tensor<B, 3>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     #[cfg(feature = "runtime-model-wgpu")]
     {
@@ -7778,7 +7929,7 @@ where
             ]);
         }
     }
-    linear_forward_stable_via_2d(linear, x)
+    linear_forward_block_via_2d(linear, x)
 }
 
 fn linear_forward_attention_to_dtype<B: Backend>(
@@ -7789,6 +7940,7 @@ fn linear_forward_attention_to_dtype<B: Backend>(
 ) -> Tensor<B, 3>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     tensor_cast_float_3d_if_needed(linear_forward_attention(linear, x, allow_f16_output), dtype)
 }
@@ -7797,7 +7949,11 @@ fn linear_forward_token_chunked_reference<B: Backend>(
     linear: &nn::Linear<B>,
     x: Tensor<B, 3>,
     chunk_tokens: usize,
-) -> Tensor<B, 3> {
+) -> Tensor<B, 3>
+where
+    SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
+{
     let [batch, tokens, channels] = x.dims();
     if chunk_tokens >= tokens {
         return linear_forward_stable_via_2d_reference(linear, x);
@@ -7821,6 +7977,7 @@ fn linear_forward_input_token_chunked<B: Backend>(
 ) -> Tensor<B, 3>
 where
     SparseFlowLinearWgpuBridgeImpl: SparseFlowLinearWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     let [batch, tokens, channels] = x.dims();
     let out_channels = linear.weight.val().dims()[1];
@@ -8810,6 +8967,7 @@ fn apply_rms_norm_and_rope_single<B: Backend>(
 where
     RopeRotateWgpuBridgeImpl: RopeRotateWgpuBridge<B>,
     RopeRotateWgpuBridgeImpl: SparseFlowRmsNormWgpuBridge<B>,
+    SparseFlowBf16EmulationBridgeImpl: SparseFlowBf16EmulationBridge<B>,
 {
     let mut x = if let Some(norm) = norm {
         if use_rope {
@@ -9173,15 +9331,6 @@ fn load_burnpack_blob_bytes(path: &Path) -> Result<Vec<u8>, String> {
     load_blob_bytes_from_blob_burnpack(path)
 }
 
-#[cfg(test)]
-fn metadata_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("model.bpk");
-    path.with_file_name(format!("{file_name}.meta.json"))
-}
-
 fn key_remap_rules() -> &'static [(&'static str, &'static str)] {
     &[
         (r"^(t_embedder)\.mlp\.0\.(weight|bias)$", "$1.mlp_0.$2"),
@@ -9274,28 +9423,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-    use burn::module::{Param, ParamId};
     use burn::prelude::Backend;
-    use burn::tensor::{Int, Tensor, TensorData, module::attention, ops::AttentionModuleOptions};
-    use burn_store::{BurnToPyTorchAdapter, BurnpackStore, ModuleSnapshot, SafetensorsStore};
+    use burn::tensor::{
+        Int, Tensor, activation::softmax, module::attention, ops::AttentionModuleOptions,
+    };
+    use burn_store::{BurnToPyTorchAdapter, ModuleSnapshot, SafetensorsStore};
 
+    use crate::blob_burnpack::save_blob_bytes_to_burnpack;
     use crate::hook_diff::{HookSnapshot, HookTensor, compute_stats};
-    #[cfg(feature = "runtime-model-wgpu")]
     use crate::runtime_model::runtime_config::{
         RuntimeModelDebugConfig, set_runtime_model_debug_config,
+        set_runtime_model_sparse_flow_attention_policy,
     };
     use crate::sampler::FlowEulerSampleConfig;
 
     #[cfg(feature = "runtime-model-wgpu")]
     use super::WgpuRuntimeBackend;
     use super::{
-        BinaryBlob, BlobMetadata, CpuRuntimeBackend, SelfAttention, SparseFlowCondition,
-        SparseRuntimeTensorAccess, SparseStructureFlowConfig, SparseStructureFlowModel,
-        SparseStructureFlowRuntime, SparseStructureFlowRuntimeImpl, SparseTensorOwned,
-        VarLenTensorOwned, apply_rope_single, dense_grid_token_coords, force_contiguous_4d,
-        host_transfer_stats, layer_norm_affine_stable, layer_norm_no_affine,
-        linear_forward_attention, linear_forward_stable_2d, linear_forward_token_chunked_reference,
-        metadata_path, reset_host_transfer_stats, reset_sparse_flow_op_telemetry,
+        CpuRuntimeBackend, SelfAttention, SparseFlowCondition, SparseRuntimeTensorAccess,
+        SparseStructureFlowConfig, SparseStructureFlowModel, SparseStructureFlowRuntime,
+        SparseStructureFlowRuntimeImpl, SparseTensorOwned, VarLenTensorOwned, apply_rope_single,
+        dense_grid_token_coords, force_contiguous_4d, host_transfer_stats,
+        layer_norm_affine_stable, layer_norm_no_affine, linear_forward_attention,
+        linear_forward_input_token_chunked, linear_forward_stable_2d,
+        linear_forward_stable_2d_reference, linear_forward_token_chunked_reference,
+        matmul_4d_via_3d, reset_host_transfer_stats, reset_sparse_flow_op_telemetry,
         resolve_model_weight_candidates, scaled_dot_product_attention,
         scaled_dot_product_attention_dense, scaled_dot_product_attention_stream, silu,
         sparse_flow_attention_logits_within_budget, sparse_flow_linear_chunk_tokens_for_backend,
@@ -9304,7 +9456,7 @@ mod tests {
         sparse_flow_module_attention_dtype_for_shape,
         sparse_flow_module_attention_long_k_requires_fallback,
         sparse_flow_module_attention_safe_query_cap_for_shape, sparse_flow_op_telemetry,
-        sparse_flow_stream_chunk_plan,
+        sparse_flow_stock_bf16_round, sparse_flow_stream_chunk_plan,
     };
 
     static HOST_STATS_LOCK: Mutex<()> = Mutex::new(());
@@ -9440,6 +9592,7 @@ mod tests {
             sparse_flow_module_attention_f16: false,
             sparse_flow_linear_f16: false,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -9453,6 +9606,7 @@ mod tests {
             sparse_flow_module_attention_f16: true,
             sparse_flow_linear_f16: true,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -9480,6 +9634,7 @@ mod tests {
             sparse_flow_module_attention_f16: true,
             sparse_flow_linear_f16: true,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -9519,6 +9674,7 @@ mod tests {
             sparse_flow_module_attention_f16: true,
             sparse_flow_linear_f16: false,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -9643,7 +9799,6 @@ mod tests {
 
     #[test]
     fn runtime_loads_blob_burnpack_when_module_layout_is_absent() {
-        type BlobBackend = burn::backend::NdArray<f32, u8>;
         type TestBackend = burn::backend::NdArray<f32>;
 
         let unique = SystemTime::now()
@@ -9709,25 +9864,8 @@ mod tests {
         let source_bytes = std::fs::read(&source_path).expect("read source safetensors");
 
         let burnpack_path = ckpts.join("flow_model.bpk");
-        let blob_device = <BlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
-        let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
-            TensorData::new(source_bytes.clone(), [source_bytes.len()]),
-            &blob_device,
-        );
-        let blob = BinaryBlob {
-            bytes: Param::initialized(ParamId::new(), tensor),
-        };
-        let mut burnpack_store = BurnpackStore::from_file(&burnpack_path).overwrite(true);
-        blob.save_into(&mut burnpack_store)
+        save_blob_bytes_to_burnpack(&burnpack_path, source_bytes.as_slice(), 1024)
             .expect("save blob burnpack");
-        let metadata = BlobMetadata {
-            bytes_len: source_bytes.len(),
-        };
-        std::fs::write(
-            metadata_path(&burnpack_path),
-            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
-        )
-        .expect("write metadata");
 
         std::fs::remove_file(&source_path).expect("remove source safetensors");
 
@@ -9757,7 +9895,6 @@ mod tests {
 
     #[test]
     fn runtime_loads_blob_burnpack_from_parts_manifest_when_base_file_missing() {
-        type BlobBackend = burn::backend::NdArray<f32, u8>;
         type TestBackend = burn::backend::NdArray<f32>;
 
         let unique = SystemTime::now()
@@ -9823,43 +9960,24 @@ mod tests {
         let source_bytes = std::fs::read(&source_path).expect("read source safetensors");
 
         let burnpack_path = ckpts.join("flow_model.bpk");
-        let blob_device = <BlobBackend as burn::tensor::backend::BackendTypes>::Device::default();
-        let tensor = Tensor::<BlobBackend, 1, Int>::from_data(
-            TensorData::new(source_bytes.clone(), [source_bytes.len()]),
-            &blob_device,
-        );
-        let blob = BinaryBlob {
-            bytes: Param::initialized(ParamId::new(), tensor),
-        };
-        let mut burnpack_store = BurnpackStore::from_file(&burnpack_path).overwrite(true);
-        blob.save_into(&mut burnpack_store)
+        save_blob_bytes_to_burnpack(&burnpack_path, source_bytes.as_slice(), 1024)
             .expect("save blob burnpack");
-        let metadata = BlobMetadata {
-            bytes_len: source_bytes.len(),
-        };
-        std::fs::write(
-            metadata_path(&burnpack_path),
-            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
-        )
-        .expect("write metadata");
 
         let part_path = ckpts.join("flow_model.bpk.part-00000.bpk");
-        let part_meta_path = metadata_path(&part_path);
         std::fs::rename(&burnpack_path, &part_path).expect("move burnpack into part");
-        std::fs::rename(metadata_path(&burnpack_path), &part_meta_path)
-            .expect("move part metadata");
+        let part_bytes = std::fs::metadata(&part_path).expect("part metadata").len();
         let manifest_path = ckpts.join("flow_model.bpk.parts.json");
         std::fs::write(
             &manifest_path,
             format!(
                 "{{\n  \"version\": 1,\n  \"source_file\": \"flow_model.bpk\",\n  \"source_modified_unix_ms\": 0,\n  \"total_bytes\": {},\n  \"max_part_bytes\": {},\n  \"parts\": [{{\"path\": \"{}\", \"bytes\": {}, \"sha256\": \"\", \"tensors\": 1}}]\n}}",
-                source_bytes.len(),
-                source_bytes.len(),
+                part_bytes,
+                part_bytes,
                 part_path
                     .file_name()
                     .and_then(|v| v.to_str())
                     .expect("part file name"),
-                source_bytes.len()
+                part_bytes
             ),
         )
         .expect("write parts manifest");
@@ -9903,6 +10021,7 @@ mod tests {
         super::RopeRotateWgpuBridgeImpl: super::SparseFlowRmsNormWgpuBridge<B>,
         super::RopeRotateWgpuBridgeImpl: super::SparseFlowQkRmsNormWgpuBridge<B>,
         super::SparseFlowLinearWgpuBridgeImpl: super::SparseFlowLinearWgpuBridge<B>,
+        super::SparseFlowBf16EmulationBridgeImpl: super::SparseFlowBf16EmulationBridge<B>,
     {
         let config = SparseStructureFlowConfig {
             resolution: 2,
@@ -10386,6 +10505,7 @@ mod tests {
             sparse_flow_module_attention_f16: false,
             sparse_flow_linear_f16: false,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -10416,6 +10536,7 @@ mod tests {
             sparse_flow_module_attention_f16: true,
             sparse_flow_linear_f16: true,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -10452,6 +10573,7 @@ mod tests {
             sparse_flow_module_attention_f16: probe_f16,
             sparse_flow_linear_f16: false,
             sparse_flow_torso_f16: false,
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -10928,7 +11050,7 @@ mod tests {
         key: &str,
     ) -> Option<crate::hook_diff::MetricStats> {
         let Some(reference) = hook.tensors.get(key) else {
-            eprintln!("trellis2 slat probe: reference key '{key}' missing; skipping {label}");
+            eprintln!("trellis2 flow probe: reference key '{key}' missing; skipping {label}");
             return None;
         };
         assert_eq!(
@@ -10938,7 +11060,7 @@ mod tests {
         );
         let stats = compute_stats(actual, reference.data.as_slice());
         eprintln!(
-            "trellis2 slat probe {label}: key={key} mean_abs={:.9e} max_abs={:.9e} rmse={:.9e} non_finite={}",
+            "trellis2 flow probe {label}: key={key} mean_abs={:.9e} max_abs={:.9e} rmse={:.9e} non_finite={}",
             stats.mean_abs, stats.max_abs, stats.rmse, stats.non_finite_count
         );
         Some(stats)
@@ -11287,7 +11409,12 @@ mod tests {
         if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_DEBUG_ATTENTION_PRE_ONLY").is_ok() {
             return;
         }
-        let sdpa = scaled_dot_product_attention(q.clone(), k.clone(), v.clone(), attn.head_dim);
+        let sdpa = sparse_flow_stock_bf16_round(scaled_dot_product_attention(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            attn.head_dim,
+        ));
         compare_debug_probe_tensor(
             "block0.self_attn.sdpa",
             tensor_to_vec4(sdpa.clone()).as_slice(),
@@ -11541,6 +11668,454 @@ mod tests {
     }
 
     #[cfg(feature = "runtime-model-wgpu")]
+    fn maybe_run_sparse_structure_block0_debug_probe(
+        runtime_impl: &SparseStructureFlowRuntimeImpl<WgpuRuntimeBackend>,
+        noise: &HookTensor,
+        timestep: f32,
+        cond: Tensor<WgpuRuntimeBackend, 3>,
+        hook: &HookSnapshot,
+    ) {
+        let debug_prefix = "debug.sparse_structure.block0";
+        if !hook
+            .tensors
+            .contains_key(format!("{debug_prefix}.input_layer").as_str())
+        {
+            return;
+        }
+
+        let config = runtime_impl.config();
+        let model = &runtime_impl.model;
+        let batch = 1usize;
+        let tokens = config.resolution * config.resolution * config.resolution;
+        let channels = config.model_channels;
+        let sample = Tensor::<WgpuRuntimeBackend, 1>::from_floats(
+            noise.data.as_slice(),
+            &runtime_impl.device,
+        )
+        .reshape([
+            batch,
+            config.out_channels,
+            config.resolution,
+            config.resolution,
+            config.resolution,
+        ]);
+        let x = sample
+            .reshape([batch, config.out_channels, tokens])
+            .swap_dims(1, 2);
+        let token_coords =
+            super::dense_grid_token_coords(config.resolution, runtime_impl.device.clone());
+        let compare = |label: &str, actual: &[f32], key_suffix: &str| {
+            compare_debug_probe_tensor(
+                label,
+                actual,
+                Some(hook),
+                format!("{debug_prefix}.{key_suffix}").as_str(),
+            );
+        };
+
+        let h_input = linear_forward_input_token_chunked(
+            &model.input_layer,
+            x,
+            sparse_flow_linear_chunk_tokens_for_backend::<WgpuRuntimeBackend>(tokens),
+        );
+        compare(
+            "ss.block0.input_layer",
+            tensor_to_vec3(h_input.clone()).as_slice(),
+            "input_layer",
+        );
+
+        let t =
+            Tensor::<WgpuRuntimeBackend, 1>::from_floats([timestep * 1000.0], &runtime_impl.device);
+        let t_emb = model.t_embedder.forward(t, config.frequency_embedding_size);
+        compare(
+            "ss.block0.t_embedder",
+            tensor_to_vec2(t_emb.clone()).as_slice(),
+            "t_embedder",
+        );
+        let mod_signal_base =
+            linear_forward_stable_2d_reference(&model.ada_ln_modulation, silu(t_emb));
+        compare(
+            "ss.block0.mod_signal_base",
+            tensor_to_vec2(mod_signal_base.clone()).as_slice(),
+            "mod_signal_base",
+        );
+
+        let h = sparse_flow_stock_bf16_round(h_input);
+        let mod_signal_cast = sparse_flow_stock_bf16_round(mod_signal_base);
+        let cond_cast = sparse_flow_stock_bf16_round(cond);
+        compare(
+            "ss.block0.input_cast",
+            tensor_to_vec3(h.clone()).as_slice(),
+            "input_cast",
+        );
+        compare(
+            "ss.block0.mod_signal_cast",
+            tensor_to_vec2(mod_signal_cast.clone()).as_slice(),
+            "mod_signal_cast",
+        );
+        compare(
+            "ss.block0.cond_cast",
+            tensor_to_vec3(cond_cast.clone()).as_slice(),
+            "cond_cast",
+        );
+
+        let block = &model.blocks[0];
+        let mod_bias = block.modulation.val().reshape([1, channels * 6]);
+        let mod_signal_dtype: burn::tensor::FloatDType = mod_signal_cast.dtype().into();
+        let mod_bias_dtype: burn::tensor::FloatDType = mod_bias.dtype().into();
+        let mod_bias = if mod_bias_dtype != mod_signal_dtype {
+            mod_bias.cast(mod_signal_dtype)
+        } else {
+            mod_bias
+        };
+        let mod_signal = sparse_flow_stock_bf16_round(mod_signal_cast.add(mod_bias));
+        compare(
+            "ss.block0.mod_signal_with_bias",
+            tensor_to_vec2(mod_signal.clone()).as_slice(),
+            "mod_signal_with_bias",
+        );
+        let shift_msa = mod_signal
+            .clone()
+            .slice([0..batch, 0..channels])
+            .reshape([batch, 1, channels]);
+        let scale_msa = mod_signal
+            .clone()
+            .slice([0..batch, channels..(channels * 2)])
+            .reshape([batch, 1, channels]);
+        let gate_msa = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 2)..(channels * 3)])
+            .reshape([batch, 1, channels]);
+        let shift_mlp = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 3)..(channels * 4)])
+            .reshape([batch, 1, channels]);
+        let scale_mlp = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 4)..(channels * 5)])
+            .reshape([batch, 1, channels]);
+        let gate_mlp = mod_signal
+            .clone()
+            .slice([0..batch, (channels * 5)..(channels * 6)])
+            .reshape([batch, 1, channels]);
+        compare(
+            "ss.block0.shift_msa",
+            tensor_to_vec3(shift_msa.clone()).as_slice(),
+            "shift_msa",
+        );
+        compare(
+            "ss.block0.scale_msa",
+            tensor_to_vec3(scale_msa.clone()).as_slice(),
+            "scale_msa",
+        );
+        compare(
+            "ss.block0.gate_msa",
+            tensor_to_vec3(gate_msa.clone()).as_slice(),
+            "gate_msa",
+        );
+
+        let norm1 =
+            sparse_flow_stock_bf16_round(layer_norm_no_affine(h.clone(), super::LAYER_NORM_EPS));
+        compare(
+            "ss.block0.norm1",
+            tensor_to_vec3(norm1.clone()).as_slice(),
+            "norm1",
+        );
+        let scale_msa_plus = sparse_flow_stock_bf16_round(scale_msa.add_scalar(1.0));
+        let norm1_scaled = sparse_flow_stock_bf16_round(norm1.mul(scale_msa_plus));
+        let norm1_mod = sparse_flow_stock_bf16_round(norm1_scaled.add(shift_msa));
+        compare(
+            "ss.block0.norm1_mod",
+            tensor_to_vec3(norm1_mod.clone()).as_slice(),
+            "norm1_mod",
+        );
+
+        let attn = &block.self_attn;
+        let qkv_linear = linear_forward_attention(&attn.to_qkv, norm1_mod.clone(), false);
+        compare(
+            "ss.block0.self_attn.qkv_linear",
+            tensor_to_vec3(qkv_linear.clone()).as_slice(),
+            "self_attn.qkv_linear",
+        );
+        let qkv = qkv_linear.reshape([batch, tokens, 3, attn.num_heads, attn.head_dim]);
+        let q = qkv
+            .clone()
+            .slice([
+                0..batch,
+                0..tokens,
+                0..1,
+                0..attn.num_heads,
+                0..attn.head_dim,
+            ])
+            .reshape([batch, tokens, attn.num_heads, attn.head_dim]);
+        let k = qkv
+            .clone()
+            .slice([
+                0..batch,
+                0..tokens,
+                1..2,
+                0..attn.num_heads,
+                0..attn.head_dim,
+            ])
+            .reshape([batch, tokens, attn.num_heads, attn.head_dim]);
+        let v = qkv
+            .clone()
+            .slice([
+                0..batch,
+                0..tokens,
+                2..3,
+                0..attn.num_heads,
+                0..attn.head_dim,
+            ])
+            .reshape([batch, tokens, attn.num_heads, attn.head_dim]);
+        compare(
+            "ss.block0.self_attn.q_pre_norm",
+            tensor_to_vec4(q.clone()).as_slice(),
+            "self_attn.q_pre_norm",
+        );
+        compare(
+            "ss.block0.self_attn.k_pre_norm",
+            tensor_to_vec4(k.clone()).as_slice(),
+            "self_attn.k_pre_norm",
+        );
+        compare(
+            "ss.block0.self_attn.v",
+            tensor_to_vec4(v.clone()).as_slice(),
+            "self_attn.v",
+        );
+        let q = if let Some(norm) = attn.q_rms_norm.as_ref() {
+            norm.forward(q)
+        } else {
+            q
+        };
+        let k = if let Some(norm) = attn.k_rms_norm.as_ref() {
+            norm.forward(k)
+        } else {
+            k
+        };
+        compare(
+            "ss.block0.self_attn.q_rms",
+            tensor_to_vec4(q.clone()).as_slice(),
+            "self_attn.q_rms",
+        );
+        compare(
+            "ss.block0.self_attn.k_rms",
+            tensor_to_vec4(k.clone()).as_slice(),
+            "self_attn.k_rms",
+        );
+        let q = if attn.use_rope {
+            apply_rope_single(
+                q,
+                config.resolution,
+                attn.head_dim,
+                attn.rope_freq,
+                Some(token_coords.clone()),
+                0,
+            )
+        } else {
+            q
+        };
+        let k = if attn.use_rope {
+            apply_rope_single(
+                k,
+                config.resolution,
+                attn.head_dim,
+                attn.rope_freq,
+                Some(token_coords.clone()),
+                0,
+            )
+        } else {
+            k
+        };
+        compare(
+            "ss.block0.self_attn.q_rope",
+            tensor_to_vec4(q.clone()).as_slice(),
+            "self_attn.q_rope",
+        );
+        compare(
+            "ss.block0.self_attn.k_rope",
+            tensor_to_vec4(k.clone()).as_slice(),
+            "self_attn.k_rope",
+        );
+        let debug_q = tokens.min(16);
+        let q_bh = q.clone().permute([0, 2, 1, 3]);
+        let k_bh = k.clone().permute([0, 2, 1, 3]);
+        let v_bh = v.clone().permute([0, 2, 1, 3]);
+        let q_bh_chunk = q_bh
+            .slice([0..batch, 0..attn.num_heads, 0..debug_q, 0..attn.head_dim])
+            .clone();
+        let logits = sparse_flow_stock_bf16_round(
+            matmul_4d_via_3d(q_bh_chunk, k_bh.clone().swap_dims(2, 3))
+                .mul_scalar(1.0 / (attn.head_dim as f32).sqrt()),
+        );
+        compare(
+            "ss.block0.self_attn.logits_q0_16",
+            tensor_to_vec4(logits.clone()).as_slice(),
+            "self_attn.logits_q0_16",
+        );
+        let probs = sparse_flow_stock_bf16_round(softmax(logits, 3));
+        compare(
+            "ss.block0.self_attn.probs_q0_16",
+            tensor_to_vec4(probs.clone()).as_slice(),
+            "self_attn.probs_q0_16",
+        );
+        let context =
+            sparse_flow_stock_bf16_round(matmul_4d_via_3d(probs, v_bh)).permute([0, 2, 1, 3]);
+        compare(
+            "ss.block0.self_attn.context_q0_16",
+            tensor_to_vec4(context).as_slice(),
+            "self_attn.context_q0_16",
+        );
+        let sdpa = sparse_flow_stock_bf16_round(scaled_dot_product_attention(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            attn.head_dim,
+        ));
+        compare(
+            "ss.block0.self_attn.sdpa",
+            tensor_to_vec4(sdpa.clone()).as_slice(),
+            "self_attn.sdpa",
+        );
+        let sdpa_flat = sdpa.reshape([batch, tokens, channels]);
+        let self_out = linear_forward_attention(&attn.to_out, sdpa_flat, false);
+        compare(
+            "ss.block0.self_attn.out",
+            tensor_to_vec3(self_out.clone()).as_slice(),
+            "self_attn.out",
+        );
+        let self_forward =
+            block
+                .self_attn
+                .forward(norm1_mod, config.resolution, Some(token_coords.clone()));
+        compare(
+            "ss.block0.self_attn.forward",
+            tensor_to_vec3(self_forward.clone()).as_slice(),
+            "self_attn.forward",
+        );
+
+        let after_self = sparse_flow_stock_bf16_round(
+            h.clone()
+                .add(sparse_flow_stock_bf16_round(self_forward.mul(gate_msa))),
+        );
+        compare(
+            "ss.block0.after_self",
+            tensor_to_vec3(after_self.clone()).as_slice(),
+            "after_self",
+        );
+        let norm2 = sparse_flow_stock_bf16_round(layer_norm_affine_stable(
+            after_self.clone(),
+            &block.norm2,
+            super::LAYER_NORM_EPS,
+        ));
+        compare(
+            "ss.block0.norm2",
+            tensor_to_vec3(norm2.clone()).as_slice(),
+            "norm2",
+        );
+
+        let cross = &block.cross_attn;
+        let cross_q_linear = linear_forward_attention(&cross.to_q, norm2.clone(), false);
+        let cross_kv_linear = linear_forward_attention(&cross.to_kv, cond_cast.clone(), false);
+        compare(
+            "ss.block0.cross_attn.q_linear",
+            tensor_to_vec3(cross_q_linear.clone()).as_slice(),
+            "cross_attn.q_linear",
+        );
+        compare(
+            "ss.block0.cross_attn.kv_linear",
+            tensor_to_vec3(cross_kv_linear.clone()).as_slice(),
+            "cross_attn.kv_linear",
+        );
+        let [cond_batch, cond_tokens, _] = cond_cast.dims();
+        let mut cross_q = cross_q_linear.reshape([batch, tokens, cross.num_heads, cross.head_dim]);
+        let cross_kv =
+            cross_kv_linear.reshape([cond_batch, cond_tokens, 2, cross.num_heads, cross.head_dim]);
+        let mut cross_k = cross_kv
+            .clone()
+            .slice([
+                0..cond_batch,
+                0..cond_tokens,
+                0..1,
+                0..cross.num_heads,
+                0..cross.head_dim,
+            ])
+            .reshape([cond_batch, cond_tokens, cross.num_heads, cross.head_dim]);
+        let cross_v = cross_kv
+            .slice([
+                0..cond_batch,
+                0..cond_tokens,
+                1..2,
+                0..cross.num_heads,
+                0..cross.head_dim,
+            ])
+            .reshape([cond_batch, cond_tokens, cross.num_heads, cross.head_dim]);
+        if let Some(norm) = cross.q_rms_norm.as_ref() {
+            cross_q = norm.forward(cross_q);
+        }
+        if let Some(norm) = cross.k_rms_norm.as_ref() {
+            cross_k = norm.forward(cross_k);
+        }
+        compare(
+            "ss.block0.cross_attn.q_rms",
+            tensor_to_vec4(cross_q.clone()).as_slice(),
+            "cross_attn.q_rms",
+        );
+        compare(
+            "ss.block0.cross_attn.k_rms",
+            tensor_to_vec4(cross_k.clone()).as_slice(),
+            "cross_attn.k_rms",
+        );
+        let cross_sdpa = sparse_flow_stock_bf16_round(scaled_dot_product_attention(
+            cross_q,
+            cross_k,
+            cross_v,
+            cross.head_dim,
+        ));
+        compare(
+            "ss.block0.cross_attn.sdpa",
+            tensor_to_vec4(cross_sdpa.clone()).as_slice(),
+            "cross_attn.sdpa",
+        );
+        let cross_flat = cross_sdpa.reshape([batch, tokens, channels]);
+        let cross_out = linear_forward_attention(&cross.to_out, cross_flat, false);
+        compare(
+            "ss.block0.cross_attn.out",
+            tensor_to_vec3(cross_out.clone()).as_slice(),
+            "cross_attn.out",
+        );
+        let after_cross =
+            sparse_flow_stock_bf16_round(after_self.add(sparse_flow_stock_bf16_round(cross_out)));
+        compare(
+            "ss.block0.after_cross",
+            tensor_to_vec3(after_cross.clone()).as_slice(),
+            "after_cross",
+        );
+        let norm3 = sparse_flow_stock_bf16_round(layer_norm_no_affine(
+            after_cross.clone(),
+            super::LAYER_NORM_EPS,
+        ));
+        let scale_mlp_plus = sparse_flow_stock_bf16_round(scale_mlp.add_scalar(1.0));
+        let norm3_scaled = sparse_flow_stock_bf16_round(norm3.mul(scale_mlp_plus));
+        let norm3_mod = sparse_flow_stock_bf16_round(norm3_scaled.add(shift_mlp));
+        compare(
+            "ss.block0.norm3_mod",
+            tensor_to_vec3(norm3_mod.clone()).as_slice(),
+            "norm3_mod",
+        );
+        let mlp = block.mlp.forward(norm3_mod);
+        compare(
+            "ss.block0.mlp",
+            tensor_to_vec3(mlp.clone()).as_slice(),
+            "mlp",
+        );
+        let block_out = sparse_flow_stock_bf16_round(
+            after_cross.add(sparse_flow_stock_bf16_round(mlp.mul(gate_mlp))),
+        );
+        compare("ss.block0.out", tensor_to_vec3(block_out).as_slice(), "out");
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn slat_first_forward_probe() {
         if std::env::var("TRELLIS2_SLAT_FORWARD_PROBE").is_err() {
@@ -11593,6 +12168,7 @@ mod tests {
             sparse_flow_module_attention_f16: attention_f16,
             sparse_flow_linear_f16: linear_f16,
             sparse_flow_torso_f16: std::env::var("TRELLIS2_SLAT_FORWARD_PROBE_TORSO_F16").is_ok(),
+            sparse_flow_stock_bf16_emulation: false,
             sparse_flow_coord_rope_kernel: true,
             sparse_decoder_conv_f16: false,
         });
@@ -11983,6 +12559,252 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    #[test]
+    fn sparse_structure_flow_sampler_probe_current_reference_wgpu() {
+        if std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE").is_err() {
+            eprintln!(
+                "Skipping Trellis.2 sparse-structure WGPU sampler probe: set TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE=1 to enable."
+            );
+            return;
+        }
+
+        let hook_path = std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_HOOK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(
+                    "tmp/runs/20260621T203243Z_trellis2_ui_medium_fullhook_capture/python/reference_hook.safetensors",
+                )
+            });
+        assert!(
+            hook_path.exists(),
+            "TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_HOOK does not exist: {}",
+            hook_path.display()
+        );
+        let weights_root = std::env::var("TRELLIS2_WEIGHTS_ROOT")
+            .map(PathBuf::from)
+            .expect("TRELLIS2_WEIGHTS_ROOT must point at the TRELLIS.2-4B weights root");
+        assert!(
+            weights_root.exists(),
+            "TRELLIS2_WEIGHTS_ROOT does not exist: {}",
+            weights_root.display()
+        );
+
+        let profile = std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_PROFILE")
+            .unwrap_or_else(|_| "reference-f32".to_string());
+        let (self_f16, cross_f16, final_f32_steps, stock_bf16_emulation) = match profile.as_str() {
+            "reference-f32" | "f32" => (false, false, 0usize, false),
+            "stock-bf16-emulated" => (false, false, 0usize, true),
+            "wgpu-fast-mixed-f16" => (false, false, 0usize, false),
+            "wgpu-fast-sparse-self-f16" => (true, false, 0usize, false),
+            "wgpu-fast-sparse-cross-f16" => (false, true, 0usize, false),
+            "wgpu-fast-f16-tail1-f32" => (true, true, 1usize, false),
+            "wgpu-fast-f16-tail2-f32" => (true, true, 2usize, false),
+            "wgpu-fast-f16-tail4-f32" => (true, true, 4usize, false),
+            "wgpu-fast-f16-tail6-f32" => (true, true, 6usize, false),
+            "wgpu-fast-f16" => (true, true, 0usize, false),
+            other => panic!("unsupported sparse-structure probe profile '{other}'"),
+        };
+        set_runtime_model_debug_config(RuntimeModelDebugConfig {
+            stage_debug: std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_STAGE_DEBUG").is_ok(),
+            attention_debug: false,
+            sparse_flow_module_attention: true,
+            sparse_flow_module_attention_f16: self_f16 || cross_f16,
+            sparse_flow_linear_f16: std::env::var(
+                "TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_LINEAR_F16",
+            )
+            .is_ok(),
+            sparse_flow_torso_f16: std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_TORSO_F16")
+                .is_ok(),
+            sparse_flow_stock_bf16_emulation: stock_bf16_emulation,
+            sparse_flow_coord_rope_kernel: true,
+            sparse_decoder_conv_f16: false,
+        });
+        set_runtime_model_sparse_flow_attention_policy(self_f16, cross_f16, final_f32_steps);
+
+        let hook = HookSnapshot::from_file(&hook_path)
+            .expect("load Python sparse-structure hook snapshot");
+        let model_stem = std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_MODEL_STEM")
+            .unwrap_or_else(|_| "ckpts/ss_flow_img_dit_1_3B_64_bf16".to_string());
+        let runtime = SparseStructureFlowRuntime::load_from_stem(
+            weights_root.as_path(),
+            None,
+            model_stem.as_str(),
+            true,
+            None,
+        )
+        .expect("load sparse-structure flow runtime on WGPU");
+        assert_eq!(
+            runtime.backend_name(),
+            "wgpu",
+            "probe must execute on the WGPU backend"
+        );
+
+        let config = runtime.config().clone();
+        let sampler_config_key = "sample_sparse_structure.sampler.config";
+        let sample_cfg = sampler_config_from_hook(&hook, sampler_config_key);
+        let sigma_min = sampler_sigma_min(&hook, sampler_config_key);
+        let noise = required_hook_tensor(&hook, "sample_sparse_structure.noise");
+        assert_eq!(
+            noise.shape,
+            vec![
+                1usize,
+                config.out_channels,
+                config.resolution,
+                config.resolution,
+                config.resolution
+            ],
+            "sparse-structure noise shape must match runtime config"
+        );
+        let cond_key = "get_cond_512.out.cond";
+        let neg_cond_key = "get_cond_512.out.neg_cond";
+        let (cond_values, cond_tokens) = hook_condition_values(
+            required_hook_tensor(&hook, cond_key),
+            config.cond_channels,
+            cond_key,
+        );
+        let (neg_values, neg_tokens) = hook_condition_values(
+            required_hook_tensor(&hook, neg_cond_key),
+            config.cond_channels,
+            neg_cond_key,
+        );
+        assert_eq!(cond_tokens, neg_tokens, "cond/neg token count mismatch");
+        let cond = runtime
+            .prepare_condition(cond_values.as_slice(), cond_tokens)
+            .expect("prepare positive sparse-structure condition");
+        let neg_cond = runtime
+            .prepare_condition(neg_values.as_slice(), neg_tokens)
+            .expect("prepare negative sparse-structure condition");
+
+        if let SparseStructureFlowRuntime::Wgpu(runtime_impl) = &runtime {
+            let cond_tensor = match &cond {
+                SparseFlowCondition::Wgpu(tensor) => tensor.clone(),
+                SparseFlowCondition::Cpu(_) => panic!("positive condition must be WGPU-backed"),
+            };
+            let t_pairs = super::timestep_pairs(sample_cfg.steps, sample_cfg.rescale_t);
+            maybe_run_sparse_structure_block0_debug_probe(
+                runtime_impl,
+                noise,
+                t_pairs[0].0,
+                cond_tensor,
+                &hook,
+            );
+            if std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_BLOCK0_DEBUG_ONLY").is_ok() {
+                return;
+            }
+        }
+
+        let start = Instant::now();
+        let trace = runtime
+            .sample_with_trace(
+                noise.data.as_slice(),
+                sample_cfg,
+                sigma_min,
+                &cond,
+                &neg_cond,
+                None,
+                true,
+            )
+            .expect("sample sparse-structure flow with trace");
+        <WgpuRuntimeBackend as Backend>::sync(&burn_wgpu::WgpuDevice::default())
+            .expect("sync sparse-structure flow probe");
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        eprintln!(
+            "trellis2 sparse-structure sampler probe: profile={profile} steps={} elapsed={elapsed_ms:.2}ms",
+            sample_cfg.steps
+        );
+
+        let mut strict_stats = Vec::new();
+        if let Some(stats) = compare_probe_tensor(
+            "step_0_pred_v",
+            trace.step_0_pred_v.as_slice(),
+            &hook,
+            "sample_sparse_structure.sampler.step_000_of_012.pred_v",
+        ) {
+            strict_stats.push(("step_0_pred_v", stats));
+        }
+        if let Some(stats) = compare_probe_tensor(
+            "step_0_x_t",
+            trace.step_0_x_t.as_slice(),
+            &hook,
+            "sample_sparse_structure.sampler.step_000_of_012.x_t",
+        ) {
+            strict_stats.push(("step_0_x_t", stats));
+        }
+        if let Some(stats) = compare_probe_tensor(
+            "latent",
+            trace.samples.as_slice(),
+            &hook,
+            "sample_sparse_structure.latent",
+        ) {
+            strict_stats.push(("latent", stats));
+        }
+
+        for (step_idx, pred_v) in trace.step_pred_v.iter().enumerate() {
+            let key = format!(
+                "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.pred_v",
+                sample_cfg.steps
+            );
+            if let Some(stats) = compare_probe_tensor(
+                format!("step_{step_idx:03}_pred_v").as_str(),
+                pred_v,
+                &hook,
+                key.as_str(),
+            ) {
+                strict_stats.push(("step_pred_v", stats));
+            }
+        }
+        for (step_idx, x_t) in trace.step_x_t.iter().enumerate() {
+            let key = format!(
+                "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.x_t",
+                sample_cfg.steps
+            );
+            if let Some(stats) = compare_probe_tensor(
+                format!("step_{step_idx:03}_x_t").as_str(),
+                x_t,
+                &hook,
+                key.as_str(),
+            ) {
+                strict_stats.push(("step_x_t", stats));
+            }
+        }
+
+        if std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_STRICT").is_ok() {
+            assert!(
+                !strict_stats.is_empty(),
+                "strict sparse-structure flow probe did not compare any reference tensors"
+            );
+            let mean_abs_tol = std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_MEAN_ABS_TOL")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(2.0e-3);
+            let max_abs_tol = std::env::var("TRELLIS2_SPARSE_STRUCTURE_FLOW_PROBE_MAX_ABS_TOL")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(2.0e-2);
+            for (label, stats) in strict_stats {
+                assert_eq!(
+                    stats.non_finite_count, 0,
+                    "sparse-structure {label} produced {} non-finite comparisons",
+                    stats.non_finite_count
+                );
+                assert!(
+                    stats.mean_abs <= mean_abs_tol,
+                    "sparse-structure {label} mean_abs {:.6e} exceeded tolerance {:.6e}",
+                    stats.mean_abs,
+                    mean_abs_tol
+                );
+                assert!(
+                    stats.max_abs <= max_abs_tol,
+                    "sparse-structure {label} max_abs {:.6e} exceeded tolerance {:.6e}",
+                    stats.max_abs,
+                    max_abs_tol
+                );
+            }
+        }
+        set_runtime_model_debug_config(RuntimeModelDebugConfig::default());
     }
 
     #[cfg(feature = "runtime-model-wgpu")]

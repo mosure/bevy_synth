@@ -1,6 +1,6 @@
-use std::fs;
 #[cfg(feature = "runtime-model")]
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 
 #[cfg(feature = "runtime-model")]
@@ -12,8 +12,8 @@ use super::{
     validate_sparse_layout_rows,
 };
 use super::{
-    SparseCoordCapSource, bake_pbr_from_voxels, runtime_max_sparse_coords_for_backend,
-    summarize_material,
+    SparseCoordCapSource, TrellisDecodeOutputMode, bake_pbr_from_voxels,
+    runtime_max_sparse_coords_for_backend, summarize_material,
 };
 #[cfg(feature = "runtime-model")]
 use crate::hook_diff::{HookSnapshot, compute_stats};
@@ -22,24 +22,35 @@ use crate::mesh::MeshPbrTextures;
 use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 #[cfg(feature = "runtime-model")]
 use crate::preprocess::PreprocessOutput;
-#[cfg(feature = "runtime-model-wgpu")]
-use burn::tensor::{Int, Tensor, TensorData};
-#[cfg(feature = "runtime-model-wgpu")]
-use burn_flex_gmm::wgpu::DefaultWgpuBackend;
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::fdg_decoder::{FdgDecoderRuntime, decode_fdg_outputs};
+#[cfg(feature = "runtime-model")]
+use crate::runtime_model::runtime_config::{
+    RuntimeModelDebugConfig, set_runtime_model_debug_config,
+};
 #[cfg(feature = "runtime-model")]
 use crate::runtime_model::sparse_decoder::{
     SparseSubdivisionLogits, decoder_conv_telemetry, decoder_op_telemetry,
     reset_decoder_conv_telemetry, reset_decoder_op_telemetry,
 };
 #[cfg(feature = "runtime-model")]
-use crate::runtime_model::sparse_unet_vae_decoder::{SparseUnetVaeDecoderRuntime, decode_tex_outputs};
+use crate::runtime_model::sparse_unet_vae_decoder::{
+    SparseUnetVaeDecoderRuntime, decode_tex_outputs,
+};
 #[cfg(feature = "runtime-model")]
 use crate::trellis_config::TrellisPipelineConfig;
+#[cfg(feature = "runtime-model-wgpu")]
+use burn::tensor::{Int, Tensor, TensorData};
+#[cfg(feature = "runtime-model-wgpu")]
+use burn_flex_gmm::wgpu::DefaultWgpuBackend;
 
 #[cfg(feature = "runtime-model")]
 fn env_flag(name: &str) -> bool {
+    env_flag_default(name, false)
+}
+
+#[cfg(feature = "runtime-model")]
+fn env_flag_default(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
         .map(|value| {
@@ -48,7 +59,7 @@ fn env_flag(name: &str) -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(default)
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -61,6 +72,18 @@ fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<f32>().ok())
+}
+
+#[test]
+fn decode_output_modes_keep_mesh_postprocess_separate_from_pbr() {
+    assert!(TrellisDecodeOutputMode::NativePbr.needs_native_pbr());
+    assert!(TrellisDecodeOutputMode::NativePbr.needs_native_mesh_postprocess());
+
+    assert!(!TrellisDecodeOutputMode::NativeMesh.needs_native_pbr());
+    assert!(TrellisDecodeOutputMode::NativeMesh.needs_native_mesh_postprocess());
+
+    assert!(!TrellisDecodeOutputMode::OvoxelHookExport.needs_native_pbr());
+    assert!(!TrellisDecodeOutputMode::OvoxelHookExport.needs_native_mesh_postprocess());
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -78,7 +101,10 @@ fn coords_to_default_wgpu_tensor(coords: &[[u32; 4]]) -> Tensor<DefaultWgpuBacke
             flat.push(converted);
         }
     }
-    Tensor::<DefaultWgpuBackend, 2, Int>::from_data(TensorData::new(flat, [coords.len(), 4]), &device)
+    Tensor::<DefaultWgpuBackend, 2, Int>::from_data(
+        TensorData::new(flat, [coords.len(), 4]),
+        &device,
+    )
 }
 
 #[cfg(feature = "runtime-model")]
@@ -287,9 +313,8 @@ fn canonical_wgpu_no_host_readback_before_extraction() {
             occurrences.push((rel_path.to_string(), line_no));
         }
     }
-    occurrences.sort_by(|(file_a, line_a), (file_b, line_b)| {
-        file_a.cmp(file_b).then(line_a.cmp(line_b))
-    });
+    occurrences
+        .sort_by(|(file_a, line_a), (file_b, line_b)| file_a.cmp(file_b).then(line_a.cmp(line_b)));
 
     let mut actual = Vec::with_capacity(occurrences.len());
     let mut current_file: Option<String> = None;
@@ -312,7 +337,10 @@ fn canonical_wgpu_no_host_readback_before_extraction() {
 #[test]
 fn sample_voxel_attr_returns_none_for_sparse_holes() {
     let mut voxel_map = std::collections::HashMap::new();
-    voxel_map.insert(super::pack_coord(10, 10, 10), [0.2, 0.3, 0.4, 0.1, 0.9, 1.0]);
+    voxel_map.insert(
+        super::pack_coord(10, 10, 10),
+        [0.2, 0.3, 0.4, 0.1, 0.9, 1.0],
+    );
 
     let sampled = super::sample_voxel_attr([0.0, 0.0, 0.0], &voxel_map, [512, 512, 512])
         .expect("sampling with non-empty map should not error");
@@ -331,7 +359,10 @@ fn decode_pbr_device_path_sparse_hole_failfast() {
 #[test]
 fn sample_voxel_attr_returns_value_when_supported() {
     let mut voxel_map = std::collections::HashMap::new();
-    voxel_map.insert(super::pack_coord(10, 10, 10), [0.2, 0.3, 0.4, 0.1, 0.9, 1.0]);
+    voxel_map.insert(
+        super::pack_coord(10, 10, 10),
+        [0.2, 0.3, 0.4, 0.1, 0.9, 1.0],
+    );
 
     let position = [
         (10.0 / 512.0) - 0.5,
@@ -354,13 +385,16 @@ fn dense_voxel_lookup_sampling_matches_sparse_hash_sampling() {
     ];
     let spatial = [16, 16, 16];
 
-    let lookup = super::build_voxel_attr_lookup(voxel_coords.as_slice(), voxel_attrs.as_slice(), spatial)
-        .expect("lookup build should succeed");
+    let lookup =
+        super::build_voxel_attr_lookup(voxel_coords.as_slice(), voxel_attrs.as_slice(), spatial)
+            .expect("lookup build should succeed");
     let (occupancy, attrs) = match lookup {
         super::VoxelAttrLookup::Dense {
             occupancy, attrs, ..
         } => (occupancy, attrs),
-        super::VoxelAttrLookup::Sparse { .. } => panic!("expected dense lookup for bounded spatial volume"),
+        super::VoxelAttrLookup::Sparse { .. } => {
+            panic!("expected dense lookup for bounded spatial volume")
+        }
     };
 
     let mut sparse_map = std::collections::HashMap::new();
@@ -374,8 +408,13 @@ fn dense_voxel_lookup_sampling_matches_sparse_hash_sampling() {
         [0.0, 0.0, 0.0],
     ];
     for position in positions {
-        let dense = super::sample_voxel_attr_dense(position, occupancy.as_slice(), attrs.as_slice(), spatial)
-            .expect("dense lookup should not fail");
+        let dense = super::sample_voxel_attr_dense(
+            position,
+            occupancy.as_slice(),
+            attrs.as_slice(),
+            spatial,
+        )
+        .expect("dense lookup should not fail");
         let sparse = super::sample_voxel_attr(position, &sparse_map, spatial)
             .expect("sparse lookup should not fail");
         assert_eq!(dense.is_some(), sparse.is_some());
@@ -432,6 +471,7 @@ fn pbr_bake_wgpu_dense_sampling_matches_cpu_sampling() {
     let (_uv_cpu, tex_cpu, _debug_cpu) = super::bake_pbr_from_voxels_with_options(
         vertices.as_slice(),
         faces.as_slice(),
+        None,
         vox_coords.as_slice(),
         vox_attrs.as_slice(),
         32,
@@ -443,6 +483,7 @@ fn pbr_bake_wgpu_dense_sampling_matches_cpu_sampling() {
     let (_uv_wgpu, tex_wgpu, _debug_wgpu) = super::bake_pbr_from_voxels_with_options(
         vertices.as_slice(),
         faces.as_slice(),
+        None,
         vox_coords.as_slice(),
         vox_attrs.as_slice(),
         32,
@@ -550,7 +591,8 @@ fn cascade_quantize_wgpu_matches_host_sort_dedup_semantics() {
     let host = super::quantize_cascade_coords(hr_coords.as_slice(), 512, 64)
         .expect("host quantize should succeed");
 
-    let device = <super::SparseFlowWgpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
+    let device =
+        <super::SparseFlowWgpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
     let mut flat = Vec::with_capacity(hr_coords.len().saturating_mul(4));
     for coord in hr_coords {
         for value in coord {
@@ -632,8 +674,7 @@ fn validate_sparse_layout_rows_accepts_contiguous_layout() {
 #[test]
 fn validate_sparse_layout_rows_rejects_row_mismatch() {
     let layout = vec![0..2, 2..3];
-    let err =
-        validate_sparse_layout_rows(layout.as_slice(), 4, "unit").expect_err("must fail");
+    let err = validate_sparse_layout_rows(layout.as_slice(), 4, "unit").expect_err("must fail");
     assert!(err.contains("layout_rows=3 expected_rows=4"));
 }
 
@@ -788,13 +829,62 @@ fn pbr_bake_produces_textures_and_uvs() {
     assert!(debug.raster_mask.iter().any(|value| *value != 0));
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pbr_bake_reused_projection_bvh_matches_owned_projection_bvh() {
+    let vertices = vec![[-0.02, 0.0, -0.02], [0.02, 0.0, -0.02], [0.0, 0.0, 0.02]];
+    let faces = vec![[0, 1, 2]];
+    let projection_vertices = vertices.clone();
+    let projection_faces = faces.clone();
+    let projection_source = super::PbrProjectionSource {
+        vertices: projection_vertices.as_slice(),
+        faces: projection_faces.as_slice(),
+    };
+    let vox_coords = vec![[0, 16, 16, 16], [0, 20, 16, 16], [0, 16, 20, 16]];
+    let vox_attrs = vec![
+        [0.8, 0.2, 0.1, 0.1, 0.8, 1.0],
+        [0.1, 0.8, 0.2, 0.3, 0.6, 1.0],
+        [0.2, 0.1, 0.8, 0.5, 0.4, 1.0],
+    ];
+
+    let (owned_mesh, owned_textures, _) = super::bake_pbr_from_voxels_with_options(
+        vertices.as_slice(),
+        faces.as_slice(),
+        Some(projection_source),
+        vox_coords.as_slice(),
+        vox_attrs.as_slice(),
+        32,
+        None,
+        false,
+        false,
+    )
+    .expect("owned projection bvh bake should succeed");
+    let projection_bvh = super::build_projection_bvh_for_pbr(projection_source)
+        .expect("projection bvh should build");
+    let (reused_mesh, reused_textures, _) =
+        super::bake_pbr_from_voxels_with_options_and_projection_bvh(
+            vertices.as_slice(),
+            faces.as_slice(),
+            Some(projection_source),
+            Some(&projection_bvh),
+            vox_coords.as_slice(),
+            vox_attrs.as_slice(),
+            32,
+            None,
+            false,
+            false,
+        )
+        .expect("reused projection bvh bake should succeed");
+
+    assert_eq!(reused_mesh.vertices, owned_mesh.vertices);
+    assert_eq!(reused_mesh.faces, owned_mesh.faces);
+    assert_eq!(reused_mesh.uvs, owned_mesh.uvs);
+    assert_eq!(reused_textures, owned_textures);
+}
+
 #[test]
 fn pbr_debug_samples_are_first_hit_bounded() {
-    let vertices = vec![
-        [-0.03, 0.0, -0.03],
-        [0.03, 0.0, -0.03],
-        [0.0, 0.0, 0.03],
-    ];
+    let vertices = vec![[-0.03, 0.0, -0.03], [0.03, 0.0, -0.03], [0.0, 0.0, 0.03]];
     // Duplicate the face to force overdraw. Debug hooks should still record one
     // accepted sample per covered texel, not every raster candidate.
     let faces = vec![[0, 1, 2], [0, 1, 2]];
@@ -879,6 +969,126 @@ fn pbr_quantization_tracks_float_buffers() {
 }
 
 #[test]
+fn pbr_inpaint_fills_uncovered_texels_without_hiding_raster_mask() {
+    let texture_size = 3;
+    let texels = texture_size * texture_size;
+    let center = 4;
+    let mut mask = vec![0u8; texels];
+    mask[center] = 255;
+    let mut base_color_float = vec![[0.0f32; 4]; texels];
+    let mut metallic_float = vec![0.0f32; texels];
+    let mut roughness_float = vec![1.0f32; texels];
+    let mut alpha_float = vec![0.0f32; texels];
+    base_color_float[center] = [0.25, 0.5, 0.75, 1.0];
+    metallic_float[center] = 0.4;
+    roughness_float[center] = 0.6;
+    alpha_float[center] = 1.0;
+
+    super::inpaint_texture_channels(
+        texture_size,
+        mask.as_mut_slice(),
+        base_color_float.as_mut_slice(),
+        metallic_float.as_mut_slice(),
+        roughness_float.as_mut_slice(),
+        alpha_float.as_mut_slice(),
+    )
+    .expect("inpaint should fill from the single covered texel");
+
+    for idx in 0..texels {
+        for channel in 0..4 {
+            assert!(
+                (base_color_float[idx][channel] - base_color_float[center][channel]).abs() < 1.0e-6
+            );
+        }
+        assert!((metallic_float[idx] - metallic_float[center]).abs() < 1.0e-6);
+        assert!((roughness_float[idx] - roughness_float[center]).abs() < 1.0e-6);
+        assert!((alpha_float[idx] - alpha_float[center]).abs() < 1.0e-6);
+    }
+    assert_eq!(mask.iter().filter(|value| **value != 0).count(), 1);
+    assert_eq!(mask[center], 255);
+}
+
+#[test]
+fn pbr_glb_output_uvs_flip_v_from_raster_uvs() {
+    let output = super::glb_output_uvs_from_raster_uvs(&[[0.25, 0.2], [1.2, -0.2]]);
+    assert_eq!(output, vec![[0.25, 0.8], [1.0, 1.0]]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_pbr_simple_dc_remesh_extracts_nonempty_surface() {
+    let vertices = vec![
+        [-0.25, -0.25, -0.25],
+        [0.25, -0.25, -0.25],
+        [0.25, 0.25, -0.25],
+        [-0.25, 0.25, -0.25],
+        [-0.25, -0.25, 0.25],
+        [0.25, -0.25, 0.25],
+        [0.25, 0.25, 0.25],
+        [-0.25, 0.25, 0.25],
+    ];
+    let faces = vec![
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+    ];
+
+    let bvh = super::build_projection_bvh_for_pbr(super::PbrProjectionSource {
+        vertices: vertices.as_slice(),
+        faces: faces.as_slice(),
+    })
+    .expect("projection bvh should build");
+    let (remeshed_vertices, remeshed_faces) =
+        super::remesh_narrow_band_simple_dc_with_projection_bvh(&bvh, 32, 1.0)
+            .expect("simple dc remesh should extract a surface");
+
+    assert!(!remeshed_vertices.is_empty());
+    assert!(!remeshed_faces.is_empty());
+    assert!(remeshed_faces.iter().all(|face| {
+        face.iter()
+            .all(|index| (*index as usize) < remeshed_vertices.len())
+    }));
+    assert!(remeshed_vertices.iter().all(|vertex| {
+        vertex
+            .iter()
+            .all(|component| component.is_finite() && component.abs() <= 0.6)
+    }));
+}
+
+#[test]
+fn pbr_uv_domain_is_portable_and_seam_split() {
+    let vertices = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    let faces = vec![[0, 1, 2], [0, 1, 3]];
+    let domain = super::build_uv_raster_domain(vertices.as_slice(), faces.as_slice(), 64);
+
+    assert_eq!(domain.output_faces.len(), faces.len());
+    assert_eq!(domain.raster_faces.len(), faces.len());
+    assert_eq!(domain.output_vertices.len(), faces.len() * 3);
+    assert_eq!(domain.raster_vertices.len(), faces.len() * 3);
+    assert_eq!(domain.output_uvs.len(), faces.len() * 3);
+    assert_eq!(domain.raster_uvs.len(), faces.len() * 3);
+    assert!(domain.output_vertices.len() > vertices.len());
+    for uv in domain.raster_uvs.iter().chain(domain.output_uvs.iter()) {
+        assert!((0.0..=1.0).contains(&uv[0]), "u out of range: {uv:?}");
+        assert!((0.0..=1.0).contains(&uv[1]), "v out of range: {uv:?}");
+    }
+}
+
+#[test]
 fn pbr_bake_benchmark_report() {
     if std::env::var("TRELLIS2_PBR_BENCH").is_err() {
         eprintln!("skipping: set TRELLIS2_PBR_BENCH=1 to run pbr_bake_benchmark_report");
@@ -939,6 +1149,7 @@ fn pbr_bake_benchmark_report() {
         let (_uvs, textures, debug) = super::bake_pbr_from_voxels_with_options(
             vertices.as_slice(),
             faces.as_slice(),
+            None,
             vox_coords.as_slice(),
             vox_attrs.as_slice(),
             fallback_res,
@@ -1123,18 +1334,31 @@ fn runtime_decoder_hook_alignment_report() {
             .expect("missing decode_shape_slat.input.feats"),
     )
     .expect("decode input feats should decode");
+    let tex_coords_key = if reference
+        .tensors
+        .contains_key("sample_tex_slat.slat.coords")
+    {
+        "sample_tex_slat.slat.coords"
+    } else {
+        "decode_tex_slat.input.coords"
+    };
+    let tex_feats_key = if reference.tensors.contains_key("sample_tex_slat.slat.feats") {
+        "sample_tex_slat.slat.feats"
+    } else {
+        "decode_tex_slat.input.feats"
+    };
     let tex_coords = tensor_to_coords4(
         reference
             .tensors
-            .get("sample_tex_slat.slat.coords")
-            .expect("missing sample_tex_slat.slat.coords"),
+            .get(tex_coords_key)
+            .unwrap_or_else(|| panic!("missing {tex_coords_key}")),
     )
     .expect("tex coords should decode");
     let tex_feats = tensor_to_rows::<32>(
         reference
             .tensors
-            .get("sample_tex_slat.slat.feats")
-            .expect("missing sample_tex_slat.slat.feats"),
+            .get(tex_feats_key)
+            .unwrap_or_else(|| panic!("missing {tex_feats_key}")),
     )
     .expect("tex feats should decode");
     let reference_voxel_coords = tensor_to_coords4(
@@ -1202,6 +1426,10 @@ fn runtime_decoder_hook_alignment_report() {
         .models
         .get("tex_slat_decoder")
         .expect("tex_slat_decoder model stem missing");
+    set_runtime_model_debug_config(RuntimeModelDebugConfig {
+        sparse_decoder_conv_f16: env_flag_default("TRELLIS2_DECODER_CONV_F16", true),
+        ..RuntimeModelDebugConfig::default()
+    });
 
     let shape_decoder = FdgDecoderRuntime::load_from_stem(
         weights_root.as_path(),

@@ -122,6 +122,13 @@ impl Mesh {
     }
 }
 
+pub fn remap_mesh_to_python_glb_frame(mesh: &mut Mesh) {
+    for vertex in mesh.vertices.iter_mut() {
+        let [x, y, z] = *vertex;
+        *vertex = [x, z, -y];
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MeshBinaryLayout {
     buffer: Vec<u8>,
@@ -222,6 +229,43 @@ pub fn write_obj_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
         .flush()
         .map_err(|err| format!("failed to flush OBJ: {err}"))?;
     Ok(())
+}
+
+pub fn mesh_signed_volume(mesh: &Mesh) -> f32 {
+    let mut volume = 0.0f32;
+    for face in &mesh.faces {
+        let i0 = face[0] as usize;
+        let i1 = face[1] as usize;
+        let i2 = face[2] as usize;
+        if i0 >= mesh.vertices.len() || i1 >= mesh.vertices.len() || i2 >= mesh.vertices.len() {
+            continue;
+        }
+        let a = mesh.vertices[i0];
+        let b = mesh.vertices[i1];
+        let c = mesh.vertices[i2];
+        volume += dot3(a, cross3(b, c)) / 6.0;
+    }
+    volume
+}
+
+pub fn orient_mesh_faces_to_positive_volume(mesh: &mut Mesh) {
+    if mesh_signed_volume(mesh) < 0.0 {
+        for face in &mut mesh.faces {
+            face.swap(1, 2);
+        }
+    }
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 pub fn write_glb_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
@@ -559,7 +603,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Mesh, MeshPbrTextures, MeshTexture, load_obj_mesh, write_glb_mesh, write_obj_mesh,
+        Mesh, MeshPbrTextures, MeshTexture, load_obj_mesh, mesh_signed_volume,
+        orient_mesh_faces_to_positive_volume, remap_mesh_to_python_glb_frame, write_glb_mesh,
+        write_obj_mesh,
     };
 
     #[test]
@@ -580,6 +626,32 @@ mod tests {
         let loaded = load_obj_mesh(&path).expect("failed to read obj");
         assert_eq!(loaded, mesh);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mesh_remap_to_python_glb_frame_swaps_yz_and_flips_y() {
+        let mut mesh = Mesh::new(vec![[1.0, 2.0, 3.0], [-4.0, -5.0, 6.0]], vec![[0, 1, 0]]);
+        remap_mesh_to_python_glb_frame(&mut mesh);
+        assert_eq!(mesh.vertices, vec![[1.0, 3.0, -2.0], [-4.0, 6.0, 5.0]]);
+    }
+
+    #[test]
+    fn orient_mesh_faces_to_positive_volume_flips_negative_winding() {
+        let mut mesh = Mesh::new(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        );
+        for face in &mut mesh.faces {
+            face.swap(1, 2);
+        }
+        assert!(mesh_signed_volume(&mesh) < 0.0);
+        orient_mesh_faces_to_positive_volume(&mut mesh);
+        assert!(mesh_signed_volume(&mesh) > 0.0);
     }
 
     #[test]

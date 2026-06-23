@@ -92,6 +92,7 @@
           <label class="boot-control-label" for="synthesis-model">synthesis</label>
           <select id="synthesis-model" class="boot-control-select" name="synthesis_model">
             <option value="triposg" selected>triposg</option>
+            <option value="trellis">trellis</option>
             <option value="triposplat">triposplat</option>
           </select>
         </div>
@@ -183,6 +184,9 @@
       const normalizeSynthesisModel = (value) => {
         const normalized = String(value || "").trim().toLowerCase();
         if (normalized === "triposg" || normalized === "tripo") return "triposg";
+        if (normalized === "trellis" || normalized === "trellis2" || normalized === "trellis.2") {
+          return "trellis";
+        }
         if (
           normalized === "triposplat" ||
           normalized === "tripo-splat" ||

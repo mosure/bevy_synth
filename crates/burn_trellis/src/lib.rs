@@ -40,7 +40,8 @@ pub mod runtime_model;
 
 pub use config::{TrellisComputeProfile, TrellisQuality, TrellisQualitySettings};
 pub use mesh::{
-    Mesh, MeshMaterial, MeshPbrTextures, MeshTexture, load_obj_mesh, write_glb_mesh, write_obj_mesh,
+    Mesh, MeshMaterial, MeshPbrTextures, MeshTexture, load_obj_mesh, mesh_signed_volume,
+    orient_mesh_faces_to_positive_volume, write_glb_mesh, write_obj_mesh,
 };
 pub use pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions, TrellisRuntimeError,

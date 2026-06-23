@@ -116,6 +116,10 @@ fn set_runtime_model_debug_config_for_stage(
         sparse_flow_module_attention_f16: module_attention_f16,
         sparse_flow_linear_f16: run_config.compute_profile.wgpu_linear_f16(),
         sparse_flow_torso_f16: run_config.compute_profile.wgpu_flow_torso_f16(),
+        sparse_flow_stock_bf16_emulation: matches!(stage, RuntimeFlowStage::SparseStructure)
+            && run_config
+                .compute_profile
+                .wgpu_sparse_stock_bf16_emulation(),
         sparse_flow_coord_rope_kernel: true,
         sparse_decoder_conv_f16: run_config.compute_profile.wgpu_decoder_conv_f16(),
     });
@@ -169,11 +173,14 @@ fn runtime_pipeline_stage_boundary_sync(_stage: &str, _enabled: bool) -> Result<
 
 macro_rules! trellis_stage_log {
     ($($arg:tt)*) => {{
-        std::eprintln!(
+        let message = format!(
             "[{}] {}",
             $crate::staged_pipeline::stage_log_timestamp(),
             format!($($arg)*)
         );
+        std::eprintln!("{message}");
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&message.into());
     }};
 }
 
@@ -426,6 +433,38 @@ pub struct TexSLatSample {
     pub features_wgpu: Option<Tensor<SparseFlowWgpuBackend, 2>>,
 }
 
+fn empty_tex_slat_sample(
+    sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
+    sparse_resolution: usize,
+) -> TexSLatSample {
+    let (_, sample_cfg, sigma_min) = resolve_sampler_settings(sampler_config, sampler_override);
+    TexSLatSample {
+        sampler_config: sample_cfg,
+        sigma_min,
+        step_count: 0,
+        dense_resolution: sparse_resolution,
+        dense_channels: 0,
+        dense_noise: None,
+        features: Vec::new(),
+        noise: Vec::new(),
+        step_0_pred_v: Vec::new(),
+        step_0_pred_v_pos: Vec::new(),
+        step_0_pred_v_neg: Vec::new(),
+        step_0_x_t: Vec::new(),
+        step_mid_x_t: Vec::new(),
+        step_last_x_t: Vec::new(),
+        shape_slat_cond: Vec::new(),
+        coords: Vec::new(),
+        layout: Vec::new(),
+        flow_ops: SparseFlowOpTimingSummary::default(),
+        #[cfg(feature = "runtime-model-wgpu")]
+        coords_wgpu: None,
+        #[cfg(feature = "runtime-model-wgpu")]
+        features_wgpu: None,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TrellisStageConditioning {
     pub cond_512: Vec<f32>,
@@ -481,6 +520,7 @@ struct DecodeRuntimeTimings {
     tex_decoder_ms: f64,
     attr_merge_ms: f64,
     mesh_ms: f64,
+    pre_pbr_decimate_ms: f64,
     pbr_ms: f64,
     shape_conv_calls: u64,
     tex_conv_calls: u64,
@@ -529,6 +569,7 @@ pub struct TrellisStageTimings {
     pub decode_tex_decoder_ms: f64,
     pub decode_attr_merge_ms: f64,
     pub decode_mesh_ms: f64,
+    pub decode_pre_pbr_decimate_ms: f64,
     pub decode_pbr_ms: f64,
     pub decode_shape_conv_calls: u64,
     pub decode_tex_conv_calls: u64,
@@ -563,6 +604,7 @@ pub struct TrellisStageRunConfig {
 pub enum TrellisDecodeOutputMode {
     #[default]
     NativePbr,
+    NativeMesh,
     OvoxelHookExport,
 }
 
@@ -570,12 +612,17 @@ impl TrellisDecodeOutputMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NativePbr => "native-pbr",
+            Self::NativeMesh => "native-mesh",
             Self::OvoxelHookExport => "ovoxel-hook-export",
         }
     }
 
     pub fn needs_native_pbr(self) -> bool {
         matches!(self, Self::NativePbr)
+    }
+
+    pub fn needs_native_mesh_postprocess(self) -> bool {
+        matches!(self, Self::NativePbr | Self::NativeMesh)
     }
 }
 
@@ -1328,6 +1375,32 @@ impl TrellisStageRuntime {
             .as_ref()
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "runtime-model"))]
+    pub fn warm_runtime_component(&self, component_key: &str) -> Result<(), String> {
+        let loaded = match component_key {
+            "sparse_structure_decoder" => self.sparse_structure_decoder_runtime().is_some(),
+            "sparse_structure_flow_model" => self.sparse_flow_runtime().is_some(),
+            "shape_slat_decoder" => self.shape_decoder_runtime().is_some(),
+            "shape_slat_flow_model_512" => self.shape_flow_runtime_512().is_some(),
+            "shape_slat_flow_model_1024" => self.shape_flow_runtime_1024().is_some(),
+            "tex_slat_decoder" => self.tex_decoder_runtime().is_some(),
+            "tex_slat_flow_model_512" | "tex_slat_flow_model_1024" => {
+                self.tex_flow_runtime().is_some()
+            }
+            "image_conditioning" => self.image_conditioning_runtime().is_some(),
+            other => {
+                return Err(format!("unknown Trellis runtime component key '{other}'"));
+            }
+        };
+        if loaded {
+            Ok(())
+        } else {
+            Err(format!(
+                "Trellis runtime component '{component_key}' failed to load"
+            ))
+        }
+    }
+
     #[cfg(feature = "runtime-model")]
     fn extract_runtime_conditioning_with_log(
         &self,
@@ -1353,6 +1426,113 @@ impl TrellisStageRuntime {
             extract_ms
         );
         Ok(values)
+    }
+
+    #[cfg(all(feature = "runtime-model", target_arch = "wasm32"))]
+    async fn extract_runtime_conditioning_with_log_async(
+        &self,
+        preprocess: &PreprocessOutput,
+        stage: &str,
+        resolution: usize,
+        cond_tokens: usize,
+        cond_channels: usize,
+    ) -> Result<Vec<f32>, String> {
+        let extract_start = Instant::now();
+        let values = self
+            .extract_runtime_conditioning_async(
+                preprocess,
+                stage,
+                resolution,
+                cond_tokens,
+                cond_channels,
+            )
+            .await?;
+        let extract_ms = extract_start.elapsed().as_secs_f64() * 1000.0;
+        trellis_stage_log!(
+            "burn_trellis: image conditioning extracted (stage='{}' resolution={} extract_ms={:.2})",
+            stage,
+            resolution,
+            extract_ms
+        );
+        Ok(values)
+    }
+
+    #[cfg(all(feature = "runtime-model", target_arch = "wasm32"))]
+    pub async fn resolve_runtime_conditioning_async(
+        &self,
+        preprocess: &PreprocessOutput,
+        overrides: Option<&TrellisNoiseOverrides>,
+    ) -> Result<TrellisStageConditioning, String> {
+        const COND_CHANNELS: usize = 1024;
+        const TOKENS_512: usize = 32 * 32 + 5;
+        const TOKENS_1024: usize = 64 * 64 + 5;
+        const RESOLUTION_512: usize = 512;
+        const RESOLUTION_1024: usize = 1024;
+
+        let expected_512 = TOKENS_512.saturating_mul(COND_CHANNELS);
+        let cond_512 = if let Some(values) = validated_cond_override(
+            expected_512,
+            overrides.and_then(|value| value.cond_512.as_deref()),
+            "get_cond_512",
+            "cond",
+        )? {
+            values
+        } else {
+            self.extract_runtime_conditioning_with_log_async(
+                preprocess,
+                "get_cond_512",
+                RESOLUTION_512,
+                TOKENS_512,
+                COND_CHANNELS,
+            )
+            .await?
+        };
+        let neg_cond_512 = validated_cond_override(
+            expected_512,
+            overrides.and_then(|value| value.neg_cond_512.as_deref()),
+            "get_cond_512",
+            "neg-cond",
+        )?
+        .unwrap_or_else(|| vec![0.0; expected_512]);
+
+        let require_1024 = !matches!(self.pipeline_type.as_str(), "512" | "512_base");
+        let (cond_1024, neg_cond_1024) = if require_1024 {
+            let expected_1024 = TOKENS_1024.saturating_mul(COND_CHANNELS);
+            let cond_1024 = if let Some(values) = validated_cond_override(
+                expected_1024,
+                overrides.and_then(|value| value.cond_1024.as_deref()),
+                "get_cond_1024",
+                "cond",
+            )? {
+                values
+            } else {
+                self.extract_runtime_conditioning_with_log_async(
+                    preprocess,
+                    "get_cond_1024",
+                    RESOLUTION_1024,
+                    TOKENS_1024,
+                    COND_CHANNELS,
+                )
+                .await?
+            };
+            let neg_cond_1024 = validated_cond_override(
+                expected_1024,
+                overrides.and_then(|value| value.neg_cond_1024.as_deref()),
+                "get_cond_1024",
+                "neg-cond",
+            )?
+            .unwrap_or_else(|| vec![0.0; expected_1024]);
+            (Some(cond_1024), Some(neg_cond_1024))
+        } else {
+            (None, None)
+        };
+
+        Ok(TrellisStageConditioning {
+            cond_512,
+            neg_cond_512,
+            cond_1024,
+            neg_cond_1024,
+        })
     }
 
     #[cfg(feature = "runtime-model")]
@@ -1431,6 +1611,76 @@ impl TrellisStageRuntime {
         })
     }
 
+    #[cfg(all(feature = "runtime-model", target_arch = "wasm32"))]
+    async fn extract_runtime_conditioning_async(
+        &self,
+        preprocess: &PreprocessOutput,
+        stage: &str,
+        resolution: usize,
+        cond_tokens: usize,
+        cond_channels: usize,
+    ) -> Result<Vec<f32>, String> {
+        let expected = cond_tokens.saturating_mul(cond_channels);
+        trellis_stage_log!(
+            "burn_trellis: image conditioning runtime begin (stage='{}' resolution={})",
+            stage,
+            resolution
+        );
+        let runtime = self.image_conditioning_runtime().ok_or_else(|| {
+            format!(
+                "{} no internal image-conditioning runtime model is available for stage '{}'.",
+                missing_runtime_conditioning_error(stage, cond_tokens, cond_channels),
+                stage
+            )
+        })?;
+        trellis_stage_log!(
+            "burn_trellis: image conditioning runtime ready (stage='{}' backend='{}')",
+            stage,
+            runtime.backend_name()
+        );
+        trellis_stage_log!(
+            "burn_trellis: image conditioning extract begin (stage='{}' resolution={})",
+            stage,
+            resolution
+        );
+        let output = runtime
+            .extract_condition_async(preprocess, resolution)
+            .await
+            .map_err(|err| {
+                format!(
+                    "{} internal image-conditioning extraction failed on backend '{}' for stage '{}': {err}",
+                    missing_runtime_conditioning_error(stage, cond_tokens, cond_channels),
+                    runtime.backend_name(),
+                    stage
+                )
+            })?;
+        trellis_stage_log!(
+            "burn_trellis: image conditioning extract raw complete (stage='{}' tokens={} channels={} values={})",
+            stage,
+            output.token_count,
+            output.channels,
+            output.values.len()
+        );
+        if output.token_count != cond_tokens || output.channels != cond_channels {
+            return Err(format!(
+                "{} internal image-conditioning extractor returned tokens={} channels={} (resolution={}).",
+                missing_runtime_conditioning_error(stage, cond_tokens, cond_channels),
+                output.token_count,
+                output.channels,
+                output.resolution
+            ));
+        }
+        if output.values.len() != expected {
+            return Err(format!(
+                "{} internal image-conditioning extractor returned {} values (expected {}).",
+                missing_runtime_conditioning_error(stage, cond_tokens, cond_channels),
+                output.values.len(),
+                expected
+            ));
+        }
+        Ok(output.values)
+    }
+
     #[cfg(feature = "runtime-model")]
     fn extract_runtime_conditioning(
         &self,
@@ -1441,6 +1691,11 @@ impl TrellisStageRuntime {
         cond_channels: usize,
     ) -> Result<Vec<f32>, String> {
         let expected = cond_tokens.saturating_mul(cond_channels);
+        trellis_stage_log!(
+            "burn_trellis: image conditioning runtime begin (stage='{}' resolution={})",
+            stage,
+            resolution
+        );
         let runtime = self.image_conditioning_runtime().ok_or_else(|| {
             format!(
                 "{} no internal image-conditioning runtime model is available for stage '{}'.",
@@ -1448,6 +1703,16 @@ impl TrellisStageRuntime {
                 stage
             )
         })?;
+        trellis_stage_log!(
+            "burn_trellis: image conditioning runtime ready (stage='{}' backend='{}')",
+            stage,
+            runtime.backend_name()
+        );
+        trellis_stage_log!(
+            "burn_trellis: image conditioning extract begin (stage='{}' resolution={})",
+            stage,
+            resolution
+        );
         let output = runtime
             .extract_condition(preprocess, resolution)
             .map_err(|err| {
@@ -1458,6 +1723,13 @@ impl TrellisStageRuntime {
                     stage
                 )
             })?;
+        trellis_stage_log!(
+            "burn_trellis: image conditioning extract raw complete (stage='{}' tokens={} channels={} values={})",
+            stage,
+            output.token_count,
+            output.channels,
+            output.values.len()
+        );
         if output.token_count != cond_tokens || output.channels != cond_channels {
             return Err(format!(
                 "{} internal image-conditioning extractor returned tokens={} channels={} (resolution={}).",
@@ -1520,6 +1792,406 @@ impl TrellisStageRuntime {
         )
     }
 
+    #[cfg(all(
+        target_arch = "wasm32",
+        feature = "runtime-model",
+        feature = "runtime-model-wgpu"
+    ))]
+    pub async fn run_profiled_with_overrides_async(
+        &self,
+        preprocess: &PreprocessOutput,
+        seed: u64,
+        noise_overrides: Option<&TrellisNoiseOverrides>,
+        capture_sampler_trace: bool,
+        run_config: TrellisStageRunConfig,
+    ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
+        let total_start = Instant::now();
+        trellis_stage_log!(
+            "burn_trellis: staged runtime profile begin (pipeline_type='{}')",
+            self.pipeline_type()
+        );
+        set_runtime_debug_toggles(run_config);
+        let parity_strict = runtime_parity_strict();
+        let max_sparse_coords_override = run_config.max_sparse_coords.filter(|limit| *limit > 0);
+        let max_num_tokens = run_config
+            .max_num_tokens
+            .filter(|limit| *limit > 0)
+            .unwrap_or(49_152);
+        let sparse_resolution = sparse_resolution_for_pipeline(self.pipeline_type());
+        let mut rng = Lcg::new(seed);
+        trellis_stage_log!("burn_trellis: resolve runtime conditioning begin");
+        let stage_conditioning = self
+            .resolve_runtime_conditioning_async(preprocess, noise_overrides)
+            .await?;
+        trellis_stage_log!("burn_trellis: resolve runtime conditioning complete");
+        let mut effective_overrides_storage = noise_overrides.cloned().unwrap_or_default();
+        effective_overrides_storage.cond_512 = Some(stage_conditioning.cond_512.clone());
+        effective_overrides_storage.neg_cond_512 = Some(stage_conditioning.neg_cond_512.clone());
+        effective_overrides_storage.cond_1024 = stage_conditioning.cond_1024.clone();
+        effective_overrides_storage.neg_cond_1024 = stage_conditioning.neg_cond_1024.clone();
+
+        let effective_overrides = Some(&effective_overrides_storage);
+        let sparse_noise_override = effective_overrides.and_then(|v| v.sparse_noise.as_deref());
+        let sparse_coords_override = effective_overrides.and_then(|v| v.sparse_coords.as_deref());
+        let shape_noise_override = effective_overrides.and_then(|v| v.shape_noise.as_ref());
+        let tex_noise_override = effective_overrides.and_then(|v| v.tex_noise.as_ref());
+        let shape_slat_override = effective_overrides.and_then(|v| v.shape_slat.as_ref());
+        let tex_slat_override = effective_overrides.and_then(|v| v.tex_slat.as_ref());
+        let decode_shape_input_override = effective_overrides
+            .and_then(|v| v.decode_shape_input.as_ref())
+            .cloned();
+        let decode_tex_input_override = effective_overrides
+            .and_then(|v| v.decode_tex_input.as_ref())
+            .cloned();
+        let decode_shape_subs_override =
+            effective_overrides.and_then(|v| v.decode_shape_subs.as_deref());
+        let decode_tex_voxels_override =
+            effective_overrides.and_then(|v| v.decode_tex_voxels.as_ref());
+        let decode_mesh_vertices_override =
+            effective_overrides.and_then(|v| v.decode_mesh_vertices.as_deref());
+        let decode_mesh_faces_override =
+            effective_overrides.and_then(|v| v.decode_mesh_faces.as_deref());
+        let shape_noise_dense_override =
+            effective_overrides.and_then(|v| v.shape_noise_dense.as_deref());
+        let tex_noise_dense_override =
+            effective_overrides.and_then(|v| v.tex_noise_dense.as_deref());
+        let sparse_sampler_override = if parity_strict {
+            None
+        } else {
+            effective_overrides.and_then(|v| v.sparse_sampler)
+        };
+        let shape_sampler_override = if parity_strict {
+            None
+        } else {
+            effective_overrides.and_then(|v| v.shape_sampler)
+        };
+        let tex_sampler_override = if parity_strict {
+            None
+        } else {
+            effective_overrides.and_then(|v| v.tex_sampler)
+        };
+        let sparse_cond_override = effective_overrides.and_then(|v| v.cond_512.as_deref());
+        let sparse_neg_cond_override = effective_overrides.and_then(|v| v.neg_cond_512.as_deref());
+        let cascade_requires_decoder_upsample =
+            matches!(self.pipeline_type(), "1024_cascade" | "1536_cascade");
+        let sparse_requires_host_coords = if !cascade_requires_decoder_upsample {
+            false
+        } else {
+            self.sparse_flow_runtime()
+                .map(|runtime| runtime.backend_name() != "wgpu")
+                .unwrap_or(true)
+        };
+        let sparse_materialize_host_coords = sparse_requires_host_coords
+            || capture_sampler_trace
+            || shape_noise_dense_override.is_some()
+            || tex_noise_dense_override.is_some();
+        trellis_stage_log!("burn_trellis: sparse flow runtime begin");
+        let sparse_flow_runtime = self.sparse_flow_runtime();
+        trellis_stage_log!(
+            "burn_trellis: sparse flow runtime {}",
+            if sparse_flow_runtime.is_some() {
+                "ready"
+            } else {
+                "unavailable"
+            }
+        );
+        trellis_stage_log!("burn_trellis: sparse decoder runtime begin");
+        let sparse_structure_decoder_runtime = self.sparse_structure_decoder_runtime();
+        trellis_stage_log!(
+            "burn_trellis: sparse decoder runtime {}",
+            if sparse_structure_decoder_runtime.is_some() {
+                "ready"
+            } else {
+                "unavailable"
+            }
+        );
+        let sparse_flow_runtime = sparse_flow_runtime.ok_or_else(|| {
+            "burn_trellis: sparse flow runtime is required for sparse_structure stage".to_string()
+        })?;
+        let sparse_structure_decoder_runtime = sparse_structure_decoder_runtime.ok_or_else(|| {
+            "burn_trellis: sparse structure decoder runtime is required for sparse_structure stage"
+                .to_string()
+        })?;
+
+        let sparse_start = Instant::now();
+        trellis_stage_log!("burn_trellis: stage sparse begin");
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SparseStructure);
+        let sparse = sample_sparse_structure_with_model_async(
+            preprocess,
+            sparse_resolution,
+            &mut rng,
+            sparse_noise_override,
+            sparse_coords_override,
+            sparse_cond_override,
+            sparse_neg_cond_override,
+            &self.sparse_sampler,
+            sparse_sampler_override,
+            capture_sampler_trace,
+            sparse_materialize_host_coords,
+            max_sparse_coords_override,
+            sparse_flow_runtime,
+            sparse_structure_decoder_runtime,
+        )
+        .await?;
+        let sparse_ms = sparse_start.elapsed().as_secs_f64() * 1000.0;
+        let sparse_rows = if !sparse.coords.is_empty() {
+            sparse.coords.len()
+        } else {
+            sparse
+                .coords_wgpu
+                .as_ref()
+                .map(|coords_t| coords_t.dims()[0])
+                .unwrap_or(0)
+        };
+        trellis_stage_log!(
+            "burn_trellis: stage sparse complete ({sparse_ms:.2} ms, coords={})",
+            sparse_rows
+        );
+        let sparse_flow_ops = sparse
+            .runtime_profile
+            .map(|profile| profile.flow_ops)
+            .unwrap_or_default();
+
+        let is_cascade_shape_pipeline =
+            matches!(self.pipeline_type(), "1024_cascade" | "1536_cascade");
+        let shape_start = Instant::now();
+        trellis_stage_log!("burn_trellis: stage shape_slat begin");
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+        let (shape_slat, shape_slat_lr, shape_slat_sparse_resolution, shape_slat_decode_resolution) =
+            if shape_slat_override.is_none() && is_cascade_shape_pipeline {
+                let shape_flow_runtime_512 = self.shape_flow_runtime_512();
+                let shape_flow_runtime_1024 = self.shape_flow_runtime_1024();
+                let shape_decoder_runtime_for_cascade = self.shape_decoder_runtime();
+                let target_decode_resolution = match self.pipeline_type() {
+                    "1024_cascade" => 1024usize,
+                    "1536_cascade" => 1536usize,
+                    _ => final_resolution_for_pipeline(self.pipeline_type()),
+                };
+                trellis_stage_log!(
+                    "burn_trellis: shape_slat cascade begin (base_sparse_res={}, target_decode_res={}, max_num_tokens={})",
+                    sparse.resolution,
+                    target_decode_resolution,
+                    max_num_tokens
+                );
+                sample_shape_slat_cascade_runtime(
+                    preprocess,
+                    sparse.coords.as_slice(),
+                    sparse.layout.as_slice(),
+                    sparse.coords_wgpu.clone(),
+                    &mut rng,
+                    shape_noise_override,
+                    shape_noise_dense_override,
+                    effective_overrides,
+                    &self.shape_sampler,
+                    shape_sampler_override,
+                    &self.shape_norm,
+                    sparse.resolution,
+                    512,
+                    target_decode_resolution,
+                    max_num_tokens,
+                    capture_sampler_trace,
+                    parity_strict,
+                    shape_flow_runtime_512,
+                    shape_flow_runtime_1024,
+                    shape_decoder_runtime_for_cascade,
+                )
+                .await?
+            } else {
+                let shape_flow_runtime = self.shape_flow_runtime();
+                (
+                    sample_shape_slat(
+                        preprocess,
+                        &sparse.coords,
+                        sparse.layout.as_slice(),
+                        shape_slat_override,
+                        &mut rng,
+                        shape_noise_override,
+                        shape_noise_dense_override,
+                        effective_overrides,
+                        &self.shape_sampler,
+                        shape_sampler_override,
+                        &self.shape_norm,
+                        sparse.resolution,
+                        capture_sampler_trace,
+                        parity_strict,
+                        sparse.coords_wgpu.clone(),
+                        shape_flow_runtime,
+                    )?,
+                    None,
+                    sparse.resolution,
+                    final_resolution_for_pipeline(self.pipeline_type()),
+                )
+            };
+        let shape_slat_ms = shape_start.elapsed().as_secs_f64() * 1000.0;
+        let shape_rows = if !shape_slat.coords.is_empty() {
+            shape_slat.coords.len()
+        } else {
+            shape_slat
+                .coords_wgpu
+                .as_ref()
+                .map(|coords_t| coords_t.dims()[0])
+                .unwrap_or(shape_slat.features.len())
+        };
+        trellis_stage_log!(
+            "burn_trellis: stage shape_slat complete ({shape_slat_ms:.2} ms, rows={})",
+            shape_rows
+        );
+        let shape_slat_flow_ops = shape_slat.flow_ops;
+
+        let needs_tex_slat = run_config.decode_output_mode.needs_native_pbr();
+        let tex_start = Instant::now();
+        let tex_slat = if needs_tex_slat {
+            let tex_flow_runtime = self.tex_flow_runtime();
+            trellis_stage_log!("burn_trellis: stage tex_slat begin");
+            set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+            sample_tex_slat(
+                preprocess,
+                &shape_slat,
+                tex_slat_override,
+                &mut rng,
+                tex_noise_override,
+                tex_noise_dense_override,
+                effective_overrides,
+                &self.tex_sampler,
+                tex_sampler_override,
+                &self.shape_norm,
+                &self.tex_norm,
+                shape_slat_sparse_resolution,
+                capture_sampler_trace,
+                parity_strict,
+                tex_flow_runtime,
+            )?
+        } else {
+            trellis_stage_log!(
+                "burn_trellis: stage tex_slat skipped (decode_output_mode={})",
+                run_config.decode_output_mode.as_str()
+            );
+            empty_tex_slat_sample(
+                &self.tex_sampler,
+                tex_sampler_override,
+                shape_slat_sparse_resolution,
+            )
+        };
+        let tex_slat_ms = if needs_tex_slat {
+            tex_start.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+        let tex_rows = if !tex_slat.coords.is_empty() {
+            tex_slat.coords.len()
+        } else {
+            tex_slat
+                .coords_wgpu
+                .as_ref()
+                .map(|coords_t| coords_t.dims()[0])
+                .or_else(|| {
+                    tex_slat
+                        .features_wgpu
+                        .as_ref()
+                        .map(|rows_t| rows_t.dims()[0])
+                })
+                .unwrap_or(tex_slat.features.len())
+        };
+        trellis_stage_log!(
+            "burn_trellis: stage tex_slat complete ({tex_slat_ms:.2} ms, rows={})",
+            tex_rows
+        );
+        let tex_slat_flow_ops = tex_slat.flow_ops;
+
+        let decode_start = Instant::now();
+        trellis_stage_log!("burn_trellis: stage decode begin");
+        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+        let shape_decoder_runtime = self.shape_decoder_runtime();
+        let tex_decoder_runtime = if run_config.decode_output_mode.needs_native_pbr() {
+            self.tex_decoder_runtime()
+        } else {
+            None
+        };
+        let decode_overrides = DecodeHookOverrides {
+            decode_shape_subs: decode_shape_subs_override,
+            decode_tex_voxels: decode_tex_voxels_override,
+            decode_mesh_vertices: decode_mesh_vertices_override,
+            decode_mesh_faces: decode_mesh_faces_override,
+        };
+        let decoded = decode_latent_to_outputs_async(
+            &shape_slat,
+            &tex_slat,
+            self.pipeline_type(),
+            Some(shape_slat_decode_resolution),
+            run_config.target_faces,
+            run_config.pbr_texture_size,
+            parity_strict,
+            capture_sampler_trace,
+            decode_overrides,
+            run_config.decode_output_mode,
+            RuntimeDecodeModels {
+                shape_decoder: shape_decoder_runtime,
+                tex_decoder: tex_decoder_runtime,
+            },
+        )
+        .await?;
+        let decode_uses_wgpu_dispatch =
+            decoded.timings.shape_wgpu_dispatches > 0 || decoded.timings.tex_wgpu_dispatches > 0;
+        runtime_pipeline_stage_boundary_sync(
+            "decode_complete",
+            decode_uses_wgpu_dispatch && runtime_stage_fence_enabled(),
+        )?;
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        trellis_stage_log!(
+            "burn_trellis: stage decode complete ({decode_ms:.2} ms, vertices={}, faces={})",
+            decoded.mesh.vertices.len(),
+            decoded.mesh.faces.len()
+        );
+        let sparse_runtime_profile = sparse.runtime_profile.unwrap_or_default();
+        let output = TrellisStageOutput {
+            sparse,
+            shape_slat,
+            shape_slat_lr,
+            tex_slat,
+            conditioning: stage_conditioning,
+            decode_shape_input: decode_shape_input_override,
+            decode_tex_input: decode_tex_input_override,
+            decode_source: decoded.source,
+            decode_shape_subs: decoded.shape_subs,
+            decode_tex_voxels: decoded.tex_voxels,
+            mesh: decoded.mesh,
+            pbr: decoded.pbr,
+        };
+        let timings = TrellisStageTimings {
+            sparse_ms,
+            sparse_cond_ms: sparse_runtime_profile.cond_prepare_ms,
+            sparse_sample_ms: sparse_runtime_profile.sample_ms,
+            sparse_post_ms: sparse_runtime_profile.postprocess_ms,
+            sparse_flow_ops,
+            shape_slat_ms,
+            shape_slat_flow_ops,
+            tex_slat_ms,
+            tex_slat_flow_ops,
+            decode_ms,
+            decode_stage_fenced: decoded.timings.stage_fenced,
+            decode_shape_decoder_ms: decoded.timings.shape_decoder_ms,
+            decode_tex_decoder_ms: decoded.timings.tex_decoder_ms,
+            decode_attr_merge_ms: decoded.timings.attr_merge_ms,
+            decode_mesh_ms: decoded.timings.mesh_ms,
+            decode_pre_pbr_decimate_ms: decoded.timings.pre_pbr_decimate_ms,
+            decode_pbr_ms: decoded.timings.pbr_ms,
+            decode_shape_conv_calls: decoded.timings.shape_conv_calls,
+            decode_tex_conv_calls: decoded.timings.tex_conv_calls,
+            decode_shape_wgpu_dispatches: decoded.timings.shape_wgpu_dispatches,
+            decode_tex_wgpu_dispatches: decoded.timings.tex_wgpu_dispatches,
+            decode_shape_wgpu_chunked_calls: decoded.timings.shape_wgpu_chunked_calls,
+            decode_tex_wgpu_chunked_calls: decoded.timings.tex_wgpu_chunked_calls,
+            decode_shape_wgpu_input_bytes: decoded.timings.shape_wgpu_input_bytes,
+            decode_tex_wgpu_input_bytes: decoded.timings.tex_wgpu_input_bytes,
+            decode_shape_wgpu_output_bytes: decoded.timings.shape_wgpu_output_bytes,
+            decode_tex_wgpu_output_bytes: decoded.timings.tex_wgpu_output_bytes,
+            decode_shape_wgpu_max_chunk_rows: decoded.timings.shape_wgpu_max_chunk_rows,
+            decode_tex_wgpu_max_chunk_rows: decoded.timings.tex_wgpu_max_chunk_rows,
+            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+        };
+        Ok((output, timings))
+    }
+
     pub fn run_profiled_with_overrides(
         &self,
         preprocess: &PreprocessOutput,
@@ -1529,6 +2201,10 @@ impl TrellisStageRuntime {
         run_config: TrellisStageRunConfig,
     ) -> Result<(TrellisStageOutput, TrellisStageTimings), String> {
         let total_start = Instant::now();
+        trellis_stage_log!(
+            "burn_trellis: staged runtime profile begin (pipeline_type='{}')",
+            self.pipeline_type()
+        );
         set_runtime_debug_toggles(run_config);
         let parity_strict = runtime_parity_strict();
         let max_sparse_coords_override = run_config.max_sparse_coords.filter(|limit| *limit > 0);
@@ -1545,7 +2221,9 @@ impl TrellisStageRuntime {
         let effective_overrides_storage: Option<TrellisNoiseOverrides> = None;
         #[cfg(feature = "runtime-model")]
         let stage_conditioning = {
+            trellis_stage_log!("burn_trellis: resolve runtime conditioning begin");
             let conditioning = self.resolve_runtime_conditioning(preprocess, noise_overrides)?;
+            trellis_stage_log!("burn_trellis: resolve runtime conditioning complete");
             let mut merged = noise_overrides.cloned().unwrap_or_default();
             merged.cond_512 = Some(conditioning.cond_512.clone());
             merged.neg_cond_512 = Some(conditioning.neg_cond_512.clone());
@@ -1625,9 +2303,33 @@ impl TrellisStageRuntime {
             || shape_noise_dense_override.is_some()
             || tex_noise_dense_override.is_some();
         #[cfg(feature = "runtime-model")]
-        let sparse_flow_runtime = self.sparse_flow_runtime();
+        let sparse_flow_runtime = {
+            trellis_stage_log!("burn_trellis: sparse flow runtime begin");
+            let runtime = self.sparse_flow_runtime();
+            trellis_stage_log!(
+                "burn_trellis: sparse flow runtime {}",
+                if runtime.is_some() {
+                    "ready"
+                } else {
+                    "unavailable"
+                }
+            );
+            runtime
+        };
         #[cfg(feature = "runtime-model")]
-        let sparse_structure_decoder_runtime = self.sparse_structure_decoder_runtime();
+        let sparse_structure_decoder_runtime = {
+            trellis_stage_log!("burn_trellis: sparse decoder runtime begin");
+            let runtime = self.sparse_structure_decoder_runtime();
+            trellis_stage_log!(
+                "burn_trellis: sparse decoder runtime {}",
+                if runtime.is_some() {
+                    "ready"
+                } else {
+                    "unavailable"
+                }
+            );
+            runtime
+        };
         let sparse_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage sparse begin");
         #[cfg(feature = "runtime-model")]
@@ -1702,29 +2404,39 @@ impl TrellisStageRuntime {
                         target_decode_resolution,
                         max_num_tokens
                     );
-                    sample_shape_slat_cascade_runtime(
-                        preprocess,
-                        sparse.coords.as_slice(),
-                        sparse.layout.as_slice(),
-                        #[cfg(feature = "runtime-model-wgpu")]
-                        sparse.coords_wgpu.clone(),
-                        &mut rng,
-                        shape_noise_override,
-                        shape_noise_dense_override,
-                        effective_overrides,
-                        &self.shape_sampler,
-                        shape_sampler_override,
-                        &self.shape_norm,
-                        sparse.resolution,
-                        512,
-                        target_decode_resolution,
-                        max_num_tokens,
-                        capture_sampler_trace,
-                        parity_strict,
-                        shape_flow_runtime_512,
-                        shape_flow_runtime_1024,
-                        shape_decoder_runtime_for_cascade,
-                    )?
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        pollster::block_on(sample_shape_slat_cascade_runtime(
+                            preprocess,
+                            sparse.coords.as_slice(),
+                            sparse.layout.as_slice(),
+                            #[cfg(feature = "runtime-model-wgpu")]
+                            sparse.coords_wgpu.clone(),
+                            &mut rng,
+                            shape_noise_override,
+                            shape_noise_dense_override,
+                            effective_overrides,
+                            &self.shape_sampler,
+                            shape_sampler_override,
+                            &self.shape_norm,
+                            sparse.resolution,
+                            512,
+                            target_decode_resolution,
+                            max_num_tokens,
+                            capture_sampler_trace,
+                            parity_strict,
+                            shape_flow_runtime_512,
+                            shape_flow_runtime_1024,
+                            shape_decoder_runtime_for_cascade,
+                        ))?
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        return Err(
+                            "burn_trellis: sync cascade runtime is unsupported on wasm; use run_profiled_with_overrides_async"
+                                .to_string(),
+                        );
+                    }
                 } else {
                     let shape_flow_runtime = self.shape_flow_runtime();
                     (
@@ -1803,31 +2515,48 @@ impl TrellisStageRuntime {
         );
         let shape_slat_flow_ops = shape_slat.flow_ops;
 
-        #[cfg(feature = "runtime-model")]
-        let tex_flow_runtime = self.tex_flow_runtime();
+        let needs_tex_slat = run_config.decode_output_mode.needs_native_pbr();
         let tex_start = Instant::now();
-        trellis_stage_log!("burn_trellis: stage tex_slat begin");
-        #[cfg(feature = "runtime-model")]
-        set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
-        let tex_slat = sample_tex_slat(
-            preprocess,
-            &shape_slat,
-            tex_slat_override,
-            &mut rng,
-            tex_noise_override,
-            tex_noise_dense_override,
-            effective_overrides,
-            &self.tex_sampler,
-            tex_sampler_override,
-            &self.shape_norm,
-            &self.tex_norm,
-            shape_slat_sparse_resolution,
-            capture_sampler_trace,
-            parity_strict,
+        let tex_slat = if needs_tex_slat {
             #[cfg(feature = "runtime-model")]
-            tex_flow_runtime,
-        )?;
-        let tex_slat_ms = tex_start.elapsed().as_secs_f64() * 1000.0;
+            let tex_flow_runtime = self.tex_flow_runtime();
+            trellis_stage_log!("burn_trellis: stage tex_slat begin");
+            #[cfg(feature = "runtime-model")]
+            set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+            sample_tex_slat(
+                preprocess,
+                &shape_slat,
+                tex_slat_override,
+                &mut rng,
+                tex_noise_override,
+                tex_noise_dense_override,
+                effective_overrides,
+                &self.tex_sampler,
+                tex_sampler_override,
+                &self.shape_norm,
+                &self.tex_norm,
+                shape_slat_sparse_resolution,
+                capture_sampler_trace,
+                parity_strict,
+                #[cfg(feature = "runtime-model")]
+                tex_flow_runtime,
+            )?
+        } else {
+            trellis_stage_log!(
+                "burn_trellis: stage tex_slat skipped (decode_output_mode={})",
+                run_config.decode_output_mode.as_str()
+            );
+            empty_tex_slat_sample(
+                &self.tex_sampler,
+                tex_sampler_override,
+                shape_slat_sparse_resolution,
+            )
+        };
+        let tex_slat_ms = if needs_tex_slat {
+            tex_start.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
         let tex_rows = if !tex_slat.coords.is_empty() {
             tex_slat.coords.len()
         } else {
@@ -1863,7 +2592,11 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let shape_decoder_runtime = self.shape_decoder_runtime();
         #[cfg(feature = "runtime-model")]
-        let tex_decoder_runtime = self.tex_decoder_runtime();
+        let tex_decoder_runtime = if run_config.decode_output_mode.needs_native_pbr() {
+            self.tex_decoder_runtime()
+        } else {
+            None
+        };
         let decode_overrides = DecodeHookOverrides {
             decode_shape_subs: decode_shape_subs_override,
             decode_tex_voxels: decode_tex_voxels_override,
@@ -1937,6 +2670,7 @@ impl TrellisStageRuntime {
             decode_tex_decoder_ms: decoded.timings.tex_decoder_ms,
             decode_attr_merge_ms: decoded.timings.attr_merge_ms,
             decode_mesh_ms: decoded.timings.mesh_ms,
+            decode_pre_pbr_decimate_ms: decoded.timings.pre_pbr_decimate_ms,
             decode_pbr_ms: decoded.timings.pbr_ms,
             decode_shape_conv_calls: decoded.timings.shape_conv_calls,
             decode_tex_conv_calls: decoded.timings.tex_conv_calls,

@@ -66,6 +66,7 @@ impl SparseUnetVaeDecoderRuntime {
     }
 
     #[cfg(feature = "runtime-model-wgpu")]
+    #[allow(dead_code)]
     pub fn decode_with_guidance_result_with_tensors(
         &self,
         coords_wgpu: Tensor<DefaultWgpuBackend, 2, Int>,
@@ -74,6 +75,18 @@ impl SparseUnetVaeDecoderRuntime {
     ) -> Result<SparseDecodeResult, String> {
         self.inner
             .decode_with_tensors(coords_wgpu, rows_wgpu, Some(guide_subdivisions))
+    }
+
+    #[cfg(feature = "runtime-model-wgpu")]
+    pub async fn decode_with_guidance_result_with_tensors_async(
+        &self,
+        coords_wgpu: Tensor<DefaultWgpuBackend, 2, Int>,
+        rows_wgpu: Tensor<DefaultWgpuBackend, 2>,
+        guide_subdivisions: &[SparseSubdivisionLogits],
+    ) -> Result<SparseDecodeResult, String> {
+        self.inner
+            .decode_with_tensors_async(coords_wgpu, rows_wgpu, Some(guide_subdivisions))
+            .await
     }
 }
 

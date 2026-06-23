@@ -1,5 +1,5 @@
 #[cfg(feature = "runtime-model-wgpu")]
-use crate::runtime_model::types::extraction::tensor_i32_to_vec;
+use crate::runtime_model::types::extraction::{tensor_i32_to_vec, tensor_i32_to_vec_async};
 #[cfg(feature = "runtime-model-wgpu")]
 use crate::sampler::FlowEulerSampleTrace;
 
@@ -461,6 +461,317 @@ fn sample_sparse_structure_with_model(
         coords,
         layout,
         #[cfg(feature = "runtime-model-wgpu")]
+        coords_wgpu,
+        runtime_profile: Some(SparseStructureRuntimeProfile {
+            cond_prepare_ms,
+            sample_ms,
+            postprocess_ms,
+            flow_ops: flow_ops_summary,
+        }),
+    })
+}
+
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "runtime-model",
+    feature = "runtime-model-wgpu"
+))]
+#[allow(clippy::too_many_arguments)]
+async fn sample_sparse_structure_with_model_async(
+    preprocess: &PreprocessOutput,
+    resolution: usize,
+    rng: &mut Lcg,
+    noise_override: Option<&[f32]>,
+    coords_override: Option<&[[u32; 4]]>,
+    cond_override: Option<&[f32]>,
+    neg_cond_override: Option<&[f32]>,
+    sampler_config: &TrellisSamplerConfig,
+    sampler_override: Option<SamplerConfigOverride>,
+    capture_sampler_trace: bool,
+    materialize_host_coords: bool,
+    max_sparse_coords_override: Option<usize>,
+    sparse_flow: &SparseStructureFlowRuntime,
+    sparse_structure_decoder: &SparseStructureDecoderRuntime,
+) -> Result<SparseStructureSample, String> {
+    let materialize_host_coords =
+        if sparse_flow.backend_name() == "wgpu" && sparse_structure_decoder.backend_name() == "wgpu"
+        {
+            false
+        } else {
+            materialize_host_coords
+        };
+    let cond_prepare_start = Instant::now();
+    let config = sparse_flow.config();
+    let flow_resolution = config.resolution;
+    let channels = config.in_channels;
+    let flow_voxels = flow_resolution * flow_resolution * flow_resolution;
+    let noise = dense_noise_with_override(
+        rng,
+        channels * flow_voxels,
+        noise_override,
+        "sparse_runtime",
+    );
+
+    let cond_tokens = 32 * 32 + 5;
+    let cond = dense_cond_with_override(
+        preprocess,
+        cond_tokens,
+        config.cond_channels,
+        cond_override,
+        "sparse_runtime",
+    )
+    .map_err(|err| format!("burn_trellis: sparse flow cond override rejected ({err})"))?;
+    let neg_cond = dense_neg_cond_with_override(
+        cond.len(),
+        neg_cond_override,
+        "sparse_runtime",
+    )
+    .map_err(|err| format!("burn_trellis: sparse flow neg-cond override rejected ({err})"))?;
+    if runtime_stage_debug_enabled() {
+        let mut diff_sum = 0.0f64;
+        let mut diff_max = 0.0f32;
+        for (pos, neg) in cond.iter().zip(neg_cond.iter()) {
+            let diff = (pos - neg).abs();
+            diff_sum += diff as f64;
+            diff_max = diff_max.max(diff);
+        }
+        let diff_mean = if cond.is_empty() {
+            0.0
+        } else {
+            (diff_sum / cond.len() as f64) as f32
+        };
+        trellis_stage_log!(
+            "burn_trellis: sparse cond override delta mean_abs={:.6} max_abs={:.6} len={}",
+            diff_mean,
+            diff_max,
+            cond.len()
+        );
+    }
+    let cond_tensor = sparse_flow
+        .prepare_condition(cond.as_ref(), cond_tokens)
+        .map_err(|err| format!("burn_trellis: sparse flow cond preparation failed ({err})"))?;
+    let neg_cond_tensor = sparse_flow
+        .prepare_condition(neg_cond.as_ref(), cond_tokens)
+        .map_err(|err| {
+            format!("burn_trellis: sparse flow negative cond preparation failed ({err})")
+        })?;
+    let (_, sample_cfg, sigma_min) = resolve_sampler_settings(sampler_config, sampler_override);
+    let cond_prepare_ms = cond_prepare_start.elapsed().as_secs_f64() * 1000.0;
+    let sample_start = Instant::now();
+    reset_sparse_flow_op_telemetry();
+    let use_tensor_sparse_handoff = sparse_flow.backend_name() == "wgpu"
+        && sparse_structure_decoder.backend_name() == "wgpu"
+        && !capture_sampler_trace
+        && coords_override.is_none();
+    let (trace, latent, latent_tensor_wgpu) = if use_tensor_sparse_handoff {
+        let latent_tensor = sparse_flow
+            .sample_final_tensor_wgpu(
+                noise.as_slice(),
+                sample_cfg,
+                sigma_min,
+                &cond_tensor,
+                &neg_cond_tensor,
+                None,
+            )
+            .map_err(|err| format!("burn_trellis: sparse flow model prediction failed ({err})"))?;
+        (
+            FlowEulerSampleTrace {
+                steps: sample_cfg.steps,
+                samples: Vec::new(),
+                step_0_pred_v: Vec::new(),
+                step_0_pred_v_pos: Vec::new(),
+                step_0_pred_v_neg: Vec::new(),
+                step_0_x_t: Vec::new(),
+                step_mid_x_t: Vec::new(),
+                step_last_x_t: Vec::new(),
+                step_pred_v: Vec::new(),
+                step_x_t: Vec::new(),
+            },
+            Vec::new(),
+            Some(latent_tensor),
+        )
+    } else {
+        let trace = sparse_flow
+            .sample_with_trace(
+                noise.as_slice(),
+                sample_cfg,
+                sigma_min,
+                &cond_tensor,
+                &neg_cond_tensor,
+                None,
+                capture_sampler_trace,
+            )
+            .map_err(|err| format!("burn_trellis: sparse flow model prediction failed ({err})"))?;
+        let latent = trace.samples.clone();
+        (trace, latent, None)
+    };
+    let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+    let flow_ops = sparse_flow_op_telemetry();
+    let flow_ops_summary = current_sparse_flow_op_timing_summary();
+    trellis_stage_log!(
+        "burn_trellis: sparse flow op telemetry [sparse_runtime] self_attn_calls={} self_attn_ms={:.2} cross_attn_calls={} cross_attn_ms={:.2} mlp_calls={} mlp_ms={:.2}",
+        flow_ops.self_attn_calls,
+        flow_ops.self_attn_ns as f64 / 1_000_000.0,
+        flow_ops.cross_attn_calls,
+        flow_ops.cross_attn_ns as f64 / 1_000_000.0,
+        flow_ops.mlp_calls,
+        flow_ops.mlp_ns as f64 / 1_000_000.0
+    );
+    let post_start = Instant::now();
+    if runtime_stage_debug_enabled() && !latent.is_empty() {
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum_v = 0.0f64;
+        for value in latent.iter().copied() {
+            min_v = min_v.min(value);
+            max_v = max_v.max(value);
+            sum_v += value as f64;
+        }
+        let mean_v = (sum_v / latent.len() as f64) as f32;
+        trellis_stage_log!(
+            "burn_trellis: sparse latent stats rows={} min={:.6} max={:.6} mean={:.6}",
+            latent.len(),
+            min_v,
+            max_v,
+            mean_v
+        );
+    }
+    if runtime_stage_debug_enabled()
+        && latent.is_empty()
+        && let Some(latent_t) = latent_tensor_wgpu.as_ref()
+    {
+        let [batch, channels, depth, height, width] = latent_t.dims();
+        trellis_stage_log!(
+            "burn_trellis: sparse latent tensor stats backend=wgpu dims=[{batch},{channels},{depth},{height},{width}]"
+        );
+    }
+    let max_sparse_cap =
+        runtime_max_sparse_coords_for_backend(sparse_flow.backend_name(), max_sparse_coords_override);
+    let max_sparse_coords = max_sparse_cap.map(|(limit, _)| limit);
+    let (coords, coords_wgpu, layout) = if let Some(override_coords) = coords_override {
+        if runtime_stage_debug_enabled() {
+            trellis_stage_log!(
+                "burn_trellis: sparse runtime using hook coord override rows={}",
+                override_coords.len()
+            );
+        }
+        let layout = sparse_layout_from_coords(override_coords)?;
+        if sparse_flow.backend_name() == "wgpu" {
+            let coords_t = coords_u32_to_wgpu_tensor(override_coords)?;
+            let coords_host = if materialize_host_coords {
+                override_coords.to_vec()
+            } else {
+                Vec::new()
+            };
+            (coords_host, Some(coords_t), layout)
+        } else {
+            (override_coords.to_vec(), None, layout)
+        }
+    } else {
+        let sampled = if let Some(latent_t) = latent_tensor_wgpu.as_ref() {
+            sparse_structure_decoder
+                .decode_to_sparse_coords_wgpu_latent_tensor_async(
+                    latent_t.clone(),
+                    resolution,
+                    max_sparse_coords,
+                )
+                .await
+                .map_err(|err| {
+                    format!(
+                        "burn_trellis: sparse structure decoder failed after tensor-native flow sampling ({err})"
+                    )
+                })?
+        } else {
+            sparse_structure_decoder
+                .decode_to_sparse_coords(
+                    latent.as_slice(),
+                    flow_resolution,
+                    resolution,
+                    max_sparse_coords,
+                )
+                .map_err(|err| {
+                    format!(
+                        "burn_trellis: sparse structure decoder failed after flow sampling ({err})"
+                    )
+                })?
+        };
+        if sampled.rows() == 0 {
+            return Err(
+                "burn_trellis: sparse structure decoder produced zero active coordinates"
+                    .to_string(),
+            );
+        }
+        let sampled_rows = sampled.rows();
+        let sampled_wgpu = sampled.coords_tensor();
+        let sampled_host = if materialize_host_coords {
+            sampled
+                .coords_host("sparse structure decode coord materialization for staged runtime")?
+        } else {
+            Vec::new()
+        };
+        if let Some((limit, source)) = max_sparse_cap {
+            trellis_stage_log!(
+                "burn_trellis: sparse coords after threshold/cap = {} (limit={}, source={})",
+                sampled_rows,
+                limit,
+                source.as_str()
+            );
+        }
+        let sampled_layout = if sampled_rows == 0 {
+            Vec::new()
+        } else if !sampled_host.is_empty() {
+            sparse_layout_from_coords(sampled_host.as_slice())?
+        } else if sampled_wgpu.is_some() {
+            vec![0..sampled_rows]
+        } else {
+            return Err(
+                "burn_trellis: sparse structure stage requires either host coords or device coord tensor to derive layout"
+                    .to_string(),
+            );
+        };
+        (sampled_host, sampled_wgpu, sampled_layout)
+    };
+    if coords.is_empty()
+        && coords_wgpu
+            .as_ref()
+            .map_or(true, |coords_t| coords_t.dims()[0] == 0)
+    {
+        return Err(
+            "burn_trellis: sparse structure stage produced no coordinates after overrides"
+                .to_string(),
+        );
+    }
+    let postprocess_ms = post_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: sparse runtime profile cond_prep={cond_prepare_ms:.2} ms sample={sample_ms:.2} ms post={postprocess_ms:.2} ms total={:.2} ms",
+        cond_prepare_ms + sample_ms + postprocess_ms
+    );
+    Ok(SparseStructureSample {
+        source: match (
+            sparse_flow.backend_name(),
+            sparse_structure_decoder.backend_name(),
+        ) {
+            ("wgpu", "wgpu") => SparseStructureStageSource::RuntimeModelWgpu,
+            _ => SparseStructureStageSource::RuntimeModelCpu,
+        },
+        sampler_config: sample_cfg,
+        sigma_min,
+        step_count: trace.steps,
+        resolution,
+        flow_resolution,
+        flow_channels: channels,
+        noise,
+        step_0_pred_v: trace.step_0_pred_v,
+        step_0_pred_v_pos: trace.step_0_pred_v_pos,
+        step_0_pred_v_neg: trace.step_0_pred_v_neg,
+        step_0_x_t: trace.step_0_x_t,
+        step_mid_x_t: trace.step_mid_x_t,
+        step_last_x_t: trace.step_last_x_t,
+        step_pred_v: trace.step_pred_v,
+        step_x_t: trace.step_x_t,
+        latent,
+        coords,
+        layout,
         coords_wgpu,
         runtime_profile: Some(SparseStructureRuntimeProfile {
             cond_prepare_ms,
@@ -1983,7 +2294,7 @@ fn sample_tex_slat(
 
 #[cfg(feature = "runtime-model")]
 #[allow(clippy::too_many_arguments)]
-fn sample_shape_slat_cascade_runtime(
+async fn sample_shape_slat_cascade_runtime(
     preprocess: &PreprocessOutput,
     coords: &[[u32; 4]],
     sparse_layout: &[std::ops::Range<usize>],
@@ -2080,21 +2391,25 @@ fn sample_shape_slat_cascade_runtime(
             "burn_trellis: cascade canonical wgpu path requires device shape row tensor from low-resolution shape stage"
                 .to_string()
         })?;
-        shape_decoder.upsample_coords_result_with_tensors(
+        shape_decoder
+            .upsample_coords_result_with_tensors_async(
             shape_coords_t.clone(),
             shape_rows_t.clone(),
             4,
-        )?
+            )
+            .await?
     } else if let Some(shape_coords_t) = shape_lr.coords_wgpu.as_ref() {
         let shape_rows_t = shape_lr.features_wgpu.as_ref().ok_or_else(|| {
             "burn_trellis: cascade tensor-coord upsample path requires device shape rows; host completion fallback is disabled"
                 .to_string()
         })?;
-        shape_decoder.upsample_coords_result_with_tensors(
+        shape_decoder
+            .upsample_coords_result_with_tensors_async(
             shape_coords_t.clone(),
             shape_rows_t.clone(),
             4,
-        )?
+            )
+            .await?
     } else {
         shape_decoder.upsample_coords_result(
             shape_lr.coords.as_slice(),
@@ -2172,10 +2487,11 @@ fn sample_shape_slat_cascade_runtime(
         });
         let hr_coords_quantized_host =
             if noise_dense_override.is_some() || hr_noise_override.is_some() {
-                coords_wgpu_tensor_to_host(
+                coords_wgpu_tensor_to_host_async(
                     hr_coords_quantized_t.clone(),
                     "burn_trellis: cascade quantized coord materialization for dense noise",
-                )?
+                )
+                .await?
             } else {
                 Vec::new()
             };
@@ -2213,6 +2529,11 @@ fn sample_shape_slat_cascade_runtime(
         ));
     }
 
+    #[cfg(feature = "runtime-model-wgpu")]
+    let hr_coords = hr_coords_sparse
+        .coords_host_async("burn_trellis: cascade decoder upsample coord materialization")
+        .await?;
+    #[cfg(not(feature = "runtime-model-wgpu"))]
     let hr_coords = hr_coords_sparse
         .coords_host("burn_trellis: cascade decoder upsample coord materialization")?;
 
@@ -2522,6 +2843,43 @@ fn coords_wgpu_tensor_to_host(
         ));
     }
     let values = tensor_i32_to_vec(coords_t, context)?;
+    if values.len() != rows.saturating_mul(4) {
+        return Err(format!(
+            "{context}: coord tensor length mismatch: got={} expected={}",
+            values.len(),
+            rows.saturating_mul(4)
+        ));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        let base = row_idx.saturating_mul(4);
+        let to_u32 = |value: i32| -> Result<u32, String> {
+            u32::try_from(value).map_err(|_| {
+                format!("{context}: negative coordinate value {value} at row {row_idx}")
+            })
+        };
+        out.push([
+            to_u32(values[base])?,
+            to_u32(values[base + 1])?,
+            to_u32(values[base + 2])?,
+            to_u32(values[base + 3])?,
+        ]);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "runtime-model-wgpu")]
+async fn coords_wgpu_tensor_to_host_async(
+    coords_t: Tensor<SparseFlowWgpuBackend, 2, Int>,
+    context: &str,
+) -> Result<Vec<[u32; 4]>, String> {
+    let [rows, cols] = coords_t.dims();
+    if cols != 4 {
+        return Err(format!(
+            "{context}: coord tensor must have 4 columns, got {cols}"
+        ));
+    }
+    let values = tensor_i32_to_vec_async(coords_t, context).await?;
     if values.len() != rows.saturating_mul(4) {
         return Err(format!(
             "{context}: coord tensor length mismatch: got={} expected={}",

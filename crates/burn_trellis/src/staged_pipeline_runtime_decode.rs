@@ -46,19 +46,21 @@ fn decode_latent_to_outputs(
                     .to_string(),
             );
         };
-        let Some(tex_decoder) = runtime_decoders.tex_decoder else {
-            return Err(
-                "burn_trellis: tex runtime decoder is required (missing `tex_slat_decoder` runtime)"
-                    .to_string(),
-            );
+        let tex_decoder = if decode_output_mode.needs_native_pbr() {
+            Some(runtime_decoders.tex_decoder.ok_or_else(|| {
+                "burn_trellis: tex runtime decoder is required for native PBR decode (missing `tex_slat_decoder` runtime)"
+                    .to_string()
+            })?)
+        } else {
+            runtime_decoders.tex_decoder
         };
-        let decoded = decode_latent_with_runtime_decoders(
-            shape,
-            tex,
-            RuntimeDecodeRequest {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (
+                shape,
+                tex,
                 pipeline_type,
-                final_resolution: final_resolution_override
-                    .unwrap_or_else(|| final_resolution_for_pipeline(pipeline_type)),
+                final_resolution_override,
                 target_faces,
                 pbr_texture_size,
                 parity_strict,
@@ -66,12 +68,35 @@ fn decode_latent_to_outputs(
                 decode_output_mode,
                 shape_decoder,
                 tex_decoder,
-                shape_guide_subdivisions: None,
-            },
-        )
-        .map_err(|err| format!("burn_trellis: runtime decode pipeline failed: {err}"))?;
-        let _ = decode_overrides;
-        Ok(decoded)
+            );
+            return Err(
+                "burn_trellis: sync runtime decode is unsupported on wasm; use async runtime decode"
+                    .to_string(),
+            );
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let decoded = pollster::block_on(decode_latent_with_runtime_decoders(
+                shape,
+                tex,
+                RuntimeDecodeRequest {
+                    pipeline_type,
+                    final_resolution: final_resolution_override
+                        .unwrap_or_else(|| final_resolution_for_pipeline(pipeline_type)),
+                    target_faces,
+                    pbr_texture_size,
+                    parity_strict,
+                    capture_debug_artifacts,
+                    decode_output_mode,
+                    shape_decoder,
+                    tex_decoder,
+                    shape_guide_subdivisions: None,
+                },
+            ))
+            .map_err(|err| format!("burn_trellis: runtime decode pipeline failed: {err}"))?;
+            let _ = decode_overrides;
+            Ok(decoded)
+        }
     }
 
     #[cfg(not(feature = "runtime-model"))]
@@ -90,6 +115,71 @@ fn decode_latent_to_outputs(
         );
         Err("burn_trellis: TRELLIS decode requires `runtime-model` feature".to_string())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(feature = "runtime-model")]
+async fn decode_latent_to_outputs_async(
+    shape: &ShapeSLatSample,
+    tex: &TexSLatSample,
+    pipeline_type: &str,
+    final_resolution_override: Option<usize>,
+    target_faces: Option<usize>,
+    pbr_texture_size: Option<usize>,
+    parity_strict: bool,
+    capture_debug_artifacts: bool,
+    decode_overrides: DecodeHookOverrides<'_>,
+    decode_output_mode: TrellisDecodeOutputMode,
+    runtime_decoders: RuntimeDecodeModels<'_>,
+) -> Result<DecodedLatentOutput, String> {
+    let has_decode_override = decode_overrides.decode_shape_subs.is_some()
+        || decode_overrides.decode_tex_voxels.is_some()
+        || decode_overrides.decode_mesh_vertices.is_some()
+        || decode_overrides.decode_mesh_faces.is_some();
+    if has_decode_override {
+        return Err(
+            "burn_trellis: decode hook override tensors are disabled on canonical runtime decode path"
+                .to_string(),
+        );
+    }
+
+    let Some(shape_decoder) = runtime_decoders.shape_decoder else {
+        return Err(
+            "burn_trellis: shape runtime decoder is required (missing `shape_slat_decoder` runtime)"
+                .to_string(),
+        );
+    };
+    let tex_decoder = if decode_output_mode.needs_native_pbr() {
+        Some(runtime_decoders.tex_decoder.ok_or_else(|| {
+            "burn_trellis: tex runtime decoder is required for native PBR decode (missing `tex_slat_decoder` runtime)"
+                .to_string()
+        })?)
+    } else {
+        runtime_decoders.tex_decoder
+    };
+
+    let decoded = decode_latent_with_runtime_decoders(
+        shape,
+        tex,
+        RuntimeDecodeRequest {
+            pipeline_type,
+            final_resolution: final_resolution_override
+                .unwrap_or_else(|| final_resolution_for_pipeline(pipeline_type)),
+            target_faces,
+            pbr_texture_size,
+            parity_strict,
+            capture_debug_artifacts,
+            decode_output_mode,
+            shape_decoder,
+            tex_decoder,
+            shape_guide_subdivisions: None,
+        },
+    )
+    .await
+    .map_err(|err| format!("burn_trellis: runtime decode pipeline failed: {err}"))?;
+    let _ = decode_overrides;
+    Ok(decoded)
 }
 
 #[cfg(feature = "runtime-model")]
@@ -126,6 +216,21 @@ type MeshVertices = Vec<[f32; 3]>;
 type MeshFaces = Vec<[u32; 3]>;
 #[cfg(feature = "runtime-model")]
 type MeshSanitizeResult = (MeshVertices, MeshFaces, usize, usize, usize);
+#[cfg(feature = "runtime-model")]
+const NATIVE_PBR_OVOXEL_REMESH_BAND: f32 = 1.0;
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+const NATIVE_PBR_SMALL_COMPONENT_AREA: f32 = 1.0e-5;
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+const NATIVE_PBR_MAX_HOLE_PERIMETER: f32 = 3.0e-2;
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy, Default)]
+struct MeshCleanupStats {
+    duplicate_faces_removed: usize,
+    nonmanifold_faces_removed: usize,
+    small_component_faces_removed: usize,
+    hole_faces_added: usize,
+}
 
 #[cfg(feature = "runtime-model")]
 fn sanitize_mesh_geometry(vertices: MeshVertices, faces: MeshFaces) -> MeshSanitizeResult {
@@ -180,6 +285,415 @@ fn sanitize_mesh_geometry(vertices: MeshVertices, faces: MeshFaces) -> MeshSanit
 }
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn cleanup_mesh_topology(vertices: &mut MeshVertices, faces: &mut MeshFaces) -> MeshCleanupStats {
+    let duplicate_faces_removed = remove_duplicate_mesh_faces(faces);
+    let nonmanifold_faces_removed = remove_nonmanifold_mesh_faces(faces);
+    let small_component_faces_removed = remove_small_connected_components(
+        vertices.as_slice(),
+        faces,
+        NATIVE_PBR_SMALL_COMPONENT_AREA,
+    );
+    let hole_faces_added =
+        fill_small_boundary_holes(vertices, faces, NATIVE_PBR_MAX_HOLE_PERIMETER);
+    remove_unreferenced_vertices(vertices, faces);
+    MeshCleanupStats {
+        duplicate_faces_removed,
+        nonmanifold_faces_removed,
+        small_component_faces_removed,
+        hole_faces_added,
+    }
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn remove_duplicate_mesh_faces(faces: &mut MeshFaces) -> usize {
+    let before = faces.len();
+    let mut seen = std::collections::HashSet::<[u32; 3]>::with_capacity(faces.len());
+    faces.retain(|face| {
+        let mut key = *face;
+        key.sort_unstable();
+        if key[0] == key[1] || key[1] == key[2] {
+            return false;
+        }
+        seen.insert(key)
+    });
+    before.saturating_sub(faces.len())
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn remove_nonmanifold_mesh_faces(faces: &mut MeshFaces) -> usize {
+    if faces.is_empty() {
+        return 0;
+    }
+
+    let mut edge_faces =
+        std::collections::HashMap::<(u32, u32), Vec<usize>>::with_capacity(faces.len() * 3);
+    for (face_idx, face) in faces.iter().copied().enumerate() {
+        for edge in face_edges_u32(face) {
+            edge_faces.entry(edge).or_default().push(face_idx);
+        }
+    }
+
+    let mut drop_face = vec![false; faces.len()];
+    for mut owners in edge_faces.into_values() {
+        if owners.len() <= 2 {
+            continue;
+        }
+        owners.sort_unstable();
+        for face_idx in owners.into_iter().skip(2) {
+            drop_face[face_idx] = true;
+        }
+    }
+
+    if !drop_face.iter().any(|drop| *drop) {
+        return 0;
+    }
+
+    let before = faces.len();
+    faces.retain_with_index(|face_idx, _face| !drop_face[face_idx]);
+    before.saturating_sub(faces.len())
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn remove_small_connected_components(
+    vertices: &[[f32; 3]],
+    faces: &mut MeshFaces,
+    min_area: f32,
+) -> usize {
+    if faces.is_empty() {
+        return 0;
+    }
+
+    let mut parent = (0..faces.len()).collect::<Vec<_>>();
+    let mut edge_owner =
+        std::collections::HashMap::<(u32, u32), usize>::with_capacity(faces.len() * 3);
+    for (face_idx, face) in faces.iter().copied().enumerate() {
+        for edge in face_edges_u32(face) {
+            if let Some(prev_idx) = edge_owner.insert(edge, face_idx) {
+                mesh_union(parent.as_mut_slice(), prev_idx, face_idx);
+            }
+        }
+    }
+
+    let mut component_area = std::collections::HashMap::<usize, f32>::new();
+    for (face_idx, face) in faces.iter().copied().enumerate() {
+        let root = mesh_find(parent.as_mut_slice(), face_idx);
+        let area = triangle_area_by_indices(vertices, face).unwrap_or(0.0);
+        *component_area.entry(root).or_insert(0.0) += area;
+    }
+    let largest_component = component_area
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(root, _)| *root);
+
+    let before = faces.len();
+    faces.retain_with_index(|face_idx, _face| {
+        let root = mesh_find(parent.as_mut_slice(), face_idx);
+        Some(root) == largest_component
+            || component_area.get(&root).copied().unwrap_or(0.0) >= min_area
+    });
+    before.saturating_sub(faces.len())
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn fill_small_boundary_holes(
+    vertices: &mut MeshVertices,
+    faces: &mut MeshFaces,
+    max_hole_perimeter: f32,
+) -> usize {
+    if faces.is_empty() || vertices.is_empty() {
+        return 0;
+    }
+
+    let mut edge_counts =
+        std::collections::HashMap::<(u32, u32), u8>::with_capacity(faces.len() * 3);
+    let mut directed_edges = Vec::<(u32, u32)>::with_capacity(faces.len() * 3);
+    for face in faces.iter().copied() {
+        for [a, b] in [[face[0], face[1]], [face[1], face[2]], [face[2], face[0]]] {
+            let key = sorted_edge_u32(a, b);
+            let count = edge_counts.entry(key).or_insert(0);
+            *count = count.saturating_add(1);
+            directed_edges.push((a, b));
+        }
+    }
+
+    let mut outgoing = std::collections::HashMap::<u32, Vec<u32>>::new();
+    for (a, b) in directed_edges {
+        if edge_counts
+            .get(&sorted_edge_u32(a, b))
+            .copied()
+            .unwrap_or(0)
+            == 1
+        {
+            outgoing.entry(a).or_default().push(b);
+        }
+    }
+    for next in outgoing.values_mut() {
+        next.sort_unstable();
+    }
+
+    let mut used = std::collections::HashSet::<(u32, u32)>::new();
+    let mut loops = Vec::<Vec<u32>>::new();
+    let mut starts = outgoing.keys().copied().collect::<Vec<_>>();
+    starts.sort_unstable();
+    for start in starts {
+        let Some(candidates) = outgoing.get(&start) else {
+            continue;
+        };
+        let next_candidates = candidates.clone();
+        for first_next in next_candidates {
+            if used.contains(&(start, first_next)) {
+                continue;
+            }
+            let mut loop_vertices = vec![start];
+            let mut current = start;
+            let mut next = first_next;
+            let mut closed = false;
+            for _ in 0..vertices.len().saturating_add(1) {
+                if !used.insert((current, next)) {
+                    break;
+                }
+                current = next;
+                if current == start {
+                    closed = true;
+                    break;
+                }
+                loop_vertices.push(current);
+                let Some(options) = outgoing.get(&current) else {
+                    break;
+                };
+                let Some(candidate) = options
+                    .iter()
+                    .copied()
+                    .find(|candidate| !used.contains(&(current, *candidate)))
+                else {
+                    break;
+                };
+                next = candidate;
+            }
+            if closed && loop_vertices.len() >= 3 {
+                loops.push(loop_vertices);
+            }
+        }
+    }
+
+    let mut added = 0usize;
+    for boundary in loops {
+        let perimeter = boundary_loop_perimeter(vertices.as_slice(), boundary.as_slice());
+        if !perimeter.is_finite() || perimeter > max_hole_perimeter {
+            continue;
+        }
+        let mut center = [0.0f32; 3];
+        let mut valid = true;
+        for &idx in &boundary {
+            let Some(vertex) = vertices.get(idx as usize) else {
+                valid = false;
+                break;
+            };
+            center[0] += vertex[0];
+            center[1] += vertex[1];
+            center[2] += vertex[2];
+        }
+        if !valid {
+            continue;
+        }
+        let denom = boundary.len().max(1) as f32;
+        center[0] /= denom;
+        center[1] /= denom;
+        center[2] /= denom;
+        let center_idx = vertices.len() as u32;
+        vertices.push(center);
+        for i in 0..boundary.len() {
+            let a = boundary[i];
+            let b = boundary[(i + 1) % boundary.len()];
+            faces.push([a, center_idx, b]);
+            added += 1;
+        }
+    }
+    added
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn remove_unreferenced_vertices(vertices: &mut MeshVertices, faces: &mut MeshFaces) {
+    let mut remap = vec![u32::MAX; vertices.len()];
+    let mut compacted = Vec::with_capacity(vertices.len());
+    for face in faces.iter() {
+        for &idx in face {
+            let idx_usize = idx as usize;
+            if idx_usize >= vertices.len() || remap[idx_usize] != u32::MAX {
+                continue;
+            }
+            remap[idx_usize] = compacted.len() as u32;
+            compacted.push(vertices[idx_usize]);
+        }
+    }
+    for face in faces.iter_mut() {
+        for idx in face {
+            *idx = remap[*idx as usize];
+        }
+    }
+    *vertices = compacted;
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn cleanup_pbr_bake_mesh_topology(mesh: &mut PbrBakeMesh) -> MeshCleanupStats {
+    let duplicate_faces_removed = remove_duplicate_mesh_faces(&mut mesh.faces);
+    let nonmanifold_faces_removed = remove_nonmanifold_mesh_faces(&mut mesh.faces);
+    remove_unreferenced_vertices_and_uvs(&mut mesh.vertices, &mut mesh.faces, &mut mesh.uvs);
+    MeshCleanupStats {
+        duplicate_faces_removed,
+        nonmanifold_faces_removed,
+        small_component_faces_removed: 0,
+        hole_faces_added: 0,
+    }
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn remove_unreferenced_vertices_and_uvs(
+    vertices: &mut MeshVertices,
+    faces: &mut MeshFaces,
+    uvs: &mut Vec<[f32; 2]>,
+) {
+    let keep_uvs = uvs.len() == vertices.len();
+    let mut remap = vec![u32::MAX; vertices.len()];
+    let mut compacted_vertices = Vec::with_capacity(vertices.len());
+    let mut compacted_uvs = Vec::with_capacity(if keep_uvs { vertices.len() } else { 0 });
+    for face in faces.iter() {
+        for &idx in face {
+            let idx_usize = idx as usize;
+            if idx_usize >= vertices.len() || remap[idx_usize] != u32::MAX {
+                continue;
+            }
+            remap[idx_usize] = compacted_vertices.len() as u32;
+            compacted_vertices.push(vertices[idx_usize]);
+            if keep_uvs {
+                compacted_uvs.push(uvs[idx_usize]);
+            }
+        }
+    }
+    for face in faces.iter_mut() {
+        for idx in face {
+            *idx = remap[*idx as usize];
+        }
+    }
+    *vertices = compacted_vertices;
+    if keep_uvs {
+        *uvs = compacted_uvs;
+    }
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn boundary_loop_perimeter(vertices: &[[f32; 3]], boundary: &[u32]) -> f32 {
+    if boundary.len() < 2 {
+        return 0.0;
+    }
+    let mut perimeter = 0.0f32;
+    for i in 0..boundary.len() {
+        let Some(a) = vertices.get(boundary[i] as usize) else {
+            return f32::INFINITY;
+        };
+        let Some(b) = vertices.get(boundary[(i + 1) % boundary.len()] as usize) else {
+            return f32::INFINITY;
+        };
+        perimeter += distance3(*a, *b);
+    }
+    perimeter
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn triangle_area_by_indices(vertices: &[[f32; 3]], face: [u32; 3]) -> Option<f32> {
+    let a = *vertices.get(face[0] as usize)?;
+    let b = *vertices.get(face[1] as usize)?;
+    let c = *vertices.get(face[2] as usize)?;
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    Some(0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt())
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn distance3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn face_edges_u32(face: [u32; 3]) -> [(u32, u32); 3] {
+    [
+        sorted_edge_u32(face[0], face[1]),
+        sorted_edge_u32(face[1], face[2]),
+        sorted_edge_u32(face[2], face[0]),
+    ]
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn sorted_edge_u32(a: u32, b: u32) -> (u32, u32) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn mesh_find(parent: &mut [usize], idx: usize) -> usize {
+    let root = parent[idx];
+    if root == idx {
+        idx
+    } else {
+        let resolved = mesh_find(parent, root);
+        parent[idx] = resolved;
+        resolved
+    }
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn mesh_union(parent: &mut [usize], a: usize, b: usize) {
+    let root_a = mesh_find(parent, a);
+    let root_b = mesh_find(parent, b);
+    if root_a != root_b {
+        parent[root_b] = root_a;
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+trait RetainWithIndex<T> {
+    fn retain_with_index<F>(&mut self, f: F)
+    where
+        F: FnMut(usize, &T) -> bool;
+}
+
+#[cfg(feature = "runtime-model")]
+impl<T> RetainWithIndex<T> for Vec<T> {
+    fn retain_with_index<F>(&mut self, mut f: F)
+    where
+        F: FnMut(usize, &T) -> bool,
+    {
+        let mut idx = 0usize;
+        self.retain(|item| {
+            let keep = f(idx, item);
+            idx += 1;
+            keep
+        });
+    }
+}
+
+#[cfg(feature = "runtime-model")]
+fn apply_native_pbr_ovoxel_remesh_domain_scale(mesh: &mut Mesh, final_resolution: u32) {
+    let resolution = final_resolution.max(1) as f32;
+    let scale = (resolution + 3.0 * NATIVE_PBR_OVOXEL_REMESH_BAND) / resolution;
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    for vertex in &mut mesh.vertices {
+        vertex[0] *= scale;
+        vertex[1] *= scale;
+        vertex[2] *= scale;
+    }
+}
+
+#[cfg(feature = "runtime-model")]
 fn decimate_mesh_for_face_budget(
     vertices: &mut Vec<[f32; 3]>,
     faces: &mut Vec<[u32; 3]>,
@@ -201,48 +715,53 @@ fn decimate_mesh_for_face_budget(
     }
 
     let vertices_bytes = meshopt::typed_to_bytes(vertices.as_slice());
-    let adapter = meshopt::VertexDataAdapter::new(
-        vertices_bytes,
-        std::mem::size_of::<[f32; 3]>(),
-        0,
-    )
-    .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
+    let adapter =
+        meshopt::VertexDataAdapter::new(vertices_bytes, std::mem::size_of::<[f32; 3]>(), 0)
+            .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
 
-    let mut result_error = 0.0f32;
     let mut simplified = Vec::<u32>::new();
-    for error_limit in [0.02f32, 0.05, 0.1, 0.25, 0.5, 1.0] {
-        let mut stage_error = 0.0f32;
-        let candidate = meshopt::simplify(
-            &indices,
-            &adapter,
-            target_index_count,
-            error_limit,
-            meshopt::SimplifyOptions::None,
-            Some(&mut stage_error),
-        );
-        if candidate.len() < 3 {
-            continue;
-        }
-        result_error = stage_error;
-        simplified = candidate;
-        if simplified.len() <= target_index_count {
-            break;
-        }
+    let aggressive_ratio = target_index_count as f64 / indices.len().max(1) as f64;
+    if aggressive_ratio < 0.01 {
+        simplified = meshopt::simplify_sloppy(&indices, &adapter, target_index_count, 1.0, None);
     }
-    if simplified.len() > target_index_count {
-        simplified = meshopt::simplify_sloppy(
-            &indices,
-            &adapter,
-            target_index_count,
-            result_error.max(0.25),
-            None,
-        );
+
+    if simplified.len() < 3 || simplified.len() > target_index_count {
+        let mut result_error = 0.0f32;
+        for error_limit in [0.02f32, 0.05, 0.1, 0.25, 0.5, 1.0] {
+            let mut stage_error = 0.0f32;
+            let candidate = meshopt::simplify(
+                &indices,
+                &adapter,
+                target_index_count,
+                error_limit,
+                meshopt::SimplifyOptions::None,
+                Some(&mut stage_error),
+            );
+            if candidate.len() < 3 {
+                continue;
+            }
+            result_error = stage_error;
+            simplified = candidate;
+            if simplified.len() <= target_index_count {
+                break;
+            }
+        }
+        if simplified.len() > target_index_count {
+            simplified = meshopt::simplify_sloppy(
+                &indices,
+                &adapter,
+                target_index_count,
+                result_error.max(0.25),
+                None,
+            );
+        }
     }
     if simplified.len() < 3 {
         return Err("meshopt simplification produced empty mesh".to_string());
     }
 
-    let (vertex_count, remap) = meshopt::generate_vertex_remap(vertices.as_slice(), Some(&simplified));
+    let (vertex_count, remap) =
+        meshopt::generate_vertex_remap(vertices.as_slice(), Some(&simplified));
     let remapped_vertices = meshopt::remap_vertex_buffer(vertices.as_slice(), vertex_count, &remap);
     let remapped_indices = meshopt::remap_index_buffer(Some(&simplified), vertex_count, &remap);
     if remapped_indices.len() < 3 {
@@ -258,6 +777,187 @@ fn decimate_mesh_for_face_budget(
     Ok(())
 }
 
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone)]
+pub struct NativePbrPostprocessInput {
+    pub vertices: Vec<[f32; 3]>,
+    pub faces: Vec<[u32; 3]>,
+    pub voxel_coords: Vec<[u32; 4]>,
+    pub voxel_attrs: Vec<[f32; 6]>,
+    pub final_resolution: u32,
+    pub target_faces: Option<usize>,
+    pub pbr_texture_size: Option<usize>,
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+pub fn native_pbr_mesh_from_decoded_tensors(
+    input: NativePbrPostprocessInput,
+) -> Result<Mesh, String> {
+    let NativePbrPostprocessInput {
+        vertices,
+        faces,
+        voxel_coords,
+        voxel_attrs,
+        final_resolution,
+        target_faces,
+        pbr_texture_size,
+    } = input;
+    if voxel_coords.len() != voxel_attrs.len() {
+        return Err(format!(
+            "native pbr postprocess voxel mismatch: coords={} attrs={}",
+            voxel_coords.len(),
+            voxel_attrs.len()
+        ));
+    }
+
+    let (
+        mut vertices,
+        mut faces,
+        dropped_vertices,
+        dropped_invalid_faces,
+        dropped_degenerate_faces,
+    ) = sanitize_mesh_geometry(vertices, faces);
+    if dropped_vertices > 0 || dropped_invalid_faces > 0 || dropped_degenerate_faces > 0 {
+        trellis_stage_log!(
+            "burn_trellis: native pbr postprocess mesh sanitized (dropped_vertices={} dropped_invalid_faces={} dropped_degenerate_faces={})",
+            dropped_vertices,
+            dropped_invalid_faces,
+            dropped_degenerate_faces
+        );
+    }
+    if vertices.is_empty() || faces.is_empty() {
+        return Err("native pbr postprocess received empty mesh after sanitize".to_string());
+    }
+    let cleanup_stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+    if cleanup_stats.duplicate_faces_removed > 0
+        || cleanup_stats.nonmanifold_faces_removed > 0
+        || cleanup_stats.small_component_faces_removed > 0
+        || cleanup_stats.hole_faces_added > 0
+    {
+        trellis_stage_log!(
+            "burn_trellis: native pbr postprocess mesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+            cleanup_stats.duplicate_faces_removed,
+            cleanup_stats.nonmanifold_faces_removed,
+            cleanup_stats.small_component_faces_removed,
+            cleanup_stats.hole_faces_added,
+            vertices.len(),
+            faces.len()
+        );
+    }
+    if vertices.is_empty() || faces.is_empty() {
+        return Err("native pbr postprocess received empty mesh after cleanup".to_string());
+    }
+
+    let projection_vertices = vertices.clone();
+    let projection_faces = faces.clone();
+    let remesh_start = Instant::now();
+    let before_remesh_faces = faces.len();
+    let projection_bvh_for_pbr = build_projection_bvh_for_pbr(PbrProjectionSource {
+        vertices: projection_vertices.as_slice(),
+        faces: projection_faces.as_slice(),
+    })?;
+    let (remeshed_vertices, remeshed_faces) = remesh_narrow_band_simple_dc_with_projection_bvh(
+        &projection_bvh_for_pbr,
+        final_resolution.max(1),
+        NATIVE_PBR_OVOXEL_REMESH_BAND,
+    )?;
+    vertices = remeshed_vertices;
+    faces = remeshed_faces;
+    let remesh_cleanup_stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+    if remesh_cleanup_stats.duplicate_faces_removed > 0
+        || remesh_cleanup_stats.nonmanifold_faces_removed > 0
+        || remesh_cleanup_stats.small_component_faces_removed > 0
+        || remesh_cleanup_stats.hole_faces_added > 0
+    {
+        trellis_stage_log!(
+            "burn_trellis: native pbr postprocess remesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+            remesh_cleanup_stats.duplicate_faces_removed,
+            remesh_cleanup_stats.nonmanifold_faces_removed,
+            remesh_cleanup_stats.small_component_faces_removed,
+            remesh_cleanup_stats.hole_faces_added,
+            vertices.len(),
+            faces.len()
+        );
+    }
+    trellis_stage_log!(
+        "burn_trellis: native pbr postprocess remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
+        remesh_start.elapsed().as_secs_f64() * 1000.0,
+        before_remesh_faces,
+        faces.len(),
+        vertices.len()
+    );
+    let mut use_projection_source = true;
+    if let Some(target_faces) = target_faces.filter(|limit| *limit > 0)
+        && faces.len() > target_faces
+    {
+        let before_faces = faces.len();
+        decimate_mesh_for_face_budget(&mut vertices, &mut faces, target_faces)?;
+        use_projection_source = true;
+        let decimate_cleanup_stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+        if decimate_cleanup_stats.duplicate_faces_removed > 0
+            || decimate_cleanup_stats.nonmanifold_faces_removed > 0
+            || decimate_cleanup_stats.small_component_faces_removed > 0
+            || decimate_cleanup_stats.hole_faces_added > 0
+        {
+            trellis_stage_log!(
+                "burn_trellis: native pbr postprocess decimation cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+                decimate_cleanup_stats.duplicate_faces_removed,
+                decimate_cleanup_stats.nonmanifold_faces_removed,
+                decimate_cleanup_stats.small_component_faces_removed,
+                decimate_cleanup_stats.hole_faces_added,
+                vertices.len(),
+                faces.len()
+            );
+        }
+        trellis_stage_log!(
+            "burn_trellis: native pbr postprocess decimation complete (target_faces={} from_faces={} to_faces={})",
+            target_faces,
+            before_faces,
+            faces.len()
+        );
+    }
+
+    let (mut pbr_mesh, pbr_textures, _) = bake_pbr_from_voxels_with_options_and_projection_bvh(
+        vertices.as_slice(),
+        faces.as_slice(),
+        use_projection_source.then_some(PbrProjectionSource {
+            vertices: projection_vertices.as_slice(),
+            faces: projection_faces.as_slice(),
+        }),
+        use_projection_source.then_some(&projection_bvh_for_pbr),
+        voxel_coords.as_slice(),
+        voxel_attrs.as_slice(),
+        final_resolution.max(1),
+        pbr_texture_size,
+        false,
+        false,
+    )?;
+    let pbr_cleanup_stats = cleanup_pbr_bake_mesh_topology(&mut pbr_mesh);
+    if pbr_cleanup_stats.duplicate_faces_removed > 0
+        || pbr_cleanup_stats.nonmanifold_faces_removed > 0
+    {
+        trellis_stage_log!(
+            "burn_trellis: native pbr postprocess output cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} vertices={} faces={} uvs={})",
+            pbr_cleanup_stats.duplicate_faces_removed,
+            pbr_cleanup_stats.nonmanifold_faces_removed,
+            pbr_mesh.vertices.len(),
+            pbr_mesh.faces.len(),
+            pbr_mesh.uvs.len()
+        );
+    }
+    let material = summarize_material(voxel_attrs.as_slice(), pbr_textures.as_ref());
+    let mut mesh = Mesh {
+        vertices: pbr_mesh.vertices,
+        faces: pbr_mesh.faces,
+        uvs: pbr_mesh.uvs,
+        material,
+        pbr_textures,
+    };
+    crate::mesh::remap_mesh_to_python_glb_frame(&mut mesh);
+    crate::mesh::orient_mesh_faces_to_positive_volume(&mut mesh);
+    Ok(mesh)
+}
+
 #[cfg(feature = "runtime-model")]
 struct RuntimeDecodeRequest<'a> {
     pipeline_type: &'a str,
@@ -268,12 +968,12 @@ struct RuntimeDecodeRequest<'a> {
     capture_debug_artifacts: bool,
     decode_output_mode: TrellisDecodeOutputMode,
     shape_decoder: &'a FdgDecoderRuntime,
-    tex_decoder: &'a SparseUnetVaeDecoderRuntime,
+    tex_decoder: Option<&'a SparseUnetVaeDecoderRuntime>,
     shape_guide_subdivisions: Option<&'a [SparseSubdivisionLogits]>,
 }
 
 #[cfg(feature = "runtime-model")]
-fn decode_latent_with_runtime_decoders(
+async fn decode_latent_with_runtime_decoders(
     shape: &ShapeSLatSample,
     tex: &TexSLatSample,
     request: RuntimeDecodeRequest<'_>,
@@ -373,17 +1073,33 @@ fn decode_latent_with_runtime_decoders(
             0
         }
     };
-    let count = shape_coord_rows
-        .min(tex_coord_rows)
-        .min(shape_feature_rows)
-        .min(tex_feature_rows);
+    let needs_tex_decode = decode_output_mode.needs_native_pbr();
+    let count = if needs_tex_decode {
+        shape_coord_rows
+            .min(tex_coord_rows)
+            .min(shape_feature_rows)
+            .min(tex_feature_rows)
+    } else {
+        shape_coord_rows.min(shape_feature_rows)
+    };
     if count == 0 {
-        return Err("runtime decode received empty shape/tex latent rows".to_string());
+        return Err(if needs_tex_decode {
+            "runtime decode received empty shape/tex latent rows".to_string()
+        } else {
+            "runtime decode received empty shape latent rows".to_string()
+        });
     }
-    if shape_decoder.out_channels() < 7 || tex_decoder.out_channels() < 6 {
+    if shape_decoder.out_channels() < 7 {
         return Err(format!(
-            "decoder channel mismatch: shape_out={} tex_out={}",
-            shape_decoder.out_channels(),
+            "decoder channel mismatch: shape_out={}",
+            shape_decoder.out_channels()
+        ));
+    }
+    if let Some(tex_decoder) = tex_decoder
+        && tex_decoder.out_channels() < 6
+    {
+        return Err(format!(
+            "decoder channel mismatch: tex_out={}",
             tex_decoder.out_channels()
         ));
     }
@@ -459,20 +1175,32 @@ fn decode_latent_with_runtime_decoders(
         };
         let rows_t = shape_rows_wgpu_for_decode.clone();
         match shape_guide_subdivisions {
-            Some(guides) => shape_decoder.decode_with_guidance_result_with_tensors(
-                shape_coords_wgpu_for_decode.clone(),
-                rows_t,
-                guides,
-            ),
-            None => shape_decoder
-                .decode_sparse_result_with_tensors(shape_coords_wgpu_for_decode.clone(), rows_t),
+            Some(guides) => {
+                shape_decoder
+                    .decode_with_guidance_result_with_tensors_async(
+                        shape_coords_wgpu_for_decode.clone(),
+                        rows_t,
+                        guides,
+                    )
+                    .await
+            }
+            None => {
+                shape_decoder
+                    .decode_sparse_result_with_tensors_async(
+                        shape_coords_wgpu_for_decode.clone(),
+                        rows_t,
+                    )
+                    .await
+            }
         }
     } else if let Some(coords_host) = shape_coords_host {
         let shape_rows = shape_rows_host.ok_or_else(|| {
             "runtime decode missing shape host rows for host coord decode path".to_string()
         })?;
         match shape_guide_subdivisions {
-            Some(guides) => shape_decoder.decode_with_guidance_result(coords_host, shape_rows, guides),
+            Some(guides) => {
+                shape_decoder.decode_with_guidance_result(coords_host, shape_rows, guides)
+            }
             None => shape_decoder.decode_sparse_result(coords_host, shape_rows),
         }
     } else {
@@ -529,80 +1257,107 @@ fn decode_latent_with_runtime_decoders(
         log_neighbor_build_stats("shape_decoder");
     }
 
-    reset_decoder_conv_telemetry();
-    reset_decoder_op_telemetry();
-    reset_neighbor_build_stats();
-    let tex_decode_start = Instant::now();
-    trellis_stage_log!(
-        "burn_trellis: stage decode.tex_decoder begin (rows={} guides={})",
-        count,
-        shape_decode_result.subdivisions.len()
-    );
-    let tex_coords_host = if !tex.coords.is_empty() {
-        Some(&tex.coords[..count])
-    } else {
-        None
-    };
-    #[cfg(feature = "runtime-model-wgpu")]
-    let tex_decode_result = if using_device_decode_inputs {
-        let tex_coords_wgpu_for_decode = if let Some(coords_t) = tex_coords_wgpu.as_ref() {
-            let [rows, cols] = coords_t.dims();
-            if cols != 4 {
-                return Err(format!(
-                    "runtime decode tex coord tensor must have 4 columns, got {}",
-                    cols
-                ));
-            }
-            if rows < count {
-                return Err(format!(
-                    "runtime decode tex coord tensor rows {} smaller than requested count {}",
-                    rows, count
-                ));
-            }
-            if rows == count {
-                coords_t.clone()
-            } else {
-                coords_t.clone().slice([0..count, 0..4])
-            }
+    let tex_decode_result = if needs_tex_decode {
+        let Some(tex_decoder) = tex_decoder else {
+            return Err("runtime decode native PBR requires tex runtime decoder".to_string());
+        };
+        reset_decoder_conv_telemetry();
+        reset_decoder_op_telemetry();
+        reset_neighbor_build_stats();
+        let tex_decode_start = Instant::now();
+        trellis_stage_log!(
+            "burn_trellis: stage decode.tex_decoder begin (rows={} guides={})",
+            count,
+            shape_decode_result.subdivisions.len()
+        );
+        let tex_coords_host = if !tex.coords.is_empty() {
+            Some(&tex.coords[..count])
         } else {
-            return Err(
+            None
+        };
+        #[cfg(feature = "runtime-model-wgpu")]
+        let tex_decode_result = if using_device_decode_inputs {
+            let tex_coords_wgpu_for_decode = if let Some(coords_t) = tex_coords_wgpu.as_ref() {
+                let [rows, cols] = coords_t.dims();
+                if cols != 4 {
+                    return Err(format!(
+                        "runtime decode tex coord tensor must have 4 columns, got {}",
+                        cols
+                    ));
+                }
+                if rows < count {
+                    return Err(format!(
+                        "runtime decode tex coord tensor rows {} smaller than requested count {}",
+                        rows, count
+                    ));
+                }
+                if rows == count {
+                    coords_t.clone()
+                } else {
+                    coords_t.clone().slice([0..count, 0..4])
+                }
+            } else {
+                return Err(
                 "runtime decode canonical wgpu path requires device tex coords; shape-coord fallback is disabled"
                     .to_string(),
             );
-        };
-        let tex_rows_wgpu_for_decode = if let Some(rows_t) = tex_features_wgpu.as_ref() {
-            let [rows, cols] = rows_t.dims();
-            if cols != 32 {
-                return Err(format!(
-                    "runtime decode tex feature tensor must have 32 columns, got {}",
-                    cols
-                ));
-            }
-            if rows == count {
-                rows_t.clone()
+            };
+            let tex_rows_wgpu_for_decode = if let Some(rows_t) = tex_features_wgpu.as_ref() {
+                let [rows, cols] = rows_t.dims();
+                if cols != 32 {
+                    return Err(format!(
+                        "runtime decode tex feature tensor must have 32 columns, got {}",
+                        cols
+                    ));
+                }
+                if rows == count {
+                    rows_t.clone()
+                } else {
+                    rows_t.clone().slice([0..count, 0..32])
+                }
             } else {
-                rows_t.clone().slice([0..count, 0..32])
-            }
-        } else {
-            return Err(
+                return Err(
                 "runtime decode canonical wgpu path requires device tex rows; host row tensorization fallback is disabled"
                     .to_string(),
             );
-        };
-        let rows_t = tex_rows_wgpu_for_decode.clone();
-        match tex_decoder.decode_with_guidance_result_with_tensors(
-            tex_coords_wgpu_for_decode.clone(),
-            rows_t,
-            shape_decode_result.subdivisions.as_slice(),
-        ) {
-            Ok(decoded) => decoded,
-            Err(err) => {
-                trellis_stage_log!("burn_trellis: stage decode.tex_decoder error ({err})");
-                return Err(format!("tex runtime decoder failed: {err}"));
+            };
+            let rows_t = tex_rows_wgpu_for_decode.clone();
+            match tex_decoder
+                .decode_with_guidance_result_with_tensors_async(
+                    tex_coords_wgpu_for_decode.clone(),
+                    rows_t,
+                    shape_decode_result.subdivisions.as_slice(),
+                )
+                .await
+            {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    trellis_stage_log!("burn_trellis: stage decode.tex_decoder error ({err})");
+                    return Err(format!("tex runtime decoder failed: {err}"));
+                }
             }
-        }
-    } else {
-        match if let Some(coords_host) = tex_coords_host {
+        } else {
+            match if let Some(coords_host) = tex_coords_host {
+                let tex_rows = tex_rows_host.ok_or_else(|| {
+                    "runtime decode missing tex host rows for host coord decode path".to_string()
+                })?;
+                tex_decoder.decode_with_guidance_result(
+                    coords_host,
+                    tex_rows,
+                    shape_decode_result.subdivisions.as_slice(),
+                )
+            } else {
+                return Err("runtime decode missing tex coords for host decode path".to_string());
+            } {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    trellis_stage_log!("burn_trellis: stage decode.tex_decoder error ({err})");
+                    return Err(format!("tex runtime decoder failed: {err}"));
+                }
+            }
+        };
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        let tex_decode_result = match if let Some(coords_host) = tex_coords_host {
             let tex_rows = tex_rows_host.ok_or_else(|| {
                 "runtime decode missing tex host rows for host coord decode path".to_string()
             })?;
@@ -612,70 +1367,90 @@ fn decode_latent_with_runtime_decoders(
                 shape_decode_result.subdivisions.as_slice(),
             )
         } else {
-            return Err("runtime decode missing tex coords for host decode path".to_string());
+            return Err(
+                "runtime decode missing tex coords and crate was built without runtime-model-wgpu"
+                    .to_string(),
+            );
         } {
             Ok(decoded) => decoded,
             Err(err) => {
                 trellis_stage_log!("burn_trellis: stage decode.tex_decoder error ({err})");
                 return Err(format!("tex runtime decoder failed: {err}"));
             }
-        }
-    };
-    #[cfg(not(feature = "runtime-model-wgpu"))]
-    let tex_decode_result = match if let Some(coords_host) = tex_coords_host {
-        let tex_rows = tex_rows_host.ok_or_else(|| {
-            "runtime decode missing tex host rows for host coord decode path".to_string()
-        })?;
-        tex_decoder.decode_with_guidance_result(
-            coords_host,
-            tex_rows,
-            shape_decode_result.subdivisions.as_slice(),
-        )
-    } else {
-        return Err(
-            "runtime decode missing tex coords and crate was built without runtime-model-wgpu"
-                .to_string(),
-        );
-    } {
-        Ok(decoded) => decoded,
-        Err(err) => {
-            trellis_stage_log!("burn_trellis: stage decode.tex_decoder error ({err})");
-            return Err(format!("tex runtime decoder failed: {err}"));
-        }
-    };
-    #[cfg(feature = "runtime-model-wgpu")]
-    runtime_decode_stage_boundary_sync(
-        "tex_decoder",
-        using_device_decode_inputs && decode_stage_fenced,
-    )?;
-    let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
-    trellis_stage_log!(
-        "burn_trellis: stage decode.tex_decoder complete ({tex_decoder_ms:.2} ms, coords={})",
-        tex_decode_result.rows()
-    );
-    let tex_conv_telemetry = decoder_conv_telemetry();
-    let tex_op_telemetry = decoder_op_telemetry();
-    if stage_debug {
+        };
+        #[cfg(feature = "runtime-model-wgpu")]
+        runtime_decode_stage_boundary_sync(
+            "tex_decoder",
+            using_device_decode_inputs && decode_stage_fenced,
+        )?;
+        let tex_decoder_ms = tex_decode_start.elapsed().as_secs_f64() * 1000.0;
         trellis_stage_log!(
-            "burn_trellis: decode runtime tex-decoder complete ({:.2} ms, coords={})",
-            tex_decoder_ms,
+            "burn_trellis: stage decode.tex_decoder complete ({tex_decoder_ms:.2} ms, coords={})",
             tex_decode_result.rows()
         );
-    }
-    if stage_debug || conv_telemetry_debug {
-        log_decoder_conv_telemetry("tex_decoder", &tex_conv_telemetry);
-        log_decoder_op_telemetry("tex_decoder", &tex_op_telemetry);
-        log_neighbor_build_stats("tex_decoder");
-    }
+        let tex_conv_telemetry = decoder_conv_telemetry();
+        let tex_op_telemetry = decoder_op_telemetry();
+        if stage_debug {
+            trellis_stage_log!(
+                "burn_trellis: decode runtime tex-decoder complete ({:.2} ms, coords={})",
+                tex_decoder_ms,
+                tex_decode_result.rows()
+            );
+        }
+        if stage_debug || conv_telemetry_debug {
+            log_decoder_conv_telemetry("tex_decoder", &tex_conv_telemetry);
+            log_decoder_op_telemetry("tex_decoder", &tex_op_telemetry);
+            log_neighbor_build_stats("tex_decoder");
+        }
+        Some((
+            tex_decode_result,
+            tex_decoder_ms,
+            tex_conv_telemetry,
+            tex_op_telemetry,
+        ))
+    } else {
+        trellis_stage_log!(
+            "burn_trellis: stage decode.tex_decoder skipped (decode_output_mode={})",
+            decode_output_mode.as_str()
+        );
+        None
+    };
+    let (tex_decode_result, tex_decoder_ms, tex_conv_telemetry, _tex_op_telemetry) =
+        match tex_decode_result {
+            Some((decode_result, decoder_ms, conv_telemetry, op_telemetry)) => (
+                Some(decode_result),
+                decoder_ms,
+                conv_telemetry,
+                op_telemetry,
+            ),
+            None => (
+                None,
+                0.0,
+                DecoderConvTelemetry::default(),
+                DecoderOpTelemetry::default(),
+            ),
+        };
 
     if final_resolution == 0 {
         return Err(format!(
             "runtime decode received invalid final resolution for pipeline '{pipeline_type}'"
         ));
     }
+    #[cfg(feature = "runtime-model-wgpu")]
+    let shape_decoded_coords_host = shape_decode_result
+        .coords_host_async("runtime decode shape coord stage-boundary materialization")
+        .await
+        .map_err(|err| format!("shape runtime decoder coord readback failed: {err}"))?;
+    #[cfg(not(feature = "runtime-model-wgpu"))]
     let shape_decoded_coords_host = shape_decode_result
         .coords_host("runtime decode shape coord stage-boundary materialization")
         .map_err(|err| format!("shape runtime decoder coord readback failed: {err}"))?;
+    #[cfg(feature = "runtime-model-wgpu")]
+    let shape_decoded_feats_host = shape_decode_result
+        .feats_host_async("runtime decode shape feat stage-boundary materialization")
+        .await
+        .map_err(|err| format!("shape runtime decoder feat readback failed: {err}"))?;
+    #[cfg(not(feature = "runtime-model-wgpu"))]
     let shape_decoded_feats_host = shape_decode_result
         .feats_host("runtime decode shape feat stage-boundary materialization")
         .map_err(|err| format!("shape runtime decoder feat readback failed: {err}"))?;
@@ -687,23 +1462,33 @@ fn decode_latent_with_runtime_decoders(
         shape_decoder.voxel_margin(),
     )
     .map_err(|err| format!("shape runtime decoder output decode failed: {err}"))?;
-    let tex_decoded_rows = tex_decode_result.rows();
-    if tex_decoded_rows != shape_decoded.coords.len() {
-        return Err(format!(
-            "tex runtime decoder row mismatch: expected_rows={} actual_rows={}",
-            shape_decoded.coords.len(),
-            tex_decoded_rows
-        ));
-    }
-    let tex_decoded_feats_host = tex_decode_result
-        .feats_host("runtime decode tex feat stage-boundary materialization")
-        .map_err(|err| format!("tex runtime decoder feat readback failed: {err}"))?;
-    let tex_attrs = decode_tex_attrs_from_host(
-        tex_decoded_feats_host.as_slice(),
-        tex_decode_result.out_channels,
-        Some(shape_decoded.coords.len()),
-    )
-    .map_err(|err| format!("tex runtime decoder output decode failed: {err}"))?;
+    let tex_attrs = if let Some(tex_decode_result) = tex_decode_result.as_ref() {
+        let tex_decoded_rows = tex_decode_result.rows();
+        if tex_decoded_rows != shape_decoded.coords.len() {
+            return Err(format!(
+                "tex runtime decoder row mismatch: expected_rows={} actual_rows={}",
+                shape_decoded.coords.len(),
+                tex_decoded_rows
+            ));
+        }
+        #[cfg(feature = "runtime-model-wgpu")]
+        let tex_decoded_feats_host = tex_decode_result
+            .feats_host_async("runtime decode tex feat stage-boundary materialization")
+            .await
+            .map_err(|err| format!("tex runtime decoder feat readback failed: {err}"))?;
+        #[cfg(not(feature = "runtime-model-wgpu"))]
+        let tex_decoded_feats_host = tex_decode_result
+            .feats_host("runtime decode tex feat stage-boundary materialization")
+            .map_err(|err| format!("tex runtime decoder feat readback failed: {err}"))?;
+        decode_tex_attrs_from_host(
+            tex_decoded_feats_host.as_slice(),
+            tex_decode_result.out_channels,
+            Some(shape_decoded.coords.len()),
+        )
+        .map_err(|err| format!("tex runtime decoder output decode failed: {err}"))?
+    } else {
+        Vec::new()
+    };
     let shape_subdivisions = shape_decoded.subdivisions;
     let coords = shape_decoded.coords;
     let shape_vertices = shape_decoded.vertices;
@@ -715,12 +1500,16 @@ fn decode_latent_with_runtime_decoders(
         coords.len()
     );
     let attr_merge_start = Instant::now();
-    let voxel_attrs = merge_voxel_attrs_for_decode(
-        coords.as_slice(),
-        coords.as_slice(),
-        tex_attrs.as_slice(),
-        parity_strict,
-    )?;
+    let voxel_attrs = if needs_tex_decode {
+        merge_voxel_attrs_for_decode(
+            coords.as_slice(),
+            coords.as_slice(),
+            tex_attrs.as_slice(),
+            parity_strict,
+        )?
+    } else {
+        Vec::new()
+    };
     let attr_merge_ms = attr_merge_start.elapsed().as_secs_f64() * 1000.0;
     trellis_stage_log!("burn_trellis: stage decode.attr_merge complete ({attr_merge_ms:.2} ms)");
     if stage_debug {
@@ -786,33 +1575,112 @@ fn decode_latent_with_runtime_decoders(
     if vertices.is_empty() || faces.is_empty() {
         return Err("runtime decode produced empty mesh".to_string());
     }
+    let projection_vertices = vertices.clone();
+    let projection_faces = faces.clone();
+    let mut use_projection_source = false;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut projection_bvh_for_pbr = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if decode_output_mode.needs_native_mesh_postprocess() {
+            let remesh_start = Instant::now();
+            let before_remesh_faces = faces.len();
+            let projection_bvh = build_projection_bvh_for_pbr(PbrProjectionSource {
+                vertices: projection_vertices.as_slice(),
+                faces: projection_faces.as_slice(),
+            })
+            .map_err(|err| format!("runtime decode native mesh remesh failed: {err}"))?;
+            let (remeshed_vertices, remeshed_faces) =
+                remesh_narrow_band_simple_dc_with_projection_bvh(
+                    &projection_bvh,
+                    final_resolution as u32,
+                    NATIVE_PBR_OVOXEL_REMESH_BAND,
+                )
+                .map_err(|err| format!("runtime decode native mesh remesh failed: {err}"))?;
+            projection_bvh_for_pbr = Some(projection_bvh);
+            vertices = remeshed_vertices;
+            faces = remeshed_faces;
+            let remesh_cleanup = cleanup_mesh_topology(&mut vertices, &mut faces);
+            if remesh_cleanup.duplicate_faces_removed > 0
+                || remesh_cleanup.nonmanifold_faces_removed > 0
+                || remesh_cleanup.small_component_faces_removed > 0
+                || remesh_cleanup.hole_faces_added > 0
+            {
+                trellis_stage_log!(
+                    "burn_trellis: runtime decode native mesh remesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+                    remesh_cleanup.duplicate_faces_removed,
+                    remesh_cleanup.nonmanifold_faces_removed,
+                    remesh_cleanup.small_component_faces_removed,
+                    remesh_cleanup.hole_faces_added,
+                    vertices.len(),
+                    faces.len()
+                );
+            }
+            trellis_stage_log!(
+                "burn_trellis: runtime decode native mesh remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
+                remesh_start.elapsed().as_secs_f64() * 1000.0,
+                before_remesh_faces,
+                faces.len(),
+                vertices.len()
+            );
+            if vertices.is_empty() || faces.is_empty() {
+                return Err("runtime decode native mesh remesh produced empty mesh".to_string());
+            }
+            use_projection_source = true;
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    if decode_output_mode.needs_native_mesh_postprocess() {
+        return Err(format!(
+            "runtime decode {} requires native mesh remesh/postprocess, which is not available on wasm; refusing raw FDG output",
+            decode_output_mode.as_str()
+        ));
+    }
+    let mut pre_pbr_decimate_ms = 0.0f64;
     if let Some(target_faces) = target_faces.filter(|limit| *limit > 0) {
-        #[cfg(not(target_arch = "wasm32"))]
         if faces.len() > target_faces {
             let before_faces = faces.len();
+            let decimate_start = Instant::now();
             decimate_mesh_for_face_budget(&mut vertices, &mut faces, target_faces)?;
+            pre_pbr_decimate_ms = decimate_start.elapsed().as_secs_f64() * 1000.0;
+            use_projection_source = true;
             trellis_stage_log!(
-                "burn_trellis: runtime decode pre-pbr decimation complete (target_faces={} from_faces={} to_faces={})",
+                "burn_trellis: runtime decode pre-pbr decimation complete ({:.2} ms, target_faces={} from_faces={} to_faces={})",
+                pre_pbr_decimate_ms,
                 target_faces,
                 before_faces,
                 faces.len()
             );
             if vertices.is_empty() || faces.is_empty() {
-                return Err(
-                    "runtime decode pre-pbr decimation produced empty mesh".to_string(),
-                );
+                return Err("runtime decode pre-pbr decimation produced empty mesh".to_string());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let decimate_cleanup = cleanup_mesh_topology(&mut vertices, &mut faces);
+                if decimate_cleanup.duplicate_faces_removed > 0
+                    || decimate_cleanup.nonmanifold_faces_removed > 0
+                    || decimate_cleanup.small_component_faces_removed > 0
+                    || decimate_cleanup.hole_faces_added > 0
+                {
+                    trellis_stage_log!(
+                        "burn_trellis: runtime decode pre-pbr decimation cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+                        decimate_cleanup.duplicate_faces_removed,
+                        decimate_cleanup.nonmanifold_faces_removed,
+                        decimate_cleanup.small_component_faces_removed,
+                        decimate_cleanup.hole_faces_added,
+                        vertices.len(),
+                        faces.len()
+                    );
+                }
+                if vertices.is_empty() || faces.is_empty() {
+                    return Err(
+                        "runtime decode pre-pbr decimation cleanup produced empty mesh".to_string(),
+                    );
+                }
             }
         }
-        #[cfg(target_arch = "wasm32")]
-        if faces.len() > target_faces {
-            return Err(format!(
-                "runtime decode target face budget is unsupported on wasm (target_faces={} faces={})",
-                target_faces,
-                faces.len()
-            ));
-        }
     }
-    let (uvs, pbr_textures, pbr_debug, pbr_ms) = if decode_output_mode.needs_native_pbr() {
+    let (pbr_mesh, pbr_textures, pbr_debug, pbr_ms) = if decode_output_mode.needs_native_pbr() {
         trellis_stage_log!("burn_trellis: stage decode.pbr begin");
         let pbr_start = Instant::now();
         #[cfg(feature = "runtime-model-wgpu")]
@@ -822,49 +1690,91 @@ fn decode_latent_with_runtime_decoders(
         let prefer_wgpu_sampling = using_device_decode_inputs;
         #[cfg(not(feature = "runtime-model-wgpu"))]
         let prefer_wgpu_sampling = false;
-        let (uvs, pbr_textures, pbr_debug) = bake_pbr_from_voxels_with_options(
-            vertices.as_slice(),
-            faces.as_slice(),
-            coords.as_slice(),
-            voxel_attrs.as_slice(),
-            final_resolution as u32,
-            pbr_texture_size,
-            capture_debug_artifacts,
-            prefer_wgpu_sampling,
-        )
-        .map_err(|err| format!("runtime decode pbr bake failed: {err}"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let projection_bvh_override = if use_projection_source {
+            projection_bvh_for_pbr.as_ref()
+        } else {
+            None
+        };
+        #[cfg(target_arch = "wasm32")]
+        let projection_bvh_override = None;
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let (mut pbr_mesh, pbr_textures, pbr_debug) =
+            bake_pbr_from_voxels_with_options_and_projection_bvh(
+                vertices.as_slice(),
+                faces.as_slice(),
+                use_projection_source.then_some(PbrProjectionSource {
+                    vertices: projection_vertices.as_slice(),
+                    faces: projection_faces.as_slice(),
+                }),
+                projection_bvh_override,
+                coords.as_slice(),
+                voxel_attrs.as_slice(),
+                final_resolution as u32,
+                pbr_texture_size,
+                capture_debug_artifacts,
+                prefer_wgpu_sampling,
+            )
+            .map_err(|err| format!("runtime decode pbr bake failed: {err}"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let pbr_cleanup = cleanup_pbr_bake_mesh_topology(&mut pbr_mesh);
+            if pbr_cleanup.duplicate_faces_removed > 0 || pbr_cleanup.nonmanifold_faces_removed > 0
+            {
+                trellis_stage_log!(
+                    "burn_trellis: runtime decode pbr output cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} vertices={} faces={} uvs={})",
+                    pbr_cleanup.duplicate_faces_removed,
+                    pbr_cleanup.nonmanifold_faces_removed,
+                    pbr_mesh.vertices.len(),
+                    pbr_mesh.faces.len(),
+                    pbr_mesh.uvs.len()
+                );
+            }
+        }
         let pbr_ms = pbr_start.elapsed().as_secs_f64() * 1000.0;
         trellis_stage_log!("burn_trellis: stage decode.pbr complete ({pbr_ms:.2} ms)");
         if stage_debug {
             trellis_stage_log!("burn_trellis: decode runtime pbr complete ({pbr_ms:.2} ms)");
         }
-        (uvs, pbr_textures, pbr_debug, pbr_ms)
+        (pbr_mesh, pbr_textures, pbr_debug, pbr_ms)
     } else {
         trellis_stage_log!(
             "burn_trellis: stage decode.pbr skipped (decode_output_mode={})",
             decode_output_mode.as_str()
         );
-        (Vec::new(), None, None, 0.0)
+        (
+            PbrBakeMesh {
+                vertices,
+                faces,
+                uvs: Vec::new(),
+            },
+            None,
+            None,
+            0.0,
+        )
     };
     if parity_strict
         && decode_output_mode.needs_native_pbr()
-        && (pbr_textures.is_none() || uvs.len() != vertices.len())
+        && (pbr_textures.is_none() || pbr_mesh.uvs.len() != pbr_mesh.vertices.len())
     {
         return Err(format!(
             "parity strict mode: runtime decode pbr mismatch (textures_present={} uvs={} vertices={})",
             pbr_textures.is_some(),
-            uvs.len(),
-            vertices.len()
+            pbr_mesh.uvs.len(),
+            pbr_mesh.vertices.len()
         ));
     }
     let material = summarize_material(voxel_attrs.as_slice(), pbr_textures.as_ref());
-    let mesh = Mesh {
-        vertices,
-        faces,
-        uvs,
+    let mut mesh = Mesh {
+        vertices: pbr_mesh.vertices,
+        faces: pbr_mesh.faces,
+        uvs: pbr_mesh.uvs,
         material,
         pbr_textures,
     };
+    if decode_output_mode.needs_native_mesh_postprocess() {
+        apply_native_pbr_ovoxel_remesh_domain_scale(&mut mesh, final_resolution as u32);
+    }
 
     let shape_subs = if capture_debug_artifacts {
         shape_subdivisions
@@ -892,6 +1802,7 @@ fn decode_latent_with_runtime_decoders(
             tex_decoder_ms,
             attr_merge_ms,
             mesh_ms,
+            pre_pbr_decimate_ms,
             pbr_ms,
             shape_conv_calls: shape_conv_telemetry.conv_calls,
             tex_conv_calls: tex_conv_telemetry.conv_calls,
@@ -932,9 +1843,14 @@ fn runtime_decode_stage_boundary_sync(stage: &str, enabled: bool) -> Result<(), 
 
 #[cfg(all(test, feature = "runtime-model"))]
 mod runtime_decode_tests {
-    use super::sanitize_mesh_geometry;
+    use super::PbrBakeMesh;
+    use super::apply_native_pbr_ovoxel_remesh_domain_scale;
+    use super::cleanup_mesh_topology;
+    use super::cleanup_pbr_bake_mesh_topology;
     #[cfg(not(target_arch = "wasm32"))]
     use super::decimate_mesh_for_face_budget;
+    use super::sanitize_mesh_geometry;
+    use crate::mesh::Mesh;
 
     #[cfg(feature = "runtime-model-wgpu")]
     use super::runtime_decode_uses_device_inputs;
@@ -969,6 +1885,114 @@ mod runtime_decode_tests {
         assert_eq!(faces, vec![[0, 1, 2]]);
     }
 
+    #[test]
+    fn cleanup_mesh_topology_removes_duplicates_and_tiny_components() {
+        let mut vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.001, 0.0, 0.0],
+            [2.0, 0.001, 0.0],
+        ];
+        let mut faces = vec![[0, 1, 2], [2, 1, 0], [3, 4, 5]];
+
+        let stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+
+        assert_eq!(stats.duplicate_faces_removed, 1);
+        assert_eq!(stats.small_component_faces_removed, 1);
+        assert_eq!(stats.hole_faces_added, 0);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(vertices.len(), 3);
+    }
+
+    #[test]
+    fn cleanup_mesh_topology_removes_nonmanifold_edge_faces() {
+        let mut vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let mut faces = vec![[0, 1, 2], [1, 0, 3], [0, 1, 4]];
+
+        let stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+
+        assert_eq!(stats.duplicate_faces_removed, 0);
+        assert_eq!(stats.nonmanifold_faces_removed, 1);
+        assert_eq!(faces.len(), 2);
+        let mut edge_counts = std::collections::HashMap::<(u32, u32), usize>::new();
+        for face in &faces {
+            for [a, b] in [[face[0], face[1]], [face[1], face[2]], [face[2], face[0]]] {
+                let key = if a <= b { (a, b) } else { (b, a) };
+                *edge_counts.entry(key).or_default() += 1;
+            }
+        }
+        assert!(edge_counts.values().all(|count| *count <= 2));
+    }
+
+    #[test]
+    fn cleanup_pbr_bake_mesh_topology_preserves_uv_alignment() {
+        let mut mesh = PbrBakeMesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            faces: vec![[0, 1, 2], [1, 0, 3], [0, 1, 4]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.5], [0.5, 0.5]],
+        };
+
+        let stats = cleanup_pbr_bake_mesh_topology(&mut mesh);
+
+        assert_eq!(stats.nonmanifold_faces_removed, 1);
+        assert_eq!(mesh.faces.len(), 2);
+        assert_eq!(mesh.uvs.len(), mesh.vertices.len());
+        assert!(
+            mesh.faces
+                .iter()
+                .flatten()
+                .all(|idx| (*idx as usize) < mesh.vertices.len())
+        );
+    }
+
+    #[test]
+    fn cleanup_mesh_topology_fills_small_boundary_loop() {
+        let mut vertices = vec![
+            [0.0, 0.0, 0.0],
+            [0.005, 0.0, 0.0],
+            [0.0, 0.005, 0.0],
+            [0.0, 0.0, 0.005],
+        ];
+        let mut faces = vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]];
+
+        let stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+
+        assert_eq!(stats.duplicate_faces_removed, 0);
+        assert_eq!(stats.small_component_faces_removed, 0);
+        assert_eq!(stats.hole_faces_added, 0);
+        assert_eq!(faces.len(), 4);
+        assert_eq!(vertices.len(), 4);
+
+        faces.pop();
+        let stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+        assert!(stats.hole_faces_added >= 3);
+        assert!(faces.len() >= 4);
+    }
+
+    #[test]
+    fn native_pbr_ovoxel_remesh_domain_scale_matches_upstream_band_formula() {
+        let mut mesh = Mesh::new(vec![[1.0, -2.0, 0.5]], vec![[0, 0, 0]]);
+        apply_native_pbr_ovoxel_remesh_domain_scale(&mut mesh, 512);
+        let expected = (512.0 + 3.0) / 512.0;
+        for (actual, base) in mesh.vertices[0].iter().zip([1.0f32, -2.0, 0.5]) {
+            assert!((*actual - base * expected).abs() < 1.0e-6);
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn runtime_decode_pre_pbr_decimation_respects_face_budget() {
@@ -1000,10 +2024,41 @@ mod runtime_decode_tests {
         assert!(!vertices.is_empty());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_decode_pre_pbr_decimation_handles_extreme_reduction() {
+        let side = 64usize;
+        let mut vertices = Vec::with_capacity((side + 1) * (side + 1));
+        for y in 0..=side {
+            for x in 0..=side {
+                vertices.push([x as f32, y as f32, (x ^ y) as f32 * 0.001]);
+            }
+        }
+        let idx = |x: usize, y: usize| -> u32 { (y * (side + 1) + x) as u32 };
+        let mut faces = Vec::with_capacity(side * side * 2);
+        for y in 0..side {
+            for x in 0..side {
+                let i0 = idx(x, y);
+                let i1 = idx(x + 1, y);
+                let i2 = idx(x, y + 1);
+                let i3 = idx(x + 1, y + 1);
+                faces.push([i0, i1, i3]);
+                faces.push([i0, i3, i2]);
+            }
+        }
+        decimate_mesh_for_face_budget(&mut vertices, &mut faces, 20)
+            .expect("extreme runtime decimation should succeed");
+        assert!(faces.len() <= 20, "faces={} > 20", faces.len());
+        assert!(!faces.is_empty());
+        assert!(!vertices.is_empty());
+    }
+
     #[cfg(feature = "runtime-model-wgpu")]
     #[test]
     fn runtime_decode_device_gate_allows_host_only_inputs() {
-        assert!(!runtime_decode_uses_device_inputs(false, false, false, false));
+        assert!(!runtime_decode_uses_device_inputs(
+            false, false, false, false
+        ));
         assert!(runtime_decode_uses_device_inputs(true, false, false, false));
         assert!(runtime_decode_uses_device_inputs(false, true, false, false));
         assert!(runtime_decode_uses_device_inputs(false, false, true, false));

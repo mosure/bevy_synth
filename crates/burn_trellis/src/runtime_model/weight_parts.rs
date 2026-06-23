@@ -5,6 +5,8 @@ use serde::Deserialize;
 use crate::blob_burnpack::load_blob_bytes_from_burnpack_bytes;
 use crate::virtual_fs;
 
+const BURNPACK_PART_ALIGNMENT: u64 = 256;
+
 #[derive(Debug, Deserialize)]
 struct BurnpackPartEntry {
     path: String,
@@ -16,8 +18,6 @@ struct BurnpackPartEntry {
 struct BurnpackPartsManifest {
     #[serde(default)]
     source_file: String,
-    #[serde(default)]
-    total_bytes: u64,
     #[serde(default)]
     parts: Vec<BurnpackPartEntry>,
 }
@@ -41,11 +41,23 @@ pub(crate) fn load_blob_bytes_from_burnpack_or_parts<F>(
 where
     F: FnMut(&Path) -> Result<Vec<u8>, String>,
 {
+    let manifest_path = burnpack_parts_manifest_path(burnpack_path);
+    #[cfg(target_arch = "wasm32")]
+    if virtual_fs::exists(&manifest_path) {
+        return load_blob_bytes_from_burnpack_parts(burnpack_path, &manifest_path);
+    }
+
     if virtual_fs::exists(burnpack_path) {
         return load_blob_from_burnpack(burnpack_path);
     }
 
-    let manifest_path = burnpack_parts_manifest_path(burnpack_path);
+    load_blob_bytes_from_burnpack_parts(burnpack_path, &manifest_path)
+}
+
+fn load_blob_bytes_from_burnpack_parts(
+    burnpack_path: &Path,
+    manifest_path: &Path,
+) -> Result<Vec<u8>, String> {
     let manifest_bytes = virtual_fs::read(&manifest_path).map_err(|err| {
         format!(
             "failed to read burnpack parts manifest '{}': {err}",
@@ -80,9 +92,6 @@ where
     }
 
     let mut merged = Vec::new();
-    let mut all_part_sizes_match_file_sizes = true;
-    let mut all_part_sizes_match_payload_sizes = true;
-    let mut file_size_total = 0u64;
     let manifest_source_url = virtual_fs::source_url(&manifest_path);
     for (index, part) in manifest.parts.iter().enumerate() {
         let part_path = resolve_manifest_part_path(&manifest_path, part.path.as_str())?;
@@ -96,7 +105,6 @@ where
         } else {
             part.bytes
         };
-        file_size_total = file_size_total.saturating_add(part_file_size);
         let bytes = if virtual_fs::has_virtual_file(&part_path) {
             let burnpack_bytes = virtual_fs::read(&part_path).map_err(|err| {
                 format!(
@@ -118,28 +126,26 @@ where
             })?
         } else if let Some(manifest_url) = manifest_source_url.as_deref() {
             let part_url = resolve_manifest_part_url(manifest_url, part.path.as_str());
-            let burnpack_bytes = virtual_fs::fetch_url(part_url.as_str()).map_err(|err| {
+            return Err(format!(
+                "burnpack part {}/{} '{}' for '{}' was not preloaded; async wasm loaders must download and register shard bytes before materialization (source_url={part_url})",
+                index + 1,
+                manifest.parts.len(),
+                part_path.display(),
+                burnpack_path.display()
+            ));
+        } else {
+            let burnpack_bytes = virtual_fs::read(&part_path).map_err(|err| {
                 format!(
-                    "failed to fetch burnpack part {}/{} '{}' for '{}': {err}",
+                    "failed to read burnpack part {}/{} '{}' for '{}': {err}",
                     index + 1,
                     manifest.parts.len(),
-                    part_url,
+                    part_path.display(),
                     burnpack_path.display()
                 )
             })?;
             load_blob_bytes_from_burnpack_bytes(&burnpack_bytes).map_err(|err| {
                 format!(
-                    "failed to decode fetched burnpack part {}/{} '{}' for '{}': {err}",
-                    index + 1,
-                    manifest.parts.len(),
-                    part_url,
-                    burnpack_path.display()
-                )
-            })?
-        } else {
-            load_blob_from_burnpack(&part_path).map_err(|err| {
-                format!(
-                    "failed to load burnpack part {}/{} '{}' for '{}': {err}",
+                    "failed to decode burnpack part {}/{} '{}' for '{}': {err}",
                     index + 1,
                     manifest.parts.len(),
                     part_path.display(),
@@ -150,8 +156,10 @@ where
         if part.bytes > 0 {
             let payload_bytes = bytes.len() as u64;
             let matches_file_size = part_file_size == part.bytes;
+            let matches_padded_file_size = part_file_size >= part.bytes
+                && part_file_size.saturating_sub(part.bytes) <= BURNPACK_PART_ALIGNMENT;
             let matches_payload_size = payload_bytes == part.bytes;
-            if !matches_file_size && !matches_payload_size {
+            if !matches_file_size && !matches_padded_file_size && !matches_payload_size {
                 return Err(format!(
                     "burnpack part '{}' size mismatch: manifest={} file={} payload={}",
                     part_path.display(),
@@ -160,36 +168,8 @@ where
                     payload_bytes
                 ));
             }
-            all_part_sizes_match_file_sizes &= matches_file_size;
-            all_part_sizes_match_payload_sizes &= matches_payload_size;
-        } else {
-            all_part_sizes_match_file_sizes = false;
-            all_part_sizes_match_payload_sizes = false;
         }
         merged.extend_from_slice(bytes.as_slice());
-    }
-
-    if manifest.total_bytes > 0 {
-        if all_part_sizes_match_file_sizes {
-            if file_size_total != manifest.total_bytes {
-                return Err(format!(
-                    "assembled burnpack part file sizes for '{}' produced {} bytes, expected {}",
-                    burnpack_path.display(),
-                    file_size_total,
-                    manifest.total_bytes
-                ));
-            }
-        } else if all_part_sizes_match_payload_sizes || merged.len() as u64 != manifest.total_bytes
-        {
-            if merged.len() as u64 != manifest.total_bytes {
-                return Err(format!(
-                    "assembled burnpack parts for '{}' produced {} payload bytes, expected {}",
-                    burnpack_path.display(),
-                    merged.len(),
-                    manifest.total_bytes
-                ));
-            }
-        }
     }
 
     Ok(merged)

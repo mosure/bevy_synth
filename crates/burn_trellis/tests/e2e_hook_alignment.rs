@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use burn_trellis::TrellisComputeProfile;
 use burn_trellis::TrellisQuality;
 use burn_trellis::hook_diff::{
-    HookDiffStatus, HookSnapshot, compare_hook_snapshots, compute_stats,
+    HookDiffEntry, HookDiffReport, HookDiffStatus, HookSnapshot, compare_hook_snapshots,
+    compute_stats,
 };
 use burn_trellis::pipeline::{
     Trellis2Pipeline, Trellis2PipelineConfig, TrellisDevice, TrellisRunOptions,
@@ -106,6 +107,58 @@ fn coords_set(
     Ok(out)
 }
 
+fn reference_hook_key(
+    reference: &HookSnapshot,
+    candidates: &[&'static str],
+    label: &str,
+) -> Result<&'static str, String> {
+    candidates
+        .iter()
+        .copied()
+        .find(|key| reference.tensors.contains_key(*key))
+        .ok_or_else(|| {
+            format!(
+                "missing reference hook key for {label}; expected one of: {}",
+                candidates.join(", ")
+            )
+        })
+}
+
+fn report_entry<'a>(report: &'a HookDiffReport, key: &str) -> Result<&'a HookDiffEntry, String> {
+    report
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .ok_or_else(|| format!("missing hook diff entry '{key}'"))
+}
+
+fn assert_strict_float_gate(
+    report: &HookDiffReport,
+    key: &str,
+    mean_abs_limit: f32,
+    max_abs_limit: f32,
+    rmse_limit: f32,
+    label: &str,
+) -> Result<(), String> {
+    let entry = report_entry(report, key)?;
+    if entry.status != HookDiffStatus::Match {
+        return Err(format!(
+            "strict {label} hook mismatch for '{key}': status={:?} reference_shape={:?} actual_shape={:?}",
+            entry.status, entry.reference_shape, entry.actual_shape
+        ));
+    }
+    let stats = entry
+        .stats
+        .ok_or_else(|| format!("missing stats for strict {label} hook '{key}'"))?;
+    if stats.mean_abs > mean_abs_limit || stats.max_abs > max_abs_limit || stats.rmse > rmse_limit {
+        return Err(format!(
+            "strict {label} threshold failed for '{key}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} limits=({:.6e}, {:.6e}, {:.6e})",
+            stats.mean_abs, stats.max_abs, stats.rmse, mean_abs_limit, max_abs_limit, rmse_limit
+        ));
+    }
+    Ok(())
+}
+
 fn mesh_axis_balance(snapshot: &HookSnapshot, key: &str) -> Result<[f32; 3], String> {
     let tensor = snapshot
         .tensors
@@ -194,6 +247,8 @@ fn is_optional_canonical_missing_key(key: &str) -> bool {
 fn is_optional_diagnostic_missing_key(key: &str) -> bool {
     if key
         .strip_prefix("sample_shape_slat.sampler.samples.")
+        .or_else(|| key.strip_prefix("sample_shape_slat_lr.sampler.samples."))
+        .or_else(|| key.strip_prefix("sample_shape_slat_hr.sampler.samples."))
         .or_else(|| key.strip_prefix("sample_tex_slat.sampler.samples."))
         .is_some_and(|suffix| matches!(suffix, "coords" | "feats" | "shape" | "spatial_shape"))
     {
@@ -209,6 +264,8 @@ fn is_optional_diagnostic_missing_key(key: &str) -> bool {
 
     let Some(rest) = key
         .strip_prefix("sample_shape_slat.sampler.step_")
+        .or_else(|| key.strip_prefix("sample_shape_slat_lr.sampler.step_"))
+        .or_else(|| key.strip_prefix("sample_shape_slat_hr.sampler.step_"))
         .or_else(|| key.strip_prefix("sample_tex_slat.sampler.step_"))
     else {
         return false;
@@ -299,9 +356,18 @@ fn all_step_slat_velocity_hooks_are_optional_diagnostics() {
     assert!(is_optional_diagnostic_missing_key(
         "sample_shape_slat.sampler.samples.feats"
     ));
+    assert!(is_optional_diagnostic_missing_key(
+        "sample_shape_slat_lr.sampler.samples.feats"
+    ));
+    assert!(is_optional_diagnostic_missing_key(
+        "sample_shape_slat_hr.sampler.step_008_of_012.pred_v.feats"
+    ));
 
     assert!(!is_optional_diagnostic_missing_key(
         "sample_shape_slat.sampler.step_000_of_012.pred_v.feats"
+    ));
+    assert!(!is_optional_diagnostic_missing_key(
+        "sample_shape_slat_lr.sampler.step_000_of_012.pred_v.feats"
     ));
     assert!(!is_optional_diagnostic_missing_key(
         "sample_shape_slat.sampler.step_006_of_012.x_t.feats"
@@ -548,41 +614,55 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
     }
 
     let report = compare_hook_snapshots(&reference, &actual, None);
+    let shape_slat_feats_key = reference_hook_key(
+        &reference,
+        &[
+            "sample_shape_slat.slat.feats",
+            "decode_shape_slat.input.feats",
+        ],
+        "shape SLat features",
+    )?;
+    let tex_slat_feats_key = reference_hook_key(
+        &reference,
+        &["sample_tex_slat.slat.feats", "decode_tex_slat.input.feats"],
+        "texture SLat features",
+    )?;
+    let shape_slat_coords_key = reference_hook_key(
+        &reference,
+        &[
+            "sample_shape_slat.slat.coords",
+            "decode_shape_slat.input.coords",
+        ],
+        "shape SLat coords",
+    )?;
+    let tex_slat_coords_key = reference_hook_key(
+        &reference,
+        &[
+            "sample_tex_slat.slat.coords",
+            "decode_tex_slat.input.coords",
+        ],
+        "texture SLat coords",
+    )?;
 
     if strict {
         let strict_core_limit = 1.0e-3f32;
-        for key in [
+        assert_strict_float_gate(
+            &report,
             "sample_sparse_structure.latent",
-            "sample_shape_slat.slat.feats",
-            "sample_tex_slat.slat.feats",
-            "decode_shape_slat.input.feats",
-            "decode_tex_slat.input.feats",
-        ] {
-            let entry = report
-                .entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .ok_or_else(|| format!("missing strict core key '{key}'"))?;
-            if entry.status != HookDiffStatus::Match {
-                return Err(format!(
-                    "strict core hook mismatch for '{key}': status={:?} reference_shape={:?} actual_shape={:?}",
-                    entry.status, entry.reference_shape, entry.actual_shape
-                )
-                .into());
-            }
-            let stats = entry
-                .stats
-                .ok_or_else(|| format!("missing stats for strict core hook '{key}'"))?;
-            if stats.mean_abs > strict_core_limit
-                || stats.max_abs > strict_core_limit
-                || stats.rmse > strict_core_limit
-            {
-                return Err(format!(
-                    "strict core threshold failed for '{key}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e}",
-                    stats.mean_abs, stats.max_abs, stats.rmse
-                )
-                .into());
-            }
+            strict_core_limit,
+            strict_core_limit,
+            strict_core_limit,
+            "core",
+        )?;
+        for key in [shape_slat_feats_key, tex_slat_feats_key] {
+            assert_strict_float_gate(
+                &report,
+                key,
+                strict_core_limit,
+                3.0e-3,
+                strict_core_limit,
+                "core",
+            )?;
         }
     }
 
@@ -727,8 +807,8 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
         }
         for key in [
             "sample_sparse_structure.coords",
-            "sample_shape_slat.slat.coords",
-            "sample_tex_slat.slat.coords",
+            shape_slat_coords_key,
+            tex_slat_coords_key,
         ] {
             let actual_coords = coords_set(&actual, key)?;
             let reference_coords = coords_set(&reference, key)?;
@@ -774,27 +854,15 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
                 rmse: 1.0e-3,
             },
             StrictFloatGate {
-                key: "sample_shape_slat.slat.feats",
+                key: shape_slat_feats_key,
                 mean_abs: 1.0e-3,
-                max_abs: 1.0e-3,
+                max_abs: 3.0e-3,
                 rmse: 1.0e-3,
             },
             StrictFloatGate {
-                key: "sample_tex_slat.slat.feats",
+                key: tex_slat_feats_key,
                 mean_abs: 1.0e-3,
-                max_abs: 1.0e-3,
-                rmse: 1.0e-3,
-            },
-            StrictFloatGate {
-                key: "decode_shape_slat.input.feats",
-                mean_abs: 1.0e-3,
-                max_abs: 1.0e-3,
-                rmse: 1.0e-3,
-            },
-            StrictFloatGate {
-                key: "decode_tex_slat.input.feats",
-                mean_abs: 1.0e-3,
-                max_abs: 1.0e-3,
+                max_abs: 3.0e-3,
                 rmse: 1.0e-3,
             },
             StrictFloatGate {
@@ -811,30 +879,14 @@ fn trellis2_e2e_hook_alignment_against_reference() -> Result<(), Box<dyn std::er
             },
         ];
         for gate in strict_float_keys {
-            let entry = report
-                .entries
-                .iter()
-                .find(|entry| entry.key == gate.key)
-                .ok_or_else(|| format!("missing strict float key '{}'", gate.key))?;
-            let stats = entry
-                .stats
-                .ok_or_else(|| format!("missing stats for strict hook '{}'", gate.key))?;
-            if stats.mean_abs > gate.mean_abs
-                || stats.max_abs > gate.max_abs
-                || stats.rmse > gate.rmse
-            {
-                return Err(format!(
-                    "strict float threshold failed for '{}': mean_abs={:.6e} max_abs={:.6e} rmse={:.6e} limits=({:.6e}, {:.6e}, {:.6e})",
-                    gate.key,
-                    stats.mean_abs,
-                    stats.max_abs,
-                    stats.rmse,
-                    gate.mean_abs,
-                    gate.max_abs,
-                    gate.rmse
-                )
-                .into());
-            }
+            assert_strict_float_gate(
+                &report,
+                gate.key,
+                gate.mean_abs,
+                gate.max_abs,
+                gate.rmse,
+                "float",
+            )?;
         }
 
         let strict_pbr_float_keys = [

@@ -34,8 +34,9 @@ pub mod bevy_transform_gizmos;
 use crate::bevy_file_dialog::prelude::FileDialogExt;
 
 use bevy_synth_runtime::args::{
-    AppArgs, BackendKind, SynthesisModel, TRIPOSPLAT_GAUSSIAN_STEP, TRIPOSPLAT_MAX_NUM_GAUSSIANS,
-    TRIPOSPLAT_MIN_NUM_GAUSSIANS, TripoSplatProfile,
+    AppArgs, BackendKind, DEFAULT_TRELLIS_PBR_TEXTURE_SIZE, SynthesisModel,
+    TRIPOSPLAT_GAUSSIAN_STEP, TRIPOSPLAT_MAX_NUM_GAUSSIANS, TRIPOSPLAT_MIN_NUM_GAUSSIANS,
+    TrellisQuality, TripoSplatProfile,
 };
 use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest, UiStatus};
 
@@ -104,8 +105,18 @@ const TRIPOSG_MAX_GUIDANCE: f32 = 12.0;
 const TRIPOSG_GUIDANCE_STEP: f32 = 0.5;
 const TRIPOSG_FACE_STEP: usize = 1000;
 const TRIPOSG_MAX_FACES: usize = 100_000;
-const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 2] =
-    [SynthesisModel::Triposg, SynthesisModel::Triposplat];
+const TRELLIS_PBR_TEXTURE_MIN: usize = 1024;
+const TRELLIS_PBR_TEXTURE_MAX: usize = 4096;
+const TRELLIS_PBR_TEXTURE_STEP: usize = 1024;
+const TRELLIS_FACE_STEP: usize = 100_000;
+const TRELLIS_MAX_FACES: usize = 2_000_000;
+const TRELLIS_SPARSE_COORD_STEP: usize = 512;
+const TRELLIS_MAX_SPARSE_COORDS: usize = 49_152;
+const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 3] = [
+    SynthesisModel::Triposg,
+    SynthesisModel::Trellis,
+    SynthesisModel::Triposplat,
+];
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -174,6 +185,9 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_triposplat_profile_button,
                     handle_triposplat_setting_step_button,
                     handle_triposg_setting_step_button,
+                    handle_trellis_quality_button,
+                    handle_trellis_pbr_toggle_button,
+                    handle_trellis_setting_step_button,
                     sync_settings_modal,
                     update_settings_labels,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
@@ -606,6 +620,42 @@ struct TripoSgSettingValueLabel {
 }
 
 #[derive(Component)]
+struct TrellisQualityButton {
+    quality: TrellisQuality,
+}
+
+#[derive(Component)]
+struct TrellisPbrToggleButton;
+
+#[derive(Component)]
+struct TrellisSettingStepButton {
+    setting: TrellisSetting,
+    delta: TrellisSettingDelta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrellisSetting {
+    Resolution,
+    Pbr,
+    PbrTextureSize,
+    TargetFaces,
+    MaxSparseCoords,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrellisSettingDelta {
+    Integer(isize),
+}
+
+#[derive(Component)]
+struct TrellisSettingValueLabel {
+    setting: TrellisSetting,
+}
+
+#[derive(Component)]
+struct TrellisQualityValueLabel;
+
+#[derive(Component)]
 struct ThumbnailSpin;
 
 #[derive(Component)]
@@ -648,7 +698,7 @@ struct AvailablePipelines {
 fn pipeline_label(model: SynthesisModel) -> &'static str {
     match model {
         SynthesisModel::Triposg => "TripoSG",
-        SynthesisModel::Trellis => "Trellis",
+        SynthesisModel::Trellis => "Trellis.2",
         SynthesisModel::Triposplat => "TripoSplat",
     }
 }
@@ -690,7 +740,8 @@ fn pipeline_supported(args: Option<&AppArgs>, model: SynthesisModel) -> bool {
     };
     match model {
         SynthesisModel::Triposplat => triposplat_supported_for_backend(args.backend.clone()),
-        SynthesisModel::Triposg | SynthesisModel::Trellis => true,
+        SynthesisModel::Trellis => trellis_supported_for_backend(args.backend.clone()),
+        SynthesisModel::Triposg => true,
     }
 }
 
@@ -701,6 +752,16 @@ fn triposplat_supported_for_backend(backend: BackendKind) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn triposplat_supported_for_backend(backend: BackendKind) -> bool {
+    matches!(backend, BackendKind::Wgpu)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn trellis_supported_for_backend(backend: BackendKind) -> bool {
+    matches!(backend, BackendKind::Wgpu | BackendKind::Cuda)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trellis_supported_for_backend(backend: BackendKind) -> bool {
     matches!(backend, BackendKind::Wgpu)
 }
 
@@ -1527,6 +1588,8 @@ fn update_button_visuals(
             Option<&PipelineOptionButton>,
             Option<&SettingsButton>,
             Option<&TripoSplatProfileButton>,
+            Option<&TrellisQualityButton>,
+            Option<&TrellisPbrToggleButton>,
             &Children,
             &mut BackgroundColor,
             &mut BorderColor,
@@ -1565,6 +1628,8 @@ fn update_button_visuals(
         pipeline_option,
         settings_button,
         profile,
+        trellis_quality,
+        trellis_pbr,
         children,
         mut bg,
         mut border,
@@ -1589,7 +1654,13 @@ fn update_button_visuals(
             || settings_button.is_some_and(|_| settings_enabled && modal.open)
             || profile
                 .zip(args_ref)
-                .is_some_and(|(profile, args)| profile.profile == args.triposplat_profile);
+                .is_some_and(|(profile, args)| profile.profile == args.triposplat_profile)
+            || trellis_quality
+                .zip(args_ref)
+                .is_some_and(|(button, args)| button.quality == args.trellis_quality)
+            || trellis_pbr
+                .zip(args_ref)
+                .is_some_and(|(_, args)| args.trellis_pbr_enabled);
         let (button_bg, button_border, text_color) =
             control_button_palette(button.0, *interaction, disabled, active);
         if bg.0 != button_bg {
@@ -2255,6 +2326,73 @@ fn handle_triposg_setting_step_button(
     }
 }
 
+fn handle_trellis_quality_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<(&Interaction, &TrellisQualityButton), Changed<Interaction>>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    if active_settings_pipeline(Some(&*args)) != Some(SynthesisModel::Trellis) {
+        return;
+    }
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        args.trellis_quality = button.quality;
+        info!(
+            "Trellis.2 settings: quality={} resolution={}",
+            trellis_quality_label(button.quality),
+            trellis_resolution_text(button.quality)
+        );
+    }
+}
+
+fn handle_trellis_pbr_toggle_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<TrellisPbrToggleButton>)>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    if active_settings_pipeline(Some(&*args)) != Some(SynthesisModel::Trellis) {
+        return;
+    }
+    for interaction in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        args.trellis_pbr_enabled = !args.trellis_pbr_enabled;
+        info!(
+            "Trellis.2 settings: pbr={}",
+            if args.trellis_pbr_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
+    }
+}
+
+fn handle_trellis_setting_step_button(
+    args: Option<ResMut<AppArgs>>,
+    mut interactions: Query<(&Interaction, &TrellisSettingStepButton), Changed<Interaction>>,
+) {
+    let Some(mut args) = args else {
+        return;
+    };
+    if active_settings_pipeline(Some(&*args)) != Some(SynthesisModel::Trellis) {
+        return;
+    }
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        adjust_trellis_setting(&mut args, button.setting, button.delta);
+    }
+}
+
 fn sync_settings_modal(
     mut commands: Commands,
     args: Option<Res<AppArgs>>,
@@ -2300,6 +2438,8 @@ fn update_settings_labels(
             With<TripoSplatProfileValueLabel>,
             Without<TripoSplatSettingValueLabel>,
             Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
         ),
     >,
     mut value_labels: Query<
@@ -2307,6 +2447,8 @@ fn update_settings_labels(
         (
             Without<TripoSplatProfileValueLabel>,
             Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
         ),
     >,
     mut triposg_value_labels: Query<
@@ -2314,6 +2456,27 @@ fn update_settings_labels(
         (
             Without<TripoSplatProfileValueLabel>,
             Without<TripoSplatSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
+        ),
+    >,
+    mut trellis_quality_labels: Query<
+        &mut Text,
+        (
+            With<TrellisQualityValueLabel>,
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+            Without<TrellisSettingValueLabel>,
+        ),
+    >,
+    mut trellis_value_labels: Query<
+        (&TrellisSettingValueLabel, &mut Text),
+        (
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
         ),
     >,
 ) {
@@ -2334,6 +2497,18 @@ fn update_settings_labels(
     }
     for (value, mut label) in triposg_value_labels.iter_mut() {
         let next = triposg_setting_value_text(&args, value.setting);
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+    for mut label in trellis_quality_labels.iter_mut() {
+        let next = trellis_quality_value_text(args.trellis_quality);
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+    for (value, mut label) in trellis_value_labels.iter_mut() {
+        let next = trellis_setting_value_text(&args, value.setting);
         if label.0 != next {
             label.0 = next;
         }
@@ -2409,7 +2584,7 @@ fn spawn_settings_modal(commands: &mut Commands, model: SynthesisModel) -> Entit
                 match model {
                     SynthesisModel::Triposg => spawn_triposg_settings(panel),
                     SynthesisModel::Triposplat => spawn_triposplat_settings(panel),
-                    SynthesisModel::Trellis => {}
+                    SynthesisModel::Trellis => spawn_trellis_settings(panel),
                 }
             });
         })
@@ -2420,7 +2595,7 @@ fn settings_modal_title(model: SynthesisModel) -> &'static str {
     match model {
         SynthesisModel::Triposg => "TripoSG settings",
         SynthesisModel::Triposplat => "TripoSplat settings",
-        SynthesisModel::Trellis => "Trellis settings",
+        SynthesisModel::Trellis => "Trellis.2 settings",
     }
 }
 
@@ -2492,6 +2667,69 @@ fn spawn_triposg_settings(panel: &mut ChildSpawnerCommands) {
     spawn_triposg_setting_row(panel, "target faces", TripoSgSetting::TargetFaces);
 }
 
+fn spawn_trellis_settings(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|profiles| {
+            profiles.spawn((
+                Text::new("quality"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb(0.66, 0.7, 0.78)),
+            ));
+            profiles
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    for quality in [
+                        TrellisQuality::Low,
+                        TrellisQuality::Medium,
+                        TrellisQuality::High,
+                    ] {
+                        row.spawn((
+                            Button,
+                            TrellisQualityButton { quality },
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(trellis_quality_label(quality)),
+                                TextFont::from_font_size(12.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+                    }
+                    row.spawn((
+                        Text::new(trellis_quality_value_text(TrellisQuality::Low)),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::srgb(0.72, 0.76, 0.84)),
+                        TrellisQualityValueLabel,
+                    ));
+                });
+        });
+
+    spawn_trellis_value_row(panel, "resolution", TrellisSetting::Resolution);
+    spawn_trellis_toggle_row(panel, "pbr textures");
+    spawn_trellis_setting_row(panel, "pbr texture size", TrellisSetting::PbrTextureSize);
+    spawn_trellis_setting_row(panel, "target faces", TrellisSetting::TargetFaces);
+    spawn_trellis_setting_row(panel, "sparse cap", TrellisSetting::MaxSparseCoords);
+}
+
 fn spawn_triposg_setting_row(
     parent: &mut ChildSpawnerCommands,
     label: &'static str,
@@ -2526,6 +2764,116 @@ fn spawn_triposg_setting_row(
                     TripoSgSettingValueLabel { setting },
                 ));
                 spawn_triposg_setting_step_button(control, setting, true);
+            });
+        });
+}
+
+fn spawn_trellis_value_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: TrellisSetting,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn((
+                Text::new("0"),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                TrellisSettingValueLabel { setting },
+            ));
+        });
+}
+
+fn spawn_trellis_toggle_row(parent: &mut ChildSpawnerCommands, label: &'static str) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn((
+                Button,
+                TrellisPbrToggleButton,
+                ControlButton(ControlButtonKind::Secondary),
+                Node {
+                    width: Val::Px(72.0),
+                    height: Val::Px(26.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BorderColor::all(BUTTON_BORDER),
+                BackgroundColor(BUTTON_BG),
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("on"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(BUTTON_TEXT),
+                    ButtonLabel,
+                    TrellisSettingValueLabel {
+                        setting: TrellisSetting::Pbr,
+                    },
+                ));
+            });
+        });
+}
+
+fn spawn_trellis_setting_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: TrellisSetting,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(7.0),
+                ..default()
+            })
+            .with_children(|control| {
+                spawn_trellis_setting_step_button(control, setting, false);
+                control.spawn((
+                    Text::new("0"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                    TrellisSettingValueLabel { setting },
+                ));
+                spawn_trellis_setting_step_button(control, setting, true);
             });
         });
 }
@@ -2595,6 +2943,55 @@ fn spawn_triposg_setting_step_button(
         .spawn((
             Button,
             TripoSgSettingStepButton { setting, delta },
+            ControlButton(ControlButtonKind::Nav),
+            Node {
+                width: Val::Px(28.0),
+                height: Val::Px(24.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(BUTTON_BORDER),
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(if positive { "+" } else { "-" }),
+                TextFont::from_font_size(14.0),
+                TextColor(BUTTON_TEXT),
+                ButtonLabel,
+            ));
+        });
+}
+
+fn spawn_trellis_setting_step_button(
+    parent: &mut ChildSpawnerCommands,
+    setting: TrellisSetting,
+    positive: bool,
+) {
+    let delta = match setting {
+        TrellisSetting::PbrTextureSize => TrellisSettingDelta::Integer(if positive {
+            TRELLIS_PBR_TEXTURE_STEP as isize
+        } else {
+            -(TRELLIS_PBR_TEXTURE_STEP as isize)
+        }),
+        TrellisSetting::TargetFaces => TrellisSettingDelta::Integer(if positive {
+            TRELLIS_FACE_STEP as isize
+        } else {
+            -(TRELLIS_FACE_STEP as isize)
+        }),
+        TrellisSetting::MaxSparseCoords => TrellisSettingDelta::Integer(if positive {
+            TRELLIS_SPARSE_COORD_STEP as isize
+        } else {
+            -(TRELLIS_SPARSE_COORD_STEP as isize)
+        }),
+        TrellisSetting::Resolution | TrellisSetting::Pbr => TrellisSettingDelta::Integer(0),
+    };
+    parent
+        .spawn((
+            Button,
+            TrellisSettingStepButton { setting, delta },
             ControlButton(ControlButtonKind::Nav),
             Node {
                 width: Val::Px(28.0),
@@ -2735,6 +3132,51 @@ fn adjust_triposg_setting(args: &mut AppArgs, setting: TripoSgSetting, delta: Tr
     );
 }
 
+fn adjust_trellis_setting(args: &mut AppArgs, setting: TrellisSetting, delta: TrellisSettingDelta) {
+    match (setting, delta) {
+        (TrellisSetting::PbrTextureSize, TrellisSettingDelta::Integer(delta)) => {
+            let current = args
+                .trellis_pbr_texture_size
+                .unwrap_or(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE);
+            args.trellis_pbr_texture_size = Some(apply_integer_delta(
+                current,
+                delta,
+                TRELLIS_PBR_TEXTURE_MIN,
+                TRELLIS_PBR_TEXTURE_MAX,
+            ));
+        }
+        (TrellisSetting::TargetFaces, TrellisSettingDelta::Integer(delta)) => {
+            let current = args.trellis_target_faces.unwrap_or(0);
+            let next = apply_integer_delta(current, delta, 0, TRELLIS_MAX_FACES);
+            args.trellis_target_faces = (next > 0).then_some(next);
+        }
+        (TrellisSetting::MaxSparseCoords, TrellisSettingDelta::Integer(delta)) => {
+            let current = args.trellis_max_sparse_coords.unwrap_or(0);
+            let next = apply_integer_delta(current, delta, 0, TRELLIS_MAX_SPARSE_COORDS);
+            args.trellis_max_sparse_coords = (next > 0).then_some(next);
+        }
+        _ => {}
+    }
+    info!(
+        "Trellis.2 settings: quality={} pbr={} texture_size={} target_faces={} max_sparse_coords={}",
+        trellis_quality_label(args.trellis_quality),
+        if args.trellis_pbr_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        args.trellis_pbr_texture_size
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "runtime".to_string()),
+        args.trellis_target_faces
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "disabled".to_string()),
+        args.trellis_max_sparse_coords
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "uncapped".to_string())
+    );
+}
+
 fn apply_integer_delta(value: usize, delta: isize, min: usize, max: usize) -> usize {
     value.saturating_add_signed(delta).clamp(min, max)
 }
@@ -2746,6 +3188,29 @@ fn triposplat_profile_label(profile: TripoSplatProfile) -> &'static str {
         TripoSplatProfile::High => "high",
         TripoSplatProfile::Custom => "custom",
     }
+}
+
+fn trellis_quality_label(quality: TrellisQuality) -> &'static str {
+    match quality {
+        TrellisQuality::Low => "low",
+        TrellisQuality::Medium => "medium",
+        TrellisQuality::High => "high",
+    }
+}
+
+fn trellis_resolution_text(quality: TrellisQuality) -> &'static str {
+    match quality {
+        TrellisQuality::Low => "512",
+        TrellisQuality::Medium | TrellisQuality::High => "1024",
+    }
+}
+
+fn trellis_quality_value_text(quality: TrellisQuality) -> String {
+    format!(
+        "{} / {}",
+        trellis_quality_label(quality),
+        trellis_resolution_text(quality)
+    )
 }
 
 fn triposplat_setting_value_text(args: &AppArgs, setting: TripoSplatSetting) -> String {
@@ -2768,8 +3233,41 @@ fn triposg_setting_value_text(args: &AppArgs, setting: TripoSgSetting) -> String
     }
 }
 
+fn trellis_setting_value_text(args: &AppArgs, setting: TrellisSetting) -> String {
+    match setting {
+        TrellisSetting::Resolution => trellis_resolution_text(args.trellis_quality).to_string(),
+        TrellisSetting::Pbr => {
+            if args.trellis_pbr_enabled {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
+        TrellisSetting::PbrTextureSize => {
+            if args.trellis_pbr_enabled {
+                args.trellis_pbr_texture_size
+                    .map(format_grouped_usize)
+                    .unwrap_or_else(|| "runtime".to_string())
+            } else {
+                "disabled".to_string()
+            }
+        }
+        TrellisSetting::TargetFaces => args
+            .trellis_target_faces
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "disabled".to_string()),
+        TrellisSetting::MaxSparseCoords => args
+            .trellis_max_sparse_coords
+            .map(format_grouped_usize)
+            .unwrap_or_else(|| "uncapped".to_string()),
+    }
+}
+
 fn pipeline_has_settings(model: SynthesisModel) -> bool {
-    matches!(model, SynthesisModel::Triposg | SynthesisModel::Triposplat)
+    matches!(
+        model,
+        SynthesisModel::Triposg | SynthesisModel::Trellis | SynthesisModel::Triposplat
+    )
 }
 
 fn active_settings_pipeline(args: Option<&AppArgs>) -> Option<SynthesisModel> {
@@ -3062,7 +3560,11 @@ mod tests {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
         args.synthesis_models = vec![SynthesisModel::Triposg];
-        args.available_synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        args.available_synthesis_models = vec![
+            SynthesisModel::Triposg,
+            SynthesisModel::Trellis,
+            SynthesisModel::Triposplat,
+        ];
         let mut app = ui_test_app(Some(args));
 
         app.update();
@@ -3086,7 +3588,11 @@ mod tests {
         let models: Vec<_> = query.iter(world).map(|button| button.model).collect();
         assert_eq!(
             models,
-            vec![SynthesisModel::Triposg, SynthesisModel::Triposplat]
+            vec![
+                SynthesisModel::Triposg,
+                SynthesisModel::Trellis,
+                SynthesisModel::Triposplat
+            ]
         );
     }
 
@@ -3111,6 +3617,7 @@ mod tests {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
         assert!(pipeline_supported(Some(&args), SynthesisModel::Triposplat));
+        assert!(pipeline_supported(Some(&args), SynthesisModel::Trellis));
     }
 
     #[test]
@@ -3197,9 +3704,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_modal_opens_for_triposg_and_triposplat_pipeline() {
+    fn settings_modal_opens_for_all_pipeline_settings() {
         let mut triposg_args = AppArgs::default();
-        triposg_args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
+        triposg_args.synthesis_models = vec![
+            SynthesisModel::Triposg,
+            SynthesisModel::Trellis,
+            SynthesisModel::Triposplat,
+        ];
         let mut app = ui_test_app(Some(triposg_args));
 
         app.world_mut().resource_mut::<SettingsModalState>().open = true;
@@ -3236,34 +3747,63 @@ mod tests {
         app.update();
         app.update();
 
-        let world = app.world_mut();
-        assert!(world.resource::<SettingsModalState>().open);
-        assert_eq!(
-            world.query::<&SettingsModalRoot>().iter(world).count(),
-            1,
-            "TripoSplat settings should open when TripoSplat is active"
-        );
-        assert_eq!(
-            world
-                .query::<&TripoSplatSettingValueLabel>()
-                .iter(world)
-                .count(),
-            3
-        );
-        assert_eq!(
-            world
-                .query::<&TripoSplatProfileButton>()
-                .iter(world)
-                .count(),
-            3
-        );
-        assert_eq!(
-            world
-                .query::<&TripoSgSettingValueLabel>()
-                .iter(world)
-                .count(),
-            0
-        );
+        {
+            let world = app.world_mut();
+            assert!(world.resource::<SettingsModalState>().open);
+            assert_eq!(
+                world.query::<&SettingsModalRoot>().iter(world).count(),
+                1,
+                "TripoSplat settings should open when TripoSplat is active"
+            );
+            assert_eq!(
+                world
+                    .query::<&TripoSplatSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                world
+                    .query::<&TripoSplatProfileButton>()
+                    .iter(world)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                world
+                    .query::<&TripoSgSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                0
+            );
+        }
+
+        app.world_mut().resource_mut::<AppArgs>().synthesis_models =
+            vec![SynthesisModel::Trellis, SynthesisModel::Triposg];
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        app.update();
+
+        {
+            let world = app.world_mut();
+            assert!(world.resource::<SettingsModalState>().open);
+            assert_eq!(
+                world.query::<&SettingsModalRoot>().iter(world).count(),
+                1,
+                "Trellis.2 settings should open when Trellis.2 is active"
+            );
+            assert_eq!(
+                world.query::<&TrellisQualityButton>().iter(world).count(),
+                3
+            );
+            assert_eq!(
+                world
+                    .query::<&TrellisSettingValueLabel>()
+                    .iter(world)
+                    .count(),
+                5
+            );
+        }
     }
 
     #[test]
@@ -3314,10 +3854,18 @@ mod tests {
 
         app.world_mut().resource_mut::<AppArgs>().synthesis_models = vec![SynthesisModel::Trellis];
         app.update();
+        app.update();
 
         let world = app.world_mut();
-        assert!(!world.resource::<SettingsModalState>().open);
-        assert_eq!(world.query::<&SettingsModalRoot>().iter(world).count(), 0);
+        assert!(world.resource::<SettingsModalState>().open);
+        assert_eq!(world.query::<&SettingsModalRoot>().iter(world).count(), 1);
+        assert_eq!(
+            world
+                .query::<&TrellisSettingValueLabel>()
+                .iter(world)
+                .count(),
+            5
+        );
     }
 
     #[test]
@@ -3434,6 +3982,74 @@ mod tests {
     }
 
     #[test]
+    fn trellis_settings_clamp_and_format_values() {
+        let mut args = AppArgs::default();
+        args.trellis_quality = TrellisQuality::Low;
+        assert_eq!(
+            trellis_setting_value_text(&args, TrellisSetting::Resolution),
+            "512"
+        );
+        args.trellis_quality = TrellisQuality::High;
+        assert_eq!(
+            trellis_quality_value_text(args.trellis_quality),
+            "high / 1024"
+        );
+
+        args.trellis_pbr_enabled = false;
+        assert_eq!(
+            trellis_setting_value_text(&args, TrellisSetting::PbrTextureSize),
+            "disabled"
+        );
+        args.trellis_pbr_enabled = true;
+        args.trellis_pbr_texture_size = Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE);
+        adjust_trellis_setting(
+            &mut args,
+            TrellisSetting::PbrTextureSize,
+            TrellisSettingDelta::Integer(10_000),
+        );
+        assert_eq!(args.trellis_pbr_texture_size, Some(TRELLIS_PBR_TEXTURE_MAX));
+
+        args.trellis_target_faces = None;
+        adjust_trellis_setting(
+            &mut args,
+            TrellisSetting::TargetFaces,
+            TrellisSettingDelta::Integer(TRELLIS_FACE_STEP as isize),
+        );
+        assert_eq!(args.trellis_target_faces, Some(TRELLIS_FACE_STEP));
+        adjust_trellis_setting(
+            &mut args,
+            TrellisSetting::TargetFaces,
+            TrellisSettingDelta::Integer(-(TRELLIS_FACE_STEP as isize)),
+        );
+        assert_eq!(args.trellis_target_faces, None);
+        assert_eq!(
+            trellis_setting_value_text(&args, TrellisSetting::TargetFaces),
+            "disabled"
+        );
+
+        args.trellis_max_sparse_coords = None;
+        adjust_trellis_setting(
+            &mut args,
+            TrellisSetting::MaxSparseCoords,
+            TrellisSettingDelta::Integer(TRELLIS_SPARSE_COORD_STEP as isize),
+        );
+        assert_eq!(
+            args.trellis_max_sparse_coords,
+            Some(TRELLIS_SPARSE_COORD_STEP)
+        );
+        adjust_trellis_setting(
+            &mut args,
+            TrellisSetting::MaxSparseCoords,
+            TrellisSettingDelta::Integer(-(TRELLIS_SPARSE_COORD_STEP as isize)),
+        );
+        assert_eq!(args.trellis_max_sparse_coords, None);
+        assert_eq!(
+            trellis_setting_value_text(&args, TrellisSetting::MaxSparseCoords),
+            "uncapped"
+        );
+    }
+
+    #[test]
     fn pipeline_setting_gate_tracks_active_pipeline() {
         let mut args = AppArgs::default();
         args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
@@ -3451,7 +4067,10 @@ mod tests {
         assert!(pipeline_settings_enabled(Some(&args)));
 
         args.synthesis_models = vec![SynthesisModel::Trellis];
-        assert_eq!(active_settings_pipeline(Some(&args)), None);
-        assert!(!pipeline_settings_enabled(Some(&args)));
+        assert_eq!(
+            active_settings_pipeline(Some(&args)),
+            Some(SynthesisModel::Trellis)
+        );
+        assert!(pipeline_settings_enabled(Some(&args)));
     }
 }

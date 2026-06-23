@@ -1,15 +1,38 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-use burn::tensor::{DType, Int, Shape, Tensor as BurnTensor, TensorData, TensorPrimitive};
+use burn::tensor::{
+    DType, FloatDType, Int, Shape, Tensor as BurnTensor, TensorData, TensorPrimitive,
+};
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::{calculate_cube_count_elemwise, prelude::*};
 use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
 use half::f16;
 
 use crate::{SparseSubmConvConfig, kernel_rows};
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug)]
+struct Instant {
+    started_ms: f64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    fn now() -> Self {
+        Self {
+            started_ms: js_sys::Date::now(),
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        let ms = (js_sys::Date::now() - self.started_ms).max(0.0);
+        std::time::Duration::from_secs_f64(ms / 1000.0)
+    }
+}
 
 /// Default WGPU backend type used by the tensor convenience wrappers.
 pub type DefaultWgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
@@ -24,6 +47,53 @@ fn cast_float_tensor_if_needed<const D: usize>(
     } else {
         tensor.cast(dtype)
     }
+}
+
+#[cube(launch_unchecked)]
+fn bf16_round_to_f32_kernel(input: &Array<f32>, output: &mut Array<f32>) {
+    if ABSOLUTE_POS >= output.len() {
+        terminate!();
+    }
+
+    let bits = u32::reinterpret(input[ABSOLUTE_POS]);
+    let lsb = (bits >> 16u32) & 1u32;
+    let rounded = bits + 0x7fffu32 + lsb;
+    output[ABSOLUTE_POS] = f32::reinterpret(rounded & 0xffff0000u32);
+}
+
+pub fn bf16_round_to_f32_wgpu<const D: usize>(
+    tensor: BurnTensor<DefaultWgpuBackend, D>,
+) -> BurnTensor<DefaultWgpuBackend, D> {
+    let dims = tensor.dims();
+    let num_elements = dims.iter().product::<usize>();
+    let tensor = cast_float_tensor_if_needed(tensor, FloatDType::F32);
+    if num_elements == 0 {
+        return tensor;
+    }
+
+    let input = burn_cubecl::kernel::into_contiguous(tensor.into_primitive().tensor());
+    let output_bytes = num_elements
+        .checked_mul(core::mem::size_of::<f32>())
+        .expect("bf16 round output byte size overflow");
+    let output = CubeTensor::new_contiguous(
+        input.client.clone(),
+        input.device.clone(),
+        input.meta.shape.clone(),
+        input.client.empty(output_bytes),
+        DType::F32,
+    );
+    let cube_dim = resolve_cube_dim();
+    let cube_count = calculate_cube_count_elemwise(&input.client, num_elements, cube_dim);
+    unsafe {
+        bf16_round_to_f32_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
+            &input.client,
+            cube_count,
+            cube_dim,
+            input.clone().into_array_arg(),
+            output.clone().into_array_arg(),
+        );
+    }
+    BurnTensor::from_primitive(TensorPrimitive::Float(output))
 }
 
 trait LaunchUncheckedResultExt {
@@ -141,8 +211,7 @@ static SPARSE_WGPU_CONV_TOTAL_OUTPUT_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static SPARSE_WGPU_CONV_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
 fn layer_norm_partial_stats_enabled(rows: usize, channels: usize) -> bool {
-    channels >= LAYER_NORM_STATS_PARTIAL_MIN_CHANNELS
-        && rows >= LAYER_NORM_STATS_PARTIAL_MIN_ROWS
+    channels >= LAYER_NORM_STATS_PARTIAL_MIN_CHANNELS && rows >= LAYER_NORM_STATS_PARTIAL_MIN_ROWS
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2135,7 +2204,8 @@ fn launch_layer_norm_row_stats(
         let partial_work = rows
             .checked_mul(chunks)
             .ok_or_else(|| "layer norm partial stats work size overflow".to_string())?;
-        let partial_cube_count = calculate_cube_count_elemwise(&input.client, partial_work, cube_dim);
+        let partial_cube_count =
+            calculate_cube_count_elemwise(&input.client, partial_work, cube_dim);
         unsafe {
             layer_norm_row_stats_partial_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
                 &input.client,
@@ -2469,14 +2539,10 @@ fn multihead_qk_rms_norm_rope_coords_from_qkv_kernel(
         let out_even_idx = base + pair_channel;
         let out_odd_idx = out_even_idx + 1;
 
-        let q_even =
-            input[q_even_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel];
-        let q_odd =
-            input[q_odd_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel + 1];
-        let k_even =
-            input[k_even_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel];
-        let k_odd =
-            input[k_odd_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel + 1];
+        let q_even = input[q_even_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel];
+        let q_odd = input[q_odd_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel + 1];
+        let k_even = input[k_even_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel];
+        let k_odd = input[k_odd_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel + 1];
 
         let mut freq_dim = *pairs / 3;
         if freq_dim < 1 {
@@ -2562,14 +2628,10 @@ fn multihead_qkv_module_rms_norm_rope_coords_from_qkv_kernel(
         let out_even_idx = module_base + pair_channel;
         let out_odd_idx = out_even_idx + 1;
 
-        let q_even =
-            input[q_even_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel];
-        let q_odd =
-            input[q_odd_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel + 1];
-        let k_even =
-            input[k_even_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel];
-        let k_odd =
-            input[k_odd_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel + 1];
+        let q_even = input[q_even_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel];
+        let q_odd = input[q_odd_idx] * q_inv_rms * *scale * q_gamma[gamma_base + pair_channel + 1];
+        let k_even = input[k_even_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel];
+        let k_odd = input[k_odd_idx] * k_inv_rms * *scale * k_gamma[gamma_base + pair_channel + 1];
 
         let mut freq_dim = *pairs / 3;
         if freq_dim < 1 {
@@ -3603,9 +3665,7 @@ pub fn multihead_rms_norm_module_forward_wgpu(
             scale,
             eps,
         )
-        .map_err(|err| {
-            format!("multihead_rms_norm_module_affine_kernel launch failed: {err:?}")
-        })?;
+        .map_err(|err| format!("multihead_rms_norm_module_affine_kernel launch failed: {err:?}"))?;
     }
 
     Ok(cast_float_tensor_if_needed(
@@ -3788,8 +3848,14 @@ pub fn multihead_qk_rms_norm_rope_from_qkv_coords_wgpu(
         .reshape([batch, tokens, qkv, heads, head_dim])
         .into_primitive()
         .tensor();
-    let q_gamma_p = q_gamma.reshape([heads * head_dim]).into_primitive().tensor();
-    let k_gamma_p = k_gamma.reshape([heads * head_dim]).into_primitive().tensor();
+    let q_gamma_p = q_gamma
+        .reshape([heads * head_dim])
+        .into_primitive()
+        .tensor();
+    let k_gamma_p = k_gamma
+        .reshape([heads * head_dim])
+        .into_primitive()
+        .tensor();
     let coords_p = coords.reshape([tokens * 3]).into_primitive();
     let q_output = CubeTensor::new_contiguous(
         input_p.client.clone(),
@@ -3927,14 +3993,22 @@ pub fn multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu(
         .ok_or_else(|| "multihead qkv module rms norm rope output size overflow".to_string())?;
     let output_bytes = output_elements
         .checked_mul(core::mem::size_of::<f32>())
-        .ok_or_else(|| "multihead qkv module rms norm rope output byte size overflow".to_string())?;
+        .ok_or_else(|| {
+            "multihead qkv module rms norm rope output byte size overflow".to_string()
+        })?;
     let pairs = head_dim / 2;
     let input_p = input
         .reshape([batch, tokens, qkv, heads, head_dim])
         .into_primitive()
         .tensor();
-    let q_gamma_p = q_gamma.reshape([heads * head_dim]).into_primitive().tensor();
-    let k_gamma_p = k_gamma.reshape([heads * head_dim]).into_primitive().tensor();
+    let q_gamma_p = q_gamma
+        .reshape([heads * head_dim])
+        .into_primitive()
+        .tensor();
+    let k_gamma_p = k_gamma
+        .reshape([heads * head_dim])
+        .into_primitive()
+        .tensor();
     let coords_p = coords.reshape([tokens * 3]).into_primitive();
     let q_output = CubeTensor::new_contiguous(
         input_p.client.clone(),
@@ -4182,7 +4256,13 @@ fn sparse_subm_conv_forward_wgpu_im2col_matmul_impl(
     }
     let [rows, kernel_rows] = neighbor_rows.dims();
     let [input_rows, in_channels] = input.dims();
-    let [out_channels, kernel_d, kernel_h, kernel_w, weight_in_channels] = weight.dims();
+    let [
+        out_channels,
+        kernel_d,
+        kernel_h,
+        kernel_w,
+        weight_in_channels,
+    ] = weight.dims();
     if in_channels != config.in_channels || weight_in_channels != config.in_channels {
         return Err(format!(
             "im2col sparse conv channel mismatch: input={} config={} weight={}",
@@ -4241,8 +4321,7 @@ fn sparse_subm_conv_forward_wgpu_im2col_matmul_impl(
     let output = if let Some(dtype) = matmul_dtype {
         let cols = cast_float_tensor_if_needed(cols, dtype);
         let weight_mat = cast_float_tensor_if_needed(weight_mat, dtype);
-        cols.matmul(weight_mat)
-            .cast(burn::tensor::FloatDType::F32)
+        cols.matmul(weight_mat).cast(burn::tensor::FloatDType::F32)
     } else {
         cols.matmul(weight_mat)
     };
@@ -4422,6 +4501,13 @@ fn resolve_neighbor_device_algo(
     kernel_rows: usize,
     preference: NeighborDeviceAlgoPreference,
 ) -> NeighborDeviceAlgo {
+    #[cfg(target_arch = "wasm32")]
+    if matches!(preference, NeighborDeviceAlgoPreference::SortedHash) {
+        if kernel_rows <= 64 && rows >= DEFAULT_NEIGHBOR_BUCKET_HASH_ROWS_THRESHOLD_SMALL_K {
+            return NeighborDeviceAlgo::BucketHash;
+        }
+        return NeighborDeviceAlgo::Hash;
+    }
     match preference {
         NeighborDeviceAlgoPreference::Auto => {}
         NeighborDeviceAlgoPreference::Scan => return NeighborDeviceAlgo::Scan,
@@ -4448,6 +4534,10 @@ fn resolve_neighbor_device_algo(
         && work >= sorted_threshold
     {
         return NeighborDeviceAlgo::BucketHash;
+    }
+    #[cfg(target_arch = "wasm32")]
+    if work >= sorted_threshold {
+        return NeighborDeviceAlgo::Hash;
     }
     if work >= sorted_threshold {
         NeighborDeviceAlgo::SortedHash
@@ -4904,34 +4994,51 @@ fn build_neighbor_rows_tensor_device_hash_wgsl_table_tensor(
         )
         .map_err(|err| format!("neighbor_hash_build_serial_kernel launch failed: {err:?}"))?;
     }
-    let hash_build_stats_t: BurnTensor<DefaultWgpuBackend, 1, Int> =
-        BurnTensor::from_primitive(hash_build_stats);
-    let hash_build_stats_data = hash_build_stats_t.to_data();
-    let hash_build_stats = hash_build_stats_data
-        .as_slice::<i32>()
-        .map_err(|err| format!("neighbor hash build stats readback failed: {err:?}"))?;
-    let fail_rows = hash_build_stats
-        .get(HASH_BUILD_STAT_FAIL_ROWS)
-        .copied()
-        .unwrap_or(0);
-    let total_probes = hash_build_stats
-        .get(HASH_BUILD_STAT_TOTAL_PROBES)
-        .copied()
-        .unwrap_or(0)
-        .max(0) as u64;
-    let max_probe_used = hash_build_stats
-        .get(HASH_BUILD_STAT_MAX_PROBE)
-        .copied()
-        .unwrap_or(0)
-        .max(0) as u64;
-    NEIGHBOR_DEVICE_HASH_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
-    NEIGHBOR_DEVICE_HASH_PROBE_TOTAL.fetch_add(total_probes, Ordering::Relaxed);
-    NEIGHBOR_DEVICE_HASH_PROBE_MAX.fetch_max(max_probe_used, Ordering::Relaxed);
-    NEIGHBOR_DEVICE_HASH_INSERT_FAIL_ROWS.fetch_add(fail_rows.max(0) as u64, Ordering::Relaxed);
-    if fail_rows != 0 {
-        return Err(format!(
-            "neighbor hash build failed to insert {fail_rows} row(s); rows={rows} table_size={table_size} max_probe={max_probe} probe_total={total_probes} probe_max={max_probe_used}"
-        ));
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let hash_build_stats_t: BurnTensor<DefaultWgpuBackend, 1, Int> =
+            BurnTensor::from_primitive(hash_build_stats);
+        let hash_build_stats_data = hash_build_stats_t.to_data();
+        let hash_build_stats = hash_build_stats_data
+            .as_slice::<i32>()
+            .map_err(|err| format!("neighbor hash build stats readback failed: {err:?}"))?;
+        let fail_rows = hash_build_stats
+            .get(HASH_BUILD_STAT_FAIL_ROWS)
+            .copied()
+            .unwrap_or(0);
+        let total_probes = hash_build_stats
+            .get(HASH_BUILD_STAT_TOTAL_PROBES)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
+        let max_probe_used = hash_build_stats
+            .get(HASH_BUILD_STAT_MAX_PROBE)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
+        NEIGHBOR_DEVICE_HASH_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+        NEIGHBOR_DEVICE_HASH_PROBE_TOTAL.fetch_add(total_probes, Ordering::Relaxed);
+        NEIGHBOR_DEVICE_HASH_PROBE_MAX.fetch_max(max_probe_used, Ordering::Relaxed);
+        NEIGHBOR_DEVICE_HASH_INSERT_FAIL_ROWS.fetch_add(fail_rows.max(0) as u64, Ordering::Relaxed);
+        if fail_rows != 0 {
+            return Err(format!(
+                "neighbor hash build failed to insert {fail_rows} row(s); rows={rows} table_size={table_size} max_probe={max_probe} probe_total={total_probes} probe_max={max_probe_used}"
+            ));
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Browser WebGPU cannot synchronously read the diagnostic build-stat
+        // tensor. Keep the wasm path device-resident and route auto selection to
+        // this low-load-factor serial hash builder; native still validates the
+        // failure counter above.
+        let _ = hash_build_stats;
+        NEIGHBOR_DEVICE_HASH_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+        NEIGHBOR_DEVICE_HASH_PROBE_TOTAL.fetch_add(
+            (rows as u64).saturating_mul(max_probe as u64),
+            Ordering::Relaxed,
+        );
+        NEIGHBOR_DEVICE_HASH_PROBE_MAX.fetch_max(max_probe as u64, Ordering::Relaxed);
     }
 
     let query_count = calculate_cube_count_elemwise(&coords_p.client, output_elements, cube_dim);
@@ -5265,17 +5372,6 @@ fn build_neighbor_rows_tensor_device_bucket_hash_tensor(
         .map_err(|err| format!("neighbor_bucket_hash_query_kernel launch failed: {err:?}"))?;
     }
 
-    let overflow_rows_t: BurnTensor<DefaultWgpuBackend, 1, Int> =
-        BurnTensor::from_primitive(overflow_rows);
-    let overflow_rows_data = overflow_rows_t.to_data();
-    let overflow_rows = overflow_rows_data
-        .as_slice::<i32>()
-        .map_err(|err| format!("neighbor bucket-hash overflow readback failed: {err:?}"))?
-        .first()
-        .copied()
-        .unwrap_or(0)
-        .max(0) as u64;
-
     NEIGHBOR_DEVICE_HASH_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
     NEIGHBOR_DEVICE_HASH_PROBE_TOTAL.fetch_add(
         (output_elements as u64).saturating_mul(DEFAULT_NEIGHBOR_BUCKET_HASH_SLOT_CAP as u64),
@@ -5285,12 +5381,30 @@ fn build_neighbor_rows_tensor_device_bucket_hash_tensor(
         DEFAULT_NEIGHBOR_BUCKET_HASH_SLOT_CAP as u64,
         Ordering::Relaxed,
     );
-    NEIGHBOR_DEVICE_HASH_INSERT_FAIL_ROWS.fetch_add(overflow_rows, Ordering::Relaxed);
-    if overflow_rows != 0 {
-        return Err(format!(
-            "neighbor bucket-hash overflowed {} row(s); rows={} buckets={} slot_cap={}",
-            overflow_rows, rows, bucket_count, DEFAULT_NEIGHBOR_BUCKET_HASH_SLOT_CAP
-        ));
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let overflow_rows_t: BurnTensor<DefaultWgpuBackend, 1, Int> =
+            BurnTensor::from_primitive(overflow_rows);
+        let overflow_rows_data = overflow_rows_t.to_data();
+        let overflow_rows = overflow_rows_data
+            .as_slice::<i32>()
+            .map_err(|err| format!("neighbor bucket-hash overflow readback failed: {err:?}"))?
+            .first()
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        NEIGHBOR_DEVICE_HASH_INSERT_FAIL_ROWS.fetch_add(overflow_rows, Ordering::Relaxed);
+        if overflow_rows != 0 {
+            return Err(format!(
+                "neighbor bucket-hash overflowed {} row(s); rows={} buckets={} slot_cap={}",
+                overflow_rows, rows, bucket_count, DEFAULT_NEIGHBOR_BUCKET_HASH_SLOT_CAP
+            ));
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = overflow_rows;
     }
 
     let neighbor_rows_1d: BurnTensor<DefaultWgpuBackend, 1, Int> =
@@ -6015,14 +6129,12 @@ mod tests {
         clear_neighbor_rows_tensor_cache, dense_trilinear_sample_attrs_wgpu,
         layer_norm_affine_forward_wgpu, layer_norm_affine_silu_forward_wgpu,
         layer_norm_modulated_forward_wgpu, layer_norm_row_stats_debug_wgpu,
-        linear_skinny_forward_wgpu,
-        multihead_qk_rms_norm_rope_from_qkv_coords_wgpu,
-        multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu,
-        multihead_rms_norm_forward_wgpu, multihead_rms_norm_module_forward_wgpu,
-        multihead_rms_norm_rope_from_coords_wgpu, neighbor_rows_build_stats,
-        neighbor_rows_tensor_from_coords, neighbor_rows_tensor_from_coords_tensor,
-        neighbor_rows_tensor_from_coords_with_algo, reset_neighbor_rows_build_stats,
-        reset_sparse_wgpu_kernel_stats,
+        linear_skinny_forward_wgpu, multihead_qk_rms_norm_rope_from_qkv_coords_wgpu,
+        multihead_qkv_module_rms_norm_rope_from_qkv_coords_wgpu, multihead_rms_norm_forward_wgpu,
+        multihead_rms_norm_module_forward_wgpu, multihead_rms_norm_rope_from_coords_wgpu,
+        neighbor_rows_build_stats, neighbor_rows_tensor_from_coords,
+        neighbor_rows_tensor_from_coords_tensor, neighbor_rows_tensor_from_coords_with_algo,
+        reset_neighbor_rows_build_stats, reset_sparse_wgpu_kernel_stats,
         resolve_sparse_wgpu_forward_config, resolve_sparse_wgpu_forward_config_internal,
         rope_rotate_pairs_from_coords_wgpu, rope_rotate_pairs_from_phase_wgpu,
         rope_rotate_pairs_wgpu, sparse_subm_conv_forward_wgpu,
@@ -6691,9 +6803,8 @@ mod tests {
                 let inv_std = (var + eps).sqrt().recip();
                 for ch in 0..channels {
                     let mod_idx = b * channels + ch;
-                    let expected =
-                        (input[base + ch] - mean) * inv_std * (scale[mod_idx] + 1.0)
-                            + shift[mod_idx];
+                    let expected = (input[base + ch] - mean) * inv_std * (scale[mod_idx] + 1.0)
+                        + shift[mod_idx];
                     let actual = output[base + ch];
                     max_abs = max_abs.max((actual - expected).abs());
                 }
@@ -6840,8 +6951,7 @@ mod tests {
             }
             let inv_rms = (sq_sum + eps).sqrt().recip();
             for ch in 0..head_dim {
-                let expected =
-                    input[base + ch] * inv_rms * scale * gamma[head * head_dim + ch];
+                let expected = input[base + ch] * inv_rms * scale * gamma[head * head_dim + ch];
                 let actual = output[base + ch];
                 max_abs = max_abs.max((actual - expected).abs());
             }
@@ -6883,17 +6993,17 @@ mod tests {
             &device,
         )
         .reshape([heads, head_dim]);
-        let reference = multihead_rms_norm_forward_wgpu(
-            input_t.clone(),
-            gamma_t.clone(),
-            scale,
-            eps,
-        )
-        .expect("multihead rms norm output")
-        .permute([0, 2, 1, 3]);
+        let reference =
+            multihead_rms_norm_forward_wgpu(input_t.clone(), gamma_t.clone(), scale, eps)
+                .expect("multihead rms norm output")
+                .permute([0, 2, 1, 3]);
         let output = multihead_rms_norm_module_forward_wgpu(input_t, gamma_t, scale, eps)
             .expect("multihead rms norm module output");
-        let reference = reference.to_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let reference = reference
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
         let output = output.to_data().convert::<f32>().to_vec::<f32>().unwrap();
 
         let mut max_abs = 0.0f32;
@@ -6976,12 +7086,9 @@ mod tests {
             for pair in 0..pairs {
                 let even_ch = pair * 2;
                 let odd_ch = even_ch + 1;
-                let even = input[base + even_ch]
-                    * inv_rms
-                    * scale
-                    * gamma[head * head_dim + even_ch];
-                let odd =
-                    input[base + odd_ch] * inv_rms * scale * gamma[head * head_dim + odd_ch];
+                let even =
+                    input[base + even_ch] * inv_rms * scale * gamma[head * head_dim + even_ch];
+                let odd = input[base + odd_ch] * inv_rms * scale * gamma[head * head_dim + odd_ch];
                 let (axis, freq_idx) = if pair < freq_dim {
                     (0usize, pair)
                 } else if pair < freq_dim * 2 {

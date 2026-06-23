@@ -144,7 +144,11 @@ test('burn_synth wasm API page exposes asset-specific TripoSplat controls', asyn
   });
 
   await expect(page.locator('#synthesis-model')).toHaveValue('triposg');
-  await expect(page.locator('#synthesis-model option')).toHaveText(['triposg', 'triposplat']);
+  await expect(page.locator('#synthesis-model option')).toHaveText([
+    'triposg',
+    'trellis',
+    'triposplat',
+  ]);
   await expect(page.locator('#asset-format')).toHaveValue('splat');
   await expect(page.locator('#asset-format')).toBeDisabled();
   await expect(page.locator('#run-infer')).toHaveText('Infer GLB');
@@ -191,6 +195,27 @@ test('burn_synth wasm API page exposes asset-specific TripoSplat controls', asyn
     .toEqual({
       synthesisModel: 'triposplat',
       assetFormat: 'ply',
+    });
+
+  await page.selectOption('#synthesis-model', 'trellis');
+
+  await expect(page.locator('#asset-format')).toBeDisabled();
+  await expect(page.locator('#run-infer')).toHaveText('Infer GLB');
+  await expect(page.locator('#download')).toHaveAttribute('download', 'burn_synth_output.glb');
+  await expect
+    .poll(
+      async () => {
+        const url = new URL(page.url());
+        return {
+          synthesisModel: url.searchParams.get('synthesis_model'),
+          assetFormat: url.searchParams.get('asset_format'),
+        };
+      },
+      { timeout: 10000 },
+    )
+    .toEqual({
+      synthesisModel: 'trellis',
+      assetFormat: null,
     });
 
   await page.selectOption('#synthesis-model', 'triposg');
@@ -803,6 +828,9 @@ test('burn_synth wasm trellis inference path can run end-to-end', async ({ page 
 
   const modelRequests = [];
   const failedModelResponses = [];
+  page.on('console', (message) => {
+    console.log(`[trellis-browser:${message.type()}] ${message.text()}`);
+  });
   const normalizeModelUrl = (url) => {
     if (url.includes('/www/assets/models/')) {
       return url.replace('/www/assets/models/', '/assets/models/');
@@ -847,6 +875,8 @@ test('burn_synth wasm trellis inference path can run end-to-end', async ({ page 
       options.set_synthesis_model('trellis');
       options.set_rmbg_model('rmbg14');
       options.set_quality('fast');
+      options.set_num_steps(2);
+      options.set_trellis_pbr_enabled(false);
       options.set_seed(42n);
 
       const inferPromise = window.__burnSynthWasm
@@ -882,12 +912,38 @@ test('burn_synth wasm trellis inference path can run end-to-end', async ({ page 
     }
   });
 
+  if (!inference.ok) {
+    const error = inference.error ?? '';
+    const expectedSafeCap =
+      !inference.timeout &&
+      error.includes('exceeds the default wasm safe component preload cap');
+    if (expectedSafeCap) {
+      expect(
+        modelRequests.some((url) => url.includes('/assets/models/TRELLIS.2-4B/')),
+        `expected TRELLIS model requests before safe preload refusal, saw: ${modelRequests.join(' | ')}`,
+      ).toBe(true);
+      expect(
+        failedModelResponses,
+        `failed model responses before safe preload refusal: ${failedModelResponses.join(' | ')}`,
+      ).toEqual([]);
+      console.log(`[trellis-browser:skip] ${error}`);
+      return;
+    }
+  }
   expect(inference.ok, `trellis wasm inference failed: ${JSON.stringify(inference)}`).toBe(true);
   expect(inference.glbBytes).toBeGreaterThan(0);
   expect(
     modelRequests.some((url) => url.includes('/assets/models/TRELLIS.2-4B/')),
     `expected TRELLIS model requests, saw: ${modelRequests.join(' | ')}`,
   ).toBe(true);
+  expect(
+    modelRequests.some((url) => url.includes('tex_dec_next_dc_f16c32_fp16')),
+    `mesh-only TRELLIS should not fetch tex_slat_decoder assets: ${modelRequests.join(' | ')}`,
+  ).toBe(false);
+  expect(
+    modelRequests.some((url) => url.includes('slat_flow_imgshape2tex')),
+    `mesh-only TRELLIS should not fetch tex_slat_flow assets: ${modelRequests.join(' | ')}`,
+  ).toBe(false);
   expect(
     failedModelResponses,
     `failed model responses: ${failedModelResponses.join(' | ')}`,

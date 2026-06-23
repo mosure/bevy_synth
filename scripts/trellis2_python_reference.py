@@ -214,6 +214,17 @@ def capture_sparse(
         captures[f"{prefix}.spatial_shape"] = list_tensor(value.spatial_shape)
 
 
+def capture_sparse_or_tensor(
+    captures: dict[str, torch.Tensor],
+    prefix: str,
+    value: Any,
+) -> None:
+    if hasattr(value, "coords") and hasattr(value, "feats"):
+        capture_sparse(captures, prefix, value)
+    elif isinstance(value, torch.Tensor):
+        captures[prefix] = to_cpu_tensor(value, torch.float32)
+
+
 def capture_mesh(
     captures: dict[str, torch.Tensor],
     prefix: str,
@@ -226,16 +237,6 @@ def capture_mesh(
     captures[f"{prefix}.faces"] = faces_t
     captures[f"{prefix}.vertices_count"] = scalar_tensor(vertices_t.shape[0])
     captures[f"{prefix}.faces_count"] = scalar_tensor(faces_t.shape[0])
-
-
-def capture_sparse_noise(
-    captures: dict[str, torch.Tensor],
-    prefix: str,
-    coords: torch.Tensor,
-    feats: torch.Tensor,
-) -> None:
-    captures[f"{prefix}.coords"] = to_cpu_tensor(coords, torch.float32)
-    captures[f"{prefix}.feats"] = to_cpu_tensor(feats, torch.float32)
 
 
 def sampler_config_tensor(sampler: Any, params: dict[str, Any]) -> torch.Tensor:
@@ -261,6 +262,78 @@ def capture_sampler_config(
     params: dict[str, Any],
 ) -> None:
     captures[f"{prefix}.config"] = sampler_config_tensor(sampler, params)
+
+
+def install_sampler_step_capture(
+    captures: dict[str, torch.Tensor],
+    sampler: Any,
+    prefixes: list[str],
+    params: dict[str, Any],
+):
+    original_sample = sampler.sample
+    original_sample_once = getattr(sampler, "sample_once", None)
+    state = {
+        "call": -1,
+        "prefix": prefixes[0],
+        "step": 0,
+        "steps": int(params.get("steps", 0) or 0),
+    }
+
+    def sample_wrapper(*sample_args: Any, **sample_kwargs: Any) -> Any:
+        call = int(state["call"]) + 1
+        state["call"] = call
+        state["step"] = 0
+        prefix = prefixes[min(call, len(prefixes) - 1)]
+        state["prefix"] = prefix
+        capture_sampler_config(captures, f"{prefix}.sampler", sampler, params)
+        if len(sample_args) > 1:
+            capture_sparse_or_tensor(captures, f"{prefix}.noise", sample_args[1])
+        sampled = original_sample(*sample_args, **sample_kwargs)
+        samples = getattr(sampled, "samples", None)
+        if samples is not None:
+            capture_sparse_or_tensor(captures, f"{prefix}.sampler.samples", samples)
+        pred_x_t = getattr(sampled, "pred_x_t", None)
+        if isinstance(pred_x_t, list):
+            total_steps = len(pred_x_t)
+            for step_idx, step_value in enumerate(pred_x_t):
+                capture_sparse_or_tensor(
+                    captures,
+                    f"{prefix}.sampler.step_{step_idx:03}_of_{total_steps:03}.x_t",
+                    step_value,
+                )
+        return sampled
+
+    def sample_once_wrapper(
+        model: Any,
+        x_t: Any,
+        t: float,
+        t_prev: float,
+        cond: Any = None,
+        **sample_once_kwargs: Any,
+    ) -> Any:
+        out = original_sample_once(model, x_t, t, t_prev, cond, **sample_once_kwargs)
+        pred_x_prev = getattr(out, "pred_x_prev", None)
+        step_idx = int(state["step"])
+        state["step"] = step_idx + 1
+        if pred_x_prev is not None and t != t_prev:
+            pred_v = (x_t - pred_x_prev) / float(t - t_prev)
+            capture_sparse_or_tensor(
+                captures,
+                f"{state['prefix']}.sampler.step_{step_idx:03}_of_{int(state['steps']):03}.pred_v",
+                pred_v,
+            )
+        return out
+
+    sampler.sample = sample_wrapper
+    if original_sample_once is not None:
+        sampler.sample_once = sample_once_wrapper
+
+    def restore() -> None:
+        sampler.sample = original_sample
+        if original_sample_once is not None:
+            sampler.sample_once = original_sample_once
+
+    return restore
 
 
 def export_obj(path: Path, vertices: torch.Tensor, faces: torch.Tensor) -> None:
@@ -695,29 +768,31 @@ def main() -> int:
     ) -> Any:
         resolution = int(getattr(flow_model, "resolution", 0) or 0)
         name = f"shape_slat_{resolution}" if resolution > 0 else "shape_slat"
+        sampler_restore = None
         if capture_enabled and not args.skip_row_noise_capture:
-            rng_state = torch.get_rng_state()
-            noise = torch.randn(coords.shape[0], flow_model.in_channels).contiguous()
-            torch.set_rng_state(rng_state)
-            capture_sparse_noise(captures, "sample_shape_slat.noise", coords, noise)
             params = {**pipe.shape_slat_sampler_params, **sampler_params}
-            capture_sampler_config(
+            sampler_restore = install_sampler_step_capture(
                 captures,
-                "sample_shape_slat.sampler",
                 pipe.shape_slat_sampler,
+                ["sample_shape_slat"],
                 params,
             )
-        out = time_stage(
-            name,
-            orig_sample_shape_slat,
-            cond,
-            flow_model,
-            coords,
-            sampler_params,
-        )
+        try:
+            out = time_stage(
+                name,
+                orig_sample_shape_slat,
+                cond,
+                flow_model,
+                coords,
+                sampler_params,
+            )
+        finally:
+            if sampler_restore is not None:
+                sampler_restore()
         runtime_shapes["shape_slat_rows"] = sparse_rows(out)
         if capture_enabled:
             capture_sparse(captures, f"{name}.output", out)
+            capture_sparse(captures, "sample_shape_slat.slat", out)
         return out
 
     def sample_shape_slat_cascade_wrapper(
@@ -731,37 +806,40 @@ def main() -> int:
         sampler_params: dict = {},
         max_num_tokens: int = 49152,
     ) -> Any:
+        sampler_restore = None
         if capture_enabled and not args.skip_row_noise_capture:
-            rng_state = torch.get_rng_state()
-            noise = torch.randn(coords.shape[0], flow_model_lr.in_channels).contiguous()
-            torch.set_rng_state(rng_state)
-            capture_sparse_noise(captures, "sample_shape_slat_lr.noise", coords, noise)
             params = {**pipe.shape_slat_sampler_params, **sampler_params}
-            capture_sampler_config(
+            sampler_restore = install_sampler_step_capture(
                 captures,
-                "sample_shape_slat.sampler",
                 pipe.shape_slat_sampler,
+                ["sample_shape_slat_lr", "sample_shape_slat_hr"],
                 params,
             )
-        out = time_stage(
-            "shape_slat_cascade",
-            orig_sample_shape_slat_cascade,
-            lr_cond,
-            cond,
-            flow_model_lr,
-            flow_model,
-            lr_resolution,
-            resolution,
-            coords,
-            sampler_params,
-            max_num_tokens,
-        )
+        try:
+            out = time_stage(
+                "shape_slat_cascade",
+                orig_sample_shape_slat_cascade,
+                lr_cond,
+                cond,
+                flow_model_lr,
+                flow_model,
+                lr_resolution,
+                resolution,
+                coords,
+                sampler_params,
+                max_num_tokens,
+            )
+        finally:
+            if sampler_restore is not None:
+                sampler_restore()
         slat = out[0] if isinstance(out, tuple) else out
         runtime_shapes["shape_slat_rows"] = sparse_rows(slat)
         if isinstance(out, tuple) and len(out) > 1:
             runtime_shapes["shape_final_resolution"] = int(out[1])
         if capture_enabled:
             capture_sparse(captures, "shape_slat_cascade.output", slat)
+            capture_sparse(captures, "sample_shape_slat.slat", slat)
+            capture_sparse(captures, "sample_shape_slat_hr.slat", slat)
         return out
 
     def sample_tex_slat_wrapper(
@@ -770,37 +848,31 @@ def main() -> int:
         shape_slat: Any,
         sampler_params: dict = {},
     ) -> Any:
+        sampler_restore = None
         if capture_enabled and not args.skip_row_noise_capture:
-            in_channels = (
-                flow_model.in_channels
-                if hasattr(flow_model, "in_channels")
-                else flow_model[0].in_channels
-            )
-            shape_channels = int(shape_slat.feats.shape[1])
-            rng_state = torch.get_rng_state()
-            noise = torch.randn(
-                shape_slat.coords.shape[0], int(in_channels) - shape_channels
-            ).contiguous()
-            torch.set_rng_state(rng_state)
-            capture_sparse_noise(captures, "sample_tex_slat.noise", shape_slat.coords, noise)
             params = {**pipe.tex_slat_sampler_params, **sampler_params}
-            capture_sampler_config(
+            sampler_restore = install_sampler_step_capture(
                 captures,
-                "sample_tex_slat.sampler",
                 pipe.tex_slat_sampler,
+                ["sample_tex_slat"],
                 params,
             )
-        out = time_stage(
-            "tex_slat",
-            orig_sample_tex_slat,
-            cond,
-            flow_model,
-            shape_slat,
-            sampler_params,
-        )
+        try:
+            out = time_stage(
+                "tex_slat",
+                orig_sample_tex_slat,
+                cond,
+                flow_model,
+                shape_slat,
+                sampler_params,
+            )
+        finally:
+            if sampler_restore is not None:
+                sampler_restore()
         runtime_shapes["tex_slat_rows"] = sparse_rows(out)
         if capture_enabled:
             capture_sparse(captures, "tex_slat.output", out)
+            capture_sparse(captures, "sample_tex_slat.slat", out)
         return out
 
     def decode_shape_wrapper(slat: Any, resolution: int):

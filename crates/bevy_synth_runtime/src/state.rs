@@ -7,7 +7,7 @@ use std::time::Duration;
 use bevy::prelude::*;
 
 use crate::SynthAsset;
-use crate::args::{AppArgs, SynthesisModel};
+use crate::args::{AppArgs, SynthesisModel, TrellisQuality};
 
 #[derive(Resource, Default)]
 pub struct UiStatus {
@@ -61,6 +61,11 @@ pub struct InferenceSettings {
     pub guidance_scale: f32,
     pub target_faces: Option<usize>,
     pub triposplat_num_gaussians: usize,
+    pub trellis_quality: TrellisQuality,
+    pub trellis_pbr_enabled: bool,
+    pub trellis_pbr_texture_size: Option<usize>,
+    pub trellis_target_faces: Option<usize>,
+    pub trellis_max_sparse_coords: Option<usize>,
 }
 
 impl InferenceSettings {
@@ -71,6 +76,11 @@ impl InferenceSettings {
             guidance_scale: args.guidance_scale,
             target_faces: args.target_faces,
             triposplat_num_gaussians: args.triposplat_num_gaussians,
+            trellis_quality: args.trellis_quality,
+            trellis_pbr_enabled: args.trellis_pbr_enabled,
+            trellis_pbr_texture_size: args.trellis_pbr_texture_size,
+            trellis_target_faces: args.trellis_target_faces,
+            trellis_max_sparse_coords: args.trellis_max_sparse_coords,
         }
     }
 }

@@ -7,6 +7,8 @@ use super::weight_parts::{candidate_exists_or_has_parts, load_blob_bytes_from_bu
 use crate::blob_burnpack::load_blob_bytes_from_burnpack as load_blob_bytes_from_blob_burnpack;
 use crate::virtual_fs;
 use burn::prelude::Backend;
+#[cfg(target_arch = "wasm32")]
+use burn::tensor::TensorData;
 use burn::tensor::activation::sigmoid;
 use burn::tensor::module::conv3d;
 use burn::tensor::ops::ConvOptions;
@@ -268,9 +270,20 @@ where
                 })?;
         let weight_backing = load_weight_backing(&weight_path)?;
         let safetensors = SafeTensors::deserialize(weight_backing.as_slice()).map_err(|err| {
+            let bytes = weight_backing.as_slice();
+            let first_u64 = bytes
+                .get(..8)
+                .map(|header| {
+                    u64::from_le_bytes([
+                        header[0], header[1], header[2], header[3], header[4], header[5],
+                        header[6], header[7],
+                    ])
+                })
+                .unwrap_or(0);
             format!(
-                "failed to deserialize sparse structure decoder weights '{}' as safetensors: {err}",
-                weight_path.display()
+                "failed to deserialize sparse structure decoder weights '{}' as safetensors: {err} (bytes={}, first_u64={first_u64})",
+                weight_path.display(),
+                bytes.len()
             )
         })?;
 
@@ -416,6 +429,86 @@ where
             sparse_structure_stage_debug_enabled(),
         )
     }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn decode_to_coord_tensor_from_latent_tensor_async(
+        &self,
+        latent_tensor: Tensor<B, 5>,
+        target_resolution: usize,
+        max_sparse_coords: Option<usize>,
+    ) -> Result<Tensor<B, 2, Int>, String> {
+        if target_resolution == 0 {
+            return Err("sparse structure decoder target resolution must be > 0".to_string());
+        }
+        let [
+            latent_batch,
+            latent_channels,
+            latent_depth,
+            latent_height,
+            latent_width,
+        ] = latent_tensor.dims();
+        if latent_batch != 1 {
+            return Err(format!(
+                "sparse structure decoder latent batch mismatch: expected 1, got {latent_batch}"
+            ));
+        }
+        if latent_channels != self.latent_channels {
+            return Err(format!(
+                "sparse structure decoder latent channel mismatch: expected {}, got {}",
+                self.latent_channels, latent_channels
+            ));
+        }
+        if latent_depth == 0 || latent_depth != latent_height || latent_depth != latent_width {
+            return Err(format!(
+                "sparse structure decoder latent tensor must be cubic with non-zero resolution, got [{latent_depth},{latent_height},{latent_width}]"
+            ));
+        }
+
+        let logits = self.model.forward(latent_tensor);
+        let [batch, channels, depth, height, width] = logits.dims();
+        if batch != 1 || channels != 1 {
+            return Err(format!(
+                "sparse structure decoder output shape mismatch: expected [1,1,D,H,W], got [{batch},{channels},{depth},{height},{width}]"
+            ));
+        }
+        if depth != height || depth != width {
+            return Err(format!(
+                "sparse structure decoder output must be cubic, got [{depth},{height},{width}]"
+            ));
+        }
+        if depth < target_resolution || !depth.is_multiple_of(target_resolution) {
+            return Err(format!(
+                "sparse structure decoder cannot downsample occupancy from {} to {} (ratio must be integer and >= 1)",
+                depth, target_resolution
+            ));
+        }
+        let ratio = (depth / target_resolution).max(1);
+
+        let reduced_logits = if ratio > 1 {
+            logits
+                .reshape([
+                    target_resolution,
+                    ratio,
+                    target_resolution,
+                    ratio,
+                    target_resolution,
+                    ratio,
+                ])
+                .max_dim(5)
+                .max_dim(3)
+                .max_dim(1)
+                .reshape([target_resolution, target_resolution, target_resolution])
+        } else {
+            logits.reshape([depth, height, width])
+        };
+        select_positive_coord_tensor_async(
+            reduced_logits,
+            target_resolution,
+            max_sparse_coords,
+            sparse_structure_stage_debug_enabled(),
+        )
+        .await
+    }
 }
 
 fn select_positive_coord_tensor<B: Backend>(
@@ -540,6 +633,139 @@ fn select_positive_coord_tensor<B: Backend>(
         .reshape([selected_count, 1]);
     let batch_col = Tensor::<B, 2, Int>::zeros([selected_count, 1], &device);
     Ok(Tensor::cat(vec![batch_col, z_col, y_col, x_col], 1))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn select_positive_coord_tensor_async<B: Backend>(
+    reduced_logits: Tensor<B, 3>,
+    target_resolution: usize,
+    max_sparse_coords: Option<usize>,
+    stage_debug: bool,
+) -> Result<Tensor<B, 2, Int>, String> {
+    let [reduced_depth, reduced_height, reduced_width] = reduced_logits.dims();
+    if reduced_depth != target_resolution
+        || reduced_height != target_resolution
+        || reduced_width != target_resolution
+    {
+        return Err(format!(
+            "sparse structure decoder reduced logits shape mismatch: expected [{0},{0},{0}], got [{1},{2},{3}]",
+            target_resolution, reduced_depth, reduced_height, reduced_width
+        ));
+    }
+
+    let device = reduced_logits.device();
+    let positive = reduced_logits.greater_elem(0.0).argwhere_async().await;
+    let [positive_count, positive_cols] = positive.dims();
+    if positive_cols != 3 {
+        return Err(format!(
+            "sparse structure decoder argwhere output mismatch: expected [N,3], got [N,{}]",
+            positive_cols
+        ));
+    }
+    if stage_debug {
+        let reduced_elements = reduced_depth
+            .saturating_mul(reduced_height)
+            .saturating_mul(reduced_width);
+        web_sys::console::log_1(
+            &format!(
+                "burn_trellis: sparse structure logits stats backend={} depth={} target={} total={} positive={}",
+                std::any::type_name::<B>(),
+                reduced_depth,
+                target_resolution,
+                reduced_elements,
+                positive_count
+            )
+            .into(),
+        );
+    }
+
+    let resolution_i64 = i64::try_from(target_resolution).map_err(|_| {
+        format!(
+            "sparse structure decoder target resolution {} exceeds i64 range",
+            target_resolution
+        )
+    })?;
+    let max_key = resolution_i64
+        .checked_mul(resolution_i64)
+        .and_then(|value| value.checked_mul(resolution_i64))
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| {
+            format!(
+                "sparse structure decoder key-space overflow for resolution {}",
+                target_resolution
+            )
+        })?;
+    if max_key > i32::MAX as i64 {
+        return Err(format!(
+            "sparse structure decoder key-space {} exceeds i32 range for resolution {}",
+            max_key, target_resolution
+        ));
+    }
+    let resolution_i32 = i32::try_from(target_resolution).map_err(|_| {
+        format!(
+            "sparse structure decoder target resolution {} exceeds i32 range",
+            target_resolution
+        )
+    })?;
+    let resolution_sq_i32 = resolution_i32.checked_mul(resolution_i32).ok_or_else(|| {
+        format!(
+            "sparse structure decoder key stride overflow for resolution {}",
+            target_resolution
+        )
+    })?;
+
+    let values = positive
+        .into_data_async()
+        .await
+        .map_err(|err| {
+            format!("failed async sparse structure decoder positive coord readback: {err:?}")
+        })?
+        .convert::<i32>()
+        .to_vec::<i32>()
+        .map_err(|err| {
+            format!("failed to convert sparse structure decoder positive coords: {err:?}")
+        })?;
+    if values.len() != positive_count.saturating_mul(3) {
+        return Err(format!(
+            "sparse structure decoder positive coord length mismatch: got={} expected={}",
+            values.len(),
+            positive_count.saturating_mul(3)
+        ));
+    }
+
+    let mut rows = Vec::<[i32; 3]>::with_capacity(positive_count);
+    for row in values.chunks_exact(3) {
+        rows.push([row[0], row[1], row[2]]);
+    }
+    if rows.len() > 1 {
+        rows.sort_by_key(|row| {
+            row[0]
+                .saturating_mul(resolution_sq_i32)
+                .saturating_add(row[1].saturating_mul(resolution_i32))
+                .saturating_add(row[2])
+        });
+    }
+
+    let mut selected_count = rows.len();
+    if let Some(limit) = max_sparse_coords.filter(|limit| *limit > 0)
+        && selected_count > limit
+    {
+        selected_count = limit;
+        rows.truncate(limit);
+    }
+
+    if selected_count == 0 {
+        return Ok(Tensor::<B, 2, Int>::zeros([0, 4], &device));
+    }
+
+    let mut coords = Vec::with_capacity(selected_count.saturating_mul(4));
+    for [z, y, x] in rows {
+        coords.extend_from_slice(&[0, z, y, x]);
+    }
+    Ok(Tensor::<B, 2, Int>::from_data(
+        TensorData::new(coords, [selected_count, 4]),
+        &device,
+    ))
 }
 
 fn tensor_to_coords_u32<B: Backend>(
@@ -736,6 +962,29 @@ impl SparseStructureDecoderRuntime {
                     target_resolution,
                     max_sparse_coords,
                 )
+                .map(SparseStructureCoords::from_wgpu_tensor),
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "runtime-model-wgpu"))]
+    pub async fn decode_to_sparse_coords_wgpu_latent_tensor_async(
+        &self,
+        latent_tensor: Tensor<WgpuRuntimeBackend, 5>,
+        target_resolution: usize,
+        max_sparse_coords: Option<usize>,
+    ) -> Result<SparseStructureCoords, String> {
+        match self {
+            Self::Cpu(_) => Err(
+                "sparse structure decoder tensor-native latent path requires wgpu runtime backend"
+                    .to_string(),
+            ),
+            Self::Wgpu(runtime) => runtime
+                .decode_to_coord_tensor_from_latent_tensor_async(
+                    latent_tensor,
+                    target_resolution,
+                    max_sparse_coords,
+                )
+                .await
                 .map(SparseStructureCoords::from_wgpu_tensor),
         }
     }

@@ -15,6 +15,7 @@ pub enum TrellisQuality {
 pub enum TrellisComputeProfile {
     #[default]
     ReferenceF32,
+    StockBf16Emulated,
     WgpuFastMixedF16,
     WgpuFastSparseSelfF16,
     WgpuFastSparseCrossF16,
@@ -26,9 +27,12 @@ pub enum TrellisComputeProfile {
 }
 
 impl TrellisComputeProfile {
+    pub const FAST_WGPU_BENCHMARK_CANDIDATE: Self = Self::WgpuFastF16Tail1F32;
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReferenceF32 => "reference-f32",
+            Self::StockBf16Emulated => "stock-bf16-emulated",
             Self::WgpuFastMixedF16 => "wgpu-fast-mixed-f16",
             Self::WgpuFastSparseSelfF16 => "wgpu-fast-sparse-self-f16",
             Self::WgpuFastSparseCrossF16 => "wgpu-fast-sparse-cross-f16",
@@ -85,7 +89,7 @@ impl TrellisComputeProfile {
     }
 
     pub fn wgpu_slat_module_attention_f16(self) -> bool {
-        !matches!(self, Self::ReferenceF32)
+        !matches!(self, Self::ReferenceF32 | Self::StockBf16Emulated)
     }
 
     pub fn wgpu_linear_f16(self) -> bool {
@@ -100,7 +104,43 @@ impl TrellisComputeProfile {
     }
 
     pub fn wgpu_decoder_conv_f16(self) -> bool {
-        !matches!(self, Self::ReferenceF32)
+        // The TRELLIS.2 sparse decoders are fp16 models upstream. Keeping the
+        // flow/sampler in f32 while running decoder conv activations in fp16 is
+        // both faster and closer to Python subdivision/topology hooks.
+        !matches!(self, Self::StockBf16Emulated)
+    }
+
+    pub fn wgpu_sparse_stock_bf16_emulation(self) -> bool {
+        matches!(self, Self::StockBf16Emulated)
+    }
+
+    pub fn is_diagnostic(self) -> bool {
+        matches!(
+            self,
+            Self::StockBf16Emulated
+                | Self::WgpuFastSparseSelfF16
+                | Self::WgpuFastSparseCrossF16
+                | Self::WgpuFastF16
+        )
+    }
+
+    pub fn is_parity_reference(self) -> bool {
+        matches!(self, Self::ReferenceF32)
+    }
+
+    pub fn is_fast_candidate(self) -> bool {
+        matches!(
+            self,
+            Self::WgpuFastMixedF16
+                | Self::WgpuFastF16Tail1F32
+                | Self::WgpuFastF16Tail2F32
+                | Self::WgpuFastF16Tail4F32
+                | Self::WgpuFastF16Tail6F32
+        )
+    }
+
+    pub fn requires_render_or_hook_parity_gate(self) -> bool {
+        !self.is_parity_reference()
     }
 }
 
@@ -226,6 +266,24 @@ mod tests {
     }
 
     #[test]
+    fn stock_bf16_emulated_profile_keeps_fast_f16_paths_disabled() {
+        assert!(!TrellisComputeProfile::StockBf16Emulated.wgpu_module_attention_f16());
+        assert!(!TrellisComputeProfile::StockBf16Emulated.wgpu_sparse_module_attention_f16());
+        assert!(!TrellisComputeProfile::StockBf16Emulated.wgpu_slat_module_attention_f16());
+        assert!(!TrellisComputeProfile::StockBf16Emulated.wgpu_linear_f16());
+        assert!(!TrellisComputeProfile::StockBf16Emulated.wgpu_flow_torso_f16());
+        assert!(!TrellisComputeProfile::StockBf16Emulated.wgpu_decoder_conv_f16());
+        assert!(TrellisComputeProfile::StockBf16Emulated.wgpu_sparse_stock_bf16_emulation());
+    }
+
+    #[test]
+    fn reference_profile_uses_upstream_fp16_decoder() {
+        assert!(!TrellisComputeProfile::ReferenceF32.wgpu_module_attention_f16());
+        assert!(!TrellisComputeProfile::ReferenceF32.wgpu_linear_f16());
+        assert!(TrellisComputeProfile::ReferenceF32.wgpu_decoder_conv_f16());
+    }
+
+    #[test]
     fn diagnostic_sparse_f16_profiles_are_split() {
         assert!(TrellisComputeProfile::WgpuFastSparseSelfF16.wgpu_sparse_self_attention_f16());
         assert!(!TrellisComputeProfile::WgpuFastSparseSelfF16.wgpu_sparse_cross_attention_f16());
@@ -253,5 +311,32 @@ mod tests {
         );
         assert!(TrellisComputeProfile::WgpuFastF16Tail4F32.wgpu_sparse_self_attention_f16());
         assert!(TrellisComputeProfile::WgpuFastF16Tail4F32.wgpu_sparse_cross_attention_f16());
+    }
+
+    #[test]
+    fn compute_profile_classes_do_not_mark_fast_candidates_as_parity_reference() {
+        assert!(TrellisComputeProfile::ReferenceF32.is_parity_reference());
+        assert!(!TrellisComputeProfile::ReferenceF32.is_fast_candidate());
+        assert!(!TrellisComputeProfile::ReferenceF32.requires_render_or_hook_parity_gate());
+
+        assert_eq!(
+            TrellisComputeProfile::FAST_WGPU_BENCHMARK_CANDIDATE,
+            TrellisComputeProfile::WgpuFastF16Tail1F32
+        );
+        assert!(TrellisComputeProfile::WgpuFastF16Tail1F32.is_fast_candidate());
+        assert!(!TrellisComputeProfile::WgpuFastF16Tail1F32.is_parity_reference());
+        assert!(TrellisComputeProfile::WgpuFastF16Tail1F32.requires_render_or_hook_parity_gate());
+
+        assert!(TrellisComputeProfile::WgpuFastF16.is_diagnostic());
+        assert!(!TrellisComputeProfile::WgpuFastF16.is_fast_candidate());
+        assert!(TrellisComputeProfile::WgpuFastF16.requires_render_or_hook_parity_gate());
+    }
+
+    #[test]
+    fn default_compute_profile_is_reference_f32() {
+        assert_eq!(
+            TrellisComputeProfile::default(),
+            TrellisComputeProfile::ReferenceF32
+        );
     }
 }
