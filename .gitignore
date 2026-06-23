@@ -27,16 +27,19 @@ docs/reports/
 .tmp/
 *.patch
 
-scripts/
-!scripts/
+scripts/*
+!scripts/bundle_web_assets.ps1
+!scripts/check_trellis_strict_benchmark_invariants.py
 !scripts/guard_canonical_runtime.sh
-!scripts/triposplat_gsplat_render.py
-!scripts/triposplat_torch_flow_bench.py
 !scripts/trellis2_python_reference.py
 !scripts/trellis2_perf_matrix.sh
-!scripts/guards/
-!scripts/guards/README.md
-!scripts/guards/*.baseline
+!scripts/triposplat_bootstrap.sh
+!scripts/triposplat_compare_splat.py
+!scripts/triposplat_compare_stage_tensors.py
+!scripts/triposplat_gsplat_render.py
+!scripts/triposplat_reference.py
+!scripts/triposplat_torch_flow_bench.py
+!scripts/triposplat_wgpu_reference_parity.sh
 src/dino/
 screenshots/
 test-results/

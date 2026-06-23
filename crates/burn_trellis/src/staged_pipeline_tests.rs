@@ -287,14 +287,24 @@ fn canonical_wgpu_no_host_readback_before_extraction() {
         "crates/burn_trellis/src/staged_pipeline_sampling.rs",
     ];
 
-    let baseline_path = repo_root.join("scripts/guards/canonical_runtime_into_data.baseline");
-    let expected = fs::read_to_string(&baseline_path)
-        .unwrap_or_else(|err| panic!("failed reading {}: {err}", baseline_path.display()))
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let expected = [
+        "crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#1",
+        "crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#2",
+        "crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#3",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#1",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#2",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#3",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#4",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#5",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#6",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#7",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#8",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#9",
+        "crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#10",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>();
 
     let mut occurrences = Vec::<(String, usize)>::new();
     for rel_path in canonical_files {
@@ -330,7 +340,7 @@ fn canonical_wgpu_no_host_readback_before_extraction() {
 
     assert_eq!(
         actual, expected,
-        "canonical runtime `.into_data()` baseline changed; run scripts/guard_canonical_runtime.sh and update baseline only if intentional"
+        "canonical runtime `.into_data()` allowlist changed; run scripts/guard_canonical_runtime.sh and update the test allowlist only if intentional"
     );
 }
 

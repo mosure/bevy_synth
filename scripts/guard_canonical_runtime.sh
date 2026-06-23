@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASELINE_DIR="${ROOT_DIR}/scripts/guards"
 cd "${ROOT_DIR}"
 
 CANONICAL_FILES=(
@@ -16,6 +15,38 @@ CANONICAL_FILES=(
   "crates/burn_trellis/src/staged_pipeline_runtime_decode.rs"
   "crates/burn_trellis/src/staged_pipeline_sampling.rs"
 )
+
+EXPECTED_INTO_DATA_OCCURRENCES="$(cat <<'EOF'
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#1
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#2
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#3
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#1
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#2
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#3
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#4
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#5
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#6
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#7
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#8
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#9
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#10
+EOF
+)"
+
+EXPECTED_ENV_VAR_OCCURRENCES="$(cat <<'EOF'
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#1
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#2
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#3
+crates/burn_trellis/src/runtime_model/sparse_decoder_wgpu_ops.rs#4
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#1
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#2
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#3
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#4
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#5
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#6
+crates/burn_trellis/src/runtime_model/sparse_structure_flow.rs#7
+EOF
+)"
 
 collect_occurrences() {
   local needle="$1"
@@ -54,31 +85,33 @@ collect_occurrences() {
 
 check_baseline() {
   local label="$1"
-  local pattern="$2"
-  local baseline_path="$3"
+  local needle="$2"
+  local expected="$3"
   local actual_path
+  local expected_path
   actual_path="$(mktemp)"
-  collect_occurrences "${pattern}" "${actual_path}"
-  if ! diff -u "${baseline_path}" "${actual_path}"; then
+  expected_path="$(mktemp)"
+  collect_occurrences "${needle}" "${actual_path}"
+  printf '%s\n' "${expected}" > "${expected_path}"
+  if ! diff -u "${expected_path}" "${actual_path}"; then
     echo
     echo "canonical runtime guard failed for ${label}"
-    echo "If this change is intentional, update baseline:"
-    echo "  cp \"${actual_path}\" \"${baseline_path}\""
-    rm -f "${actual_path}"
+    echo "If this change is intentional, update the inline allowlist in scripts/guard_canonical_runtime.sh."
+    rm -f "${actual_path}" "${expected_path}"
     return 1
   fi
-  rm -f "${actual_path}"
+  rm -f "${actual_path}" "${expected_path}"
 }
 
 check_baseline \
   "into_data" \
   ".into_data(" \
-  "${BASELINE_DIR}/canonical_runtime_into_data.baseline"
+  "${EXPECTED_INTO_DATA_OCCURRENCES}"
 
 check_baseline \
   "std::env::var" \
   "std::env::var(" \
-  "${BASELINE_DIR}/canonical_runtime_env_var.baseline"
+  "${EXPECTED_ENV_VAR_OCCURRENCES}"
 
 run_strict_benchmark_invariants_if_configured() {
   local strict_log="${TRELLIS2_STRICT_BENCH_LOG:-}"
