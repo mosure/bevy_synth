@@ -27,6 +27,7 @@ patches once upstream crates support the same behavior.
 | --- | --- | --- | --- | --- |
 | `burn_dino` | `third_party/burn_dino` | crates.io `burn_dino` 0.7.0 | `[patch.crates-io]` path override | Burn 0.21 API compatibility, DINOv3 support, TripoSplat image-encoder parity, wasm loading, and attention/rope fixes. |
 | `cubek-attention` | `third_party/cubek-attention` | crates.io `cubek-attention` 0.2.0 | `[patch.crates-io]` path override | WGPU long-sequence attention safety and dtype selection fixes needed by TripoSplat. |
+| `gpu-allocator` | `third_party/gpu-allocator` | crates.io `gpu-allocator` 0.28.0 | `[patch.crates-io]` path override | Windows CI compatibility for WGPU 29: align the D3D12 allocator's `windows` crate with `wgpu-hal` 29.0.x. |
 
 ## `third_party/burn_dino`
 
@@ -133,6 +134,43 @@ cargo bench -p burn_triposplat --features import,backend_wgpu
 
 For performance-sensitive changes, capture stage timings and GPU utilization for
 encoder, sampling, and decode separately.
+
+## `third_party/gpu-allocator`
+
+`gpu-allocator` is patched through the workspace root:
+
+```toml
+[patch.crates-io]
+gpu-allocator = { path = "third_party/gpu-allocator" }
+```
+
+### Reasons for the local fork
+
+`wgpu-hal` 29.0.x compiles its D3D12 backend against `windows`/`windows-core`
+0.62.x. The published `gpu-allocator` 0.28.0 Windows dependency uses the range
+`>=0.53, <=0.62`, which Cargo resolves to `windows` 0.61.x because `<=0.62`
+means `<=0.62.0`. On Windows this gives `wgpu-hal` two incompatible D3D12 COM
+wrapper types in the same crate and CI fails before this repository's code
+builds.
+
+### Main patch areas
+
+- `Cargo.toml`: pins the Windows dependency and Windows dev-dependency to
+  `windows = "0.62.2"` so the allocator types match `wgpu-hal` 29.0.x.
+
+### Risk notes
+
+This is a metadata-only compatibility patch. It does not change allocator source
+logic. It should be removed when upstream publishes a release with a Windows
+dependency bound compatible with `windows` 0.62.x patch releases.
+
+### Suggested validation
+
+```bash
+cargo tree --workspace --target x86_64-pc-windows-msvc -i windows-core@0.61.2 --edges normal
+cargo check -p bevy_synth_runtime -p bevy_synth_ui -p bevy_synth
+cargo check -p bevy_synth --target wasm32-unknown-unknown
+```
 
 ## Bevy/WGPU Stack
 

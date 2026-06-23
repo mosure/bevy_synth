@@ -14,7 +14,11 @@ members = [
   "crates/burn_foreground",
   "crates/burn_synth_mcp",
 ]
-exclude = ["third_party/burn_dino", "third_party/cubek-attention"]
+exclude = [
+  "third_party/burn_dino",
+  "third_party/cubek-attention",
+  "third_party/gpu-allocator",
+]
 
 [workspace.package]
 authors = ["mosure <mitchell@mosure.me>"]
@@ -60,3 +64,4 @@ panic = "abort"
 [patch.crates-io]
 burn_dino = { path = "third_party/burn_dino" }
 cubek-attention = { path = "third_party/cubek-attention" }
+gpu-allocator = { path = "third_party/gpu-allocator" }
