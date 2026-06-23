@@ -25,9 +25,9 @@ cuda = ["burn-cuda", "burn_synth/cuda"]
 shared-runtime = ["burn_synth/runtime"]
 
 [dependencies]
-bevy = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
-bevy_asset = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
-bevy_mesh = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy = "0.19.0"
+bevy_asset = "0.19.0"
+bevy_mesh = "0.19.0"
 base64 = "0.22"
 bytemuck = "1.25"
 clap = { version = "4.5", features = ["derive"] }

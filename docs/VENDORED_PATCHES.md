@@ -1,6 +1,6 @@
 # Vendored and Patched Dependencies
 
-Last reviewed: 2026-06-18
+Last reviewed: 2026-06-23
 
 This repository vendors or pins a small set of dependencies when upstream crates do
 not yet match the repo's Bevy, Burn, WGPU, wasm, or numerical-correctness
@@ -13,8 +13,8 @@ patches once upstream crates support the same behavior.
   `[patch.crates-io]`.
 - Vendored crates live under `third_party/` and are not normal workspace
   implementation modules.
-- Pinned git dependencies are not vendored crates; they are recorded separately
-  because their revisions are part of the reproducible build surface.
+- Pinned git dependencies, if any, are not vendored crates; record them
+  separately because their revisions are part of the reproducible build surface.
 - Local source adaptations copied into project crates must be called out here, but
   they should not grow into hidden alternate implementations.
 - Before changing a vendored dependency, compare against the upstream crate or git
@@ -27,8 +27,6 @@ patches once upstream crates support the same behavior.
 | --- | --- | --- | --- | --- |
 | `burn_dino` | `third_party/burn_dino` | crates.io `burn_dino` 0.7.0 | `[patch.crates-io]` path override | Burn 0.21 API compatibility, DINOv3 support, TripoSplat image-encoder parity, wasm loading, and attention/rope fixes. |
 | `cubek-attention` | `third_party/cubek-attention` | crates.io `cubek-attention` 0.2.0 | `[patch.crates-io]` path override | WGPU long-sequence attention safety and dtype selection fixes needed by TripoSplat. |
-| `bevy` | pinned git rev `ae2fcc0353d95e887470f0f6fc8a7e434e5549ce` | `github.com/bevyengine/bevy` | direct git dependency in Bevy-facing crates | Keeps Bevy and Burn aligned on the WGPU 29 stack. |
-| `bevy_gaussian_splatting` | pinned git rev `e0da1488d7441db54e4f86cc8f5845df308b306f` | `github.com/mosure/bevy_gaussian_splatting` | direct git dependency in `bevy_synth` | Provides the Bevy/WGPU-compatible Gaussian splat renderer used by TripoSplat native and wasm rendering. |
 
 ## `third_party/burn_dino`
 
@@ -136,46 +134,19 @@ cargo bench -p burn_triposplat --features import,backend_wgpu
 For performance-sensitive changes, capture stage timings and GPU utilization for
 encoder, sampling, and decode separately.
 
-## Pinned Git Dependencies
+## Bevy/WGPU Stack
 
-### Bevy
+Bevy-facing crates use crates.io `bevy = "0.19.0"` and
+`bevy_gaussian_splatting = "8.0.0"`. Both resolve to the WGPU 29 family expected
+by Burn/CubeCL in this workspace. Do not bump this stack independently of Burn,
+CubeCL, `wgpu`, or native/wasm rendering validation.
 
-Bevy-facing crates pin Bevy to:
-
-```toml
-git = "https://github.com/bevyengine/bevy.git"
-rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce"
-```
-
-The pin keeps Bevy on the same WGPU 29 family expected by Burn/CubeCL in this
-workspace. Do not bump this independently of Burn, CubeCL, `wgpu`, or
-`bevy_gaussian_splatting` validation.
-
-Suggested validation after changing the Bevy revision:
+Suggested validation after changing Bevy or Gaussian splatting versions:
 
 ```bash
 cargo check -p bevy_synth
 cargo check -p bevy_synth_runtime
-cargo check -p burn_synth --target wasm32-unknown-unknown --features wasm-api,wasm-api-wgpu
-```
-
-### `bevy_gaussian_splatting`
-
-`bevy_synth` pins:
-
-```toml
-git = "https://github.com/mosure/bevy_gaussian_splatting.git"
-rev = "e0da1488d7441db54e4f86cc8f5845df308b306f"
-```
-
-This renderer is used for TripoSplat Gaussian cloud output rather than a mesh
-proxy. The pin exists because it is known to match the Bevy/WGPU stack above and
-is expected to work for native and wasm rendering.
-
-Suggested validation after changing this revision:
-
-```bash
-cargo check -p bevy_synth
+cargo check -p bevy_synth --target wasm32-unknown-unknown
 cargo test -p bevy_synth_runtime triposplat -- --nocapture
 ```
 
@@ -191,9 +162,9 @@ maintenance surface.
 ### Infinite grid
 
 `crates/bevy_synth/src/infinite_grid.rs` is a local adaptation of
-`fslabs/bevy_infinite_grid` for the pinned Bevy render API. Keep this file
-focused on grid rendering. If upstream becomes compatible with the pinned Bevy
-revision, prefer switching back to the external crate.
+`fslabs/bevy_infinite_grid` for the Bevy 0.19 render API. Keep this file
+focused on grid rendering. If upstream becomes compatible with the workspace
+Bevy version, prefer switching back to the external crate.
 
 Validation:
 
@@ -219,7 +190,7 @@ cargo check -p bevy_synth_ui
 The app currently carries local panorbit-style camera controls in
 `crates/bevy_synth/src/app.rs` instead of depending directly on
 `bevy_panorbit_camera`. The goal is standard orbit/pan/zoom behavior while
-remaining compatible with the pinned Bevy revision.
+remaining compatible with the workspace Bevy version.
 
 Validation:
 

@@ -490,7 +490,7 @@ fn queue_infinite_grids(
             {
                 continue;
             }
-            phase.add(Transparent3d {
+            phase.add_retained(Transparent3d {
                 sorting_info: TransparentSortingInfo3d::AlwaysOnTop,
                 pipeline: pipeline_id,
                 entity: (*render_entity, *main_entity),

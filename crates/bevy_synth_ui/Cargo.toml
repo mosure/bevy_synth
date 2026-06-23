@@ -18,24 +18,24 @@ triposg = ["bevy_synth_runtime/triposg"]
 trellis = ["bevy_synth_runtime/trellis"]
 
 [dependencies]
-bevy = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
-bevy_gaussian_splatting = { git = "https://github.com/mosure/bevy_gaussian_splatting.git", rev = "e0da1488d7441db54e4f86cc8f5845df308b306f", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std"] }
-bevy_mesh = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
-bevy_picking = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy = "0.19.0"
+bevy_gaussian_splatting = { version = "8.0.0", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std"] }
+bevy_mesh = "0.19.0"
+bevy_picking = "0.19.0"
 bevy_synth_runtime = { version = "0.2.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
 crossbeam-channel = "0.5"
-bevy_tasks = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", features = ["multi_threaded"] }
-bevy_app = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", default-features = false }
-bevy_ecs = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", default-features = false }
-bevy_utils = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
-bevy_window = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce", default-features = false }
-bevy_winit = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
-bevy_derive = { git = "https://github.com/bevyengine/bevy.git", rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce" }
+bevy_tasks = { version = "0.19.0", features = ["multi_threaded"] }
+bevy_app = { version = "0.19.0", default-features = false }
+bevy_ecs = { version = "0.19.0", default-features = false }
+bevy_utils = "0.19.0"
+bevy_window = { version = "0.19.0", default-features = false }
+bevy_winit = "0.19.0"
+bevy_derive = "0.19.0"
 log = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-bevy_gaussian_splatting = { git = "https://github.com/mosure/bevy_gaussian_splatting.git", rev = "e0da1488d7441db54e4f86cc8f5845df308b306f", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std", "webgpu"] }
+bevy_gaussian_splatting = { version = "8.0.0", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std", "webgpu"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
