@@ -1,6 +1,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{CameraOutputMode, RenderTarget};
+use bevy::light::{DirectionalLight, PointLight};
 use bevy::pbr::MeshMaterial3d;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
@@ -54,6 +55,9 @@ const PREVIEW_CAMERA_FOV: f32 = std::f32::consts::FRAC_PI_4;
 const PREVIEW_CAMERA_MARGIN: f32 = 0.2;
 const PREVIEW_TARGET_RADIUS: f32 = 0.72;
 const PREVIEW_FALLBACK_RADIUS: f32 = 0.72;
+const CATALOG_LABEL_MAX_CHARS: usize = 34;
+const CATALOG_STATUS_MAX_CHARS: usize = 36;
+const CATALOG_DOUBLE_CLICK_SECONDS: f64 = 0.35;
 const DRAG_GHOST_ALPHA: f32 = 0.35;
 const MENU_BG: Color = Color::srgb(0.08, 0.09, 0.11);
 const PANEL_BG: Color = Color::srgb(0.06, 0.07, 0.09);
@@ -148,6 +152,17 @@ pub struct CatalogDeleteRequest {
     pub cache_key: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneSaveKind {
+    Bsn,
+    Glb,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct SceneSaveRequest {
+    pub kind: SceneSaveKind,
+}
+
 pub struct BurnSynthUiPlugin;
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -162,8 +177,11 @@ impl Plugin for BurnSynthUiPlugin {
             .init_resource::<CatalogSelectionState>()
             .init_resource::<SettingsModalState>()
             .init_resource::<PipelineDropdownState>()
+            .init_resource::<SaveSceneMenuState>()
+            .init_resource::<CatalogSourceImageModalState>()
             .add_message::<CatalogSpawnRequest>()
             .add_message::<CatalogDeleteRequest>()
+            .add_message::<SceneSaveRequest>()
             .add_systems(Startup, setup_ui)
             .add_systems(
                 Update,
@@ -180,6 +198,17 @@ impl Plugin for BurnSynthUiPlugin {
                         update_pipeline_value_label,
                     )
                         .chain(),
+                ),
+            )
+            .add_systems(
+                Update,
+                (
+                    (
+                        handle_save_scene_button,
+                        handle_save_scene_option_button,
+                        sync_save_scene_menu,
+                    )
+                        .chain(),
                     handle_settings_button,
                     handle_settings_close_button,
                     handle_triposplat_profile_button,
@@ -190,6 +219,14 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_trellis_setting_step_button,
                     sync_settings_modal,
                     update_settings_labels,
+                ),
+            )
+            .add_systems(
+                Update,
+                (
+                    handle_source_image_modal_close_button,
+                    handle_source_image_modal_escape,
+                    sync_source_image_modal,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
                     update_button_visuals,
                     (
@@ -251,6 +288,7 @@ impl CatalogState {
             material: None,
             gaussian: None,
             source_image_path: Some(request.image_path.display().to_string()),
+            source_image: None,
             cache_key: None,
             preview: None,
         });
@@ -275,6 +313,7 @@ impl CatalogState {
             material: Some(material),
             gaussian: None,
             source_image_path,
+            source_image: None,
             cache_key,
             preview: None,
         });
@@ -297,6 +336,7 @@ impl CatalogState {
             material: None,
             gaussian: None,
             source_image_path,
+            source_image: None,
             cache_key,
             preview: None,
         });
@@ -320,6 +360,7 @@ impl CatalogState {
             material: None,
             gaussian: Some(gaussian),
             source_image_path,
+            source_image: None,
             cache_key,
             preview: None,
         });
@@ -333,6 +374,13 @@ impl CatalogState {
 
     pub fn entry_mut(&mut self, id: u32) -> Option<&mut CatalogEntry> {
         self.entries.iter_mut().find(|entry| entry.id == id)
+    }
+
+    pub fn set_source_image(&mut self, id: u32, image: Option<Handle<Image>>) {
+        if let Some(entry) = self.entry_mut(id) {
+            entry.source_image = image;
+            self.bump_revision();
+        }
     }
 
     pub fn remove_entry(&mut self, id: u32) -> Option<CatalogEntry> {
@@ -410,6 +458,7 @@ pub struct CatalogEntry {
     pub material: Option<Handle<StandardMaterial>>,
     pub gaussian: Option<Handle<PlanarGaussian3d>>,
     pub source_image_path: Option<String>,
+    pub source_image: Option<Handle<Image>>,
     pub cache_key: Option<String>,
     pub preview: Option<PreviewScene>,
 }
@@ -425,6 +474,7 @@ pub struct PreviewScene {
     pub image: Handle<Image>,
     pub asset_entity: Entity,
     pub camera_entity: Entity,
+    pub light_entities: Vec<Entity>,
     pub layer_index: usize,
 }
 
@@ -463,11 +513,18 @@ pub struct CatalogUiState {
     last_expanded: bool,
     panel_width: f32,
     settings_modal_open: bool,
+    source_modal_open: bool,
+    pipeline_menu_open: bool,
+    save_menu_open: bool,
 }
 
 impl CatalogUiState {
     pub fn cursor_over_ui(&self, window: &Window) -> bool {
-        if self.settings_modal_open {
+        if self.settings_modal_open
+            || self.source_modal_open
+            || self.pipeline_menu_open
+            || self.save_menu_open
+        {
             return true;
         }
         window
@@ -496,6 +553,7 @@ impl DragState {
 #[derive(Resource, Default)]
 struct CatalogSelectionState {
     selected: Option<u32>,
+    last_pressed: Option<(u32, f64)>,
 }
 
 #[derive(Component)]
@@ -537,6 +595,17 @@ struct CatalogDeleteButton;
 struct OpenImageButton;
 
 #[derive(Component)]
+struct SaveSceneButton;
+
+#[derive(Component)]
+struct SaveSceneOptionButton {
+    kind: SceneSaveKind,
+}
+
+#[derive(Component)]
+struct SaveSceneMenuRoot;
+
+#[derive(Component)]
 struct PipelineDropdownHost;
 
 #[derive(Component)]
@@ -558,6 +627,12 @@ struct SettingsButton;
 
 #[derive(Component)]
 struct SettingsCloseButton;
+
+#[derive(Component)]
+struct CatalogSourceImageModalRoot;
+
+#[derive(Component)]
+struct CatalogSourceImageCloseButton;
 
 #[derive(Component)]
 struct SettingsModalRoot;
@@ -687,6 +762,19 @@ struct SettingsModalState {
 #[derive(Resource, Default)]
 struct PipelineDropdownState {
     open: bool,
+    entity: Option<Entity>,
+}
+
+#[derive(Resource, Default)]
+struct SaveSceneMenuState {
+    open: bool,
+    entity: Option<Entity>,
+}
+
+#[derive(Resource, Default)]
+struct CatalogSourceImageModalState {
+    entry_id: Option<u32>,
+    rendered_entry_id: Option<u32>,
     entity: Option<Entity>,
 }
 
@@ -932,6 +1020,30 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                     right
                         .spawn((
                             Button,
+                            SaveSceneButton,
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                position_type: PositionType::Relative,
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                overflow: Overflow::visible(),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new("save scene"),
+                                TextFont::from_font_size(13.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+
+                    right
+                        .spawn((
+                            Button,
                             SettingsButton,
                             ControlButton(ControlButtonKind::Secondary),
                             Node {
@@ -1139,6 +1251,9 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
         last_expanded: true,
         panel_width: PANEL_WIDTH,
         settings_modal_open: false,
+        source_modal_open: false,
+        pipeline_menu_open: false,
+        save_menu_open: false,
     });
 }
 
@@ -1325,13 +1440,11 @@ fn rebuild_catalog_list(
                     } else {
                         format!("failed: {err}")
                     };
-                    if label.len() > 48 {
-                        label.truncate(48);
-                        label.push_str("...");
-                    }
+                    label = ellipsize_text(&label, CATALOG_STATUS_MAX_CHARS);
                     (label, Color::srgb(0.9, 0.3, 0.3))
                 }
             };
+            let display_label = ellipsize_text(&entry.label, CATALOG_LABEL_MAX_CHARS);
             parent
                 .spawn((
                     Button,
@@ -1379,15 +1492,18 @@ fn rebuild_catalog_list(
                     }
 
                     row.spawn(Node {
+                        width: Val::Px(PANEL_WIDTH - THUMB_SIZE - 78.0),
+                        min_width: Val::Px(0.0),
                         flex_direction: FlexDirection::Column,
                         justify_content: JustifyContent::Center,
                         padding: UiRect::left(Val::Px(4.0)),
                         row_gap: Val::Px(4.0),
+                        overflow: Overflow::clip(),
                         ..default()
                     })
                     .with_children(|text_col| {
                         text_col.spawn((
-                            Text::new(entry.label.clone()),
+                            Text::new(display_label.clone()),
                             TextFont::from_font_size(13.0),
                             TextColor(Color::srgb(0.9, 0.92, 0.97)),
                         ));
@@ -1428,15 +1544,90 @@ fn despawn_children_recursive(
 
 fn handle_catalog_entry_interaction(
     mut interactions: Query<(&Interaction, &CatalogEntryButton), Changed<Interaction>>,
+    time: Res<Time>,
     mut drag: ResMut<DragState>,
     mut selection: ResMut<CatalogSelectionState>,
+    mut source_modal: ResMut<CatalogSourceImageModalState>,
 ) {
     for (interaction, entry) in interactions.iter_mut() {
         if *interaction == Interaction::Pressed {
-            selection.selected = Some(entry.id);
-            drag.active = Some(entry.id);
-            drag.ghost_entry = None;
+            let now = time.elapsed_secs_f64();
+            let double_click = selection.last_pressed.is_some_and(|(id, last)| {
+                id == entry.id && now - last <= CATALOG_DOUBLE_CLICK_SECONDS
+            });
+            selection.last_pressed = Some((entry.id, now));
+            if double_click {
+                drag.active = None;
+                drag.ghost_entry = None;
+                source_modal.entry_id = Some(entry.id);
+                return;
+            } else {
+                selection.selected = Some(entry.id);
+                drag.active = Some(entry.id);
+                drag.ghost_entry = None;
+            }
         }
+    }
+}
+
+fn handle_source_image_modal_close_button(
+    mut interactions: Query<
+        &Interaction,
+        (Changed<Interaction>, With<CatalogSourceImageCloseButton>),
+    >,
+    mut modal: ResMut<CatalogSourceImageModalState>,
+) {
+    for interaction in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            modal.entry_id = None;
+        }
+    }
+}
+
+fn handle_source_image_modal_escape(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut modal: ResMut<CatalogSourceImageModalState>,
+) {
+    if modal.entry_id.is_some() && keys.just_pressed(KeyCode::Escape) {
+        modal.entry_id = None;
+    }
+}
+
+fn sync_source_image_modal(
+    mut commands: Commands,
+    catalog: Res<CatalogState>,
+    mut modal: ResMut<CatalogSourceImageModalState>,
+    mut ui: ResMut<CatalogUiState>,
+    children: Query<&Children>,
+) {
+    if modal.entry_id.and_then(|id| catalog.entry(id)).is_none() {
+        modal.entry_id = None;
+    }
+    ui.source_modal_open = modal.entry_id.is_some();
+
+    if modal.entity.is_some() && modal.rendered_entry_id != modal.entry_id {
+        if let Some(entity) = modal.entity.take() {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+        }
+        modal.rendered_entry_id = None;
+    }
+
+    match (modal.entry_id, modal.entity) {
+        (Some(id), None) => {
+            if let Some(entry) = catalog.entry(id) {
+                modal.entity = Some(spawn_source_image_modal(&mut commands, entry));
+                modal.rendered_entry_id = Some(id);
+            }
+        }
+        (None, Some(entity)) => {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+            modal.entity = None;
+            modal.rendered_entry_id = None;
+        }
+        (Some(_), Some(_)) => {}
+        _ => {}
     }
 }
 
@@ -1464,6 +1655,9 @@ fn delete_catalog_entry(
     if let Some(preview) = entry.preview {
         commands.entity(preview.asset_entity).despawn();
         commands.entity(preview.camera_entity).despawn();
+        for light in preview.light_entities {
+            commands.entity(light).despawn();
+        }
         catalog.release_preview_layer(preview.layer_index);
     }
     if selection.selected == Some(id) {
@@ -1992,6 +2186,9 @@ fn sync_catalog_previews(
                 if let Some(preview) = preview {
                     commands.entity(preview.asset_entity).despawn();
                     commands.entity(preview.camera_entity).despawn();
+                    for light in preview.light_entities {
+                        commands.entity(light).despawn();
+                    }
                     catalog.release_preview_layer(preview.layer_index);
                     changed = true;
                 }
@@ -2109,11 +2306,14 @@ fn sync_pipeline_dropdown(
     args: Option<Res<AppArgs>>,
     available: Option<Res<AvailablePipelines>>,
     mut dropdown: ResMut<PipelineDropdownState>,
+    mut ui: ResMut<CatalogUiState>,
     hosts: Query<Entity, With<PipelineDropdownHost>>,
     children: Query<&Children>,
 ) {
+    ui.pipeline_menu_open = dropdown.open;
     let Some(available) = available else {
         dropdown.open = false;
+        ui.pipeline_menu_open = false;
         if let Some(entity) = dropdown.entity.take() {
             despawn_children_recursive(entity, &mut commands, &children);
             commands.entity(entity).despawn();
@@ -2122,6 +2322,7 @@ fn sync_pipeline_dropdown(
     };
     if available.models.len() <= 1 {
         dropdown.open = false;
+        ui.pipeline_menu_open = false;
     }
 
     match (dropdown.open, dropdown.entity) {
@@ -2144,6 +2345,119 @@ fn sync_pipeline_dropdown(
         }
         _ => {}
     }
+}
+
+fn handle_save_scene_button(
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<SaveSceneButton>)>,
+    mut menu: ResMut<SaveSceneMenuState>,
+) {
+    for interaction in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            menu.open = !menu.open;
+        }
+    }
+}
+
+fn handle_save_scene_option_button(
+    mut interactions: Query<(&Interaction, &SaveSceneOptionButton), Changed<Interaction>>,
+    mut menu: ResMut<SaveSceneMenuState>,
+    mut requests: MessageWriter<SceneSaveRequest>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        menu.open = false;
+        requests.write(SceneSaveRequest { kind: button.kind });
+    }
+}
+
+fn sync_save_scene_menu(
+    mut commands: Commands,
+    mut menu: ResMut<SaveSceneMenuState>,
+    mut ui: ResMut<CatalogUiState>,
+    hosts: Query<Entity, With<SaveSceneButton>>,
+    children: Query<&Children>,
+) {
+    ui.save_menu_open = menu.open;
+    match (menu.open, menu.entity) {
+        (true, None) => {
+            let Ok(host) = hosts.single() else {
+                menu.open = false;
+                ui.save_menu_open = false;
+                return;
+            };
+            menu.entity = Some(spawn_save_scene_menu(&mut commands, host));
+        }
+        (false, Some(entity)) => {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+            menu.entity = None;
+        }
+        _ => {}
+    }
+}
+
+fn spawn_save_scene_menu(commands: &mut Commands, host: Entity) -> Entity {
+    let mut menu_entity = Entity::PLACEHOLDER;
+    commands.entity(host).with_children(|host| {
+        menu_entity = host
+            .spawn((
+                SaveSceneMenuRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(32.0),
+                    right: Val::Px(0.0),
+                    width: Val::Px(132.0),
+                    padding: UiRect::all(Val::Px(4.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(3.0),
+                    ..default()
+                },
+                ZIndex(100),
+                GlobalZIndex(20_000),
+                BorderColor::all(PANEL_BORDER),
+                BackgroundColor(PANEL_BG),
+            ))
+            .with_children(|menu| {
+                spawn_save_scene_option(menu, SceneSaveKind::Bsn, "save BSN");
+                spawn_save_scene_option(menu, SceneSaveKind::Glb, "export GLB");
+            })
+            .id();
+    });
+    menu_entity
+}
+
+fn spawn_save_scene_option(
+    parent: &mut ChildSpawnerCommands<'_>,
+    kind: SceneSaveKind,
+    label: &str,
+) {
+    parent
+        .spawn((
+            Button,
+            SaveSceneOptionButton { kind },
+            ControlButton(ControlButtonKind::Secondary),
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Px(26.0),
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BorderColor::all(BUTTON_BORDER),
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(label),
+                TextFont::from_font_size(12.0),
+                TextColor(BUTTON_TEXT),
+                ButtonLabel,
+            ));
+        });
 }
 
 fn update_pipeline_value_label(
@@ -2513,6 +2827,126 @@ fn update_settings_labels(
             label.0 = next;
         }
     }
+}
+
+fn spawn_source_image_modal(commands: &mut Commands, entry: &CatalogEntry) -> Entity {
+    let title = ellipsize_text(&entry.label, 56);
+    let source_text = entry
+        .source_image_path
+        .as_deref()
+        .map(|path| ellipsize_text(path, 72))
+        .unwrap_or_else(|| "source image unknown".to_string());
+    commands
+        .spawn((
+            CatalogSourceImageModalRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(MODAL_SCRIM),
+            GlobalZIndex(30_000),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    width: Val::Px(560.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(12.0),
+                    padding: UiRect::all(Val::Px(16.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(MODAL_BG),
+                BorderColor::all(MODAL_BORDER),
+            ))
+            .with_children(|panel| {
+                panel
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(12.0),
+                        ..default()
+                    })
+                    .with_children(|header| {
+                        header.spawn((
+                            Text::new(title.clone()),
+                            TextFont::from_font_size(16.0),
+                            TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                        ));
+                        header
+                            .spawn((
+                                Button,
+                                CatalogSourceImageCloseButton,
+                                ControlButton(ControlButtonKind::Secondary),
+                                Node {
+                                    padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BorderColor::all(BUTTON_BORDER),
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|button| {
+                                button.spawn((
+                                    Text::new("close"),
+                                    TextFont::from_font_size(12.0),
+                                    TextColor(BUTTON_TEXT),
+                                    ButtonLabel,
+                                ));
+                            });
+                    });
+
+                panel.spawn((
+                    Text::new(source_text),
+                    TextFont::from_font_size(12.0),
+                    TextColor(Color::srgb(0.7, 0.74, 0.82)),
+                ));
+
+                if let Some(image) = entry.source_image.as_ref() {
+                    panel.spawn((
+                        Node {
+                            width: Val::Px(512.0),
+                            height: Val::Px(512.0),
+                            border: UiRect::all(Val::Px(1.0)),
+                            align_self: AlignSelf::Center,
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgb(0.24, 0.27, 0.34)),
+                        ImageNode::new(image.clone()),
+                    ));
+                } else {
+                    panel
+                        .spawn((
+                            Node {
+                                width: Val::Px(512.0),
+                                height: Val::Px(220.0),
+                                border: UiRect::all(Val::Px(1.0)),
+                                align_self: AlignSelf::Center,
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgb(0.24, 0.27, 0.34)),
+                            BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+                        ))
+                        .with_children(|missing| {
+                            missing.spawn((
+                                Text::new("source image unavailable"),
+                                TextFont::from_font_size(13.0),
+                                TextColor(Color::srgb(0.8, 0.84, 0.9)),
+                            ));
+                        });
+                }
+            });
+        })
+        .id()
 }
 
 fn spawn_settings_modal(commands: &mut Commands, model: SynthesisModel) -> Entity {
@@ -3279,6 +3713,20 @@ fn pipeline_settings_enabled(args: Option<&AppArgs>) -> bool {
     active_settings_pipeline(args).is_some()
 }
 
+fn ellipsize_text(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".chars().take(max_chars).collect();
+    }
+    let keep = max_chars - 3;
+    let mut out: String = value.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
 fn format_grouped_usize(value: usize) -> String {
     let raw = value.to_string();
     let mut out = String::with_capacity(raw.len() + raw.len().saturating_sub(1) / 3);
@@ -3352,6 +3800,34 @@ fn spawn_preview_scene(
             ))
             .id(),
     };
+    let light_entities = vec![
+        commands
+            .spawn((
+                DirectionalLight {
+                    color: Color::srgb(1.0, 0.98, 0.95),
+                    illuminance: 18_000.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_xyz(2.8, 4.0, 3.4).looking_at(Vec3::ZERO, Vec3::Y),
+                layer.clone(),
+            ))
+            .id(),
+        commands
+            .spawn((
+                PointLight {
+                    color: Color::srgb(0.76, 0.86, 1.0),
+                    intensity: 12_000.0,
+                    range: 7.0,
+                    radius: 0.35,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_xyz(-2.5, 2.6, 2.2),
+                layer.clone(),
+            ))
+            .id(),
+    ];
 
     let camera_entity = commands
         .spawn((
@@ -3381,6 +3857,7 @@ fn spawn_preview_scene(
         image: image_handle,
         asset_entity,
         camera_entity,
+        light_entities,
         layer_index,
     }
 }
@@ -3479,11 +3956,7 @@ fn preview_fit_for_gaussian_cloud(cloud: &PlanarGaussian3d) -> PreviewFit {
 }
 
 pub fn preview_light_layers() -> RenderLayers {
-    let mut layers = RenderLayers::layer(0);
-    for layer in 1..=PREVIEW_MAX_LAYER {
-        layers = layers.with(layer);
-    }
-    layers
+    RenderLayers::layer(0)
 }
 
 #[cfg(test)]
@@ -3637,6 +4110,16 @@ mod tests {
     }
 
     #[test]
+    fn catalog_labels_are_ellipsized_to_fixed_width() {
+        assert_eq!(ellipsize_text("short", 12), "short");
+        assert_eq!(
+            ellipsize_text("very-long-catalog-entry-name", 13),
+            "very-long-..."
+        );
+        assert_eq!(ellipsize_text("abcdef", 2), "..");
+    }
+
+    #[test]
     fn splat_catalog_entry_creates_gaussian_preview_scene() {
         let mut app = App::new();
         app.insert_resource(CatalogState::default());
@@ -3687,6 +4170,15 @@ mod tests {
             )
         };
         assert!(has_preview, "splat entry should get a preview");
+        assert_eq!(
+            world
+                .resource::<CatalogState>()
+                .entry(7)
+                .and_then(|entry| entry.preview.as_ref())
+                .map(|preview| preview.light_entities.len()),
+            Some(2),
+            "preview scene should own isolated light entities"
+        );
         assert!(has_gaussian);
         assert!(!has_mesh);
         assert!(!has_material);
@@ -3701,6 +4193,8 @@ mod tests {
         assert_eq!(settings.sort_mode, SortMode::Std);
         assert_eq!(settings.color_space, GaussianColorSpace::SrgbRec709Display);
         assert_eq!(world.query::<&GaussianCamera>().iter(world).count(), 1);
+        assert_eq!(world.query::<&DirectionalLight>().iter(world).count(), 1);
+        assert_eq!(world.query::<&PointLight>().iter(world).count(), 1);
     }
 
     #[test]

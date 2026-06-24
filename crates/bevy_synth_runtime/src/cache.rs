@@ -25,6 +25,8 @@ const TRIPOSPLAT_SPLAT_CACHE_NAMESPACE: &str = "triposplat-v2";
 const INDEX_FILE_NAME: &str = "index.json";
 #[cfg(not(target_arch = "wasm32"))]
 const MESH_DIR_NAME: &str = "meshes";
+#[cfg(not(target_arch = "wasm32"))]
+const SOURCE_IMAGE_DIR_NAME: &str = "source_images";
 
 pub type CacheResult<T> = Result<T, CacheError>;
 
@@ -57,11 +59,17 @@ pub enum CachedAssetKind {
     GaussianSplat,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CachedMeshMetadata {
     pub cache_key: String,
     pub source_image_path: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image_payload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image_mime: Option<String>,
     #[serde(default)]
     pub asset_kind: CachedAssetKind,
     pub mesh_payload_id: String,
@@ -70,7 +78,24 @@ pub struct CachedMeshMetadata {
     pub glb_output_id: String,
     #[serde(default)]
     pub splat_payload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_aabb: Option<CachedAssetAabb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_frame: Option<CachedAssetFrame>,
     pub updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CachedAssetAabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CachedAssetFrame {
+    pub yaw_offset_degrees: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_m: Option<[f32; 2]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -81,6 +106,13 @@ pub struct CachedWorldItem {
     pub scale: [f32; 3],
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedSourceImage {
+    pub file_name: String,
+    pub mime_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CachedCameraState {
     pub translation: [f32; 3],
@@ -89,6 +121,8 @@ pub struct CachedCameraState {
     pub yaw: f32,
     pub pitch: f32,
     pub radius: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_fov_degrees: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,6 +278,20 @@ impl From<MeshPayload> for SynthMesh {
     }
 }
 
+fn mesh_local_aabb(mesh: &SynthMesh) -> Option<CachedAssetAabb> {
+    let mut iter = mesh.mesh.vertices.iter();
+    let first = *iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for vertex in iter {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex[axis]);
+            max[axis] = max[axis].max(vertex[axis]);
+        }
+    }
+    Some(CachedAssetAabb { min, max })
+}
+
 #[derive(Clone, Debug)]
 pub struct MeshCache {
     index: CacheIndex,
@@ -356,6 +404,36 @@ impl MeshCache {
         }
     }
 
+    pub fn load_source_image(
+        &self,
+        metadata: &CachedMeshMetadata,
+    ) -> CacheResult<Option<CachedSourceImage>> {
+        if let Some(bytes) = self.read_source_image_payload(metadata)? {
+            return Ok(Some(CachedSourceImage {
+                file_name: metadata.source_image_name.clone().unwrap_or_else(|| {
+                    asset_label(&metadata.source_image_path, CachedAssetKind::Mesh)
+                }),
+                mime_type: metadata.source_image_mime.clone(),
+                bytes,
+            }));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = Path::new(&metadata.source_image_path);
+            if path.is_file() {
+                let bytes = fs::read(path).map_err(|err| CacheError::Io(err.to_string()))?;
+                return Ok(Some(CachedSourceImage {
+                    file_name: source_image_file_name(&metadata.source_image_path),
+                    mime_type: source_image_mime(&metadata.source_image_path),
+                    bytes,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn load_gaussian_splat(&self, cache_key: &str) -> CacheResult<Option<GaussianSplatCloud>> {
         let Some(payload) = self.read_splat_payload(cache_key)? else {
             return Ok(None);
@@ -368,6 +446,15 @@ impl MeshCache {
     pub fn upsert_mesh_for_image(
         &mut self,
         source_image_path: &Path,
+        mesh: &SynthMesh,
+    ) -> CacheResult<CachedMeshMetadata> {
+        self.upsert_mesh_for_image_with_source_bytes(source_image_path, None, mesh)
+    }
+
+    pub fn upsert_mesh_for_image_with_source_bytes(
+        &mut self,
+        source_image_path: &Path,
+        source_image_bytes: Option<&[u8]>,
         mesh: &SynthMesh,
     ) -> CacheResult<CachedMeshMetadata> {
         let source_image_path = normalize_source_image_path(source_image_path);
@@ -384,16 +471,29 @@ impl MeshCache {
         let glb = mesh_to_glb(mesh)?;
         self.write_glb_output(&cache_key, &glb)?;
         let glb_output_id = self.glb_output_id(&cache_key);
+        let source_image_payload =
+            self.write_source_image_payload(&cache_key, &source_image_path, source_image_bytes)?;
 
         let metadata = CachedMeshMetadata {
             cache_key: cache_key.clone(),
             source_image_path: source_image_path.clone(),
             label,
+            source_image_payload_id: source_image_payload
+                .as_ref()
+                .map(|payload| payload.payload_id.clone()),
+            source_image_name: source_image_payload
+                .as_ref()
+                .map(|payload| payload.file_name.clone()),
+            source_image_mime: source_image_payload
+                .as_ref()
+                .and_then(|payload| payload.mime_type.clone()),
             asset_kind: CachedAssetKind::Mesh,
             mesh_payload_id: glb_output_id.clone(),
             gltf_output_id: None,
             glb_output_id,
             splat_payload_id: None,
+            local_aabb: mesh_local_aabb(mesh),
+            canonical_frame: None,
             updated_at_unix_ms: now_unix_ms(),
         };
 
@@ -407,6 +507,7 @@ impl MeshCache {
                 self.remove_gltf_output(&old_cache_key)?;
                 self.remove_glb_output(&old_cache_key)?;
                 self.remove_splat_payload(&old_cache_key)?;
+                self.remove_source_image_payload(&old_cache_key)?;
             }
             self.index.meshes[position] = metadata.clone();
         } else {
@@ -422,6 +523,15 @@ impl MeshCache {
         source_image_path: &Path,
         splats: &GaussianSplatCloud,
     ) -> CacheResult<CachedMeshMetadata> {
+        self.upsert_gaussian_splat_for_image_with_source_bytes(source_image_path, None, splats)
+    }
+
+    pub fn upsert_gaussian_splat_for_image_with_source_bytes(
+        &mut self,
+        source_image_path: &Path,
+        source_image_bytes: Option<&[u8]>,
+        splats: &GaussianSplatCloud,
+    ) -> CacheResult<CachedMeshMetadata> {
         let source_image_path = normalize_source_image_path(source_image_path);
         let cache_key =
             cache_key_from_source_and_kind(&source_image_path, CachedAssetKind::GaussianSplat);
@@ -435,16 +545,29 @@ impl MeshCache {
             .map_err(|err| CacheError::Serialization(err.to_string()))?;
         self.write_splat_payload(&cache_key, &payload)?;
         let splat_payload_id = self.splat_payload_id(&cache_key);
+        let source_image_payload =
+            self.write_source_image_payload(&cache_key, &source_image_path, source_image_bytes)?;
 
         let metadata = CachedMeshMetadata {
             cache_key: cache_key.clone(),
             source_image_path: source_image_path.clone(),
             label,
+            source_image_payload_id: source_image_payload
+                .as_ref()
+                .map(|payload| payload.payload_id.clone()),
+            source_image_name: source_image_payload
+                .as_ref()
+                .map(|payload| payload.file_name.clone()),
+            source_image_mime: source_image_payload
+                .as_ref()
+                .and_then(|payload| payload.mime_type.clone()),
             asset_kind: CachedAssetKind::GaussianSplat,
             mesh_payload_id: splat_payload_id.clone(),
             gltf_output_id: None,
             glb_output_id: splat_payload_id.clone(),
             splat_payload_id: Some(splat_payload_id),
+            local_aabb: None,
+            canonical_frame: None,
             updated_at_unix_ms: now_unix_ms(),
         };
 
@@ -458,6 +581,7 @@ impl MeshCache {
                 self.remove_gltf_output(&old_cache_key)?;
                 self.remove_glb_output(&old_cache_key)?;
                 self.remove_splat_payload(&old_cache_key)?;
+                self.remove_source_image_payload(&old_cache_key)?;
             }
             self.index.meshes[position] = metadata.clone();
         } else {
@@ -483,6 +607,7 @@ impl MeshCache {
         self.remove_gltf_output(cache_key)?;
         self.remove_glb_output(cache_key)?;
         self.remove_splat_payload(cache_key)?;
+        self.remove_source_image_payload(cache_key)?;
         self.index
             .world_items
             .retain(|item| item.cache_key != cache_key);
@@ -557,6 +682,40 @@ impl MeshCache {
             .map_err(|err| CacheError::Io(err.to_string()))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_source_image_payload(
+        &self,
+        metadata: &CachedMeshMetadata,
+    ) -> CacheResult<Option<Vec<u8>>> {
+        let Some(payload_id) = metadata.source_image_payload_id.as_ref() else {
+            return Ok(None);
+        };
+        let path = Path::new(payload_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        fs::read(path)
+            .map(Some)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_source_image_payload(
+        &self,
+        metadata: &CachedMeshMetadata,
+    ) -> CacheResult<Option<Vec<u8>>> {
+        let Some(payload_id) = metadata.source_image_payload_id.as_ref() else {
+            return Ok(None);
+        };
+        let Some(encoded) = web_storage_get(payload_id)? else {
+            return Ok(None);
+        };
+        BASE64_STANDARD
+            .decode(encoded)
+            .map(Some)
+            .map_err(|err| CacheError::InvalidData(err.to_string()))
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn read_glb_output(&self, cache_key: &str) -> CacheResult<Option<Vec<u8>>> {
         let Some(encoded) = web_storage_get(&self.glb_output_storage_key(cache_key))? else {
@@ -600,6 +759,32 @@ impl MeshCache {
             fs::remove_file(path).map_err(|err| CacheError::Io(err.to_string()))?;
         }
         Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remove_source_image_payload(&self, cache_key: &str) -> CacheResult<()> {
+        let dir = self.source_image_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir).map_err(|err| CacheError::Io(err.to_string()))? {
+            let entry = entry.map_err(|err| CacheError::Io(err.to_string()))?;
+            let path = entry.path();
+            if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == cache_key)
+                && path.is_file()
+            {
+                fs::remove_file(path).map_err(|err| CacheError::Io(err.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn remove_source_image_payload(&self, cache_key: &str) -> CacheResult<()> {
+        web_storage_remove(&self.source_image_storage_key(cache_key))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -700,6 +885,99 @@ impl MeshCache {
             .join(format!("{cache_key}.glb"))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn source_image_dir(&self) -> PathBuf {
+        self.root.join(SOURCE_IMAGE_DIR_NAME)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn source_image_payload_path(&self, cache_key: &str, extension: &str) -> PathBuf {
+        self.source_image_dir()
+            .join(format!("{cache_key}.{extension}"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn source_image_storage_key(&self, cache_key: &str) -> String {
+        format!("{}/source_image/{cache_key}", self.prefix)
+    }
+
+    fn write_source_image_payload(
+        &self,
+        cache_key: &str,
+        source_image_path: &str,
+        source_image_bytes: Option<&[u8]>,
+    ) -> CacheResult<Option<SourceImagePayloadInfo>> {
+        let bytes = if let Some(bytes) = source_image_bytes {
+            if bytes.is_empty() {
+                None
+            } else {
+                Some(bytes.to_vec())
+            }
+        } else {
+            self.read_source_image_from_path(source_image_path)?
+        };
+        let Some(bytes) = bytes else {
+            self.remove_source_image_payload(cache_key)?;
+            return Ok(None);
+        };
+        let extension = source_image_extension(source_image_path);
+        let file_name = source_image_file_name(source_image_path);
+        let mime_type = source_image_mime(source_image_path);
+        let payload_id = self.write_source_image_bytes(cache_key, extension, bytes.as_slice())?;
+        Ok(Some(SourceImagePayloadInfo {
+            payload_id,
+            file_name,
+            mime_type,
+        }))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_source_image_from_path(&self, source_image_path: &str) -> CacheResult<Option<Vec<u8>>> {
+        let path = Path::new(source_image_path);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        fs::read(path)
+            .map(Some)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_source_image_from_path(
+        &self,
+        _source_image_path: &str,
+    ) -> CacheResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_source_image_bytes(
+        &self,
+        cache_key: &str,
+        extension: &str,
+        bytes: &[u8],
+    ) -> CacheResult<String> {
+        fs::create_dir_all(self.source_image_dir())
+            .map_err(|err| CacheError::Io(err.to_string()))?;
+        self.remove_source_image_payload(cache_key)?;
+        let path = self.source_image_payload_path(cache_key, extension);
+        fs::write(&path, bytes).map_err(|err| CacheError::Io(err.to_string()))?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_source_image_bytes(
+        &self,
+        cache_key: &str,
+        _extension: &str,
+        bytes: &[u8],
+    ) -> CacheResult<String> {
+        let key = self.source_image_storage_key(cache_key);
+        let encoded = BASE64_STANDARD.encode(bytes);
+        web_storage_set(&key, &encoded)?;
+        Ok(key)
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn glb_output_storage_key(&self, cache_key: &str) -> String {
         format!("{}/glb/{cache_key}", self.prefix)
@@ -756,6 +1034,51 @@ fn asset_label(source_image_path: &str, kind: CachedAssetKind) -> String {
         CachedAssetKind::Mesh => label,
         CachedAssetKind::GaussianSplat => format!("{label} (splat)"),
     }
+}
+
+#[derive(Clone, Debug)]
+struct SourceImagePayloadInfo {
+    payload_id: String,
+    file_name: String,
+    mime_type: Option<String>,
+}
+
+fn source_image_file_name(source_image_path: &str) -> String {
+    Path::new(source_image_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("source_image")
+        .to_string()
+}
+
+fn source_image_extension(source_image_path: &str) -> &str {
+    match Path::new(source_image_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "jpg",
+        Some("png") => "png",
+        Some("webp") => "webp",
+        Some("bmp") => "bmp",
+        Some("gif") => "gif",
+        Some("tif" | "tiff") => "tiff",
+        _ => "img",
+    }
+}
+
+fn source_image_mime(source_image_path: &str) -> Option<String> {
+    let mime = match source_image_extension(source_image_path) {
+        "jpg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "gif" => "image/gif",
+        "tiff" => "image/tiff",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 fn cache_key_from_source(source: &str) -> String {
@@ -851,7 +1174,9 @@ fn default_web_cache_prefix() -> String {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ensure_native_layout(root: &Path) -> CacheResult<()> {
-    fs::create_dir_all(root.join(MESH_DIR_NAME)).map_err(|err| CacheError::Io(err.to_string()))
+    fs::create_dir_all(root.join(MESH_DIR_NAME)).map_err(|err| CacheError::Io(err.to_string()))?;
+    fs::create_dir_all(root.join(SOURCE_IMAGE_DIR_NAME))
+        .map_err(|err| CacheError::Io(err.to_string()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -977,6 +1302,13 @@ mod tests {
 
         assert_eq!(cache.mesh_entries().len(), 1);
         assert_eq!(first.cache_key, second.cache_key);
+        assert_eq!(
+            second.local_aabb,
+            Some(CachedAssetAabb {
+                min: [0.0, 0.0, 0.0],
+                max: [2.0, 2.0, 0.0],
+            })
+        );
 
         let loaded = cache
             .load_mesh(&second.cache_key)
@@ -1013,6 +1345,71 @@ mod tests {
             .expect("mesh exists");
         assert_eq!(loaded.mesh.vertices.len(), 3);
         assert_eq!(loaded.mesh.faces.len(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn upsert_mesh_retains_source_image_payload() {
+        let root = temp_root("source_image");
+        let image = PathBuf::from("C:/data/input/chair.png");
+        let source_bytes = [137, 80, 78, 71, 13, 10, 26, 10];
+
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let entry = cache
+            .upsert_mesh_for_image_with_source_bytes(&image, Some(&source_bytes), &dummy_mesh(1.0))
+            .expect("insert mesh with source image");
+
+        assert!(entry.source_image_payload_id.is_some());
+        assert_eq!(entry.source_image_name.as_deref(), Some("chair.png"));
+        assert_eq!(entry.source_image_mime.as_deref(), Some("image/png"));
+
+        let loaded = cache
+            .load_source_image(&entry)
+            .expect("load source image")
+            .expect("source image exists");
+        assert_eq!(loaded.file_name, "chair.png");
+        assert_eq!(loaded.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(loaded.bytes, source_bytes);
+
+        let cache = MeshCache::load_from_root(root.clone()).expect("reload cache");
+        let reloaded = cache
+            .asset_entries()
+            .iter()
+            .find(|metadata| metadata.cache_key == entry.cache_key)
+            .expect("reloaded metadata");
+        let loaded = cache
+            .load_source_image(reloaded)
+            .expect("load source image after reload")
+            .expect("source image exists after reload");
+        assert_eq!(loaded.bytes, source_bytes);
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn remove_mesh_entry_cleans_source_image_payload() {
+        let root = temp_root("remove_source_image");
+        let image = PathBuf::from("C:/data/input/remove_source.png");
+
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let entry = cache
+            .upsert_mesh_for_image_with_source_bytes(&image, Some(&[1, 2, 3, 4]), &dummy_mesh(1.0))
+            .expect("insert mesh with source image");
+        let payload = entry
+            .source_image_payload_id
+            .as_ref()
+            .map(PathBuf::from)
+            .expect("source image payload path");
+        assert!(payload.exists());
+
+        let removed = cache
+            .remove_mesh_entry(&entry.cache_key)
+            .expect("remove mesh entry");
+        assert!(removed);
+        assert!(!payload.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }
@@ -1103,6 +1500,7 @@ mod tests {
             yaw: 1.0,
             pitch: -0.25,
             radius: 6.5,
+            vertical_fov_degrees: Some(72.0),
         };
         cache
             .set_camera_state(Some(state.clone()))

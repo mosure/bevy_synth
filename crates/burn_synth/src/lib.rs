@@ -25,7 +25,9 @@ pub use io::mesh_to_glb_bytes;
 pub use io::write_glb_mesh;
 pub use io::{ImageSource, TextPrompt};
 pub use mesh::{
-    Mesh, MeshLike, MeshMaterial, MeshPbrTextures, MeshStats, MeshTexture, mesh_bounds, mesh_stats,
+    Mesh, MeshConnectivityMetrics, MeshLike, MeshMaterial, MeshPbrTextureMetrics, MeshPbrTextures,
+    MeshQualityMetrics, MeshStats, MeshTexture, mesh_bounds, mesh_quality_failures,
+    mesh_quality_metrics, mesh_stats,
 };
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
 pub use native_model_bootstrap::set_bootstrap_status_callback;

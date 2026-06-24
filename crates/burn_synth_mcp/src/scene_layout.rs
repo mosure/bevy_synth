@@ -29,7 +29,15 @@ pub(crate) struct SceneAssetBinding {
     #[serde(default)]
     pub cache_key: Option<String>,
     #[serde(default)]
+    pub local_aabb: Option<SceneAssetAabb>,
+    #[serde(default)]
     pub select: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) struct SceneAssetAabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -170,12 +178,19 @@ pub(crate) fn compose_scene_layout(args: SceneComposeArgs) -> Result<SceneCompos
         used_assets.insert(asset_index);
         let bbox = normalize_bbox(reference.bbox);
         let center_x = (bbox[0] + bbox[2]) * 0.5;
-        let center_y = (bbox[1] + bbox[3]) * 0.5;
+        let center_y = bbox[3];
         let width = (bbox[2] - bbox[0]).max(0.01);
         let height = (bbox[3] - bbox[1]).max(0.01);
         let footprint_x = (width * args.layout_width * args.scale_multiplier).max(args.min_scale);
         let footprint_z = (height * args.layout_depth * args.scale_multiplier).max(args.min_scale);
-        let uniform_scale = footprint_x.max(footprint_z);
+        let uniform_scale = asset
+            .local_aabb
+            .map(|aabb| uniform_asset_scale(aabb, target_footprint_for_label(reference)))
+            .unwrap_or_else(|| footprint_x.max(footprint_z));
+        let y = asset
+            .local_aabb
+            .map(|aabb| args.y - aabb.min[1] * uniform_scale)
+            .unwrap_or(args.y);
         let cache_key = asset
             .cache_key
             .clone()
@@ -188,7 +203,7 @@ pub(crate) fn compose_scene_layout(args: SceneComposeArgs) -> Result<SceneCompos
             cache_key,
             translation: [
                 (center_x - 0.5) * args.layout_width,
-                args.y,
+                y,
                 (center_y - 0.5) * args.layout_depth,
             ],
             rotation: [0.0, 0.0, 0.0, 1.0],
@@ -341,6 +356,31 @@ fn asset_reference_score(reference: &SceneReferenceObject, asset: &SceneAssetBin
         .iter()
         .map(|label| reference_label_score(reference, label))
         .fold(0.0, f32::max)
+}
+
+fn uniform_asset_scale(aabb: SceneAssetAabb, target_footprint: [f32; 2]) -> f32 {
+    let size_x = (aabb.max[0] - aabb.min[0]).abs().max(1.0e-5);
+    let size_z = (aabb.max[2] - aabb.min[2]).abs().max(1.0e-5);
+    let local_footprint = size_x.max(size_z);
+    let target = target_footprint[0].max(target_footprint[1]).max(0.1);
+    (target / local_footprint).clamp(0.05, 20.0)
+}
+
+fn target_footprint_for_label(reference: &SceneReferenceObject) -> [f32; 2] {
+    let descriptor =
+        format!("{} {}", reference.label, reference.aliases.join(" ")).to_ascii_lowercase();
+    if descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+    {
+        [4.4, 2.1]
+    } else if descriptor.contains("table") {
+        [1.55, 0.95]
+    } else if descriptor.contains("chair") {
+        [0.85, 0.85]
+    } else {
+        [1.0, 1.0]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +818,7 @@ mod tests {
                     aliases: Vec::new(),
                     path: Some(PathBuf::from("/tmp/chair.glb")),
                     cache_key: None,
+                    local_aabb: None,
                     select: false,
                 },
                 SceneAssetBinding {
@@ -786,6 +827,7 @@ mod tests {
                     aliases: Vec::new(),
                     path: Some(PathBuf::from("/tmp/table.glb")),
                     cache_key: None,
+                    local_aabb: None,
                     select: false,
                 },
             ],

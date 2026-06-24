@@ -2,15 +2,17 @@
 
 mod scene_layout;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bevy_synth_runtime::cache::{CachedMeshMetadata, MeshCache};
+use bevy_synth_runtime::cache::{CachedAssetAabb, CachedMeshMetadata, MeshCache};
 use bevy_synth_runtime::{
     SynthMesh as CachedSynthMesh, SynthMeshMaterial as CachedSynthMeshMaterial,
     SynthMeshPbrTextures as CachedSynthMeshPbrTextures, SynthMeshTexture as CachedSynthMeshTexture,
@@ -18,15 +20,19 @@ use bevy_synth_runtime::{
 };
 use burn_synth::{
     AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, ModelSelection,
-    RuntimeBatchPolicy, RuntimeConfig, SynthRuntime, SynthesisAsset, write_glb_mesh,
+    RuntimeBatchPolicy, RuntimeConfig, SynthRuntime, SynthesisAsset, mesh_quality_failures,
+    mesh_quality_metrics, write_glb_mesh,
 };
 use burn_synth_scene::{
-    OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider, SceneAssetBinding, SceneBsnRequest,
-    SceneBuildConfig, SceneObjectManifest, ScenePipeline, SceneQualityProfile,
-    SceneReasoningRequest, SceneResult, parse_scene_bsn, scene_plan_to_mcp_commands,
+    DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, GroundedSceneLayout, GroundedScenePlacement,
+    ObjectImageGenerationPolicy, OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider,
+    SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneBsnRequest, SceneBuildConfig,
+    SceneObjectManifest, ScenePipeline, SceneQualityProfile, SceneReasoningRequest, SceneResult,
+    grounded_scene_layout_for_manifest, parse_scene_bsn, scene_plan_to_mcp_commands,
+    write_json_file,
 };
-use clap::{Parser, ValueEnum};
-use serde::{Deserialize, Serialize};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use scene_layout::{
@@ -37,7 +43,6 @@ use scene_layout::{
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 const DEFAULT_SCENE_TRELLIS_TARGET_FACES: usize = 80_000;
 const DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE: usize = 512;
-const MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE: f32 = 0.45;
 static NEXT_SCENE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -77,6 +82,14 @@ pub enum QualityPreset {
     Fast,
     Balanced,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedbackThresholdProfile {
+    Loose,
+    Standard,
+    Strict,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,7 +158,7 @@ pub enum AssetOutputFormat {
 #[command(
     name = "burn_synth_mcp",
     version,
-    about = "burn_synth MCP stdio server"
+    about = "burn_synth MCP stdio server and scene e2e CLI"
 )]
 pub struct ServerArgs {
     #[arg(long, value_enum, default_value_t = ForegroundModel::Rmbg2)]
@@ -240,6 +253,159 @@ pub struct ServerArgs {
     /// Example/reference isolated-object image for OpenAI object generation.
     #[arg(long, default_value = "docs/input_chair.jpg")]
     pub scene_object_reference_image: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<ServerCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ServerCommand {
+    /// Run the full source-scene image -> object images -> assets -> grounded BSN pipeline once.
+    SceneBuild(SceneBuildCliArgs),
+    /// Replay render-capture-feedback using existing scene-build artifacts.
+    SceneFeedbackReplay(SceneFeedbackReplayCliArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct SceneBuildCliArgs {
+    /// Source scene image path.
+    #[arg(long, visible_alias = "scene")]
+    pub source_scene_path: PathBuf,
+
+    /// Example/reference isolated-object image. Defaults to --scene-object-reference-image.
+    #[arg(long, visible_alias = "object-reference")]
+    pub object_reference_image_path: Option<PathBuf>,
+
+    /// Output directory for generated images, assets, BSN, metrics, and response JSON.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Number of generated object-image candidates in the default budget.
+    #[arg(long, visible_alias = "candidates")]
+    pub candidate_count: Option<usize>,
+
+    /// Maximum guarded image-generation attempts per object.
+    #[arg(long)]
+    pub candidate_retry_attempts: Option<usize>,
+
+    /// Image candidates requested per retry attempt.
+    #[arg(long)]
+    pub candidate_batch_size: Option<usize>,
+
+    /// Minimum isolated-object reconstruction score before TRELLIS lifting.
+    #[arg(long)]
+    pub min_reconstruction_score: Option<f32>,
+
+    /// OpenAI object-image generation profile.
+    #[arg(long, value_enum, visible_alias = "profile")]
+    pub quality_profile: Option<SceneQualityProfile>,
+
+    /// Allow object planning to consider existing catalog assets.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub allow_catalog_reuse: bool,
+
+    /// Lift selected generated object images into 3D assets.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub lift_assets: bool,
+
+    /// TRELLIS target face count. Use 0 to disable decimation.
+    #[arg(long)]
+    pub target_faces: Option<usize>,
+
+    /// Batch chunk size for object-image lifting. Use 0 for auto/global default.
+    #[arg(long)]
+    pub batch_size: Option<usize>,
+
+    /// Explicit VRAM budget in MB for auto batch planning.
+    #[arg(long)]
+    pub batch_vram_mb: Option<u64>,
+
+    /// Enable native TRELLIS PBR UV/material texture baking.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub trellis_pbr: bool,
+
+    /// Native TRELLIS PBR texture size.
+    #[arg(long)]
+    pub trellis_pbr_texture_size: Option<usize>,
+
+    /// Add lifted assets to the shared Bevy catalog/cache.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub promote_to_catalog: bool,
+
+    /// Write structured e2e artifacts to the output directory.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub write_artifacts: bool,
+
+    /// Clear the live Bevy scene before applying generated commands.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub clear_existing: bool,
+
+    /// Apply the generated scene to the configured Bevy scene bridge.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Run bounded render-capture-feedback layout validation/refinement.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub feedback: bool,
+
+    /// Maximum render-capture-feedback iterations.
+    #[arg(long, default_value_t = 3)]
+    pub feedback_iters: usize,
+
+    /// Leave a temporary feedback viewer running after scene-build completes.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback_keep_viewer: bool,
+
+    /// Optional directory for feedback screenshots, status, metrics, and deltas.
+    #[arg(long)]
+    pub feedback_capture_dir: Option<PathBuf>,
+
+    /// Geometry-first feedback pass/fail threshold profile.
+    #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SceneFeedbackReplayCliArgs {
+    /// Existing scene-build output directory with manifest/assets/layout/commands artifacts.
+    #[arg(long)]
+    pub output_dir: PathBuf,
+
+    /// Manifest JSON path. Defaults to <output-dir>/manifest.json.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+
+    /// Asset bindings JSON path. Defaults to <output-dir>/asset_bindings.json.
+    #[arg(long)]
+    pub asset_bindings_path: Option<PathBuf>,
+
+    /// Grounded layout JSON path. Defaults to <output-dir>/grounded_layout.json.
+    #[arg(long)]
+    pub grounded_layout_path: Option<PathBuf>,
+
+    /// Scene command JSON path. Defaults to <output-dir>/commands.json.
+    #[arg(long)]
+    pub commands_path: Option<PathBuf>,
+
+    /// Rebuild initial commands from grounded_layout.bsn instead of replaying saved commands.json.
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
+    pub rebuild_commands_from_grounded_layout: bool,
+
+    /// Maximum render-capture-feedback iterations.
+    #[arg(long, default_value_t = 3)]
+    pub feedback_iters: usize,
+
+    /// Leave the temporary feedback viewer running after replay.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback_keep_viewer: bool,
+
+    /// Optional directory for replay screenshots, status, metrics, and deltas.
+    #[arg(long)]
+    pub feedback_capture_dir: Option<PathBuf>,
+
+    /// Geometry-first feedback pass/fail threshold profile.
+    #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +436,9 @@ pub struct ServerConfig {
     pub scene_status_path: Option<PathBuf>,
     pub catalog_cache_root: Option<PathBuf>,
     pub scene_timeout: Duration,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_project_id: Option<String>,
     pub openai_reasoning_model: String,
     pub openai_image_model: String,
     pub scene_object_reference_image: PathBuf,
@@ -310,6 +479,9 @@ impl ServerConfig {
             scene_control_path: args.scene_control_path,
             catalog_cache_root: args.catalog_cache_root,
             scene_timeout: Duration::from_millis(args.scene_timeout_ms.max(1)),
+            openai_api_key: env_or_dotenv_var("OPENAI_API_KEY"),
+            openai_base_url: env_or_dotenv_var("OPENAI_BASE_URL"),
+            openai_project_id: env_or_dotenv_var("OPENAI_PROJECT_ID"),
             openai_reasoning_model: args.openai_reasoning_model,
             openai_image_model: args.openai_image_model,
             scene_object_reference_image: args.scene_object_reference_image,
@@ -349,7 +521,112 @@ impl ServerConfig {
 }
 
 pub fn run_from_args(args: ServerArgs) -> Result<(), String> {
-    run_stdio_server(ServerConfig::from_args(args))
+    let command = args.command.clone();
+    let config = ServerConfig::from_args(args);
+    match command {
+        Some(ServerCommand::SceneBuild(args)) => run_scene_build_command(config, args),
+        Some(ServerCommand::SceneFeedbackReplay(args)) => {
+            run_scene_feedback_replay_command(config, args)
+        }
+        None => run_stdio_server(config),
+    }
+}
+
+fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let response = server.call_scene_build_from_image(SceneBuildFromImageArgs {
+        source_scene_path: args.source_scene_path,
+        object_reference_image_path: args.object_reference_image_path,
+        output_dir: args.output_dir,
+        candidate_count: args.candidate_count,
+        candidate_retry_attempts: args.candidate_retry_attempts,
+        candidate_batch_size: args.candidate_batch_size,
+        min_reconstruction_score: args.min_reconstruction_score,
+        quality_profile: args.quality_profile,
+        allow_catalog_reuse: args.allow_catalog_reuse,
+        lift_assets: args.lift_assets,
+        target_faces: args.target_faces,
+        batch_size: args.batch_size.filter(|value| *value > 0),
+        batch_vram_mb: args.batch_vram_mb,
+        trellis_pbr: Some(args.trellis_pbr),
+        trellis_pbr_texture_size: args.trellis_pbr_texture_size,
+        promote_to_catalog: args.promote_to_catalog,
+        write_artifacts: args.write_artifacts,
+        apply: args.apply,
+        clear_existing: args.clear_existing,
+        feedback: args.feedback,
+        feedback_iters: args.feedback_iters,
+        feedback_keep_viewer: args.feedback_keep_viewer,
+        feedback_capture_dir: args.feedback_capture_dir,
+        feedback_threshold_profile: args.feedback_threshold_profile,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-build response: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_scene_feedback_replay_command(
+    config: ServerConfig,
+    args: SceneFeedbackReplayCliArgs,
+) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let manifest_path = args
+        .manifest_path
+        .unwrap_or_else(|| args.output_dir.join("manifest.json"));
+    let asset_bindings_path = args
+        .asset_bindings_path
+        .unwrap_or_else(|| args.output_dir.join("asset_bindings.json"));
+    let grounded_layout_path = args
+        .grounded_layout_path
+        .unwrap_or_else(|| args.output_dir.join("grounded_layout.json"));
+    let commands_path = args
+        .commands_path
+        .unwrap_or_else(|| args.output_dir.join("commands.json"));
+    let capture_dir = args
+        .feedback_capture_dir
+        .unwrap_or_else(|| args.output_dir.join("iterations_replay"));
+    let manifest = read_json_path::<SceneObjectManifest>(&manifest_path)?;
+    let asset_bindings = read_json_path::<Vec<SceneAssetBinding>>(&asset_bindings_path)?;
+    let grounded_layout = read_json_path::<GroundedSceneLayout>(&grounded_layout_path)?;
+    let commands = if args.rebuild_commands_from_grounded_layout {
+        let plan = parse_scene_bsn(&grounded_layout.bsn, &asset_bindings)
+            .map_err(|err| err.to_string())?;
+        scene_commands_with_cache_reload(
+            scene_plan_to_mcp_commands(&plan, &asset_bindings, true)
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        read_json_path::<Vec<Value>>(&commands_path)?
+    };
+    let response = server.run_scene_feedback(
+        &args.output_dir,
+        &manifest,
+        &asset_bindings,
+        &grounded_layout,
+        commands,
+        SceneFeedbackOptions {
+            max_iters: args.feedback_iters,
+            keep_viewer: args.feedback_keep_viewer,
+            capture_dir: Some(capture_dir),
+            threshold_profile: args.feedback_threshold_profile,
+        },
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-feedback-replay response: {err}"))?
+    );
+    Ok(())
+}
+
+fn read_json_path<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("failed to read JSON {}: {err}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| format!("failed to parse JSON {}: {err}", path.display()))
 }
 
 pub fn run_stdio_server(config: ServerConfig) -> Result<(), String> {
@@ -610,6 +887,10 @@ impl McpServer {
                 Ok(value) => success_tool_result(value),
                 Err(err) => error_tool_result(err),
             },
+            "scene_project_status" => match self.call_scene_project_status() {
+                Ok(value) => success_tool_result(value),
+                Err(err) => error_tool_result(err),
+            },
             "scene_list_assets" => match self.call_scene_list_assets() {
                 Ok(value) => success_tool_result(value),
                 Err(err) => error_tool_result(err),
@@ -814,6 +1095,7 @@ impl McpServer {
             "output_format": "glb",
             "vertices": item["vertices"].clone(),
             "faces": item["faces"].clone(),
+            "local_aabb": item["local_aabb"].clone(),
             "target_faces": item["target_faces"].clone(),
             "material": item["material"].clone(),
             "rmbg_model": assets["rmbg_model"].clone(),
@@ -946,7 +1228,17 @@ impl McpServer {
         } else {
             None
         };
-        for (batch_item, input_path) in batch.items.into_iter().zip(args.input_image_paths.iter()) {
+        for batch_item in batch.items {
+            let input_path = args
+                .input_image_paths
+                .get(batch_item.item_index)
+                .ok_or_else(|| {
+                    format!(
+                        "asset batch item index {} out of range for {} input images",
+                        batch_item.item_index,
+                        args.input_image_paths.len()
+                    )
+                })?;
             let output = batch_item.output.map_err(|err| err.to_string())?;
             let item = write_asset_output(
                 input_path,
@@ -974,8 +1266,11 @@ impl McpServer {
                 "vertices": item.vertices,
                 "faces": item.faces,
                 "gaussians": item.gaussians,
+                "local_aabb": item.local_aabb,
                 "target_faces": effective_target_faces,
                 "material": item.material,
+                "mesh_quality": item.mesh_quality,
+                "mesh_quality_failures": item.mesh_quality_failures,
                 "cache_key": item.catalog_entry.as_ref().map(|entry| entry.cache_key.clone()),
                 "catalog_entry": item.catalog_entry,
             }));
@@ -1054,6 +1349,8 @@ impl McpServer {
         &mut self,
         args: SceneBuildFromImageArgs,
     ) -> Result<Value, String> {
+        let e2e_started = Instant::now();
+        let mut stage_report = Vec::new();
         let prepare_args = ScenePrepareBuildArgs {
             source_scene_path: args.source_scene_path,
             object_reference_image_path: args.object_reference_image_path,
@@ -1062,39 +1359,91 @@ impl McpServer {
             quality_profile: args.quality_profile,
             allow_catalog_reuse: args.allow_catalog_reuse,
         };
+        let stage_started = Instant::now();
         let config = self.scene_build_config(prepare_args)?;
         let output_dir = config.output_dir.clone();
+        let candidate_policy = ObjectImageGenerationPolicy {
+            min_score: args
+                .min_reconstruction_score
+                .unwrap_or(DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE),
+            max_attempts_per_object: args
+                .candidate_retry_attempts
+                .or(args.candidate_count)
+                .unwrap_or(config.candidate_count)
+                .max(1),
+            candidates_per_attempt: args.candidate_batch_size.unwrap_or(1).max(1),
+        };
         let provider = self.openai_provider()?;
         let mut pipeline = ScenePipeline::new(config, provider);
         let preparation = pipeline
             .prepare_openai_inputs()
             .map_err(|err| err.to_string())?;
+        record_stage(&mut stage_report, "prepare_openai_inputs", stage_started);
+        let stage_started = Instant::now();
         let manifest = pipeline.plan_objects().map_err(|err| err.to_string())?;
+        record_stage(&mut stage_report, "plan_objects", stage_started);
+        let stage_started = Instant::now();
         let requests = pipeline
             .prepare_object_image_requests(&manifest)
             .map_err(|err| err.to_string())?;
-        let candidates = pipeline
-            .generate_object_candidates(&requests)
+        record_stage(
+            &mut stage_report,
+            "prepare_object_image_requests",
+            stage_started,
+        );
+        let stage_started = Instant::now();
+        let candidate_report = pipeline
+            .generate_object_candidates_with_policy(&requests, candidate_policy)
             .map_err(|err| err.to_string())?;
-        let selected = select_scene_candidates(&manifest, &candidates)?;
+        record_stage(
+            &mut stage_report,
+            "generate_object_candidates",
+            stage_started,
+        );
+        let selected = if candidate_report.rejected_objects.is_empty() {
+            candidate_report.selected_candidates.clone()
+        } else {
+            Vec::new()
+        };
+        let selected_values = selected_candidates_to_values(&selected);
 
         let mut response = json!({
             "tool": "scene_build_from_image",
             "preparation": preparation,
             "manifest": manifest,
             "object_image_requests": requests,
-            "candidates": candidates,
-            "selected_candidates": selected,
+            "candidate_generation": candidate_report.clone(),
+            "candidates": candidate_report.candidates.clone(),
+            "selected_candidates": selected_values,
             "lift_assets": args.lift_assets,
         });
+        if !candidate_report.rejected_objects.is_empty() {
+            response["stage_report"] = json!(stage_report);
+            response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+            if args.write_artifacts {
+                write_scene_build_artifacts(&output_dir, &response)?;
+            }
+            let message = candidate_report
+                .rejected_objects
+                .first()
+                .map(|rejection| rejection.message.clone())
+                .unwrap_or_else(|| "scene candidate generation failed guardrails".to_string());
+            return Err(message);
+        }
         if !args.lift_assets {
+            response["stage_report"] = json!(stage_report);
+            response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+            if args.write_artifacts {
+                write_scene_build_artifacts(&output_dir, &response)?;
+            }
             return Ok(response);
         }
 
         let input_image_paths = selected
             .iter()
-            .filter_map(|candidate| candidate["image_path"].as_str().map(PathBuf::from))
+            .map(|candidate| PathBuf::from(&candidate.image_path))
             .collect::<Vec<_>>();
+        let stage_started = Instant::now();
         let asset_outputs = self.call_images_to_assets(ImagesToAssetsToolArgs {
             input_image_paths,
             output_dir: Some(output_dir.join("assets")),
@@ -1115,50 +1464,108 @@ impl McpServer {
             promote_to_catalog: args.promote_to_catalog,
             dry_run: false,
         })?;
+        record_stage(&mut stage_report, "images_to_assets", stage_started);
+        let mesh_quality_failures = scene_asset_quality_failures(&asset_outputs);
+        if !mesh_quality_failures.is_empty() {
+            response["asset_outputs"] = asset_outputs;
+            response["mesh_quality_failures"] = json!(mesh_quality_failures);
+            response["stage_report"] = json!(stage_report);
+            response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+            if args.write_artifacts {
+                write_scene_build_artifacts(&output_dir, &response)?;
+            }
+            return Err(response["mesh_quality_failures"]
+                .as_array()
+                .and_then(|failures| failures.first())
+                .and_then(Value::as_str)
+                .unwrap_or("scene mesh quality gate failed")
+                .to_string());
+        }
+        let stage_started = Instant::now();
         let asset_bindings =
-            scene_asset_bindings_from_outputs(&manifest, &selected, &asset_outputs)?;
-        let bsn = pipeline
-            .plan_scene_bsn(manifest.clone(), asset_bindings.clone())
+            scene_asset_bindings_from_outputs(&manifest, &selected_values, &asset_outputs)?;
+        let grounded_layout = grounded_scene_layout_for_manifest(&manifest, &asset_bindings)
             .map_err(|err| err.to_string())?;
+        let mut bsn = grounded_layout.bsn.clone();
         let plan = parse_scene_bsn(&bsn, &asset_bindings).map_err(|err| err.to_string())?;
-        let commands = scene_commands_with_cache_reload(
+        let mut commands = scene_commands_with_cache_reload(
             scene_plan_to_mcp_commands(&plan, &asset_bindings, args.clear_existing)
                 .map_err(|err| err.to_string())?,
         );
+        record_stage(&mut stage_report, "plan_grounded_scene", stage_started);
+        if args.feedback && args.lift_assets {
+            let stage_started = Instant::now();
+            let feedback = self.run_scene_feedback(
+                &output_dir,
+                &manifest,
+                &asset_bindings,
+                &grounded_layout,
+                commands.clone(),
+                SceneFeedbackOptions {
+                    max_iters: args.feedback_iters,
+                    keep_viewer: args.feedback_keep_viewer,
+                    capture_dir: args.feedback_capture_dir.clone(),
+                    threshold_profile: args.feedback_threshold_profile,
+                },
+            )?;
+            if let Some(final_commands) = feedback
+                .get("final_commands")
+                .and_then(Value::as_array)
+                .cloned()
+            {
+                commands = final_commands;
+                bsn = feedback_bsn_from_commands(&asset_bindings, &grounded_layout, &commands)?;
+            }
+            response["feedback"] = feedback;
+            record_stage(&mut stage_report, "render_capture_feedback", stage_started);
+        }
         response["asset_outputs"] = asset_outputs;
         response["asset_bindings"] =
             serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
         response["bsn"] = json!(bsn);
         response["plan"] = serde_json::to_value(&plan).map_err(|err| err.to_string())?;
+        response["grounded_layout"] =
+            serde_json::to_value(&grounded_layout).map_err(|err| err.to_string())?;
         response["commands"] = json!(commands);
         response["clear_existing"] = json!(args.clear_existing);
         response["apply"] = json!(args.apply);
-        if args.apply {
-            response["acknowledgement"] = self.send_scene_commands(
-                response["commands"].as_array().cloned().unwrap_or_default(),
-            )?;
+        if args.apply && !args.feedback {
+            let stage_started = Instant::now();
+            match self
+                .send_scene_commands(response["commands"].as_array().cloned().unwrap_or_default())
+            {
+                Ok(acknowledgement) => {
+                    response["acknowledgement"] = acknowledgement;
+                }
+                Err(err) => {
+                    record_stage(&mut stage_report, "apply_scene_commands", stage_started);
+                    response["apply_error"] = json!(err);
+                    response["stage_report"] = json!(stage_report);
+                    response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+                    if args.write_artifacts {
+                        write_scene_build_artifacts(&output_dir, &response)?;
+                    }
+                    return Err(response["apply_error"]
+                        .as_str()
+                        .unwrap_or("scene apply failed")
+                        .to_string());
+                }
+            }
+            record_stage(&mut stage_report, "apply_scene_commands", stage_started);
+        }
+        response["stage_report"] = json!(stage_report);
+        response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+        if args.write_artifacts {
+            write_scene_build_artifacts(&output_dir, &response)?;
         }
         Ok(response)
     }
 
     fn call_scene_plan_bsn(&self, args: ScenePlanBsnArgs) -> Result<Value, String> {
-        let config = SceneBuildConfig {
-            source_scene_path: PathBuf::from(&args.manifest.source_scene_path),
-            object_reference_image_path: args
-                .object_reference_image_path
-                .unwrap_or_else(|| self.config.scene_object_reference_image.clone()),
-            output_dir: args.output_dir.unwrap_or_else(default_scene_output_dir),
-            candidate_count: 1,
-            quality_profile: SceneQualityProfile::Quality,
-            reasoning_model: self.config.openai_reasoning_model.clone(),
-            image_model: self.config.openai_image_model.clone(),
-            allow_catalog_reuse: false,
-        };
-        let provider = self.openai_provider()?;
-        let pipeline = ScenePipeline::new(config, provider);
-        let bsn = pipeline
-            .plan_scene_bsn(args.manifest, args.asset_bindings.clone())
-            .map_err(|err| err.to_string())?;
+        let grounded_layout =
+            grounded_scene_layout_for_manifest(&args.manifest, &args.asset_bindings)
+                .map_err(|err| err.to_string())?;
+        let bsn = grounded_layout.bsn.clone();
         let plan = match parse_scene_bsn(&bsn, &args.asset_bindings) {
             Ok(plan) => plan,
             Err(err) => {
@@ -1182,6 +1589,7 @@ impl McpServer {
             "valid": true,
             "bsn": bsn,
             "plan": plan,
+            "grounded_layout": grounded_layout,
             "commands": commands,
             "asset_bindings": args.asset_bindings,
             "clear_existing": args.clear_existing,
@@ -1233,6 +1641,13 @@ impl McpServer {
 
     fn openai_provider(&self) -> Result<OpenAiSceneProvider, String> {
         OpenAiSceneProvider::from_env(OpenAiProviderConfig {
+            api_key: self.config.openai_api_key.clone().unwrap_or_default(),
+            base_url: self
+                .config
+                .openai_base_url
+                .clone()
+                .unwrap_or_else(|| OpenAiProviderConfig::default().base_url),
+            project_id: self.config.openai_project_id.clone(),
             reasoning_model: self.config.openai_reasoning_model.clone(),
             image_model: self.config.openai_image_model.clone(),
             ..OpenAiProviderConfig::default()
@@ -1256,6 +1671,18 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| "scene_status_path is not configured".to_string())?;
         read_scene_status(status_path)
+    }
+
+    fn call_scene_project_status(&self) -> Result<Value, String> {
+        let status = self.call_scene_status()?;
+        Ok(json!({
+            "tool": "scene_project_status",
+            "camera": status.get("camera").cloned().unwrap_or(Value::Null),
+            "world_items": status.get("world_items").cloned().unwrap_or(Value::Null),
+            "projected_items": status.get("projected_items").cloned().unwrap_or(Value::Null),
+            "screenshots": status.get("screenshots").cloned().unwrap_or(Value::Null),
+            "status": status,
+        }))
     }
 
     fn call_scene_list_assets(&self) -> Result<Value, String> {
@@ -1315,6 +1742,7 @@ impl McpServer {
             "yaw": args.yaw,
             "pitch": args.pitch,
             "radius": args.radius,
+            "vertical_fov": args.vertical_fov,
         })])
     }
 
@@ -1362,6 +1790,304 @@ impl McpServer {
             args.scene_status = Some(self.call_scene_status()?);
         }
         validate_scene_layout(args)
+    }
+
+    fn run_scene_feedback(
+        &mut self,
+        output_dir: &Path,
+        manifest: &SceneObjectManifest,
+        asset_bindings: &[SceneAssetBinding],
+        grounded_layout: &GroundedSceneLayout,
+        initial_commands: Vec<Value>,
+        options: SceneFeedbackOptions,
+    ) -> Result<Value, String> {
+        let original_control_path = self.config.scene_control_path.clone();
+        let original_status_path = self.config.scene_status_path.clone();
+        let original_timeout = self.config.scene_timeout;
+        let capture_root = options
+            .capture_dir
+            .clone()
+            .unwrap_or_else(|| output_dir.join("iterations"));
+        fs::create_dir_all(&capture_root).map_err(|err| {
+            format!(
+                "failed to create feedback capture directory {}: {err}",
+                capture_root.display()
+            )
+        })?;
+
+        let mut spawned_viewer = None;
+        if self.config.scene_control_path.is_none() {
+            let bridge_dir = output_dir.join("feedback_viewer");
+            fs::create_dir_all(&bridge_dir).map_err(|err| {
+                format!(
+                    "failed to create feedback viewer directory {}: {err}",
+                    bridge_dir.display()
+                )
+            })?;
+            let control_path = bridge_dir.join("scene_commands.json");
+            let status_path = bridge_dir.join("scene_commands.status.json");
+            let log_path = bridge_dir.join("viewer.log");
+            spawned_viewer = Some(spawn_feedback_viewer(&control_path, &log_path)?);
+            self.config.scene_control_path = Some(control_path);
+            self.config.scene_status_path = Some(status_path);
+            self.config.scene_timeout = self.config.scene_timeout.max(Duration::from_secs(60));
+        }
+
+        let lock_result = self.send_scene_commands(vec![scene_interaction_lock_command(
+            true,
+            "iterative scene composition",
+        )]);
+        let feedback_result = match lock_result {
+            Ok(lock_ack) => {
+                let _ = write_json_file(&capture_root.join("interaction_lock_ack.json"), &lock_ack);
+                let mut result = self.run_scene_feedback_iterations(
+                    &capture_root,
+                    manifest,
+                    asset_bindings,
+                    grounded_layout,
+                    initial_commands,
+                    options.max_iters.max(1),
+                    options.threshold_profile,
+                );
+                if let Ok(value) = &mut result {
+                    value["interaction_lock_ack"] = lock_ack;
+                }
+                result
+            }
+            Err(err) => Err(format!("failed to lock scene interaction: {err}")),
+        };
+        let unlock_result =
+            self.send_scene_commands(vec![scene_interaction_lock_command(false, "")]);
+        let feedback_result = match (feedback_result, unlock_result) {
+            (Ok(mut value), Ok(unlock_ack)) => {
+                let _ = write_json_file(
+                    &capture_root.join("interaction_unlock_ack.json"),
+                    &unlock_ack,
+                );
+                value["interaction_unlock_ack"] = unlock_ack;
+                Ok(value)
+            }
+            (Ok(_), Err(unlock_err)) => Err(format!(
+                "feedback completed but failed to unlock scene interaction: {unlock_err}"
+            )),
+            (Err(err), Ok(unlock_ack)) => {
+                let _ = write_json_file(
+                    &capture_root.join("interaction_unlock_ack.json"),
+                    &unlock_ack,
+                );
+                Err(err)
+            }
+            (Err(err), Err(unlock_err)) => Err(format!(
+                "{err}; additionally failed to unlock scene interaction: {unlock_err}"
+            )),
+        };
+
+        if let Some(mut child) = spawned_viewer
+            && !options.keep_viewer
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.config.scene_control_path = original_control_path;
+        self.config.scene_status_path = original_status_path;
+        self.config.scene_timeout = original_timeout;
+
+        feedback_result
+    }
+
+    fn run_scene_feedback_iterations(
+        &self,
+        capture_root: &Path,
+        manifest: &SceneObjectManifest,
+        asset_bindings: &[SceneAssetBinding],
+        grounded_layout: &GroundedSceneLayout,
+        initial_commands: Vec<Value>,
+        max_iters: usize,
+        threshold_profile: FeedbackThresholdProfile,
+    ) -> Result<Value, String> {
+        let mut commands = initial_commands;
+        let thresholds = threshold_profile.thresholds();
+        let mut iterations = Vec::new();
+        let mut accepted_iteration = None;
+        let mut best_iteration = None;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_commands = commands.clone();
+        for iteration_index in 0..max_iters {
+            let iteration_dir = capture_root.join(format!("iter_{iteration_index:02}"));
+            fs::create_dir_all(&iteration_dir).map_err(|err| {
+                format!(
+                    "failed to create feedback iteration directory {}: {err}",
+                    iteration_dir.display()
+                )
+            })?;
+            write_json_file(&iteration_dir.join("commands.json"), &json!(commands))
+                .map_err(|err| err.to_string())?;
+            let iteration_bsn =
+                feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
+            fs::write(iteration_dir.join("scene.bsn"), iteration_bsn).map_err(|err| {
+                format!(
+                    "failed to write feedback BSN {}: {err}",
+                    iteration_dir.join("scene.bsn").display()
+                )
+            })?;
+
+            let apply_ack = self.send_scene_commands(commands.clone())?;
+            write_json_file(&iteration_dir.join("apply_ack.json"), &apply_ack)
+                .map_err(|err| err.to_string())?;
+            thread::sleep(Duration::from_millis(250));
+            let screenshot_path = iteration_dir.join("screenshot.png");
+            let capture = self.call_scene_capture(SceneCaptureArgs {
+                output_path: screenshot_path.clone(),
+            })?;
+            write_json_file(&iteration_dir.join("capture_ack.json"), &capture)
+                .map_err(|err| err.to_string())?;
+            let status = Self::feedback_capture_status(&apply_ack, &capture);
+            write_json_file(&iteration_dir.join("status.json"), &status)
+                .map_err(|err| err.to_string())?;
+            let metrics = scene_feedback_metrics(
+                manifest,
+                grounded_layout,
+                &status,
+                &screenshot_path,
+                thresholds,
+                threshold_profile,
+            )?;
+            write_json_file(&iteration_dir.join("metrics.json"), &metrics)
+                .map_err(|err| err.to_string())?;
+            let passed = metrics
+                .get("passed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let score = metrics
+                .get("score")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .unwrap_or(f64::NEG_INFINITY);
+            if score > best_score {
+                best_score = score;
+                best_iteration = Some(iteration_index);
+                best_commands = commands.clone();
+            }
+            let deltas = feedback_layout_deltas(&metrics);
+            write_json_file(&iteration_dir.join("layout_delta.json"), &deltas)
+                .map_err(|err| err.to_string())?;
+            iterations.push(json!({
+                "iteration": iteration_index,
+                "dir": iteration_dir.display().to_string(),
+                "screenshot": screenshot_path.display().to_string(),
+                "metrics": metrics,
+                "layout_delta": deltas,
+                "passed": passed,
+            }));
+            if passed {
+                accepted_iteration = Some(iteration_index);
+                break;
+            }
+            commands = apply_feedback_deltas_to_commands(&commands, &deltas)?;
+        }
+        if accepted_iteration.is_none() && best_iteration.is_some() {
+            commands = best_commands;
+        }
+        let final_bsn = feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
+        fs::write(capture_root.join("scene.feedback.bsn"), &final_bsn).map_err(|err| {
+            format!(
+                "failed to write final feedback BSN {}: {err}",
+                capture_root.join("scene.feedback.bsn").display()
+            )
+        })?;
+        write_json_file(
+            &capture_root.join("commands.feedback.json"),
+            &json!(commands),
+        )
+        .map_err(|err| err.to_string())?;
+        let mut final_evidence = Value::Null;
+        if accepted_iteration.is_none() && max_iters > 0 {
+            let final_dir = capture_root.join("final");
+            fs::create_dir_all(&final_dir).map_err(|err| {
+                format!(
+                    "failed to create final feedback directory {}: {err}",
+                    final_dir.display()
+                )
+            })?;
+            write_json_file(&final_dir.join("commands.json"), &json!(commands))
+                .map_err(|err| err.to_string())?;
+            fs::write(final_dir.join("scene.bsn"), &final_bsn).map_err(|err| {
+                format!(
+                    "failed to write final feedback BSN {}: {err}",
+                    final_dir.join("scene.bsn").display()
+                )
+            })?;
+            let apply_ack = self.send_scene_commands(commands.clone())?;
+            write_json_file(&final_dir.join("apply_ack.json"), &apply_ack)
+                .map_err(|err| err.to_string())?;
+            thread::sleep(Duration::from_millis(250));
+            let screenshot_path = final_dir.join("screenshot.png");
+            let capture = self.call_scene_capture(SceneCaptureArgs {
+                output_path: screenshot_path.clone(),
+            })?;
+            write_json_file(&final_dir.join("capture_ack.json"), &capture)
+                .map_err(|err| err.to_string())?;
+            let status = Self::feedback_capture_status(&apply_ack, &capture);
+            write_json_file(&final_dir.join("status.json"), &status)
+                .map_err(|err| err.to_string())?;
+            let metrics = scene_feedback_metrics(
+                manifest,
+                grounded_layout,
+                &status,
+                &screenshot_path,
+                thresholds,
+                threshold_profile,
+            )?;
+            write_json_file(&final_dir.join("metrics.json"), &metrics)
+                .map_err(|err| err.to_string())?;
+            let passed = metrics
+                .get("passed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            final_evidence = json!({
+                "dir": final_dir.display().to_string(),
+                "screenshot": screenshot_path.display().to_string(),
+                "metrics": metrics,
+                "passed": passed,
+            });
+        }
+        let report = feedback_markdown_report(
+            capture_root,
+            threshold_profile,
+            accepted_iteration,
+            &iterations,
+        );
+        fs::write(capture_root.join("feedback_report.md"), report).map_err(|err| {
+            format!(
+                "failed to write feedback markdown report {}: {err}",
+                capture_root.join("feedback_report.md").display()
+            )
+        })?;
+        Ok(json!({
+            "tool": "scene_render_capture_feedback",
+            "enabled": true,
+            "threshold_profile": threshold_profile,
+            "max_iters": max_iters,
+            "accepted": accepted_iteration.is_some(),
+            "accepted_iteration": accepted_iteration,
+            "best_iteration": best_iteration,
+            "best_score": if best_score.is_finite() { Value::from(best_score) } else { Value::Null },
+            "capture_dir": capture_root.display().to_string(),
+            "iterations": iterations,
+            "final_evidence": final_evidence,
+            "final_bsn_path": capture_root.join("scene.feedback.bsn").display().to_string(),
+            "final_commands_path": capture_root.join("commands.feedback.json").display().to_string(),
+            "final_commands": commands,
+        }))
+    }
+
+    fn feedback_capture_status(apply_ack: &Value, capture_ack: &Value) -> Value {
+        capture_ack
+            .get("acknowledgement")
+            .and_then(|ack| ack.get("status"))
+            .cloned()
+            .or_else(|| apply_ack.get("status").cloned())
+            .unwrap_or(Value::Null)
     }
 
     fn send_scene_commands(&self, commands: Vec<Value>) -> Result<Value, String> {
@@ -1437,6 +2163,14 @@ fn scene_commands_from_plan(plan: &SceneComposePlan) -> Result<Vec<Value>, Strin
     Ok(commands)
 }
 
+fn scene_interaction_lock_command(locked: bool, reason: &str) -> Value {
+    json!({
+        "type": "set_interaction_lock",
+        "locked": locked,
+        "reason": reason,
+    })
+}
+
 fn scene_commands_with_cache_reload(mut commands: Vec<Value>) -> Vec<Value> {
     let uses_cache = commands.iter().any(|command| {
         command
@@ -1457,6 +2191,1026 @@ fn scene_commands_with_cache_reload(mut commands: Vec<Value>) -> Vec<Value> {
         .unwrap_or(0);
     commands.insert(insert_at, json!({ "type": "reload_cache" }));
     commands
+}
+
+fn spawn_feedback_viewer(control_path: &Path, log_path: &Path) -> Result<Child, String> {
+    let exe = feedback_viewer_exe()?;
+    ensure_parent_dir(control_path).map_err(|err| err.to_string())?;
+    ensure_parent_dir(log_path).map_err(|err| err.to_string())?;
+    let log = fs::File::create(log_path).map_err(|err| {
+        format!(
+            "failed to create feedback viewer log {}: {err}",
+            log_path.display()
+        )
+    })?;
+    let err_log = log
+        .try_clone()
+        .map_err(|err| format!("failed to clone feedback viewer log handle: {err}"))?;
+    Command::new(&exe)
+        .arg("--mcp-scene-control-path")
+        .arg(control_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err_log))
+        .spawn()
+        .map_err(|err| format!("failed to spawn feedback viewer {}: {err}", exe.display()))
+}
+
+fn feedback_viewer_exe() -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let direct = current.with_file_name(format!("bevy_synth{}", std::env::consts::EXE_SUFFIX));
+    if direct.exists() {
+        return Ok(direct);
+    }
+    if current
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "deps")
+        && let Some(parent) = current.parent().and_then(Path::parent)
+    {
+        let candidate = parent.join(format!("bevy_synth{}", std::env::consts::EXE_SUFFIX));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Ok(direct)
+}
+
+fn scene_feedback_metrics(
+    manifest: &SceneObjectManifest,
+    grounded_layout: &GroundedSceneLayout,
+    status: &Value,
+    screenshot_path: &Path,
+    thresholds: SceneFeedbackThresholds,
+    profile: FeedbackThresholdProfile,
+) -> Result<Value, String> {
+    let projected = status
+        .get("projected_items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "scene feedback status missing projected_items array".to_string())?;
+    let mut object_metrics = Vec::new();
+    let mut passed_count = 0usize;
+    let mut score_total = 0.0f32;
+    let camera_yaw_degrees = status_camera_yaw_degrees(status, grounded_layout.camera.yaw);
+    let feedback_camera = FeedbackCamera::from_status(status, screenshot_path);
+    let floor_y = grounded_layout.rug_center[1];
+    for (index, placement) in grounded_layout.placements.iter().enumerate() {
+        let projected_item = projected.get(index).unwrap_or(&Value::Null);
+        let observed_bbox = projected_item.get("screen_bbox").and_then(json_array4);
+        let observed_contact = projected_item.get("screen_contact").and_then(json_array2);
+        let expected_bbox = placement.source_bbox;
+        let expected_contact = placement.contact_pixel;
+        let expected_anchor = feedback_expected_anchor_pixel(placement);
+        let anchor_basis = feedback_anchor_basis(placement);
+        let (center_error, area_log2_error, aspect_log2_error, contact_error, score, passed) =
+            if let Some(observed_bbox) = observed_bbox {
+                let expected_center = bbox_center(expected_bbox);
+                let observed_center = bbox_center(observed_bbox);
+                let center_error = distance2(expected_center, observed_center);
+                let expected_area = bbox_area(expected_bbox);
+                let observed_area = bbox_area(observed_bbox);
+                let area_log2_error = safe_log2_ratio(observed_area, expected_area).abs();
+                let aspect_log2_error =
+                    safe_log2_ratio(bbox_aspect(observed_bbox), bbox_aspect(expected_bbox)).abs();
+                let observed_anchor =
+                    feedback_observed_anchor_pixel(placement, observed_bbox, observed_contact);
+                let contact_error = distance2(expected_anchor, observed_anchor);
+                let center_score =
+                    (1.0 - center_error / thresholds.max_center_error.max(1.0e-5)).clamp(0.0, 1.0);
+                let contact_score = (1.0
+                    - contact_error / thresholds.max_contact_error.max(1.0e-5))
+                .clamp(0.0, 1.0);
+                let area_score = (1.0
+                    - area_log2_error / thresholds.max_area_log2_error.max(1.0e-5))
+                .clamp(0.0, 1.0);
+                let score = center_score * 0.45 + contact_score * 0.25 + area_score * 0.30;
+                let passed = center_error <= thresholds.max_center_error
+                    && contact_error <= thresholds.max_contact_error
+                    && area_log2_error <= thresholds.max_area_log2_error;
+                (
+                    center_error,
+                    area_log2_error,
+                    aspect_log2_error,
+                    contact_error,
+                    score,
+                    passed,
+                )
+            } else {
+                (1.0, 8.0, 8.0, 1.0, 0.0, false)
+            };
+        if passed {
+            passed_count += 1;
+        }
+        score_total += score;
+        let observed_bbox = observed_bbox.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        let observed_contact = observed_contact.unwrap_or(bbox_center(observed_bbox));
+        let observed_anchor =
+            feedback_observed_anchor_pixel(placement, observed_bbox, Some(observed_contact));
+        let expected_area = bbox_area(expected_bbox);
+        let observed_area = bbox_area(observed_bbox);
+        let scale_multiplier = if observed_area > 1.0e-5 {
+            (expected_area / observed_area).sqrt().clamp(0.82, 1.22)
+        } else {
+            1.0
+        };
+        let contact_delta = vec2_sub(expected_anchor, observed_anchor);
+        let center_delta = vec2_sub(bbox_center(expected_bbox), bbox_center(observed_bbox));
+        let fallback_delta = [
+            (center_delta[0] * 2.0).clamp(-0.35, 0.35),
+            0.0,
+            (contact_delta[1] * 2.0).clamp(-0.35, 0.35),
+        ];
+        let target_ground_point =
+            feedback_camera.and_then(|camera| camera.ground_point(expected_anchor, floor_y));
+        let observed_ground_point = projected_item_ground_point(projected_item);
+        let (mut translation_delta, grounding_basis) =
+            if let (Some(target), Some(observed)) = (target_ground_point, observed_ground_point) {
+                (
+                    clamp_xz_delta(
+                        [target[0] - observed[0], 0.0, target[2] - observed[2]],
+                        0.85,
+                    ),
+                    "camera-ray-ground-plane",
+                )
+            } else {
+                (fallback_delta, "screen-space-fallback")
+            };
+        let center_residual_applied = grounding_basis == "camera-ray-ground-plane"
+            && !feedback_uses_bbox_center_anchor(placement)
+            && contact_error <= 0.04
+            && center_error > 0.04;
+        if center_residual_applied {
+            let residual = [
+                (-center_delta[0] * 1.15).clamp(-0.18, 0.18),
+                0.0,
+                (-center_delta[1] * 1.15).clamp(-0.18, 0.18),
+            ];
+            translation_delta = clamp_xz_delta(add3(translation_delta, residual), 0.85);
+        }
+        let yaw_correction =
+            feedback_yaw_correction(placement, expected_bbox, observed_bbox, camera_yaw_degrees);
+        object_metrics.push(json!({
+            "index": index,
+            "object_id": placement.object_id,
+            "instance_id": placement.instance_id,
+            "label": placement.label,
+            "cache_key": projected_item.get("cache_key").cloned().unwrap_or(Value::Null),
+            "expected_bbox": expected_bbox,
+            "observed_bbox": observed_bbox,
+            "expected_contact": expected_contact,
+            "observed_contact": observed_contact,
+            "expected_anchor": expected_anchor,
+            "observed_anchor": observed_anchor,
+            "anchor_basis": anchor_basis,
+            "center_error": center_error,
+            "contact_error": contact_error,
+            "area_log2_error": area_log2_error,
+            "aspect_log2_error": aspect_log2_error,
+            "score": score,
+            "passed": passed,
+            "translation_delta": translation_delta,
+            "grounding_basis": grounding_basis,
+            "center_residual_applied": center_residual_applied,
+            "target_ground_point": target_ground_point,
+            "observed_ground_point": observed_ground_point,
+            "scale_multiplier": scale_multiplier,
+            "yaw_delta_degrees": yaw_correction.delta_degrees,
+            "yaw_basis": yaw_correction.basis,
+            "current_yaw_degrees": placement.rotation_y_degrees,
+            "camera_yaw_degrees": camera_yaw_degrees,
+            "target_yaw_degrees": normalize_degrees(placement.rotation_y_degrees + yaw_correction.delta_degrees),
+        }));
+    }
+    let object_count = grounded_layout.placements.len().max(1);
+    let mean_score = score_total / object_count as f32;
+    let passed = passed_count == grounded_layout.placements.len()
+        && mean_score >= thresholds.min_overall_score;
+    Ok(json!({
+        "profile": profile,
+        "passed": passed,
+        "score": mean_score,
+        "object_count": grounded_layout.placements.len(),
+        "object_pass_count": passed_count,
+        "source_scene_path": manifest.source_scene_path,
+        "screenshot_path": screenshot_path.display().to_string(),
+        "thresholds": {
+            "max_center_error": thresholds.max_center_error,
+            "max_contact_error": thresholds.max_contact_error,
+            "max_area_log2_error": thresholds.max_area_log2_error,
+            "min_overall_score": thresholds.min_overall_score,
+        },
+        "objects": object_metrics,
+        "camera": status.get("camera").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn feedback_expected_anchor_pixel(placement: &GroundedScenePlacement) -> [f32; 2] {
+    if feedback_uses_bbox_center_anchor(placement) {
+        bbox_center(placement.source_bbox)
+    } else {
+        placement.contact_pixel
+    }
+}
+
+fn feedback_observed_anchor_pixel(
+    placement: &GroundedScenePlacement,
+    observed_bbox: [f32; 4],
+    observed_contact: Option<[f32; 2]>,
+) -> [f32; 2] {
+    if feedback_uses_bbox_center_anchor(placement) {
+        bbox_center(observed_bbox)
+    } else {
+        observed_contact.unwrap_or_else(|| bbox_center(observed_bbox))
+    }
+}
+
+fn feedback_anchor_basis(placement: &GroundedScenePlacement) -> &'static str {
+    if feedback_uses_bbox_center_anchor(placement) {
+        "bbox-center"
+    } else {
+        "floor-contact"
+    }
+}
+
+fn feedback_uses_bbox_center_anchor(placement: &GroundedScenePlacement) -> bool {
+    let descriptor = format!("{} {}", placement.object_id, placement.label).to_lowercase();
+    descriptor.contains("table")
+        || descriptor.contains("desk")
+        || descriptor.contains("counter")
+        || descriptor.contains("bench")
+}
+
+fn feedback_layout_deltas(metrics: &Value) -> Value {
+    let objects = metrics
+        .get("objects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut scale_groups: HashMap<String, (f64, usize)> = HashMap::new();
+    let mut camera_ray_contact_sum = 0.0f64;
+    let mut camera_ray_contact_count = 0usize;
+    for object in &objects {
+        if object
+            .get("grounding_basis")
+            .and_then(Value::as_str)
+            .is_some_and(|basis| basis == "camera-ray-ground-plane")
+            && let Some(contact_error) = object
+                .get("contact_error")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+        {
+            camera_ray_contact_sum += contact_error;
+            camera_ray_contact_count += 1;
+        }
+        let Some(group_key) = feedback_scale_group_key(object) else {
+            continue;
+        };
+        let Some(scale) = object
+            .get("scale_multiplier")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+        else {
+            continue;
+        };
+        let scale = damped_feedback_scale_multiplier(object, scale);
+        let entry = scale_groups.entry(group_key).or_insert((0.0, 0));
+        entry.0 += scale.clamp(0.82, 1.22);
+        entry.1 += 1;
+    }
+    let repeated_scale_by_group = scale_groups
+        .into_iter()
+        .filter_map(|(key, (sum, count))| {
+            if count > 1 {
+                Some((key, (sum / count as f64).clamp(0.82, 1.22)))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    let mut source_min = [f32::INFINITY, f32::INFINITY];
+    let mut source_max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let mut observed_min = [f32::INFINITY, f32::INFINITY];
+    let mut observed_max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for object in &objects {
+        if let Some(bbox) = object.get("expected_bbox").and_then(json_array4) {
+            expand_bbox_envelope(&mut source_min, &mut source_max, bbox);
+        }
+        if let Some(bbox) = object.get("observed_bbox").and_then(json_array4) {
+            expand_bbox_envelope(&mut observed_min, &mut observed_max, bbox);
+        }
+    }
+    let source_area = envelope_area(source_min, source_max);
+    let observed_area = envelope_area(observed_min, observed_max);
+    let raw_camera_radius_multiplier = if source_area > 1.0e-5 && observed_area > 1.0e-5 {
+        (observed_area / source_area).sqrt().clamp(0.90, 1.10)
+    } else {
+        1.0
+    };
+    let camera_radius_multiplier = if camera_ray_contact_count > 0 {
+        let mean_contact = camera_ray_contact_sum / camera_ray_contact_count as f64;
+        if mean_contact > 0.05 {
+            1.0
+        } else {
+            (1.0 + (raw_camera_radius_multiplier - 1.0) * 0.25).clamp(0.97, 1.03)
+        }
+    } else {
+        raw_camera_radius_multiplier
+    };
+    json!({
+        "objects": objects.iter().map(|object| {
+            let group_key = feedback_scale_group_key(object);
+            let grouped_scale = group_key
+                .as_ref()
+                .and_then(|key| repeated_scale_by_group.get(key))
+                .copied();
+            let object_scale = object
+                .get("scale_multiplier")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .unwrap_or(1.0)
+                .clamp(0.82, 1.22);
+            let object_scale = damped_feedback_scale_multiplier(object, object_scale);
+            json!({
+                "index": object.get("index").cloned().unwrap_or(Value::Null),
+                "translation_delta": object.get("translation_delta").cloned().unwrap_or(json!([0.0, 0.0, 0.0])),
+                "scale_multiplier": grouped_scale.unwrap_or(object_scale),
+                "scale_group_key": group_key,
+                "scale_source": if grouped_scale.is_some() { "repeated_instance_group" } else { "object_projection" },
+                "yaw_delta_degrees": object.get("yaw_delta_degrees").cloned().unwrap_or(json!(0.0)),
+            })
+        }).collect::<Vec<_>>(),
+        "camera": {
+            "radius_multiplier": camera_radius_multiplier,
+        }
+    })
+}
+
+fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -> f64 {
+    let raw_scale = raw_scale.clamp(0.82, 1.22);
+    if !object
+        .get("grounding_basis")
+        .and_then(Value::as_str)
+        .is_some_and(|basis| basis == "camera-ray-ground-plane")
+    {
+        return raw_scale;
+    }
+    let contact_error = object
+        .get("contact_error")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0);
+    let center_error = object
+        .get("center_error")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0);
+    let weight = if contact_error <= 0.05 && center_error <= 0.08 {
+        1.0
+    } else if contact_error <= 0.10 && center_error <= 0.16 {
+        0.55
+    } else {
+        0.25
+    };
+    (1.0 + (raw_scale - 1.0) * weight).clamp(0.88, 1.12)
+}
+
+fn feedback_scale_group_key(object: &Value) -> Option<String> {
+    object
+        .get("cache_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            object
+                .get("object_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(ToString::to_string)
+}
+
+fn apply_feedback_deltas_to_commands(
+    commands: &[Value],
+    deltas: &Value,
+) -> Result<Vec<Value>, String> {
+    let object_deltas = deltas
+        .get("objects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = commands.to_vec();
+    let mut spawn_index = 0usize;
+    for command in &mut out {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        if command_type == "spawn_cached" || command_type == "spawn_path" {
+            if let Some(delta) = object_deltas.get(spawn_index) {
+                apply_object_delta_to_command(command, delta)?;
+            }
+            spawn_index += 1;
+        } else if command_type == "set_camera" {
+            let radius_multiplier = deltas
+                .get("camera")
+                .and_then(|camera| camera.get("radius_multiplier"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            if let Some(radius) = command.get("radius").and_then(Value::as_f64) {
+                command["radius"] = json!((radius as f32 * radius_multiplier).clamp(1.0, 20.0));
+            }
+        }
+    }
+    normalize_reused_command_scales(&mut out);
+    Ok(out)
+}
+
+fn normalize_reused_command_scales(commands: &mut [Value]) {
+    let mut groups: HashMap<String, (f32, usize)> = HashMap::new();
+    for command in commands.iter() {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        if command_type != "spawn_cached" && command_type != "spawn_path" {
+            continue;
+        }
+        let Some(group_key) = command
+            .get("cache_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(scale) = command.get("scale").and_then(json_array3) else {
+            continue;
+        };
+        let uniform_scale =
+            ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0);
+        let entry = groups.entry(group_key.to_string()).or_insert((0.0, 0));
+        entry.0 += uniform_scale;
+        entry.1 += 1;
+    }
+    let repeated_scale = groups
+        .into_iter()
+        .filter_map(|(key, (sum, count))| {
+            if count > 1 {
+                Some((key, (sum / count as f32).clamp(0.05, 20.0)))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    for command in commands.iter_mut() {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        if command_type != "spawn_cached" && command_type != "spawn_path" {
+            continue;
+        }
+        let Some(group_key) = command
+            .get("cache_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(scale) = repeated_scale.get(group_key).copied() else {
+            continue;
+        };
+        command["scale"] = json!([scale, scale, scale]);
+    }
+}
+
+fn apply_object_delta_to_command(command: &mut Value, delta: &Value) -> Result<(), String> {
+    let mut translation = command
+        .get("translation")
+        .and_then(json_array3)
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let translation_delta = delta
+        .get("translation_delta")
+        .and_then(json_array3)
+        .unwrap_or([0.0, 0.0, 0.0]);
+    translation[0] += translation_delta[0];
+    translation[1] += translation_delta[1];
+    translation[2] += translation_delta[2];
+    command["translation"] = json!(translation);
+
+    let multiplier = delta
+        .get("scale_multiplier")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0) as f32;
+    let mut scale = command
+        .get("scale")
+        .and_then(json_array3)
+        .unwrap_or([1.0, 1.0, 1.0]);
+    for value in &mut scale {
+        *value = (*value * multiplier).clamp(0.05, 20.0);
+    }
+    command["scale"] = json!(scale);
+
+    let yaw_delta = delta
+        .get("yaw_delta_degrees")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    if yaw_delta.abs() > 1.0e-4 {
+        let current_yaw = command
+            .get("rotation")
+            .and_then(json_array4)
+            .map(quat_y_degrees)
+            .unwrap_or(0.0);
+        let target_yaw = normalize_degrees(current_yaw + yaw_delta.clamp(-30.0, 30.0));
+        command["rotation"] = json!(quat_from_y_degrees(target_yaw));
+    }
+    Ok(())
+}
+
+fn feedback_bsn_from_commands(
+    asset_bindings: &[SceneAssetBinding],
+    grounded_layout: &GroundedSceneLayout,
+    commands: &[Value],
+) -> Result<String, String> {
+    let mut out = String::from("synth_scene_v1 {\n");
+    for asset in asset_bindings {
+        out.push_str(&format!(
+            "asset {} = \"generated:{}\";\n",
+            asset.asset_id, asset.asset_id
+        ));
+    }
+    out.push_str(&format!(
+        "environment rug translation [{}] scale [{}] color [0.62,0.02,0.26];\n",
+        fmt_feedback_vec3(grounded_layout.rug_center),
+        fmt_feedback_vec3(grounded_layout.rug_scale)
+    ));
+    let mut spawn_index = 0usize;
+    for command in commands {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        if command_type == "spawn_cached" || command_type == "spawn_path" {
+            let asset_id = command_asset_id(asset_bindings, command)?;
+            let translation = command
+                .get("translation")
+                .and_then(json_array3)
+                .unwrap_or([0.0, 0.0, 0.0]);
+            let scale = command
+                .get("scale")
+                .and_then(json_array3)
+                .unwrap_or([1.0, 1.0, 1.0]);
+            let rotation_y = command
+                .get("rotation")
+                .and_then(json_array4)
+                .map(quat_y_degrees)
+                .unwrap_or(0.0);
+            let entity_id = grounded_layout
+                .placements
+                .get(spawn_index)
+                .map(|placement| placement.entity_id.as_str())
+                .unwrap_or("feedback_item");
+            out.push_str(&format!(
+                "spawn {} uses {} translation [{}] rotation_y {} scale [{}];\n",
+                entity_id,
+                asset_id,
+                fmt_feedback_vec3(translation),
+                fmt_feedback_num(rotation_y),
+                fmt_feedback_vec3(scale)
+            ));
+            spawn_index += 1;
+        } else if command_type == "set_camera" {
+            let translation = command
+                .get("translation")
+                .and_then(json_array3)
+                .unwrap_or(grounded_layout.camera.translation);
+            let focus = command
+                .get("focus")
+                .and_then(json_array3)
+                .unwrap_or(grounded_layout.camera.focus);
+            let yaw = command
+                .get("yaw")
+                .and_then(Value::as_f64)
+                .map(|value| value as f32)
+                .or(grounded_layout.camera.yaw)
+                .unwrap_or(0.0);
+            let pitch = command
+                .get("pitch")
+                .and_then(Value::as_f64)
+                .map(|value| value as f32)
+                .or(grounded_layout.camera.pitch)
+                .unwrap_or(30.0);
+            let radius = command
+                .get("radius")
+                .and_then(Value::as_f64)
+                .map(|value| value as f32)
+                .or(grounded_layout.camera.radius)
+                .unwrap_or(5.0);
+            let vertical_fov = command
+                .get("vertical_fov")
+                .and_then(Value::as_f64)
+                .map(|value| value as f32)
+                .or(grounded_layout.camera.vertical_fov_degrees)
+                .unwrap_or(72.0);
+            out.push_str(&format!(
+                "camera translation [{}] focus [{}] yaw {} pitch {} radius {} vertical_fov {};\n",
+                fmt_feedback_vec3(translation),
+                fmt_feedback_vec3(focus),
+                fmt_feedback_num(yaw),
+                fmt_feedback_num(pitch),
+                fmt_feedback_num(radius),
+                fmt_feedback_num(vertical_fov)
+            ));
+        }
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn command_asset_id<'a>(
+    assets: &'a [SceneAssetBinding],
+    command: &Value,
+) -> Result<&'a str, String> {
+    if let Some(cache_key) = command.get("cache_key").and_then(Value::as_str)
+        && let Some(asset) = assets
+            .iter()
+            .find(|asset| asset.cache_key.as_deref() == Some(cache_key))
+    {
+        return Ok(asset.asset_id.as_str());
+    }
+    if let Some(path) = command.get("path").and_then(Value::as_str)
+        && let Some(asset) = assets.iter().find(|asset| {
+            asset
+                .path
+                .as_ref()
+                .is_some_and(|asset_path| asset_path == path)
+        })
+    {
+        return Ok(asset.asset_id.as_str());
+    }
+    if let Some(cache_key) = command.get("cache_key").and_then(Value::as_str)
+        && let Some(asset) = assets.iter().find(|asset| asset.asset_id == cache_key)
+    {
+        return Ok(asset.asset_id.as_str());
+    }
+    Err("feedback command references an unknown asset".to_string())
+}
+
+fn feedback_markdown_report(
+    capture_root: &Path,
+    profile: FeedbackThresholdProfile,
+    accepted_iteration: Option<usize>,
+    iterations: &[Value],
+) -> String {
+    let mut out = format!(
+        "# Scene Feedback Report\n\nprofile: {:?}\naccepted_iteration: {:?}\n\n",
+        profile, accepted_iteration
+    );
+    for iteration in iterations {
+        let index = iteration
+            .get("iteration")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let screenshot = iteration
+            .get("screenshot")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let score = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("score"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let passed = iteration
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\n\n![iteration {index}]({})\n\n",
+            path_relative_to(capture_root, Path::new(screenshot))
+        ));
+    }
+    out
+}
+
+fn path_relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FeedbackCamera {
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    vertical_fov_degrees: f32,
+    aspect: f32,
+}
+
+impl FeedbackCamera {
+    fn from_status(status: &Value, screenshot_path: &Path) -> Option<Self> {
+        let camera = status.get("camera")?;
+        let translation = camera.get("translation").and_then(json_array3)?;
+        let rotation = camera.get("rotation").and_then(json_array4)?;
+        let vertical_fov_degrees = camera
+            .get("vertical_fov_degrees")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite() && *value > 1.0)
+            .unwrap_or(70.0);
+        let aspect = image::image_dimensions(screenshot_path)
+            .ok()
+            .map(|(width, height)| width.max(1) as f32 / height.max(1) as f32)
+            .filter(|value| value.is_finite() && *value > 0.1)
+            .unwrap_or(16.0 / 9.0);
+        Some(Self {
+            translation,
+            rotation,
+            vertical_fov_degrees,
+            aspect,
+        })
+    }
+
+    fn ground_point(&self, screen: [f32; 2], floor_y: f32) -> Option<[f32; 3]> {
+        let tan_half = (self.vertical_fov_degrees.to_radians() * 0.5).tan();
+        let local = normalize3([
+            (2.0 * screen[0].clamp(0.0, 1.0) - 1.0) * self.aspect.max(0.1) * tan_half,
+            (1.0 - 2.0 * screen[1].clamp(0.0, 1.0)) * tan_half,
+            -1.0,
+        ])?;
+        let direction = quat_rotate_vec3(self.rotation, local);
+        if !direction[1].is_finite() || direction[1].abs() <= 1.0e-5 {
+            return None;
+        }
+        let t = (floor_y - self.translation[1]) / direction[1];
+        if !t.is_finite() || t <= 0.0 {
+            return None;
+        }
+        Some([
+            self.translation[0] + direction[0] * t,
+            floor_y,
+            self.translation[2] + direction[2] * t,
+        ])
+    }
+}
+
+fn projected_item_ground_point(projected_item: &Value) -> Option<[f32; 3]> {
+    let aabb = projected_item.get("world_aabb")?;
+    let min = aabb.get("min").and_then(json_array3)?;
+    let max = aabb.get("max").and_then(json_array3)?;
+    if !min.iter().all(|value| value.is_finite()) || !max.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    Some([
+        (min[0] + max[0]) * 0.5,
+        min[1].min(max[1]),
+        (min[2] + max[2]) * 0.5,
+    ])
+}
+
+fn normalize3(value: [f32; 3]) -> Option<[f32; 3]> {
+    let len = (value[0] * value[0] + value[1] * value[1] + value[2] * value[2]).sqrt();
+    if !len.is_finite() || len <= 1.0e-8 {
+        return None;
+    }
+    Some([value[0] / len, value[1] / len, value[2] / len])
+}
+
+fn quat_rotate_vec3(quat: [f32; 4], vector: [f32; 3]) -> [f32; 3] {
+    let q = [quat[0], quat[1], quat[2]];
+    let t = scale3(cross3(q, vector), 2.0);
+    add3(add3(vector, scale3(t, quat[3])), cross3(q, t))
+}
+
+fn cross3(lhs: [f32; 3], rhs: [f32; 3]) -> [f32; 3] {
+    [
+        lhs[1] * rhs[2] - lhs[2] * rhs[1],
+        lhs[2] * rhs[0] - lhs[0] * rhs[2],
+        lhs[0] * rhs[1] - lhs[1] * rhs[0],
+    ]
+}
+
+fn add3(lhs: [f32; 3], rhs: [f32; 3]) -> [f32; 3] {
+    [lhs[0] + rhs[0], lhs[1] + rhs[1], lhs[2] + rhs[2]]
+}
+
+fn scale3(value: [f32; 3], scalar: f32) -> [f32; 3] {
+    [value[0] * scalar, value[1] * scalar, value[2] * scalar]
+}
+
+fn clamp_xz_delta(delta: [f32; 3], max_len: f32) -> [f32; 3] {
+    let len = (delta[0] * delta[0] + delta[2] * delta[2]).sqrt();
+    if !len.is_finite() || len <= max_len.max(1.0e-5) {
+        return delta;
+    }
+    let scale = max_len.max(1.0e-5) / len;
+    [delta[0] * scale, delta[1], delta[2] * scale]
+}
+
+fn json_array2(value: &Value) -> Option<[f32; 2]> {
+    let values = value.as_array()?;
+    Some([
+        values.first()?.as_f64()? as f32,
+        values.get(1)?.as_f64()? as f32,
+    ])
+}
+
+fn json_array3(value: &Value) -> Option<[f32; 3]> {
+    let values = value.as_array()?;
+    Some([
+        values.first()?.as_f64()? as f32,
+        values.get(1)?.as_f64()? as f32,
+        values.get(2)?.as_f64()? as f32,
+    ])
+}
+
+fn json_array4(value: &Value) -> Option<[f32; 4]> {
+    let values = value.as_array()?;
+    Some([
+        values.first()?.as_f64()? as f32,
+        values.get(1)?.as_f64()? as f32,
+        values.get(2)?.as_f64()? as f32,
+        values.get(3)?.as_f64()? as f32,
+    ])
+}
+
+fn bbox_center(bbox: [f32; 4]) -> [f32; 2] {
+    [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5]
+}
+
+fn bbox_area(bbox: [f32; 4]) -> f32 {
+    ((bbox[2] - bbox[0]).abs() * (bbox[3] - bbox[1]).abs()).max(1.0e-6)
+}
+
+fn bbox_aspect(bbox: [f32; 4]) -> f32 {
+    ((bbox[2] - bbox[0]).abs() / (bbox[3] - bbox[1]).abs().max(1.0e-6)).max(1.0e-6)
+}
+
+fn distance2(lhs: [f32; 2], rhs: [f32; 2]) -> f32 {
+    let dx = lhs[0] - rhs[0];
+    let dy = lhs[1] - rhs[1];
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn vec2_sub(lhs: [f32; 2], rhs: [f32; 2]) -> [f32; 2] {
+    [lhs[0] - rhs[0], lhs[1] - rhs[1]]
+}
+
+fn safe_log2_ratio(lhs: f32, rhs: f32) -> f32 {
+    (lhs.max(1.0e-6) / rhs.max(1.0e-6)).log2()
+}
+
+fn expand_bbox_envelope(min: &mut [f32; 2], max: &mut [f32; 2], bbox: [f32; 4]) {
+    min[0] = min[0].min(bbox[0]);
+    min[1] = min[1].min(bbox[1]);
+    max[0] = max[0].max(bbox[2]);
+    max[1] = max[1].max(bbox[3]);
+}
+
+fn envelope_area(min: [f32; 2], max: [f32; 2]) -> f32 {
+    if !min[0].is_finite() || !max[0].is_finite() {
+        return 0.0;
+    }
+    ((max[0] - min[0]).abs() * (max[1] - min[1]).abs()).max(1.0e-6)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FeedbackYawCorrection {
+    delta_degrees: f32,
+    basis: &'static str,
+}
+
+fn status_camera_yaw_degrees(status: &Value, fallback_degrees: Option<f32>) -> f32 {
+    let raw_yaw = status
+        .get("camera")
+        .and_then(|camera| camera.get("yaw"))
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .or(fallback_degrees)
+        .unwrap_or(180.0);
+    let degrees = if raw_yaw.abs() <= std::f32::consts::TAU + 1.0e-3 {
+        raw_yaw.to_degrees()
+    } else {
+        raw_yaw
+    };
+    normalize_degrees(degrees)
+}
+
+fn feedback_yaw_correction(
+    placement: &GroundedScenePlacement,
+    expected_bbox: [f32; 4],
+    observed_bbox: [f32; 4],
+    camera_yaw_degrees: f32,
+) -> FeedbackYawCorrection {
+    let signed_aspect_error =
+        safe_log2_ratio(bbox_aspect(expected_bbox), bbox_aspect(observed_bbox));
+    let aspect_error = signed_aspect_error.abs();
+    if aspect_error < 0.10 {
+        return FeedbackYawCorrection {
+            delta_degrees: 0.0,
+            basis: "aspect-within-threshold",
+        };
+    }
+
+    let footprint_width = (placement.local_aabb.max[0] - placement.local_aabb.min[0]).abs()
+        * placement.scale[0].abs();
+    let footprint_depth = (placement.local_aabb.max[2] - placement.local_aabb.min[2]).abs()
+        * placement.scale[2].abs();
+    let current_relative_yaw = normalize_degrees(placement.rotation_y_degrees - camera_yaw_degrees);
+    let step_degrees = (aspect_error * 20.0).clamp(3.0, 18.0);
+    let wants_wider = signed_aspect_error > 0.0;
+
+    let current_width =
+        apparent_width_for_yaw(footprint_width, footprint_depth, current_relative_yaw);
+    let plus_width = apparent_width_for_yaw(
+        footprint_width,
+        footprint_depth,
+        current_relative_yaw + step_degrees,
+    );
+    let minus_width = apparent_width_for_yaw(
+        footprint_width,
+        footprint_depth,
+        current_relative_yaw - step_degrees,
+    );
+    let plus_gain = if wants_wider {
+        plus_width - current_width
+    } else {
+        current_width - plus_width
+    };
+    let minus_gain = if wants_wider {
+        minus_width - current_width
+    } else {
+        current_width - minus_width
+    };
+    let delta_degrees = if plus_gain > minus_gain + 1.0e-4 && plus_gain > 1.0e-4 {
+        step_degrees
+    } else if minus_gain > plus_gain + 1.0e-4 && minus_gain > 1.0e-4 {
+        -step_degrees
+    } else if aspect_error >= 0.22 {
+        let source_side_sign = if bbox_center(expected_bbox)[0] <= 0.5 {
+            1.0
+        } else {
+            -1.0
+        };
+        source_side_sign * step_degrees.min(10.0) * if wants_wider { 1.0 } else { -1.0 }
+    } else {
+        0.0
+    };
+    let basis = if delta_degrees.abs() <= 1.0e-4 {
+        "apparent-width-flat"
+    } else if (plus_gain - minus_gain).abs() <= 1.0e-4 {
+        "source-side-aspect-fallback"
+    } else {
+        "apparent-width-gradient"
+    };
+
+    FeedbackYawCorrection {
+        delta_degrees: delta_degrees.clamp(-18.0, 18.0),
+        basis,
+    }
+}
+
+fn apparent_width_for_yaw(
+    footprint_width: f32,
+    footprint_depth: f32,
+    relative_yaw_degrees: f32,
+) -> f32 {
+    let yaw = relative_yaw_degrees.to_radians();
+    footprint_width.max(1.0e-5) * yaw.cos().abs() + footprint_depth.max(1.0e-5) * yaw.sin().abs()
+}
+
+fn quat_y_degrees(quat: [f32; 4]) -> f32 {
+    normalize_degrees((2.0 * quat[1].atan2(quat[3])).to_degrees())
+}
+
+fn quat_from_y_degrees(degrees: f32) -> [f32; 4] {
+    let half = normalize_degrees(degrees).to_radians() * 0.5;
+    [0.0, half.sin(), 0.0, half.cos()]
+}
+
+fn normalize_degrees(mut degrees: f32) -> f32 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    while degrees <= -180.0 {
+        degrees += 360.0;
+    }
+    while degrees > 180.0 {
+        degrees -= 360.0;
+    }
+    degrees
+}
+
+fn fmt_feedback_vec3(value: [f32; 3]) -> String {
+    format!(
+        "{},{},{}",
+        fmt_feedback_num(value[0]),
+        fmt_feedback_num(value[1]),
+        fmt_feedback_num(value[2])
+    )
+}
+
+fn fmt_feedback_num(value: f32) -> String {
+    let mut text = format!("{value:.4}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.push('0');
+    }
+    if text == "-0.0" {
+        "0.0".to_string()
+    } else {
+        text
+    }
 }
 
 fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel> {
@@ -1489,7 +3243,10 @@ struct WrittenAsset {
     vertices: Option<usize>,
     faces: Option<usize>,
     gaussians: Option<usize>,
+    local_aabb: Option<SceneAssetAabb>,
     material: Option<Value>,
+    mesh_quality: Option<Value>,
+    mesh_quality_failures: Vec<String>,
     catalog_entry: Option<CachedMeshMetadata>,
 }
 
@@ -1515,6 +3272,12 @@ fn write_asset_output(
             }
             let mesh = apply_mesh_decimation(mesh, target_faces)
                 .map_err(|err| format!("mesh decimation failed: {err}"))?;
+            let quality = mesh_quality_metrics(&mesh);
+            let quality_failures = mesh_quality_failures(&quality);
+            let mesh_quality = Some(
+                serde_json::to_value(&quality)
+                    .map_err(|err| format!("failed to serialize mesh quality metrics: {err}"))?,
+            );
             let catalog_mesh = catalog_cache
                 .as_ref()
                 .map(|_| cached_mesh_from_runtime_mesh(&mesh));
@@ -1546,7 +3309,10 @@ fn write_asset_output(
                 vertices: Some(mesh.vertices.len()),
                 faces: Some(mesh.faces.len()),
                 gaussians: None,
+                local_aabb: mesh_scene_aabb(&mesh),
                 material,
+                mesh_quality,
+                mesh_quality_failures: quality_failures,
                 catalog_entry,
             })
         }
@@ -1583,7 +3349,10 @@ fn write_asset_output(
                 vertices: None,
                 faces: None,
                 gaussians: Some(splats.len()),
+                local_aabb: None,
                 material: None,
+                mesh_quality: None,
+                mesh_quality_failures: Vec::new(),
                 catalog_entry,
             })
         }
@@ -1615,6 +3384,49 @@ fn cached_mesh_from_runtime_mesh(mesh: &Mesh) -> CachedSynthMesh {
                 emissive: textures.emissive.map(cached_texture_from_runtime_texture),
                 occlusion: textures.occlusion.map(cached_texture_from_runtime_texture),
             }),
+    }
+}
+
+fn mesh_scene_aabb(mesh: &Mesh) -> Option<SceneAssetAabb> {
+    let mut iter = mesh.vertices.iter();
+    let first = *iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for vertex in iter {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex[axis]);
+            max[axis] = max[axis].max(vertex[axis]);
+        }
+    }
+    Some(SceneAssetAabb { min, max })
+}
+
+fn cached_aabb_to_scene(value: CachedAssetAabb) -> SceneAssetAabb {
+    SceneAssetAabb {
+        min: value.min,
+        max: value.max,
+    }
+}
+
+fn inferred_scene_asset_frame(
+    label: &str,
+    aliases: &[String],
+    local_aabb: Option<SceneAssetAabb>,
+    target_footprint_m: Option<[f32; 2]>,
+) -> SceneAssetFrame {
+    let descriptor = format!("{} {}", label, aliases.join(" ")).to_ascii_lowercase();
+    let yaw_offset_degrees = if descriptor.contains("table") {
+        local_aabb
+            .map(|aabb| aabb.max[0] - aabb.min[0] > (aabb.max[2] - aabb.min[2]) * 1.15)
+            .unwrap_or(false)
+            .then_some(90.0)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    SceneAssetFrame {
+        yaw_offset_degrees,
+        footprint_m: target_footprint_m,
     }
 }
 
@@ -1671,6 +3483,9 @@ fn apply_mesh_decimation(mesh: Mesh, target_faces: Option<usize>) -> Result<Mesh
     let Some(target) = target_faces else {
         return Ok(mesh);
     };
+    if mesh.pbr_textures.is_some() {
+        return Ok(mesh);
+    }
     if mesh.faces.len() <= target {
         return Ok(mesh);
     }
@@ -1789,55 +3604,254 @@ fn default_scene_promote_to_catalog() -> bool {
     true
 }
 
+fn default_scene_write_artifacts() -> bool {
+    true
+}
+
+fn default_scene_feedback() -> bool {
+    true
+}
+
+fn default_scene_feedback_iters() -> usize {
+    3
+}
+
+fn default_scene_feedback_threshold_profile() -> FeedbackThresholdProfile {
+    FeedbackThresholdProfile::Standard
+}
+
+fn env_or_dotenv_var(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| dotenv_var(Path::new(".env"), key))
+}
+
+fn dotenv_var(path: &Path, key: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() == key {
+            return Some(parse_dotenv_value(value.trim()));
+        }
+    }
+    None
+}
+
+fn parse_dotenv_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value
+        .split_once(" #")
+        .map(|(prefix, _)| prefix.trim_end())
+        .unwrap_or(value)
+        .to_string()
+}
+
+#[cfg(test)]
 fn select_scene_candidates(
     manifest: &SceneObjectManifest,
     candidates: &[burn_synth_scene::ObjectImageCandidate],
 ) -> Result<Vec<Value>, String> {
-    let mut by_object = candidates
+    let selected = burn_synth_scene::select_object_image_candidates(
+        manifest,
+        candidates,
+        DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(selected_candidates_to_values(&selected))
+}
+
+fn selected_candidates_to_values(
+    selected: &[burn_synth_scene::SelectedObjectImageCandidate],
+) -> Vec<Value> {
+    selected
         .iter()
-        .map(|candidate| (candidate.object_id.as_str(), candidate))
-        .collect::<Vec<_>>();
-    by_object.sort_by(|(_, left), (_, right)| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.candidate_index.cmp(&right.candidate_index))
-    });
-    let mut selected = Vec::new();
-    let mut seen_groups = HashSet::new();
-    for object in &manifest.objects {
-        let group = object
-            .reuse_group
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or(object.id.as_str())
-            .to_string();
-        if !seen_groups.insert(group.clone()) {
+        .map(|candidate| {
+            json!({
+                "object_id": candidate.object_id,
+                "reuse_group": candidate.reuse_group,
+                "label": candidate.label,
+                "image_path": candidate.image_path,
+                "candidate_index": candidate.candidate_index,
+                "score": candidate.score,
+                "prompt_hash": candidate.prompt_hash,
+            })
+        })
+        .collect()
+}
+
+fn record_stage(stage_report: &mut Vec<Value>, stage: &str, started: Instant) {
+    stage_report.push(json!({
+        "stage": stage,
+        "elapsed_ms": elapsed_ms(started.elapsed()),
+    }));
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn scene_build_summary(response: &Value, elapsed: Duration) -> Value {
+    let rejected = response
+        .pointer("/candidate_generation/rejected_objects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let selected_count = response
+        .get("selected_candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let candidate_count = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let assets = response
+        .pointer("/asset_outputs/items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "input_image_path": item.get("input_image_path").cloned().unwrap_or(Value::Null),
+                        "output_path": item.get("output_path").cloned().unwrap_or(Value::Null),
+                        "cache_key": item.get("cache_key").cloned().unwrap_or(Value::Null),
+                        "vertices": item.get("vertices").cloned().unwrap_or(Value::Null),
+                        "faces": item.get("faces").cloned().unwrap_or(Value::Null),
+                        "local_aabb": item.get("local_aabb").cloned().unwrap_or(Value::Null),
+                        "mesh_quality": item.get("mesh_quality").cloned().unwrap_or(Value::Null),
+                        "mesh_quality_failures": item.get("mesh_quality_failures").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let placements = response
+        .pointer("/grounded_layout/placements")
+        .and_then(Value::as_array)
+        .map(|placements| {
+            placements
+                .iter()
+                .map(|placement| {
+                    json!({
+                        "object_id": placement.get("object_id").cloned().unwrap_or(Value::Null),
+                        "asset_id": placement.get("asset_id").cloned().unwrap_or(Value::Null),
+                        "translation": placement.get("translation").cloned().unwrap_or(Value::Null),
+                        "scale": placement.get("scale").cloned().unwrap_or(Value::Null),
+                        "target_footprint_m": placement.get("target_footprint_m").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "ok": rejected.is_empty(),
+        "elapsed_ms": elapsed_ms(elapsed),
+        "source_scene_path": response.pointer("/manifest/source_scene_path").cloned().unwrap_or(Value::Null),
+        "candidate_count": candidate_count,
+        "selected_count": selected_count,
+        "rejected_objects": rejected,
+        "asset_count": assets.len(),
+        "assets": assets,
+        "placement_count": placements.len(),
+        "placements": placements,
+        "feedback": response.get("feedback").map(|feedback| json!({
+            "enabled": feedback.get("enabled").cloned().unwrap_or(Value::Null),
+            "accepted": feedback.get("accepted").cloned().unwrap_or(Value::Null),
+            "accepted_iteration": feedback.get("accepted_iteration").cloned().unwrap_or(Value::Null),
+            "capture_dir": feedback.get("capture_dir").cloned().unwrap_or(Value::Null),
+        })).unwrap_or(Value::Null),
+        "stage_report": response.get("stage_report").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn scene_asset_quality_failures(asset_outputs: &Value) -> Vec<String> {
+    let Some(items) = asset_outputs.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut failures = Vec::new();
+    for item in items {
+        if item.get("asset_kind").and_then(Value::as_str) != Some("mesh") {
             continue;
         }
-        let candidate = by_object
-            .iter()
-            .find(|(object_id, _)| *object_id == object.id)
-            .map(|(_, candidate)| *candidate)
-            .ok_or_else(|| format!("no generated image candidate for object `{}`", object.id))?;
-        if candidate.score < MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE {
-            return Err(format!(
-                "generated image candidate for object `{}` is not suitable for TRELLIS/RMBG reconstruction (score={:.3}, min={:.3}); regenerate with more candidates or improve the isolated-object prompt/background",
-                object.id, candidate.score, MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE
-            ));
+        if item.get("synthesis_backend").and_then(Value::as_str) != Some("trellis") {
+            continue;
         }
-        selected.push(json!({
-            "object_id": object.id,
-            "reuse_group": group,
-            "label": object.label,
-            "image_path": candidate.image_path,
-            "candidate_index": candidate.candidate_index,
-            "score": candidate.score,
-            "prompt_hash": candidate.prompt_hash,
-        }));
+        let output_path = item
+            .get("output_path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown output>");
+        for failure in item
+            .get("mesh_quality_failures")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            failures.push(format!("{output_path}: {failure}"));
+        }
     }
-    Ok(selected)
+    failures
+}
+
+fn write_scene_build_artifacts(output_dir: &Path, response: &Value) -> Result<(), String> {
+    fs::create_dir_all(output_dir).map_err(|err| {
+        format!(
+            "create scene build artifact directory {}: {err}",
+            output_dir.display()
+        )
+    })?;
+    for (key, file_name) in [
+        ("preparation", "preparation.json"),
+        ("manifest", "manifest.json"),
+        ("object_image_requests", "object_image_requests.json"),
+        ("candidate_generation", "candidate_generation.json"),
+        ("candidates", "candidates.json"),
+        ("selected_candidates", "selected_candidates.json"),
+        ("asset_outputs", "asset_outputs.json"),
+        ("asset_bindings", "asset_bindings.json"),
+        ("plan", "plan.json"),
+        ("grounded_layout", "grounded_layout.json"),
+        ("commands", "commands.json"),
+        ("feedback", "feedback_report.json"),
+        ("stage_report", "stage_report.json"),
+        ("e2e_summary", "summary.json"),
+    ] {
+        if let Some(value) = response.get(key) {
+            write_json_file(&output_dir.join(file_name), value).map_err(|err| err.to_string())?;
+        }
+    }
+    if let Some(bsn) = response.get("bsn").and_then(Value::as_str) {
+        fs::write(output_dir.join("scene.bsn"), bsn).map_err(|err| {
+            format!(
+                "write scene BSN artifact {}: {err}",
+                output_dir.join("scene.bsn").display()
+            )
+        })?;
+    }
+    write_json_file(
+        &output_dir.join("scene_build_response_structured.json"),
+        response,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 fn scene_asset_bindings_from_outputs(
@@ -1860,7 +3874,8 @@ fn scene_asset_bindings_from_outputs(
         .iter()
         .map(|object| (object.id.as_str(), object))
         .collect::<HashMap<_, _>>();
-    let mut bindings = Vec::with_capacity(items.len());
+    let mut bindings = Vec::with_capacity(manifest.objects.len().max(items.len()));
+    let mut bindings_by_reuse_group = HashMap::new();
     for (item, selected) in items.iter().zip(selected_candidates.iter()) {
         let object_id = selected["object_id"]
             .as_str()
@@ -1872,7 +3887,20 @@ fn scene_asset_bindings_from_outputs(
             .as_str()
             .ok_or_else(|| "asset output item missing output_path".to_string())?;
         let cache_key = item["cache_key"].as_str().map(ToOwned::to_owned);
-        bindings.push(SceneAssetBinding {
+        let local_aabb = item
+            .get("local_aabb")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .and_then(|value| serde_json::from_value::<SceneAssetAabb>(value).ok())
+            .or_else(|| {
+                item.get("catalog_entry")
+                    .and_then(|entry| entry.get("local_aabb"))
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<CachedAssetAabb>(value).ok())
+                    .map(cached_aabb_to_scene)
+            });
+        let binding = SceneAssetBinding {
             asset_id: sanitize_scene_identifier(&format!("{object_id}_asset")),
             object_id: object.id.clone(),
             label: object.label.clone(),
@@ -1881,16 +3909,64 @@ fn scene_asset_bindings_from_outputs(
             cache_key: cache_key.clone(),
             reusable: cache_key.is_some()
                 || object.instance_count > 1
+                || object.instances.len() > 1
                 || object.reuse_group.is_some(),
             source_image_path: selected["image_path"].as_str().map(ToOwned::to_owned),
             pipeline: item["synthesis_backend"].as_str().map(ToOwned::to_owned),
+            local_aabb,
+            canonical_frame: Some(inferred_scene_asset_frame(
+                &object.label,
+                &object.aliases,
+                local_aabb,
+                object.target_footprint_m,
+            )),
             provenance: Some(burn_synth_scene::SceneAssetProvenance {
                 run_id: "scene_build_from_image".to_string(),
                 source_scene_path: manifest.source_scene_path.clone(),
                 source_object_id: object.id.clone(),
                 generated_by: "scene_build_from_image".to_string(),
             }),
-        });
+        };
+        let reuse_group = object
+            .reuse_group
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(object.id.as_str())
+            .to_string();
+        bindings_by_reuse_group
+            .entry(reuse_group)
+            .or_insert_with(|| binding.clone());
+        bindings.push(binding);
+    }
+
+    for object in &manifest.objects {
+        if bindings
+            .iter()
+            .any(|binding| binding.object_id.as_str() == object.id.as_str())
+        {
+            continue;
+        }
+        let reuse_group = object
+            .reuse_group
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(object.id.as_str());
+        let Some(source_binding) = bindings_by_reuse_group.get(reuse_group) else {
+            return Err(format!(
+                "scene object `{}` was not selected and has no reusable asset binding for reuse group `{reuse_group}`",
+                object.id
+            ));
+        };
+        let mut binding = source_binding.clone();
+        binding.asset_id = sanitize_scene_identifier(&format!("{}_asset", object.id));
+        binding.object_id = object.id.clone();
+        binding.label = object.label.clone();
+        binding.aliases = object.aliases.clone();
+        binding.reusable = true;
+        if let Some(provenance) = binding.provenance.as_mut() {
+            provenance.source_object_id = object.id.clone();
+        }
+        bindings.push(binding);
     }
     Ok(bindings)
 }
@@ -2135,7 +4211,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "scene_build_from_image",
-            "description": "Quality-first OpenAI scene build: plan objects, generate isolated object images, lift selected candidates through RMBG+TRELLIS, generate restricted BSN, validate it, and optionally apply to Bevy. Requires OPENAI_API_KEY.",
+            "description": "Quality-first OpenAI scene build: plan objects, generate source-preserving isolated object images, lift selected candidates through RMBG+TRELLIS, generate grounded restricted BSN from image bboxes plus asset AABBs, validate it, and optionally apply to Bevy. Requires OPENAI_API_KEY.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2143,6 +4219,9 @@ fn tool_defs() -> Vec<Value> {
                     "object_reference_image_path": { "type": "string" },
                     "output_dir": { "type": "string" },
                     "candidate_count": { "type": "integer" },
+                    "candidate_retry_attempts": { "type": "integer", "description": "Maximum guarded image-generation attempts per object. Defaults to candidate_count." },
+                    "candidate_batch_size": { "type": "integer", "description": "Generated image candidates requested per retry attempt. Defaults to 1 so weak candidates can be retried without overwriting artifacts." },
+                    "min_reconstruction_score": { "type": "number", "description": "Minimum isolated-object reconstruction suitability score before TRELLIS lifting. Defaults to the canonical scene threshold." },
                     "quality_profile": { "type": "string", "enum": ["draft", "quality"] },
                     "allow_catalog_reuse": { "type": "boolean" },
                     "lift_assets": { "type": "boolean", "description": "When false, stop after object image generation." },
@@ -2152,8 +4231,14 @@ fn tool_defs() -> Vec<Value> {
                     "trellis_pbr": { "type": "boolean", "description": "Enable native TRELLIS UV/material texture baking for lifted GLB assets." },
                     "trellis_pbr_texture_size": { "type": "integer", "description": "Native TRELLIS PBR texture size." },
                     "promote_to_catalog": { "type": "boolean", "description": "Add lifted objects to the shared Bevy catalog/cache for later reuse. Defaults to true; fresh scene mode still does not read existing catalog assets while planning." },
+                    "write_artifacts": { "type": "boolean", "description": "Write structured e2e artifacts such as selected candidates, asset outputs, grounded layout, commands, summary, and scene.bsn to output_dir. Defaults to true." },
                     "clear_existing": { "type": "boolean" },
-                    "apply": { "type": "boolean" }
+                    "apply": { "type": "boolean" },
+                    "feedback": { "type": "boolean", "description": "Run bounded render-capture-feedback placement validation/refinement. Defaults to true for full scene builds." },
+                    "feedback_iters": { "type": "integer", "description": "Maximum feedback iterations. Defaults to 3." },
+                    "feedback_keep_viewer": { "type": "boolean", "description": "Leave the temporary feedback viewer running after completion." },
+                    "feedback_capture_dir": { "type": "string", "description": "Optional feedback artifact directory. Defaults to output_dir/iterations." },
+                    "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] }
                 },
                 "required": ["source_scene_path"],
                 "additionalProperties": false
@@ -2161,7 +4246,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "scene_plan_bsn",
-            "description": "Use the raw OpenAI API to plan restricted synth_scene_v1 BSN from an existing object manifest and generated asset bindings, then validate commands before optional Bevy apply. Requires OPENAI_API_KEY.",
+            "description": "Plan a grounded restricted synth_scene_v1 BSN from an existing object manifest and generated asset bindings, using source-image bbox contact points, class scale priors, and asset AABBs; then validate commands before optional Bevy apply.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2169,10 +4254,8 @@ fn tool_defs() -> Vec<Value> {
                     "asset_bindings": {
                         "type": "array",
                         "items": { "type": "object" },
-                        "description": "Generated asset bindings with asset_id plus path or cache_key."
+                        "description": "Generated asset bindings with asset_id plus path or cache_key. local_aabb is used for ground-plane bottom-fit and scale when present."
                     },
-                    "object_reference_image_path": { "type": "string" },
-                    "output_dir": { "type": "string" },
                     "clear_existing": { "type": "boolean" },
                     "apply": { "type": "boolean", "description": "When true, send commands to Bevy scene bridge." }
                 },
@@ -2202,6 +4285,15 @@ fn tool_defs() -> Vec<Value> {
         json!({
             "name": "scene_status",
             "description": "Read the latest Bevy scene bridge status, including cache entries, world items, camera, and screenshots.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_project_status",
+            "description": "Read camera/world status plus per-object projected screen-space evidence from the Bevy scene bridge.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2281,7 +4373,8 @@ fn tool_defs() -> Vec<Value> {
                     "focus": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
                     "yaw": { "type": "number" },
                     "pitch": { "type": "number" },
-                    "radius": { "type": "number" }
+                    "radius": { "type": "number" },
+                    "vertical_fov": { "type": "number" }
                 },
                 "required": ["translation", "rotation"],
                 "additionalProperties": false
@@ -2338,6 +4431,7 @@ fn tool_defs() -> Vec<Value> {
                                 "aliases": { "type": "array", "items": { "type": "string" } },
                                 "path": { "type": "string" },
                                 "cache_key": { "type": "string" },
+                                "local_aabb": { "type": "object", "description": "Optional asset local bounds {min:[x,y,z], max:[x,y,z]} for ground-fit scaling." },
                                 "select": { "type": "boolean" }
                             },
                             "additionalProperties": false
@@ -2600,6 +4694,12 @@ struct SceneBuildFromImageArgs {
     #[serde(default)]
     pub candidate_count: Option<usize>,
     #[serde(default)]
+    pub candidate_retry_attempts: Option<usize>,
+    #[serde(default)]
+    pub candidate_batch_size: Option<usize>,
+    #[serde(default)]
+    pub min_reconstruction_score: Option<f32>,
+    #[serde(default)]
     pub quality_profile: Option<SceneQualityProfile>,
     #[serde(default)]
     pub allow_catalog_reuse: bool,
@@ -2617,20 +4717,69 @@ struct SceneBuildFromImageArgs {
     pub trellis_pbr_texture_size: Option<usize>,
     #[serde(default = "default_scene_promote_to_catalog")]
     pub promote_to_catalog: bool,
+    #[serde(default = "default_scene_write_artifacts")]
+    pub write_artifacts: bool,
     #[serde(default)]
     pub apply: bool,
     #[serde(default = "default_scene_clear_existing")]
     pub clear_existing: bool,
+    #[serde(default = "default_scene_feedback")]
+    pub feedback: bool,
+    #[serde(default = "default_scene_feedback_iters")]
+    pub feedback_iters: usize,
+    #[serde(default)]
+    pub feedback_keep_viewer: bool,
+    #[serde(default)]
+    pub feedback_capture_dir: Option<PathBuf>,
+    #[serde(default = "default_scene_feedback_threshold_profile")]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+}
+
+#[derive(Clone, Debug)]
+struct SceneFeedbackOptions {
+    max_iters: usize,
+    keep_viewer: bool,
+    capture_dir: Option<PathBuf>,
+    threshold_profile: FeedbackThresholdProfile,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SceneFeedbackThresholds {
+    max_center_error: f32,
+    max_contact_error: f32,
+    max_area_log2_error: f32,
+    min_overall_score: f32,
+}
+
+impl FeedbackThresholdProfile {
+    fn thresholds(self) -> SceneFeedbackThresholds {
+        match self {
+            Self::Loose => SceneFeedbackThresholds {
+                max_center_error: 0.18,
+                max_contact_error: 0.22,
+                max_area_log2_error: 1.20,
+                min_overall_score: 0.55,
+            },
+            Self::Standard => SceneFeedbackThresholds {
+                max_center_error: 0.10,
+                max_contact_error: 0.14,
+                max_area_log2_error: 0.65,
+                min_overall_score: 0.65,
+            },
+            Self::Strict => SceneFeedbackThresholds {
+                max_center_error: 0.06,
+                max_contact_error: 0.09,
+                max_area_log2_error: 0.35,
+                min_overall_score: 0.82,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ScenePlanBsnArgs {
     pub manifest: SceneObjectManifest,
     pub asset_bindings: Vec<SceneAssetBinding>,
-    #[serde(default)]
-    pub object_reference_image_path: Option<PathBuf>,
-    #[serde(default)]
-    pub output_dir: Option<PathBuf>,
     #[serde(default)]
     pub apply: bool,
     #[serde(default = "default_scene_clear_existing")]
@@ -2693,6 +4842,8 @@ struct SceneSetCameraArgs {
     pub pitch: Option<f32>,
     #[serde(default)]
     pub radius: Option<f32>,
+    #[serde(default)]
+    pub vertical_fov: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2816,6 +4967,7 @@ impl From<TrellisQuality> for burn_synth::TrellisQuality {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn_synth_scene::SceneCamera;
     use clap::Parser;
 
     #[test]
@@ -2864,6 +5016,97 @@ mod tests {
     }
 
     #[test]
+    fn server_args_accept_scene_build_subcommand() {
+        let args = ServerArgs::parse_from([
+            "burn_synth_mcp",
+            "--backend",
+            "wgpu",
+            "--trellis-quality",
+            "low",
+            "scene-build",
+            "--source-scene-path",
+            "/tmp/scene.jpg",
+            "--output-dir",
+            "/tmp/scene-run",
+            "--candidate-count",
+            "2",
+            "--candidate-retry-attempts",
+            "3",
+            "--candidate-batch-size",
+            "1",
+            "--batch-size",
+            "0",
+            "--trellis-pbr",
+            "false",
+            "--apply",
+        ]);
+        assert_eq!(args.backend, InferenceBackend::Wgpu);
+        assert_eq!(args.trellis_quality, TrellisQuality::Low);
+        let Some(ServerCommand::SceneBuild(command)) = args.command else {
+            panic!("expected scene-build subcommand");
+        };
+        assert_eq!(command.source_scene_path, PathBuf::from("/tmp/scene.jpg"));
+        assert_eq!(command.output_dir, Some(PathBuf::from("/tmp/scene-run")));
+        assert_eq!(command.candidate_count, Some(2));
+        assert_eq!(command.candidate_retry_attempts, Some(3));
+        assert_eq!(command.candidate_batch_size, Some(1));
+        assert_eq!(command.batch_size, Some(0));
+        assert!(!command.trellis_pbr);
+        assert!(command.apply);
+        assert!(command.feedback);
+        assert_eq!(command.feedback_iters, 3);
+        assert_eq!(
+            command.feedback_threshold_profile,
+            FeedbackThresholdProfile::Standard
+        );
+    }
+
+    #[test]
+    fn server_args_accept_scene_feedback_replay_rebuild_flag() {
+        let args = ServerArgs::parse_from([
+            "burn_synth_mcp",
+            "scene-feedback-replay",
+            "--output-dir",
+            "/tmp/scene-run",
+            "--feedback-iters",
+            "4",
+            "--rebuild-commands-from-grounded-layout",
+        ]);
+        let Some(ServerCommand::SceneFeedbackReplay(command)) = args.command else {
+            panic!("expected scene-feedback-replay subcommand");
+        };
+        assert_eq!(command.output_dir, PathBuf::from("/tmp/scene-run"));
+        assert_eq!(command.feedback_iters, 4);
+        assert!(command.rebuild_commands_from_grounded_layout);
+    }
+
+    #[test]
+    fn dotenv_var_parses_plain_export_and_quoted_values() {
+        let root = unique_test_dir("dotenv");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join(".env");
+        fs::write(
+            &path,
+            "\n# comment\nOPENAI_API_KEY=plain-key # local\nexport OPENAI_PROJECT_ID='proj_123'\nOPENAI_BASE_URL=\"https://example.test\"\n",
+        )
+        .expect("write .env");
+
+        assert_eq!(
+            dotenv_var(&path, "OPENAI_API_KEY").as_deref(),
+            Some("plain-key")
+        );
+        assert_eq!(
+            dotenv_var(&path, "OPENAI_PROJECT_ID").as_deref(),
+            Some("proj_123")
+        );
+        assert_eq!(
+            dotenv_var(&path, "OPENAI_BASE_URL").as_deref(),
+            Some("https://example.test")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tool_list_includes_batch_splat_and_scene_tools() {
         let tools = tool_defs();
         let names = tools
@@ -2884,6 +5127,7 @@ mod tests {
             "scene_spawn_path",
             "scene_clear",
             "scene_capture",
+            "scene_project_status",
             "scene_compose_assets",
             "scene_validate_layout",
         ] {
@@ -2895,16 +5139,20 @@ mod tests {
     fn select_scene_candidates_rejects_low_reconstruction_score() {
         let manifest = SceneObjectManifest {
             source_scene_path: "/tmp/scene.jpg".to_string(),
+            scene_calibration: None,
             objects: vec![burn_synth_scene::SceneObjectSpec {
                 id: "coffee_table".to_string(),
                 label: "coffee table".to_string(),
                 aliases: Vec::new(),
                 bbox: [0.2, 0.2, 0.8, 0.8],
+                instances: Vec::new(),
+                representative_instance_id: None,
                 reuse_group: None,
                 instance_count: 1,
                 object_prompt: "white coffee table".to_string(),
                 camera_hint: None,
                 rotation_hint_degrees: None,
+                target_footprint_m: None,
             }],
         };
         let candidates = vec![burn_synth_scene::ObjectImageCandidate {
@@ -2913,7 +5161,7 @@ mod tests {
             image_path: "/tmp/table.png".to_string(),
             raw_image_path: None,
             prompt_hash: "hash".to_string(),
-            score: MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE - 0.01,
+            score: DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE - 0.01,
             provider_request_id: None,
         }];
         let err = select_scene_candidates(&manifest, &candidates).unwrap_err();
@@ -2921,19 +5169,112 @@ mod tests {
     }
 
     #[test]
+    fn scene_build_tool_schema_exposes_retry_and_artifact_controls() {
+        let tools = tool_defs();
+        let scene_build = tools
+            .iter()
+            .find(|tool| tool["name"] == "scene_build_from_image")
+            .expect("scene_build_from_image tool");
+        let properties = &scene_build["inputSchema"]["properties"];
+        for key in [
+            "candidate_retry_attempts",
+            "candidate_batch_size",
+            "min_reconstruction_score",
+            "batch_size",
+            "batch_vram_mb",
+            "write_artifacts",
+            "feedback",
+            "feedback_iters",
+            "feedback_keep_viewer",
+            "feedback_capture_dir",
+            "feedback_threshold_profile",
+        ] {
+            assert!(
+                properties.get(key).is_some(),
+                "scene_build_from_image schema missing {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "burn_synth_mcp_artifact_test_{}",
+            next_scene_sequence()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let response = json!({
+            "tool": "scene_build_from_image",
+            "manifest": {
+                "source_scene_path": "/tmp/scene.jpg",
+                "objects": []
+            },
+            "candidates": [],
+            "selected_candidates": [],
+            "asset_outputs": {
+                "items": [
+                    {
+                        "input_image_path": "/tmp/chair.png",
+                        "output_path": "/tmp/chair.glb",
+                        "cache_key": "chair-cache",
+                        "vertices": 12,
+                        "faces": 8,
+                        "local_aabb": {
+                            "min": [-0.5, 0.0, -0.5],
+                            "max": [0.5, 1.0, 0.5]
+                        }
+                    }
+                ]
+            },
+            "grounded_layout": {
+                "placements": [
+                    {
+                        "object_id": "chair",
+                        "asset_id": "chair_asset",
+                        "translation": [0.0, 0.0, 1.0],
+                        "scale": [1.0, 1.0, 1.0],
+                        "target_footprint_m": [0.85, 0.85]
+                    }
+                ]
+            },
+            "commands": [{ "type": "clear_scene" }],
+            "stage_report": [{ "stage": "generate_object_candidates", "elapsed_ms": 7 }],
+            "e2e_summary": {
+                "ok": true,
+                "elapsed_ms": 12
+            },
+            "bsn": "synth_scene_v1 {}"
+        });
+
+        write_scene_build_artifacts(&dir, &response).unwrap();
+
+        assert!(dir.join("manifest.json").exists());
+        assert!(dir.join("asset_outputs.json").exists());
+        assert!(dir.join("stage_report.json").exists());
+        assert!(dir.join("summary.json").exists());
+        assert!(dir.join("scene.bsn").exists());
+        assert!(dir.join("scene_build_response_structured.json").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn scene_asset_bindings_prefer_promoted_catalog_cache_keys() {
         let manifest = SceneObjectManifest {
             source_scene_path: "/tmp/scene.jpg".to_string(),
+            scene_calibration: None,
             objects: vec![burn_synth_scene::SceneObjectSpec {
                 id: "chair_left".to_string(),
                 label: "conference chair".to_string(),
                 aliases: vec!["chair".to_string()],
                 bbox: [0.1, 0.2, 0.3, 0.7],
+                instances: Vec::new(),
+                representative_instance_id: None,
                 reuse_group: None,
                 instance_count: 1,
                 object_prompt: "green conference chair".to_string(),
                 camera_hint: None,
                 rotation_hint_degrees: None,
+                target_footprint_m: None,
             }],
         };
         let selected = vec![json!({
@@ -2950,7 +5291,11 @@ mod tests {
                 {
                     "output_path": "/tmp/chair_candidate_mesh.glb",
                     "cache_key": "central-chair-cache-key",
-                    "synthesis_backend": "trellis"
+                    "synthesis_backend": "trellis",
+                    "local_aabb": {
+                        "min": [-0.5, 0.0, -0.5],
+                        "max": [0.5, 1.0, 0.5]
+                    }
                 }
             ]
         });
@@ -2963,6 +5308,10 @@ mod tests {
             Some("central-chair-cache-key")
         );
         assert!(bindings[0].reusable);
+        assert_eq!(
+            bindings[0].local_aabb.as_ref().map(|aabb| aabb.max[1]),
+            Some(1.0)
+        );
 
         let bsn = "synth_scene_v1 {\nasset chair_left_asset = \"generated:chair_left_asset\";\nspawn chair uses chair_left_asset translation [0.0,0.0,0.0] rotation_y 0.0 scale [1.0,1.0,1.0];\n}";
         let plan = parse_scene_bsn(bsn, &bindings).unwrap();
@@ -2970,6 +5319,179 @@ mod tests {
         assert_eq!(commands[0]["type"], "clear_scene");
         assert_eq!(commands[1]["type"], "spawn_cached");
         assert_eq!(commands[1]["cache_key"], json!("central-chair-cache-key"));
+    }
+
+    #[test]
+    fn scene_asset_bindings_mark_explicit_instances_reusable() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/scene.jpg".to_string(),
+            scene_calibration: None,
+            objects: vec![burn_synth_scene::SceneObjectSpec {
+                id: "chair_group".to_string(),
+                label: "chair group".to_string(),
+                aliases: vec!["chair".to_string()],
+                bbox: [0.1, 0.2, 0.8, 0.8],
+                instances: vec![
+                    burn_synth_scene::SceneObjectInstanceSpec {
+                        id: Some("left".to_string()),
+                        bbox: [0.1, 0.2, 0.25, 0.7],
+                        contact: Some([0.18, 0.7]),
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: None,
+                        slot_index: None,
+                        target_footprint_m: None,
+                    },
+                    burn_synth_scene::SceneObjectInstanceSpec {
+                        id: Some("right".to_string()),
+                        bbox: [0.65, 0.2, 0.8, 0.7],
+                        contact: Some([0.72, 0.7]),
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: None,
+                        slot_index: None,
+                        target_footprint_m: None,
+                    },
+                ],
+                representative_instance_id: None,
+                reuse_group: None,
+                instance_count: 1,
+                object_prompt: "one reusable chair".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            }],
+        };
+        let selected = vec![json!({
+            "object_id": "chair_group",
+            "reuse_group": "chair_group",
+            "label": "chair group",
+            "image_path": "/tmp/chair_candidate.png",
+            "candidate_index": 0,
+            "score": 0.91,
+            "prompt_hash": "abc",
+        })];
+        let asset_outputs = json!({
+            "items": [
+                {
+                    "output_path": "/tmp/chair_candidate_mesh.glb",
+                    "synthesis_backend": "trellis"
+                }
+            ]
+        });
+
+        let bindings =
+            scene_asset_bindings_from_outputs(&manifest, &selected, &asset_outputs).unwrap();
+
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].reusable);
+    }
+
+    #[test]
+    fn scene_asset_bindings_expand_reused_groups_to_each_scene_object() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/scene.jpg".to_string(),
+            scene_calibration: None,
+            objects: vec![
+                burn_synth_scene::SceneObjectSpec {
+                    id: "whiteboard_left".to_string(),
+                    label: "left whiteboard".to_string(),
+                    aliases: vec!["whiteboard".to_string()],
+                    bbox: [0.05, 0.1, 0.35, 0.6],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: Some("whiteboard".to_string()),
+                    instance_count: 1,
+                    object_prompt: "whiteboard on a stand".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: None,
+                },
+                burn_synth_scene::SceneObjectSpec {
+                    id: "whiteboard_right".to_string(),
+                    label: "right whiteboard".to_string(),
+                    aliases: vec!["whiteboard".to_string()],
+                    bbox: [0.65, 0.1, 0.95, 0.6],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: Some("whiteboard".to_string()),
+                    instance_count: 1,
+                    object_prompt: "whiteboard on a stand".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: None,
+                },
+            ],
+        };
+        let selected = vec![json!({
+            "object_id": "whiteboard_left",
+            "reuse_group": "whiteboard",
+            "label": "left whiteboard",
+            "image_path": "/tmp/whiteboard_candidate.png",
+            "candidate_index": 0,
+            "score": 0.95,
+            "prompt_hash": "abc",
+        })];
+        let asset_outputs = json!({
+            "items": [
+                {
+                    "output_path": "/tmp/whiteboard_candidate_mesh.glb",
+                    "cache_key": "whiteboard-cache-key",
+                    "synthesis_backend": "trellis",
+                    "local_aabb": {
+                        "min": [-0.5, 0.0, -0.05],
+                        "max": [0.5, 1.2, 0.05]
+                    }
+                }
+            ]
+        });
+
+        let bindings =
+            scene_asset_bindings_from_outputs(&manifest, &selected, &asset_outputs).unwrap();
+        assert_eq!(bindings.len(), 2);
+        let left = bindings
+            .iter()
+            .find(|binding| binding.object_id == "whiteboard_left")
+            .unwrap();
+        let right = bindings
+            .iter()
+            .find(|binding| binding.object_id == "whiteboard_right")
+            .unwrap();
+        assert_eq!(left.path, right.path);
+        assert_eq!(right.label, "right whiteboard");
+        assert!(right.reusable);
+
+        let layout = grounded_scene_layout_for_manifest(&manifest, &bindings).unwrap();
+        assert!(layout.bsn.contains("whiteboard_left"));
+        assert!(layout.bsn.contains("whiteboard_right"));
+    }
+
+    #[test]
+    fn scene_asset_quality_failures_gate_trellis_mesh_outputs() {
+        let asset_outputs = json!({
+            "items": [
+                {
+                    "asset_kind": "mesh",
+                    "synthesis_backend": "trellis",
+                    "output_path": "/tmp/chair.glb",
+                    "mesh_quality_failures": [
+                        "position-welded boundary edge ratio 0.4200 exceeds 0.0500"
+                    ]
+                },
+                {
+                    "asset_kind": "mesh",
+                    "synthesis_backend": "triposg",
+                    "output_path": "/tmp/legacy.glb",
+                    "mesh_quality_failures": ["legacy warning"]
+                }
+            ]
+        });
+
+        let failures = scene_asset_quality_failures(&asset_outputs);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("/tmp/chair.glb"));
+        assert!(failures[0].contains("boundary edge ratio"));
     }
 
     #[test]
@@ -2987,6 +5509,482 @@ mod tests {
     }
 
     #[test]
+    fn scene_interaction_lock_command_uses_viewer_control_protocol() {
+        let command = scene_interaction_lock_command(true, "iterative scene composition");
+
+        assert_eq!(command["type"], json!("set_interaction_lock"));
+        assert_eq!(command["locked"], json!(true));
+        assert_eq!(command["reason"], json!("iterative scene composition"));
+    }
+
+    #[test]
+    fn feedback_deltas_adjust_spawn_and_camera_commands() {
+        let commands = vec![
+            json!({ "type": "clear_scene" }),
+            json!({
+                "type": "spawn_cached",
+                "cache_key": "chair",
+                "translation": [1.0, 0.5, 2.0],
+                "scale": [1.0, 1.0, 1.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0]
+            }),
+            json!({
+                "type": "set_camera",
+                "translation": [0.0, 2.0, 5.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "focus": [0.0, 0.0, 0.0],
+                "yaw": 180.0,
+                "pitch": 25.0,
+                "radius": 5.0,
+                "vertical_fov": 72.0
+            }),
+        ];
+        let deltas = json!({
+            "objects": [{
+                "index": 0,
+                "translation_delta": [0.25, 0.0, -0.5],
+                "scale_multiplier": 1.2,
+                "yaw_delta_degrees": 12.0
+            }],
+            "camera": {
+                "radius_multiplier": 0.9
+            }
+        });
+
+        let adjusted = apply_feedback_deltas_to_commands(&commands, &deltas).unwrap();
+
+        assert_eq!(adjusted[1]["translation"], json!([1.25, 0.5, 1.5]));
+        let adjusted_scale = adjusted[1]["scale"]
+            .as_array()
+            .expect("spawn command keeps scale array");
+        for component in adjusted_scale {
+            let component = component.as_f64().expect("scale component is numeric");
+            assert!((component - 1.2).abs() <= 1.0e-5);
+        }
+        let adjusted_yaw = quat_y_degrees(json_array4(&adjusted[1]["rotation"]).unwrap());
+        assert!((adjusted_yaw - 12.0).abs() <= 1.0e-4);
+        assert_eq!(adjusted[2]["radius"], json!(4.5));
+    }
+
+    #[test]
+    fn feedback_deltas_normalize_existing_reused_command_scales() {
+        let commands = vec![
+            json!({
+                "type": "spawn_cached",
+                "cache_key": "chair-cache",
+                "translation": [0.0, 0.0, 0.0],
+                "scale": [1.0, 1.0, 1.0],
+            }),
+            json!({
+                "type": "spawn_cached",
+                "cache_key": "chair-cache",
+                "translation": [1.0, 0.0, 0.0],
+                "scale": [2.0, 2.0, 2.0],
+            }),
+            json!({
+                "type": "spawn_cached",
+                "cache_key": "table-cache",
+                "translation": [0.0, 0.0, 1.0],
+                "scale": [0.75, 0.75, 0.75],
+            }),
+        ];
+        let deltas = json!({
+            "objects": [
+                { "translation_delta": [0.0, 0.0, 0.0], "scale_multiplier": 1.0 },
+                { "translation_delta": [0.0, 0.0, 0.0], "scale_multiplier": 1.0 },
+                { "translation_delta": [0.0, 0.0, 0.0], "scale_multiplier": 1.0 }
+            ]
+        });
+
+        let adjusted = apply_feedback_deltas_to_commands(&commands, &deltas).unwrap();
+
+        assert_eq!(adjusted[0]["scale"], json!([1.5, 1.5, 1.5]));
+        assert_eq!(adjusted[1]["scale"], json!([1.5, 1.5, 1.5]));
+        assert_eq!(adjusted[2]["scale"], json!([0.75, 0.75, 0.75]));
+    }
+
+    #[test]
+    fn feedback_deltas_share_scale_for_reused_instances() {
+        let metrics = json!({
+            "objects": [
+                {
+                    "index": 0,
+                    "object_id": "chair",
+                    "cache_key": "chair-cache",
+                    "expected_bbox": [0.1, 0.1, 0.2, 0.3],
+                    "observed_bbox": [0.1, 0.1, 0.3, 0.5],
+                    "translation_delta": [0.0, 0.0, 0.0],
+                    "scale_multiplier": 0.82,
+                    "yaw_delta_degrees": 0.0
+                },
+                {
+                    "index": 1,
+                    "object_id": "chair",
+                    "cache_key": "chair-cache",
+                    "expected_bbox": [0.5, 0.1, 0.6, 0.3],
+                    "observed_bbox": [0.5, 0.1, 0.55, 0.2],
+                    "translation_delta": [0.0, 0.0, 0.0],
+                    "scale_multiplier": 1.22,
+                    "yaw_delta_degrees": 0.0
+                },
+                {
+                    "index": 2,
+                    "object_id": "table",
+                    "cache_key": "table-cache",
+                    "expected_bbox": [0.2, 0.4, 0.8, 0.6],
+                    "observed_bbox": [0.2, 0.4, 0.8, 0.6],
+                    "translation_delta": [0.0, 0.0, 0.0],
+                    "scale_multiplier": 0.95,
+                    "yaw_delta_degrees": 0.0
+                }
+            ]
+        });
+
+        let deltas = feedback_layout_deltas(&metrics);
+        let objects = deltas["objects"].as_array().unwrap();
+        let chair_scale_a = objects[0]["scale_multiplier"].as_f64().unwrap();
+        let chair_scale_b = objects[1]["scale_multiplier"].as_f64().unwrap();
+        let table_scale = objects[2]["scale_multiplier"].as_f64().unwrap();
+
+        assert!((chair_scale_a - 1.02).abs() <= 1.0e-6);
+        assert!((chair_scale_b - 1.02).abs() <= 1.0e-6);
+        assert!((table_scale - 0.95).abs() <= 1.0e-6);
+        assert_eq!(objects[0]["scale_group_key"], json!("chair-cache"));
+        assert_eq!(objects[1]["scale_source"], json!("repeated_instance_group"));
+        assert_eq!(objects[2]["scale_source"], json!("object_projection"));
+    }
+
+    #[test]
+    fn feedback_deltas_damp_camera_ray_scale_until_contact_converges() {
+        let metrics = json!({
+            "objects": [
+                {
+                    "index": 0,
+                    "object_id": "table",
+                    "cache_key": "table-cache",
+                    "expected_bbox": [0.2, 0.5, 0.8, 1.0],
+                    "observed_bbox": [0.1, 0.2, 0.9, 1.2],
+                    "translation_delta": [0.0, 0.0, -0.5],
+                    "grounding_basis": "camera-ray-ground-plane",
+                    "center_error": 0.24,
+                    "contact_error": 0.31,
+                    "scale_multiplier": 0.82,
+                    "yaw_delta_degrees": 0.0
+                }
+            ]
+        });
+
+        let deltas = feedback_layout_deltas(&metrics);
+        let scale = deltas["objects"][0]["scale_multiplier"].as_f64().unwrap();
+        let camera_radius = deltas["camera"]["radius_multiplier"].as_f64().unwrap();
+
+        assert!((scale - 0.955).abs() <= 1.0e-6);
+        assert!((camera_radius - 1.0).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn feedback_status_prefers_capture_acknowledgement_for_screenshot_metrics() {
+        let apply_ack = json!({
+            "status": {
+                "sequence": 1,
+                "projected_items": [{
+                    "screen_bbox": [0.1, 0.1, 0.2, 0.2]
+                }]
+            }
+        });
+        let capture_ack = json!({
+            "acknowledgement": {
+                "status": {
+                    "sequence": 2,
+                    "projected_items": [{
+                        "screen_bbox": [0.3, 0.3, 0.4, 0.4]
+                    }]
+                }
+            }
+        });
+
+        let status = McpServer::feedback_capture_status(&apply_ack, &capture_ack);
+
+        assert_eq!(status["sequence"], json!(2));
+        assert_eq!(
+            status["projected_items"][0]["screen_bbox"],
+            json!([0.3, 0.3, 0.4, 0.4])
+        );
+    }
+
+    #[test]
+    fn feedback_metrics_use_camera_ray_grounding_when_status_has_world_aabb() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: Vec::new(),
+        };
+        let layout = GroundedSceneLayout {
+            bsn: "scene {}".to_string(),
+            placements: vec![GroundedScenePlacement {
+                entity_id: "chair_1".to_string(),
+                asset_id: "chair".to_string(),
+                object_id: "chair".to_string(),
+                instance_id: Some("chair_1".to_string()),
+                label: "chair".to_string(),
+                source_bbox: [0.16, 0.63, 0.37, 1.0],
+                contact_pixel: [0.347, 0.985],
+                ground_point: [0.0, 0.0, 0.0],
+                translation: [0.0, 0.0, 0.0],
+                rotation_y_degrees: 0.0,
+                scale: [1.0, 1.0, 1.0],
+                local_aabb: SceneAssetAabb {
+                    min: [-0.5, 0.0, -0.5],
+                    max: [0.5, 1.0, 0.5],
+                },
+                target_footprint_m: [0.8, 0.8],
+            }],
+            camera: SceneCamera {
+                translation: [0.0, 2.0, -3.0],
+                focus: [0.0, 0.7, 0.0],
+                yaw: Some(180.0),
+                pitch: Some(25.0),
+                radius: Some(4.0),
+                vertical_fov_degrees: Some(70.0),
+            },
+            rug_center: [0.0, 0.0, 0.0],
+            rug_scale: [1.0, 1.0, 1.0],
+        };
+        let status = json!({
+            "projected_items": [{
+                "cache_key": "chair",
+                "screen_bbox": [0.60, 0.42, 0.82, 0.74],
+                "screen_contact": [0.70, 0.66],
+                "world_aabb": {
+                    "min": [-0.5, 0.0, -0.5],
+                    "max": [0.5, 1.0, 0.5]
+                },
+                "projected_corners": 8,
+                "total_corners": 8
+            }],
+            "camera": {
+                "translation": [-0.00000027, 1.9615524, -3.07795],
+                "rotation": [0.0000000083, 0.9816272, 0.19080901, -0.0000000429],
+                "yaw": std::f32::consts::PI,
+                "pitch": 0.38397244,
+                "radius": 3.3142834,
+                "vertical_fov_degrees": 70.0
+            }
+        });
+
+        let metrics = scene_feedback_metrics(
+            &manifest,
+            &layout,
+            &status,
+            Path::new("/tmp/no_screenshot.png"),
+            FeedbackThresholdProfile::Standard.thresholds(),
+            FeedbackThresholdProfile::Standard,
+        )
+        .unwrap();
+        let object = &metrics["objects"][0];
+        let translation_delta = json_array3(&object["translation_delta"]).unwrap();
+
+        assert_eq!(object["grounding_basis"], json!("camera-ray-ground-plane"));
+        assert!(translation_delta[0] > 0.2);
+        assert!(translation_delta[2] < -0.5);
+        assert!(object["target_ground_point"].is_array());
+        assert!(object["observed_ground_point"].is_array());
+    }
+
+    #[test]
+    fn feedback_metrics_use_bbox_center_anchor_for_tabletops() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: Vec::new(),
+        };
+        let layout = GroundedSceneLayout {
+            bsn: "scene {}".to_string(),
+            placements: vec![GroundedScenePlacement {
+                entity_id: "table_1".to_string(),
+                asset_id: "table".to_string(),
+                object_id: "conference_table".to_string(),
+                instance_id: None,
+                label: "conference table".to_string(),
+                source_bbox: [0.4, 0.5, 0.6, 1.0],
+                contact_pixel: [0.5, 1.0],
+                ground_point: [0.0, 0.0, 0.0],
+                translation: [0.0, 0.0, 0.0],
+                rotation_y_degrees: 0.0,
+                scale: [1.0, 1.0, 1.0],
+                local_aabb: SceneAssetAabb {
+                    min: [-1.0, 0.0, -0.4],
+                    max: [1.0, 0.2, 0.4],
+                },
+                target_footprint_m: [2.0, 0.8],
+            }],
+            camera: SceneCamera {
+                translation: [0.0, 2.0, -3.0],
+                focus: [0.0, 0.7, 0.0],
+                yaw: Some(180.0),
+                pitch: Some(25.0),
+                radius: Some(4.0),
+                vertical_fov_degrees: Some(70.0),
+            },
+            rug_center: [0.0, 0.0, 0.0],
+            rug_scale: [1.0, 1.0, 1.0],
+        };
+        let status = json!({
+            "projected_items": [{
+                "cache_key": "table",
+                "screen_bbox": [0.4, 0.3, 0.6, 0.7],
+                "screen_contact": [0.5, 0.45],
+                "world_aabb": {
+                    "min": [-1.0, 0.0, -0.4],
+                    "max": [1.0, 0.2, 0.4]
+                },
+                "projected_corners": 8,
+                "total_corners": 8
+            }],
+            "camera": {
+                "translation": [0.0, 2.0, -3.0],
+                "rotation": [0.0, 0.9816272, 0.19080901, 0.0],
+                "yaw": std::f32::consts::PI,
+                "pitch": 0.38397244,
+                "radius": 3.3142834,
+                "vertical_fov_degrees": 70.0
+            }
+        });
+
+        let metrics = scene_feedback_metrics(
+            &manifest,
+            &layout,
+            &status,
+            Path::new("/tmp/no_screenshot.png"),
+            FeedbackThresholdProfile::Standard.thresholds(),
+            FeedbackThresholdProfile::Standard,
+        )
+        .unwrap();
+        let object = &metrics["objects"][0];
+        let translation_delta = json_array3(&object["translation_delta"]).unwrap();
+
+        assert_eq!(object["anchor_basis"], json!("bbox-center"));
+        assert_eq!(object["expected_anchor"], json!([0.5, 0.75]));
+        assert_eq!(object["observed_anchor"], json!([0.5, 0.5]));
+        assert!(translation_delta[2].abs() <= 0.850001);
+    }
+
+    #[test]
+    fn feedback_metrics_emit_bounded_corrections_for_projection_mismatch() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: Vec::new(),
+        };
+        let layout = GroundedSceneLayout {
+            bsn: "scene {}".to_string(),
+            placements: vec![GroundedScenePlacement {
+                entity_id: "chair_1".to_string(),
+                asset_id: "chair".to_string(),
+                object_id: "chair".to_string(),
+                instance_id: Some("chair_1".to_string()),
+                label: "chair".to_string(),
+                source_bbox: [0.4, 0.4, 0.6, 0.7],
+                contact_pixel: [0.5, 0.7],
+                ground_point: [0.0, 0.0, 0.0],
+                translation: [0.0, 0.0, 0.0],
+                rotation_y_degrees: 0.0,
+                scale: [1.0, 1.0, 1.0],
+                local_aabb: SceneAssetAabb {
+                    min: [-0.5, 0.0, -0.5],
+                    max: [0.5, 1.0, 0.5],
+                },
+                target_footprint_m: [0.8, 0.8],
+            }],
+            camera: SceneCamera {
+                translation: [0.0, 2.0, 5.0],
+                focus: [0.0, 0.0, 0.0],
+                yaw: Some(180.0),
+                pitch: Some(25.0),
+                radius: Some(5.0),
+                vertical_fov_degrees: Some(72.0),
+            },
+            rug_center: [0.0, 0.0, 0.0],
+            rug_scale: [1.0, 1.0, 1.0],
+        };
+        let status = json!({
+            "projected_items": [{
+                "cache_key": "chair",
+                "screen_bbox": [0.45, 0.5, 0.55, 0.6],
+                "screen_contact": [0.5, 0.6],
+                "projected_corners": 8,
+                "total_corners": 8
+            }],
+            "camera": {
+                "radius": 5.0
+            }
+        });
+
+        let metrics = scene_feedback_metrics(
+            &manifest,
+            &layout,
+            &status,
+            Path::new("/tmp/iter.png"),
+            FeedbackThresholdProfile::Standard.thresholds(),
+            FeedbackThresholdProfile::Standard,
+        )
+        .unwrap();
+        let deltas = feedback_layout_deltas(&metrics);
+
+        assert!(!metrics["passed"].as_bool().unwrap());
+        assert_eq!(metrics["object_count"], json!(1));
+        assert_eq!(metrics["object_pass_count"], json!(0));
+        let object_delta = &deltas["objects"][0];
+        let translation_delta = object_delta["translation_delta"].as_array().unwrap();
+        assert!(translation_delta[0].as_f64().unwrap().abs() <= 1.0e-6);
+        assert!(translation_delta[1].as_f64().unwrap().abs() <= 1.0e-6);
+        assert!((translation_delta[2].as_f64().unwrap() - 0.2).abs() <= 1.0e-5);
+        let scale = object_delta["scale_multiplier"].as_f64().unwrap();
+        assert!((scale - 1.22).abs() <= 1.0e-5);
+        let yaw_delta = object_delta["yaw_delta_degrees"].as_f64().unwrap();
+        assert!(yaw_delta.abs() > 1.0);
+        assert_eq!(
+            metrics["objects"][0]["yaw_basis"],
+            json!("source-side-aspect-fallback")
+        );
+    }
+
+    #[test]
+    fn apply_mesh_decimation_preserves_pbr_baked_meshes() {
+        let mesh = Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            faces: vec![[0, 1, 2], [1, 3, 2]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            material: None,
+            pbr_textures: Some(burn_synth::MeshPbrTextures {
+                base_color: burn_synth::MeshTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![255, 255, 255, 255],
+                },
+                metallic_roughness: burn_synth::MeshTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![0, 255, 0, 255],
+                },
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
+        };
+
+        let output = apply_mesh_decimation(mesh.clone(), Some(1)).expect("decimation");
+
+        assert_eq!(output.faces.len(), mesh.faces.len());
+        assert!(output.pbr_textures.is_some());
+    }
+
+    #[test]
     fn scene_compose_plan_generates_spawn_commands_with_validation_keys() {
         let plan = compose_scene_layout(SceneComposeArgs {
             reference_objects: vec![scene_layout::SceneReferenceObject {
@@ -3001,6 +5999,7 @@ mod tests {
                 aliases: Vec::new(),
                 path: Some(PathBuf::from("/tmp/chair.glb")),
                 cache_key: None,
+                local_aabb: None,
                 select: true,
             }],
             apply: false,

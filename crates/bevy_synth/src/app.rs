@@ -64,7 +64,8 @@ use bevy_synth_ui::bevy_editor_core::selection::{
     EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
 };
 use bevy_synth_ui::bevy_file_dialog::prelude::{
-    DialogFileDropped, DialogFileLoaded, FileDialogExt, FileDialogPlugin,
+    DialogFileDropped, DialogFileLoaded, DialogFileSaveCanceled, DialogFileSaved, FileDialogExt,
+    FileDialogPlugin,
 };
 use bevy_synth_ui::bevy_transform_gizmos;
 use bevy_synth_ui::bevy_transform_gizmos::TransformGizmoSystems;
@@ -79,19 +80,29 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
-
 #[cfg(not(target_arch = "wasm32"))]
+use burn_synth_scene::{
+    SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneCamera, parse_scene_bsn,
+};
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use bevy_synth_runtime::args::BackendKind;
 use bevy_synth_runtime::args::SynthesisModel;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 #[cfg(target_arch = "wasm32")]
 use bevy_synth_runtime::args::{QualityPreset, RmbgModel, TripoSplatProfile, WeightPrecision};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::cache::CachedAssetKind;
 use bevy_synth_runtime::cache::{
-    CachedCameraState, CachedMeshMetadata, CachedWorldItem, MeshCache,
+    CachedAssetAabb, CachedAssetFrame, CachedCameraState, CachedMeshMetadata, CachedWorldItem,
+    MeshCache,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::io::mesh_from_glb_bytes;
-use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
+use bevy_synth_runtime::io::{
+    SceneGlbMeshInstance, image_bytes_to_bevy_image, is_image_file, is_mesh_file,
+    resolve_output_path, scene_meshes_to_glb_bytes, write_glb,
+};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
 use bevy_synth_runtime::state::{
     ExitState, InferenceQueue, InferenceRequest, InferenceSettings, InferenceWorker, Spinner,
@@ -114,7 +125,7 @@ use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogSpawnAsset,
     CatalogSpawnRequest, CatalogState, CatalogStatus, CatalogUiState, DragState, MainCamera,
-    preview_light_layers,
+    SceneSaveKind, SceneSaveRequest, preview_light_layers,
 };
 
 use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -184,6 +195,34 @@ impl Plugin for PanOrbitCameraPlugin {
 #[derive(Component, Clone, Debug)]
 pub(crate) struct CachedMeshInstance {
     pub(crate) cache_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct SceneBsnSaveDialog;
+
+#[derive(Clone, Debug)]
+struct SceneGlbSaveDialog;
+
+#[derive(Resource, Default)]
+struct PendingSceneBsnSave {
+    assets_json: Option<Vec<u8>>,
+}
+
+#[derive(Resource, Clone, Debug, Default)]
+pub(crate) struct SceneInteractionLock {
+    pub(crate) locked: bool,
+    pub(crate) reason: Option<String>,
+}
+
+impl SceneInteractionLock {
+    pub(crate) fn set(&mut self, locked: bool, reason: Option<String>) {
+        self.locked = locked;
+        self.reason = if locked {
+            reason.filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
+    }
 }
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
@@ -669,9 +708,16 @@ enum McpSceneCommand {
         pitch: Option<f32>,
         #[serde(default)]
         radius: Option<f32>,
+        #[serde(default)]
+        vertical_fov: Option<f32>,
     },
     CaptureScreenshot {
         path: PathBuf,
+    },
+    SetInteractionLock {
+        locked: bool,
+        #[serde(default)]
+        reason: Option<String>,
     },
     ReloadCache,
     SaveCache,
@@ -689,8 +735,22 @@ struct McpSceneStatus {
     command_results: Vec<McpSceneCommandResult>,
     cache_entries: Vec<CachedMeshMetadata>,
     world_items: Vec<CachedWorldItem>,
+    projected_items: Vec<McpProjectedWorldItem>,
     camera: Option<CachedCameraState>,
     screenshots: Vec<String>,
+    interaction_locked: bool,
+    interaction_lock_reason: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize)]
+struct McpProjectedWorldItem {
+    cache_key: String,
+    world_aabb: Option<CachedAssetAabb>,
+    screen_bbox: Option<[f32; 4]>,
+    screen_contact: Option<[f32; 2]>,
+    projected_corners: usize,
+    total_corners: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -762,6 +822,8 @@ pub(crate) fn run() {
         .init_resource::<EditorSelection>()
         .insert_resource(MeshCacheResource::load_or_empty())
         .insert_resource(WorldCachePersistence::default())
+        .insert_resource(PendingSceneBsnSave::default())
+        .insert_resource(SceneInteractionLock::default())
         .insert_resource(UiStatus {
             message: status_message,
             processing: false,
@@ -795,6 +857,9 @@ pub(crate) fn run() {
             handle_open_file_dialog,
             handle_file_dialog_loads,
             handle_dropped_files,
+            handle_scene_save_requests,
+            handle_scene_bsn_save_results,
+            handle_scene_glb_save_results,
             #[cfg(target_arch = "wasm32")]
             kickoff_wasm_warmup.before(finish_wasm_startup_when_models_ready),
             #[cfg(target_arch = "wasm32")]
@@ -815,12 +880,18 @@ pub(crate) fn run() {
     );
     app.add_systems(
         PostUpdate,
+        enforce_scene_interaction_lock.before(TransformGizmoSystems::Main),
+    );
+    app.add_systems(
+        PostUpdate,
         (sync_panorbit_bindings, sync_panorbit_enabled).before(PanOrbitCameraSystemSet),
     );
     app.add_plugins(
         FileDialogPlugin::new()
             .with_load_file::<ImagePickDialog>()
-            .with_drop_file::<ImagePickDialog>(),
+            .with_drop_file::<ImagePickDialog>()
+            .with_save_file::<SceneBsnSaveDialog>()
+            .with_save_file::<SceneGlbSaveDialog>(),
     );
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1789,6 +1860,8 @@ fn hydrate_from_cache(
                 );
             }
         }
+        let source_image = cached_source_image_handle(&cache.cache, &metadata, images.as_mut());
+        catalog.set_source_image(entry_id, source_image);
         loaded_assets += 1;
     }
 
@@ -1853,6 +1926,33 @@ fn cached_asset_handles(
                     None
                 }
             }
+        }
+    }
+}
+
+fn cached_source_image_handle(
+    cache: &MeshCache,
+    metadata: &CachedMeshMetadata,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    match cache.load_source_image(metadata) {
+        Ok(Some(source)) => match image_bytes_to_bevy_image(source.bytes.as_slice()) {
+            Ok(image) => Some(images.add(image)),
+            Err(err) => {
+                warn!(
+                    "failed to decode cached source image for key {}: {err}",
+                    metadata.cache_key
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                "failed to load cached source image for key {}: {err}",
+                metadata.cache_key
+            );
+            None
         }
     }
 }
@@ -1992,6 +2092,7 @@ fn transform_from_cached_world_item(item: &CachedWorldItem) -> Option<Transform>
 fn camera_state_from_components(
     transform: &Transform,
     orbit: &PanOrbitCamera,
+    projection: Option<&Projection>,
 ) -> Option<CachedCameraState> {
     let translation = transform.translation;
     let rotation = if transform.rotation.length_squared() > 0.0 {
@@ -2021,6 +2122,10 @@ fn camera_state_from_components(
         yaw,
         pitch,
         radius,
+        vertical_fov_degrees: projection.and_then(|projection| match projection {
+            Projection::Perspective(perspective) => Some(perspective.fov.to_degrees()),
+            _ => None,
+        }),
     })
 }
 
@@ -2295,8 +2400,9 @@ fn handle_open_file_dialog(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
     exit_state: Res<ExitState>,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
-    if exit_state.requested {
+    if exit_state.requested || interaction_lock.locked {
         return;
     }
     let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
@@ -2328,8 +2434,13 @@ fn handle_file_dialog_loads(
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
     exit_state: Res<ExitState>,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
     if exit_state.requested {
+        return;
+    }
+    if interaction_lock.locked {
+        for _ in events.read() {}
         return;
     }
     let mut queued = 0usize;
@@ -2368,8 +2479,13 @@ fn handle_dropped_files(
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
     exit_state: Res<ExitState>,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
     if exit_state.requested {
+        return;
+    }
+    if interaction_lock.locked {
+        for _ in events.read() {}
         return;
     }
     let mut queued = 0usize;
@@ -2392,6 +2508,389 @@ fn handle_dropped_files(
     if queued > 0 {
         update_status_message(&args, &queue, &mut status);
     }
+}
+
+fn handle_scene_save_requests(
+    mut requests: MessageReader<SceneSaveRequest>,
+    mut commands: Commands,
+    cache: Res<MeshCacheResource>,
+    cached_query: Query<(&CachedMeshInstance, &Transform)>,
+    camera_query: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
+    mut pending_bsn: ResMut<PendingSceneBsnSave>,
+    mut status: ResMut<UiStatus>,
+    interaction_lock: Res<SceneInteractionLock>,
+) {
+    let mut last_request = None;
+    for request in requests.read() {
+        last_request = Some(request.kind);
+    }
+    if interaction_lock.locked {
+        return;
+    }
+    let Some(kind) = last_request else {
+        return;
+    };
+
+    let world_items = collect_cached_world_items(&cached_query);
+    let camera_state = camera_query
+        .single()
+        .ok()
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
+
+    match kind {
+        SceneSaveKind::Bsn => {
+            #[cfg(not(target_arch = "wasm32"))]
+            match scene_bsn_export_for_world(&cache.cache, &world_items, camera_state) {
+                Ok((bsn, assets_json)) => {
+                    pending_bsn.assets_json = Some(assets_json);
+                    commands
+                        .dialog()
+                        .set_title("save scene")
+                        .set_file_name("scene.bsn")
+                        .add_filter("BSN scene", &["bsn"])
+                        .save_file::<SceneBsnSaveDialog>(bsn.into_bytes());
+                }
+                Err(err) => {
+                    pending_bsn.assets_json = None;
+                    status.message = format!("scene save failed: {err}");
+                    warn!("{}", status.message);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = camera_state;
+                pending_bsn.assets_json = None;
+                status.message =
+                    "BSN scene save requires native sidecar file support; export GLB instead."
+                        .to_string();
+                warn!("{}", status.message);
+            }
+        }
+        SceneSaveKind::Glb => match scene_glb_export_for_world(&cache.cache, &world_items) {
+            Ok(glb) => {
+                commands
+                    .dialog()
+                    .set_title("export scene")
+                    .set_file_name("scene.glb")
+                    .add_filter("GLB scene", &["glb"])
+                    .save_file::<SceneGlbSaveDialog>(glb);
+            }
+            Err(err) => {
+                status.message = format!("GLB export failed: {err}");
+                warn!("{}", status.message);
+            }
+        },
+    }
+}
+
+fn handle_scene_bsn_save_results(
+    mut saved: MessageReader<DialogFileSaved<SceneBsnSaveDialog>>,
+    mut canceled: MessageReader<DialogFileSaveCanceled<SceneBsnSaveDialog>>,
+    mut pending: ResMut<PendingSceneBsnSave>,
+    mut status: ResMut<UiStatus>,
+) {
+    let mut canceled_any = false;
+    for _ in canceled.read() {
+        canceled_any = true;
+    }
+    if canceled_any {
+        pending.assets_json = None;
+        status.message = "scene save canceled.".to_string();
+    }
+
+    for event in saved.read() {
+        match &event.result {
+            Ok(()) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(path) = event.path()
+                    && let Some(assets_json) = pending.assets_json.take()
+                {
+                    let sidecar = scene_assets_sidecar_path(path);
+                    if let Err(err) = fs::write(&sidecar, assets_json) {
+                        status.message = format!(
+                            "saved {}, but failed to write {}: {err}",
+                            event.file_name,
+                            sidecar.display()
+                        );
+                        warn!("{}", status.message);
+                        continue;
+                    }
+                    status.message = format!(
+                        "saved {} and {}.",
+                        event.file_name,
+                        sidecar
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("scene.assets.json")
+                    );
+                    continue;
+                }
+                pending.assets_json = None;
+                status.message = format!("saved {}.", event.file_name);
+            }
+            Err(err) => {
+                pending.assets_json = None;
+                status.message = format!("scene save failed: {err}");
+                warn!("{}", status.message);
+            }
+        }
+    }
+}
+
+fn handle_scene_glb_save_results(
+    mut saved: MessageReader<DialogFileSaved<SceneGlbSaveDialog>>,
+    mut canceled: MessageReader<DialogFileSaveCanceled<SceneGlbSaveDialog>>,
+    mut status: ResMut<UiStatus>,
+) {
+    for _ in canceled.read() {
+        status.message = "GLB export canceled.".to_string();
+    }
+    for event in saved.read() {
+        match &event.result {
+            Ok(()) => {
+                status.message = format!("exported {}.", event.file_name);
+            }
+            Err(err) => {
+                status.message = format!("GLB export failed: {err}");
+                warn!("{}", status.message);
+            }
+        }
+    }
+}
+
+pub(crate) fn scene_glb_export_for_world(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+) -> Result<Vec<u8>, String> {
+    if world_items.is_empty() {
+        return Err("scene is empty".to_string());
+    }
+
+    let mut instances = Vec::with_capacity(world_items.len());
+    for (index, item) in world_items.iter().enumerate() {
+        let asset = cache
+            .load_asset(&item.cache_key)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("cache entry {} is missing its payload", item.cache_key))?;
+        match asset {
+            SynthAsset::Mesh(mesh) => {
+                instances.push(SceneGlbMeshInstance {
+                    name: scene_entity_name(index, &item.cache_key),
+                    mesh,
+                    translation: item.translation,
+                    rotation: item.rotation,
+                    scale: item.scale,
+                });
+            }
+            SynthAsset::GaussianSplat(_) => {
+                return Err(
+                    "GLB export currently supports mesh scenes only; use BSN for splats."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    scene_meshes_to_glb_bytes(&instances).map_err(|err| err.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scene_bsn_export_for_world(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    camera_state: Option<CachedCameraState>,
+) -> Result<(String, Vec<u8>), String> {
+    if world_items.is_empty() {
+        return Err("scene is empty".to_string());
+    }
+
+    let (assets, asset_ids) = scene_asset_bindings_for_world(cache, world_items)?;
+    let mut bsn = String::from("synth_scene_v1 {\n");
+    for asset in &assets {
+        bsn.push_str(&format!(
+            "asset {} = \"cache:{}\";\n",
+            asset.asset_id,
+            asset
+                .cache_key
+                .as_deref()
+                .unwrap_or(asset.asset_id.as_str())
+        ));
+    }
+    for (index, item) in world_items.iter().enumerate() {
+        let asset_id = asset_ids
+            .get(&item.cache_key)
+            .ok_or_else(|| format!("missing scene asset id for {}", item.cache_key))?;
+        bsn.push_str(&format!(
+            "spawn {} uses {} translation [{}] rotation_y {} scale [{}];\n",
+            scene_entity_name(index, &item.cache_key),
+            asset_id,
+            fmt_scene_vec3(item.translation),
+            fmt_scene_f32(rotation_y_degrees_from_quat(item.rotation)),
+            fmt_scene_vec3(item.scale)
+        ));
+    }
+    if let Some(camera) = camera_state.map(scene_camera_from_cached_state) {
+        bsn.push_str(&format!(
+            "camera translation [{}] focus [{}] yaw {} pitch {} radius {};\n",
+            fmt_scene_vec3(camera.translation),
+            fmt_scene_vec3(camera.focus),
+            fmt_scene_f32(camera.yaw.unwrap_or(0.0)),
+            fmt_scene_f32(camera.pitch.unwrap_or(0.0)),
+            fmt_scene_f32(camera.radius.unwrap_or(0.0))
+        ));
+    }
+    bsn.push_str("}\n");
+
+    parse_scene_bsn(&bsn, &assets).map_err(|err| err.to_string())?;
+    let assets_json = serde_json::to_vec_pretty(&assets).map_err(|err| err.to_string())?;
+    Ok((bsn, assets_json))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_asset_bindings_for_world(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+) -> Result<(Vec<SceneAssetBinding>, HashMap<String, String>), String> {
+    let mut assets = Vec::new();
+    let mut asset_ids = HashMap::new();
+    for item in world_items {
+        if asset_ids.contains_key(&item.cache_key) {
+            continue;
+        }
+        let metadata = cache
+            .asset_entries()
+            .iter()
+            .find(|entry| entry.cache_key == item.cache_key)
+            .ok_or_else(|| format!("cache entry {} is missing metadata", item.cache_key))?;
+        let mut asset_id = format!("asset_{}", sanitize_scene_identifier(&item.cache_key));
+        if asset_ids.values().any(|existing| existing == &asset_id) {
+            asset_id = format!("{asset_id}_{}", assets.len() + 1);
+        }
+        asset_ids.insert(item.cache_key.clone(), asset_id.clone());
+        assets.push(SceneAssetBinding {
+            asset_id,
+            object_id: sanitize_scene_identifier(&metadata.label),
+            label: metadata.label.clone(),
+            aliases: Vec::new(),
+            path: None,
+            cache_key: Some(metadata.cache_key.clone()),
+            reusable: true,
+            source_image_path: Some(metadata.source_image_path.clone()),
+            pipeline: Some(scene_pipeline_label(metadata.asset_kind).to_string()),
+            local_aabb: metadata.local_aabb.map(scene_aabb_from_cached),
+            canonical_frame: metadata.canonical_frame.map(scene_frame_from_cached),
+            provenance: None,
+        });
+    }
+    Ok((assets, asset_ids))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_pipeline_label(kind: CachedAssetKind) -> &'static str {
+    match kind {
+        CachedAssetKind::Mesh => "mesh",
+        CachedAssetKind::GaussianSplat => "gaussian_splat",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_aabb_from_cached(aabb: bevy_synth_runtime::cache::CachedAssetAabb) -> SceneAssetAabb {
+    SceneAssetAabb {
+        min: aabb.min,
+        max: aabb.max,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_frame_from_cached(frame: CachedAssetFrame) -> SceneAssetFrame {
+    SceneAssetFrame {
+        yaw_offset_degrees: frame.yaw_offset_degrees,
+        footprint_m: frame.footprint_m,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_camera_from_cached_state(camera: CachedCameraState) -> SceneCamera {
+    SceneCamera {
+        translation: camera.translation,
+        focus: camera.focus,
+        yaw: Some(camera.yaw.to_degrees()),
+        pitch: Some(camera.pitch.to_degrees()),
+        radius: Some(camera.radius),
+        vertical_fov_degrees: camera.vertical_fov_degrees,
+    }
+}
+
+fn scene_entity_name(index: usize, cache_key: &str) -> String {
+    format!(
+        "item_{:03}_{}",
+        index + 1,
+        sanitize_scene_identifier(cache_key)
+    )
+}
+
+fn sanitize_scene_identifier(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().max(1));
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("asset");
+    }
+    if out
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        out.insert_str(0, "id_");
+    }
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rotation_y_degrees_from_quat(rotation: [f32; 4]) -> f32 {
+    if rotation.iter().any(|value| !value.is_finite()) {
+        return 0.0;
+    }
+    let quat = Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
+    let quat = if quat.length_squared() > 0.0 {
+        quat.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let (yaw, _, _) = quat.to_euler(EulerRot::YXZ);
+    yaw.to_degrees()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_scene_vec3(value: [f32; 3]) -> String {
+    value.map(fmt_scene_f32).join(",")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_scene_f32(value: f32) -> String {
+    let value = if value.abs() < 1.0e-6 { 0.0 } else { value };
+    let mut out = format!("{value:.6}");
+    while out.contains('.') && out.ends_with('0') {
+        out.pop();
+    }
+    if out.ends_with('.') {
+        out.pop();
+    }
+    if out == "-0" { "0".to_string() } else { out }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_assets_sidecar_path(path: &Path) -> PathBuf {
+    path.with_extension("assets.json")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2483,11 +2982,13 @@ fn poll_mcp_scene_control(
     mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
     mut cache: ResMut<MeshCacheResource>,
     mut selection: ResMut<EditorSelection>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
     transformables: Query<(), With<GizmoTransformable>>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut query_set: ParamSet<(
-        Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+        Query<(&mut Transform, &mut PanOrbitCamera, &mut Projection), With<MainCamera>>,
         Query<(&CachedMeshInstance, &Transform)>,
+        Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     )>,
     mut world_cache: ResMut<WorldCachePersistence>,
 ) {
@@ -2602,11 +3103,16 @@ fn poll_mcp_scene_control(
                         cache_key: cache_key.clone(),
                         source_image_path: cache_key.clone(),
                         label: cache_key.clone(),
+                        source_image_payload_id: None,
+                        source_image_name: None,
+                        source_image_mime: None,
                         asset_kind: Default::default(),
                         mesh_payload_id: String::new(),
                         gltf_output_id: None,
                         glb_output_id: String::new(),
                         splat_payload_id: None,
+                        local_aabb: None,
+                        canonical_frame: None,
                         updated_at_unix_ms: 0,
                     });
                 let Some(handles) = cached_asset_handles(
@@ -2832,43 +3338,65 @@ fn poll_mcp_scene_control(
                 yaw,
                 pitch,
                 radius,
+                vertical_fov,
             } => {
-                if let Ok((mut transform, mut orbit)) = query_set.p0().single_mut() {
-                    let target_translation = Vec3::from_array(translation);
+                if let Ok((mut transform, mut orbit, mut projection)) = query_set.p0().single_mut()
+                {
+                    let mut target_translation = Vec3::from_array(translation);
                     let target_rotation =
                         Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
+                    let target_focus = focus
+                        .map(Vec3::from_array)
+                        .filter(|value| value.is_finite())
+                        .unwrap_or(orbit.focus);
+                    let target_yaw = yaw
+                        .filter(|value| value.is_finite())
+                        .map(|value| value.to_radians());
+                    let target_pitch = pitch
+                        .filter(|value| value.is_finite())
+                        .map(|value| value.abs().to_radians());
+                    let target_radius = radius.filter(|value| value.is_finite() && *value > 0.0);
+                    let target_vertical_fov =
+                        vertical_fov.filter(|value| value.is_finite() && *value > 0.0);
+                    if let (Some(yaw), Some(pitch), Some(radius)) =
+                        (target_yaw, target_pitch, target_radius)
+                    {
+                        let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
+                        let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
+                        let orbit_rotation = yaw_rot * pitch_rot;
+                        target_translation =
+                            target_focus + orbit_rotation * Vec3::new(0.0, 0.0, radius);
+                    }
                     if target_translation.is_finite() && target_rotation.is_finite() {
                         transform.translation = target_translation;
-                        transform.rotation = if target_rotation.length_squared() > 0.0 {
-                            target_rotation.normalize()
-                        } else {
-                            Quat::IDENTITY
-                        };
-                        if let Some(focus) = focus {
-                            let focus = Vec3::from_array(focus);
-                            if focus.is_finite() {
-                                orbit.focus = focus;
-                                orbit.target_focus = focus;
-                            }
-                        }
-                        if let Some(yaw) = yaw
-                            && yaw.is_finite()
+                        if let (Some(yaw), Some(pitch), Some(radius)) =
+                            (target_yaw, target_pitch, target_radius)
                         {
+                            let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
+                            let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
+                            transform.rotation = yaw_rot * pitch_rot;
                             orbit.yaw = Some(yaw);
                             orbit.target_yaw = yaw;
-                        }
-                        if let Some(pitch) = pitch
-                            && pitch.is_finite()
-                        {
                             orbit.pitch = Some(pitch);
                             orbit.target_pitch = pitch;
-                        }
-                        if let Some(radius) = radius
-                            && radius.is_finite()
-                            && radius > 0.0
-                        {
                             orbit.radius = Some(radius);
                             orbit.target_radius = radius;
+                        } else if target_focus.distance_squared(target_translation) > 0.000_001 {
+                            transform.look_at(target_focus, Vec3::Y);
+                        } else {
+                            transform.rotation = if target_rotation.length_squared() > 0.0 {
+                                target_rotation.normalize()
+                            } else {
+                                Quat::IDENTITY
+                            };
+                        }
+                        orbit.focus = target_focus;
+                        orbit.target_focus = target_focus;
+                        orbit.initialized = true;
+                        if let (Some(vertical_fov), Projection::Perspective(perspective)) =
+                            (target_vertical_fov, projection.as_mut())
+                        {
+                            perspective.fov = vertical_fov.to_radians();
                         }
                         command_results.push(mcp_scene_command_result(
                             command_index,
@@ -2932,6 +3460,28 @@ fn poll_mcp_scene_control(
                     screenshots.last().cloned(),
                 ));
             }
+            McpSceneCommand::SetInteractionLock { locked, reason } => {
+                interaction_lock.set(locked, reason.clone());
+                if locked {
+                    selection.clear();
+                }
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "set_interaction_lock",
+                    true,
+                    if locked {
+                        reason
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or("scene interaction locked")
+                            .to_string()
+                    } else {
+                        "scene interaction unlocked".to_string()
+                    },
+                    None,
+                    None,
+                ));
+            }
             McpSceneCommand::ReloadCache => match MeshCache::load_default() {
                 Ok(reloaded_cache) => {
                     let entries = reloaded_cache.asset_entries().len();
@@ -2977,7 +3527,9 @@ fn poll_mcp_scene_control(
             main_camera
                 .single()
                 .ok()
-                .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit))
+                .and_then(|(transform, orbit, projection)| {
+                    camera_state_from_components(transform, orbit, Some(projection))
+                })
         };
         let cached_query = query_set.p1();
         if let Err(err) = flush_world_cache_now(&mut cache, &cached_query, camera_state) {
@@ -2997,18 +3549,26 @@ fn poll_mcp_scene_control(
             main_camera
                 .single()
                 .ok()
-                .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit))
+                .and_then(|(transform, orbit, projection)| {
+                    camera_state_from_components(transform, orbit, Some(projection))
+                })
         };
-        let cached_query = query_set.p1();
-        let mut world_items = if cleared_scene {
-            Vec::new()
-        } else {
-            collect_cached_world_items(&cached_query)
+        let mut world_items = {
+            let cached_query = query_set.p1();
+            if cleared_scene {
+                Vec::new()
+            } else {
+                collect_cached_world_items(&cached_query)
+            }
         };
         if !deleted_cache_keys.is_empty() {
             world_items.retain(|item| !deleted_cache_keys.contains(&item.cache_key));
         }
         world_items.extend(predicted_world_items);
+        let projected_items = {
+            let camera_query = query_set.p2();
+            collect_projected_world_items(&cache.cache, &world_items, &camera_query)
+        };
         let status = McpSceneStatus {
             session_id,
             last_sequence: sequence,
@@ -3026,8 +3586,11 @@ fn poll_mcp_scene_control(
             command_results,
             cache_entries: cache.cache.asset_entries().to_vec(),
             world_items,
+            projected_items,
             camera: camera_state,
             screenshots,
+            interaction_locked: interaction_lock.locked,
+            interaction_lock_reason: interaction_lock.reason.clone(),
         };
         if let Err(err) = write_mcp_scene_status(status_path, &status) {
             warn!(
@@ -3171,7 +3734,12 @@ fn handle_catalog_spawn_requests(
     mut requests: MessageReader<CatalogSpawnRequest>,
     mut commands: Commands,
     mut selection: Option<ResMut<EditorSelection>>,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
+    if interaction_lock.locked {
+        for _ in requests.read() {}
+        return;
+    }
     for request in requests.read() {
         let entity = match &request.asset {
             CatalogSpawnAsset::Mesh { mesh, material } => spawn_mesh_instance(
@@ -3201,7 +3769,12 @@ pub(crate) fn handle_catalog_delete_requests(
     mut cache: ResMut<MeshCacheResource>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut commands: Commands,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
+    if interaction_lock.locked {
+        for _ in requests.read() {}
+        return;
+    }
     for request in requests.read() {
         let Some(cache_key) = request.cache_key.as_ref() else {
             continue;
@@ -3227,6 +3800,15 @@ pub(crate) fn handle_catalog_delete_requests(
     }
 }
 
+fn enforce_scene_interaction_lock(
+    interaction_lock: Res<SceneInteractionLock>,
+    mut selection: ResMut<EditorSelection>,
+) {
+    if interaction_lock.locked {
+        selection.clear();
+    }
+}
+
 fn sync_panorbit_bindings(mut cameras: Query<&mut PanOrbitCamera>) {
     for mut camera in cameras.iter_mut() {
         if camera.button_orbit != MouseButton::Left {
@@ -3245,6 +3827,7 @@ fn sync_panorbit_enabled(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     ui_state: Res<CatalogUiState>,
+    interaction_lock: Res<SceneInteractionLock>,
     mut cameras: Query<&mut PanOrbitCamera>,
 ) {
     let gizmo_active = gizmos.iter().any(|gizmo| gizmo.interaction().is_some());
@@ -3257,7 +3840,11 @@ fn sync_panorbit_enabled(
         .ok()
         .map(|window| ui_state.cursor_over_ui(window))
         .unwrap_or(false);
-    let enabled = !gizmo_active && !gizmo_handle_pressed && !drag.is_dragging() && !ui_block;
+    let enabled = !interaction_lock.locked
+        && !gizmo_active
+        && !gizmo_handle_pressed
+        && !drag.is_dragging()
+        && !ui_block;
     for mut camera in cameras.iter_mut() {
         if !enabled {
             camera.target_focus = camera.focus;
@@ -3407,7 +3994,7 @@ fn handle_exit_requests(
     let camera_state = main_camera
         .single()
         .ok()
-        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
     if let Err(err) = flush_world_cache_now(&mut cache, &cached_instances, camera_state) {
         warn!("Failed to flush world cache during shutdown: {err}");
     }
@@ -3441,10 +4028,11 @@ fn handle_inference_result(
                 warn!("failed to write mesh to {}: {err}", output.display());
             }
 
-            let cached_metadata = match cache
-                .cache
-                .upsert_mesh_for_image(&request.image_path, &mesh)
-            {
+            let cached_metadata = match cache.cache.upsert_mesh_for_image_with_source_bytes(
+                &request.image_path,
+                request.image_contents.as_deref(),
+                &mesh,
+            ) {
                 Ok(metadata) => Some(metadata),
                 Err(err) => {
                     warn!(
@@ -3475,9 +4063,12 @@ fn handle_inference_result(
                 entry.gaussian = None;
                 entry.source_image_path = Some(request.image_path.display().to_string());
                 entry.cache_key = cache_key;
-                if let Some(metadata) = cached_metadata {
-                    entry.label = metadata.label;
-                    entry.source_image_path = Some(metadata.source_image_path);
+                entry.source_image = cached_metadata.as_ref().and_then(|metadata| {
+                    cached_source_image_handle(&cache.cache, metadata, images.as_mut())
+                });
+                if let Some(metadata) = cached_metadata.as_ref() {
+                    entry.label = metadata.label.clone();
+                    entry.source_image_path = Some(metadata.source_image_path.clone());
                 }
                 catalog.bump_revision();
             }
@@ -3499,8 +4090,11 @@ fn handle_inference_result(
 
             let cached_metadata = match cache
                 .cache
-                .upsert_gaussian_splat_for_image(&request.image_path, &splats)
-            {
+                .upsert_gaussian_splat_for_image_with_source_bytes(
+                    &request.image_path,
+                    request.image_contents.as_deref(),
+                    &splats,
+                ) {
                 Ok(metadata) => Some(metadata),
                 Err(err) => {
                     warn!(
@@ -3533,9 +4127,12 @@ fn handle_inference_result(
                         entry.gaussian = Some(cloud_handle);
                         entry.source_image_path = Some(request.image_path.display().to_string());
                         entry.cache_key = cache_key;
-                        if let Some(metadata) = cached_metadata {
-                            entry.label = metadata.label;
-                            entry.source_image_path = Some(metadata.source_image_path);
+                        entry.source_image = cached_metadata.as_ref().and_then(|metadata| {
+                            cached_source_image_handle(&cache.cache, metadata, images.as_mut())
+                        });
+                        if let Some(metadata) = cached_metadata.as_ref() {
+                            entry.label = metadata.label.clone();
+                            entry.source_image_path = Some(metadata.source_image_path.clone());
                         }
                         catalog.bump_revision();
                     }
@@ -4038,7 +4635,7 @@ fn persist_world_cache(
     let camera_state = main_camera
         .single()
         .ok()
-        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
     match flush_world_cache_now(&mut cache, &query, camera_state) {
         Ok(()) => {
             persistence.dirty = false;
@@ -4061,6 +4658,126 @@ fn collect_cached_world_items(
         ));
     }
     world_items
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_projected_world_items(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    camera_query: &Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+) -> Vec<McpProjectedWorldItem> {
+    let metadata_by_key = cache
+        .asset_entries()
+        .iter()
+        .map(|entry| (entry.cache_key.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let camera = camera_query.single().ok();
+    world_items
+        .iter()
+        .map(|item| {
+            let world_aabb = metadata_by_key
+                .get(item.cache_key.as_str())
+                .and_then(|metadata| metadata.local_aabb)
+                .and_then(|aabb| {
+                    transform_from_cached_world_item(item)
+                        .map(|transform| transformed_world_aabb(&transform, aabb))
+                });
+            let (screen_bbox, screen_contact, projected_corners, total_corners) = if let (
+                Some(world_aabb),
+                Some((camera, camera_transform)),
+            ) =
+                (world_aabb, camera)
+            {
+                project_world_aabb(camera, camera_transform, world_aabb)
+            } else {
+                (None, None, 0, 0)
+            };
+            McpProjectedWorldItem {
+                cache_key: item.cache_key.clone(),
+                world_aabb,
+                screen_bbox,
+                screen_contact,
+                projected_corners,
+                total_corners,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn transformed_world_aabb(transform: &Transform, local_aabb: CachedAssetAabb) -> CachedAssetAabb {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for corner in aabb_corners(local_aabb) {
+        let world = transform.transform_point(corner);
+        min = min.min(world);
+        max = max.max(world);
+    }
+    CachedAssetAabb {
+        min: min.to_array(),
+        max: max.to_array(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn aabb_corners(aabb: CachedAssetAabb) -> [Vec3; 8] {
+    let min = Vec3::from_array(aabb.min);
+    let max = Vec3::from_array(aabb.max);
+    [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+        Vec3::new(max.x, max.y, max.z),
+    ]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn project_world_aabb(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    world_aabb: CachedAssetAabb,
+) -> (Option<[f32; 4]>, Option<[f32; 2]>, usize, usize) {
+    let Some(viewport) = camera
+        .logical_viewport_size()
+        .filter(|size| size.x > 0.0 && size.y > 0.0)
+    else {
+        return (None, None, 0, 8);
+    };
+    let mut projected = Vec::with_capacity(8);
+    for corner in aabb_corners(world_aabb) {
+        if let Ok(pixel) = camera.world_to_viewport(camera_transform, corner) {
+            let normalized = Vec2::new(pixel.x / viewport.x, pixel.y / viewport.y);
+            if normalized.is_finite() {
+                projected.push(normalized);
+            }
+        }
+    }
+    let screen_bbox = if projected.is_empty() {
+        None
+    } else {
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
+        for point in &projected {
+            min = min.min(*point);
+            max = max.max(*point);
+        }
+        Some([min.x, min.y, max.x, max.y])
+    };
+    let contact_world = Vec3::new(
+        (world_aabb.min[0] + world_aabb.max[0]) * 0.5,
+        world_aabb.min[1],
+        (world_aabb.min[2] + world_aabb.max[2]) * 0.5,
+    );
+    let screen_contact = camera
+        .world_to_viewport(camera_transform, contact_world)
+        .ok()
+        .map(|pixel| [pixel.x / viewport.x, pixel.y / viewport.y])
+        .filter(|point| point[0].is_finite() && point[1].is_finite());
+    (screen_bbox, screen_contact, projected.len(), 8)
 }
 
 fn cached_world_item_from_transform(cache_key: String, transform: &Transform) -> CachedWorldItem {
@@ -4254,7 +4971,11 @@ fn delete_selected_meshes(
     mut selection: ResMut<EditorSelection>,
     transformables: Query<(), With<GizmoTransformable>>,
     mut commands: Commands,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
+    if interaction_lock.locked {
+        return;
+    }
     if !keys.just_pressed(KeyCode::Delete) && !keys.just_pressed(KeyCode::Backspace) {
         return;
     }
@@ -4292,7 +5013,11 @@ fn update_selection_from_primary_click(
         With<GizmoTransformable>,
     >,
     meshes: Res<Assets<BevyMesh>>,
+    interaction_lock: Res<SceneInteractionLock>,
 ) {
+    if interaction_lock.locked {
+        return;
+    }
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }

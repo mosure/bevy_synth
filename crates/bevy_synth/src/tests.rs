@@ -20,8 +20,9 @@ use crate::app::prepare_startup_bsn_scene;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{
-    CachedMeshInstance, MeshCacheResource, drive_inference, enqueue_inference,
-    handle_catalog_delete_requests, processing_window_title, should_run_headless_once,
+    CachedMeshInstance, MeshCacheResource, SceneInteractionLock, drive_inference,
+    enqueue_inference, handle_catalog_delete_requests, processing_window_title,
+    scene_bsn_export_for_world, scene_glb_export_for_world, should_run_headless_once,
     title_rattler_frame,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,7 +34,7 @@ use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DEFAULT_TRELLIS_PBR_TEXTURE_SIZE, DinoBackend, MeshMode, QualityPreset,
     RmbgBackend, RmbgModel, SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
 };
-use bevy_synth_runtime::cache::MeshCache;
+use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::io::write_glb;
 use bevy_synth_runtime::state::{
@@ -194,6 +195,92 @@ fn startup_bsn_scene_writes_mcp_command_envelope() {
     std::fs::remove_dir_all(dir).expect("remove temp dir");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scene_bsn_export_serializes_only_placed_cached_assets() {
+    let dir = isolated_cache_root();
+    let mut cache = MeshCache::load_from_root(dir.clone()).expect("create isolated cache");
+    let chair = cache
+        .upsert_mesh_for_image(&PathBuf::from("chair.png"), &dummy_mesh())
+        .expect("cache chair mesh");
+    let unused = cache
+        .upsert_mesh_for_image(&PathBuf::from("unused.png"), &dummy_mesh())
+        .expect("cache unused mesh");
+    let world_items = vec![CachedWorldItem {
+        cache_key: chair.cache_key.clone(),
+        translation: [1.0, 0.0, 2.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.25, 1.0, 1.25],
+    }];
+    let camera = CachedCameraState {
+        translation: [0.0, 3.0, 5.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        focus: [0.0, 0.0, 0.0],
+        yaw: 0.25,
+        pitch: -0.5,
+        radius: 5.8,
+        vertical_fov_degrees: Some(72.0),
+    };
+
+    let (bsn, assets_json) =
+        scene_bsn_export_for_world(&cache, &world_items, Some(camera)).expect("scene bsn");
+    assert!(bsn.contains("synth_scene_v1"));
+    assert!(bsn.contains("spawn item_001_"));
+    assert!(bsn.contains("camera translation"));
+    assert!(bsn.contains(&chair.cache_key));
+    assert!(!bsn.contains(&unused.cache_key));
+
+    let assets: Vec<burn_synth_scene::SceneAssetBinding> =
+        serde_json::from_slice(&assets_json).expect("asset sidecar json");
+    assert_eq!(assets.len(), 1);
+    assert_eq!(
+        assets[0].cache_key.as_deref(),
+        Some(chair.cache_key.as_str())
+    );
+    assert_eq!(assets[0].source_image_path.as_deref(), Some("chair.png"));
+
+    std::fs::remove_dir_all(dir).expect("remove temp dir");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scene_glb_export_rejects_splats_and_exports_mesh_instances() {
+    let dir = isolated_cache_root();
+    let mut cache = MeshCache::load_from_root(dir.clone()).expect("create isolated cache");
+    let chair = cache
+        .upsert_mesh_for_image(&PathBuf::from("chair.png"), &dummy_mesh())
+        .expect("cache chair mesh");
+    let splat = cache
+        .upsert_gaussian_splat_for_image(
+            &PathBuf::from("cloud.png"),
+            &GaussianSplatCloud::canonical_debug_cloud(),
+        )
+        .expect("cache splat");
+
+    let mesh_items = vec![CachedWorldItem {
+        cache_key: chair.cache_key.clone(),
+        translation: [1.0, 0.0, 2.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.0, 1.0, 1.0],
+    }];
+    let glb = scene_glb_export_for_world(&cache, &mesh_items).expect("mesh scene glb");
+    assert!(
+        glb.starts_with(&[0x67, 0x6C, 0x54, 0x46]),
+        "mesh scene export should be a binary GLB"
+    );
+
+    let splat_items = vec![CachedWorldItem {
+        cache_key: splat.cache_key.clone(),
+        translation: [0.0, 0.0, 0.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.0, 1.0, 1.0],
+    }];
+    let err = scene_glb_export_for_world(&cache, &splat_items).unwrap_err();
+    assert!(err.contains("mesh scenes only"));
+
+    std::fs::remove_dir_all(dir).expect("remove temp dir");
+}
+
 fn isolated_cache_root() -> PathBuf {
     let nonce = TEST_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
@@ -218,6 +305,7 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(InferenceDispatchGate::ready_for_dispatch());
     app.insert_resource(CatalogState::default());
     app.insert_resource(ExitState::default());
+    app.insert_resource(SceneInteractionLock::default());
     let cache = MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache");
     app.insert_resource(MeshCacheResource { cache });
     app.insert_resource(Assets::<Image>::default());
@@ -614,6 +702,7 @@ fn catalog_delete_request_removes_cache_backed_instances_in_same_update() {
     app.insert_resource(MeshCacheResource {
         cache: MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache"),
     });
+    app.insert_resource(SceneInteractionLock::default());
     let entity = app
         .world_mut()
         .spawn(CachedMeshInstance {
@@ -633,6 +722,38 @@ fn catalog_delete_request_removes_cache_backed_instances_in_same_update() {
     assert!(
         !app.world().entities().contains(entity),
         "cache-backed spawned instance should be despawned on the same update as the catalog delete request"
+    );
+}
+
+#[test]
+fn catalog_delete_request_is_ignored_while_scene_interaction_locked() {
+    let mut app = App::new();
+    app.add_message::<CatalogDeleteRequest>();
+    app.insert_resource(MeshCacheResource {
+        cache: MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache"),
+    });
+    let mut interaction_lock = SceneInteractionLock::default();
+    interaction_lock.set(true, Some("feedback iteration".to_string()));
+    app.insert_resource(interaction_lock);
+    let entity = app
+        .world_mut()
+        .spawn(CachedMeshInstance {
+            cache_key: "cache-key".to_string(),
+        })
+        .id();
+    app.add_systems(
+        Update,
+        (
+            write_catalog_delete_request_once.in_set(BurnSynthUiSystemSet::CatalogRequests),
+            handle_catalog_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+        ),
+    );
+
+    app.update();
+
+    assert!(
+        app.world().entities().contains(entity),
+        "read-only scene interaction lock should prevent catalog deletes from changing the scene"
     );
 }
 

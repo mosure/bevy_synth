@@ -71,6 +71,29 @@ bevy_synth --quality balanced
 
 # burn_synth_mcp: start MCP stdio server
 burn_synth_mcp
+
+# burn_synth_mcp: run source scene -> object images -> TRELLIS assets -> BSN once
+burn_synth_mcp \
+  --backend wgpu \
+  --trellis-quality low \
+  scene-build \
+  --source-scene-path /path/to/source_scene.jpg \
+  --output-dir tmp/runs/scene_e2e \
+  --candidate-count 2 \
+  --candidate-retry-attempts 2 \
+  --batch-size 0 \
+  --trellis-pbr true
+
+# To apply into a running bevy_synth viewer, launch the viewer with the same
+# control path and add --apply to the scene-build command.
+bevy_synth --mcp-scene-control-path tmp/runs/scene_e2e/scene_commands.json
+burn_synth_mcp \
+  --scene-control-path tmp/runs/scene_e2e/scene_commands.json \
+  --scene-status-path tmp/runs/scene_e2e/scene_commands.status.json \
+  scene-build \
+  --source-scene-path /path/to/source_scene.jpg \
+  --output-dir tmp/runs/scene_e2e \
+  --apply
 ```
 
 
