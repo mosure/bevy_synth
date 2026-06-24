@@ -12,6 +12,7 @@ members = [
   "crates/bevy_synth_runtime",
   "crates/bevy_synth_ui",
   "crates/burn_foreground",
+  "crates/burn_synth_scene",
   "crates/burn_synth_mcp",
 ]
 exclude = [

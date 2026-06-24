@@ -221,6 +221,8 @@ const NATIVE_PBR_OVOXEL_REMESH_BAND: f32 = 1.0;
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
 const NATIVE_PBR_SMALL_COMPONENT_AREA: f32 = 1.0e-5;
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+const NATIVE_PBR_SMALL_COMPONENT_AREA_FRACTION: f32 = 1.0e-4;
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
 const NATIVE_PBR_MAX_HOLE_PERIMETER: f32 = 3.0e-2;
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
@@ -380,6 +382,8 @@ fn remove_small_connected_components(
         let area = triangle_area_by_indices(vertices, face).unwrap_or(0.0);
         *component_area.entry(root).or_insert(0.0) += area;
     }
+    let total_area = component_area.values().copied().sum::<f32>();
+    let min_area = min_area.max(total_area * NATIVE_PBR_SMALL_COMPONENT_AREA_FRACTION);
     let largest_component = component_area
         .iter()
         .max_by(|a, b| a.1.total_cmp(b.1))
@@ -720,44 +724,33 @@ fn decimate_mesh_for_face_budget(
             .map_err(|err| format!("meshopt vertex adapter: {err}"))?;
 
     let mut simplified = Vec::<u32>::new();
-    let aggressive_ratio = target_index_count as f64 / indices.len().max(1) as f64;
-    if aggressive_ratio < 0.01 {
-        simplified = meshopt::simplify_sloppy(&indices, &adapter, target_index_count, 1.0, None);
-    }
-
-    if simplified.len() < 3 || simplified.len() > target_index_count {
-        let mut result_error = 0.0f32;
-        for error_limit in [0.02f32, 0.05, 0.1, 0.25, 0.5, 1.0] {
-            let mut stage_error = 0.0f32;
-            let candidate = meshopt::simplify(
-                &indices,
-                &adapter,
-                target_index_count,
-                error_limit,
-                meshopt::SimplifyOptions::None,
-                Some(&mut stage_error),
-            );
-            if candidate.len() < 3 {
-                continue;
-            }
-            result_error = stage_error;
-            simplified = candidate;
-            if simplified.len() <= target_index_count {
-                break;
-            }
+    for error_limit in [0.02f32, 0.05, 0.1, 0.25, 0.5, 1.0] {
+        let mut stage_error = 0.0f32;
+        let candidate = meshopt::simplify(
+            &indices,
+            &adapter,
+            target_index_count,
+            error_limit,
+            meshopt::SimplifyOptions::None,
+            Some(&mut stage_error),
+        );
+        if candidate.len() < 3 {
+            continue;
         }
-        if simplified.len() > target_index_count {
-            simplified = meshopt::simplify_sloppy(
-                &indices,
-                &adapter,
-                target_index_count,
-                result_error.max(0.25),
-                None,
-            );
+        simplified = candidate;
+        if simplified.len() <= target_index_count {
+            break;
         }
     }
     if simplified.len() < 3 {
         return Err("meshopt simplification produced empty mesh".to_string());
+    }
+    if simplified.len() > target_index_count {
+        trellis_stage_log!(
+            "burn_trellis: runtime decode decimation preserved topology over exact face budget (target_faces={} produced_faces={})",
+            target_faces,
+            simplified.len() / 3
+        );
     }
 
     let (vertex_count, remap) =
@@ -1849,6 +1842,8 @@ mod runtime_decode_tests {
     use super::cleanup_pbr_bake_mesh_topology;
     #[cfg(not(target_arch = "wasm32"))]
     use super::decimate_mesh_for_face_budget;
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::{mesh_find, mesh_union};
     use super::sanitize_mesh_geometry;
     use crate::mesh::Mesh;
 
@@ -1902,6 +1897,25 @@ mod runtime_decode_tests {
         assert_eq!(stats.duplicate_faces_removed, 1);
         assert_eq!(stats.small_component_faces_removed, 1);
         assert_eq!(stats.hole_faces_added, 0);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(vertices.len(), 3);
+    }
+
+    #[test]
+    fn cleanup_mesh_topology_removes_relative_area_fragments() {
+        let mut vertices = vec![
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [20.02, 0.0, 0.0],
+            [20.0, 0.02, 0.0],
+        ];
+        let mut faces = vec![[0, 1, 2], [3, 4, 5]];
+
+        let stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+
+        assert_eq!(stats.small_component_faces_removed, 1);
         assert_eq!(faces.len(), 1);
         assert_eq!(vertices.len(), 3);
     }
@@ -2051,6 +2065,78 @@ mod runtime_decode_tests {
         assert!(faces.len() <= 20, "faces={} > 20", faces.len());
         assert!(!faces.is_empty());
         assert!(!vertices.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_decode_pre_pbr_decimation_preserves_topology_for_subpercent_budget() {
+        let side = 128usize;
+        let mut vertices = Vec::with_capacity((side + 1) * (side + 1));
+        for y in 0..=side {
+            for x in 0..=side {
+                let xf = x as f32 / side as f32;
+                let yf = y as f32 / side as f32;
+                vertices.push([
+                    xf,
+                    yf,
+                    0.025 * (xf * std::f32::consts::TAU).sin()
+                        * (yf * std::f32::consts::TAU).cos(),
+                ]);
+            }
+        }
+        let idx = |x: usize, y: usize| -> u32 { (y * (side + 1) + x) as u32 };
+        let mut faces = Vec::with_capacity(side * side * 2);
+        for y in 0..side {
+            for x in 0..side {
+                let i0 = idx(x, y);
+                let i1 = idx(x + 1, y);
+                let i2 = idx(x, y + 1);
+                let i3 = idx(x + 1, y + 1);
+                faces.push([i0, i1, i3]);
+                faces.push([i0, i3, i2]);
+            }
+        }
+
+        decimate_mesh_for_face_budget(&mut vertices, &mut faces, 200)
+            .expect("sub-percent runtime decimation should succeed");
+        assert!(faces.len() <= 200, "faces={} > 200", faces.len());
+        assert!(!faces.is_empty());
+        assert_eq!(
+            connected_face_component_count(&faces),
+            1,
+            "decimation should preserve one connected surface"
+        );
+        let before_cleanup_faces = faces.len();
+        let cleanup = cleanup_mesh_topology(&mut vertices, &mut faces);
+        assert_eq!(cleanup.nonmanifold_faces_removed, 0);
+        assert!(
+            faces.len() * 100 >= before_cleanup_faces * 95,
+            "cleanup should not destroy topology after decimation: before={} after={} stats={cleanup:?}",
+            before_cleanup_faces,
+            faces.len()
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn connected_face_component_count(faces: &[[u32; 3]]) -> usize {
+        if faces.is_empty() {
+            return 0;
+        }
+        let mut parent = (0..faces.len()).collect::<Vec<_>>();
+        let mut edge_owner = std::collections::HashMap::<(u32, u32), usize>::new();
+        for (face_idx, face) in faces.iter().copied().enumerate() {
+            for [a, b] in [[face[0], face[1]], [face[1], face[2]], [face[2], face[0]]] {
+                let key = if a <= b { (a, b) } else { (b, a) };
+                if let Some(prev_idx) = edge_owner.insert(key, face_idx) {
+                    mesh_union(parent.as_mut_slice(), prev_idx, face_idx);
+                }
+            }
+        }
+        let mut roots = std::collections::HashSet::<usize>::new();
+        for face_idx in 0..faces.len() {
+            roots.insert(mesh_find(parent.as_mut_slice(), face_idx));
+        }
+        roots.len()
     }
 
     #[cfg(feature = "runtime-model-wgpu")]

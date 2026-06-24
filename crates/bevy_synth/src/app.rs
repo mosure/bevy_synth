@@ -78,6 +78,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
+use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
+
+#[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::args::BackendKind;
 use bevy_synth_runtime::args::SynthesisModel;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
@@ -279,6 +282,52 @@ impl McpSceneControl {
             last_modified: None,
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn prepare_startup_bsn_scene(args: &mut AppArgs) -> Result<(), String> {
+    let Some(bsn_path) = args.scene_bsn.as_ref() else {
+        if args.scene_assets_json.is_some() {
+            return Err("--scene-assets-json requires --scene-bsn".to_string());
+        }
+        return Ok(());
+    };
+    let assets_path = args
+        .scene_assets_json
+        .as_ref()
+        .ok_or_else(|| "--scene-bsn requires --scene-assets-json".to_string())?;
+    let command_path = args.mcp_scene_control_path.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "bevy_synth_bsn_scene_{}_commands.json",
+            std::process::id()
+        ))
+    });
+    let envelope = scene_bsn_file_to_mcp_command_envelope(
+        bsn_path,
+        assets_path,
+        args.scene_bsn_clear_existing,
+        Some("bevy_synth-startup-bsn"),
+        Some(1),
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(parent) = command_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create BSN scene command directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&envelope)
+        .map_err(|err| format!("failed to serialize BSN scene command envelope: {err}"))?;
+    fs::write(&command_path, bytes).map_err(|err| {
+        format!(
+            "failed to write BSN scene command envelope {}: {err}",
+            command_path.display()
+        )
+    })?;
+    args.mcp_scene_control_path = Some(command_path);
+    Ok(())
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
@@ -624,6 +673,7 @@ enum McpSceneCommand {
     CaptureScreenshot {
         path: PathBuf,
     },
+    ReloadCache,
     SaveCache,
 }
 
@@ -678,12 +728,14 @@ pub(crate) struct InferenceContext<'w, 's> {
 
 pub(crate) fn run() {
     let args = Args::parse();
-    #[cfg(target_arch = "wasm32")]
     let mut app_args = build_app_args(args);
-    #[cfg(not(target_arch = "wasm32"))]
-    let app_args = build_app_args(args);
     #[cfg(target_arch = "wasm32")]
     apply_wasm_url_overrides(&mut app_args);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(err) = prepare_startup_bsn_scene(&mut app_args) {
+        eprintln!("failed to prepare BSN scene viewer: {err}");
+        std::process::exit(1);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if should_run_headless_once(&app_args) {
         if let Err(err) = run_headless_once(&app_args) {
@@ -2880,6 +2932,31 @@ fn poll_mcp_scene_control(
                     screenshots.last().cloned(),
                 ));
             }
+            McpSceneCommand::ReloadCache => match MeshCache::load_default() {
+                Ok(reloaded_cache) => {
+                    let entries = reloaded_cache.asset_entries().len();
+                    cache.cache = reloaded_cache;
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "reload_cache",
+                        true,
+                        format!("reloaded {entries} cached catalog asset(s)"),
+                        None,
+                        None,
+                    ));
+                }
+                Err(err) => {
+                    warn!("MCP reload_cache failed: {err}");
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "reload_cache",
+                        false,
+                        format!("cache reload failed: {err}"),
+                        None,
+                        None,
+                    ));
+                }
+            },
             McpSceneCommand::SaveCache => {
                 force_cache_flush = true;
                 command_results.push(mcp_scene_command_result(

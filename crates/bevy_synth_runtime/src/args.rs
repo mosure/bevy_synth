@@ -229,6 +229,18 @@ pub struct Args {
     /// Optional JSON command file path for external MCP/agent scene control.
     #[arg(long)]
     pub mcp_scene_control_path: Option<PathBuf>,
+
+    /// Restricted synth_scene_v1 BSN scene file to load into the viewer at startup.
+    #[arg(long)]
+    pub scene_bsn: Option<PathBuf>,
+
+    /// Asset binding JSON for --scene-bsn.
+    #[arg(long)]
+    pub scene_assets_json: Option<PathBuf>,
+
+    /// Clear the current scene before applying --scene-bsn.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub scene_bsn_clear_existing: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -410,6 +422,9 @@ pub struct AppArgs {
     pub pause_render_during_inference: bool,
     pub max_batch_size: usize,
     pub mcp_scene_control_path: Option<PathBuf>,
+    pub scene_bsn: Option<PathBuf>,
+    pub scene_assets_json: Option<PathBuf>,
+    pub scene_bsn_clear_existing: bool,
 }
 
 pub fn build_app_args(args: Args) -> AppArgs {
@@ -514,6 +529,9 @@ pub fn build_app_args(args: Args) -> AppArgs {
         pause_render_during_inference: args.pause_render_during_inference,
         max_batch_size: args.max_batch_size.max(1),
         mcp_scene_control_path: args.mcp_scene_control_path,
+        scene_bsn: args.scene_bsn,
+        scene_assets_json: args.scene_assets_json,
+        scene_bsn_clear_existing: args.scene_bsn_clear_existing,
     }
 }
 
@@ -629,6 +647,29 @@ mod tests {
         let args = Args::parse_from(["bevy_synth", "--max-batch-size", "0"]);
         let app_args = build_app_args(args);
         assert_eq!(app_args.max_batch_size, 1);
+    }
+
+    #[test]
+    fn bsn_scene_viewer_args_are_preserved() {
+        let args = Args::parse_from([
+            "bevy_synth",
+            "--scene-bsn",
+            "tmp/runs/demo/scene.bsn",
+            "--scene-assets-json",
+            "tmp/runs/demo/assets.json",
+            "--scene-bsn-clear-existing",
+            "false",
+        ]);
+        let app_args = build_app_args(args);
+        assert_eq!(
+            app_args.scene_bsn.as_deref(),
+            Some(std::path::Path::new("tmp/runs/demo/scene.bsn"))
+        );
+        assert_eq!(
+            app_args.scene_assets_json.as_deref(),
+            Some(std::path::Path::new("tmp/runs/demo/assets.json"))
+        );
+        assert!(!app_args.scene_bsn_clear_existing);
     }
 
     #[test]

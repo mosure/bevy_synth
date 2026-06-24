@@ -2,6 +2,7 @@
 
 mod scene_layout;
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,9 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bevy_synth_runtime::cache::{CachedMeshMetadata, MeshCache};
+use bevy_synth_runtime::{
+    SynthMesh as CachedSynthMesh, SynthMeshMaterial as CachedSynthMeshMaterial,
+    SynthMeshPbrTextures as CachedSynthMeshPbrTextures, SynthMeshTexture as CachedSynthMeshTexture,
+    TripoMesh as CachedTripoMesh,
+};
 use burn_synth::{
     AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, ModelSelection,
     RuntimeBatchPolicy, RuntimeConfig, SynthRuntime, SynthesisAsset, write_glb_mesh,
+};
+use burn_synth_scene::{
+    OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider, SceneAssetBinding, SceneBsnRequest,
+    SceneBuildConfig, SceneObjectManifest, ScenePipeline, SceneQualityProfile,
+    SceneReasoningRequest, SceneResult, parse_scene_bsn, scene_plan_to_mcp_commands,
 };
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -23,6 +35,9 @@ use scene_layout::{
 };
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+const DEFAULT_SCENE_TRELLIS_TARGET_FACES: usize = 80_000;
+const DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE: usize = 512;
+const MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE: f32 = 0.45;
 static NEXT_SCENE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -166,6 +181,14 @@ pub struct ServerArgs {
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     pub trellis_quality: TrellisQuality,
 
+    /// Enable native TRELLIS PBR UV/material texture baking.
+    #[arg(long)]
+    pub trellis_pbr: bool,
+
+    /// Native TRELLIS PBR texture size. Uses runtime default when omitted.
+    #[arg(long)]
+    pub trellis_pbr_texture_size: Option<usize>,
+
     /// Quality preset (fast, balanced, full). Individual flags override this preset.
     #[arg(long, value_enum, default_value_t = QualityPreset::Balanced)]
     pub quality: QualityPreset,
@@ -198,9 +221,25 @@ pub struct ServerArgs {
     #[arg(long)]
     pub scene_status_path: Option<PathBuf>,
 
+    /// Shared Bevy asset cache root. Defaults to the normal user cache.
+    #[arg(long)]
+    pub catalog_cache_root: Option<PathBuf>,
+
     /// Timeout for scene command acknowledgements.
     #[arg(long, default_value_t = 5000)]
     pub scene_timeout_ms: u64,
+
+    /// OpenAI reasoning model used by scene planning tools.
+    #[arg(long, default_value = "gpt-5.5")]
+    pub openai_reasoning_model: String,
+
+    /// OpenAI image model used by object-image generation tools.
+    #[arg(long, default_value = "gpt-image-2")]
+    pub openai_image_model: String,
+
+    /// Example/reference isolated-object image for OpenAI object generation.
+    #[arg(long, default_value = "docs/input_chair.jpg")]
+    pub scene_object_reference_image: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +253,8 @@ pub struct ServerConfig {
     pub trellis_python_bin: Option<PathBuf>,
     pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
+    pub trellis_pbr_enabled: bool,
+    pub trellis_pbr_texture_size: Option<usize>,
     pub quality: QualityPreset,
     pub bg_weights_root: Option<PathBuf>,
     pub num_steps: usize,
@@ -227,7 +268,11 @@ pub struct ServerConfig {
     pub batch_vram_mb: Option<u64>,
     pub scene_control_path: Option<PathBuf>,
     pub scene_status_path: Option<PathBuf>,
+    pub catalog_cache_root: Option<PathBuf>,
     pub scene_timeout: Duration,
+    pub openai_reasoning_model: String,
+    pub openai_image_model: String,
+    pub scene_object_reference_image: PathBuf,
 }
 
 impl ServerConfig {
@@ -244,6 +289,8 @@ impl ServerConfig {
             trellis_python_bin: args.trellis_python_bin,
             trellis_bridge_script: args.trellis_bridge_script,
             trellis_quality: args.trellis_quality,
+            trellis_pbr_enabled: args.trellis_pbr,
+            trellis_pbr_texture_size: args.trellis_pbr_texture_size,
             quality,
             bg_weights_root: args.bg_weights_root,
             num_steps: args.num_steps.unwrap_or(defaults.num_steps),
@@ -261,7 +308,11 @@ impl ServerConfig {
                     .map(|path| path.with_extension("status.json"))
             }),
             scene_control_path: args.scene_control_path,
+            catalog_cache_root: args.catalog_cache_root,
             scene_timeout: Duration::from_millis(args.scene_timeout_ms.max(1)),
+            openai_reasoning_model: args.openai_reasoning_model,
+            openai_image_model: args.openai_image_model,
+            scene_object_reference_image: args.scene_object_reference_image,
         }
     }
 
@@ -281,6 +332,8 @@ impl ServerConfig {
             trellis_python_bin: self.trellis_python_bin.clone(),
             trellis_bridge_script: self.trellis_bridge_script.clone(),
             trellis_quality: self.trellis_quality.into(),
+            trellis_pbr_enabled: self.trellis_pbr_enabled,
+            trellis_pbr_texture_size: self.trellis_pbr_texture_size,
             bg_weights_root: self.bg_weights_root.clone(),
             num_steps: self.num_steps,
             num_tokens: self.num_tokens,
@@ -323,6 +376,31 @@ struct McpServer {
     config: ServerConfig,
     runtime: SynthRuntime,
     should_exit: bool,
+}
+
+struct NoopSceneProvider;
+
+impl SceneAiProvider for NoopSceneProvider {
+    fn plan_objects(&self, _request: &SceneReasoningRequest) -> SceneResult<SceneObjectManifest> {
+        Err(burn_synth_scene::SceneError::Provider(
+            "offline schema preparation cannot plan objects".to_string(),
+        ))
+    }
+
+    fn generate_object_images(
+        &self,
+        _request: &burn_synth_scene::ObjectImageRequest,
+    ) -> SceneResult<Vec<Vec<u8>>> {
+        Err(burn_synth_scene::SceneError::Provider(
+            "offline schema preparation cannot generate images".to_string(),
+        ))
+    }
+
+    fn plan_scene_bsn(&self, _request: &SceneBsnRequest) -> SceneResult<String> {
+        Err(burn_synth_scene::SceneError::Provider(
+            "offline schema preparation cannot plan BSN".to_string(),
+        ))
+    }
 }
 
 impl McpServer {
@@ -449,6 +527,82 @@ impl McpServer {
                     },
                     Err(err) => {
                         error_tool_result(format!("invalid arguments for images_to_assets: {err}"))
+                    }
+                }
+            }
+            "scene_prepare_build" => {
+                let args: Result<ScenePrepareBuildArgs, _> =
+                    serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_prepare_build(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_prepare_build: {err}"
+                    )),
+                }
+            }
+            "scene_plan_objects" => {
+                let args: Result<ScenePrepareBuildArgs, _> =
+                    serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_plan_objects(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_plan_objects: {err}"
+                    )),
+                }
+            }
+            "scene_generate_object_images" => {
+                let args: Result<SceneGenerateObjectImagesArgs, _> =
+                    serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_generate_object_images(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_generate_object_images: {err}"
+                    )),
+                }
+            }
+            "scene_build_from_image" => {
+                let args: Result<SceneBuildFromImageArgs, _> =
+                    serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_build_from_image(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => error_tool_result(format!(
+                        "invalid arguments for scene_build_from_image: {err}"
+                    )),
+                }
+            }
+            "scene_plan_bsn" => {
+                let args: Result<ScenePlanBsnArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_plan_bsn(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_plan_bsn: {err}"))
+                    }
+                }
+            }
+            "scene_apply_bsn" => {
+                let args: Result<SceneApplyBsnArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_apply_bsn(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_apply_bsn: {err}"))
                     }
                 }
             }
@@ -643,6 +797,9 @@ impl McpServer {
             target_faces: args.target_faces,
             batch_size: Some(1),
             batch_vram_mb: None,
+            trellis_pbr: None,
+            trellis_pbr_texture_size: None,
+            promote_to_catalog: false,
             dry_run: args.dry_run,
         })?;
         let item = assets["items"]
@@ -678,6 +835,9 @@ impl McpServer {
             target_faces: None,
             batch_size: Some(1),
             batch_vram_mb: None,
+            trellis_pbr: None,
+            trellis_pbr_texture_size: None,
+            promote_to_catalog: false,
             dry_run: args.dry_run,
         })?;
         let item = assets["items"]
@@ -728,36 +888,64 @@ impl McpServer {
             vram_budget_mb: args.batch_vram_mb.or(self.config.batch_vram_mb),
             ..RuntimeBatchPolicy::default()
         };
+        let previous_trellis_pbr_enabled = self.runtime.config().trellis_pbr_enabled;
+        let previous_trellis_pbr_texture_size = self.runtime.config().trellis_pbr_texture_size;
+        let previous_target_faces = self.runtime.config().target_faces;
+        let effective_trellis_pbr_enabled =
+            args.trellis_pbr.unwrap_or(previous_trellis_pbr_enabled);
+        let effective_trellis_pbr_texture_size = args
+            .trellis_pbr_texture_size
+            .or(previous_trellis_pbr_texture_size);
+        let effective_target_faces = match args.target_faces {
+            Some(0) => None,
+            Some(value) => Some(value),
+            None => previous_target_faces,
+        };
+        {
+            let config = self.runtime.config_mut();
+            config.trellis_pbr_enabled = effective_trellis_pbr_enabled;
+            config.trellis_pbr_texture_size = effective_trellis_pbr_texture_size;
+            config.target_faces = effective_target_faces;
+        }
 
-        let batch = self
-            .runtime
-            .synthesize_assets_batch(AssetBatchRequest {
-                items: args
-                    .input_image_paths
+        let batch_result = self.runtime.synthesize_assets_batch(AssetBatchRequest {
+            items: args
+                .input_image_paths
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    AssetBatchItem::new(
+                        format!("asset_{index}"),
+                        ImageSource::from_path(input.clone()),
+                    )
+                })
+                .collect(),
+            foreground_model: Some(selected_rmbg.into()),
+            synthesis_models: Some(
+                selected_synthesis_models
                     .iter()
-                    .enumerate()
-                    .map(|(index, input)| {
-                        AssetBatchItem::new(
-                            format!("asset_{index}"),
-                            ImageSource::from_path(input.clone()),
-                        )
-                    })
+                    .copied()
+                    .map(Into::into)
                     .collect(),
-                foreground_model: Some(selected_rmbg.into()),
-                synthesis_models: Some(
-                    selected_synthesis_models
-                        .iter()
-                        .copied()
-                        .map(Into::into)
-                        .collect(),
-                ),
-                backend: Some(selected_backend.into()),
-                dry_run: args.dry_run,
-                policy,
-            })
-            .map_err(|err| err.to_string())?;
+            ),
+            backend: Some(selected_backend.into()),
+            dry_run: args.dry_run,
+            policy,
+        });
+        {
+            let config = self.runtime.config_mut();
+            config.trellis_pbr_enabled = previous_trellis_pbr_enabled;
+            config.trellis_pbr_texture_size = previous_trellis_pbr_texture_size;
+            config.target_faces = previous_target_faces;
+        }
+        let batch = batch_result.map_err(|err| err.to_string())?;
 
         let mut items = Vec::with_capacity(batch.items.len());
+        let mut catalog_cache = if args.promote_to_catalog {
+            Some(self.open_catalog_cache()?)
+        } else {
+            None
+        };
         for (batch_item, input_path) in batch.items.into_iter().zip(args.input_image_paths.iter()) {
             let output = batch_item.output.map_err(|err| err.to_string())?;
             let item = write_asset_output(
@@ -768,7 +956,8 @@ impl McpServer {
                     .and_then(|paths| paths.get(batch_item.item_index).cloned()),
                 args.output_format.unwrap_or(AssetOutputFormat::Auto),
                 output.asset,
-                args.target_faces,
+                effective_target_faces,
+                catalog_cache.as_mut(),
             )?;
             items.push(json!({
                 "id": batch_item.id,
@@ -785,8 +974,10 @@ impl McpServer {
                 "vertices": item.vertices,
                 "faces": item.faces,
                 "gaussians": item.gaussians,
-                "target_faces": args.target_faces.filter(|value| *value > 0),
+                "target_faces": effective_target_faces,
                 "material": item.material,
+                "cache_key": item.catalog_entry.as_ref().map(|entry| entry.cache_key.clone()),
+                "catalog_entry": item.catalog_entry,
             }));
         }
 
@@ -805,8 +996,257 @@ impl McpServer {
             "rmbg_model": selected_rmbg.as_str(),
             "synthesis_models": selected_synthesis_models.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
             "backend": selected_backend.as_str(),
+            "trellis_pbr_enabled": effective_trellis_pbr_enabled,
+            "trellis_pbr_texture_size": effective_trellis_pbr_texture_size,
+            "target_faces": effective_target_faces,
+            "promote_to_catalog": args.promote_to_catalog,
             "dry_run": args.dry_run,
         }))
+    }
+
+    fn call_scene_prepare_build(&self, args: ScenePrepareBuildArgs) -> Result<Value, String> {
+        let config = self.scene_build_config(args)?;
+        let provider = NoopSceneProvider;
+        let mut pipeline = ScenePipeline::new(config, provider);
+        let preparation = pipeline
+            .prepare_openai_inputs()
+            .map_err(|err| err.to_string())?;
+        serde_json::to_value(preparation).map_err(|err| err.to_string())
+    }
+
+    fn call_scene_plan_objects(&self, args: ScenePrepareBuildArgs) -> Result<Value, String> {
+        let config = self.scene_build_config(args)?;
+        let provider = self.openai_provider()?;
+        let pipeline = ScenePipeline::new(config, provider);
+        let manifest = pipeline.plan_objects().map_err(|err| err.to_string())?;
+        serde_json::to_value(manifest).map_err(|err| err.to_string())
+    }
+
+    fn call_scene_generate_object_images(
+        &self,
+        args: SceneGenerateObjectImagesArgs,
+    ) -> Result<Value, String> {
+        let prepare_args = ScenePrepareBuildArgs {
+            source_scene_path: args.source_scene_path,
+            object_reference_image_path: args.object_reference_image_path,
+            output_dir: args.output_dir,
+            candidate_count: args.candidate_count,
+            quality_profile: args.quality_profile,
+            allow_catalog_reuse: false,
+        };
+        let config = self.scene_build_config(prepare_args)?;
+        let provider = self.openai_provider()?;
+        let pipeline = ScenePipeline::new(config, provider);
+        let requests = pipeline
+            .prepare_object_image_requests(&args.manifest)
+            .map_err(|err| err.to_string())?;
+        let candidates = pipeline
+            .generate_object_candidates(&requests)
+            .map_err(|err| err.to_string())?;
+        Ok(json!({
+            "tool": "scene_generate_object_images",
+            "requests": requests,
+            "candidates": candidates,
+        }))
+    }
+
+    fn call_scene_build_from_image(
+        &mut self,
+        args: SceneBuildFromImageArgs,
+    ) -> Result<Value, String> {
+        let prepare_args = ScenePrepareBuildArgs {
+            source_scene_path: args.source_scene_path,
+            object_reference_image_path: args.object_reference_image_path,
+            output_dir: args.output_dir,
+            candidate_count: args.candidate_count,
+            quality_profile: args.quality_profile,
+            allow_catalog_reuse: args.allow_catalog_reuse,
+        };
+        let config = self.scene_build_config(prepare_args)?;
+        let output_dir = config.output_dir.clone();
+        let provider = self.openai_provider()?;
+        let mut pipeline = ScenePipeline::new(config, provider);
+        let preparation = pipeline
+            .prepare_openai_inputs()
+            .map_err(|err| err.to_string())?;
+        let manifest = pipeline.plan_objects().map_err(|err| err.to_string())?;
+        let requests = pipeline
+            .prepare_object_image_requests(&manifest)
+            .map_err(|err| err.to_string())?;
+        let candidates = pipeline
+            .generate_object_candidates(&requests)
+            .map_err(|err| err.to_string())?;
+        let selected = select_scene_candidates(&manifest, &candidates)?;
+
+        let mut response = json!({
+            "tool": "scene_build_from_image",
+            "preparation": preparation,
+            "manifest": manifest,
+            "object_image_requests": requests,
+            "candidates": candidates,
+            "selected_candidates": selected,
+            "lift_assets": args.lift_assets,
+        });
+        if !args.lift_assets {
+            return Ok(response);
+        }
+
+        let input_image_paths = selected
+            .iter()
+            .filter_map(|candidate| candidate["image_path"].as_str().map(PathBuf::from))
+            .collect::<Vec<_>>();
+        let asset_outputs = self.call_images_to_assets(ImagesToAssetsToolArgs {
+            input_image_paths,
+            output_dir: Some(output_dir.join("assets")),
+            output_paths: None,
+            output_format: Some(AssetOutputFormat::Glb),
+            rmbg_model: Some(ForegroundModel::Rmbg2),
+            synthesis_models: Some(vec![SynthesisModel::Trellis]),
+            backend: Some(self.config.default_backend),
+            target_faces: args
+                .target_faces
+                .or(Some(DEFAULT_SCENE_TRELLIS_TARGET_FACES)),
+            batch_size: args.batch_size,
+            batch_vram_mb: args.batch_vram_mb,
+            trellis_pbr: Some(args.trellis_pbr.unwrap_or(true)),
+            trellis_pbr_texture_size: args
+                .trellis_pbr_texture_size
+                .or(Some(DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE)),
+            promote_to_catalog: args.promote_to_catalog,
+            dry_run: false,
+        })?;
+        let asset_bindings =
+            scene_asset_bindings_from_outputs(&manifest, &selected, &asset_outputs)?;
+        let bsn = pipeline
+            .plan_scene_bsn(manifest.clone(), asset_bindings.clone())
+            .map_err(|err| err.to_string())?;
+        let plan = parse_scene_bsn(&bsn, &asset_bindings).map_err(|err| err.to_string())?;
+        let commands = scene_commands_with_cache_reload(
+            scene_plan_to_mcp_commands(&plan, &asset_bindings, args.clear_existing)
+                .map_err(|err| err.to_string())?,
+        );
+        response["asset_outputs"] = asset_outputs;
+        response["asset_bindings"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["bsn"] = json!(bsn);
+        response["plan"] = serde_json::to_value(&plan).map_err(|err| err.to_string())?;
+        response["commands"] = json!(commands);
+        response["clear_existing"] = json!(args.clear_existing);
+        response["apply"] = json!(args.apply);
+        if args.apply {
+            response["acknowledgement"] = self.send_scene_commands(
+                response["commands"].as_array().cloned().unwrap_or_default(),
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn call_scene_plan_bsn(&self, args: ScenePlanBsnArgs) -> Result<Value, String> {
+        let config = SceneBuildConfig {
+            source_scene_path: PathBuf::from(&args.manifest.source_scene_path),
+            object_reference_image_path: args
+                .object_reference_image_path
+                .unwrap_or_else(|| self.config.scene_object_reference_image.clone()),
+            output_dir: args.output_dir.unwrap_or_else(default_scene_output_dir),
+            candidate_count: 1,
+            quality_profile: SceneQualityProfile::Quality,
+            reasoning_model: self.config.openai_reasoning_model.clone(),
+            image_model: self.config.openai_image_model.clone(),
+            allow_catalog_reuse: false,
+        };
+        let provider = self.openai_provider()?;
+        let pipeline = ScenePipeline::new(config, provider);
+        let bsn = pipeline
+            .plan_scene_bsn(args.manifest, args.asset_bindings.clone())
+            .map_err(|err| err.to_string())?;
+        let plan = match parse_scene_bsn(&bsn, &args.asset_bindings) {
+            Ok(plan) => plan,
+            Err(err) => {
+                return Ok(json!({
+                    "tool": "scene_plan_bsn",
+                    "valid": false,
+                    "bsn": bsn,
+                    "validation_error": err.to_string(),
+                    "asset_bindings": args.asset_bindings,
+                    "clear_existing": args.clear_existing,
+                    "apply": false,
+                }));
+            }
+        };
+        let commands = scene_commands_with_cache_reload(
+            scene_plan_to_mcp_commands(&plan, &args.asset_bindings, args.clear_existing)
+                .map_err(|err| err.to_string())?,
+        );
+        let mut response = json!({
+            "tool": "scene_plan_bsn",
+            "valid": true,
+            "bsn": bsn,
+            "plan": plan,
+            "commands": commands,
+            "asset_bindings": args.asset_bindings,
+            "clear_existing": args.clear_existing,
+            "apply": args.apply,
+        });
+        if args.apply {
+            response["acknowledgement"] = self.send_scene_commands(
+                response["commands"].as_array().cloned().unwrap_or_default(),
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn call_scene_apply_bsn(&self, args: SceneApplyBsnArgs) -> Result<Value, String> {
+        let plan =
+            parse_scene_bsn(&args.bsn, &args.asset_bindings).map_err(|err| err.to_string())?;
+        let commands = scene_commands_with_cache_reload(
+            scene_plan_to_mcp_commands(&plan, &args.asset_bindings, args.clear_existing)
+                .map_err(|err| err.to_string())?,
+        );
+        let mut response = json!({
+            "tool": "scene_apply_bsn",
+            "plan": plan,
+            "commands": commands,
+            "apply": args.apply,
+        });
+        if args.apply {
+            response["acknowledgement"] = self.send_scene_commands(
+                response["commands"].as_array().cloned().unwrap_or_default(),
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn scene_build_config(&self, args: ScenePrepareBuildArgs) -> Result<SceneBuildConfig, String> {
+        Ok(SceneBuildConfig {
+            source_scene_path: args.source_scene_path,
+            object_reference_image_path: args
+                .object_reference_image_path
+                .unwrap_or_else(|| self.config.scene_object_reference_image.clone()),
+            output_dir: args.output_dir.unwrap_or_else(default_scene_output_dir),
+            candidate_count: args.candidate_count.unwrap_or(3).max(1),
+            quality_profile: args.quality_profile.unwrap_or(SceneQualityProfile::Quality),
+            reasoning_model: self.config.openai_reasoning_model.clone(),
+            image_model: self.config.openai_image_model.clone(),
+            allow_catalog_reuse: args.allow_catalog_reuse,
+        })
+    }
+
+    fn openai_provider(&self) -> Result<OpenAiSceneProvider, String> {
+        OpenAiSceneProvider::from_env(OpenAiProviderConfig {
+            reasoning_model: self.config.openai_reasoning_model.clone(),
+            image_model: self.config.openai_image_model.clone(),
+            ..OpenAiProviderConfig::default()
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    fn open_catalog_cache(&self) -> Result<MeshCache, String> {
+        if let Some(root) = self.config.catalog_cache_root.as_ref() {
+            MeshCache::load_from_root(root.clone())
+        } else {
+            MeshCache::load_default()
+        }
+        .map_err(|err| format!("failed to open shared asset cache: {err}"))
     }
 
     fn call_scene_status(&self) -> Result<Value, String> {
@@ -997,6 +1437,28 @@ fn scene_commands_from_plan(plan: &SceneComposePlan) -> Result<Vec<Value>, Strin
     Ok(commands)
 }
 
+fn scene_commands_with_cache_reload(mut commands: Vec<Value>) -> Vec<Value> {
+    let uses_cache = commands.iter().any(|command| {
+        command
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|command_type| command_type == "spawn_cached")
+    });
+    if !uses_cache {
+        return commands;
+    }
+
+    let insert_at = commands
+        .first()
+        .and_then(|command| command.get("type"))
+        .and_then(Value::as_str)
+        .filter(|command_type| *command_type == "clear_scene")
+        .map(|_| 1)
+        .unwrap_or(0);
+    commands.insert(insert_at, json!({ "type": "reload_cache" }));
+    commands
+}
+
 fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel> {
     let mut out = Vec::new();
     for model in models {
@@ -1028,6 +1490,7 @@ struct WrittenAsset {
     faces: Option<usize>,
     gaussians: Option<usize>,
     material: Option<Value>,
+    catalog_entry: Option<CachedMeshMetadata>,
 }
 
 fn write_asset_output(
@@ -1037,6 +1500,7 @@ fn write_asset_output(
     requested_format: AssetOutputFormat,
     asset: SynthesisAsset,
     target_faces: Option<usize>,
+    catalog_cache: Option<&mut MeshCache>,
 ) -> Result<WrittenAsset, String> {
     match asset {
         SynthesisAsset::Mesh(mesh) => {
@@ -1051,6 +1515,9 @@ fn write_asset_output(
             }
             let mesh = apply_mesh_decimation(mesh, target_faces)
                 .map_err(|err| format!("mesh decimation failed: {err}"))?;
+            let catalog_mesh = catalog_cache
+                .as_ref()
+                .map(|_| cached_mesh_from_runtime_mesh(&mesh));
             let output_path =
                 resolve_asset_output_path(input_path, output_dir, explicit_output, "_mesh", "glb");
             write_glb_mesh(output_path.as_path(), &mesh)?;
@@ -1062,6 +1529,16 @@ fn write_asset_output(
                     "alpha": value.alpha,
                 })
             });
+            let catalog_entry = match (catalog_cache, catalog_mesh.as_ref()) {
+                (Some(cache), Some(cached_mesh)) => Some(
+                    cache
+                        .upsert_mesh_for_image(input_path, cached_mesh)
+                        .map_err(|err| {
+                            format!("failed to promote mesh to shared catalog: {err}")
+                        })?,
+                ),
+                _ => None,
+            };
             Ok(WrittenAsset {
                 output_path,
                 output_format: AssetOutputFormat::Glb,
@@ -1070,6 +1547,7 @@ fn write_asset_output(
                 faces: Some(mesh.faces.len()),
                 gaussians: None,
                 material,
+                catalog_entry,
             })
         }
         SynthesisAsset::GaussianSplat(splats) => {
@@ -1088,6 +1566,16 @@ fn write_asset_output(
                 output_format.as_str(),
             );
             write_splat_asset(output_path.as_path(), &splats, output_format)?;
+            let catalog_entry = match catalog_cache {
+                Some(cache) => Some(
+                    cache
+                        .upsert_gaussian_splat_for_image(input_path, &splats)
+                        .map_err(|err| {
+                            format!("failed to promote Gaussian splat to shared catalog: {err}")
+                        })?,
+                ),
+                None => None,
+            };
             Ok(WrittenAsset {
                 output_path,
                 output_format,
@@ -1096,8 +1584,45 @@ fn write_asset_output(
                 faces: None,
                 gaussians: Some(splats.len()),
                 material: None,
+                catalog_entry,
             })
         }
+    }
+}
+
+fn cached_mesh_from_runtime_mesh(mesh: &Mesh) -> CachedSynthMesh {
+    CachedSynthMesh {
+        mesh: CachedTripoMesh {
+            vertices: mesh.vertices.clone(),
+            faces: mesh.faces.clone(),
+        },
+        uvs: mesh.uvs.clone(),
+        material: mesh.material.map(|material| CachedSynthMeshMaterial {
+            base_color: material.base_color,
+            metallic: material.metallic,
+            roughness: material.roughness,
+            alpha: material.alpha,
+        }),
+        pbr_textures: mesh
+            .pbr_textures
+            .clone()
+            .map(|textures| CachedSynthMeshPbrTextures {
+                base_color: cached_texture_from_runtime_texture(textures.base_color),
+                metallic_roughness: cached_texture_from_runtime_texture(
+                    textures.metallic_roughness,
+                ),
+                normal: textures.normal.map(cached_texture_from_runtime_texture),
+                emissive: textures.emissive.map(cached_texture_from_runtime_texture),
+                occlusion: textures.occlusion.map(cached_texture_from_runtime_texture),
+            }),
+    }
+}
+
+fn cached_texture_from_runtime_texture(texture: burn_synth::MeshTexture) -> CachedSynthMeshTexture {
+    CachedSynthMeshTexture {
+        width: texture.width,
+        height: texture.height,
+        rgba8: texture.rgba8,
     }
 }
 
@@ -1245,6 +1770,144 @@ fn next_scene_sequence() -> u64 {
             Ok(_) => return next,
             Err(value) => current = value,
         }
+    }
+}
+
+fn default_scene_output_dir() -> PathBuf {
+    PathBuf::from("tmp/runs").join(format!("{}_scene_openai_mcp", next_scene_sequence()))
+}
+
+fn default_scene_lift_assets() -> bool {
+    true
+}
+
+fn default_scene_clear_existing() -> bool {
+    true
+}
+
+fn default_scene_promote_to_catalog() -> bool {
+    true
+}
+
+fn select_scene_candidates(
+    manifest: &SceneObjectManifest,
+    candidates: &[burn_synth_scene::ObjectImageCandidate],
+) -> Result<Vec<Value>, String> {
+    let mut by_object = candidates
+        .iter()
+        .map(|candidate| (candidate.object_id.as_str(), candidate))
+        .collect::<Vec<_>>();
+    by_object.sort_by(|(_, left), (_, right)| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.candidate_index.cmp(&right.candidate_index))
+    });
+    let mut selected = Vec::new();
+    let mut seen_groups = HashSet::new();
+    for object in &manifest.objects {
+        let group = object
+            .reuse_group
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(object.id.as_str())
+            .to_string();
+        if !seen_groups.insert(group.clone()) {
+            continue;
+        }
+        let candidate = by_object
+            .iter()
+            .find(|(object_id, _)| *object_id == object.id)
+            .map(|(_, candidate)| *candidate)
+            .ok_or_else(|| format!("no generated image candidate for object `{}`", object.id))?;
+        if candidate.score < MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE {
+            return Err(format!(
+                "generated image candidate for object `{}` is not suitable for TRELLIS/RMBG reconstruction (score={:.3}, min={:.3}); regenerate with more candidates or improve the isolated-object prompt/background",
+                object.id, candidate.score, MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE
+            ));
+        }
+        selected.push(json!({
+            "object_id": object.id,
+            "reuse_group": group,
+            "label": object.label,
+            "image_path": candidate.image_path,
+            "candidate_index": candidate.candidate_index,
+            "score": candidate.score,
+            "prompt_hash": candidate.prompt_hash,
+        }));
+    }
+    Ok(selected)
+}
+
+fn scene_asset_bindings_from_outputs(
+    manifest: &SceneObjectManifest,
+    selected_candidates: &[Value],
+    asset_outputs: &Value,
+) -> Result<Vec<SceneAssetBinding>, String> {
+    let items = asset_outputs["items"]
+        .as_array()
+        .ok_or_else(|| "images_to_assets response missing items array".to_string())?;
+    if items.len() != selected_candidates.len() {
+        return Err(format!(
+            "asset output count ({}) did not match selected candidate count ({})",
+            items.len(),
+            selected_candidates.len()
+        ));
+    }
+    let objects_by_id = manifest
+        .objects
+        .iter()
+        .map(|object| (object.id.as_str(), object))
+        .collect::<HashMap<_, _>>();
+    let mut bindings = Vec::with_capacity(items.len());
+    for (item, selected) in items.iter().zip(selected_candidates.iter()) {
+        let object_id = selected["object_id"]
+            .as_str()
+            .ok_or_else(|| "selected candidate missing object_id".to_string())?;
+        let object = objects_by_id
+            .get(object_id)
+            .ok_or_else(|| format!("selected candidate references unknown object `{object_id}`"))?;
+        let output_path = item["output_path"]
+            .as_str()
+            .ok_or_else(|| "asset output item missing output_path".to_string())?;
+        let cache_key = item["cache_key"].as_str().map(ToOwned::to_owned);
+        bindings.push(SceneAssetBinding {
+            asset_id: sanitize_scene_identifier(&format!("{object_id}_asset")),
+            object_id: object.id.clone(),
+            label: object.label.clone(),
+            aliases: object.aliases.clone(),
+            path: Some(output_path.to_string()),
+            cache_key: cache_key.clone(),
+            reusable: cache_key.is_some()
+                || object.instance_count > 1
+                || object.reuse_group.is_some(),
+            source_image_path: selected["image_path"].as_str().map(ToOwned::to_owned),
+            pipeline: item["synthesis_backend"].as_str().map(ToOwned::to_owned),
+            provenance: Some(burn_synth_scene::SceneAssetProvenance {
+                run_id: "scene_build_from_image".to_string(),
+                source_scene_path: manifest.source_scene_path.clone(),
+                source_object_id: object.id.clone(),
+                generated_by: "scene_build_from_image".to_string(),
+            }),
+        });
+    }
+    Ok(bindings)
+}
+
+fn sanitize_scene_identifier(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "asset".to_string()
+    } else {
+        output
     }
 }
 
@@ -1410,9 +2073,129 @@ fn tool_defs() -> Vec<Value> {
                     "target_faces": { "type": "integer", "description": "Optional target face count for mesh simplification." },
                     "batch_size": { "type": "integer", "description": "Optional explicit chunk size; omit for server default/auto." },
                     "batch_vram_mb": { "type": "integer", "description": "Optional VRAM budget in MB for auto chunking." },
+                    "trellis_pbr": { "type": "boolean", "description": "Enable native TRELLIS UV/material texture baking for lifted GLB assets." },
+                    "trellis_pbr_texture_size": { "type": "integer", "description": "Native TRELLIS PBR texture size." },
+                    "promote_to_catalog": { "type": "boolean", "description": "Also add generated assets to the shared Bevy catalog/cache for later reuse. Defaults to false for direct batch conversion." },
                     "dry_run": { "type": "boolean", "description": "Skip model inference and emit canonical debug assets." }
                 },
                 "required": ["input_image_paths"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_prepare_build",
+            "description": "Prepare a formal OpenAI scene-builder run offline: validate paths and return strict schemas/prompts without calling OpenAI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_scene_path": { "type": "string", "description": "Source scene image path." },
+                    "object_reference_image_path": { "type": "string", "description": "Optional isolated-object style reference image; defaults to docs/input_chair.jpg." },
+                    "output_dir": { "type": "string", "description": "Run output directory under tmp/runs." },
+                    "candidate_count": { "type": "integer", "description": "Object image candidates per reusable object." },
+                    "quality_profile": { "type": "string", "enum": ["draft", "quality"] },
+                    "allow_catalog_reuse": { "type": "boolean", "description": "Whether the planner may consider existing catalog assets." }
+                },
+                "required": ["source_scene_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_plan_objects",
+            "description": "Use the raw OpenAI API to create a strict object manifest from a source scene image. Requires OPENAI_API_KEY.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_scene_path": { "type": "string" },
+                    "object_reference_image_path": { "type": "string" },
+                    "output_dir": { "type": "string" },
+                    "candidate_count": { "type": "integer" },
+                    "quality_profile": { "type": "string", "enum": ["draft", "quality"] },
+                    "allow_catalog_reuse": { "type": "boolean" }
+                },
+                "required": ["source_scene_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_generate_object_images",
+            "description": "Use the raw OpenAI Image API to generate isolated object-image candidates from a scene manifest, source crop, source scene image, and docs/input_chair.jpg-style reference. Requires OPENAI_API_KEY.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_scene_path": { "type": "string" },
+                    "manifest": { "type": "object", "description": "SceneObjectManifest returned by scene_plan_objects." },
+                    "object_reference_image_path": { "type": "string" },
+                    "output_dir": { "type": "string" },
+                    "candidate_count": { "type": "integer" },
+                    "quality_profile": { "type": "string", "enum": ["draft", "quality"] }
+                },
+                "required": ["source_scene_path", "manifest"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_build_from_image",
+            "description": "Quality-first OpenAI scene build: plan objects, generate isolated object images, lift selected candidates through RMBG+TRELLIS, generate restricted BSN, validate it, and optionally apply to Bevy. Requires OPENAI_API_KEY.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_scene_path": { "type": "string" },
+                    "object_reference_image_path": { "type": "string" },
+                    "output_dir": { "type": "string" },
+                    "candidate_count": { "type": "integer" },
+                    "quality_profile": { "type": "string", "enum": ["draft", "quality"] },
+                    "allow_catalog_reuse": { "type": "boolean" },
+                    "lift_assets": { "type": "boolean", "description": "When false, stop after object image generation." },
+                    "target_faces": { "type": "integer" },
+                    "batch_size": { "type": "integer" },
+                    "batch_vram_mb": { "type": "integer" },
+                    "trellis_pbr": { "type": "boolean", "description": "Enable native TRELLIS UV/material texture baking for lifted GLB assets." },
+                    "trellis_pbr_texture_size": { "type": "integer", "description": "Native TRELLIS PBR texture size." },
+                    "promote_to_catalog": { "type": "boolean", "description": "Add lifted objects to the shared Bevy catalog/cache for later reuse. Defaults to true; fresh scene mode still does not read existing catalog assets while planning." },
+                    "clear_existing": { "type": "boolean" },
+                    "apply": { "type": "boolean" }
+                },
+                "required": ["source_scene_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_plan_bsn",
+            "description": "Use the raw OpenAI API to plan restricted synth_scene_v1 BSN from an existing object manifest and generated asset bindings, then validate commands before optional Bevy apply. Requires OPENAI_API_KEY.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "manifest": { "type": "object", "description": "SceneObjectManifest returned by scene_plan_objects or scene_build_from_image." },
+                    "asset_bindings": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "description": "Generated asset bindings with asset_id plus path or cache_key."
+                    },
+                    "object_reference_image_path": { "type": "string" },
+                    "output_dir": { "type": "string" },
+                    "clear_existing": { "type": "boolean" },
+                    "apply": { "type": "boolean", "description": "When true, send commands to Bevy scene bridge." }
+                },
+                "required": ["manifest", "asset_bindings"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_apply_bsn",
+            "description": "Validate restricted synth_scene_v1 BSN against explicit generated asset bindings and optionally apply it to the Bevy scene bridge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bsn": { "type": "string", "description": "Restricted synth_scene_v1 text." },
+                    "asset_bindings": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "description": "Generated asset bindings with asset_id plus path or cache_key."
+                    },
+                    "clear_existing": { "type": "boolean" },
+                    "apply": { "type": "boolean", "description": "When true, send commands to Bevy scene bridge." }
+                },
+                "required": ["bsn", "asset_bindings"],
                 "additionalProperties": false
             }
         }),
@@ -1769,7 +2552,99 @@ struct ImagesToAssetsToolArgs {
     #[serde(default)]
     pub batch_vram_mb: Option<u64>,
     #[serde(default)]
+    pub trellis_pbr: Option<bool>,
+    #[serde(default)]
+    pub trellis_pbr_texture_size: Option<usize>,
+    #[serde(default)]
+    pub promote_to_catalog: bool,
+    #[serde(default)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScenePrepareBuildArgs {
+    pub source_scene_path: PathBuf,
+    #[serde(default)]
+    pub object_reference_image_path: Option<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub candidate_count: Option<usize>,
+    #[serde(default)]
+    pub quality_profile: Option<SceneQualityProfile>,
+    #[serde(default)]
+    pub allow_catalog_reuse: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneGenerateObjectImagesArgs {
+    pub source_scene_path: PathBuf,
+    pub manifest: SceneObjectManifest,
+    #[serde(default)]
+    pub object_reference_image_path: Option<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub candidate_count: Option<usize>,
+    #[serde(default)]
+    pub quality_profile: Option<SceneQualityProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneBuildFromImageArgs {
+    pub source_scene_path: PathBuf,
+    #[serde(default)]
+    pub object_reference_image_path: Option<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub candidate_count: Option<usize>,
+    #[serde(default)]
+    pub quality_profile: Option<SceneQualityProfile>,
+    #[serde(default)]
+    pub allow_catalog_reuse: bool,
+    #[serde(default = "default_scene_lift_assets")]
+    pub lift_assets: bool,
+    #[serde(default)]
+    pub target_faces: Option<usize>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub batch_vram_mb: Option<u64>,
+    #[serde(default)]
+    pub trellis_pbr: Option<bool>,
+    #[serde(default)]
+    pub trellis_pbr_texture_size: Option<usize>,
+    #[serde(default = "default_scene_promote_to_catalog")]
+    pub promote_to_catalog: bool,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default = "default_scene_clear_existing")]
+    pub clear_existing: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScenePlanBsnArgs {
+    pub manifest: SceneObjectManifest,
+    pub asset_bindings: Vec<SceneAssetBinding>,
+    #[serde(default)]
+    pub object_reference_image_path: Option<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default = "default_scene_clear_existing")]
+    pub clear_existing: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SceneApplyBsnArgs {
+    pub bsn: String,
+    pub asset_bindings: Vec<SceneAssetBinding>,
+    #[serde(default)]
+    pub clear_existing: bool,
+    #[serde(default)]
+    pub apply: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1999,6 +2874,12 @@ mod tests {
             "images_to_assets",
             "image_to_splat",
             "scene_status",
+            "scene_prepare_build",
+            "scene_plan_objects",
+            "scene_generate_object_images",
+            "scene_build_from_image",
+            "scene_plan_bsn",
+            "scene_apply_bsn",
             "scene_spawn_cached",
             "scene_spawn_path",
             "scene_clear",
@@ -2008,6 +2889,101 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+    }
+
+    #[test]
+    fn select_scene_candidates_rejects_low_reconstruction_score() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/scene.jpg".to_string(),
+            objects: vec![burn_synth_scene::SceneObjectSpec {
+                id: "coffee_table".to_string(),
+                label: "coffee table".to_string(),
+                aliases: Vec::new(),
+                bbox: [0.2, 0.2, 0.8, 0.8],
+                reuse_group: None,
+                instance_count: 1,
+                object_prompt: "white coffee table".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+            }],
+        };
+        let candidates = vec![burn_synth_scene::ObjectImageCandidate {
+            object_id: "coffee_table".to_string(),
+            candidate_index: 0,
+            image_path: "/tmp/table.png".to_string(),
+            raw_image_path: None,
+            prompt_hash: "hash".to_string(),
+            score: MIN_SCENE_RECONSTRUCTION_IMAGE_SCORE - 0.01,
+            provider_request_id: None,
+        }];
+        let err = select_scene_candidates(&manifest, &candidates).unwrap_err();
+        assert!(err.contains("not suitable for TRELLIS/RMBG reconstruction"));
+    }
+
+    #[test]
+    fn scene_asset_bindings_prefer_promoted_catalog_cache_keys() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/scene.jpg".to_string(),
+            objects: vec![burn_synth_scene::SceneObjectSpec {
+                id: "chair_left".to_string(),
+                label: "conference chair".to_string(),
+                aliases: vec!["chair".to_string()],
+                bbox: [0.1, 0.2, 0.3, 0.7],
+                reuse_group: None,
+                instance_count: 1,
+                object_prompt: "green conference chair".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+            }],
+        };
+        let selected = vec![json!({
+            "object_id": "chair_left",
+            "reuse_group": "chair_left",
+            "label": "conference chair",
+            "image_path": "/tmp/chair_candidate.png",
+            "candidate_index": 0,
+            "score": 0.91,
+            "prompt_hash": "abc",
+        })];
+        let asset_outputs = json!({
+            "items": [
+                {
+                    "output_path": "/tmp/chair_candidate_mesh.glb",
+                    "cache_key": "central-chair-cache-key",
+                    "synthesis_backend": "trellis"
+                }
+            ]
+        });
+
+        let bindings =
+            scene_asset_bindings_from_outputs(&manifest, &selected, &asset_outputs).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].cache_key.as_deref(),
+            Some("central-chair-cache-key")
+        );
+        assert!(bindings[0].reusable);
+
+        let bsn = "synth_scene_v1 {\nasset chair_left_asset = \"generated:chair_left_asset\";\nspawn chair uses chair_left_asset translation [0.0,0.0,0.0] rotation_y 0.0 scale [1.0,1.0,1.0];\n}";
+        let plan = parse_scene_bsn(bsn, &bindings).unwrap();
+        let commands = scene_plan_to_mcp_commands(&plan, &bindings, true).unwrap();
+        assert_eq!(commands[0]["type"], "clear_scene");
+        assert_eq!(commands[1]["type"], "spawn_cached");
+        assert_eq!(commands[1]["cache_key"], json!("central-chair-cache-key"));
+    }
+
+    #[test]
+    fn scene_commands_with_cache_reload_preserves_clear_first() {
+        let commands = scene_commands_with_cache_reload(vec![
+            json!({ "type": "clear_scene" }),
+            json!({ "type": "spawn_cached", "cache_key": "chair" }),
+            json!({ "type": "spawn_cached", "cache_key": "table" }),
+        ]);
+
+        assert_eq!(commands[0]["type"], "clear_scene");
+        assert_eq!(commands[1]["type"], "reload_cache");
+        assert_eq!(commands[2]["type"], "spawn_cached");
+        assert_eq!(commands.len(), 4);
     }
 
     #[test]

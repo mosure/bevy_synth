@@ -15,6 +15,8 @@ use bevy_synth_ui::{
     BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogState, CatalogStatus,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::prepare_startup_bsn_scene;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{
@@ -96,6 +98,9 @@ fn test_args() -> AppArgs {
         pause_render_during_inference: true,
         max_batch_size: 1,
         mcp_scene_control_path: None,
+        scene_bsn: None,
+        scene_assets_json: None,
+        scene_bsn_clear_existing: true,
     }
 }
 
@@ -128,6 +133,63 @@ fn generated_glb_path_loader_uses_runtime_mesh_parser() {
     assert!(
         materials.get(&material_handle).is_some(),
         "generated GLB should produce a Bevy material handle"
+    );
+    std::fs::remove_dir_all(dir).expect("remove temp dir");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn startup_bsn_scene_writes_mcp_command_envelope() {
+    let dir = isolated_cache_root();
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let bsn_path = dir.join("scene.bsn");
+    let assets_path = dir.join("assets.json");
+    let command_path = dir.join("scene_commands.json");
+    let mesh_path = dir.join("chair.glb");
+    write_glb(&mesh_path, &dummy_mesh()).expect("write generated glb");
+    std::fs::write(
+        &bsn_path,
+        "synth_scene_v1 {\nasset chair_asset = \"generated:chair_asset\";\nspawn chair_left uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0 scale [1.0,1.0,1.0];\n}\n",
+    )
+    .expect("write bsn");
+    std::fs::write(
+        &assets_path,
+        serde_json::to_vec_pretty(&serde_json::json!([
+            {
+                "asset_id": "chair_asset",
+                "object_id": "chair_group",
+                "label": "chair",
+                "aliases": ["chair"],
+                "path": mesh_path,
+                "cache_key": null,
+                "reusable": false,
+                "source_image_path": null,
+                "pipeline": "trellis",
+                "provenance": null
+            }
+        ]))
+        .unwrap(),
+    )
+    .expect("write assets");
+    let mut args = test_args();
+    args.scene_bsn = Some(bsn_path);
+    args.scene_assets_json = Some(assets_path);
+    args.mcp_scene_control_path = Some(command_path.clone());
+    prepare_startup_bsn_scene(&mut args).expect("prepare startup bsn");
+    assert_eq!(args.mcp_scene_control_path.as_ref(), Some(&command_path));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&command_path).expect("read envelope")).unwrap();
+    assert_eq!(
+        envelope["session_id"],
+        serde_json::json!("bevy_synth-startup-bsn")
+    );
+    assert_eq!(
+        envelope["commands"][0]["type"],
+        serde_json::json!("clear_scene")
+    );
+    assert_eq!(
+        envelope["commands"][1]["type"],
+        serde_json::json!("spawn_path")
     );
     std::fs::remove_dir_all(dir).expect("remove temp dir");
 }

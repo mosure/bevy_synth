@@ -106,8 +106,55 @@ fn initialize_and_list_tools() {
     assert!(names.contains(&"image_to_mesh"));
     assert!(names.contains(&"images_to_assets"));
     assert!(names.contains(&"scene_clear"));
+    assert!(names.contains(&"scene_prepare_build"));
+    assert!(names.contains(&"scene_plan_objects"));
+    assert!(names.contains(&"scene_generate_object_images"));
+    assert!(names.contains(&"scene_build_from_image"));
+    assert!(names.contains(&"scene_plan_bsn"));
+    assert!(names.contains(&"scene_apply_bsn"));
     assert!(names.contains(&"scene_compose_assets"));
     assert!(names.contains(&"scene_validate_layout"));
+    client.shutdown();
+}
+
+#[test]
+fn scene_apply_bsn_validates_generated_asset_bindings() {
+    let mut client = McpTestClient::spawn(&[]);
+    let response = client.send_request(
+        "tools/call",
+        json!({
+            "name": "scene_apply_bsn",
+            "arguments": {
+                "bsn": "synth_scene_v1 {\nasset chair_asset = \"generated:chair_asset\";\nspawn chair_left uses chair_asset translation [-1.0,0.0,2.0] rotation_y 25.0 scale [1.0,1.0,1.0];\n}",
+                "asset_bindings": [
+                    {
+                        "asset_id": "chair_asset",
+                        "object_id": "chair_group",
+                        "label": "chair",
+                        "aliases": ["conference chair"],
+                        "path": "/tmp/chair.glb",
+                        "reusable": true,
+                        "source_image_path": "/tmp/chair.png",
+                        "pipeline": "trellis"
+                    }
+                ],
+                "clear_existing": true,
+                "apply": false
+            }
+        }),
+    );
+    assert!(
+        response["result"]["isError"].is_null(),
+        "unexpected bsn tool error: {response:#}"
+    );
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(
+        structured["plan"]["placements"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(structured["commands"][0]["type"], "clear_scene");
+    assert_eq!(structured["commands"][1]["type"], "spawn_path");
+    assert_eq!(structured["commands"][1]["cache_key"], "chair_asset");
     client.shutdown();
 }
 
@@ -543,6 +590,117 @@ fn mesh_tool_supports_target_faces_and_material_metadata_fields() {
     assert!(
         face_count <= 4_u64,
         "expected face count <= 4, got {face_count}"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn images_to_assets_applies_trellis_pbr_and_target_faces() {
+    let mut client = McpTestClient::spawn(&[
+        "--synthesis-models",
+        "trellis",
+        "--backend",
+        "cpu",
+        "--trellis-pbr",
+        "--trellis-pbr-texture-size",
+        "512",
+    ]);
+    let dir = make_temp_dir("images_to_assets_trellis_config");
+    let input = dir.join("input.png");
+    let output_dir = dir.join("assets");
+    write_test_image(&input);
+
+    let response = client.send_request(
+        "tools/call",
+        json!({
+            "name": "images_to_assets",
+            "arguments": {
+                "input_image_paths": [input.display().to_string()],
+                "output_dir": output_dir.display().to_string(),
+                "target_faces": 42000,
+                "trellis_pbr": true,
+                "trellis_pbr_texture_size": 1024,
+                "dry_run": true
+            }
+        }),
+    );
+    assert!(
+        response["result"]["isError"].is_null(),
+        "unexpected tool error: {response:#}"
+    );
+    let structured = response["result"]["structuredContent"].clone();
+    assert_eq!(structured["synthesis_models"], json!(["trellis"]));
+    assert_eq!(structured["backend"], json!("cpu"));
+    assert_eq!(structured["target_faces"], json!(42000));
+    assert_eq!(structured["trellis_pbr_enabled"], json!(true));
+    assert_eq!(structured["trellis_pbr_texture_size"], json!(1024));
+    let item = &structured["items"][0];
+    assert_eq!(item["target_faces"], json!(42000));
+    assert_eq!(item["output_format"], json!("glb"));
+    assert!(
+        PathBuf::from(item["output_path"].as_str().expect("output path")).exists(),
+        "expected dry-run asset output"
+    );
+
+    client.shutdown();
+}
+
+#[test]
+fn images_to_assets_can_promote_outputs_to_shared_catalog() {
+    let dir = make_temp_dir("images_to_assets_catalog_promote");
+    let catalog_root = dir.join("catalog");
+    let mut client = McpTestClient::spawn(&[
+        "--synthesis-models",
+        "trellis",
+        "--backend",
+        "cpu",
+        "--catalog-cache-root",
+        catalog_root.to_str().expect("catalog root path"),
+    ]);
+    let input = dir.join("chair.png");
+    let output_dir = dir.join("assets");
+    write_test_image(&input);
+
+    let response = client.send_request(
+        "tools/call",
+        json!({
+            "name": "images_to_assets",
+            "arguments": {
+                "input_image_paths": [input.display().to_string()],
+                "output_dir": output_dir.display().to_string(),
+                "synthesis_models": ["trellis"],
+                "backend": "cpu",
+                "promote_to_catalog": true,
+                "dry_run": true
+            }
+        }),
+    );
+    assert!(
+        response["result"]["isError"].is_null(),
+        "unexpected catalog promotion error: {response:#}"
+    );
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["promote_to_catalog"], json!(true));
+    let item = &structured["items"][0];
+    let cache_key = item["cache_key"].as_str().expect("cache key");
+    assert_eq!(item["catalog_entry"]["cache_key"], json!(cache_key));
+    assert_eq!(
+        item["catalog_entry"]["source_image_path"],
+        json!(input.display().to_string())
+    );
+
+    let index_path = catalog_root.join("index.json");
+    let index = fs::read_to_string(&index_path).expect("read shared catalog index");
+    let index: Value = serde_json::from_str(&index).expect("parse shared catalog index");
+    assert_eq!(index["meshes"].as_array().expect("mesh entries").len(), 1);
+    assert_eq!(index["meshes"][0]["cache_key"], json!(cache_key));
+    let glb_output_id = index["meshes"][0]["glb_output_id"]
+        .as_str()
+        .expect("glb output id");
+    assert!(
+        PathBuf::from(glb_output_id).exists(),
+        "central cache GLB should exist"
     );
 
     client.shutdown();
