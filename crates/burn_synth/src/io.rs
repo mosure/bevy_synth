@@ -59,7 +59,7 @@ use std::fs;
 use std::io;
 
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
-use crate::mesh::{Mesh, MeshTexture};
+use crate::mesh::{Mesh, MeshTexture, compute_position_welded_normals};
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use image::ImageEncoder;
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
@@ -71,6 +71,8 @@ struct MeshBinaryLayout {
     buffer: Vec<u8>,
     positions_byte_offset: usize,
     positions_byte_length: usize,
+    normals_byte_offset: usize,
+    normals_byte_length: usize,
     indices_byte_offset: usize,
     indices_byte_length: usize,
     uvs_byte_offset: Option<usize>,
@@ -125,7 +127,7 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         }
     }
 
-    let mut buffer = Vec::with_capacity(mesh.vertices.len() * 12 + mesh.faces.len() * 12 + 8192);
+    let mut buffer = Vec::with_capacity(mesh.vertices.len() * 24 + mesh.faces.len() * 12 + 8192);
     let positions_byte_offset = buffer.len();
     for vertex in &mesh.vertices {
         for component in vertex {
@@ -133,6 +135,16 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         }
     }
     let positions_byte_length = buffer.len() - positions_byte_offset;
+
+    pad_buffer_4(&mut buffer);
+    let normals = compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55);
+    let normals_byte_offset = buffer.len();
+    for normal in &normals {
+        for component in normal {
+            buffer.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    let normals_byte_length = buffer.len() - normals_byte_offset;
 
     let mut uvs_byte_offset = None;
     let mut uvs_byte_length = None;
@@ -200,6 +212,8 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         buffer,
         positions_byte_offset,
         positions_byte_length,
+        normals_byte_offset,
+        normals_byte_length,
         indices_byte_offset,
         indices_byte_length,
         uvs_byte_offset,
@@ -218,13 +232,14 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
 fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
     let mut primitive = json!({
         "attributes": {
-            "POSITION": 0
+            "POSITION": 0,
+            "NORMAL": 1
         },
-        "indices": 1,
+        "indices": 2,
         "mode": 4
     });
     if mesh.uvs.len() == mesh.vertices.len() && !mesh.uvs.is_empty() {
-        primitive["attributes"]["TEXCOORD_0"] = json!(2);
+        primitive["attributes"]["TEXCOORD_0"] = json!(3);
     }
 
     let buffers = vec![json!({
@@ -236,6 +251,12 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
         "buffer": 0,
         "byteOffset": layout.positions_byte_offset,
         "byteLength": layout.positions_byte_length,
+        "target": 34962
+    }));
+    buffer_views.push(json!({
+        "buffer": 0,
+        "byteOffset": layout.normals_byte_offset,
+        "byteLength": layout.normals_byte_length,
         "target": 34962
     }));
     buffer_views.push(json!({
@@ -264,13 +285,19 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
     }));
     accessors.push(json!({
         "bufferView": 1,
+        "componentType": 5126,
+        "count": mesh.vertices.len(),
+        "type": "VEC3"
+    }));
+    accessors.push(json!({
+        "bufferView": 2,
         "componentType": 5125,
         "count": mesh.faces.len() * 3,
         "type": "SCALAR"
     }));
     if mesh.uvs.len() == mesh.vertices.len() && !mesh.uvs.is_empty() {
         accessors.push(json!({
-            "bufferView": 2,
+            "bufferView": 3,
             "componentType": 5126,
             "count": mesh.uvs.len(),
             "type": "VEC2"
@@ -298,7 +325,14 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
         texture_index
     };
 
-    if let Some(material) = mesh.material {
+    let has_pbr_textures = mesh.pbr_textures.is_some();
+    if has_pbr_textures {
+        pbr_mr = json!({
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "metallicFactor": 1.0,
+            "roughnessFactor": 1.0
+        });
+    } else if let Some(material) = mesh.material {
         pbr_mr = json!({
             "baseColorFactor": [
                 material.base_color[0],
@@ -319,7 +353,7 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
         pbr_mr["metallicRoughnessTexture"] = json!({ "index": texture_index });
     }
 
-    if mesh.material.is_some() || mesh.pbr_textures.is_some() {
+    if mesh.material.is_some() || has_pbr_textures {
         let alpha = mesh
             .material
             .map(|value| value.alpha)
@@ -328,8 +362,8 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> Value {
         let material_index = materials.len();
         let mut material = json!({
             "pbrMetallicRoughness": pbr_mr,
-            "alphaMode": if alpha < 0.995 { "BLEND" } else { "OPAQUE" },
-            "doubleSided": true
+            "alphaMode": if has_pbr_textures || alpha >= 0.99 { "OPAQUE" } else { "BLEND" },
+            "doubleSided": !has_pbr_textures
         });
         if let Some((normal_offset, normal_len)) = layout.normal_image_view {
             let texture_index = push_texture_image(normal_offset, normal_len);
@@ -446,9 +480,9 @@ mod tests {
             faces: vec![[0, 1, 2]],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
             material: Some(MeshMaterial {
-                base_color: [1.0, 1.0, 1.0],
-                metallic: 1.0,
-                roughness: 1.0,
+                base_color: [0.25, 0.5, 0.75],
+                metallic: 0.2,
+                roughness: 0.4,
                 alpha: 1.0,
             }),
             pbr_textures: Some(MeshPbrTextures {
@@ -470,9 +504,20 @@ mod tests {
 
         let materials = json["materials"].as_array().expect("materials array");
         assert_eq!(materials.len(), 1);
+        let primitive = &json["meshes"][0]["primitives"][0];
+        assert_eq!(primitive["attributes"]["POSITION"], 0);
+        assert_eq!(primitive["attributes"]["NORMAL"], 1);
+        assert_eq!(primitive["indices"], 2);
+        assert_eq!(primitive["attributes"]["TEXCOORD_0"], 3);
+        assert_eq!(json["accessors"][1]["type"], "VEC3");
         let pbr = &materials[0]["pbrMetallicRoughness"];
+        assert_eq!(pbr["baseColorFactor"], json!([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(pbr["metallicFactor"], json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], json!(1.0));
         assert!(pbr.get("baseColorTexture").is_some());
         assert!(pbr.get("metallicRoughnessTexture").is_some());
+        assert_eq!(materials[0]["alphaMode"], "OPAQUE");
+        assert_eq!(materials[0]["doubleSided"], false);
         assert!(
             json["textures"]
                 .as_array()
@@ -498,6 +543,9 @@ mod tests {
         assert_eq!(materials.len(), 1);
         assert_eq!(materials[0]["alphaMode"], "OPAQUE");
         let pbr = &materials[0]["pbrMetallicRoughness"];
+        assert_eq!(pbr["baseColorFactor"], json!([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(pbr["metallicFactor"], json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], json!(1.0));
         assert!(pbr.get("baseColorTexture").is_some());
         assert!(pbr.get("metallicRoughnessTexture").is_some());
     }

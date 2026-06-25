@@ -210,13 +210,13 @@ impl<'a> ProjectionBvh<'a> {
         })
     }
 
-    fn closest_point(&self, point: [f32; 3]) -> [f32; 3] {
-        self.closest_point_and_distance2(point).0
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     fn closest_distance2(&self, point: [f32; 3]) -> f32 {
         self.closest_point_and_distance2(point).1
+    }
+
+    fn closest_point(&self, point: [f32; 3]) -> [f32; 3] {
+        self.closest_point_and_distance2(point).0
     }
 
     fn closest_point_and_distance2(&self, point: [f32; 3]) -> ([f32; 3], f32) {
@@ -866,7 +866,6 @@ fn vec3_mul(a: [f32; 3], scale: f32) -> [f32; 3] {
     [a[0] * scale, a[1] * scale, a[2] * scale]
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn vec3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -1169,6 +1168,11 @@ fn empty_pbr_bake_debug() -> PbrBakeDebug {
         texture_height: 0,
         uvs: Vec::new(),
         raster_mask: Vec::new(),
+        raster_candidate_texels: 0,
+        raster_conflict_texels: 0,
+        zero_support_samples: 0,
+        projection_rejected_samples: 0,
+        inpainted_texels: 0,
         sample_positions: Vec::new(),
         sample_attrs: Vec::new(),
         base_color_float: Vec::new(),
@@ -1439,6 +1443,10 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
     ));
     let raster_start = Instant::now();
     let mut sample_error: Option<String> = None;
+    let mut raster_candidate_texels = 0usize;
+    let mut raster_conflict_texels = 0usize;
+    let mut zero_support_samples = 0usize;
+    let projection_rejected_samples = 0usize;
     for face in uv_domain.raster_faces.iter().copied() {
         let i0 = face[0] as usize;
         let i1 = face[1] as usize;
@@ -1467,16 +1475,25 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
             }
             let idx = y * texture_size + x;
             if raster_mask[idx] != 0 {
+                raster_conflict_texels = raster_conflict_texels.saturating_add(1);
                 return;
             }
+            raster_candidate_texels = raster_candidate_texels.saturating_add(1);
 
             let raster_position = [
                 p0[0] * bary[0] + p1[0] * bary[1] + p2[0] * bary[2],
                 p0[1] * bary[0] + p1[1] * bary[1] + p2[1] * bary[2],
                 p0[2] * bary[0] + p1[2] * bary[1] + p2[2] * bary[2],
             ];
-            let position =
-                projection_bvh.map_or(raster_position, |bvh| bvh.closest_point(raster_position));
+            let position = if let Some(bvh) = projection_bvh {
+                // Match upstream `o_voxel.postprocess.to_glb`: every valid UV texel is
+                // projected to the closest point on the original high-resolution mesh
+                // before volume sampling. Do not normal-gate here; that creates
+                // unsupported texels and dark texture islands on thin/chair/table parts.
+                bvh.closest_point(raster_position)
+            } else {
+                raster_position
+            };
             #[cfg(feature = "runtime-model-wgpu")]
             if use_wgpu_dense_sampling {
                 deferred_raster_mask[idx] = 255;
@@ -1501,10 +1518,8 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
             let attrs = match sample_voxel_attr_from_lookup(position, &voxel_lookup) {
                 Ok(Some(attrs)) => attrs,
                 Ok(None) => {
-                    // Match upstream nvdiffrast/grid_sample semantics: raster coverage
-                    // owns the mask; sparse holes sample as zero attrs instead of
-                    // expanding the inpaint domain.
-                    [0.0; 6]
+                    zero_support_samples = zero_support_samples.saturating_add(1);
+                    return;
                 }
                 Err(err) => {
                     sample_error = Some(err);
@@ -1583,6 +1598,7 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
                         alpha_float[texel_idx] = attrs[5];
                         raster_mask[texel_idx] = 255;
                     } else {
+                        zero_support_samples = zero_support_samples.saturating_add(1);
                         let next = deferred_next[entry];
                         cursor[texel_idx] = next;
                         if next >= 0 {
@@ -1594,18 +1610,18 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
             }
             active_texels = next_active_texels;
         }
-        for (idx, covered) in deferred_raster_mask.iter().copied().enumerate() {
-            if covered != 0 && raster_mask[idx] == 0 {
-                raster_mask[idx] = 255;
-            }
-        }
+        let _ = deferred_raster_mask;
     }
     let covered_texels = raster_mask.iter().filter(|value| **value != 0).count();
     pbr_stage_log(format!(
-        "burn_trellis: decode.pbr raster_sample complete ({:.2} ms, covered_texels={} coverage={:.4})",
+        "burn_trellis: decode.pbr raster_sample complete ({:.2} ms, covered_texels={} coverage={:.4} candidates={} conflicts={} zero_support={} projection_rejected={})",
         raster_start.elapsed().as_secs_f64() * 1000.0,
         covered_texels,
-        covered_texels as f64 / texel_count.max(1) as f64
+        covered_texels as f64 / texel_count.max(1) as f64,
+        raster_candidate_texels,
+        raster_conflict_texels,
+        zero_support_samples,
+        projection_rejected_samples
     ));
 
     let inpaint_start = Instant::now();
@@ -1617,9 +1633,11 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
         roughness_float.as_mut_slice(),
         alpha_float.as_mut_slice(),
     )?;
+    let inpainted_texels = texel_count.saturating_sub(covered_texels);
     pbr_stage_log(format!(
-        "burn_trellis: decode.pbr inpaint complete ({:.2} ms)",
-        inpaint_start.elapsed().as_secs_f64() * 1000.0
+        "burn_trellis: decode.pbr inpaint complete ({:.2} ms, inpainted_texels={})",
+        inpaint_start.elapsed().as_secs_f64() * 1000.0,
+        inpainted_texels
     ));
 
     let pack_start = Instant::now();
@@ -1679,6 +1697,11 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
             texture_height: texture_size,
             uvs: debug_uvs,
             raster_mask,
+            raster_candidate_texels,
+            raster_conflict_texels,
+            zero_support_samples,
+            projection_rejected_samples,
+            inpainted_texels,
             sample_positions,
             sample_attrs,
             base_color_float,
@@ -1769,20 +1792,18 @@ pub(super) fn build_uv_raster_domain(
             components[component_idx].include(projected);
         }
     }
-    let fragmented_component_limit = texture_size
-        .saturating_mul(texture_size)
-        .checked_div(16)
-        .unwrap_or(0)
-        .max(256);
+    let fragmented_component_limit = texture_size.saturating_mul(2).max(256);
     let dense_face_texel_limit = texture_size
         .saturating_mul(texture_size)
         .saturating_mul(4)
         .max(1);
     if components.len() > fragmented_component_limit || atlas_faces.len() > dense_face_texel_limit {
         pbr_stage_log(format!(
-            "burn_trellis: decode.pbr uv using chart atlas fallback (components={} faces={} texture_size={})",
+            "burn_trellis: decode.pbr uv using chart atlas fallback (components={} component_limit={} faces={} face_limit={} texture_size={})",
             components.len(),
+            fragmented_component_limit,
             atlas_faces.len(),
+            dense_face_texel_limit,
             texture_size
         ));
         let mut chart_components =

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -134,6 +135,8 @@ struct MeshBinaryLayout {
     buffer: Vec<u8>,
     positions_byte_offset: usize,
     positions_byte_length: usize,
+    normals_byte_offset: usize,
+    normals_byte_length: usize,
     indices_byte_offset: usize,
     indices_byte_length: usize,
     uvs_byte_offset: Option<usize>,
@@ -268,6 +271,106 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn vec3_len2(a: [f32; 3]) -> f32 {
+    dot3(a, a)
+}
+
+fn normalize_or_up(normal: [f32; 3]) -> [f32; 3] {
+    let len2 = vec3_len2(normal);
+    if len2 > 1.0e-12 {
+        let inv = len2.sqrt().recip();
+        [normal[0] * inv, normal[1] * inv, normal[2] * inv]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+fn compute_vertex_normals(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<[f32; 3]> {
+    let mut normals = vec![[0.0f32; 3]; vertices.len()];
+    let vertex_count = vertices.len() as u32;
+    for face in faces {
+        let [i0, i1, i2] = *face;
+        if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
+            continue;
+        }
+        let v0 = vertices[i0 as usize];
+        let v1 = vertices[i1 as usize];
+        let v2 = vertices[i2 as usize];
+        let normal = cross3(vec3_sub(v1, v0), vec3_sub(v2, v0));
+        if vec3_len2(normal) <= 1.0e-20 {
+            continue;
+        }
+        for idx in [i0, i1, i2] {
+            let entry = &mut normals[idx as usize];
+            entry[0] += normal[0];
+            entry[1] += normal[1];
+            entry[2] += normal[2];
+        }
+    }
+    for normal in &mut normals {
+        *normal = normalize_or_up(*normal);
+    }
+    normals
+}
+
+fn compute_position_welded_normals(
+    vertices: &[[f32; 3]],
+    faces: &[[u32; 3]],
+    weld_epsilon: f32,
+    smooth_cos: f32,
+) -> Vec<[f32; 3]> {
+    let mut normals = compute_vertex_normals(vertices, faces);
+    if vertices.is_empty() {
+        return normals;
+    }
+
+    let inv = weld_epsilon.max(1.0e-12).recip();
+    let mut groups = HashMap::<[i64; 3], Vec<usize>>::new();
+    for (idx, vertex) in vertices.iter().enumerate() {
+        let key = [
+            (vertex[0] * inv).round() as i64,
+            (vertex[1] * inv).round() as i64,
+            (vertex[2] * inv).round() as i64,
+        ];
+        groups.entry(key).or_default().push(idx);
+    }
+
+    for members in groups.values() {
+        if members.len() <= 1 {
+            continue;
+        }
+
+        let mut clusters: Vec<([f32; 3], Vec<usize>)> = Vec::new();
+        for &idx in members {
+            let normal = normals[idx];
+            if let Some((cluster_sum, cluster_members)) = clusters.iter_mut().find(|(sum, _)| {
+                let cluster_normal = normalize_or_up(*sum);
+                dot3(cluster_normal, normal) >= smooth_cos
+            }) {
+                cluster_sum[0] += normal[0];
+                cluster_sum[1] += normal[1];
+                cluster_sum[2] += normal[2];
+                cluster_members.push(idx);
+            } else {
+                clusters.push((normal, vec![idx]));
+            }
+        }
+
+        for (cluster_sum, cluster_members) in clusters {
+            let cluster_normal = normalize_or_up(cluster_sum);
+            for idx in cluster_members {
+                normals[idx] = cluster_normal;
+            }
+        }
+    }
+
+    normals
+}
+
 pub fn write_glb_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -294,7 +397,7 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         }
     }
 
-    let mut buffer = Vec::with_capacity(mesh.vertices.len() * 12 + mesh.faces.len() * 12 + 8192);
+    let mut buffer = Vec::with_capacity(mesh.vertices.len() * 24 + mesh.faces.len() * 12 + 8192);
     let positions_byte_offset = buffer.len();
     for vertex in &mesh.vertices {
         for component in vertex {
@@ -302,6 +405,16 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         }
     }
     let positions_byte_length = buffer.len() - positions_byte_offset;
+
+    pad_buffer_to_4_bytes(&mut buffer, 0);
+    let normals = compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55);
+    let normals_byte_offset = buffer.len();
+    for normal in &normals {
+        for component in normal {
+            buffer.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    let normals_byte_length = buffer.len() - normals_byte_offset;
 
     let mut uvs_byte_offset = None;
     let mut uvs_byte_length = None;
@@ -371,6 +484,8 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         buffer,
         positions_byte_offset,
         positions_byte_length,
+        normals_byte_offset,
+        normals_byte_length,
         indices_byte_offset,
         indices_byte_length,
         uvs_byte_offset,
@@ -387,8 +502,14 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
 
 fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
     let mut primitive = serde_json::Map::new();
-    primitive.insert("attributes".to_string(), json!({ "POSITION": 0 }));
-    primitive.insert("indices".to_string(), json!(1));
+    primitive.insert(
+        "attributes".to_string(),
+        json!({
+            "POSITION": 0,
+            "NORMAL": 1
+        }),
+    );
+    primitive.insert("indices".to_string(), json!(2));
     primitive.insert("mode".to_string(), json!(4));
     if mesh.uvs.len() == mesh.vertices.len()
         && !mesh.uvs.is_empty()
@@ -396,7 +517,7 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
             .get_mut("attributes")
             .and_then(|value| value.as_object_mut())
     {
-        attributes.insert("TEXCOORD_0".to_string(), json!(2));
+        attributes.insert("TEXCOORD_0".to_string(), json!(3));
     }
 
     let mut buffer_views = Vec::new();
@@ -404,6 +525,12 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
         "buffer": 0,
         "byteOffset": layout.positions_byte_offset,
         "byteLength": layout.positions_byte_length,
+        "target": 34962
+    }));
+    buffer_views.push(json!({
+        "buffer": 0,
+        "byteOffset": layout.normals_byte_offset,
+        "byteLength": layout.normals_byte_length,
         "target": 34962
     }));
     buffer_views.push(json!({
@@ -432,13 +559,19 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
     }));
     accessors.push(json!({
         "bufferView": 1,
+        "componentType": 5126,
+        "count": mesh.vertices.len(),
+        "type": "VEC3"
+    }));
+    accessors.push(json!({
+        "bufferView": 2,
         "componentType": 5125,
         "count": mesh.faces.len() * 3,
         "type": "SCALAR"
     }));
     if mesh.uvs.len() == mesh.vertices.len() && !mesh.uvs.is_empty() {
         accessors.push(json!({
-            "bufferView": 2,
+            "bufferView": 3,
             "componentType": 5126,
             "count": mesh.uvs.len(),
             "type": "VEC2"
@@ -466,7 +599,14 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
         texture_index
     };
 
-    if let Some(material) = mesh.material {
+    let has_pbr_textures = mesh.pbr_textures.is_some();
+    if has_pbr_textures {
+        pbr_mr = json!({
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "metallicFactor": 1.0,
+            "roughnessFactor": 1.0
+        });
+    } else if let Some(material) = mesh.material {
         pbr_mr = json!({
             "baseColorFactor": [
                 material.base_color[0],
@@ -487,7 +627,7 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
         pbr_mr["metallicRoughnessTexture"] = json!({ "index": texture_index });
     }
 
-    if mesh.material.is_some() || mesh.pbr_textures.is_some() {
+    if mesh.material.is_some() || has_pbr_textures {
         let alpha = mesh
             .material
             .map(|value| value.alpha)
@@ -495,8 +635,8 @@ fn gltf_json(mesh: &Mesh, layout: &MeshBinaryLayout) -> serde_json::Value {
             .clamp(0.0, 1.0);
         let mut material = json!({
             "pbrMetallicRoughness": pbr_mr,
-            "alphaMode": if alpha < 0.995 { "BLEND" } else { "OPAQUE" },
-            "doubleSided": true
+            "alphaMode": if has_pbr_textures || alpha >= 0.995 { "OPAQUE" } else { "BLEND" },
+            "doubleSided": !has_pbr_textures
         });
         if let Some((normal_offset, normal_len)) = layout.normal_image_view {
             let texture_index = push_texture_image(normal_offset, normal_len);
@@ -725,8 +865,21 @@ mod tests {
             value.get("materials").is_some(),
             "expected textured material data"
         );
+        let pbr = &value["materials"][0]["pbrMetallicRoughness"];
+        assert_eq!(
+            pbr["baseColorFactor"],
+            serde_json::json!([1.0, 1.0, 1.0, 1.0])
+        );
+        assert_eq!(pbr["metallicFactor"], serde_json::json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], serde_json::json!(1.0));
+        assert_eq!(value["materials"][0]["alphaMode"], "OPAQUE");
+        assert_eq!(value["materials"][0]["doubleSided"], false);
         let primitive = &value["meshes"][0]["primitives"][0];
-        assert_eq!(primitive["attributes"]["TEXCOORD_0"], 2);
+        assert_eq!(primitive["attributes"]["POSITION"], 0);
+        assert_eq!(primitive["attributes"]["NORMAL"], 1);
+        assert_eq!(primitive["indices"], 2);
+        assert_eq!(primitive["attributes"]["TEXCOORD_0"], 3);
+        assert_eq!(value["accessors"][1]["type"], "VEC3");
         let _ = std::fs::remove_file(path);
     }
 }

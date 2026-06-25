@@ -55,43 +55,7 @@ fn to_bevy_mesh_with_uvs(
 }
 
 pub(crate) fn compute_normals(mesh: &TripoMesh) -> Vec<[f32; 3]> {
-    let mut normals = vec![[0.0f32; 3]; mesh.vertices.len()];
-    let vertex_count = mesh.vertices.len() as u32;
-    for face in &mesh.faces {
-        let [i0, i1, i2] = *face;
-        if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
-            continue;
-        }
-        let v0 = mesh.vertices[i0 as usize];
-        let v1 = mesh.vertices[i1 as usize];
-        let v2 = mesh.vertices[i2 as usize];
-        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-        let n = [
-            e1[1] * e2[2] - e1[2] * e2[1],
-            e1[2] * e2[0] - e1[0] * e2[2],
-            e1[0] * e2[1] - e1[1] * e2[0],
-        ];
-        for &idx in &[i0, i1, i2] {
-            let entry = &mut normals[idx as usize];
-            entry[0] += n[0];
-            entry[1] += n[1];
-            entry[2] += n[2];
-        }
-    }
-
-    for normal in &mut normals {
-        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
-        if length > 1e-6 {
-            normal[0] /= length;
-            normal[1] /= length;
-            normal[2] /= length;
-        } else {
-            *normal = [0.0, 1.0, 0.0];
-        }
-    }
-
-    normals
+    burn_synth::compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55)
 }
 
 #[cfg(test)]

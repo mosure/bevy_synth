@@ -916,6 +916,134 @@ fn pbr_debug_samples_are_first_hit_bounded() {
     assert_eq!(debug.sample_positions.len(), covered);
     assert_eq!(debug.sample_attrs.len(), covered);
     assert!(debug.sample_positions.len() <= debug.texture_width * debug.texture_height);
+    assert!(debug.raster_candidate_texels >= covered);
+    assert!(debug.raster_conflict_texels > 0);
+    assert_eq!(debug.zero_support_samples, 0);
+}
+
+#[test]
+fn pbr_bake_inpaints_sparse_holes_instead_of_black_texels() {
+    let vertices = vec![
+        [-0.12, 0.0, -0.12],
+        [-0.02, 0.0, -0.12],
+        [-0.12, 0.0, -0.02],
+        [0.02, 0.0, 0.02],
+        [0.12, 0.0, 0.02],
+        [0.02, 0.0, 0.12],
+    ];
+    let faces = vec![[0, 2, 1], [3, 5, 4]];
+    let mut vox_coords = Vec::new();
+    let mut vox_attrs = Vec::new();
+    for x in 11..=16 {
+        for y in 15..=17 {
+            for z in 11..=16 {
+                vox_coords.push([0, x, y, z]);
+                vox_attrs.push([0.92, 0.88, 0.82, 0.0, 0.7, 1.0]);
+            }
+        }
+    }
+
+    let (_, textures, debug) = super::bake_pbr_from_voxels_with_options(
+        vertices.as_slice(),
+        faces.as_slice(),
+        None,
+        vox_coords.as_slice(),
+        vox_attrs.as_slice(),
+        32,
+        Some(32),
+        true,
+        false,
+    )
+    .expect("pbr bake should succeed");
+    let textures = textures.expect("pbr textures");
+    let debug = debug.expect("debug capture");
+
+    assert!(debug.zero_support_samples > 0, "{debug:?}");
+    assert!(debug.inpainted_texels > 0, "{debug:?}");
+    let covered = debug
+        .raster_mask
+        .iter()
+        .filter(|value| **value != 0)
+        .count();
+    assert!(covered > 0);
+    assert!(covered < debug.texture_width * debug.texture_height);
+    let min_luma = textures
+        .base_color
+        .rgba8
+        .chunks_exact(4)
+        .filter(|rgba| rgba[3] != 0)
+        .map(|rgba| {
+            0.2126 * rgba[0] as f32 + 0.7152 * rgba[1] as f32 + 0.0722 * rgba[2] as f32
+        })
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        min_luma > 150.0,
+        "unsupported samples should be inpainted from valid light texels, min_luma={min_luma}"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pbr_projection_matches_upstream_closest_surface_for_thin_surfaces() {
+    let vertices = vec![[-0.1, 0.10, -0.1], [0.1, 0.10, -0.1], [0.0, 0.10, 0.1]];
+    let faces = vec![[0, 2, 1]];
+    let projection_vertices = vec![
+        [-0.1, 0.09, -0.1],
+        [0.1, 0.09, -0.1],
+        [0.0, 0.09, 0.1],
+        [-0.1, 0.20, -0.1],
+        [0.1, 0.20, -0.1],
+        [0.0, 0.20, 0.1],
+    ];
+    let projection_faces = vec![[0, 1, 2], [3, 5, 4]];
+    let projection_source = super::PbrProjectionSource {
+        vertices: projection_vertices.as_slice(),
+        faces: projection_faces.as_slice(),
+    };
+    let mut vox_coords = Vec::new();
+    let mut vox_attrs = Vec::new();
+    for x in 11..=21 {
+        for z in 11..=21 {
+            for y in [18u32, 19u32] {
+                vox_coords.push([0, x, y, z]);
+                vox_attrs.push([0.02, 0.02, 0.02, 0.0, 0.8, 1.0]);
+            }
+            for y in [22u32, 23u32] {
+                vox_coords.push([0, x, y, z]);
+                vox_attrs.push([0.95, 0.92, 0.86, 0.0, 0.65, 1.0]);
+            }
+        }
+    }
+
+    let (_, textures, debug) = super::bake_pbr_from_voxels_with_options(
+        vertices.as_slice(),
+        faces.as_slice(),
+        Some(projection_source),
+        vox_coords.as_slice(),
+        vox_attrs.as_slice(),
+        32,
+        Some(32),
+        true,
+        false,
+    )
+    .expect("pbr bake should succeed");
+    let textures = textures.expect("pbr textures");
+    let debug = debug.expect("debug capture");
+
+    assert_eq!(debug.projection_rejected_samples, 0, "{debug:?}");
+    let (mut luma_sum, mut count) = (0.0f32, 0usize);
+    for rgba in textures.base_color.rgba8.chunks_exact(4) {
+        if rgba[3] == 0 {
+            continue;
+        }
+        luma_sum += 0.2126 * rgba[0] as f32 + 0.7152 * rgba[1] as f32 + 0.0722 * rgba[2] as f32;
+        count += 1;
+    }
+    let mean_luma = luma_sum / count.max(1) as f32;
+    assert!(
+        mean_luma < 80.0,
+        "projection must match upstream closest-surface sampling, mean_luma={mean_luma}"
+    );
 }
 
 #[test]
@@ -1096,6 +1224,42 @@ fn pbr_uv_domain_is_portable_and_seam_split() {
         assert!((0.0..=1.0).contains(&uv[0]), "u out of range: {uv:?}");
         assert!((0.0..=1.0).contains(&uv[1]), "v out of range: {uv:?}");
     }
+}
+
+#[test]
+fn pbr_uv_domain_uses_chart_fallback_for_fragmented_tiny_components() {
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    for y in 0..20 {
+        for x in 0..30 {
+            let base = vertices.len() as u32;
+            let ox = x as f32 * 0.03;
+            let oz = y as f32 * 0.03;
+            vertices.push([ox, 0.0, oz]);
+            vertices.push([ox + 0.01, 0.0, oz]);
+            vertices.push([ox, 0.0, oz + 0.01]);
+            faces.push([base, base + 2, base + 1]);
+        }
+    }
+
+    let domain = super::build_uv_raster_domain(vertices.as_slice(), faces.as_slice(), 128);
+
+    assert_eq!(domain.raster_faces.len(), faces.len());
+    let mut max_area = 0.0f32;
+    for face in &domain.raster_faces {
+        let uv0 = domain.raster_uvs[face[0] as usize];
+        let uv1 = domain.raster_uvs[face[1] as usize];
+        let uv2 = domain.raster_uvs[face[2] as usize];
+        let area = ((uv1[0] - uv0[0]) * (uv2[1] - uv0[1])
+            - (uv1[1] - uv0[1]) * (uv2[0] - uv0[0]))
+            .abs()
+            * 0.5;
+        max_area = max_area.max(area);
+    }
+    assert!(
+        max_area < 3.0e-4,
+        "fragmented tiny charts should use shared chart scale, max_uv_area={max_area}"
+    );
 }
 
 #[test]

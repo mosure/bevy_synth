@@ -74,7 +74,10 @@ pub struct MeshPbrTextureMetrics {
     pub base_color_width: Option<u32>,
     pub base_color_height: Option<u32>,
     pub base_color_alpha_coverage: Option<f32>,
+    pub base_color_luma_mean: Option<f32>,
     pub base_color_luma_stddev: Option<f32>,
+    pub base_color_dark_island_fraction: Option<f32>,
+    pub base_color_bright_island_fraction: Option<f32>,
 }
 
 pub trait MeshLike {
@@ -170,6 +173,29 @@ pub fn mesh_quality_failures(metrics: &MeshQualityMetrics) -> Vec<String> {
             welded.connected_components, welded.largest_component_face_fraction
         ));
     }
+    let pbr = &metrics.pbr_textures;
+    if let (
+        Some(alpha_coverage),
+        Some(luma_mean),
+        Some(luma_stddev),
+        Some(dark_fraction),
+        Some(bright_fraction),
+    ) = (
+        pbr.base_color_alpha_coverage,
+        pbr.base_color_luma_mean,
+        pbr.base_color_luma_stddev,
+        pbr.base_color_dark_island_fraction,
+        pbr.base_color_bright_island_fraction,
+    ) && alpha_coverage > 0.95
+        && luma_mean > 120.0
+        && luma_stddev > 55.0
+        && dark_fraction > 0.24
+        && bright_fraction > 0.34
+    {
+        failures.push(format!(
+            "pbr base-color texture has severe light-surface island artifacts (mean={luma_mean:.2} stddev={luma_stddev:.2} dark_fraction={dark_fraction:.3} bright_fraction={bright_fraction:.3})"
+        ));
+    }
     failures
 }
 
@@ -210,6 +236,88 @@ fn face_is_degenerate(vertices: &[[f32; 3]], face: [u32; 3]) -> bool {
     ];
     let area2 = cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
     area2 <= 1.0e-20
+}
+
+pub fn compute_vertex_normals(vertices: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<[f32; 3]> {
+    let mut normals = vec![[0.0f32; 3]; vertices.len()];
+    let vertex_count = vertices.len() as u32;
+    for face in faces {
+        let [i0, i1, i2] = *face;
+        if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
+            continue;
+        }
+        let v0 = vertices[i0 as usize];
+        let v1 = vertices[i1 as usize];
+        let v2 = vertices[i2 as usize];
+        let normal = vec3_cross(vec3_sub(v1, v0), vec3_sub(v2, v0));
+        if vec3_len2(normal) <= 1.0e-20 {
+            continue;
+        }
+        for idx in [i0, i1, i2] {
+            let entry = &mut normals[idx as usize];
+            entry[0] += normal[0];
+            entry[1] += normal[1];
+            entry[2] += normal[2];
+        }
+    }
+    for normal in &mut normals {
+        *normal = normalize_or_up(*normal);
+    }
+    normals
+}
+
+pub fn compute_position_welded_normals(
+    vertices: &[[f32; 3]],
+    faces: &[[u32; 3]],
+    weld_epsilon: f32,
+    smooth_cos: f32,
+) -> Vec<[f32; 3]> {
+    let mut normals = compute_vertex_normals(vertices, faces);
+    if vertices.is_empty() {
+        return normals;
+    }
+
+    let inv = 1.0 / weld_epsilon.max(1.0e-12);
+    let mut groups = HashMap::<[i64; 3], Vec<usize>>::new();
+    for (idx, vertex) in vertices.iter().enumerate() {
+        let key = [
+            (vertex[0] * inv).round() as i64,
+            (vertex[1] * inv).round() as i64,
+            (vertex[2] * inv).round() as i64,
+        ];
+        groups.entry(key).or_default().push(idx);
+    }
+
+    for members in groups.values() {
+        if members.len() <= 1 {
+            continue;
+        }
+
+        let mut clusters: Vec<([f32; 3], Vec<usize>)> = Vec::new();
+        for &idx in members {
+            let normal = normals[idx];
+            if let Some((cluster_sum, cluster_members)) = clusters.iter_mut().find(|(sum, _)| {
+                let cluster_normal = normalize_or_up(*sum);
+                vec3_dot(cluster_normal, normal) >= smooth_cos
+            }) {
+                cluster_sum[0] += normal[0];
+                cluster_sum[1] += normal[1];
+                cluster_sum[2] += normal[2];
+                cluster_members.push(idx);
+            } else {
+                clusters.push((normal, vec![idx]));
+            }
+        }
+
+        for (cluster_sum, cluster_members) in clusters {
+            let cluster_normal = normalize_or_up(cluster_sum);
+            for idx in cluster_members {
+                normals[idx] = cluster_normal;
+            }
+        }
+    }
+
+    normals
 }
 
 fn connectivity_metrics(
@@ -316,34 +424,76 @@ fn pbr_texture_metrics(mesh: &Mesh) -> MeshPbrTextureMetrics {
     let pixels = base.rgba8.chunks_exact(4);
     let mut count = 0usize;
     let mut alpha_count = 0usize;
-    let mut sum = 0.0f64;
-    let mut sum_sq = 0.0f64;
+    let mut lumas = Vec::new();
     for pixel in pixels {
         count += 1;
         if pixel[3] > 0 {
             alpha_count += 1;
+            lumas.push(
+                0.2126 * pixel[0] as f64 + 0.7152 * pixel[1] as f64 + 0.0722 * pixel[2] as f64,
+            );
         }
-        let luma = 0.2126 * pixel[0] as f64 + 0.7152 * pixel[1] as f64 + 0.0722 * pixel[2] as f64;
-        sum += luma;
-        sum_sq += luma * luma;
     }
     let alpha_coverage = if count == 0 {
         None
     } else {
         Some(alpha_count as f32 / count as f32)
     };
-    let luma_stddev = if count == 0 {
-        None
+    let (luma_mean, luma_stddev, dark_fraction, bright_fraction) = if lumas.is_empty() {
+        (None, None, None, None)
     } else {
-        let mean = sum / count as f64;
-        Some((sum_sq / count as f64 - mean * mean).max(0.0).sqrt() as f32)
+        let mean = lumas.iter().sum::<f64>() / lumas.len() as f64;
+        let sum_sq = lumas.iter().map(|luma| luma * luma).sum::<f64>();
+        let stddev = (sum_sq / lumas.len() as f64 - mean * mean).max(0.0).sqrt();
+        let dark_cutoff = (mean - 40.0).max(0.0);
+        let dark = lumas.iter().filter(|value| **value < dark_cutoff).count();
+        let bright = lumas.iter().filter(|value| **value > 200.0).count();
+        (
+            Some(mean as f32),
+            Some(stddev as f32),
+            Some(dark as f32 / lumas.len() as f32),
+            Some(bright as f32 / lumas.len() as f32),
+        )
     };
     MeshPbrTextureMetrics {
         has_pbr_textures: true,
         base_color_width: Some(base.width),
         base_color_height: Some(base.height),
         base_color_alpha_coverage: alpha_coverage,
+        base_color_luma_mean: luma_mean,
         base_color_luma_stddev: luma_stddev,
+        base_color_dark_island_fraction: dark_fraction,
+        base_color_bright_island_fraction: bright_fraction,
+    }
+}
+
+fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn vec3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn vec3_len2(a: [f32; 3]) -> f32 {
+    vec3_dot(a, a)
+}
+
+fn normalize_or_up(normal: [f32; 3]) -> [f32; 3] {
+    let len2 = vec3_len2(normal);
+    if len2.is_finite() && len2 > 1.0e-12 {
+        let inv = len2.sqrt().recip();
+        [normal[0] * inv, normal[1] * inv, normal[2] * inv]
+    } else {
+        [0.0, 1.0, 0.0]
     }
 }
 
@@ -382,6 +532,39 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid_texture(width: u32, height: u32, rgba: [u8; 4]) -> MeshTexture {
+        let mut rgba8 = Vec::with_capacity(width as usize * height as usize * 4);
+        for _ in 0..(width as usize * height as usize) {
+            rgba8.extend_from_slice(&rgba);
+        }
+        MeshTexture {
+            width,
+            height,
+            rgba8,
+        }
+    }
+
+    fn closed_tetra_mesh_with_base_texture(base_color: MeshTexture) -> Mesh {
+        Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.5, 0.866, 0.0],
+                [0.5, 0.2887, 0.816],
+            ],
+            faces: vec![[0, 1, 2], [0, 3, 1], [1, 3, 2], [2, 3, 0]],
+            uvs: vec![[0.0, 0.0]; 4],
+            material: None,
+            pbr_textures: Some(MeshPbrTextures {
+                base_color,
+                metallic_roughness: solid_texture(4, 4, [0, 128, 0, 255]),
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
+        }
+    }
 
     #[test]
     fn mesh_quality_allows_uv_seam_split_when_positions_weld_cleanly() {
@@ -441,6 +624,72 @@ mod tests {
                 .any(|failure| failure.contains("boundary edge ratio")),
             "{failures:?}"
         );
+    }
+
+    #[test]
+    fn mesh_quality_rejects_light_surface_texture_islands() {
+        let mut rgba8 = Vec::new();
+        for idx in 0..16 {
+            if idx % 3 == 0 {
+                rgba8.extend_from_slice(&[40, 40, 40, 255]);
+            } else {
+                rgba8.extend_from_slice(&[230, 230, 230, 255]);
+            }
+        }
+        let mesh = closed_tetra_mesh_with_base_texture(MeshTexture {
+            width: 4,
+            height: 4,
+            rgba8,
+        });
+
+        let metrics = mesh_quality_metrics(&mesh);
+        let failures = mesh_quality_failures(&metrics);
+
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("light-surface island artifacts")),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn mesh_quality_allows_dark_uniform_pbr_texture() {
+        let mesh = closed_tetra_mesh_with_base_texture(solid_texture(4, 4, [20, 20, 20, 255]));
+
+        let metrics = mesh_quality_metrics(&mesh);
+        let failures = mesh_quality_failures(&metrics);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(metrics.pbr_textures.base_color_luma_mean, Some(20.0));
+        assert_eq!(
+            metrics.pbr_textures.base_color_dark_island_fraction,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn position_welded_normals_preserve_vertex_count_and_unit_length() {
+        let vertices = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let faces = vec![[0, 1, 2], [3, 4, 5]];
+
+        let normals = compute_position_welded_normals(&vertices, &faces, 1.0e-5, 0.55);
+
+        assert_eq!(normals.len(), vertices.len());
+        for normal in normals {
+            let len = vec3_len2(normal).sqrt();
+            assert!(
+                (len - 1.0).abs() <= 1.0e-5,
+                "normal must be unit length: {normal:?}"
+            );
+        }
     }
 }
 

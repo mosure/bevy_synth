@@ -601,7 +601,14 @@ fn append_mesh_primitive_json(
         textures.push(serde_json::json!({ "source": image_index }));
         texture_index
     };
-    if let Some(material) = mesh.material {
+    let has_pbr_textures = mesh.pbr_textures.is_some();
+    if has_pbr_textures {
+        pbr_mr = serde_json::json!({
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "metallicFactor": 1.0,
+            "roughnessFactor": 1.0
+        });
+    } else if let Some(material) = mesh.material {
         pbr_mr = serde_json::json!({
             "baseColorFactor": [
                 material.base_color[0],
@@ -634,7 +641,7 @@ fn append_mesh_primitive_json(
         primitive["attributes"]["TEXCOORD_0"] = serde_json::json!(uv_accessor);
     }
 
-    if mesh.material.is_some() || mesh.pbr_textures.is_some() {
+    if mesh.material.is_some() || has_pbr_textures {
         let alpha = mesh
             .material
             .map(|value| value.alpha)
@@ -643,8 +650,8 @@ fn append_mesh_primitive_json(
         let material_index = materials.len();
         let mut material = serde_json::json!({
             "pbrMetallicRoughness": pbr_mr,
-            "alphaMode": if alpha < 0.995 { "BLEND" } else { "OPAQUE" },
-            "doubleSided": true
+            "alphaMode": if has_pbr_textures || alpha >= 0.99 { "OPAQUE" } else { "BLEND" },
+            "doubleSided": !has_pbr_textures
         });
         if let Some((normal_offset, normal_len)) = layout.normal_image_view {
             let texture_index = push_texture_image(normal_offset, normal_len);
@@ -868,6 +875,55 @@ mod tests {
         assert_eq!(primitive["indices"], 2);
         assert_eq!(primitive["attributes"]["TEXCOORD_0"], 3);
         assert_eq!(json["accessors"][1]["type"], "VEC3");
+    }
+
+    #[test]
+    fn glb_export_uses_neutral_material_factors_for_pbr_textures() {
+        let mesh = SynthMesh {
+            mesh: crate::TripoMesh {
+                vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.75, 0.0]],
+                faces: vec![[0, 1, 2]],
+            },
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            material: Some(crate::SynthMeshMaterial {
+                base_color: [0.2, 0.3, 0.4],
+                metallic: 0.25,
+                roughness: 0.5,
+                alpha: 0.75,
+            }),
+            pbr_textures: Some(crate::SynthMeshPbrTextures {
+                base_color: crate::SynthMeshTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![200, 190, 180, 255],
+                },
+                metallic_roughness: crate::SynthMeshTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![0, 255, 255, 255],
+                },
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
+        };
+
+        let glb_bytes = mesh_to_glb_bytes(&mesh).expect("glb export");
+        let glb = gltf::Glb::from_slice(glb_bytes.as_slice()).expect("parse glb");
+        let json: Value = serde_json::from_slice(glb.json.as_ref()).expect("parse glb json");
+        let material = &json["materials"][0];
+        let pbr = &material["pbrMetallicRoughness"];
+
+        assert_eq!(
+            pbr["baseColorFactor"],
+            serde_json::json!([1.0, 1.0, 1.0, 1.0])
+        );
+        assert_eq!(pbr["metallicFactor"], serde_json::json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], serde_json::json!(1.0));
+        assert!(pbr.get("baseColorTexture").is_some());
+        assert!(pbr.get("metallicRoughnessTexture").is_some());
+        assert_eq!(material["alphaMode"], "OPAQUE");
+        assert_eq!(material["doubleSided"], false);
     }
 
     #[test]
