@@ -228,6 +228,13 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error
     if uvs.len() != vertices.len() {
         uvs.clear();
     }
+    let mut normals: Vec<[f32; 3]> = reader
+        .read_normals()
+        .map(|normals| normals.collect())
+        .unwrap_or_default();
+    if normals.len() != vertices.len() {
+        normals.clear();
+    }
 
     let material_ref = primitive.material();
     let pbr = material_ref.pbr_metallic_roughness();
@@ -274,6 +281,7 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error
     Ok(SynthMesh {
         mesh: crate::TripoMesh { vertices, faces },
         uvs,
+        normals,
         material,
         pbr_textures,
     })
@@ -361,7 +369,17 @@ fn build_mesh_binary_layout(
     let positions_byte_length = buffer.len() - positions_byte_offset;
 
     pad_buffer_4(&mut buffer);
-    let normals = compute_normals(&mesh.mesh);
+    let normals = if mesh.normals.len() == mesh.mesh.vertices.len() && !mesh.normals.is_empty() {
+        let mut normals = mesh.normals.clone();
+        burn_synth::align_normals_with_faces(
+            mesh.mesh.vertices.as_slice(),
+            mesh.mesh.faces.as_slice(),
+            normals.as_mut_slice(),
+        );
+        normals
+    } else {
+        compute_normals(&mesh.mesh)
+    };
     let normals_byte_offset = buffer.len();
     for normal in &normals {
         for component in normal {
@@ -861,6 +879,7 @@ mod tests {
                 faces: vec![[0, 1, 2]],
             },
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };
@@ -885,6 +904,7 @@ mod tests {
                 faces: vec![[0, 1, 2]],
             },
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
             material: Some(crate::SynthMeshMaterial {
                 base_color: [0.2, 0.3, 0.4],
                 metallic: 0.25,
@@ -934,6 +954,7 @@ mod tests {
                 faces: vec![[0, 1, 2]],
             },
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };

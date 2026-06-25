@@ -46,9 +46,9 @@ fn decode_latent_to_outputs(
                     .to_string(),
             );
         };
-        let tex_decoder = if decode_output_mode.needs_native_pbr() {
+        let tex_decoder = if decode_output_mode.needs_texture_attrs() {
             Some(runtime_decoders.tex_decoder.ok_or_else(|| {
-                "burn_trellis: tex runtime decoder is required for native PBR decode (missing `tex_slat_decoder` runtime)"
+                "burn_trellis: tex runtime decoder is required for textured TRELLIS decode (missing `tex_slat_decoder` runtime)"
                     .to_string()
             })?)
         } else {
@@ -150,9 +150,9 @@ async fn decode_latent_to_outputs_async(
                 .to_string(),
         );
     };
-    let tex_decoder = if decode_output_mode.needs_native_pbr() {
+    let tex_decoder = if decode_output_mode.needs_texture_attrs() {
         Some(runtime_decoders.tex_decoder.ok_or_else(|| {
-            "burn_trellis: tex runtime decoder is required for native PBR decode (missing `tex_slat_decoder` runtime)"
+            "burn_trellis: tex runtime decoder is required for textured TRELLIS decode (missing `tex_slat_decoder` runtime)"
                 .to_string()
         })?)
     } else {
@@ -542,7 +542,12 @@ fn remove_unreferenced_vertices(vertices: &mut MeshVertices, faces: &mut MeshFac
 fn cleanup_pbr_bake_mesh_topology(mesh: &mut PbrBakeMesh) -> MeshCleanupStats {
     let duplicate_faces_removed = remove_duplicate_mesh_faces(&mut mesh.faces);
     let nonmanifold_faces_removed = remove_nonmanifold_mesh_faces(&mut mesh.faces);
-    remove_unreferenced_vertices_and_uvs(&mut mesh.vertices, &mut mesh.faces, &mut mesh.uvs);
+    remove_unreferenced_vertices_uvs_normals(
+        &mut mesh.vertices,
+        &mut mesh.faces,
+        &mut mesh.uvs,
+        &mut mesh.normals,
+    );
     MeshCleanupStats {
         duplicate_faces_removed,
         nonmanifold_faces_removed,
@@ -552,15 +557,18 @@ fn cleanup_pbr_bake_mesh_topology(mesh: &mut PbrBakeMesh) -> MeshCleanupStats {
 }
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
-fn remove_unreferenced_vertices_and_uvs(
+fn remove_unreferenced_vertices_uvs_normals(
     vertices: &mut MeshVertices,
     faces: &mut MeshFaces,
     uvs: &mut Vec<[f32; 2]>,
+    normals: &mut Vec<[f32; 3]>,
 ) {
     let keep_uvs = uvs.len() == vertices.len();
+    let keep_normals = normals.len() == vertices.len();
     let mut remap = vec![u32::MAX; vertices.len()];
     let mut compacted_vertices = Vec::with_capacity(vertices.len());
     let mut compacted_uvs = Vec::with_capacity(if keep_uvs { vertices.len() } else { 0 });
+    let mut compacted_normals = Vec::with_capacity(if keep_normals { vertices.len() } else { 0 });
     for face in faces.iter() {
         for &idx in face {
             let idx_usize = idx as usize;
@@ -572,6 +580,9 @@ fn remove_unreferenced_vertices_and_uvs(
             if keep_uvs {
                 compacted_uvs.push(uvs[idx_usize]);
             }
+            if keep_normals {
+                compacted_normals.push(normals[idx_usize]);
+            }
         }
     }
     for face in faces.iter_mut() {
@@ -582,6 +593,11 @@ fn remove_unreferenced_vertices_and_uvs(
     *vertices = compacted_vertices;
     if keep_uvs {
         *uvs = compacted_uvs;
+    }
+    if keep_normals {
+        *normals = compacted_normals;
+    } else {
+        normals.clear();
     }
 }
 
@@ -797,7 +813,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
     } = input;
     if voxel_coords.len() != voxel_attrs.len() {
         return Err(format!(
-            "native pbr postprocess voxel mismatch: coords={} attrs={}",
+            "rust o_voxel pbr postprocess voxel mismatch: coords={} attrs={}",
             voxel_coords.len(),
             voxel_attrs.len()
         ));
@@ -812,14 +828,14 @@ pub fn native_pbr_mesh_from_decoded_tensors(
     ) = sanitize_mesh_geometry(vertices, faces);
     if dropped_vertices > 0 || dropped_invalid_faces > 0 || dropped_degenerate_faces > 0 {
         trellis_stage_log!(
-            "burn_trellis: native pbr postprocess mesh sanitized (dropped_vertices={} dropped_invalid_faces={} dropped_degenerate_faces={})",
+            "burn_trellis: rust_ovoxel pbr postprocess mesh sanitized (dropped_vertices={} dropped_invalid_faces={} dropped_degenerate_faces={})",
             dropped_vertices,
             dropped_invalid_faces,
             dropped_degenerate_faces
         );
     }
     if vertices.is_empty() || faces.is_empty() {
-        return Err("native pbr postprocess received empty mesh after sanitize".to_string());
+        return Err("rust o_voxel pbr postprocess received empty mesh after sanitize".to_string());
     }
     let cleanup_stats = cleanup_mesh_topology(&mut vertices, &mut faces);
     if cleanup_stats.duplicate_faces_removed > 0
@@ -828,7 +844,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         || cleanup_stats.hole_faces_added > 0
     {
         trellis_stage_log!(
-            "burn_trellis: native pbr postprocess mesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+            "burn_trellis: rust_ovoxel pbr postprocess mesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
             cleanup_stats.duplicate_faces_removed,
             cleanup_stats.nonmanifold_faces_removed,
             cleanup_stats.small_component_faces_removed,
@@ -838,7 +854,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         );
     }
     if vertices.is_empty() || faces.is_empty() {
-        return Err("native pbr postprocess received empty mesh after cleanup".to_string());
+        return Err("rust o_voxel pbr postprocess received empty mesh after cleanup".to_string());
     }
 
     let projection_vertices = vertices.clone();
@@ -863,7 +879,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         || remesh_cleanup_stats.hole_faces_added > 0
     {
         trellis_stage_log!(
-            "burn_trellis: native pbr postprocess remesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+            "burn_trellis: rust_ovoxel pbr postprocess remesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
             remesh_cleanup_stats.duplicate_faces_removed,
             remesh_cleanup_stats.nonmanifold_faces_removed,
             remesh_cleanup_stats.small_component_faces_removed,
@@ -873,7 +889,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         );
     }
     trellis_stage_log!(
-        "burn_trellis: native pbr postprocess remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
+        "burn_trellis: rust_ovoxel pbr postprocess remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
         remesh_start.elapsed().as_secs_f64() * 1000.0,
         before_remesh_faces,
         faces.len(),
@@ -893,7 +909,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
             || decimate_cleanup_stats.hole_faces_added > 0
         {
             trellis_stage_log!(
-                "burn_trellis: native pbr postprocess decimation cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+                "burn_trellis: rust_ovoxel pbr postprocess decimation cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
                 decimate_cleanup_stats.duplicate_faces_removed,
                 decimate_cleanup_stats.nonmanifold_faces_removed,
                 decimate_cleanup_stats.small_component_faces_removed,
@@ -903,7 +919,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
             );
         }
         trellis_stage_log!(
-            "burn_trellis: native pbr postprocess decimation complete (target_faces={} from_faces={} to_faces={})",
+            "burn_trellis: rust_ovoxel pbr postprocess decimation complete (target_faces={} from_faces={} to_faces={})",
             target_faces,
             before_faces,
             faces.len()
@@ -930,7 +946,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         || pbr_cleanup_stats.nonmanifold_faces_removed > 0
     {
         trellis_stage_log!(
-            "burn_trellis: native pbr postprocess output cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} vertices={} faces={} uvs={})",
+            "burn_trellis: rust_ovoxel pbr postprocess output cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} vertices={} faces={} uvs={})",
             pbr_cleanup_stats.duplicate_faces_removed,
             pbr_cleanup_stats.nonmanifold_faces_removed,
             pbr_mesh.vertices.len(),
@@ -943,6 +959,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         vertices: pbr_mesh.vertices,
         faces: pbr_mesh.faces,
         uvs: pbr_mesh.uvs,
+        normals: pbr_mesh.normals,
         material,
         pbr_textures,
     };
@@ -1066,7 +1083,7 @@ async fn decode_latent_with_runtime_decoders(
             0
         }
     };
-    let needs_tex_decode = decode_output_mode.needs_native_pbr();
+    let needs_tex_decode = decode_output_mode.needs_texture_attrs();
     let count = if needs_tex_decode {
         shape_coord_rows
             .min(tex_coord_rows)
@@ -1252,7 +1269,7 @@ async fn decode_latent_with_runtime_decoders(
 
     let tex_decode_result = if needs_tex_decode {
         let Some(tex_decoder) = tex_decoder else {
-            return Err("runtime decode native PBR requires tex runtime decoder".to_string());
+            return Err("runtime decode rust o_voxel PBR requires tex runtime decoder".to_string());
         };
         reset_decoder_conv_telemetry();
         reset_decoder_op_telemetry();
@@ -1582,14 +1599,14 @@ async fn decode_latent_with_runtime_decoders(
                 vertices: projection_vertices.as_slice(),
                 faces: projection_faces.as_slice(),
             })
-            .map_err(|err| format!("runtime decode native mesh remesh failed: {err}"))?;
+            .map_err(|err| format!("runtime decode rust o_voxel mesh remesh failed: {err}"))?;
             let (remeshed_vertices, remeshed_faces) =
                 remesh_narrow_band_simple_dc_with_projection_bvh(
                     &projection_bvh,
                     final_resolution as u32,
                     NATIVE_PBR_OVOXEL_REMESH_BAND,
                 )
-                .map_err(|err| format!("runtime decode native mesh remesh failed: {err}"))?;
+                .map_err(|err| format!("runtime decode rust o_voxel mesh remesh failed: {err}"))?;
             projection_bvh_for_pbr = Some(projection_bvh);
             vertices = remeshed_vertices;
             faces = remeshed_faces;
@@ -1600,7 +1617,7 @@ async fn decode_latent_with_runtime_decoders(
                 || remesh_cleanup.hole_faces_added > 0
             {
                 trellis_stage_log!(
-                    "burn_trellis: runtime decode native mesh remesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
+                    "burn_trellis: runtime decode rust_ovoxel mesh remesh cleanup complete (duplicate_faces_removed={} nonmanifold_faces_removed={} small_component_faces_removed={} hole_faces_added={} vertices={} faces={})",
                     remesh_cleanup.duplicate_faces_removed,
                     remesh_cleanup.nonmanifold_faces_removed,
                     remesh_cleanup.small_component_faces_removed,
@@ -1610,14 +1627,14 @@ async fn decode_latent_with_runtime_decoders(
                 );
             }
             trellis_stage_log!(
-                "burn_trellis: runtime decode native mesh remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
+                "burn_trellis: runtime decode rust_ovoxel mesh remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
                 remesh_start.elapsed().as_secs_f64() * 1000.0,
                 before_remesh_faces,
                 faces.len(),
                 vertices.len()
             );
             if vertices.is_empty() || faces.is_empty() {
-                return Err("runtime decode native mesh remesh produced empty mesh".to_string());
+                return Err("runtime decode rust o_voxel mesh remesh produced empty mesh".to_string());
             }
             use_projection_source = true;
         }
@@ -1625,7 +1642,7 @@ async fn decode_latent_with_runtime_decoders(
     #[cfg(target_arch = "wasm32")]
     if decode_output_mode.needs_native_mesh_postprocess() {
         return Err(format!(
-            "runtime decode {} requires native mesh remesh/postprocess, which is not available on wasm; refusing raw FDG output",
+            "runtime decode {} requires Rust o_voxel mesh remesh/postprocess, which is not available on wasm yet; refusing raw FDG output",
             decode_output_mode.as_str()
         ));
     }
@@ -1740,6 +1757,7 @@ async fn decode_latent_with_runtime_decoders(
                 vertices,
                 faces,
                 uvs: Vec::new(),
+                normals: Vec::new(),
             },
             None,
             None,
@@ -1762,6 +1780,7 @@ async fn decode_latent_with_runtime_decoders(
         vertices: pbr_mesh.vertices,
         faces: pbr_mesh.faces,
         uvs: pbr_mesh.uvs,
+        normals: pbr_mesh.normals,
         material,
         pbr_textures,
     };
@@ -1958,6 +1977,7 @@ mod runtime_decode_tests {
             ],
             faces: vec![[0, 1, 2], [1, 0, 3], [0, 1, 4]],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.5], [0.5, 0.5]],
+            normals: Vec::new(),
         };
 
         let stats = cleanup_pbr_bake_mesh_topology(&mut mesh);

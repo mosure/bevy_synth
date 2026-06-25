@@ -572,6 +572,7 @@ fn runtime_mesh_to_synth_mesh(mesh: burn_synth::mesh::Mesh) -> SynthMesh {
             faces: mesh.faces,
         },
         uvs: mesh.uvs,
+        normals: mesh.normals,
         material: mesh.material.map(|material| SynthMeshMaterial {
             base_color: material.base_color,
             metallic: material.metallic,

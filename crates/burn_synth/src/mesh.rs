@@ -7,6 +7,7 @@ pub struct Mesh {
     pub vertices: Vec<[f32; 3]>,
     pub faces: Vec<[u32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    pub normals: Vec<[f32; 3]>,
     pub material: Option<MeshMaterial>,
     pub pbr_textures: Option<MeshPbrTextures>,
 }
@@ -320,6 +321,41 @@ pub fn compute_position_welded_normals(
     normals
 }
 
+pub fn align_normals_with_faces(
+    vertices: &[[f32; 3]],
+    faces: &[[u32; 3]],
+    normals: &mut [[f32; 3]],
+) {
+    if normals.len() != vertices.len() {
+        return;
+    }
+    let mut reference = vec![[0.0f32; 3]; vertices.len()];
+    for face in faces {
+        let i0 = face[0] as usize;
+        let i1 = face[1] as usize;
+        let i2 = face[2] as usize;
+        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+            continue;
+        }
+        let a = vertices[i0];
+        let b = vertices[i1];
+        let c = vertices[i2];
+        let face_normal = vec3_cross(vec3_sub(b, a), vec3_sub(c, a));
+        for idx in [i0, i1, i2] {
+            reference[idx][0] += face_normal[0];
+            reference[idx][1] += face_normal[1];
+            reference[idx][2] += face_normal[2];
+        }
+    }
+    for (normal, expected) in normals.iter_mut().zip(reference.iter()) {
+        if vec3_dot(*normal, *expected) < 0.0 {
+            normal[0] = -normal[0];
+            normal[1] = -normal[1];
+            normal[2] = -normal[2];
+        }
+    }
+}
+
 fn connectivity_metrics(
     vertices: &[[f32; 3]],
     faces: &[[u32; 3]],
@@ -555,6 +591,7 @@ mod tests {
             ],
             faces: vec![[0, 1, 2], [0, 3, 1], [1, 3, 2], [2, 3, 0]],
             uvs: vec![[0.0, 0.0]; 4],
+            normals: Vec::new(),
             material: None,
             pbr_textures: Some(MeshPbrTextures {
                 base_color,
@@ -586,6 +623,7 @@ mod tests {
             vertices,
             faces,
             uvs: vec![[0.0, 0.0]; 12],
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };
@@ -611,6 +649,7 @@ mod tests {
             vertices,
             faces,
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };
@@ -700,6 +739,7 @@ impl From<burn_tripo::pipeline::mesh::Mesh> for Mesh {
             vertices: value.vertices,
             faces: value.faces,
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         }
@@ -724,6 +764,7 @@ impl From<burn_trellis::Mesh> for Mesh {
             vertices: value.vertices,
             faces: value.faces,
             uvs: value.uvs,
+            normals: value.normals,
             material: value.material.map(|material| MeshMaterial {
                 base_color: material.base_color,
                 metallic: material.metallic,

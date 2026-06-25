@@ -59,11 +59,11 @@ struct Cli {
     #[arg(long)]
     trellis_max_sparse_coords: Option<usize>,
 
-    /// Native Trellis PBR texture size for Rust GLB export. Use 0 for runtime default.
+    /// Trellis PBR texture size for Rust/Burn o_voxel GLB export. Use 0 for runtime default.
     #[arg(long)]
     trellis_pbr_texture_size: Option<usize>,
 
-    /// Enable native Trellis PBR texture baking. Pass `--trellis-pbr true` for textured GLB output.
+    /// Enable Trellis PBR texture baking through the Rust/Burn o_voxel export path.
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     trellis_pbr: bool,
 

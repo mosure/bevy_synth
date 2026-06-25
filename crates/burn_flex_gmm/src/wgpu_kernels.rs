@@ -1502,9 +1502,6 @@ fn dense_trilinear_sample_attrs_kernel(
     max_x: &i32,
     max_y: &i32,
     max_z: &i32,
-    max_x_f: &f32,
-    max_y_f: &f32,
-    max_z_f: &f32,
     stride_x: &i32,
     stride_xy: &i32,
 ) {
@@ -1517,26 +1514,38 @@ fn dense_trilinear_sample_attrs_kernel(
     let mut cx = (positions[pos_base] + 0.5) * *dim_x;
     let mut cy = (positions[pos_base + 1] + 0.5) * *dim_y;
     let mut cz = (positions[pos_base + 2] + 0.5) * *dim_z;
-    cx = cx.max(0.0).min(*max_x_f);
-    cy = cy.max(0.0).min(*max_y_f);
-    cz = cz.max(0.0).min(*max_z_f);
+    cx = cx.max(0.0).min(*dim_x);
+    cy = cy.max(0.0).min(*dim_y);
+    cz = cz.max(0.0).min(*dim_z);
 
-    let x0 = i32::cast_from(cx).clamp(0, *max_x);
-    let y0 = i32::cast_from(cy).clamp(0, *max_y);
-    let z0 = i32::cast_from(cz).clamp(0, *max_z);
-    let x1 = (x0 + 1).clamp(0, *max_x);
-    let y1 = (y0 + 1).clamp(0, *max_y);
-    let z1 = (z0 + 1).clamp(0, *max_z);
+    let mut x0 = i32::cast_from((cx - 0.5).max(0.0));
+    let mut y0 = i32::cast_from((cy - 0.5).max(0.0));
+    let mut z0 = i32::cast_from((cz - 0.5).max(0.0));
+    if cx < 0.5 {
+        x0 = -1;
+    }
+    if cy < 0.5 {
+        y0 = -1;
+    }
+    if cz < 0.5 {
+        z0 = -1;
+    }
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let z1 = z0 + 1;
 
-    let fx = cx - f32::cast_from(x0);
-    let fy = cy - f32::cast_from(y0);
-    let fz = cz - f32::cast_from(z0);
-    let wx0 = 1.0 - fx;
-    let wy0 = 1.0 - fy;
-    let wz0 = 1.0 - fz;
-    let wx1 = fx;
-    let wy1 = fy;
-    let wz1 = fz;
+    let dx0 = cx - f32::cast_from(x0) - 0.5;
+    let dy0 = cy - f32::cast_from(y0) - 0.5;
+    let dz0 = cz - f32::cast_from(z0) - 0.5;
+    let dx1 = cx - f32::cast_from(x1) - 0.5;
+    let dy1 = cy - f32::cast_from(y1) - 0.5;
+    let dz1 = cz - f32::cast_from(z1) - 0.5;
+    let wx0 = (1.0 - dx0.max(-dx0)).max(0.0);
+    let wy0 = (1.0 - dy0.max(-dy0)).max(0.0);
+    let wz0 = (1.0 - dz0.max(-dz0)).max(0.0);
+    let wx1 = (1.0 - dx1.max(-dx1)).max(0.0);
+    let wy1 = (1.0 - dy1.max(-dy1)).max(0.0);
+    let wz1 = (1.0 - dz1.max(-dz1)).max(0.0);
 
     let mut a0 = 0.0;
     let mut a1 = 0.0;
@@ -1547,7 +1556,14 @@ fn dense_trilinear_sample_attrs_kernel(
     let mut wsum = 0.0;
 
     let w000 = wx0 * wy0 * wz0;
-    if w000 > 0.0 {
+    if w000 > 0.0
+        && x0 >= 0
+        && x0 <= *max_x
+        && y0 >= 0
+        && y0 <= *max_y
+        && z0 >= 0
+        && z0 <= *max_z
+    {
         let idx000 = usize::cast_from((z0 * *stride_xy + y0 * *stride_x + x0).max(0));
         if occupancy[idx000] > 0 {
             let base = idx000 * 6;
@@ -1561,7 +1577,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w100 = wx1 * wy0 * wz0;
-    if w100 > 0.0 {
+    if w100 > 0.0
+        && x1 >= 0
+        && x1 <= *max_x
+        && y0 >= 0
+        && y0 <= *max_y
+        && z0 >= 0
+        && z0 <= *max_z
+    {
         let idx100 = usize::cast_from((z0 * *stride_xy + y0 * *stride_x + x1).max(0));
         if occupancy[idx100] > 0 {
             let base = idx100 * 6;
@@ -1575,7 +1598,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w010 = wx0 * wy1 * wz0;
-    if w010 > 0.0 {
+    if w010 > 0.0
+        && x0 >= 0
+        && x0 <= *max_x
+        && y1 >= 0
+        && y1 <= *max_y
+        && z0 >= 0
+        && z0 <= *max_z
+    {
         let idx010 = usize::cast_from((z0 * *stride_xy + y1 * *stride_x + x0).max(0));
         if occupancy[idx010] > 0 {
             let base = idx010 * 6;
@@ -1589,7 +1619,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w110 = wx1 * wy1 * wz0;
-    if w110 > 0.0 {
+    if w110 > 0.0
+        && x1 >= 0
+        && x1 <= *max_x
+        && y1 >= 0
+        && y1 <= *max_y
+        && z0 >= 0
+        && z0 <= *max_z
+    {
         let idx110 = usize::cast_from((z0 * *stride_xy + y1 * *stride_x + x1).max(0));
         if occupancy[idx110] > 0 {
             let base = idx110 * 6;
@@ -1603,7 +1640,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w001 = wx0 * wy0 * wz1;
-    if w001 > 0.0 {
+    if w001 > 0.0
+        && x0 >= 0
+        && x0 <= *max_x
+        && y0 >= 0
+        && y0 <= *max_y
+        && z1 >= 0
+        && z1 <= *max_z
+    {
         let idx001 = usize::cast_from((z1 * *stride_xy + y0 * *stride_x + x0).max(0));
         if occupancy[idx001] > 0 {
             let base = idx001 * 6;
@@ -1617,7 +1661,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w101 = wx1 * wy0 * wz1;
-    if w101 > 0.0 {
+    if w101 > 0.0
+        && x1 >= 0
+        && x1 <= *max_x
+        && y0 >= 0
+        && y0 <= *max_y
+        && z1 >= 0
+        && z1 <= *max_z
+    {
         let idx101 = usize::cast_from((z1 * *stride_xy + y0 * *stride_x + x1).max(0));
         if occupancy[idx101] > 0 {
             let base = idx101 * 6;
@@ -1631,7 +1682,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w011 = wx0 * wy1 * wz1;
-    if w011 > 0.0 {
+    if w011 > 0.0
+        && x0 >= 0
+        && x0 <= *max_x
+        && y1 >= 0
+        && y1 <= *max_y
+        && z1 >= 0
+        && z1 <= *max_z
+    {
         let idx011 = usize::cast_from((z1 * *stride_xy + y1 * *stride_x + x0).max(0));
         if occupancy[idx011] > 0 {
             let base = idx011 * 6;
@@ -1645,7 +1703,14 @@ fn dense_trilinear_sample_attrs_kernel(
         }
     }
     let w111 = wx1 * wy1 * wz1;
-    if w111 > 0.0 {
+    if w111 > 0.0
+        && x1 >= 0
+        && x1 <= *max_x
+        && y1 >= 0
+        && y1 <= *max_y
+        && z1 >= 0
+        && z1 <= *max_z
+    {
         let idx111 = usize::cast_from((z1 * *stride_xy + y1 * *stride_x + x1).max(0));
         if occupancy[idx111] > 0 {
             let base = idx111 * 6;
@@ -4177,9 +4242,6 @@ pub fn dense_trilinear_sample_attrs_wgpu(
     let dim_x = spatial[0] as f32;
     let dim_y = spatial[1] as f32;
     let dim_z = spatial[2] as f32;
-    let max_x_f = max_x as f32;
-    let max_y_f = max_y as f32;
-    let max_z_f = max_z as f32;
     unsafe {
         dense_trilinear_sample_attrs_kernel::launch_unchecked::<burn_wgpu::WgpuRuntime>(
             &positions_p.client,
@@ -4196,9 +4258,6 @@ pub fn dense_trilinear_sample_attrs_wgpu(
             max_x,
             max_y,
             max_z,
-            max_x_f,
-            max_y_f,
-            max_z_f,
             stride_x,
             stride_xy,
         )
@@ -6187,7 +6246,7 @@ mod tests {
     ) -> Option<[f32; 6]> {
         let map_axis = |value: f32, dim: usize| -> f32 {
             let dim = dim.max(1) as f32;
-            ((value + 0.5) * dim).clamp(0.0, dim - 1.0)
+            ((value + 0.5) * dim).clamp(0.0, dim)
         };
         let coord = [
             map_axis(position[0], spatial[0]),
@@ -6195,41 +6254,45 @@ mod tests {
             map_axis(position[2], spatial[2]),
         ];
         let base = [
-            coord[0].floor() as i32,
-            coord[1].floor() as i32,
-            coord[2].floor() as i32,
-        ];
-        let frac = [
-            coord[0] - base[0] as f32,
-            coord[1] - base[1] as f32,
-            coord[2] - base[2] as f32,
+            (coord[0] - 0.5).floor() as i32,
+            (coord[1] - 0.5).floor() as i32,
+            (coord[2] - 0.5).floor() as i32,
         ];
 
         let max_x = spatial[0].saturating_sub(1) as i32;
         let max_y = spatial[1].saturating_sub(1) as i32;
         let max_z = spatial[2].saturating_sub(1) as i32;
-        let x0 = base[0].clamp(0, max_x) as usize;
-        let y0 = base[1].clamp(0, max_y) as usize;
-        let z0 = base[2].clamp(0, max_z) as usize;
-        let x1 = (base[0] + 1).clamp(0, max_x) as usize;
-        let y1 = (base[1] + 1).clamp(0, max_y) as usize;
-        let z1 = (base[2] + 1).clamp(0, max_z) as usize;
-        let wx0 = 1.0 - frac[0];
-        let wy0 = 1.0 - frac[1];
-        let wz0 = 1.0 - frac[2];
-        let wx1 = frac[0];
-        let wy1 = frac[1];
-        let wz1 = frac[2];
+        let x0 = base[0];
+        let y0 = base[1];
+        let z0 = base[2];
+        let x1 = base[0] + 1;
+        let y1 = base[1] + 1;
+        let z1 = base[2] + 1;
+        let weight_axis = |query: f32, cell: i32| -> f32 {
+            (1.0 - (query - cell as f32 - 0.5).abs()).max(0.0)
+        };
+        let wx0 = weight_axis(coord[0], x0);
+        let wy0 = weight_axis(coord[1], y0);
+        let wz0 = weight_axis(coord[2], z0);
+        let wx1 = weight_axis(coord[0], x1);
+        let wy1 = weight_axis(coord[1], y1);
+        let wz1 = weight_axis(coord[2], z1);
         let stride_x = spatial[0];
         let stride_xy = spatial[0].saturating_mul(spatial[1]);
         let idx = |x: usize, y: usize, z: usize| -> usize { z * stride_xy + y * stride_x + x };
 
         let mut accum = [0.0f32; 6];
         let mut weight_sum = 0.0f32;
-        let mut sample_corner = |x: usize, y: usize, z: usize, weight: f32| {
+        let mut sample_corner = |x: i32, y: i32, z: i32, weight: f32| {
             if weight <= 0.0 {
                 return;
             }
+            if x < 0 || x > max_x || y < 0 || y > max_y || z < 0 || z > max_z {
+                return;
+            }
+            let x = x as usize;
+            let y = y as usize;
+            let z = z as usize;
             let linear = idx(x, y, z);
             if occupancy[linear] == 0 {
                 return;

@@ -19,6 +19,8 @@ pub mod wasm_api;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_loader;
 
+#[cfg(feature = "runtime")]
+pub use io::mesh_from_glb_bytes;
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
 pub use io::mesh_to_glb_bytes;
 #[cfg(feature = "runtime")]
@@ -26,8 +28,9 @@ pub use io::write_glb_mesh;
 pub use io::{ImageSource, TextPrompt};
 pub use mesh::{
     Mesh, MeshConnectivityMetrics, MeshLike, MeshMaterial, MeshPbrTextureMetrics, MeshPbrTextures,
-    MeshQualityMetrics, MeshStats, MeshTexture, compute_position_welded_normals,
-    compute_vertex_normals, mesh_bounds, mesh_quality_failures, mesh_quality_metrics, mesh_stats,
+    MeshQualityMetrics, MeshStats, MeshTexture, align_normals_with_faces,
+    compute_position_welded_normals, compute_vertex_normals, mesh_bounds, mesh_quality_failures,
+    mesh_quality_metrics, mesh_stats,
 };
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
 pub use native_model_bootstrap::set_bootstrap_status_callback;

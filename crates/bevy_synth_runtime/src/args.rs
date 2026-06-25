@@ -60,11 +60,11 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = TrellisQuality::Low)]
     pub trellis_quality: TrellisQuality,
 
-    /// Enable native Trellis PBR texture baking. Pass `--trellis-pbr true` for textured output.
+    /// Enable Trellis PBR texture baking through the Rust/Burn o_voxel export path.
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub trellis_pbr: bool,
 
-    /// Native Trellis PBR texture size. Use 0 for the runtime default.
+    /// Trellis PBR texture size for Rust/Burn o_voxel GLB export. Use 0 for the runtime default.
     #[arg(long, default_value_t = DEFAULT_TRELLIS_PBR_TEXTURE_SIZE)]
     pub trellis_pbr_texture_size: usize,
 

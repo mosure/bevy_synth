@@ -1478,7 +1478,7 @@ where
     )?;
 
     let quality = trellis_quality_from_wasm_preset(preset);
-    let decode_output_mode = trellis_decode_output_mode_from_wasm_preset(preset);
+    let decode_output_mode = trellis_decode_output_mode_from_wasm_preset(preset)?;
     let required_model_keys = trellis_required_model_keys_for_quality(quality, decode_output_mode);
     load_ctx.status(format!(
         "Loading Trellis {} model set ({} model components)...",
@@ -1667,7 +1667,7 @@ fn trellis_required_model_keys_for_quality(
             "tex_slat_flow_model_1024",
         ],
     };
-    if !decode_output_mode.needs_native_pbr() {
+    if !decode_output_mode.needs_texture_attrs() {
         keys.retain(|key| !key.starts_with("tex_slat_") && *key != "tex_slat_decoder");
     }
     keys
@@ -1676,12 +1676,12 @@ fn trellis_required_model_keys_for_quality(
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
 fn trellis_decode_output_mode_from_wasm_preset(
     preset: &WasmInferencePreset,
-) -> TrellisDecodeOutputMode {
-    if preset.trellis_pbr_enabled {
+) -> Result<TrellisDecodeOutputMode, String> {
+    Ok(if preset.trellis_pbr_enabled {
         TrellisDecodeOutputMode::NativePbr
     } else {
         TrellisDecodeOutputMode::NativeMesh
-    }
+    })
 }
 
 #[cfg(all(feature = "wasm-api-wgpu", feature = "trellis"))]
@@ -1982,6 +1982,7 @@ fn trellis_run_options_from_wasm_preset(
     preset: &WasmInferencePreset,
     adapter_profile: &WebGpuAdapterProfile,
 ) -> Result<TrellisRunOptions, String> {
+    let decode_output_mode = trellis_decode_output_mode_from_wasm_preset(preset)?;
     Ok(TrellisRunOptions {
         quality: trellis_quality_from_wasm_preset(preset),
         device: TrellisDevice::Wgpu,
@@ -1994,7 +1995,7 @@ fn trellis_run_options_from_wasm_preset(
             .trellis_pbr_enabled
             .then_some(preset.trellis_pbr_texture_size)
             .filter(|size| *size > 0),
-        decode_output_mode: trellis_decode_output_mode_from_wasm_preset(preset),
+        decode_output_mode,
         sampler_overrides: trellis_sampler_overrides_from_wasm_preset(preset),
         ..TrellisRunOptions::default()
     })
@@ -3074,6 +3075,7 @@ fn tripo_mesh_to_mesh(mesh: TripoMesh) -> Mesh {
         vertices: mesh.vertices,
         faces: mesh.faces,
         uvs: Vec::new(),
+        normals: Vec::new(),
         material: None,
         pbr_textures: None,
     }

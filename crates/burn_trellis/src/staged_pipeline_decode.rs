@@ -19,6 +19,7 @@ pub(super) struct UvRasterDomain {
     pub(super) output_vertices: Vec<[f32; 3]>,
     pub(super) output_faces: Vec<[u32; 3]>,
     pub(super) output_uvs: Vec<[f32; 2]>,
+    pub(super) output_normals: Vec<[f32; 3]>,
     pub(super) raster_vertices: Vec<[f32; 3]>,
     pub(super) raster_uvs: Vec<[f32; 2]>,
     pub(super) raster_faces: Vec<[u32; 3]>,
@@ -29,6 +30,7 @@ pub(super) struct PbrBakeMesh {
     pub vertices: Vec<[f32; 3]>,
     pub faces: Vec<[u32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    pub normals: Vec<[f32; 3]>,
 }
 
 type VoxelAttrFastHasher = BuildHasherDefault<FxHasher>;
@@ -294,7 +296,7 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
     let resolution = final_resolution.max(1);
     if resolution < 2 {
         return Err(format!(
-            "native pbr remesh requires resolution >= 2, got {resolution}"
+            "rust o_voxel pbr remesh requires resolution >= 2, got {resolution}"
         ));
     }
 
@@ -304,7 +306,7 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
     while base_resolution > 32 {
         if base_resolution % 2 != 0 {
             return Err(format!(
-                "native pbr remesh resolution must be divisible by two down to <=32, got {resolution}"
+                "rust o_voxel pbr remesh resolution must be divisible by two down to <=32, got {resolution}"
             ));
         }
         base_resolution /= 2;
@@ -356,7 +358,7 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
         coords = children;
     }
     if coords.is_empty() {
-        return Err("native pbr remesh produced no active voxels".to_string());
+        return Err("rust o_voxel pbr remesh produced no active voxels".to_string());
     }
     pbr_stage_log(format!(
         "burn_trellis: decode.pbr remesh refine complete ({:.2} ms, active_voxels={})",
@@ -446,7 +448,7 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
         }
     }
     if faces_out.is_empty() {
-        return Err("native pbr remesh produced no faces".to_string());
+        return Err("rust o_voxel pbr remesh produced no faces".to_string());
     }
 
     let mut vertices_out = Vec::with_capacity(used.iter().filter(|value| **value).count());
@@ -528,16 +530,15 @@ fn simple_dual_contour_voxel(
     grid_vertex_map: &FastHashMap<(i32, i32, i32), usize>,
     grid_values: &[f32],
 ) -> Result<([f32; 3], [i32; 3]), String> {
-    let value = |x: i32, y: i32, z: i32| -> Result<f32, String> {
-        let idx = grid_vertex_map
-            .get(&(x, y, z))
-            .copied()
-            .ok_or_else(|| format!("native pbr remesh missing grid vertex ({x},{y},{z})"))?;
-        grid_values
-            .get(idx)
-            .copied()
-            .ok_or_else(|| format!("native pbr remesh grid value index out of range: {idx}"))
-    };
+    let value =
+        |x: i32, y: i32, z: i32| -> Result<f32, String> {
+            let idx = grid_vertex_map.get(&(x, y, z)).copied().ok_or_else(|| {
+                format!("rust o_voxel pbr remesh missing grid vertex ({x},{y},{z})")
+            })?;
+            grid_values.get(idx).copied().ok_or_else(|| {
+                format!("rust o_voxel pbr remesh grid value index out of range: {idx}")
+            })
+        };
 
     let [vx, vy, vz] = coord;
     let mut intersection_sum = [0.0f32; 3];
@@ -1069,6 +1070,18 @@ pub(super) fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn normalize3_in_place(value: &mut [f32; 3]) {
+    let len = dot3(*value, *value).sqrt();
+    if len <= 1.0e-12 {
+        *value = [0.0, 1.0, 0.0];
+        return;
+    }
+    let inv = 1.0 / len;
+    value[0] *= inv;
+    value[1] *= inv;
+    value[2] *= inv;
+}
+
 pub(super) fn pack_coord(x: u32, y: u32, z: u32) -> u64 {
     ((x as u64) << 42) | ((y as u64) << 21) | z as u64
 }
@@ -1304,6 +1317,7 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
                 vertices: Vec::new(),
                 faces: Vec::new(),
                 uvs: Vec::new(),
+                normals: Vec::new(),
             },
             None,
             if capture_debug {
@@ -1476,7 +1490,6 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
             let idx = y * texture_size + x;
             if raster_mask[idx] != 0 {
                 raster_conflict_texels = raster_conflict_texels.saturating_add(1);
-                return;
             }
             raster_candidate_texels = raster_candidate_texels.saturating_add(1);
 
@@ -1504,13 +1517,11 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
                 }
                 let entry = deferred_positions.len();
                 deferred_positions.push(position);
-                deferred_next.push(-1);
-                if deferred_head[idx] < 0 {
-                    deferred_head[idx] = entry as i32;
-                } else {
-                    let tail = deferred_tail[idx] as usize;
-                    deferred_next[tail] = entry as i32;
-                }
+                // Upstream o_voxel composes raster chunks with later valid
+                // texels overwriting earlier ones. Push new candidates to the
+                // head so deferred sampling resolves last-rasterized hits first.
+                deferred_next.push(deferred_head[idx]);
+                deferred_head[idx] = entry as i32;
                 deferred_tail[idx] = entry as i32;
                 deferred_candidate_counts[idx] = deferred_candidate_counts[idx].saturating_add(1);
                 return;
@@ -1519,6 +1530,16 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
                 Ok(Some(attrs)) => attrs,
                 Ok(None) => {
                     zero_support_samples = zero_support_samples.saturating_add(1);
+                    // Upstream o_voxel keeps raster coverage separate from sparse
+                    // interpolation support: flex_gemm returns zeros for valid
+                    // texels without contributing sparse cells, and those zeros are
+                    // not inpainted away.
+                    roughness_float[idx] = 0.0;
+                    raster_mask[idx] = 255;
+                    if capture_debug {
+                        sample_positions.push(position);
+                        sample_attrs.push([0.0; 6]);
+                    }
                     return;
                 }
                 Err(err) => {
@@ -1526,13 +1547,11 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
                     return;
                 }
             };
-            if raster_mask[idx] == 0 {
-                base_color_float[idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
-                metallic_float[idx] = attrs[3];
-                roughness_float[idx] = attrs[4];
-                alpha_float[idx] = attrs[5];
-                raster_mask[idx] = 255;
-            }
+            base_color_float[idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
+            metallic_float[idx] = attrs[3];
+            roughness_float[idx] = attrs[4];
+            alpha_float[idx] = attrs[5];
+            raster_mask[idx] = 255;
             if capture_debug {
                 sample_positions.push(position);
                 sample_attrs.push(attrs);
@@ -1557,60 +1576,53 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
                 );
             }
         };
-        // Resolve texels by trying candidates in first-hit order per texel until one
-        // samples successfully; this preserves canonical behavior while avoiding
-        // sampling duplicate candidates after a texel is already resolved.
-        let mut cursor = deferred_head;
+        // Resolve only the last rasterized candidate for each texel. Upstream
+        // nvdiffrast overwrites by face order before grid_sample_3d, and sparse
+        // misses remain covered zero texels rather than falling back to an older
+        // overdraw candidate.
+        let cursor = deferred_head;
         let mut active_texels = cursor
             .iter()
             .enumerate()
             .filter_map(|(idx, head)| (*head >= 0).then_some(idx))
             .collect::<Vec<_>>();
-        while !active_texels.is_empty() {
-            let mut next_active_texels = Vec::new();
-            let mut start = 0usize;
-            while start < active_texels.len() {
-                let end = (start + DENSE_VOXEL_WGPU_SAMPLE_BATCH).min(active_texels.len());
-                let batch_texels = &active_texels[start..end];
-                let mut batch_positions = Vec::with_capacity(batch_texels.len());
-                let mut batch_meta = Vec::with_capacity(batch_texels.len());
-                for &texel_idx in batch_texels {
-                    let entry = cursor[texel_idx];
-                    if entry < 0 {
-                        continue;
-                    }
-                    let entry = entry as usize;
-                    batch_positions.push(deferred_positions[entry]);
-                    batch_meta.push((texel_idx, entry));
+        let mut start = 0usize;
+        while start < active_texels.len() {
+            let end = (start + DENSE_VOXEL_WGPU_SAMPLE_BATCH).min(active_texels.len());
+            let batch_texels = &active_texels[start..end];
+            let mut batch_positions = Vec::with_capacity(batch_texels.len());
+            let mut batch_meta = Vec::with_capacity(batch_texels.len());
+            for &texel_idx in batch_texels {
+                let entry = cursor[texel_idx];
+                if entry < 0 {
+                    continue;
                 }
-                let sampled =
-                    sample_voxel_attr_dense_wgpu_batch(batch_positions.as_slice(), &wgpu_sampler)?;
-                for (sampled_attrs, (texel_idx, entry)) in
-                    sampled.into_iter().zip(batch_meta.into_iter())
-                {
-                    if raster_mask[texel_idx] != 0 {
-                        continue;
-                    }
-                    if let Some(attrs) = sampled_attrs {
-                        base_color_float[texel_idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
-                        metallic_float[texel_idx] = attrs[3];
-                        roughness_float[texel_idx] = attrs[4];
-                        alpha_float[texel_idx] = attrs[5];
-                        raster_mask[texel_idx] = 255;
-                    } else {
-                        zero_support_samples = zero_support_samples.saturating_add(1);
-                        let next = deferred_next[entry];
-                        cursor[texel_idx] = next;
-                        if next >= 0 {
-                            next_active_texels.push(texel_idx);
-                        }
-                    }
-                }
-                start = end;
+                let entry = entry as usize;
+                batch_positions.push(deferred_positions[entry]);
+                batch_meta.push(texel_idx);
             }
-            active_texels = next_active_texels;
+            let sampled =
+                sample_voxel_attr_dense_wgpu_batch(batch_positions.as_slice(), &wgpu_sampler)?;
+            for (sampled_attrs, texel_idx) in sampled.into_iter().zip(batch_meta.into_iter()) {
+                if raster_mask[texel_idx] != 0 {
+                    continue;
+                }
+                if let Some(attrs) = sampled_attrs {
+                    base_color_float[texel_idx] = [attrs[0], attrs[1], attrs[2], attrs[5]];
+                    metallic_float[texel_idx] = attrs[3];
+                    roughness_float[texel_idx] = attrs[4];
+                    alpha_float[texel_idx] = attrs[5];
+                } else {
+                    zero_support_samples = zero_support_samples.saturating_add(1);
+                    roughness_float[texel_idx] = 0.0;
+                }
+                raster_mask[texel_idx] = 255;
+            }
+            start = end;
         }
+        active_texels.clear();
         let _ = deferred_raster_mask;
+        let _ = deferred_next;
     }
     let covered_texels = raster_mask.iter().filter(|value| **value != 0).count();
     pbr_stage_log(format!(
@@ -1720,6 +1732,7 @@ pub(super) fn bake_pbr_from_voxels_with_options_and_projection_bvh(
             vertices: uv_domain.output_vertices,
             faces: uv_domain.output_faces,
             uvs: uv_domain.output_uvs,
+            normals: uv_domain.output_normals,
         },
         Some(pbr_textures),
         debug,
@@ -1736,6 +1749,7 @@ pub(super) fn build_uv_raster_domain(
             output_vertices: Vec::new(),
             output_faces: Vec::new(),
             output_uvs: Vec::new(),
+            output_normals: Vec::new(),
             raster_vertices: Vec::new(),
             raster_uvs: Vec::new(),
             raster_faces: Vec::new(),
@@ -1787,21 +1801,47 @@ pub(super) fn build_uv_raster_domain(
         atlas_face.component = component_idx;
         let face = atlas_face.source;
         components[component_idx].faces.push(face_idx);
+        components[component_idx].projected_area +=
+            box_atlas_face_projected_area(chart, vertices, face);
         for vertex_idx in face {
             let projected = box_atlas_project(chart, vertices[vertex_idx as usize]);
             components[component_idx].include(projected);
         }
     }
-    let fragmented_component_limit = texture_size.saturating_mul(2).max(256);
+    let min_tile = textureless_chart_size().max(1);
+    let min_tile_capacity = texture_size
+        .checked_div(min_tile)
+        .unwrap_or(0)
+        .pow(2)
+        .max(1);
     let dense_face_texel_limit = texture_size
         .saturating_mul(texture_size)
         .saturating_mul(4)
         .max(1);
-    if components.len() > fragmented_component_limit || atlas_faces.len() > dense_face_texel_limit {
+    let projected_area = components
+        .iter()
+        .map(|component| component.projected_area)
+        .sum::<f32>();
+    let bbox_area = components
+        .iter()
+        .map(|component| {
+            let range = component.range();
+            range[0] * range[1]
+        })
+        .sum::<f32>();
+    pbr_stage_log(format!(
+        "burn_trellis: decode.pbr uv atlas stats (components={} faces={} projected_area={:.6} bbox_area={:.6} fill_estimate={:.4})",
+        components.len(),
+        atlas_faces.len(),
+        projected_area,
+        bbox_area,
+        projected_area / bbox_area.max(1.0e-8)
+    ));
+    if components.len() > min_tile_capacity || atlas_faces.len() > dense_face_texel_limit {
         pbr_stage_log(format!(
-            "burn_trellis: decode.pbr uv using chart atlas fallback (components={} component_limit={} faces={} face_limit={} texture_size={})",
+            "burn_trellis: decode.pbr uv using chart atlas fallback (components={} component_capacity={} faces={} face_limit={} texture_size={})",
             components.len(),
-            fragmented_component_limit,
+            min_tile_capacity,
             atlas_faces.len(),
             dense_face_texel_limit,
             texture_size
@@ -1845,6 +1885,8 @@ fn assign_chart_atlas_components(
         };
         atlas_face.component = component_idx;
         components[component_idx].faces.push(face_idx);
+        components[component_idx].projected_area +=
+            box_atlas_face_projected_area(face_chart, vertices, atlas_face.source);
         for vertex_idx in atlas_face.source {
             if let Some(vertex) = vertices.get(vertex_idx as usize) {
                 let projected = box_atlas_project(face_chart, *vertex);
@@ -1861,7 +1903,9 @@ fn assemble_uv_raster_domain(
     components: &[UvAtlasComponent],
     texture_size: usize,
 ) -> UvRasterDomain {
+    let source_normals = compute_pbr_vertex_normals(vertices, atlas_faces);
     let mut raster_vertices = Vec::with_capacity(atlas_faces.len() * 2);
+    let mut raster_normals = Vec::with_capacity(atlas_faces.len() * 2);
     let mut raster_uvs = Vec::with_capacity(atlas_faces.len() * 2);
     let mut raster_faces = Vec::with_capacity(atlas_faces.len());
     let mut vertex_map = fast_hash_map_with_capacity::<(usize, u32), u32>(atlas_faces.len() * 2);
@@ -1878,6 +1922,7 @@ fn assemble_uv_raster_domain(
                     let uv = component.uv(projected, texture_size);
                     let idx = raster_vertices.len() as u32;
                     raster_vertices.push(vertex);
+                    raster_normals.push(source_normals[source_idx as usize]);
                     raster_uvs.push(uv);
                     vertex_map.insert((atlas_face.component, source_idx), idx);
                     idx
@@ -1892,10 +1937,32 @@ fn assemble_uv_raster_domain(
         output_vertices: raster_vertices.clone(),
         output_faces: raster_faces.clone(),
         output_uvs,
+        output_normals: raster_normals.clone(),
         raster_vertices,
         raster_uvs,
         raster_faces,
     }
+}
+
+fn compute_pbr_vertex_normals(vertices: &[[f32; 3]], atlas_faces: &[UvAtlasFace]) -> Vec<[f32; 3]> {
+    let mut normals = vec![[0.0f32; 3]; vertices.len()];
+    for atlas_face in atlas_faces {
+        let face = atlas_face.source;
+        if face.iter().any(|idx| *idx as usize >= vertices.len()) {
+            continue;
+        }
+        let normal = triangle_normal(vertices, face);
+        for idx in face {
+            let entry = &mut normals[idx as usize];
+            entry[0] += normal[0];
+            entry[1] += normal[1];
+            entry[2] += normal[2];
+        }
+    }
+    for normal in &mut normals {
+        normalize3_in_place(normal);
+    }
+    normals
 }
 
 pub(super) fn glb_output_uvs_from_raster_uvs(raster_uvs: &[[f32; 2]]) -> Vec<[f32; 2]> {
@@ -1920,6 +1987,7 @@ struct UvAtlasComponent {
     faces: Vec<usize>,
     pos_px: [usize; 2],
     size_px: [usize; 2],
+    projected_area: f32,
 }
 
 impl UvAtlasComponent {
@@ -1931,6 +1999,7 @@ impl UvAtlasComponent {
             faces: Vec::new(),
             pos_px: [0, 0],
             size_px: [textureless_chart_size(), textureless_chart_size()],
+            projected_area: 0.0,
         }
     }
 
@@ -2126,6 +2195,28 @@ fn box_atlas_project(chart: usize, vertex: [f32; 3]) -> [f32; 2] {
     }
 }
 
+fn box_atlas_face_projected_area(chart: usize, vertices: &[[f32; 3]], face: [u32; 3]) -> f32 {
+    let Some(a) = vertices
+        .get(face[0] as usize)
+        .map(|vertex| box_atlas_project(chart, *vertex))
+    else {
+        return 0.0;
+    };
+    let Some(b) = vertices
+        .get(face[1] as usize)
+        .map(|vertex| box_atlas_project(chart, *vertex))
+    else {
+        return 0.0;
+    };
+    let Some(c) = vertices
+        .get(face[2] as usize)
+        .map(|vertex| box_atlas_project(chart, *vertex))
+    else {
+        return 0.0;
+    };
+    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
+}
+
 fn box_atlas_chart(normal: [f32; 3]) -> usize {
     let ax = normal[0].abs();
     let ay = normal[1].abs();
@@ -2151,9 +2242,9 @@ pub(super) fn sample_voxel_attr(
     }
     let map_axis = |value: f32, dim: u32| -> f32 {
         let dim = dim.max(1) as f32;
-        // Match TRELLIS2 grid-sample coordinate convention: (pos + 0.5) * resolution.
-        // Clamp to the valid sparse lattice extent for robust sampling near boundaries.
-        ((value + 0.5) * dim).clamp(0.0, dim - 1.0)
+        // Match flex_gemm grid_sample_3d: query coordinates are in voxel-space and
+        // sparse cell centers are at integer_coord + 0.5.
+        ((value + 0.5) * dim).clamp(0.0, dim)
     };
     let coord = [
         map_axis(position[0], spatial[0]),
@@ -2161,39 +2252,42 @@ pub(super) fn sample_voxel_attr(
         map_axis(position[2], spatial[2]),
     ];
     let base = [
-        coord[0].floor() as i32,
-        coord[1].floor() as i32,
-        coord[2].floor() as i32,
-    ];
-    let frac = [
-        coord[0] - base[0] as f32,
-        coord[1] - base[1] as f32,
-        coord[2] - base[2] as f32,
+        (coord[0] - 0.5).floor() as i32,
+        (coord[1] - 0.5).floor() as i32,
+        (coord[2] - 0.5).floor() as i32,
     ];
 
     let max_x = spatial[0].saturating_sub(1) as i32;
     let max_y = spatial[1].saturating_sub(1) as i32;
     let max_z = spatial[2].saturating_sub(1) as i32;
-    let x0 = base[0].clamp(0, max_x) as u32;
-    let y0 = base[1].clamp(0, max_y) as u32;
-    let z0 = base[2].clamp(0, max_z) as u32;
-    let x1 = (base[0] + 1).clamp(0, max_x) as u32;
-    let y1 = (base[1] + 1).clamp(0, max_y) as u32;
-    let z1 = (base[2] + 1).clamp(0, max_z) as u32;
+    let x0 = base[0];
+    let y0 = base[1];
+    let z0 = base[2];
+    let x1 = base[0] + 1;
+    let y1 = base[1] + 1;
+    let z1 = base[2] + 1;
 
-    let wx0 = 1.0 - frac[0];
-    let wy0 = 1.0 - frac[1];
-    let wz0 = 1.0 - frac[2];
-    let wx1 = frac[0];
-    let wy1 = frac[1];
-    let wz1 = frac[2];
+    let weight_axis =
+        |query: f32, cell: i32| -> f32 { (1.0 - (query - cell as f32 - 0.5).abs()).max(0.0) };
+    let wx0 = weight_axis(coord[0], x0);
+    let wy0 = weight_axis(coord[1], y0);
+    let wz0 = weight_axis(coord[2], z0);
+    let wx1 = weight_axis(coord[0], x1);
+    let wy1 = weight_axis(coord[1], y1);
+    let wz1 = weight_axis(coord[2], z1);
 
     let mut accum = [0.0f32; 6];
     let mut weight_sum = 0.0f32;
-    let mut accumulate_corner = |x: u32, y: u32, z: u32, weight: f32| {
+    let mut accumulate_corner = |x: i32, y: i32, z: i32, weight: f32| {
         if weight <= 0.0 {
             return;
         }
+        if x < 0 || x > max_x || y < 0 || y > max_y || z < 0 || z > max_z {
+            return;
+        }
+        let x = x as u32;
+        let y = y as u32;
+        let z = z as u32;
         let key = pack_coord(x, y, z);
         if let Some(attrs) = voxel_map.get(&key) {
             for ch in 0..6 {
@@ -2240,7 +2334,7 @@ pub(super) fn sample_voxel_attr_dense(
 
     let map_axis = |value: f32, dim: u32| -> f32 {
         let dim = dim.max(1) as f32;
-        ((value + 0.5) * dim).clamp(0.0, dim - 1.0)
+        ((value + 0.5) * dim).clamp(0.0, dim)
     };
     let coord = [
         map_axis(position[0], spatial[0]),
@@ -2248,39 +2342,42 @@ pub(super) fn sample_voxel_attr_dense(
         map_axis(position[2], spatial[2]),
     ];
     let base = [
-        coord[0].floor() as i32,
-        coord[1].floor() as i32,
-        coord[2].floor() as i32,
-    ];
-    let frac = [
-        coord[0] - base[0] as f32,
-        coord[1] - base[1] as f32,
-        coord[2] - base[2] as f32,
+        (coord[0] - 0.5).floor() as i32,
+        (coord[1] - 0.5).floor() as i32,
+        (coord[2] - 0.5).floor() as i32,
     ];
 
     let max_x = spatial[0].saturating_sub(1) as i32;
     let max_y = spatial[1].saturating_sub(1) as i32;
     let max_z = spatial[2].saturating_sub(1) as i32;
-    let x0 = base[0].clamp(0, max_x) as u32;
-    let y0 = base[1].clamp(0, max_y) as u32;
-    let z0 = base[2].clamp(0, max_z) as u32;
-    let x1 = (base[0] + 1).clamp(0, max_x) as u32;
-    let y1 = (base[1] + 1).clamp(0, max_y) as u32;
-    let z1 = (base[2] + 1).clamp(0, max_z) as u32;
+    let x0 = base[0];
+    let y0 = base[1];
+    let z0 = base[2];
+    let x1 = base[0] + 1;
+    let y1 = base[1] + 1;
+    let z1 = base[2] + 1;
 
-    let wx0 = 1.0 - frac[0];
-    let wy0 = 1.0 - frac[1];
-    let wz0 = 1.0 - frac[2];
-    let wx1 = frac[0];
-    let wy1 = frac[1];
-    let wz1 = frac[2];
+    let weight_axis =
+        |query: f32, cell: i32| -> f32 { (1.0 - (query - cell as f32 - 0.5).abs()).max(0.0) };
+    let wx0 = weight_axis(coord[0], x0);
+    let wy0 = weight_axis(coord[1], y0);
+    let wz0 = weight_axis(coord[2], z0);
+    let wx1 = weight_axis(coord[0], x1);
+    let wy1 = weight_axis(coord[1], y1);
+    let wz1 = weight_axis(coord[2], z1);
 
     let mut accum = [0.0f32; 6];
     let mut weight_sum = 0.0f32;
-    let mut accumulate_corner = |x: u32, y: u32, z: u32, weight: f32| {
+    let mut accumulate_corner = |x: i32, y: i32, z: i32, weight: f32| {
         if weight <= 0.0 {
             return;
         }
+        if x < 0 || x > max_x || y < 0 || y > max_y || z < 0 || z > max_z {
+            return;
+        }
+        let x = x as u32;
+        let y = y as u32;
+        let z = z as u32;
         let idx = dense_voxel_linear_index(x, y, z, spatial);
         if occupancy[idx] == 0 {
             return;

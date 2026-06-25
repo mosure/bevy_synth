@@ -194,11 +194,11 @@ pub struct ServerArgs {
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     pub trellis_quality: TrellisQuality,
 
-    /// Enable native TRELLIS PBR UV/material texture baking.
+    /// Enable TRELLIS PBR UV/material texture baking through the Rust/Burn o_voxel export path.
     #[arg(long)]
     pub trellis_pbr: bool,
 
-    /// Native TRELLIS PBR texture size. Uses runtime default when omitted.
+    /// TRELLIS PBR texture size for Rust/Burn o_voxel GLB export. Uses runtime default when omitted.
     #[arg(long)]
     pub trellis_pbr_texture_size: Option<usize>,
 
@@ -320,11 +320,11 @@ struct SceneBuildCliArgs {
     #[arg(long)]
     pub batch_vram_mb: Option<u64>,
 
-    /// Enable native TRELLIS PBR UV/material texture baking.
+    /// Enable TRELLIS PBR UV/material texture baking through the Rust/Burn o_voxel export path.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub trellis_pbr: bool,
 
-    /// Native TRELLIS PBR texture size.
+    /// TRELLIS PBR texture size for Rust/Burn o_voxel GLB export.
     #[arg(long)]
     pub trellis_pbr_texture_size: Option<usize>,
 
@@ -1292,6 +1292,7 @@ impl McpServer {
             "synthesis_models": selected_synthesis_models.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
             "backend": selected_backend.as_str(),
             "trellis_pbr_enabled": effective_trellis_pbr_enabled,
+            "trellis_pbr_backend": if effective_trellis_pbr_enabled { Some("rust-ovoxel") } else { None },
             "trellis_pbr_texture_size": effective_trellis_pbr_texture_size,
             "target_faces": effective_target_faces,
             "promote_to_catalog": args.promote_to_catalog,
@@ -4386,6 +4387,7 @@ fn cached_mesh_from_runtime_mesh(mesh: &Mesh) -> CachedSynthMesh {
             faces: mesh.faces.clone(),
         },
         uvs: mesh.uvs.clone(),
+        normals: mesh.normals.clone(),
         material: mesh.material.map(|material| CachedSynthMeshMaterial {
             base_color: material.base_color,
             metallic: material.metallic,
@@ -4560,6 +4562,11 @@ fn decimate_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, String> {
     } else {
         Vec::new()
     };
+    let normals = if mesh.normals.len() == mesh.vertices.len() && !mesh.normals.is_empty() {
+        meshopt::remap_vertex_buffer(mesh.normals.as_slice(), vertex_count, &remap)
+    } else {
+        Vec::new()
+    };
     let indices = meshopt::remap_index_buffer(Some(&simplified), vertex_count, &remap);
     if indices.len() < 3 {
         return Err("meshopt remap produced empty mesh".to_string());
@@ -4573,6 +4580,7 @@ fn decimate_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, String> {
         vertices,
         faces,
         uvs,
+        normals,
         material: mesh.material,
         pbr_textures: mesh.pbr_textures.clone(),
     })
@@ -5170,8 +5178,8 @@ fn tool_defs() -> Vec<Value> {
                     "target_faces": { "type": "integer", "description": "Optional target face count for mesh simplification." },
                     "batch_size": { "type": "integer", "description": "Optional explicit chunk size; omit for server default/auto." },
                     "batch_vram_mb": { "type": "integer", "description": "Optional VRAM budget in MB for auto chunking." },
-                    "trellis_pbr": { "type": "boolean", "description": "Enable native TRELLIS UV/material texture baking for lifted GLB assets." },
-                    "trellis_pbr_texture_size": { "type": "integer", "description": "Native TRELLIS PBR texture size." },
+                    "trellis_pbr": { "type": "boolean", "description": "Enable TRELLIS UV/material texture baking through the Rust/Burn o_voxel export path for lifted GLB assets." },
+                    "trellis_pbr_texture_size": { "type": "integer", "description": "TRELLIS PBR texture size." },
                     "promote_to_catalog": { "type": "boolean", "description": "Also add generated assets to the shared Bevy catalog/cache for later reuse. Defaults to false for direct batch conversion." },
                     "dry_run": { "type": "boolean", "description": "Skip model inference and emit canonical debug assets." }
                 },
@@ -5249,8 +5257,8 @@ fn tool_defs() -> Vec<Value> {
                     "target_faces": { "type": "integer" },
                     "batch_size": { "type": "integer" },
                     "batch_vram_mb": { "type": "integer" },
-                    "trellis_pbr": { "type": "boolean", "description": "Enable native TRELLIS UV/material texture baking for lifted GLB assets." },
-                    "trellis_pbr_texture_size": { "type": "integer", "description": "Native TRELLIS PBR texture size." },
+                    "trellis_pbr": { "type": "boolean", "description": "Enable TRELLIS UV/material texture baking through the Rust/Burn o_voxel export path for lifted GLB assets." },
+                    "trellis_pbr_texture_size": { "type": "integer", "description": "TRELLIS PBR texture size." },
                     "promote_to_catalog": { "type": "boolean", "description": "Add lifted objects to the shared Bevy catalog/cache for later reuse. Defaults to true; fresh scene mode still does not read existing catalog assets while planning." },
                     "write_artifacts": { "type": "boolean", "description": "Write structured e2e artifacts such as selected candidates, asset outputs, grounded layout, commands, summary, and scene.bsn to output_dir. Defaults to true." },
                     "clear_existing": { "type": "boolean" },
@@ -7376,6 +7384,7 @@ mod tests {
             ],
             faces: vec![[0, 1, 2], [1, 3, 2]],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            normals: Vec::new(),
             material: None,
             pbr_textures: Some(burn_synth::MeshPbrTextures {
                 base_color: burn_synth::MeshTexture {

@@ -194,11 +194,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     runtime_decoder_conv_telemetry: bool,
 
-    /// GLB export path. `ovoxel` uses the upstream o_voxel postprocess from hook tensors.
+    /// GLB export path. `ovoxel` is a reference-only upstream Python/Torch o_voxel export from hook tensors.
     #[arg(long = "glb-export-mode", value_enum, default_value_t = GlbExportMode::Native)]
     glb_export_mode: GlbExportMode,
 
-    /// Export GLB via canonical o_voxel postprocess using hook tensors.
+    /// Export GLB via the reference-only upstream Python/Torch o_voxel postprocess using hook tensors.
     #[arg(long, default_value_t = false)]
     ovoxel_postprocess_from_hook: bool,
 

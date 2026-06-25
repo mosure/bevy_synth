@@ -616,9 +616,9 @@ pub enum TrellisDecodeOutputMode {
 impl TrellisDecodeOutputMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::NativePbr => "native-pbr",
-            Self::NativeMesh => "native-mesh",
-            Self::OvoxelHookExport => "ovoxel-hook-export",
+            Self::NativePbr => "rust-ovoxel-pbr",
+            Self::NativeMesh => "rust-ovoxel-mesh",
+            Self::OvoxelHookExport => "reference-ovoxel-hook-export",
         }
     }
 
@@ -626,8 +626,16 @@ impl TrellisDecodeOutputMode {
         matches!(self, Self::NativePbr)
     }
 
+    pub fn needs_texture_attrs(self) -> bool {
+        matches!(self, Self::NativePbr | Self::OvoxelHookExport)
+    }
+
     pub fn needs_native_mesh_postprocess(self) -> bool {
         matches!(self, Self::NativePbr | Self::NativeMesh)
+    }
+
+    pub fn uses_ovoxel_hook_export(self) -> bool {
+        matches!(self, Self::OvoxelHookExport)
     }
 }
 
@@ -854,7 +862,7 @@ fn should_preload_shape_flow_variant(
 
 impl TrellisStageRuntime {
     pub fn from_args(args: &TrellisPipelineArgs, preferred_pipeline_type: Option<&str>) -> Self {
-        Self::from_args_with_assets(args, preferred_pipeline_type, None, None, false, None)
+        Self::from_args_with_assets(args, preferred_pipeline_type, None, None, false, None, true)
     }
 
     pub fn from_args_with_assets(
@@ -864,6 +872,7 @@ impl TrellisStageRuntime {
         _image_large_root: Option<&Path>,
         _prefer_wgpu: bool,
         sampler_overrides: Option<TrellisSamplerRuntimeOverrides>,
+        preload_texture_runtimes: bool,
     ) -> Self {
         let requested_pipeline_type = preferred_pipeline_type
             .unwrap_or(args.default_pipeline_type.as_str())
@@ -1111,9 +1120,13 @@ impl TrellisStageRuntime {
                 } else {
                     None
                 };
-                let tex_task = std::thread::spawn(move || {
-                    load_flow_runtime_from_spec(tex_spec_clone.as_ref())
-                });
+                let tex_task = if preload_texture_runtimes {
+                    Some(std::thread::spawn(move || {
+                        load_flow_runtime_from_spec(tex_spec_clone.as_ref())
+                    }))
+                } else {
+                    None
+                };
                 let sparse_structure_decoder_task = std::thread::spawn(move || {
                     load_sparse_structure_decoder_from_spec(
                         sparse_structure_decoder_spec_clone.as_ref(),
@@ -1122,9 +1135,13 @@ impl TrellisStageRuntime {
                 let shape_decoder_task = std::thread::spawn(move || {
                     load_shape_decoder_from_spec(shape_decoder_spec_clone.as_ref())
                 });
-                let tex_decoder_task = std::thread::spawn(move || {
-                    load_tex_decoder_from_spec(tex_decoder_spec_clone.as_ref())
-                });
+                let tex_decoder_task = if preload_texture_runtimes {
+                    Some(std::thread::spawn(move || {
+                        load_tex_decoder_from_spec(tex_decoder_spec_clone.as_ref())
+                    }))
+                } else {
+                    None
+                };
                 let image_cond_task = std::thread::spawn(move || {
                     load_image_conditioning_from_spec(image_cond_spec_clone.as_ref())
                 });
@@ -1172,14 +1189,18 @@ impl TrellisStageRuntime {
                 } else {
                     None
                 };
-                let tex_loaded = match tex_task.join() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        trellis_stage_log!(
-                            "burn_trellis: tex runtime preload task panicked; lazy load retry remains as the only recovery path"
-                        );
-                        None
+                let tex_loaded = if let Some(task) = tex_task {
+                    match task.join() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            trellis_stage_log!(
+                                "burn_trellis: tex runtime preload task panicked; lazy load retry remains as the only recovery path"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
                 let shape_decoder_loaded = match shape_decoder_task.join() {
                     Ok(value) => value,
@@ -1190,14 +1211,18 @@ impl TrellisStageRuntime {
                         None
                     }
                 };
-                let tex_decoder_loaded = match tex_decoder_task.join() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        trellis_stage_log!(
-                            "burn_trellis: tex decoder preload task panicked; lazy load retry remains as the only recovery path"
-                        );
-                        None
+                let tex_decoder_loaded = if let Some(task) = tex_decoder_task {
+                    match task.join() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            trellis_stage_log!(
+                                "burn_trellis: tex decoder preload task panicked; lazy load retry remains as the only recovery path"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
                 let sparse_structure_decoder_loaded = match sparse_structure_decoder_task.join() {
                     Ok(value) => value,
@@ -1225,10 +1250,14 @@ impl TrellisStageRuntime {
                 if preload_shape_flow_1024 {
                     let _ = shape_flow_1024.set(shape_1024_loaded);
                 }
-                let _ = tex_flow.set(tex_loaded);
+                if preload_texture_runtimes {
+                    let _ = tex_flow.set(tex_loaded);
+                }
                 let _ = sparse_structure_decoder.set(sparse_structure_decoder_loaded);
                 let _ = shape_decoder.set(shape_decoder_loaded);
-                let _ = tex_decoder.set(tex_decoder_loaded);
+                if preload_texture_runtimes {
+                    let _ = tex_decoder.set(tex_decoder_loaded);
+                }
                 let _ = image_conditioning.set(image_conditioning_loaded);
             }
             #[cfg(target_arch = "wasm32")]
@@ -2043,7 +2072,7 @@ impl TrellisStageRuntime {
         );
         let shape_slat_flow_ops = shape_slat.flow_ops;
 
-        let needs_tex_slat = run_config.decode_output_mode.needs_native_pbr();
+        let needs_tex_slat = run_config.decode_output_mode.needs_texture_attrs();
         let tex_start = Instant::now();
         let tex_slat = if needs_tex_slat {
             let tex_flow_runtime = self.tex_flow_runtime();
@@ -2107,7 +2136,7 @@ impl TrellisStageRuntime {
         trellis_stage_log!("burn_trellis: stage decode begin");
         set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
         let shape_decoder_runtime = self.shape_decoder_runtime();
-        let tex_decoder_runtime = if run_config.decode_output_mode.needs_native_pbr() {
+        let tex_decoder_runtime = if run_config.decode_output_mode.needs_texture_attrs() {
             self.tex_decoder_runtime()
         } else {
             None
@@ -2520,7 +2549,7 @@ impl TrellisStageRuntime {
         );
         let shape_slat_flow_ops = shape_slat.flow_ops;
 
-        let needs_tex_slat = run_config.decode_output_mode.needs_native_pbr();
+        let needs_tex_slat = run_config.decode_output_mode.needs_texture_attrs();
         let tex_start = Instant::now();
         let tex_slat = if needs_tex_slat {
             #[cfg(feature = "runtime-model")]
@@ -2597,7 +2626,7 @@ impl TrellisStageRuntime {
         #[cfg(feature = "runtime-model")]
         let shape_decoder_runtime = self.shape_decoder_runtime();
         #[cfg(feature = "runtime-model")]
-        let tex_decoder_runtime = if run_config.decode_output_mode.needs_native_pbr() {
+        let tex_decoder_runtime = if run_config.decode_output_mode.needs_texture_attrs() {
             self.tex_decoder_runtime()
         } else {
             None

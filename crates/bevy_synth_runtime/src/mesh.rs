@@ -6,7 +6,7 @@ use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
 use crate::SynthMesh;
 
 pub fn to_bevy_mesh(mesh: &TripoMesh) -> BevyMesh {
-    to_bevy_mesh_with_uvs(mesh, None, false)
+    to_bevy_mesh_with_uvs(mesh, None, None, false)
 }
 
 pub fn to_bevy_mesh_synth(mesh: &SynthMesh) -> BevyMesh {
@@ -16,17 +16,23 @@ pub fn to_bevy_mesh_synth(mesh: &SynthMesh) -> BevyMesh {
     } else {
         None
     };
+    let normals = if mesh.normals.len() == mesh.mesh.vertices.len() && !mesh.normals.is_empty() {
+        Some(mesh.normals.as_slice())
+    } else {
+        None
+    };
     let has_normal_map = mesh
         .pbr_textures
         .as_ref()
         .and_then(|pbr| pbr.normal.as_ref())
         .is_some();
-    to_bevy_mesh_with_uvs(&mesh.mesh, uvs, has_uvs && has_normal_map)
+    to_bevy_mesh_with_uvs(&mesh.mesh, uvs, normals, has_uvs && has_normal_map)
 }
 
 fn to_bevy_mesh_with_uvs(
     mesh: &TripoMesh,
     uvs_opt: Option<&[[f32; 2]]>,
+    normals_opt: Option<&[[f32; 3]]>,
     generate_tangents: bool,
 ) -> BevyMesh {
     let mut bevy_mesh = BevyMesh::new(
@@ -34,7 +40,17 @@ fn to_bevy_mesh_with_uvs(
         RenderAssetUsages::default(),
     );
 
-    let normals = compute_normals(mesh);
+    let normals = if let Some(normals) = normals_opt {
+        let mut normals = normals.to_vec();
+        burn_synth::align_normals_with_faces(
+            mesh.vertices.as_slice(),
+            mesh.faces.as_slice(),
+            normals.as_mut_slice(),
+        );
+        normals
+    } else {
+        compute_normals(mesh)
+    };
     let uvs = uvs_opt
         .map(|uvs| uvs.to_vec())
         .unwrap_or_else(|| vec![[0.0, 0.0]; mesh.vertices.len()]);
@@ -74,6 +90,7 @@ mod tests {
                 faces: vec![[0, 1, 2], [0, 2, 3]],
             },
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         }

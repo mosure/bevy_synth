@@ -59,7 +59,10 @@ use std::fs;
 use std::io;
 
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
-use crate::mesh::{Mesh, MeshTexture, compute_position_welded_normals};
+use crate::mesh::{
+    Mesh, MeshMaterial, MeshPbrTextures, MeshTexture, align_normals_with_faces,
+    compute_position_welded_normals,
+};
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
 use image::ImageEncoder;
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
@@ -112,6 +115,118 @@ pub fn mesh_to_glb_bytes(mesh: &Mesh) -> Result<Vec<u8>, String> {
     .map_err(|err| format!("failed to build GLB: {err}"))
 }
 
+#[cfg(feature = "runtime")]
+pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<Mesh, String> {
+    let gltf =
+        gltf::Gltf::from_slice(bytes).map_err(|err| format!("failed to parse GLB: {err}"))?;
+    let blob = gltf
+        .blob
+        .as_deref()
+        .ok_or_else(|| "GLB binary chunk missing".to_string())?;
+
+    let mesh = gltf
+        .meshes()
+        .next()
+        .ok_or_else(|| "GLB has no meshes".to_string())?;
+    let primitive = mesh
+        .primitives()
+        .next()
+        .ok_or_else(|| "GLB mesh has no primitives".to_string())?;
+    let reader = primitive.reader(|_buffer| Some(blob));
+
+    let vertices: Vec<[f32; 3]> = reader
+        .read_positions()
+        .ok_or_else(|| "GLB missing POSITION data".to_string())?
+        .collect();
+    if vertices.is_empty() {
+        return Err("GLB mesh has no vertices".to_string());
+    }
+
+    let indices: Vec<u32> = reader
+        .read_indices()
+        .ok_or_else(|| "GLB missing index data".to_string())?
+        .into_u32()
+        .collect();
+    if !indices.len().is_multiple_of(3) {
+        return Err("GLB indices are not triangles".to_string());
+    }
+    let vertex_count = vertices.len() as u32;
+    let mut faces = Vec::with_capacity(indices.len() / 3);
+    for tri in indices.chunks_exact(3) {
+        if tri.iter().any(|index| *index >= vertex_count) {
+            return Err("GLB indices reference out-of-range vertices".to_string());
+        }
+        faces.push([tri[0], tri[1], tri[2]]);
+    }
+
+    let mut uvs: Vec<[f32; 2]> = reader
+        .read_tex_coords(0)
+        .map(|coords| coords.into_f32().collect())
+        .unwrap_or_default();
+    if uvs.len() != vertices.len() {
+        uvs.clear();
+    }
+
+    let mut normals: Vec<[f32; 3]> = reader
+        .read_normals()
+        .map(|normals| normals.collect())
+        .unwrap_or_default();
+    if normals.len() != vertices.len() {
+        normals.clear();
+    }
+
+    let material_ref = primitive.material();
+    let pbr = material_ref.pbr_metallic_roughness();
+    let base_factor = pbr.base_color_factor();
+    let material = material_ref.index().map(|_| MeshMaterial {
+        base_color: [base_factor[0], base_factor[1], base_factor[2]],
+        metallic: pbr.metallic_factor(),
+        roughness: pbr.roughness_factor(),
+        alpha: base_factor[3],
+    });
+
+    let base_color = pbr
+        .base_color_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let metallic_roughness = pbr
+        .metallic_roughness_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let normal = material_ref
+        .normal_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let emissive = material_ref
+        .emissive_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+    let occlusion = material_ref
+        .occlusion_texture()
+        .map(|info| decode_texture_from_glb(info.texture(), blob))
+        .transpose()?;
+
+    let pbr_textures = match (base_color, metallic_roughness) {
+        (Some(base_color), Some(metallic_roughness)) => Some(MeshPbrTextures {
+            base_color,
+            metallic_roughness,
+            normal,
+            emissive,
+            occlusion,
+        }),
+        _ => None,
+    };
+
+    Ok(Mesh {
+        vertices,
+        faces,
+        uvs,
+        normals,
+        material,
+        pbr_textures,
+    })
+}
+
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
 fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
     if mesh.vertices.is_empty() {
@@ -137,7 +252,17 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
     let positions_byte_length = buffer.len() - positions_byte_offset;
 
     pad_buffer_4(&mut buffer);
-    let normals = compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55);
+    let normals = if mesh.normals.len() == mesh.vertices.len() && !mesh.normals.is_empty() {
+        let mut normals = mesh.normals.clone();
+        align_normals_with_faces(
+            mesh.vertices.as_slice(),
+            mesh.faces.as_slice(),
+            normals.as_mut_slice(),
+        );
+        normals
+    } else {
+        compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55)
+    };
     let normals_byte_offset = buffer.len();
     for normal in &normals {
         for component in normal {
@@ -225,6 +350,30 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
         occlusion_image_view,
         min,
         max,
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn decode_texture_from_glb(texture: gltf::Texture<'_>, blob: &[u8]) -> Result<MeshTexture, String> {
+    let source = texture.source().source();
+    let encoded = match source {
+        gltf::image::Source::View { view, .. } => {
+            let start = view.offset();
+            let end = start.saturating_add(view.length());
+            blob.get(start..end)
+                .ok_or_else(|| "GLB image buffer view was out of range".to_string())?
+        }
+        gltf::image::Source::Uri { .. } => {
+            return Err("GLB loader does not support URI texture sources".to_string());
+        }
+    };
+    let rgba = image::load_from_memory(encoded)
+        .map_err(|err| format!("failed to decode GLB texture: {err}"))?
+        .to_rgba8();
+    Ok(MeshTexture {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba8: rgba.into_raw(),
     })
 }
 
@@ -479,6 +628,7 @@ mod tests {
             vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.8, 0.0]],
             faces: vec![[0, 1, 2]],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
             material: Some(MeshMaterial {
                 base_color: [0.25, 0.5, 0.75],
                 metallic: 0.2,
@@ -527,6 +677,29 @@ mod tests {
             json["images"]
                 .as_array()
                 .is_some_and(|value| !value.is_empty())
+        );
+
+        let parsed = mesh_from_glb_bytes(bytes.as_slice()).expect("glb import");
+        assert_eq!(parsed.vertices, mesh.vertices);
+        assert_eq!(parsed.faces, mesh.faces);
+        assert_eq!(parsed.uvs, mesh.uvs);
+        assert_eq!(
+            parsed.material,
+            Some(MeshMaterial {
+                base_color: [1.0, 1.0, 1.0],
+                metallic: 1.0,
+                roughness: 1.0,
+                alpha: 1.0,
+            })
+        );
+        let parsed_pbr = parsed.pbr_textures.expect("pbr textures should import");
+        let mesh_pbr = mesh.pbr_textures.expect("sample pbr textures");
+        assert_eq!(parsed_pbr.base_color.width, mesh_pbr.base_color.width);
+        assert_eq!(parsed_pbr.base_color.height, mesh_pbr.base_color.height);
+        assert_eq!(parsed_pbr.base_color.rgba8, mesh_pbr.base_color.rgba8);
+        assert_eq!(
+            parsed_pbr.metallic_roughness.rgba8,
+            mesh_pbr.metallic_roughness.rgba8
         );
     }
 

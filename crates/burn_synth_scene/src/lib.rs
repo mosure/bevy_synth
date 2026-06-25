@@ -1226,8 +1226,8 @@ Include scene_calibration when a dominant table or seating arrangement is visibl
 For repeated reusable objects, set instance_count to the number of visible instances and fill instances with one bbox/contact/rotation_hint_degrees/facing_yaw_degrees/side/slot_index/target_footprint_m entry per observed object. Do not rely on a single group bbox being split later. Use side=left/right/near/far/head/foot relative to the dominant table in source-image perspective. \
 Set representative_instance_id to the clearest single reusable instance crop; never use a bbox that contains the table plus all chairs as the representative crop. \
 Normalized bboxes must be [x_min,y_min,x_max,y_max]. Contact points are normalized [x,y] pixels at the visible floor/object contact point, usually near the bottom center of that instance. For large furniture, the bbox should tightly contain only the object, not the whole room context. \
-Object prompts must preserve observed scale relationships and plan shape; do not describe a more curved, more symmetric, more wrapped, or more complete product than the source actually shows. \
-For the sofa specifically, describe the visible source object as a wide low tan open sectional with a mostly straight long run and a gentle rounded right-side bend; never ask for a complete C-shaped, horseshoe, U-shaped, circular, ring-like, or wraparound couch. allow_catalog_reuse={}.",
+Object prompts must preserve observed scale relationships and plan shape; do not describe a more symmetric, more closed, more conventional, or more complete product than the source actually shows. \
+For the Curry Up Now style sofa specifically, describe the visible source object as a large low tan crescent or semicircular banquette-like sectional with a continuous curved outer back, open center, tufted cushions, and source-cropped foreground extent. It is not a conventional straight L-sectional product sofa and not a closed circle/ring. allow_catalog_reuse={}.",
         scene_path.display(),
         reference_path.display(),
         allow_catalog_reuse
@@ -1249,7 +1249,7 @@ pub fn object_image_prompt(reference_path: &Path, object: &SceneObjectSpec) -> S
     let background = reconstruction_background_guidance(object);
     let geometry = object_geometry_guardrails(object);
     format!(
-        "{}\n{}\nReference style image: `{}`.\nObject id: {}.\nObject label: {}.\nSource crop bbox: [{:.4},{:.4},{:.4},{:.4}].\nCamera/orientation: {} {}\nSource-preserving edit requirement: use the source crop as the geometry anchor. Isolate and clean up the same observed object instead of inventing a new product render, new plan shape, or canonical showroom pose. Keep the object's visible perspective, footprint, proportions, curvature, and contact points consistent with the crop. Generate a clean isolated object image for 3D reconstruction. Preserve the source object geometry, material, color, scale proportions, and camera angle. Do not include the room, rug, table clutter, extra chairs, people, walls, text, shadows cast by the original scene, or background furniture. Do not replace the object with a proxy, cube, simplified block, alternate furniture type, or stylized approximation. Full object visible when possible, but do not hallucinate unobserved shape or wraparound structure to make it look complete. {}\n{}",
+        "{}\n{}\nReference style image: `{}`.\nObject id: {}.\nObject label: {}.\nSource crop bbox: [{:.4},{:.4},{:.4},{:.4}].\nCamera/orientation: {} {}\nSource-preserving edit requirement: use the source crop as the geometry anchor. Isolate and clean up the same observed object instead of inventing a new product render, new plan shape, or canonical showroom pose. Keep the object's visible perspective, footprint, proportions, curvature, and contact points consistent with the crop. Generate a clean isolated object image for 3D reconstruction. Preserve the source object geometry, material, color, scale proportions, and camera angle. If the observed object is cut off by the source image border, preserve that partial visible source shape instead of completing hidden ends into a new closed product. Do not include the room, rug, table clutter, extra chairs, people, walls, text, shadows cast by the original scene, or background furniture. Do not replace the object with a proxy, cube, simplified block, alternate furniture type, or stylized approximation. Full object visible when possible, but do not hallucinate unobserved shape or wraparound structure to make it look complete. {}\n{}",
         object.object_prompt,
         geometry,
         reference_path.display(),
@@ -1315,7 +1315,7 @@ fn object_geometry_guardrails(object: &SceneObjectSpec) -> &'static str {
         || descriptor.contains("couch")
         || descriptor.contains("sectional")
     {
-        "Geometry constraints: preserve the observed source sofa crop as a wide low tan open sectional, not a new product concept. It should read as a long mostly straight sofa run with a gentle rounded right-side bend and an open end, viewed from the source perspective. Do not generate a complete C-shaped, U-shaped, horseshoe, circular, ring-like, wraparound, or showroom conversation-pit sofa. Do not add an extra return segment to close the shape. Keep the silhouette wide and low, keep the visible straight run mostly straight, preserve the open end and source-facing perspective, keep seat thickness uniform, back panels vertical, and legs small/dark where visible."
+        "Geometry constraints: preserve the observed source sofa crop as a large low tan curved crescent or semicircular banquette-like sectional, not a new product concept. It should read as one continuous curved sofa with a broad arc, open center, tufted cushions, source-facing perspective, and source-cropped foreground extent. Do not convert it into a conventional straight L-sectional, a blocky modular showroom product, a closed circle/ring, or a fully symmetric horseshoe. Do not output a complete isolated product-render sectional when the source only shows a cropped partial sofa. If the sofa touches a source image edge, keep that visible source extent open/cropped instead of inventing hidden ends. Keep the silhouette wide and low, preserve the curved outer back and open inner void, keep seat thickness uniform, back panels vertical, and legs small/dark where visible."
     } else if descriptor.contains("chair") {
         "Geometry constraints: preserve one complete high-back segmented chair with stacked horizontal back cushions, padded seat, two metal loop arms, central pedestal, and five-star base. Do not generate multiple chairs in one image."
     } else if descriptor.contains("table") {
@@ -1512,11 +1512,27 @@ fn generated_shape_consistency_score(
         return 1.0;
     }
     let descriptor = object_descriptor(object);
-    let strict_ratio = if descriptor.contains("sofa")
+    let is_sofa = descriptor.contains("sofa")
         || descriptor.contains("couch")
-        || descriptor.contains("sectional")
-    {
-        Some(0.62)
+        || descriptor.contains("sectional");
+    let strict_ratio = if is_sofa {
+        if descriptor.contains("crescent")
+            || descriptor.contains("semicircular")
+            || descriptor.contains("semicircle")
+            || descriptor.contains("banquette")
+            || descriptor.contains("curved")
+        {
+            Some(0.48)
+        } else {
+            let bbox = normalize_bbox(object.bbox);
+            let touches_horizontal_edge = bbox[0] <= 0.02 || bbox[2] >= 0.98;
+            let spans_scene_width = (bbox[2] - bbox[0]) >= 0.85;
+            Some(if touches_horizontal_edge && spans_scene_width {
+                0.90
+            } else {
+                0.86
+            })
+        }
     } else if descriptor.contains("table") {
         Some(0.45)
     } else {
@@ -4004,8 +4020,8 @@ spawn debug_cube_chair uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0
     #[test]
     fn sofa_shape_score_rejects_source_aspect_drift() {
         let object = SceneObjectSpec {
-            id: "curved_sofa_001".to_string(),
-            label: "curved sofa".to_string(),
+            id: "straight_sofa_001".to_string(),
+            label: "straight sofa".to_string(),
             aliases: Vec::new(),
             bbox: [0.0, 0.155, 1.0, 1.0],
             instances: Vec::new(),
@@ -4028,7 +4044,59 @@ spawn debug_cube_chair uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0
     }
 
     #[test]
-    fn sofa_shape_score_keeps_wide_open_sectional_selectable() {
+    fn sofa_shape_score_rejects_curry_wraparound_candidate() {
+        let object = SceneObjectSpec {
+            id: "tan_open_sectional_sofa_01".to_string(),
+            label: "tan open sectional sofa".to_string(),
+            aliases: Vec::new(),
+            bbox: [0.0, 0.105, 1.0, 1.0],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: None,
+            instance_count: 1,
+            object_prompt: "wide low tan open sectional with gentle right bend".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: None,
+        };
+        let matte = ObjectImageMatteStats {
+            alpha_coverage: 0.3846,
+            alpha_bbox: Some([27, 254, 1005, 923]),
+        };
+
+        let score = generated_shape_consistency_score(&object, &matte, 1.78087);
+
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn crescent_sofa_shape_score_keeps_source_like_curved_candidate_selectable() {
+        let object = SceneObjectSpec {
+            id: "tan_open_crescent_sectional_sofa".to_string(),
+            label: "tan open crescent sectional sofa".to_string(),
+            aliases: vec!["semicircular banquette sofa".to_string()],
+            bbox: [0.0, 0.105, 1.0, 1.0],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: None,
+            instance_count: 1,
+            object_prompt: "large low tan crescent banquette sectional".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: None,
+        };
+        let matte = ObjectImageMatteStats {
+            alpha_coverage: 0.4368,
+            alpha_bbox: Some([37, 90, 997, 990]),
+        };
+
+        let score = generated_shape_consistency_score(&object, &matte, 1.78087);
+
+        assert!(score >= 0.48, "score {score}");
+    }
+
+    #[test]
+    fn sofa_shape_score_keeps_wide_source_aligned_sectional_selectable() {
         let object = SceneObjectSpec {
             id: "tan_open_sectional_sofa_001".to_string(),
             label: "tan open sectional sofa".to_string(),
@@ -4045,12 +4113,12 @@ spawn debug_cube_chair uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0
         };
         let matte = ObjectImageMatteStats {
             alpha_coverage: 0.29,
-            alpha_bbox: Some([16, 173, 1005, 863]),
+            alpha_bbox: Some([16, 270, 1005, 760]),
         };
 
         let score = generated_shape_consistency_score(&object, &matte, 1.779);
 
-        assert!(score >= 0.45, "score {score}");
+        assert!(score >= 0.82, "score {score}");
     }
 
     #[test]
@@ -4074,10 +4142,11 @@ spawn debug_cube_chair uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0
         assert!(prompt.contains("Source-preserving edit requirement"));
         assert!(prompt.contains("clean isolated"));
         assert!(prompt.contains("Do not include the room"));
+        assert!(prompt.contains("preserve that partial visible source shape"));
         assert!(prompt.contains("curved sofa"));
         assert!(prompt.contains("solid matte cobalt-blue background"));
-        assert!(prompt.contains("ring-like"));
-        assert!(prompt.contains("visible straight run mostly straight"));
+        assert!(prompt.contains("curved crescent"));
+        assert!(prompt.contains("conventional straight L-sectional"));
         assert!(prompt.contains("Target yaw/rotation hint: 35.0 degrees"));
     }
 

@@ -176,9 +176,9 @@ pub struct RuntimeConfig {
     pub trellis_noise_overrides_hook: Option<PathBuf>,
     /// Optional explicit sparse-coordinate cap for Trellis decode.
     pub trellis_max_sparse_coords: Option<usize>,
-    /// Optional native Trellis PBR texture size for Rust GLB export.
+    /// Optional TRELLIS PBR texture size for Rust o_voxel GLB export.
     pub trellis_pbr_texture_size: Option<usize>,
-    /// Whether Trellis should bake UVs/material textures in the native GLB path.
+    /// Whether Trellis should bake UVs/material textures in the Rust o_voxel export path.
     pub trellis_pbr_enabled: bool,
     /// Trellis high-level quality selection.
     pub trellis_quality: TrellisQuality,
@@ -1187,6 +1187,7 @@ impl SynthRuntime {
             InferenceBackend::Wgpu => TrellisDevice::Wgpu,
             InferenceBackend::Cuda => TrellisDevice::Cuda,
         };
+        let decode_output_mode = trellis_decode_output_mode(self.config.trellis_pbr_enabled);
         let options = TrellisRunOptions {
             quality: map_trellis_quality(self.config.trellis_quality),
             device: trellis_device,
@@ -1197,7 +1198,7 @@ impl SynthRuntime {
             max_sparse_coords: self.config.trellis_max_sparse_coords,
             target_faces: self.config.target_faces,
             pbr_texture_size: self.config.trellis_pbr_texture_size,
-            decode_output_mode: trellis_decode_output_mode(self.config.trellis_pbr_enabled),
+            decode_output_mode,
             runtime_stage_debug: false,
             runtime_attention_debug: false,
             runtime_decoder_conv_telemetry: false,
@@ -3186,6 +3187,7 @@ fn canonical_cube_mesh() -> Mesh {
         vertices,
         faces,
         uvs: Vec::new(),
+        normals: Vec::new(),
         material: None,
         pbr_textures: None,
     }
@@ -3249,6 +3251,10 @@ impl Drop for MaterializedImageInput {
 }
 
 fn unique_temp_png_path() -> PathBuf {
+    unique_temp_path("burn_synth_input", "png")
+}
+
+fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3257,7 +3263,7 @@ fn unique_temp_png_path() -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "burn_synth_input_{}_{}_{}.png",
+        "{prefix}_{}_{}_{}.{extension}",
         std::process::id(),
         nanos,
         counter
@@ -4706,7 +4712,7 @@ mod tests {
 
     #[cfg(feature = "trellis")]
     #[test]
-    fn trellis_pbr_off_uses_native_mesh_postprocess_not_hook_export() {
+    fn trellis_pbr_toggle_only_controls_ovoxel_material_bake() {
         assert_eq!(
             trellis_decode_output_mode(false),
             TrellisDecodeOutputMode::NativeMesh
@@ -4723,6 +4729,7 @@ mod tests {
             vertices: Vec::new(),
             faces: Vec::new(),
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };

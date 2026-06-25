@@ -36,6 +36,7 @@ pub struct Mesh {
     pub vertices: Vec<[f32; 3]>,
     pub faces: Vec<[u32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    pub normals: Vec<[f32; 3]>,
     pub material: Option<MeshMaterial>,
     pub pbr_textures: Option<MeshPbrTextures>,
 }
@@ -46,6 +47,7 @@ impl Mesh {
             vertices,
             faces,
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         }
@@ -60,6 +62,7 @@ impl Mesh {
             vertices,
             faces,
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: Some(material),
             pbr_textures: None,
         }
@@ -127,6 +130,10 @@ pub fn remap_mesh_to_python_glb_frame(mesh: &mut Mesh) {
     for vertex in mesh.vertices.iter_mut() {
         let [x, y, z] = *vertex;
         *vertex = [x, z, -y];
+    }
+    for normal in mesh.normals.iter_mut() {
+        let [x, y, z] = *normal;
+        *normal = [x, z, -y];
     }
 }
 
@@ -207,6 +214,7 @@ pub fn load_obj_mesh(path: &Path) -> Result<Mesh, String> {
         vertices,
         faces,
         uvs: Vec::new(),
+        normals: Vec::new(),
         material: None,
         pbr_textures: None,
     })
@@ -371,6 +379,37 @@ fn compute_position_welded_normals(
     normals
 }
 
+fn align_normals_with_faces(vertices: &[[f32; 3]], faces: &[[u32; 3]], normals: &mut [[f32; 3]]) {
+    if normals.len() != vertices.len() {
+        return;
+    }
+    let mut reference = vec![[0.0f32; 3]; vertices.len()];
+    for face in faces {
+        let i0 = face[0] as usize;
+        let i1 = face[1] as usize;
+        let i2 = face[2] as usize;
+        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+            continue;
+        }
+        let a = vertices[i0];
+        let b = vertices[i1];
+        let c = vertices[i2];
+        let face_normal = cross3(vec3_sub(b, a), vec3_sub(c, a));
+        for idx in [i0, i1, i2] {
+            reference[idx][0] += face_normal[0];
+            reference[idx][1] += face_normal[1];
+            reference[idx][2] += face_normal[2];
+        }
+    }
+    for (normal, expected) in normals.iter_mut().zip(reference.iter()) {
+        if dot3(*normal, *expected) < 0.0 {
+            normal[0] = -normal[0];
+            normal[1] = -normal[1];
+            normal[2] = -normal[2];
+        }
+    }
+}
+
 pub fn write_glb_mesh(path: &Path, mesh: &Mesh) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -407,7 +446,17 @@ fn build_mesh_binary_layout(mesh: &Mesh) -> Result<MeshBinaryLayout, String> {
     let positions_byte_length = buffer.len() - positions_byte_offset;
 
     pad_buffer_to_4_bytes(&mut buffer, 0);
-    let normals = compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55);
+    let normals = if mesh.normals.len() == mesh.vertices.len() && !mesh.normals.is_empty() {
+        let mut normals = mesh.normals.clone();
+        align_normals_with_faces(
+            mesh.vertices.as_slice(),
+            mesh.faces.as_slice(),
+            normals.as_mut_slice(),
+        );
+        normals
+    } else {
+        compute_position_welded_normals(&mesh.vertices, &mesh.faces, 1.0e-5, 0.55)
+    };
     let normals_byte_offset = buffer.len();
     for normal in &normals {
         for component in normal {
@@ -754,6 +803,7 @@ mod tests {
             vertices: vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]],
             faces: vec![[0, 1, 2]],
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };
@@ -771,8 +821,10 @@ mod tests {
     #[test]
     fn mesh_remap_to_python_glb_frame_swaps_yz_and_flips_y() {
         let mut mesh = Mesh::new(vec![[1.0, 2.0, 3.0], [-4.0, -5.0, 6.0]], vec![[0, 1, 0]]);
+        mesh.normals = vec![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         remap_mesh_to_python_glb_frame(&mut mesh);
         assert_eq!(mesh.vertices, vec![[1.0, 3.0, -2.0], [-4.0, 6.0, 5.0]]);
+        assert_eq!(mesh.normals, vec![[0.0, 0.0, -1.0], [0.0, 1.0, -0.0]]);
     }
 
     #[test]
@@ -800,6 +852,7 @@ mod tests {
             vertices: vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]],
             faces: vec![[0, 1, 2]],
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };
@@ -821,6 +874,7 @@ mod tests {
             vertices: vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]],
             faces: vec![[0, 1, 2]],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
             material: None,
             pbr_textures: Some(MeshPbrTextures {
                 base_color: MeshTexture {

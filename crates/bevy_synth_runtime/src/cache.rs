@@ -247,6 +247,8 @@ struct MeshPayload {
     #[serde(default)]
     uvs: Vec<[f32; 2]>,
     #[serde(default)]
+    normals: Vec<[f32; 3]>,
+    #[serde(default)]
     material: Option<MeshPayloadMaterial>,
     #[serde(default)]
     pbr_textures: Option<MeshPayloadPbrTextures>,
@@ -258,6 +260,7 @@ impl From<&SynthMesh> for MeshPayload {
             vertices: mesh.mesh.vertices.clone(),
             faces: mesh.mesh.faces.clone(),
             uvs: mesh.uvs.clone(),
+            normals: mesh.normals.clone(),
             material: mesh.material.map(Into::into),
             pbr_textures: mesh.pbr_textures.clone().map(Into::into),
         }
@@ -272,6 +275,7 @@ impl From<MeshPayload> for SynthMesh {
                 faces: payload.faces,
             },
             uvs: payload.uvs,
+            normals: payload.normals,
             material: payload.material.map(Into::into),
             pbr_textures: payload.pbr_textures.map(Into::into),
         }
@@ -1248,6 +1252,7 @@ mod tests {
                 faces: vec![[0, 1, 2]],
             },
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            normals: Vec::new(),
             material: Some(SynthMeshMaterial {
                 base_color: [0.5, 0.7, 0.9],
                 metallic: 0.15,

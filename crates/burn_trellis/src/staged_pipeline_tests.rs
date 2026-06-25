@@ -77,13 +77,18 @@ fn env_f32(name: &str) -> Option<f32> {
 #[test]
 fn decode_output_modes_keep_mesh_postprocess_separate_from_pbr() {
     assert!(TrellisDecodeOutputMode::NativePbr.needs_native_pbr());
+    assert!(TrellisDecodeOutputMode::NativePbr.needs_texture_attrs());
     assert!(TrellisDecodeOutputMode::NativePbr.needs_native_mesh_postprocess());
 
     assert!(!TrellisDecodeOutputMode::NativeMesh.needs_native_pbr());
+    assert!(!TrellisDecodeOutputMode::NativeMesh.needs_texture_attrs());
     assert!(TrellisDecodeOutputMode::NativeMesh.needs_native_mesh_postprocess());
+    assert!(!TrellisDecodeOutputMode::NativeMesh.uses_ovoxel_hook_export());
 
     assert!(!TrellisDecodeOutputMode::OvoxelHookExport.needs_native_pbr());
+    assert!(TrellisDecodeOutputMode::OvoxelHookExport.needs_texture_attrs());
     assert!(!TrellisDecodeOutputMode::OvoxelHookExport.needs_native_mesh_postprocess());
+    assert!(TrellisDecodeOutputMode::OvoxelHookExport.uses_ovoxel_hook_export());
 }
 
 #[cfg(feature = "runtime-model-wgpu")]
@@ -382,6 +387,41 @@ fn sample_voxel_attr_returns_value_when_supported() {
     let sampled = super::sample_voxel_attr(position, &voxel_map, [512, 512, 512])
         .expect("sampling with non-empty map should not error");
     assert!(sampled.is_some(), "expected local voxel support to resolve");
+}
+
+#[test]
+fn sample_voxel_attr_uses_flex_gemm_cell_center_convention() {
+    let mut voxel_map = std::collections::HashMap::new();
+    voxel_map.insert(super::pack_coord(8, 8, 8), [0.0, 0.1, 0.2, 0.3, 0.4, 1.0]);
+    voxel_map.insert(super::pack_coord(9, 8, 8), [1.0, 0.9, 0.8, 0.7, 0.6, 1.0]);
+
+    let at_cell_8_center = [
+        (8.5 / 16.0) - 0.5,
+        (8.5 / 16.0) - 0.5,
+        (8.5 / 16.0) - 0.5,
+    ];
+    let sampled = super::sample_voxel_attr(at_cell_8_center, &voxel_map, [16, 16, 16])
+        .expect("sampling with non-empty map should not error")
+        .expect("cell-center sample should resolve");
+    assert!(
+        (sampled[0] - 0.0).abs() <= 1.0e-6,
+        "query at coord+0.5 must sample the coord cell center, got {}",
+        sampled[0]
+    );
+
+    let halfway_between_8_and_9 = [
+        (9.0 / 16.0) - 0.5,
+        (8.5 / 16.0) - 0.5,
+        (8.5 / 16.0) - 0.5,
+    ];
+    let sampled = super::sample_voxel_attr(halfway_between_8_and_9, &voxel_map, [16, 16, 16])
+        .expect("sampling with non-empty map should not error")
+        .expect("supported midpoint sample should resolve");
+    assert!(
+        (sampled[0] - 0.5).abs() <= 1.0e-6,
+        "query halfway between cells should blend equally, got {}",
+        sampled[0]
+    );
 }
 
 #[test]
@@ -729,6 +769,7 @@ fn staged_runtime_fails_fast_when_conditioning_unavailable() {
         None,
         false,
         None,
+        true,
     );
     let err = runtime
         .run_profiled_with_overrides(
@@ -763,6 +804,7 @@ fn runtime_conditioning_preflight_accepts_explicit_overrides() {
         None,
         false,
         None,
+        true,
     );
     let overrides = super::TrellisNoiseOverrides {
         cond_512: Some(vec![0.25]),
@@ -893,10 +935,10 @@ fn pbr_bake_reused_projection_bvh_matches_owned_projection_bvh() {
 }
 
 #[test]
-fn pbr_debug_samples_are_first_hit_bounded() {
+fn pbr_debug_samples_track_bounded_overdraw() {
     let vertices = vec![[-0.03, 0.0, -0.03], [0.03, 0.0, -0.03], [0.0, 0.0, 0.03]];
-    // Duplicate the face to force overdraw. Debug hooks should still record one
-    // accepted sample per covered texel, not every raster candidate.
+    // Duplicate the face to force overdraw. Debug hooks should stay bounded to
+    // raster candidates and record that overdraw occurred.
     let faces = vec![[0, 1, 2], [0, 1, 2]];
     let vox_coords = vec![[0, 16, 16, 16], [0, 18, 16, 16], [0, 16, 18, 16]];
     let vox_attrs = vec![
@@ -913,16 +955,72 @@ fn pbr_debug_samples_are_first_hit_bounded() {
         .filter(|value| **value != 0)
         .count();
     assert!(covered > 0);
-    assert_eq!(debug.sample_positions.len(), covered);
-    assert_eq!(debug.sample_attrs.len(), covered);
-    assert!(debug.sample_positions.len() <= debug.texture_width * debug.texture_height);
+    assert!(debug.sample_positions.len() >= covered);
+    assert_eq!(debug.sample_attrs.len(), debug.sample_positions.len());
+    assert!(debug.sample_positions.len() <= debug.raster_candidate_texels);
     assert!(debug.raster_candidate_texels >= covered);
     assert!(debug.raster_conflict_texels > 0);
-    assert_eq!(debug.zero_support_samples, 0);
+    assert!(debug.zero_support_samples <= debug.raster_candidate_texels);
 }
 
 #[test]
-fn pbr_bake_inpaints_sparse_holes_instead_of_black_texels() {
+fn pbr_overdraw_uses_last_valid_sample_like_upstream_raster_chunks() {
+    let vertices = vec![
+        [-0.01, -0.10, -0.01],
+        [0.00, -0.10, 0.01],
+        [0.01, -0.10, -0.01],
+        [-0.01, 0.10, -0.01],
+        [0.00, 0.10, 0.01],
+        [0.01, 0.10, -0.01],
+    ];
+    let faces = vec![[0, 1, 2], [3, 4, 5]];
+    let mut vox_coords = Vec::new();
+    let mut vox_attrs = Vec::new();
+    for x in 15..=17 {
+        for z in 15..=17 {
+            for y in 12..=13 {
+                vox_coords.push([0, x, y, z]);
+                vox_attrs.push([0.02, 0.02, 0.02, 0.0, 0.8, 1.0]);
+            }
+            for y in 19..=20 {
+                vox_coords.push([0, x, y, z]);
+                vox_attrs.push([0.92, 0.86, 0.76, 0.0, 0.7, 1.0]);
+            }
+        }
+    }
+
+    let (_, textures, debug) = super::bake_pbr_from_voxels_with_options(
+        vertices.as_slice(),
+        faces.as_slice(),
+        None,
+        vox_coords.as_slice(),
+        vox_attrs.as_slice(),
+        32,
+        Some(3),
+        true,
+        false,
+    )
+    .expect("pbr bake should succeed");
+    let textures = textures.expect("pbr textures");
+    let debug = debug.expect("debug capture");
+
+    assert!(debug.raster_conflict_texels > 0, "{debug:?}");
+    let mut covered_luma = Vec::new();
+    for (idx, rgba) in textures.base_color.rgba8.chunks_exact(4).enumerate() {
+        if debug.raster_mask[idx] == 0 || rgba[3] == 0 {
+            continue;
+        }
+        covered_luma.push(0.2126 * rgba[0] as f32 + 0.7152 * rgba[1] as f32 + 0.0722 * rgba[2] as f32);
+    }
+    let mean_luma = covered_luma.iter().copied().sum::<f32>() / covered_luma.len().max(1) as f32;
+    assert!(
+        mean_luma > 180.0,
+        "later valid overdraw should win like upstream nvdiffrast chunks, covered_mean_luma={mean_luma}"
+    );
+}
+
+#[test]
+fn pbr_bake_preserves_zero_support_texels_like_upstream_grid_sample() {
     let vertices = vec![
         [-0.12, 0.0, -0.12],
         [-0.02, 0.0, -0.12],
@@ -967,7 +1065,24 @@ fn pbr_bake_inpaints_sparse_holes_instead_of_black_texels() {
         .count();
     assert!(covered > 0);
     assert!(covered < debug.texture_width * debug.texture_height);
-    let min_luma = textures
+    let zero_support_black_texels = debug
+        .raster_mask
+        .iter()
+        .enumerate()
+        .filter(|(idx, mask)| {
+            **mask != 0
+                && debug.alpha_float[*idx] == 0.0
+                && debug.base_color_float[*idx][0] == 0.0
+                && debug.base_color_float[*idx][1] == 0.0
+                && debug.base_color_float[*idx][2] == 0.0
+                && debug.roughness_float[*idx] == 0.0
+        })
+        .count();
+    assert!(
+        zero_support_black_texels > 0,
+        "valid raster texels without sparse support should stay covered zeros like upstream grid_sample_3d"
+    );
+    let min_supported_luma = textures
         .base_color
         .rgba8
         .chunks_exact(4)
@@ -977,8 +1092,8 @@ fn pbr_bake_inpaints_sparse_holes_instead_of_black_texels() {
         })
         .fold(f32::INFINITY, f32::min);
     assert!(
-        min_luma > 150.0,
-        "unsupported samples should be inpainted from valid light texels, min_luma={min_luma}"
+        min_supported_luma > 150.0,
+        "supported samples should remain light while zero-support texels stay alpha-zero, min_supported_luma={min_supported_luma}"
     );
 }
 
@@ -1259,6 +1374,40 @@ fn pbr_uv_domain_uses_chart_fallback_for_fragmented_tiny_components() {
     assert!(
         max_area < 3.0e-4,
         "fragmented tiny charts should use shared chart scale, max_uv_area={max_area}"
+    );
+}
+
+#[test]
+fn pbr_uv_domain_keeps_packable_fragmented_components_separate() {
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    for idx in 0..1100u32 {
+        let z = idx as f32 * 0.001;
+        let base = vertices.len() as u32;
+        vertices.push([0.0, 0.0, z]);
+        vertices.push([0.01, 0.0, z]);
+        vertices.push([0.0, 0.01, z]);
+        faces.push([base, base + 1, base + 2]);
+    }
+
+    let domain = super::build_uv_raster_domain(vertices.as_slice(), faces.as_slice(), 128);
+    let first_corner_bins = domain
+        .raster_faces
+        .iter()
+        .map(|face| {
+            let uv = domain.raster_uvs[face[0] as usize];
+            [
+                (uv[0] * 127.0).round() as i32,
+                (uv[1] * 127.0).round() as i32,
+            ]
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(domain.raster_faces.len(), faces.len());
+    assert!(
+        first_corner_bins.len() > 512,
+        "packable fragmented components should not collapse into a few overlapping chart bins: {} unique bins",
+        first_corner_bins.len()
     );
 }
 

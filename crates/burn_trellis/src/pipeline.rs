@@ -727,6 +727,7 @@ impl Trellis2Pipeline {
             self.config.image_large_root.as_deref(),
             prefer_wgpu,
             Some(sampler_overrides),
+            options.decode_output_mode.needs_texture_attrs(),
         ));
 
         if !stage_runtime_cache_disabled() {
