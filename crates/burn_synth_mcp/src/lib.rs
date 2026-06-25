@@ -1410,6 +1410,7 @@ impl McpServer {
         let mut response = json!({
             "tool": "scene_build_from_image",
             "preparation": preparation,
+            "provider_metadata": pipeline.provider_metadata(),
             "manifest": manifest,
             "object_image_requests": requests,
             "candidate_generation": candidate_report.clone(),
@@ -1958,13 +1959,9 @@ impl McpServer {
                 .get("passed")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let score = metrics
-                .get("score")
-                .and_then(Value::as_f64)
-                .filter(|value| value.is_finite())
-                .unwrap_or(f64::NEG_INFINITY);
-            if score > best_score {
-                best_score = score;
+            let selection_score = feedback_selection_score(&metrics);
+            if selection_score > best_score {
+                best_score = selection_score;
                 best_iteration = Some(iteration_index);
                 best_commands = commands.clone();
             }
@@ -1978,6 +1975,7 @@ impl McpServer {
                 "metrics": metrics,
                 "layout_delta": deltas,
                 "passed": passed,
+                "selection_score": selection_score,
             }));
             if passed {
                 accepted_iteration = Some(iteration_index);
@@ -2209,6 +2207,9 @@ fn spawn_feedback_viewer(control_path: &Path, log_path: &Path) -> Result<Child, 
     Command::new(&exe)
         .arg("--mcp-scene-control-path")
         .arg(control_path)
+        .arg("--ui-visible")
+        .arg("false")
+        .arg("--read-only")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err_log))
@@ -2256,6 +2257,8 @@ fn scene_feedback_metrics(
     let camera_yaw_degrees = status_camera_yaw_degrees(status, grounded_layout.camera.yaw);
     let feedback_camera = FeedbackCamera::from_status(status, screenshot_path);
     let floor_y = grounded_layout.rug_center[1];
+    let footprints = feedback_projected_footprints(&grounded_layout.placements, projected);
+    let physical = feedback_physical_layout(&grounded_layout.placements, &footprints, thresholds);
     for (index, placement) in grounded_layout.placements.iter().enumerate() {
         let projected_item = projected.get(index).unwrap_or(&Value::Null);
         let observed_bbox = projected_item.get("screen_bbox").and_then(json_array4);
@@ -2264,6 +2267,7 @@ fn scene_feedback_metrics(
         let expected_contact = placement.contact_pixel;
         let expected_anchor = feedback_expected_anchor_pixel(placement);
         let anchor_basis = feedback_anchor_basis(placement);
+        let uses_center_anchor = feedback_uses_bbox_center_anchor(placement);
         let (center_error, area_log2_error, aspect_log2_error, contact_error, score, passed) =
             if let Some(observed_bbox) = observed_bbox {
                 let expected_center = bbox_center(expected_bbox);
@@ -2277,18 +2281,29 @@ fn scene_feedback_metrics(
                 let observed_anchor =
                     feedback_observed_anchor_pixel(placement, observed_bbox, observed_contact);
                 let contact_error = distance2(expected_anchor, observed_anchor);
-                let center_score =
-                    (1.0 - center_error / thresholds.max_center_error.max(1.0e-5)).clamp(0.0, 1.0);
+                let center_limit = feedback_center_error_limit(
+                    uses_center_anchor,
+                    contact_error,
+                    thresholds.max_center_error,
+                    thresholds.max_contact_error,
+                );
+                let area_limit = feedback_area_log2_error_limit(
+                    uses_center_anchor,
+                    thresholds.max_area_log2_error,
+                );
+                let center_score = (1.0 - center_error / center_limit.max(1.0e-5)).clamp(0.0, 1.0);
                 let contact_score = (1.0
                     - contact_error / thresholds.max_contact_error.max(1.0e-5))
                 .clamp(0.0, 1.0);
-                let area_score = (1.0
-                    - area_log2_error / thresholds.max_area_log2_error.max(1.0e-5))
-                .clamp(0.0, 1.0);
-                let score = center_score * 0.45 + contact_score * 0.25 + area_score * 0.30;
-                let passed = center_error <= thresholds.max_center_error
+                let area_score = (1.0 - area_log2_error / area_limit.max(1.0e-5)).clamp(0.0, 1.0);
+                let score = if uses_center_anchor {
+                    center_score * 0.45 + contact_score * 0.25 + area_score * 0.30
+                } else {
+                    center_score * 0.20 + contact_score * 0.45 + area_score * 0.35
+                };
+                let passed = center_error <= center_limit
                     && contact_error <= thresholds.max_contact_error
-                    && area_log2_error <= thresholds.max_area_log2_error;
+                    && area_log2_error <= area_limit;
                 (
                     center_error,
                     area_log2_error,
@@ -2349,8 +2364,61 @@ fn scene_feedback_metrics(
             ];
             translation_delta = clamp_xz_delta(add3(translation_delta, residual), 0.85);
         }
+        let contact_residual_applied = grounding_basis == "camera-ray-ground-plane"
+            && !feedback_uses_bbox_center_anchor(placement)
+            && contact_error > 0.04;
+        if contact_residual_applied {
+            let residual = [
+                (center_delta[0] * 0.65).clamp(-0.14, 0.14),
+                0.0,
+                (-contact_delta[1] * 1.45).clamp(-0.26, 0.26),
+            ];
+            translation_delta = clamp_xz_delta(add3(translation_delta, residual), 0.95);
+        }
+        if feedback_physical_kind(placement) == FeedbackPhysicalKind::Table {
+            translation_delta = clamp_xz_delta(translation_delta, 0.15);
+        }
+        let physical_delta = physical
+            .corrections
+            .get(&index)
+            .copied()
+            .unwrap_or([0.0, 0.0, 0.0]);
+        if physical_delta[0].abs() + physical_delta[2].abs() > 1.0e-5 {
+            translation_delta = clamp_xz_delta(add3(translation_delta, physical_delta), 1.10);
+        }
+        let predictive_physical_delta = feedback_predictive_physical_delta(
+            index,
+            placement,
+            translation_delta,
+            &footprints,
+            thresholds,
+        );
+        if predictive_physical_delta[0].abs() + predictive_physical_delta[2].abs() > 1.0e-5 {
+            translation_delta =
+                clamp_xz_delta(add3(translation_delta, predictive_physical_delta), 1.10);
+        }
+        let footprint = footprints.get(index).and_then(|footprint| *footprint);
+        let world_footprint = footprint.map(|footprint| {
+            json!({
+                "min_x": footprint.rect.min_x,
+                "min_z": footprint.rect.min_z,
+                "max_x": footprint.rect.max_x,
+                "max_z": footprint.rect.max_z,
+            })
+        });
+        let projected_cache_key = projected_item.get("cache_key").and_then(Value::as_str);
+        let current_yaw_degrees = status_world_item_yaw_degrees(status, index, projected_cache_key)
+            .unwrap_or(placement.rotation_y_degrees);
         let yaw_correction =
-            feedback_yaw_correction(placement, expected_bbox, observed_bbox, camera_yaw_degrees);
+            feedback_yaw_correction(index, placement, current_yaw_degrees, &physical);
+        let canonical_yaw_error =
+            normalize_degrees(placement.rotation_y_degrees - current_yaw_degrees);
+        let physical_failures = physical
+            .object_failures
+            .get(&index)
+            .cloned()
+            .unwrap_or_default();
+        let physical_passed = physical_failures.is_empty();
         object_metrics.push(json!({
             "index": index,
             "object_id": placement.object_id,
@@ -2373,26 +2441,40 @@ fn scene_feedback_metrics(
             "translation_delta": translation_delta,
             "grounding_basis": grounding_basis,
             "center_residual_applied": center_residual_applied,
+            "contact_residual_applied": contact_residual_applied,
+            "physical_translation_delta": physical_delta,
+            "predictive_physical_translation_delta": predictive_physical_delta,
+            "physical_kind": feedback_physical_kind_str(feedback_physical_kind(placement)),
+            "world_footprint": world_footprint,
+            "physical_passed": physical_passed,
+            "physical_failures": physical_failures,
             "target_ground_point": target_ground_point,
             "observed_ground_point": observed_ground_point,
             "scale_multiplier": scale_multiplier,
             "yaw_delta_degrees": yaw_correction.delta_degrees,
             "yaw_basis": yaw_correction.basis,
-            "current_yaw_degrees": placement.rotation_y_degrees,
+            "current_yaw_degrees": current_yaw_degrees,
+            "canonical_yaw_degrees": placement.rotation_y_degrees,
+            "canonical_yaw_error_degrees": canonical_yaw_error,
             "camera_yaw_degrees": camera_yaw_degrees,
-            "target_yaw_degrees": normalize_degrees(placement.rotation_y_degrees + yaw_correction.delta_degrees),
+            "target_yaw_degrees": normalize_degrees(current_yaw_degrees + yaw_correction.delta_degrees),
         }));
     }
     let object_count = grounded_layout.placements.len().max(1);
     let mean_score = score_total / object_count as f32;
-    let passed = passed_count == grounded_layout.placements.len()
+    let projection_passed = passed_count == grounded_layout.placements.len()
         && mean_score >= thresholds.min_overall_score;
+    let physical_passed = physical.hard_failure_count == 0;
+    let passed = projection_passed && physical_passed;
     Ok(json!({
         "profile": profile,
         "passed": passed,
         "score": mean_score,
+        "projection_passed": projection_passed,
+        "physical_passed": physical_passed,
         "object_count": grounded_layout.placements.len(),
         "object_pass_count": passed_count,
+        "physical_pass_count": grounded_layout.placements.len().saturating_sub(physical.object_failure_count),
         "source_scene_path": manifest.source_scene_path,
         "screenshot_path": screenshot_path.display().to_string(),
         "thresholds": {
@@ -2400,10 +2482,46 @@ fn scene_feedback_metrics(
             "max_contact_error": thresholds.max_contact_error,
             "max_area_log2_error": thresholds.max_area_log2_error,
             "min_overall_score": thresholds.min_overall_score,
+            "max_seating_table_overlap_fraction": thresholds.max_seating_table_overlap_fraction,
+            "max_seating_table_penetration_m": thresholds.max_seating_table_penetration_m,
+            "max_seating_seating_overlap_fraction": thresholds.max_seating_seating_overlap_fraction,
+            "max_seating_seating_penetration_m": thresholds.max_seating_seating_penetration_m,
+        },
+        "physical_layout": {
+            "passed": physical_passed,
+            "hard_failure_count": physical.hard_failure_count,
+            "warning_count": physical.warning_count,
+            "object_failure_count": physical.object_failure_count,
+            "max_overlap_fraction_smaller": physical.max_overlap_fraction_smaller,
+            "min_signed_clearance_m": physical.min_signed_clearance_m,
+            "pairs": physical.pairs,
         },
         "objects": object_metrics,
         "camera": status.get("camera").cloned().unwrap_or(Value::Null),
     }))
+}
+
+fn feedback_center_error_limit(
+    uses_center_anchor: bool,
+    contact_error: f32,
+    max_center_error: f32,
+    max_contact_error: f32,
+) -> f32 {
+    if uses_center_anchor {
+        max_center_error
+    } else if contact_error <= max_contact_error {
+        max_center_error * 1.60
+    } else {
+        max_center_error * 1.25
+    }
+}
+
+fn feedback_area_log2_error_limit(uses_center_anchor: bool, max_area_log2_error: f32) -> f32 {
+    if uses_center_anchor {
+        max_area_log2_error
+    } else {
+        max_area_log2_error * 1.25
+    }
 }
 
 fn feedback_expected_anchor_pixel(placement: &GroundedScenePlacement) -> [f32; 2] {
@@ -2518,8 +2636,9 @@ fn feedback_layout_deltas(metrics: &Value) -> Value {
     } else {
         raw_camera_radius_multiplier
     };
-    json!({
-        "objects": objects.iter().map(|object| {
+    let mut object_deltas = objects
+        .iter()
+        .map(|object| {
             let group_key = feedback_scale_group_key(object);
             let grouped_scale = group_key
                 .as_ref()
@@ -2532,13 +2651,46 @@ fn feedback_layout_deltas(metrics: &Value) -> Value {
                 .unwrap_or(1.0)
                 .clamp(0.82, 1.22);
             let object_scale = damped_feedback_scale_multiplier(object, object_scale);
+            let axis_scale = feedback_axis_scale_multiplier(object);
+            FeedbackDeltaDraft {
+                index: object.get("index").cloned().unwrap_or(Value::Null),
+                translation_delta: object
+                    .get("translation_delta")
+                    .and_then(json_array3)
+                    .unwrap_or([0.0, 0.0, 0.0]),
+                scale_multiplier: if axis_scale.is_some() {
+                    1.0
+                } else {
+                    grouped_scale.unwrap_or(object_scale)
+                },
+                scale_multiplier_xyz: axis_scale,
+                scale_group_key: group_key,
+                scale_source: if grouped_scale.is_some() {
+                    "repeated_instance_group"
+                } else if axis_scale.is_some() {
+                    "axis_projection"
+                } else {
+                    "object_projection"
+                },
+                yaw_delta_degrees: object
+                    .get("yaw_delta_degrees")
+                    .cloned()
+                    .unwrap_or(json!(0.0)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let thresholds = feedback_thresholds_from_metrics(metrics);
+    feedback_project_delta_collisions(&objects, &mut object_deltas, thresholds);
+    json!({
+        "objects": object_deltas.into_iter().map(|delta| {
             json!({
-                "index": object.get("index").cloned().unwrap_or(Value::Null),
-                "translation_delta": object.get("translation_delta").cloned().unwrap_or(json!([0.0, 0.0, 0.0])),
-                "scale_multiplier": grouped_scale.unwrap_or(object_scale),
-                "scale_group_key": group_key,
-                "scale_source": if grouped_scale.is_some() { "repeated_instance_group" } else { "object_projection" },
-                "yaw_delta_degrees": object.get("yaw_delta_degrees").cloned().unwrap_or(json!(0.0)),
+                "index": delta.index,
+                "translation_delta": delta.translation_delta,
+                "scale_multiplier": delta.scale_multiplier,
+                "scale_multiplier_xyz": delta.scale_multiplier_xyz,
+                "scale_group_key": delta.scale_group_key,
+                "scale_source": delta.scale_source,
+                "yaw_delta_degrees": delta.yaw_delta_degrees,
             })
         }).collect::<Vec<_>>(),
         "camera": {
@@ -2547,7 +2699,253 @@ fn feedback_layout_deltas(metrics: &Value) -> Value {
     })
 }
 
+#[derive(Debug)]
+struct FeedbackDeltaDraft {
+    index: Value,
+    translation_delta: [f32; 3],
+    scale_multiplier: f64,
+    scale_multiplier_xyz: Option<[f64; 3]>,
+    scale_group_key: Option<String>,
+    scale_source: &'static str,
+    yaw_delta_degrees: Value,
+}
+
+fn feedback_axis_scale_multiplier(object: &Value) -> Option<[f64; 3]> {
+    if !feedback_json_object_is_table_like(object) {
+        return None;
+    }
+    let expected = object.get("expected_bbox").and_then(json_array4)?;
+    let observed = object.get("observed_bbox").and_then(json_array4)?;
+    let expected_width = (expected[2] - expected[0]).abs().max(1.0e-5) as f64;
+    let expected_height = (expected[3] - expected[1]).abs().max(1.0e-5) as f64;
+    let observed_width = (observed[2] - observed[0]).abs().max(1.0e-5) as f64;
+    let observed_height = (observed[3] - observed[1]).abs().max(1.0e-5) as f64;
+    let width_multiplier =
+        damped_axis_scale_ratio(expected_width / observed_width, 0.34, 0.84, 1.22);
+    let depth_multiplier =
+        damped_axis_scale_ratio(expected_height / observed_height, 0.22, 0.90, 1.12);
+    Some([width_multiplier, 1.0, depth_multiplier])
+}
+
+fn damped_axis_scale_ratio(ratio: f64, weight: f64, min_value: f64, max_value: f64) -> f64 {
+    let ratio = ratio.clamp(0.45, 2.40);
+    (1.0 + (ratio - 1.0) * weight).clamp(min_value, max_value)
+}
+
+fn feedback_thresholds_from_metrics(metrics: &Value) -> SceneFeedbackThresholds {
+    let defaults = FeedbackThresholdProfile::Standard.thresholds();
+    let Some(thresholds) = metrics.get("thresholds") else {
+        return defaults;
+    };
+    SceneFeedbackThresholds {
+        max_center_error: thresholds
+            .get("max_center_error")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_center_error),
+        max_contact_error: thresholds
+            .get("max_contact_error")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_contact_error),
+        max_area_log2_error: thresholds
+            .get("max_area_log2_error")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_area_log2_error),
+        min_overall_score: thresholds
+            .get("min_overall_score")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.min_overall_score),
+        max_seating_table_overlap_fraction: thresholds
+            .get("max_seating_table_overlap_fraction")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_seating_table_overlap_fraction),
+        max_seating_table_penetration_m: thresholds
+            .get("max_seating_table_penetration_m")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_seating_table_penetration_m),
+        max_seating_seating_overlap_fraction: thresholds
+            .get("max_seating_seating_overlap_fraction")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_seating_seating_overlap_fraction),
+        max_seating_seating_penetration_m: thresholds
+            .get("max_seating_seating_penetration_m")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(defaults.max_seating_seating_penetration_m),
+    }
+}
+
+fn feedback_project_delta_collisions(
+    objects: &[Value],
+    deltas: &mut [FeedbackDeltaDraft],
+    thresholds: SceneFeedbackThresholds,
+) {
+    let mut footprints = objects
+        .iter()
+        .enumerate()
+        .map(|(index, object)| {
+            let rect = object
+                .get("world_footprint")
+                .and_then(json_footprint_rect)?;
+            let kind = object
+                .get("physical_kind")
+                .and_then(Value::as_str)
+                .and_then(feedback_physical_kind_from_str)
+                .unwrap_or(FeedbackPhysicalKind::Other);
+            Some(FeedbackFootprint {
+                index,
+                kind,
+                rect: rect.translated(
+                    deltas
+                        .get(index)
+                        .map(|delta| delta.translation_delta)
+                        .unwrap_or([0.0, 0.0, 0.0]),
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for _ in 0..4 {
+        let mut changed = false;
+        for left_index in 0..footprints.len() {
+            let Some(left) = footprints[left_index] else {
+                continue;
+            };
+            for right_index in (left_index + 1)..footprints.len() {
+                let Some(right) = footprints[right_index] else {
+                    continue;
+                };
+                let overlap_area = left.rect.overlap_area(right.rect);
+                let signed_clearance_m = left.rect.signed_clearance(right.rect);
+                if overlap_area <= 1.0e-5 && signed_clearance_m >= 0.0 {
+                    continue;
+                }
+                let smaller_area = left.rect.area().min(right.rect.area()).max(1.0e-8);
+                let overlap_fraction_smaller = (overlap_area / smaller_area).clamp(0.0, 1.0);
+                match feedback_pair_relationship(left.kind, right.kind) {
+                    "seating_table" => {
+                        let (table, seating) = if left.kind == FeedbackPhysicalKind::Table {
+                            (left, right)
+                        } else {
+                            (right, left)
+                        };
+                        let seating_center_inside_table =
+                            table.rect.contains_point(seating.rect.center());
+                        if seating_center_inside_table
+                            || overlap_fraction_smaller
+                                > thresholds.max_seating_table_overlap_fraction
+                            || signed_clearance_m < -thresholds.max_seating_table_penetration_m
+                        {
+                            let source_bbox = objects
+                                .get(seating.index)
+                                .and_then(|object| object.get("expected_bbox"))
+                                .and_then(json_array4)
+                                .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                            let delta = seating_table_outward_delta(table, seating, source_bbox);
+                            if apply_projected_delta(
+                                deltas,
+                                &mut footprints,
+                                seating.index,
+                                delta,
+                                1.25,
+                            ) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    "seating_seating" => {
+                        if overlap_fraction_smaller
+                            > thresholds.max_seating_seating_overlap_fraction
+                            || signed_clearance_m < -thresholds.max_seating_seating_penetration_m
+                        {
+                            let [left_delta, right_delta] =
+                                seating_pair_separation_delta(left, right, signed_clearance_m);
+                            let left_changed = apply_projected_delta(
+                                deltas,
+                                &mut footprints,
+                                left.index,
+                                left_delta,
+                                1.25,
+                            );
+                            let right_changed = apply_projected_delta(
+                                deltas,
+                                &mut footprints,
+                                right.index,
+                                right_delta,
+                                1.25,
+                            );
+                            changed |= left_changed || right_changed;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn apply_projected_delta(
+    deltas: &mut [FeedbackDeltaDraft],
+    footprints: &mut [Option<FeedbackFootprint>],
+    index: usize,
+    correction: [f32; 3],
+    max_len: f32,
+) -> bool {
+    if correction[0].abs() + correction[2].abs() <= 1.0e-5 {
+        return false;
+    }
+    let Some(delta) = deltas.get_mut(index) else {
+        return false;
+    };
+    let next_delta = clamp_xz_delta(add3(delta.translation_delta, correction), max_len);
+    let applied = [
+        next_delta[0] - delta.translation_delta[0],
+        next_delta[1] - delta.translation_delta[1],
+        next_delta[2] - delta.translation_delta[2],
+    ];
+    if applied[0].abs() + applied[2].abs() <= 1.0e-5 {
+        return false;
+    }
+    delta.translation_delta = next_delta;
+    if let Some(Some(footprint)) = footprints.get_mut(index) {
+        footprint.rect = footprint.rect.translated(applied);
+    }
+    true
+}
+
+fn json_footprint_rect(value: &Value) -> Option<FootprintRect> {
+    let rect = FootprintRect {
+        min_x: value.get("min_x")?.as_f64()? as f32,
+        min_z: value.get("min_z")?.as_f64()? as f32,
+        max_x: value.get("max_x")?.as_f64()? as f32,
+        max_z: value.get("max_z")?.as_f64()? as f32,
+    };
+    if rect.min_x.is_finite()
+        && rect.min_z.is_finite()
+        && rect.max_x.is_finite()
+        && rect.max_z.is_finite()
+        && rect.width() > 1.0e-4
+        && rect.depth() > 1.0e-4
+    {
+        Some(rect)
+    } else {
+        None
+    }
+}
+
 fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -> f64 {
+    if feedback_json_object_is_table_like(object) {
+        return 1.0;
+    }
     let raw_scale = raw_scale.clamp(0.82, 1.22);
     if !object
         .get("grounding_basis")
@@ -2574,6 +2972,19 @@ fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -> f64 {
         0.25
     };
     (1.0 + (raw_scale - 1.0) * weight).clamp(0.88, 1.12)
+}
+
+fn feedback_json_object_is_table_like(object: &Value) -> bool {
+    let descriptor = format!(
+        "{} {}",
+        object
+            .get("object_id")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        object.get("label").and_then(Value::as_str).unwrap_or("")
+    )
+    .to_lowercase();
+    descriptor.contains("table") || descriptor.contains("desk") || descriptor.contains("counter")
 }
 
 fn feedback_scale_group_key(object: &Value) -> Option<String> {
@@ -2693,12 +3104,19 @@ fn apply_object_delta_to_command(command: &mut Value, delta: &Value) -> Result<(
         .get("scale_multiplier")
         .and_then(Value::as_f64)
         .unwrap_or(1.0) as f32;
+    let axis_multiplier = delta.get("scale_multiplier_xyz").and_then(json_array3);
     let mut scale = command
         .get("scale")
         .and_then(json_array3)
         .unwrap_or([1.0, 1.0, 1.0]);
-    for value in &mut scale {
-        *value = (*value * multiplier).clamp(0.05, 20.0);
+    if let Some(axis_multiplier) = axis_multiplier {
+        for (value, axis_multiplier) in scale.iter_mut().zip(axis_multiplier) {
+            *value = (*value * axis_multiplier).clamp(0.05, 20.0);
+        }
+    } else {
+        for value in &mut scale {
+            *value = (*value * multiplier).clamp(0.05, 20.0);
+        }
     }
     command["scale"] = json!(scale);
 
@@ -2868,16 +3286,114 @@ fn feedback_markdown_report(
             .and_then(|metrics| metrics.get("score"))
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        let selection_score = iteration
+            .get("selection_score")
+            .and_then(Value::as_f64)
+            .unwrap_or(score);
         let passed = iteration
             .get("passed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let physical = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("physical_layout"))
+            .unwrap_or(&Value::Null);
+        let physical_passed = physical
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let hard_failures = physical
+            .get("hard_failure_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_overlap = physical
+            .get("max_overlap_fraction_smaller")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let min_clearance = physical
+            .get("min_signed_clearance_m")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         out.push_str(&format!(
-            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\n\n![iteration {index}]({})\n\n",
+            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nphysical_passed: {physical_passed}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\n\n![iteration {index}]({})\n\n",
             path_relative_to(capture_root, Path::new(screenshot))
         ));
+        if let Some(pairs) = physical.get("pairs").and_then(Value::as_array) {
+            let failing_pairs = pairs
+                .iter()
+                .filter(|pair| {
+                    pair.get("hard_failure")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .take(6)
+                .collect::<Vec<_>>();
+            if !failing_pairs.is_empty() {
+                out.push_str(
+                    "| Pair | Relationship | Overlap Fraction | Clearance m | Reasons |\n",
+                );
+                out.push_str("| --- | --- | ---: | ---: | --- |\n");
+                for pair in failing_pairs {
+                    let left = pair
+                        .get("left_instance_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| pair.get("left_object_id").and_then(Value::as_str))
+                        .unwrap_or("left");
+                    let right = pair
+                        .get("right_instance_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| pair.get("right_object_id").and_then(Value::as_str))
+                        .unwrap_or("right");
+                    let relationship = pair
+                        .get("relationship")
+                        .and_then(Value::as_str)
+                        .unwrap_or("object_object");
+                    let fraction = pair
+                        .get("overlap_fraction_smaller")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let clearance = pair
+                        .get("signed_clearance_m")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let reasons = pair
+                        .get("failure_reasons")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "| {left} / {right} | {relationship} | {fraction:.4} | {clearance:.4} | {reasons} |\n"
+                    ));
+                }
+                out.push('\n');
+            }
+        }
     }
     out
+}
+
+fn feedback_selection_score(metrics: &Value) -> f64 {
+    let score = metrics
+        .get("score")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(f64::NEG_INFINITY);
+    let physical = metrics.get("physical_layout").unwrap_or(&Value::Null);
+    let hard_failures = physical
+        .get("hard_failure_count")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let max_overlap = physical
+        .get("max_overlap_fraction_smaller")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    score - hard_failures * 2.0 - max_overlap
 }
 
 fn path_relative_to(root: &Path, path: &Path) -> String {
@@ -2885,6 +3401,514 @@ fn path_relative_to(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FeedbackFootprint {
+    index: usize,
+    kind: FeedbackPhysicalKind,
+    rect: FootprintRect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedbackPhysicalKind {
+    Table,
+    Seating,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FootprintRect {
+    min_x: f32,
+    min_z: f32,
+    max_x: f32,
+    max_z: f32,
+}
+
+impl FootprintRect {
+    fn from_aabb(min: [f32; 3], max: [f32; 3]) -> Option<Self> {
+        let rect = Self {
+            min_x: min[0].min(max[0]),
+            min_z: min[2].min(max[2]),
+            max_x: min[0].max(max[0]),
+            max_z: min[2].max(max[2]),
+        };
+        if rect.min_x.is_finite()
+            && rect.min_z.is_finite()
+            && rect.max_x.is_finite()
+            && rect.max_z.is_finite()
+            && rect.width() > 1.0e-4
+            && rect.depth() > 1.0e-4
+        {
+            Some(rect)
+        } else {
+            None
+        }
+    }
+
+    fn width(self) -> f32 {
+        (self.max_x - self.min_x).max(0.0)
+    }
+
+    fn depth(self) -> f32 {
+        (self.max_z - self.min_z).max(0.0)
+    }
+
+    fn area(self) -> f32 {
+        (self.width() * self.depth()).max(1.0e-8)
+    }
+
+    fn center(self) -> [f32; 2] {
+        [
+            (self.min_x + self.max_x) * 0.5,
+            (self.min_z + self.max_z) * 0.5,
+        ]
+    }
+
+    fn half_width(self) -> f32 {
+        self.width() * 0.5
+    }
+
+    fn half_depth(self) -> f32 {
+        self.depth() * 0.5
+    }
+
+    fn contains_point(self, point: [f32; 2]) -> bool {
+        point[0] >= self.min_x
+            && point[0] <= self.max_x
+            && point[1] >= self.min_z
+            && point[1] <= self.max_z
+    }
+
+    fn overlap_extents(self, other: Self) -> [f32; 2] {
+        [
+            (self.max_x.min(other.max_x) - self.min_x.max(other.min_x)).max(0.0),
+            (self.max_z.min(other.max_z) - self.min_z.max(other.min_z)).max(0.0),
+        ]
+    }
+
+    fn overlap_area(self, other: Self) -> f32 {
+        let [x, z] = self.overlap_extents(other);
+        x * z
+    }
+
+    fn signed_clearance(self, other: Self) -> f32 {
+        let [overlap_x, overlap_z] = self.overlap_extents(other);
+        if overlap_x > 0.0 && overlap_z > 0.0 {
+            return -overlap_x.min(overlap_z);
+        }
+        let dx = if self.max_x < other.min_x {
+            other.min_x - self.max_x
+        } else if other.max_x < self.min_x {
+            self.min_x - other.max_x
+        } else {
+            0.0
+        };
+        let dz = if self.max_z < other.min_z {
+            other.min_z - self.max_z
+        } else if other.max_z < self.min_z {
+            self.min_z - other.max_z
+        } else {
+            0.0
+        };
+        (dx * dx + dz * dz).sqrt()
+    }
+
+    fn translated(self, delta: [f32; 3]) -> Self {
+        Self {
+            min_x: self.min_x + delta[0],
+            max_x: self.max_x + delta[0],
+            min_z: self.min_z + delta[2],
+            max_z: self.max_z + delta[2],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FeedbackPhysicalLayout {
+    pairs: Vec<Value>,
+    corrections: HashMap<usize, [f32; 3]>,
+    object_failures: HashMap<usize, Vec<String>>,
+    hard_failure_count: usize,
+    warning_count: usize,
+    object_failure_count: usize,
+    max_overlap_fraction_smaller: f32,
+    min_signed_clearance_m: f32,
+    table_center_xz: Option<[f32; 2]>,
+    footprint_centers: HashMap<usize, [f32; 2]>,
+}
+
+fn feedback_projected_footprints(
+    placements: &[GroundedScenePlacement],
+    projected: &[Value],
+) -> Vec<Option<FeedbackFootprint>> {
+    placements
+        .iter()
+        .enumerate()
+        .map(|(index, placement)| {
+            let aabb = projected.get(index)?.get("world_aabb")?;
+            let min = aabb.get("min").and_then(json_array3)?;
+            let max = aabb.get("max").and_then(json_array3)?;
+            Some(FeedbackFootprint {
+                index,
+                kind: feedback_physical_kind(placement),
+                rect: FootprintRect::from_aabb(min, max)?,
+            })
+        })
+        .collect()
+}
+
+fn feedback_physical_layout(
+    placements: &[GroundedScenePlacement],
+    footprints: &[Option<FeedbackFootprint>],
+    thresholds: SceneFeedbackThresholds,
+) -> FeedbackPhysicalLayout {
+    let mut pairs = Vec::new();
+    let mut corrections: HashMap<usize, [f32; 3]> = HashMap::new();
+    let mut object_failures: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut hard_failure_count = 0usize;
+    let mut warning_count = 0usize;
+    let mut max_overlap_fraction_smaller = 0.0f32;
+    let mut min_signed_clearance_m = f32::INFINITY;
+    let table_center_xz = footprints
+        .iter()
+        .flatten()
+        .find(|footprint| footprint.kind == FeedbackPhysicalKind::Table)
+        .map(|footprint| footprint.rect.center());
+    let footprint_centers = footprints
+        .iter()
+        .flatten()
+        .map(|footprint| (footprint.index, footprint.rect.center()))
+        .collect::<HashMap<_, _>>();
+
+    for left_index in 0..footprints.len() {
+        let Some(left) = footprints[left_index] else {
+            continue;
+        };
+        for right_index in (left_index + 1)..footprints.len() {
+            let Some(right) = footprints[right_index] else {
+                continue;
+            };
+            let overlap_area = left.rect.overlap_area(right.rect);
+            let signed_clearance_m = left.rect.signed_clearance(right.rect);
+            min_signed_clearance_m = min_signed_clearance_m.min(signed_clearance_m);
+            if overlap_area <= 1.0e-5 && signed_clearance_m >= 0.0 {
+                continue;
+            }
+            let smaller_area = left.rect.area().min(right.rect.area()).max(1.0e-8);
+            let overlap_fraction_smaller = (overlap_area / smaller_area).clamp(0.0, 1.0);
+            max_overlap_fraction_smaller =
+                max_overlap_fraction_smaller.max(overlap_fraction_smaller);
+            let relationship = feedback_pair_relationship(left.kind, right.kind);
+            let seating_table = relationship == "seating_table";
+            let seating_seating = relationship == "seating_seating";
+            let mut reasons = Vec::new();
+            if seating_table {
+                let (table, seating) = if left.kind == FeedbackPhysicalKind::Table {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let seating_center_inside_table = table.rect.contains_point(seating.rect.center());
+                if seating_center_inside_table {
+                    reasons.push("seating_center_inside_table");
+                }
+                if overlap_fraction_smaller > thresholds.max_seating_table_overlap_fraction {
+                    reasons.push("seating_table_overlap_fraction");
+                }
+                if signed_clearance_m < -thresholds.max_seating_table_penetration_m {
+                    reasons.push("seating_table_penetration");
+                }
+                if !reasons.is_empty() {
+                    let delta = seating_table_outward_delta(
+                        table,
+                        seating,
+                        placements[seating.index].source_bbox,
+                    );
+                    accumulate_feedback_delta(&mut corrections, seating.index, delta, 1.10);
+                }
+            } else if seating_seating {
+                if overlap_fraction_smaller > thresholds.max_seating_seating_overlap_fraction {
+                    reasons.push("seating_seating_overlap_fraction");
+                }
+                if signed_clearance_m < -thresholds.max_seating_seating_penetration_m {
+                    reasons.push("seating_seating_penetration");
+                }
+                if !reasons.is_empty() {
+                    let [left_delta, right_delta] =
+                        seating_pair_separation_delta(left, right, signed_clearance_m);
+                    accumulate_feedback_delta(&mut corrections, left.index, left_delta, 0.55);
+                    accumulate_feedback_delta(&mut corrections, right.index, right_delta, 0.55);
+                }
+            }
+
+            let hard_failure = !reasons.is_empty();
+            if hard_failure {
+                hard_failure_count += 1;
+                let left_message = feedback_physical_failure_message(
+                    relationship,
+                    &placements[right.index],
+                    overlap_fraction_smaller,
+                    signed_clearance_m,
+                    &reasons,
+                );
+                let right_message = feedback_physical_failure_message(
+                    relationship,
+                    &placements[left.index],
+                    overlap_fraction_smaller,
+                    signed_clearance_m,
+                    &reasons,
+                );
+                object_failures
+                    .entry(left.index)
+                    .or_default()
+                    .push(left_message);
+                object_failures
+                    .entry(right.index)
+                    .or_default()
+                    .push(right_message);
+            } else {
+                warning_count += 1;
+            }
+
+            pairs.push(json!({
+                "left_index": left.index,
+                "right_index": right.index,
+                "left_object_id": placements[left.index].object_id,
+                "right_object_id": placements[right.index].object_id,
+                "left_instance_id": placements[left.index].instance_id,
+                "right_instance_id": placements[right.index].instance_id,
+                "relationship": relationship,
+                "overlap_area": overlap_area,
+                "overlap_fraction_smaller": overlap_fraction_smaller,
+                "signed_clearance_m": signed_clearance_m,
+                "hard_failure": hard_failure,
+                "failure_reasons": reasons,
+            }));
+        }
+    }
+
+    FeedbackPhysicalLayout {
+        pairs,
+        corrections,
+        object_failure_count: object_failures.len(),
+        object_failures,
+        hard_failure_count,
+        warning_count,
+        max_overlap_fraction_smaller,
+        min_signed_clearance_m: if min_signed_clearance_m.is_finite() {
+            min_signed_clearance_m
+        } else {
+            0.0
+        },
+        table_center_xz,
+        footprint_centers,
+    }
+}
+
+fn feedback_predictive_physical_delta(
+    index: usize,
+    placement: &GroundedScenePlacement,
+    proposed_delta: [f32; 3],
+    footprints: &[Option<FeedbackFootprint>],
+    thresholds: SceneFeedbackThresholds,
+) -> [f32; 3] {
+    let Some(current) = footprints.get(index).and_then(|footprint| *footprint) else {
+        return [0.0, 0.0, 0.0];
+    };
+    if current.kind != FeedbackPhysicalKind::Seating {
+        return [0.0, 0.0, 0.0];
+    }
+    let predicted = FeedbackFootprint {
+        rect: current.rect.translated(proposed_delta),
+        ..current
+    };
+    let mut correction = [0.0, 0.0, 0.0];
+    for other in footprints.iter().flatten().copied() {
+        if other.index == index {
+            continue;
+        }
+        let overlap_area = predicted.rect.overlap_area(other.rect);
+        let signed_clearance_m = predicted.rect.signed_clearance(other.rect);
+        if overlap_area <= 1.0e-5 && signed_clearance_m >= 0.0 {
+            continue;
+        }
+        let smaller_area = predicted.rect.area().min(other.rect.area()).max(1.0e-8);
+        let overlap_fraction_smaller = (overlap_area / smaller_area).clamp(0.0, 1.0);
+        match feedback_pair_relationship(predicted.kind, other.kind) {
+            "seating_table" => {
+                let table = other;
+                let seating_center_inside_table =
+                    table.rect.contains_point(predicted.rect.center());
+                if seating_center_inside_table
+                    || overlap_fraction_smaller > thresholds.max_seating_table_overlap_fraction
+                    || signed_clearance_m < -thresholds.max_seating_table_penetration_m
+                {
+                    correction = add3(
+                        correction,
+                        seating_table_outward_delta(table, predicted, placement.source_bbox),
+                    );
+                }
+            }
+            "seating_seating" => {
+                if overlap_fraction_smaller > thresholds.max_seating_seating_overlap_fraction
+                    || signed_clearance_m < -thresholds.max_seating_seating_penetration_m
+                {
+                    let [self_delta, _other_delta] =
+                        seating_pair_separation_delta(predicted, other, signed_clearance_m);
+                    correction = add3(correction, self_delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    clamp_xz_delta(correction, 0.95)
+}
+
+fn feedback_physical_kind(placement: &GroundedScenePlacement) -> FeedbackPhysicalKind {
+    let descriptor = format!("{} {}", placement.object_id, placement.label).to_lowercase();
+    if descriptor.contains("table") || descriptor.contains("desk") || descriptor.contains("counter")
+    {
+        FeedbackPhysicalKind::Table
+    } else if descriptor.contains("chair")
+        || descriptor.contains("seat")
+        || descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("stool")
+    {
+        FeedbackPhysicalKind::Seating
+    } else {
+        FeedbackPhysicalKind::Other
+    }
+}
+
+fn feedback_physical_kind_str(kind: FeedbackPhysicalKind) -> &'static str {
+    match kind {
+        FeedbackPhysicalKind::Table => "table",
+        FeedbackPhysicalKind::Seating => "seating",
+        FeedbackPhysicalKind::Other => "other",
+    }
+}
+
+fn feedback_physical_kind_from_str(value: &str) -> Option<FeedbackPhysicalKind> {
+    match value {
+        "table" => Some(FeedbackPhysicalKind::Table),
+        "seating" => Some(FeedbackPhysicalKind::Seating),
+        "other" => Some(FeedbackPhysicalKind::Other),
+        _ => None,
+    }
+}
+
+fn feedback_pair_relationship(
+    left: FeedbackPhysicalKind,
+    right: FeedbackPhysicalKind,
+) -> &'static str {
+    match (left, right) {
+        (FeedbackPhysicalKind::Table, FeedbackPhysicalKind::Seating)
+        | (FeedbackPhysicalKind::Seating, FeedbackPhysicalKind::Table) => "seating_table",
+        (FeedbackPhysicalKind::Seating, FeedbackPhysicalKind::Seating) => "seating_seating",
+        (FeedbackPhysicalKind::Table, _) | (_, FeedbackPhysicalKind::Table) => "table_object",
+        _ => "object_object",
+    }
+}
+
+fn seating_table_outward_delta(
+    table: FeedbackFootprint,
+    seating: FeedbackFootprint,
+    source_bbox: [f32; 4],
+) -> [f32; 3] {
+    let table_center = table.rect.center();
+    let seating_center = seating.rect.center();
+    let norm_x = (seating_center[0] - table_center[0]) / table.rect.half_width().max(1.0e-5);
+    let norm_z = (seating_center[1] - table_center[1]) / table.rect.half_depth().max(1.0e-5);
+    let use_x_axis = if norm_x.abs() + norm_z.abs() <= 1.0e-4 {
+        true
+    } else {
+        norm_x.abs() >= norm_z.abs()
+    };
+    let clearance = 0.12;
+    if use_x_axis {
+        let sign = if norm_x.abs() <= 1.0e-4 {
+            if bbox_center(source_bbox)[0] < 0.5 {
+                -1.0
+            } else {
+                1.0
+            }
+        } else {
+            norm_x.signum()
+        };
+        let target = if sign >= 0.0 {
+            table.rect.max_x + seating.rect.half_width() + clearance
+        } else {
+            table.rect.min_x - seating.rect.half_width() - clearance
+        };
+        [(target - seating_center[0]).clamp(-0.90, 0.90), 0.0, 0.0]
+    } else {
+        let sign = if norm_z.abs() <= 1.0e-4 {
+            if bbox_center(source_bbox)[1] < 0.5 {
+                -1.0
+            } else {
+                1.0
+            }
+        } else {
+            norm_z.signum()
+        };
+        let target = if sign >= 0.0 {
+            table.rect.max_z + seating.rect.half_depth() + clearance
+        } else {
+            table.rect.min_z - seating.rect.half_depth() - clearance
+        };
+        [0.0, 0.0, (target - seating_center[1]).clamp(-0.90, 0.90)]
+    }
+}
+
+fn seating_pair_separation_delta(
+    left: FeedbackFootprint,
+    right: FeedbackFootprint,
+    signed_clearance_m: f32,
+) -> [[f32; 3]; 2] {
+    let left_center = left.rect.center();
+    let right_center = right.rect.center();
+    let dx = left_center[0] - right_center[0];
+    let dz = left_center[1] - right_center[1];
+    let len = (dx * dx + dz * dz).sqrt();
+    let direction = if len > 1.0e-5 {
+        [dx / len, dz / len]
+    } else if left.index <= right.index {
+        [-1.0, 0.0]
+    } else {
+        [1.0, 0.0]
+    };
+    let step = ((-signed_clearance_m).max(0.0) + 0.08).clamp(0.04, 0.32) * 0.5;
+    [
+        [direction[0] * step, 0.0, direction[1] * step],
+        [-direction[0] * step, 0.0, -direction[1] * step],
+    ]
+}
+
+fn accumulate_feedback_delta(
+    corrections: &mut HashMap<usize, [f32; 3]>,
+    index: usize,
+    delta: [f32; 3],
+    max_len: f32,
+) {
+    let current = corrections.entry(index).or_insert([0.0, 0.0, 0.0]);
+    *current = clamp_xz_delta(add3(*current, delta), max_len);
+}
+
+fn feedback_physical_failure_message(
+    relationship: &str,
+    other: &GroundedScenePlacement,
+    overlap_fraction_smaller: f32,
+    signed_clearance_m: f32,
+    reasons: &[&'static str],
+) -> String {
+    format!(
+        "{relationship} overlap with {} / {:?}: fraction={overlap_fraction_smaller:.3}, clearance_m={signed_clearance_m:.3}, reasons={}",
+        other.object_id,
+        other.instance_id,
+        reasons.join("|")
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3084,87 +4108,83 @@ fn status_camera_yaw_degrees(status: &Value, fallback_degrees: Option<f32>) -> f
     normalize_degrees(degrees)
 }
 
+fn status_world_item_yaw_degrees(
+    status: &Value,
+    index: usize,
+    cache_key: Option<&str>,
+) -> Option<f32> {
+    let world_items = status.get("world_items").and_then(Value::as_array)?;
+    if let Some(item) = world_items.get(index)
+        && cache_key_matches(item, cache_key)
+        && let Some(yaw) = world_item_yaw_degrees(item)
+    {
+        return Some(yaw);
+    }
+    let cache_key = cache_key?;
+    world_items
+        .iter()
+        .find(|item| cache_key_matches(item, Some(cache_key)))
+        .and_then(world_item_yaw_degrees)
+}
+
+fn cache_key_matches(item: &Value, cache_key: Option<&str>) -> bool {
+    let Some(cache_key) = cache_key else {
+        return true;
+    };
+    item.get("cache_key")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == cache_key)
+}
+
+fn world_item_yaw_degrees(item: &Value) -> Option<f32> {
+    item.get("rotation")
+        .and_then(json_array4)
+        .map(quat_y_degrees)
+}
+
 fn feedback_yaw_correction(
+    placement_index: usize,
     placement: &GroundedScenePlacement,
-    expected_bbox: [f32; 4],
-    observed_bbox: [f32; 4],
-    camera_yaw_degrees: f32,
+    current_yaw_degrees: f32,
+    physical: &FeedbackPhysicalLayout,
 ) -> FeedbackYawCorrection {
-    let signed_aspect_error =
-        safe_log2_ratio(bbox_aspect(expected_bbox), bbox_aspect(observed_bbox));
-    let aspect_error = signed_aspect_error.abs();
-    if aspect_error < 0.10 {
+    if feedback_physical_kind(placement) == FeedbackPhysicalKind::Seating
+        && let (Some(table_center), Some(object_center)) = (
+            physical.table_center_xz,
+            physical.footprint_centers.get(&placement_index),
+        )
+        && let Some(target_yaw) = yaw_toward_xz(*object_center, table_center)
+    {
+        let semantic_error = normalize_degrees(target_yaw - current_yaw_degrees);
+        if semantic_error.abs() > 6.0 {
+            let step_degrees = (semantic_error.abs() * 0.65).clamp(4.0, 20.0);
+            return FeedbackYawCorrection {
+                delta_degrees: semantic_error.clamp(-step_degrees, step_degrees),
+                basis: "table-facing-yaw",
+            };
+        }
+    }
+    let canonical_error = normalize_degrees(placement.rotation_y_degrees - current_yaw_degrees);
+    if canonical_error.abs() > 2.0 {
+        let step_degrees = (canonical_error.abs() * 0.70).clamp(3.0, 24.0);
         return FeedbackYawCorrection {
-            delta_degrees: 0.0,
-            basis: "aspect-within-threshold",
+            delta_degrees: canonical_error.clamp(-step_degrees, step_degrees),
+            basis: "canonical-bsn-yaw",
         };
     }
-
-    let footprint_width = (placement.local_aabb.max[0] - placement.local_aabb.min[0]).abs()
-        * placement.scale[0].abs();
-    let footprint_depth = (placement.local_aabb.max[2] - placement.local_aabb.min[2]).abs()
-        * placement.scale[2].abs();
-    let current_relative_yaw = normalize_degrees(placement.rotation_y_degrees - camera_yaw_degrees);
-    let step_degrees = (aspect_error * 20.0).clamp(3.0, 18.0);
-    let wants_wider = signed_aspect_error > 0.0;
-
-    let current_width =
-        apparent_width_for_yaw(footprint_width, footprint_depth, current_relative_yaw);
-    let plus_width = apparent_width_for_yaw(
-        footprint_width,
-        footprint_depth,
-        current_relative_yaw + step_degrees,
-    );
-    let minus_width = apparent_width_for_yaw(
-        footprint_width,
-        footprint_depth,
-        current_relative_yaw - step_degrees,
-    );
-    let plus_gain = if wants_wider {
-        plus_width - current_width
-    } else {
-        current_width - plus_width
-    };
-    let minus_gain = if wants_wider {
-        minus_width - current_width
-    } else {
-        current_width - minus_width
-    };
-    let delta_degrees = if plus_gain > minus_gain + 1.0e-4 && plus_gain > 1.0e-4 {
-        step_degrees
-    } else if minus_gain > plus_gain + 1.0e-4 && minus_gain > 1.0e-4 {
-        -step_degrees
-    } else if aspect_error >= 0.22 {
-        let source_side_sign = if bbox_center(expected_bbox)[0] <= 0.5 {
-            1.0
-        } else {
-            -1.0
-        };
-        source_side_sign * step_degrees.min(10.0) * if wants_wider { 1.0 } else { -1.0 }
-    } else {
-        0.0
-    };
-    let basis = if delta_degrees.abs() <= 1.0e-4 {
-        "apparent-width-flat"
-    } else if (plus_gain - minus_gain).abs() <= 1.0e-4 {
-        "source-side-aspect-fallback"
-    } else {
-        "apparent-width-gradient"
-    };
-
     FeedbackYawCorrection {
-        delta_degrees: delta_degrees.clamp(-18.0, 18.0),
-        basis,
+        delta_degrees: 0.0,
+        basis: "canonical-bsn-yaw-within-threshold",
     }
 }
 
-fn apparent_width_for_yaw(
-    footprint_width: f32,
-    footprint_depth: f32,
-    relative_yaw_degrees: f32,
-) -> f32 {
-    let yaw = relative_yaw_degrees.to_radians();
-    footprint_width.max(1.0e-5) * yaw.cos().abs() + footprint_depth.max(1.0e-5) * yaw.sin().abs()
+fn yaw_toward_xz(from: [f32; 2], target: [f32; 2]) -> Option<f32> {
+    let dx = target[0] - from[0];
+    let dz = target[1] - from[1];
+    if !dx.is_finite() || !dz.is_finite() || dx.abs() + dz.abs() <= 1.0e-5 {
+        return None;
+    }
+    Some(normalize_degrees(dx.atan2(dz).to_degrees()))
 }
 
 fn quat_y_degrees(quat: [f32; 4]) -> f32 {
@@ -3822,6 +4842,7 @@ fn write_scene_build_artifacts(output_dir: &Path, response: &Value) -> Result<()
         ("preparation", "preparation.json"),
         ("manifest", "manifest.json"),
         ("object_image_requests", "object_image_requests.json"),
+        ("provider_metadata", "provider_metadata.json"),
         ("candidate_generation", "candidate_generation.json"),
         ("candidates", "candidates.json"),
         ("selected_candidates", "selected_candidates.json"),
@@ -4749,6 +5770,10 @@ struct SceneFeedbackThresholds {
     max_contact_error: f32,
     max_area_log2_error: f32,
     min_overall_score: f32,
+    max_seating_table_overlap_fraction: f32,
+    max_seating_table_penetration_m: f32,
+    max_seating_seating_overlap_fraction: f32,
+    max_seating_seating_penetration_m: f32,
 }
 
 impl FeedbackThresholdProfile {
@@ -4759,18 +5784,30 @@ impl FeedbackThresholdProfile {
                 max_contact_error: 0.22,
                 max_area_log2_error: 1.20,
                 min_overall_score: 0.55,
+                max_seating_table_overlap_fraction: 0.45,
+                max_seating_table_penetration_m: 0.30,
+                max_seating_seating_overlap_fraction: 0.16,
+                max_seating_seating_penetration_m: 0.08,
             },
             Self::Standard => SceneFeedbackThresholds {
                 max_center_error: 0.10,
                 max_contact_error: 0.14,
                 max_area_log2_error: 0.65,
                 min_overall_score: 0.65,
+                max_seating_table_overlap_fraction: 0.35,
+                max_seating_table_penetration_m: 0.25,
+                max_seating_seating_overlap_fraction: 0.10,
+                max_seating_seating_penetration_m: 0.05,
             },
             Self::Strict => SceneFeedbackThresholds {
                 max_center_error: 0.06,
                 max_contact_error: 0.09,
                 max_area_log2_error: 0.35,
                 min_overall_score: 0.82,
+                max_seating_table_overlap_fraction: 0.25,
+                max_seating_table_penetration_m: 0.18,
+                max_seating_seating_overlap_fraction: 0.06,
+                max_seating_seating_penetration_m: 0.03,
             },
         }
     }
@@ -4967,6 +6004,51 @@ impl From<TrellisQuality> for burn_synth::TrellisQuality {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_physical_layout() -> FeedbackPhysicalLayout {
+        FeedbackPhysicalLayout {
+            pairs: Vec::new(),
+            corrections: HashMap::new(),
+            object_failures: HashMap::new(),
+            hard_failure_count: 0,
+            warning_count: 0,
+            object_failure_count: 0,
+            max_overlap_fraction_smaller: 0.0,
+            min_signed_clearance_m: 0.0,
+            table_center_xz: None,
+            footprint_centers: HashMap::new(),
+        }
+    }
+
+    fn test_feedback_placement(
+        object_id: &str,
+        label: &str,
+        translation: [f32; 3],
+        source_bbox: [f32; 4],
+    ) -> GroundedScenePlacement {
+        GroundedScenePlacement {
+            entity_id: object_id.to_string(),
+            asset_id: object_id.to_string(),
+            object_id: object_id.to_string(),
+            instance_id: None,
+            label: label.to_string(),
+            source_bbox,
+            contact_pixel: bbox_bottom_center_for_test(source_bbox),
+            ground_point: translation,
+            translation,
+            rotation_y_degrees: 0.0,
+            scale: [1.0, 1.0, 1.0],
+            local_aabb: SceneAssetAabb {
+                min: [-0.5, 0.0, -0.5],
+                max: [0.5, 1.0, 0.5],
+            },
+            target_footprint_m: [1.0, 1.0],
+        }
+    }
+
+    fn bbox_bottom_center_for_test(bbox: [f32; 4]) -> [f32; 2] {
+        [(bbox[0] + bbox[2]) * 0.5, bbox[3]]
+    }
     use burn_synth_scene::SceneCamera;
     use clap::Parser;
 
@@ -5567,6 +6649,56 @@ mod tests {
     }
 
     #[test]
+    fn feedback_deltas_apply_axis_scale_for_table_projection() {
+        let commands = vec![json!({
+            "type": "spawn_cached",
+            "cache_key": "table",
+            "translation": [0.0, 0.0, 0.0],
+            "scale": [2.0, 0.5, 4.0],
+        })];
+        let deltas = json!({
+            "objects": [{
+                "translation_delta": [0.0, 0.0, 0.0],
+                "scale_multiplier": 1.0,
+                "scale_multiplier_xyz": [1.2, 1.0, 0.9]
+            }]
+        });
+
+        let adjusted = apply_feedback_deltas_to_commands(&commands, &deltas).unwrap();
+
+        let scale = json_array3(&adjusted[0]["scale"]).unwrap();
+        assert!((scale[0] - 2.4).abs() <= 1.0e-5);
+        assert!((scale[1] - 0.5).abs() <= 1.0e-5);
+        assert!((scale[2] - 3.6).abs() <= 1.0e-5);
+    }
+
+    #[test]
+    fn feedback_deltas_emit_axis_scale_for_skinny_table_projection() {
+        let metrics = json!({
+            "objects": [{
+                "index": 0,
+                "object_id": "conference_table",
+                "label": "white rectangular conference table",
+                "cache_key": "table-cache",
+                "expected_bbox": [0.30, 0.48, 0.65, 0.96],
+                "observed_bbox": [0.40, 0.44, 0.58, 0.95],
+                "translation_delta": [0.0, 0.0, 0.0],
+                "scale_multiplier": 1.22,
+                "yaw_delta_degrees": 0.0
+            }]
+        });
+
+        let deltas = feedback_layout_deltas(&metrics);
+        let object = &deltas["objects"][0];
+        let axis_scale = json_array3(&object["scale_multiplier_xyz"]).unwrap();
+
+        assert_eq!(object["scale_source"], json!("axis_projection"));
+        assert!(axis_scale[0] > 1.1);
+        assert!((axis_scale[1] - 1.0).abs() <= 1.0e-6);
+        assert!(axis_scale[2] < 1.02);
+    }
+
+    #[test]
     fn feedback_deltas_normalize_existing_reused_command_scales() {
         let commands = vec![
             json!({
@@ -5648,10 +6780,246 @@ mod tests {
 
         assert!((chair_scale_a - 1.02).abs() <= 1.0e-6);
         assert!((chair_scale_b - 1.02).abs() <= 1.0e-6);
-        assert!((table_scale - 0.95).abs() <= 1.0e-6);
+        assert!((table_scale - 1.0).abs() <= 1.0e-6);
         assert_eq!(objects[0]["scale_group_key"], json!("chair-cache"));
         assert_eq!(objects[1]["scale_source"], json!("repeated_instance_group"));
-        assert_eq!(objects[2]["scale_source"], json!("object_projection"));
+        assert_eq!(objects[2]["scale_source"], json!("axis_projection"));
+    }
+
+    #[test]
+    fn feedback_deltas_project_simultaneous_chair_moves_out_of_overlap() {
+        let left_rect = FootprintRect {
+            min_x: -1.0,
+            min_z: -0.2,
+            max_x: -0.6,
+            max_z: 0.2,
+        };
+        let right_rect = FootprintRect {
+            min_x: 0.6,
+            min_z: -0.2,
+            max_x: 1.0,
+            max_z: 0.2,
+        };
+        let metrics = json!({
+            "thresholds": {
+                "max_seating_seating_overlap_fraction": 0.10,
+                "max_seating_seating_penetration_m": 0.05
+            },
+            "objects": [
+                {
+                    "index": 0,
+                    "object_id": "chair_left",
+                    "cache_key": "chair-cache",
+                    "expected_bbox": [0.2, 0.6, 0.35, 0.95],
+                    "observed_bbox": [0.2, 0.6, 0.35, 0.95],
+                    "translation_delta": [0.8, 0.0, 0.0],
+                    "scale_multiplier": 1.0,
+                    "yaw_delta_degrees": 0.0,
+                    "physical_kind": "seating",
+                    "world_footprint": {
+                        "min_x": left_rect.min_x,
+                        "min_z": left_rect.min_z,
+                        "max_x": left_rect.max_x,
+                        "max_z": left_rect.max_z
+                    }
+                },
+                {
+                    "index": 1,
+                    "object_id": "chair_right",
+                    "cache_key": "chair-cache",
+                    "expected_bbox": [0.65, 0.6, 0.8, 0.95],
+                    "observed_bbox": [0.65, 0.6, 0.8, 0.95],
+                    "translation_delta": [-0.8, 0.0, 0.0],
+                    "scale_multiplier": 1.0,
+                    "yaw_delta_degrees": 0.0,
+                    "physical_kind": "seating",
+                    "world_footprint": {
+                        "min_x": right_rect.min_x,
+                        "min_z": right_rect.min_z,
+                        "max_x": right_rect.max_x,
+                        "max_z": right_rect.max_z
+                    }
+                }
+            ]
+        });
+
+        let deltas = feedback_layout_deltas(&metrics);
+        let objects = deltas["objects"].as_array().unwrap();
+        let left_delta = json_array3(&objects[0]["translation_delta"]).unwrap();
+        let right_delta = json_array3(&objects[1]["translation_delta"]).unwrap();
+        let projected_left = left_rect.translated(left_delta);
+        let projected_right = right_rect.translated(right_delta);
+
+        assert!(left_delta[0] < 0.8);
+        assert!(right_delta[0] > -0.8);
+        assert!(
+            projected_left.signed_clearance(projected_right)
+                >= -FeedbackThresholdProfile::Standard
+                    .thresholds()
+                    .max_seating_seating_penetration_m
+                    - 1.0e-4
+        );
+    }
+
+    #[test]
+    fn feedback_metrics_fail_chair_contained_inside_table_footprint() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: Vec::new(),
+        };
+        let table = test_feedback_placement(
+            "conference_table",
+            "conference table",
+            [0.0, 0.0, 0.0],
+            [0.30, 0.40, 0.70, 0.70],
+        );
+        let chair = test_feedback_placement(
+            "conference_chair",
+            "conference chair",
+            [0.0, 0.0, 0.0],
+            [0.45, 0.55, 0.55, 0.85],
+        );
+        let layout = GroundedSceneLayout {
+            bsn: "scene {}".to_string(),
+            placements: vec![table, chair],
+            camera: SceneCamera {
+                translation: [0.0, 2.0, 5.0],
+                focus: [0.0, 0.0, 0.0],
+                yaw: Some(180.0),
+                pitch: Some(25.0),
+                radius: Some(5.0),
+                vertical_fov_degrees: Some(72.0),
+            },
+            rug_center: [0.0, 0.0, 0.0],
+            rug_scale: [1.0, 1.0, 1.0],
+        };
+        let status = json!({
+            "projected_items": [
+                {
+                    "cache_key": "table",
+                    "screen_bbox": [0.30, 0.40, 0.70, 0.70],
+                    "screen_contact": [0.50, 0.55],
+                    "world_aabb": {
+                        "min": [-1.5, 0.0, -0.6],
+                        "max": [1.5, 0.4, 0.6]
+                    }
+                },
+                {
+                    "cache_key": "chair",
+                    "screen_bbox": [0.45, 0.55, 0.55, 0.85],
+                    "screen_contact": [0.50, 0.85],
+                    "world_aabb": {
+                        "min": [-0.25, 0.0, -0.25],
+                        "max": [0.25, 1.0, 0.25]
+                    }
+                }
+            ],
+            "camera": { "radius": 5.0 }
+        });
+
+        let metrics = scene_feedback_metrics(
+            &manifest,
+            &layout,
+            &status,
+            Path::new("/tmp/iter.png"),
+            FeedbackThresholdProfile::Standard.thresholds(),
+            FeedbackThresholdProfile::Standard,
+        )
+        .unwrap();
+
+        assert!(!metrics["passed"].as_bool().unwrap());
+        assert_eq!(metrics["projection_passed"], json!(true));
+        assert_eq!(metrics["physical_passed"], json!(false));
+        assert_eq!(metrics["physical_layout"]["hard_failure_count"], json!(1));
+        assert_eq!(
+            metrics["physical_layout"]["pairs"][0]["failure_reasons"][0],
+            json!("seating_center_inside_table")
+        );
+        assert_eq!(metrics["objects"][1]["physical_passed"], json!(false));
+        let deltas = feedback_layout_deltas(&metrics);
+        let translation_delta = json_array3(&deltas["objects"][1]["translation_delta"]).unwrap();
+        assert!(translation_delta[0].abs() + translation_delta[2].abs() > 0.1);
+    }
+
+    #[test]
+    fn feedback_selection_score_penalizes_hard_overlap_failures() {
+        let clean = json!({
+            "score": 0.60,
+            "physical_layout": {
+                "hard_failure_count": 0,
+                "max_overlap_fraction_smaller": 0.0
+            }
+        });
+        let overlapped = json!({
+            "score": 0.95,
+            "physical_layout": {
+                "hard_failure_count": 1,
+                "max_overlap_fraction_smaller": 1.0
+            }
+        });
+
+        assert!(feedback_selection_score(&clean) > feedback_selection_score(&overlapped));
+    }
+
+    #[test]
+    fn feedback_predictive_delta_prevents_move_into_table() {
+        let placement = test_feedback_placement(
+            "conference_chair",
+            "conference chair",
+            [0.0, 0.0, -1.0],
+            [0.45, 0.7, 0.55, 0.95],
+        );
+        let footprints = vec![
+            Some(FeedbackFootprint {
+                index: 0,
+                kind: FeedbackPhysicalKind::Table,
+                rect: FootprintRect {
+                    min_x: -1.0,
+                    min_z: -0.5,
+                    max_x: 1.0,
+                    max_z: 0.5,
+                },
+            }),
+            Some(FeedbackFootprint {
+                index: 1,
+                kind: FeedbackPhysicalKind::Seating,
+                rect: FootprintRect {
+                    min_x: -0.25,
+                    min_z: -1.2,
+                    max_x: 0.25,
+                    max_z: -0.8,
+                },
+            }),
+        ];
+
+        let correction = feedback_predictive_physical_delta(
+            1,
+            &placement,
+            [0.0, 0.0, 0.7],
+            &footprints,
+            FeedbackThresholdProfile::Standard.thresholds(),
+        );
+
+        assert!(correction[2] < -0.2);
+    }
+
+    #[test]
+    fn feedback_yaw_uses_table_facing_target_when_available() {
+        let mut physical = empty_physical_layout();
+        physical.table_center_xz = Some([0.0, 0.0]);
+        physical.footprint_centers.insert(0, [1.0, 0.0]);
+        let placement = test_feedback_placement(
+            "conference_chair",
+            "conference chair",
+            [1.0, 0.0, 0.0],
+            [0.6, 0.5, 0.8, 0.9],
+        );
+
+        let correction = feedback_yaw_correction(0, &placement, 0.0, &physical);
+
+        assert_eq!(correction.basis, "table-facing-yaw");
+        assert!(correction.delta_degrees < -3.0);
     }
 
     #[test]
@@ -5678,8 +7046,55 @@ mod tests {
         let scale = deltas["objects"][0]["scale_multiplier"].as_f64().unwrap();
         let camera_radius = deltas["camera"]["radius_multiplier"].as_f64().unwrap();
 
-        assert!((scale - 0.955).abs() <= 1.0e-6);
+        assert!((scale - 1.0).abs() <= 1.0e-6);
         assert!((camera_radius - 1.0).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn feedback_yaw_uses_live_world_item_against_canonical_bsn_yaw() {
+        let placement = GroundedScenePlacement {
+            entity_id: "chair_1".to_string(),
+            asset_id: "chair".to_string(),
+            object_id: "chair".to_string(),
+            instance_id: Some("chair_1".to_string()),
+            label: "chair".to_string(),
+            source_bbox: [0.1, 0.2, 0.3, 0.7],
+            contact_pixel: [0.2, 0.7],
+            ground_point: [0.0, 0.0, 0.0],
+            translation: [0.0, 0.0, 0.0],
+            rotation_y_degrees: 90.0,
+            scale: [1.0, 1.0, 1.0],
+            local_aabb: SceneAssetAabb {
+                min: [-0.3, 0.0, -0.4],
+                max: [0.3, 1.0, 0.4],
+            },
+            target_footprint_m: [0.6, 0.8],
+        };
+
+        let correction = feedback_yaw_correction(0, &placement, 20.0, &empty_physical_layout());
+
+        assert_eq!(correction.basis, "canonical-bsn-yaw");
+        assert!(correction.delta_degrees > 20.0);
+    }
+
+    #[test]
+    fn status_world_item_yaw_matches_cache_key_when_order_differs() {
+        let status = json!({
+            "world_items": [
+                {
+                    "cache_key": "table-cache",
+                    "rotation": quat_from_y_degrees(0.0),
+                },
+                {
+                    "cache_key": "chair-cache",
+                    "rotation": quat_from_y_degrees(-90.0),
+                }
+            ]
+        });
+
+        let yaw = status_world_item_yaw_degrees(&status, 0, Some("chair-cache")).unwrap();
+
+        assert!((yaw + 90.0).abs() <= 1.0e-5);
     }
 
     #[test]
@@ -5785,8 +7200,9 @@ mod tests {
         let translation_delta = json_array3(&object["translation_delta"]).unwrap();
 
         assert_eq!(object["grounding_basis"], json!("camera-ray-ground-plane"));
-        assert!(translation_delta[0] > 0.2);
+        assert!(translation_delta[0] > 0.05);
         assert!(translation_delta[2] < -0.5);
+        assert_eq!(object["contact_residual_applied"], json!(true));
         assert!(object["target_ground_point"].is_array());
         assert!(object["observed_ground_point"].is_array());
     }
@@ -5942,10 +7358,10 @@ mod tests {
         let scale = object_delta["scale_multiplier"].as_f64().unwrap();
         assert!((scale - 1.22).abs() <= 1.0e-5);
         let yaw_delta = object_delta["yaw_delta_degrees"].as_f64().unwrap();
-        assert!(yaw_delta.abs() > 1.0);
+        assert!(yaw_delta.abs() <= 1.0e-6);
         assert_eq!(
             metrics["objects"][0]["yaw_basis"],
-            json!("source-side-aspect-fallback")
+            json!("canonical-bsn-yaw-within-threshold")
         );
     }
 

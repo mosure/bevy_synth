@@ -222,6 +222,14 @@ pub struct Args {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub pause_render_during_inference: bool,
 
+    /// Show Bevy UI overlays. Press F1 in the app to toggle this at runtime.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub ui_visible: bool,
+
+    /// Viewer read-only mode: allow camera navigation but disable scene edits and cache persistence.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub read_only: bool,
+
     /// Maximum number of queued images to batch per inference dispatch.
     #[arg(long, default_value_t = 1)]
     pub max_batch_size: usize,
@@ -420,6 +428,8 @@ pub struct AppArgs {
     pub weights_precision: WeightPrecision,
     pub rmbg_weights_precision: WeightPrecision,
     pub pause_render_during_inference: bool,
+    pub ui_visible: bool,
+    pub read_only: bool,
     pub max_batch_size: usize,
     pub mcp_scene_control_path: Option<PathBuf>,
     pub scene_bsn: Option<PathBuf>,
@@ -527,6 +537,8 @@ pub fn build_app_args(args: Args) -> AppArgs {
         weights_precision: args.weights_precision,
         rmbg_weights_precision: args.rmbg_weights_precision,
         pause_render_during_inference: args.pause_render_during_inference,
+        ui_visible: args.ui_visible,
+        read_only: args.read_only,
         max_batch_size: args.max_batch_size.max(1),
         mcp_scene_control_path: args.mcp_scene_control_path,
         scene_bsn: args.scene_bsn,
@@ -659,6 +671,9 @@ mod tests {
             "tmp/runs/demo/assets.json",
             "--scene-bsn-clear-existing",
             "false",
+            "--ui-visible",
+            "false",
+            "--read-only",
         ]);
         let app_args = build_app_args(args);
         assert_eq!(
@@ -670,6 +685,8 @@ mod tests {
             Some(std::path::Path::new("tmp/runs/demo/assets.json"))
         );
         assert!(!app_args.scene_bsn_clear_existing);
+        assert!(!app_args.ui_visible);
+        assert!(app_args.read_only);
     }
 
     #[test]
@@ -821,6 +838,8 @@ mod tests {
     fn pause_render_during_inference_defaults_on_and_can_be_disabled() {
         let default_args = build_app_args(Args::parse_from(["bevy_synth"]));
         assert!(default_args.pause_render_during_inference);
+        assert!(default_args.ui_visible);
+        assert!(!default_args.read_only);
 
         let disabled = build_app_args(Args::parse_from([
             "bevy_synth",

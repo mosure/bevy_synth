@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -475,6 +476,9 @@ pub struct ScenePreparation {
     pub output_dir: String,
     pub source_scene_path: String,
     pub object_reference_image_path: String,
+    pub provider: String,
+    pub reasoning_model: String,
+    pub image_model: String,
     pub object_manifest_schema: Value,
     pub scene_bsn_schema: Value,
     pub object_image_style_prompt: String,
@@ -484,6 +488,9 @@ pub trait SceneAiProvider {
     fn plan_objects(&self, request: &SceneReasoningRequest) -> SceneResult<SceneObjectManifest>;
     fn generate_object_images(&self, request: &ObjectImageRequest) -> SceneResult<Vec<Vec<u8>>>;
     fn plan_scene_bsn(&self, request: &SceneBsnRequest) -> SceneResult<String>;
+    fn provider_metadata(&self) -> Value {
+        Value::Null
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -528,6 +535,9 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                 .object_reference_image_path
                 .display()
                 .to_string(),
+            provider: "openai".to_string(),
+            reasoning_model: self.config.reasoning_model.clone(),
+            image_model: self.config.image_model.clone(),
             object_manifest_schema: object_manifest_schema(),
             scene_bsn_schema: scene_bsn_schema(),
             object_image_style_prompt: object_image_prompt_template(),
@@ -807,6 +817,10 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
     ) -> SceneResult<String> {
         grounded_scene_bsn(&manifest, &asset_bindings)
     }
+
+    pub fn provider_metadata(&self) -> Value {
+        self.provider.provider_metadata()
+    }
 }
 
 pub fn select_object_image_candidates(
@@ -943,6 +957,7 @@ impl Default for OpenAiProviderConfig {
 pub struct OpenAiSceneProvider {
     config: OpenAiProviderConfig,
     client: reqwest::blocking::Client,
+    request_log: RefCell<Vec<Value>>,
 }
 
 impl OpenAiSceneProvider {
@@ -965,7 +980,11 @@ impl OpenAiSceneProvider {
             .timeout(config.timeout)
             .build()
             .map_err(|err| SceneError::Http(err.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            request_log: RefCell::new(Vec::new()),
+        })
     }
 
     fn auth(
@@ -1014,6 +1033,7 @@ impl OpenAiSceneProvider {
 
     fn post_responses_schema(
         &self,
+        operation: &'static str,
         prompt: &str,
         schema: Value,
         image_paths: &[PathBuf],
@@ -1040,13 +1060,38 @@ impl OpenAiSceneProvider {
                 redact_openai_value(&value)
             )));
         }
+        let response_model = value.get("model").and_then(Value::as_str);
+        self.warn_model_mismatch(operation, &self.config.reasoning_model, response_model);
+        self.record_request(json!({
+            "operation": operation,
+            "api": "responses",
+            "requested_model": self.config.reasoning_model,
+            "response_id": value.get("id").and_then(Value::as_str),
+            "response_model": response_model,
+            "image_count": image_paths.len(),
+        }));
         extract_structured_output(value)
+    }
+
+    fn record_request(&self, value: Value) {
+        self.request_log.borrow_mut().push(value);
+    }
+
+    fn warn_model_mismatch(&self, operation: &str, requested: &str, response_model: Option<&str>) {
+        if let Some(response_model) = response_model
+            && response_model != requested
+        {
+            eprintln!(
+                "burn_synth_scene: OpenAI {operation} returned model `{response_model}` while `{requested}` was requested"
+            );
+        }
     }
 }
 
 impl SceneAiProvider for OpenAiSceneProvider {
     fn plan_objects(&self, request: &SceneReasoningRequest) -> SceneResult<SceneObjectManifest> {
         let mut value = self.post_responses_schema(
+            "plan_objects",
             &request.prompt,
             object_manifest_schema(),
             &[
@@ -1103,6 +1148,23 @@ impl SceneAiProvider for OpenAiSceneProvider {
                 redact_openai_value(&value)
             )));
         }
+        let response_model = value.get("model").and_then(Value::as_str);
+        self.warn_model_mismatch(
+            "generate_object_images",
+            &self.config.image_model,
+            response_model,
+        );
+        self.record_request(json!({
+            "operation": "generate_object_images",
+            "api": "images.edits",
+            "object_id": request.object.id,
+            "requested_model": self.config.image_model,
+            "response_id": value.get("id").and_then(Value::as_str),
+            "response_model": response_model,
+            "requested_candidates": request.candidate_count,
+            "quality": request.quality,
+            "size": request.size,
+        }));
         let data = value
             .get("data")
             .and_then(Value::as_array)
@@ -1126,6 +1188,7 @@ impl SceneAiProvider for OpenAiSceneProvider {
 
     fn plan_scene_bsn(&self, request: &SceneBsnRequest) -> SceneResult<String> {
         let value = self.post_responses_schema(
+            "plan_scene_bsn",
             &request.prompt,
             scene_bsn_schema(),
             &[request.source_scene_path.clone()],
@@ -1136,6 +1199,17 @@ impl SceneAiProvider for OpenAiSceneProvider {
             .ok_or_else(|| SceneError::Provider("scene plan missing bsn field".to_string()))?;
         let _ = parse_scene_bsn(bsn, &request.asset_bindings)?;
         Ok(bsn.to_string())
+    }
+
+    fn provider_metadata(&self) -> Value {
+        json!({
+            "provider": "openai",
+            "base_url": self.config.base_url,
+            "project_id_set": self.config.project_id.is_some(),
+            "requested_reasoning_model": self.config.reasoning_model,
+            "requested_image_model": self.config.image_model,
+            "requests": self.request_log.borrow().clone(),
+        })
     }
 }
 
@@ -1478,6 +1552,7 @@ pub struct GroundedSceneLayoutConfig {
     pub vertical_fov_degrees: f32,
     pub image_aspect: f32,
     pub floor_y: f32,
+    pub seating_clearance_m: f32,
 }
 
 impl Default for GroundedSceneLayoutConfig {
@@ -1488,6 +1563,7 @@ impl Default for GroundedSceneLayoutConfig {
             vertical_fov_degrees: 72.0,
             image_aspect: 2.0,
             floor_y: 0.0,
+            seating_clearance_m: 0.18,
         }
     }
 }
@@ -1553,6 +1629,7 @@ pub fn grounded_scene_layout_for_manifest(
 struct MetricSceneFrame {
     table_axis_degrees: f32,
     table_size_m: [f32; 2],
+    seating_clearance_m: f32,
     camera_yaw_degrees: Option<f32>,
     camera_pitch_degrees: Option<f32>,
     camera_radius_m: Option<f32>,
@@ -1560,11 +1637,15 @@ struct MetricSceneFrame {
 }
 
 impl MetricSceneFrame {
-    fn from_manifest(manifest: &SceneObjectManifest) -> Option<Self> {
+    fn from_manifest(
+        manifest: &SceneObjectManifest,
+        config: GroundedSceneLayoutConfig,
+    ) -> Option<Self> {
         let calibration = manifest.scene_calibration?;
         Some(Self {
             table_axis_degrees: finite_or(calibration.table_axis_degrees, 0.0),
             table_size_m: sane_footprint(calibration.table_size_m.unwrap_or([3.2, 1.2])),
+            seating_clearance_m: config.seating_clearance_m.clamp(0.04, 0.60),
             camera_yaw_degrees: calibration
                 .camera_yaw_degrees
                 .filter(|value| value.is_finite()),
@@ -1594,7 +1675,9 @@ impl MetricSceneFrame {
         let table_width = self.table_size_m[0].max(0.5);
         let table_length = self.table_size_m[1].max(0.5);
         let object_depth = target_footprint[1].max(target_footprint[0] * 0.75).max(0.2);
-        let clearance = 0.18;
+        let clearance = self
+            .seating_clearance_m
+            .max((object_depth * 0.20).clamp(0.08, 0.28));
         let image_side_sign = self.camera_yaw_degrees.map(|yaw| {
             if yaw.to_radians().cos() >= 0.0 {
                 1.0
@@ -1661,7 +1744,7 @@ pub fn grounded_scene_layout(
         .iter()
         .map(|asset| (asset.object_id.as_str(), asset))
         .collect::<HashMap<_, _>>();
-    let metric_frame = MetricSceneFrame::from_manifest(manifest);
+    let metric_frame = MetricSceneFrame::from_manifest(manifest, config);
     let table_contact = manifest
         .objects
         .iter()
@@ -2102,23 +2185,23 @@ fn grounded_yaw_degrees(
     if let (Some(frame), Some(side)) = (metric_frame, instance.side)
         && side != SceneInstanceSide::Unknown
     {
-        let table = frame.table_point();
-        let dx = table[0] - from[0];
-        let dz = table[2] - from[2];
-        if dx.abs() + dz.abs() > 1.0e-5 {
-            return dx.atan2(dz).to_degrees();
+        if let Some(yaw) = bsn_yaw_toward_point_degrees(from, frame.table_point()) {
+            return yaw;
         }
     }
     let Some(target) = table else {
         return 0.0;
     };
+    bsn_yaw_toward_point_degrees(from, target).unwrap_or(0.0)
+}
+
+fn bsn_yaw_toward_point_degrees(from: [f32; 3], target: [f32; 3]) -> Option<f32> {
     let dx = target[0] - from[0];
     let dz = target[2] - from[2];
-    if dx.abs() + dz.abs() <= 1.0e-5 {
-        0.0
-    } else {
-        dx.atan2(dz).to_degrees()
+    if !dx.is_finite() || !dz.is_finite() || dx.abs() + dz.abs() <= 1.0e-5 {
+        return None;
     }
+    Some(normalize_degrees(dx.atan2(dz).to_degrees()))
 }
 
 fn scene_asset_frame(
@@ -3105,6 +3188,33 @@ mod tests {
         cursor.into_inner()
     }
 
+    #[test]
+    fn preparation_records_configured_openai_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("scene.jpg");
+        let reference = dir.path().join("input_chair.jpg");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&reference, b"reference").unwrap();
+        let config = SceneBuildConfig {
+            source_scene_path: source,
+            object_reference_image_path: reference,
+            output_dir: dir.path().join("out"),
+            candidate_count: 1,
+            quality_profile: SceneQualityProfile::Quality,
+            reasoning_model: "gpt-5.5".to_string(),
+            image_model: "gpt-image-2".to_string(),
+            allow_catalog_reuse: false,
+        };
+        let provider = RetryImageProvider::new(Vec::new());
+        let mut pipeline = ScenePipeline::new(config, provider);
+
+        let preparation = pipeline.prepare_openai_inputs().unwrap();
+
+        assert_eq!(preparation.provider, "openai");
+        assert_eq!(preparation.reasoning_model, "gpt-5.5");
+        assert_eq!(preparation.image_model, "gpt-image-2");
+    }
+
     fn low_contrast_candidate_png() -> Vec<u8> {
         let mut image = image::RgbImage::from_pixel(128, 128, image::Rgb([222, 222, 222]));
         for y in 50..72 {
@@ -3685,6 +3795,7 @@ spawn debug_cube_chair uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0
         let frame = MetricSceneFrame {
             table_axis_degrees: 0.0,
             table_size_m: [1.2, 3.4],
+            seating_clearance_m: 0.18,
             camera_yaw_degrees: Some(180.0),
             camera_pitch_degrees: Some(24.0),
             camera_radius_m: Some(4.2),
@@ -3700,6 +3811,28 @@ spawn debug_cube_chair uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0
         assert!(right[0] < -0.9);
         assert!(near[2] < -1.9);
         assert!(far[2] > 1.9);
+    }
+
+    #[test]
+    fn bsn_yaw_convention_faces_plus_z_at_zero_degrees() {
+        let from = [0.0, 0.0, 0.0];
+
+        assert!(
+            (bsn_yaw_toward_point_degrees(from, [0.0, 0.0, 1.0]).unwrap() - 0.0).abs() < 1.0e-6
+        );
+        assert!(
+            (bsn_yaw_toward_point_degrees(from, [1.0, 0.0, 0.0]).unwrap() - 90.0).abs() < 1.0e-6
+        );
+        assert!(
+            (bsn_yaw_toward_point_degrees(from, [-1.0, 0.0, 0.0]).unwrap() + 90.0).abs() < 1.0e-6
+        );
+        assert!(
+            bsn_yaw_toward_point_degrees(from, [0.0, 0.0, -1.0])
+                .unwrap()
+                .abs()
+                >= 179.999
+        );
+        assert!(bsn_yaw_toward_point_degrees(from, from).is_none());
     }
 
     #[test]

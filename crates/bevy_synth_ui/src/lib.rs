@@ -750,7 +750,7 @@ enum ControlButtonKind {
 struct ButtonLabel;
 
 #[derive(Component)]
-struct UiRootNode;
+pub struct UiRootNode;
 
 #[derive(Resource, Default)]
 struct SettingsModalState {

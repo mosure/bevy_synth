@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::RecvTimeoutError;
@@ -125,7 +127,7 @@ use bevy_synth_ui::ImagePickDialog;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogSpawnAsset,
     CatalogSpawnRequest, CatalogState, CatalogStatus, CatalogUiState, DragState, MainCamera,
-    SceneSaveKind, SceneSaveRequest, preview_light_layers,
+    SceneSaveKind, SceneSaveRequest, UiRootNode, preview_light_layers,
 };
 
 use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -223,6 +225,22 @@ impl SceneInteractionLock {
             None
         };
     }
+}
+
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UiVisibilityState {
+    pub(crate) visible: bool,
+}
+
+impl UiVisibilityState {
+    pub(crate) fn new(visible: bool) -> Self {
+        Self { visible }
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SceneReadOnlyMode {
+    pub(crate) enabled: bool,
 }
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
@@ -724,6 +742,14 @@ enum McpSceneCommand {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct McpSceneScreenshotQueue {
+    pending: VecDeque<PathBuf>,
+    ui_hidden: bool,
+    restore_next_frame: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Serialize)]
 struct McpSceneStatus {
     session_id: Option<String>,
@@ -807,6 +833,10 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     let mcp_scene_control = McpSceneControl::from_args(&app_args);
 
+    let ui_visibility = UiVisibilityState::new(app_args.ui_visible);
+    let scene_read_only = SceneReadOnlyMode {
+        enabled: app_args.read_only,
+    };
     let status_message = if app_args.image.is_none() && app_args.mesh.is_none() {
         "upload an image (.png/.jpg) to begin.".to_string()
     } else {
@@ -824,6 +854,8 @@ pub(crate) fn run() {
         .insert_resource(WorldCachePersistence::default())
         .insert_resource(PendingSceneBsnSave::default())
         .insert_resource(SceneInteractionLock::default())
+        .insert_resource(ui_visibility)
+        .insert_resource(scene_read_only)
         .insert_resource(UiStatus {
             message: status_message,
             processing: false,
@@ -837,6 +869,8 @@ pub(crate) fn run() {
     app.init_resource::<InferenceRenderPauseState>();
     #[cfg(not(target_arch = "wasm32"))]
     app.init_resource::<InferenceDispatchGate>();
+    #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<McpSceneScreenshotQueue>();
     #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
     add_default_plugins(&mut app);
@@ -860,6 +894,7 @@ pub(crate) fn run() {
             handle_scene_save_requests,
             handle_scene_bsn_save_results,
             handle_scene_glb_save_results,
+            handle_ui_visibility_shortcut,
             #[cfg(target_arch = "wasm32")]
             kickoff_wasm_warmup.before(finish_wasm_startup_when_models_ready),
             #[cfg(target_arch = "wasm32")]
@@ -877,6 +912,18 @@ pub(crate) fn run() {
             rotate_spinner,
             update_window_title,
         ),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
+        sync_ui_root_visibility
+            .after(handle_ui_visibility_shortcut)
+            .after(drive_mcp_scene_screenshot_queue),
+    );
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Update,
+        sync_ui_root_visibility.after(handle_ui_visibility_shortcut),
     );
     app.add_systems(
         PostUpdate,
@@ -927,7 +974,10 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(
         Update,
-        poll_mcp_scene_control.before(mark_world_cache_dirty),
+        (
+            poll_mcp_scene_control.before(mark_world_cache_dirty),
+            drive_mcp_scene_screenshot_queue.after(poll_mcp_scene_control),
+        ),
     );
 
     app.run();
@@ -2401,8 +2451,9 @@ fn handle_open_file_dialog(
     mut commands: Commands,
     exit_state: Res<ExitState>,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    if exit_state.requested || interaction_lock.locked {
+    if exit_state.requested || interaction_lock.locked || read_only.enabled {
         return;
     }
     let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
@@ -2435,11 +2486,12 @@ fn handle_file_dialog_loads(
     mut catalog: ResMut<CatalogState>,
     exit_state: Res<ExitState>,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
         return;
     }
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         for _ in events.read() {}
         return;
     }
@@ -2480,11 +2532,12 @@ fn handle_dropped_files(
     mut catalog: ResMut<CatalogState>,
     exit_state: Res<ExitState>,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
         return;
     }
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         for _ in events.read() {}
         return;
     }
@@ -2519,12 +2572,16 @@ fn handle_scene_save_requests(
     mut pending_bsn: ResMut<PendingSceneBsnSave>,
     mut status: ResMut<UiStatus>,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     let mut last_request = None;
     for request in requests.read() {
         last_request = Some(request.kind);
     }
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
+        if read_only.enabled && last_request.is_some() {
+            status.message = "read-only scene: save/export disabled.".to_string();
+        }
         return;
     }
     let Some(kind) = last_request else {
@@ -2983,6 +3040,8 @@ fn poll_mcp_scene_control(
     mut cache: ResMut<MeshCacheResource>,
     mut selection: ResMut<EditorSelection>,
     mut interaction_lock: ResMut<SceneInteractionLock>,
+    mut screenshots_to_capture: ResMut<McpSceneScreenshotQueue>,
+    read_only: Res<SceneReadOnlyMode>,
     transformables: Query<(), With<GizmoTransformable>>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut query_set: ParamSet<(
@@ -3448,14 +3507,12 @@ fn poll_mcp_scene_control(
                     continue;
                 }
                 screenshots.push(path.display().to_string());
-                commands
-                    .spawn(Screenshot::primary_window())
-                    .observe(save_to_disk(path));
+                screenshots_to_capture.pending.push_back(path);
                 command_results.push(mcp_scene_command_result(
                     command_index,
                     "capture_screenshot",
                     true,
-                    "screenshot requested",
+                    "render-only screenshot queued",
                     None,
                     screenshots.last().cloned(),
                 ));
@@ -3508,6 +3565,17 @@ fn poll_mcp_scene_control(
                 }
             },
             McpSceneCommand::SaveCache => {
+                if read_only.enabled {
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "save_cache",
+                        false,
+                        "read-only scene: cache flush disabled",
+                        None,
+                        None,
+                    ));
+                    continue;
+                }
                 force_cache_flush = true;
                 command_results.push(mcp_scene_command_result(
                     command_index,
@@ -3521,7 +3589,7 @@ fn poll_mcp_scene_control(
         }
     }
 
-    if force_cache_flush {
+    if force_cache_flush && !read_only.enabled {
         let camera_state = {
             let main_camera = query_set.p0();
             main_camera
@@ -3538,7 +3606,7 @@ fn poll_mcp_scene_control(
             world_cache.dirty = false;
             world_cache.timer.reset();
         }
-    } else if scene_changed {
+    } else if scene_changed && !read_only.enabled {
         world_cache.dirty = true;
         world_cache.timer.reset();
     }
@@ -3598,6 +3666,82 @@ fn poll_mcp_scene_control(
                 status_path.display()
             );
         }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drive_mcp_scene_screenshot_queue(
+    mut commands: Commands,
+    mut queue: ResMut<McpSceneScreenshotQueue>,
+    ui_visibility: Res<UiVisibilityState>,
+    mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+) {
+    if queue.restore_next_frame {
+        set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+        queue.restore_next_frame = false;
+        queue.ui_hidden = false;
+        return;
+    }
+
+    if queue.pending.is_empty() {
+        if queue.ui_hidden {
+            set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+            queue.ui_hidden = false;
+        }
+        return;
+    }
+
+    if !queue.ui_hidden {
+        set_ui_root_visibility(false, &mut ui_roots);
+        queue.ui_hidden = true;
+        return;
+    }
+
+    if let Some(path) = queue.pending.pop_front() {
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+        queue.restore_next_frame = true;
+    }
+}
+
+pub(crate) fn handle_ui_visibility_shortcut(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut ui_visibility: ResMut<UiVisibilityState>,
+) {
+    if keys.just_pressed(KeyCode::F1) {
+        ui_visibility.visible = !ui_visibility.visible;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_ui_root_visibility(
+    ui_visibility: Res<UiVisibilityState>,
+    screenshot_queue: Res<McpSceneScreenshotQueue>,
+    mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+) {
+    if screenshot_queue.ui_hidden {
+        return;
+    }
+    set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sync_ui_root_visibility(
+    ui_visibility: Res<UiVisibilityState>,
+    mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+) {
+    set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+}
+
+fn set_ui_root_visibility(visible: bool, ui_roots: &mut Query<&mut Visibility, With<UiRootNode>>) {
+    let next = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut visibility in ui_roots.iter_mut() {
+        *visibility = next;
     }
 }
 
@@ -3735,8 +3879,9 @@ fn handle_catalog_spawn_requests(
     mut commands: Commands,
     mut selection: Option<ResMut<EditorSelection>>,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         for _ in requests.read() {}
         return;
     }
@@ -3770,8 +3915,9 @@ pub(crate) fn handle_catalog_delete_requests(
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut commands: Commands,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         for _ in requests.read() {}
         return;
     }
@@ -3802,9 +3948,10 @@ pub(crate) fn handle_catalog_delete_requests(
 
 fn enforce_scene_interaction_lock(
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
     mut selection: ResMut<EditorSelection>,
 ) {
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         selection.clear();
     }
 }
@@ -3978,6 +4125,7 @@ fn handle_exit_requests(
     mut cache: ResMut<MeshCacheResource>,
     cached_instances: Query<(&CachedMeshInstance, &Transform)>,
     main_camera: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
         return;
@@ -3991,12 +4139,14 @@ fn handle_exit_requests(
     }
 
     exit_state.requested = true;
-    let camera_state = main_camera
-        .single()
-        .ok()
-        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
-    if let Err(err) = flush_world_cache_now(&mut cache, &cached_instances, camera_state) {
-        warn!("Failed to flush world cache during shutdown: {err}");
+    if !read_only.enabled {
+        let camera_state = main_camera
+            .single()
+            .ok()
+            .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
+        if let Err(err) = flush_world_cache_now(&mut cache, &cached_instances, camera_state) {
+            warn!("Failed to flush world cache during shutdown: {err}");
+        }
     }
     queue.active = None;
     queue.pending.clear();
@@ -4574,6 +4724,7 @@ pub(crate) fn triposplat_cloud_settings() -> CloudSettings {
 #[cfg(not(target_arch = "wasm32"))]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
+    read_only: Res<SceneReadOnlyMode>,
     changed: Query<
         (),
         (
@@ -4590,6 +4741,10 @@ fn mark_world_cache_dirty(
     >,
     mut removed: RemovedComponents<CachedMeshInstance>,
 ) {
+    if read_only.enabled {
+        for _ in removed.read() {}
+        return;
+    }
     if changed.is_empty() && changed_camera.is_empty() && removed.read().next().is_none() {
         return;
     }
@@ -4601,6 +4756,7 @@ fn mark_world_cache_dirty(
 #[cfg(target_arch = "wasm32")]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
+    read_only: Res<SceneReadOnlyMode>,
     changed: Query<
         (),
         (
@@ -4610,6 +4766,10 @@ fn mark_world_cache_dirty(
     >,
     mut removed: RemovedComponents<CachedMeshInstance>,
 ) {
+    if read_only.enabled {
+        for _ in removed.read() {}
+        return;
+    }
     if changed.is_empty() && removed.read().next().is_none() {
         return;
     }
@@ -4623,7 +4783,12 @@ fn persist_world_cache(
     mut cache: ResMut<MeshCacheResource>,
     query: Query<(&CachedMeshInstance, &Transform)>,
     main_camera: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
+    if read_only.enabled {
+        persistence.dirty = false;
+        return;
+    }
     if !persistence.dirty {
         return;
     }
@@ -4972,8 +5137,9 @@ fn delete_selected_meshes(
     transformables: Query<(), With<GizmoTransformable>>,
     mut commands: Commands,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         return;
     }
     if !keys.just_pressed(KeyCode::Delete) && !keys.just_pressed(KeyCode::Backspace) {
@@ -5014,8 +5180,9 @@ fn update_selection_from_primary_click(
     >,
     meshes: Res<Assets<BevyMesh>>,
     interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    if interaction_lock.locked {
+    if interaction_lock.locked || read_only.enabled {
         return;
     }
     if !buttons.just_pressed(MouseButton::Left) {

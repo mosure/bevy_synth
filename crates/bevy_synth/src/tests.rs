@@ -20,10 +20,10 @@ use crate::app::prepare_startup_bsn_scene;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{
-    CachedMeshInstance, MeshCacheResource, SceneInteractionLock, drive_inference,
-    enqueue_inference, handle_catalog_delete_requests, processing_window_title,
-    scene_bsn_export_for_world, scene_glb_export_for_world, should_run_headless_once,
-    title_rattler_frame,
+    CachedMeshInstance, MeshCacheResource, SceneInteractionLock, SceneReadOnlyMode,
+    UiVisibilityState, drive_inference, enqueue_inference, handle_catalog_delete_requests,
+    handle_ui_visibility_shortcut, processing_window_title, scene_bsn_export_for_world,
+    scene_glb_export_for_world, should_run_headless_once, title_rattler_frame,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
@@ -97,6 +97,8 @@ fn test_args() -> AppArgs {
         weights_precision: WeightPrecision::Auto,
         rmbg_weights_precision: WeightPrecision::Auto,
         pause_render_during_inference: true,
+        ui_visible: true,
+        read_only: false,
         max_batch_size: 1,
         mcp_scene_control_path: None,
         scene_bsn: None,
@@ -306,6 +308,8 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
     app.insert_resource(CatalogState::default());
     app.insert_resource(ExitState::default());
     app.insert_resource(SceneInteractionLock::default());
+    app.insert_resource(SceneReadOnlyMode::default());
+    app.insert_resource(UiVisibilityState::new(true));
     let cache = MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache");
     app.insert_resource(MeshCacheResource { cache });
     app.insert_resource(Assets::<Image>::default());
@@ -682,6 +686,31 @@ fn ui_plugin_update_has_no_query_conflicts() {
     app.update();
 }
 
+#[test]
+fn f1_toggles_ui_visibility_state() {
+    let mut app = App::new();
+    app.insert_resource(UiVisibilityState::new(true));
+    app.insert_resource(ButtonInput::<KeyCode>::default());
+    app.add_systems(Update, handle_ui_visibility_shortcut);
+
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::F1);
+    app.update();
+
+    assert!(!app.world().resource::<UiVisibilityState>().visible);
+
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .reset_all();
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::F1);
+    app.update();
+
+    assert!(app.world().resource::<UiVisibilityState>().visible);
+}
+
 fn write_catalog_delete_request_once(
     mut wrote: Local<bool>,
     mut requests: MessageWriter<CatalogDeleteRequest>,
@@ -703,6 +732,7 @@ fn catalog_delete_request_removes_cache_backed_instances_in_same_update() {
         cache: MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache"),
     });
     app.insert_resource(SceneInteractionLock::default());
+    app.insert_resource(SceneReadOnlyMode::default());
     let entity = app
         .world_mut()
         .spawn(CachedMeshInstance {
@@ -735,6 +765,7 @@ fn catalog_delete_request_is_ignored_while_scene_interaction_locked() {
     let mut interaction_lock = SceneInteractionLock::default();
     interaction_lock.set(true, Some("feedback iteration".to_string()));
     app.insert_resource(interaction_lock);
+    app.insert_resource(SceneReadOnlyMode::default());
     let entity = app
         .world_mut()
         .spawn(CachedMeshInstance {
@@ -754,6 +785,37 @@ fn catalog_delete_request_is_ignored_while_scene_interaction_locked() {
     assert!(
         app.world().entities().contains(entity),
         "read-only scene interaction lock should prevent catalog deletes from changing the scene"
+    );
+}
+
+#[test]
+fn catalog_delete_request_is_ignored_in_read_only_mode() {
+    let mut app = App::new();
+    app.add_message::<CatalogDeleteRequest>();
+    app.insert_resource(MeshCacheResource {
+        cache: MeshCache::load_from_root(isolated_cache_root()).expect("create isolated cache"),
+    });
+    app.insert_resource(SceneInteractionLock::default());
+    app.insert_resource(SceneReadOnlyMode { enabled: true });
+    let entity = app
+        .world_mut()
+        .spawn(CachedMeshInstance {
+            cache_key: "cache-key".to_string(),
+        })
+        .id();
+    app.add_systems(
+        Update,
+        (
+            write_catalog_delete_request_once.in_set(BurnSynthUiSystemSet::CatalogRequests),
+            handle_catalog_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+        ),
+    );
+
+    app.update();
+
+    assert!(
+        app.world().entities().contains(entity),
+        "read-only mode should prevent catalog deletes from changing the scene"
     );
 }
 
