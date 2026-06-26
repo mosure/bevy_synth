@@ -1,6 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
@@ -35,13 +33,10 @@ impl std::fmt::Debug for WgpuNativeRuntimeCache {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocateAnythingRuntimeBackend {
-    /// Native Burn graph. This is intentionally fail-fast until the full
-    /// MoonViT + Qwen + PBD stack has hook-validated checkpoint parity.
-    BurnNative,
-    /// Explicit upstream Python/Torch reference execution. This is not a fake
-    /// native backend; logs and metadata name it as reference execution.
+    /// Native Burn graph. Detection remains explicitly opt-in until the full
+    /// MoonViT + Qwen + PBD stack has broad hook-validated checkpoint parity.
     #[default]
-    PythonReference,
+    BurnNative,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -60,14 +55,7 @@ pub struct LocateAnythingRuntimeConfig {
     pub top_k: Option<usize>,
     pub batch_prompts: bool,
     pub require_gpu: bool,
-    pub reference_script: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub python_bin: Option<PathBuf>,
-    pub reference_device: String,
-    pub reference_dtype: String,
-    pub reference_attention: String,
     pub in_token_limit: u32,
-    pub run_root: PathBuf,
 }
 
 fn default_repetition_penalty() -> f32 {
@@ -82,7 +70,7 @@ impl Default for LocateAnythingRuntimeConfig {
     fn default() -> Self {
         Self {
             model_root: PathBuf::from("assets/models/LocateAnything-3B"),
-            backend: LocateAnythingRuntimeBackend::PythonReference,
+            backend: LocateAnythingRuntimeBackend::BurnNative,
             allow_experimental_native_detect: false,
             decode_mode: DecodeMode::Hybrid,
             max_new_tokens: 8192,
@@ -91,15 +79,7 @@ impl Default for LocateAnythingRuntimeConfig {
             top_k: None,
             batch_prompts: true,
             require_gpu: true,
-            reference_script: PathBuf::from(
-                "crates/burn_locate_anything/python/locate_anything_reference.py",
-            ),
-            python_bin: None,
-            reference_device: "cuda".to_string(),
-            reference_dtype: "bf16".to_string(),
-            reference_attention: "sdpa".to_string(),
             in_token_limit: LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT,
-            run_root: PathBuf::from("tmp/runs"),
         }
     }
 }
@@ -258,17 +238,11 @@ impl LocateAnythingDetector for LocateAnythingRuntime {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        match self.config.backend {
-            LocateAnythingRuntimeBackend::PythonReference => {
-                self.detect_batch_python_reference(image, queries)
-            }
-            LocateAnythingRuntimeBackend::BurnNative => {
-                if !self.config.allow_experimental_native_detect {
-                    return self.unsupported_native_boundary(image, queries);
-                }
-                self.detect_batch_burn_native(image, queries)
-            }
+        let LocateAnythingRuntimeBackend::BurnNative = self.config.backend;
+        if !self.config.allow_experimental_native_detect {
+            return self.unsupported_native_boundary(image, queries);
         }
+        self.detect_batch_burn_native(image, queries)
     }
 }
 
@@ -517,162 +491,9 @@ impl LocateAnythingRuntime {
             .collect::<Vec<_>>()
             .join(", ");
         Err(LocateAnythingError::Unsupported(format!(
-            "Burn-native LocateAnything detect() for [{labels}] is opt-in while coverage broadens beyond the current WGPU hook/reference fixtures: native preprocessing/tokenization/prompt assembly, MoonViT/projector, multimodal Qwen generation, top-p/repetition sampling, and PBD/hybrid decode are wired and validated on the Galaxy/table fixture; prepared patch_tokens={patch_tokens}, merged_image_tokens={merged_tokens}, prompt_tokens={prompt_tokens:?}. Set allow_experimental_native_detect=true for validated WGPU parity/debug runs; keep python_reference as the conservative default for unvalidated scenes/backends."
+            "Burn-native LocateAnything detect() for [{labels}] is opt-in while coverage broadens beyond the current WGPU hook fixtures: native preprocessing/tokenization/prompt assembly, MoonViT/projector, multimodal Qwen generation, top-p/repetition sampling, and PBD/hybrid decode are wired and validated on the Galaxy/table fixture; prepared patch_tokens={patch_tokens}, merged_image_tokens={merged_tokens}, prompt_tokens={prompt_tokens:?}. Set allow_experimental_native_detect=true for validated WGPU parity/debug runs."
         )))
     }
-
-    fn detect_batch_python_reference(
-        &self,
-        image: &DynamicImage,
-        queries: &[DetectionQuery],
-    ) -> LocateAnythingResult<Vec<Vec<Detection>>> {
-        let run_dir = self.reference_run_dir()?;
-        let image_path = run_dir.join("input.png");
-        let output_path = run_dir.join("reference.json");
-        let log_path = run_dir.join("reference.log");
-        image.save(&image_path).map_err(|err| {
-            LocateAnythingError::Io(format!(
-                "failed to write LocateAnything reference input {}: {err}",
-                image_path.display()
-            ))
-        })?;
-
-        let python_bin = self.python_bin();
-        let mut command = Command::new(&python_bin);
-        command
-            .arg(&self.config.reference_script)
-            .arg("--model-root")
-            .arg(&self.config.model_root)
-            .arg("--image")
-            .arg(&image_path)
-            .arg("--output")
-            .arg(&output_path)
-            .arg("--device")
-            .arg(&self.config.reference_device)
-            .arg("--dtype")
-            .arg(&self.config.reference_dtype)
-            .arg("--attn")
-            .arg(&self.config.reference_attention)
-            .arg("--generation-mode")
-            .arg(match self.config.decode_mode {
-                DecodeMode::ParallelBox => "fast",
-                DecodeMode::Autoregressive => "slow",
-                DecodeMode::Hybrid => "hybrid",
-            })
-            .arg("--in-token-limit")
-            .arg(self.config.in_token_limit.to_string())
-            .arg("--max-new-tokens")
-            .arg(self.config.max_new_tokens.to_string())
-            .arg("--temperature")
-            .arg("0.0")
-            .arg("--top-p")
-            .arg(
-                self.config
-                    .top_p
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-1.0".to_string()),
-            )
-            .arg("--top-k")
-            .arg(
-                self.config
-                    .top_k
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "0".to_string()),
-            )
-            .arg("--repetition-penalty")
-            .arg(self.config.repetition_penalty.to_string())
-            .env("PYTHONUNBUFFERED", "1");
-        for query in queries {
-            command.arg("--query").arg(&query.query);
-        }
-
-        let output = command.output().map_err(|err| {
-            LocateAnythingError::Runtime(format!(
-                "failed to launch LocateAnything reference `{}`: {err}",
-                python_bin.display()
-            ))
-        })?;
-        let mut log = String::new();
-        log.push_str("$ ");
-        log.push_str(&format!("{command:?}\n"));
-        log.push_str("--- stdout ---\n");
-        log.push_str(&String::from_utf8_lossy(&output.stdout));
-        log.push_str("\n--- stderr ---\n");
-        log.push_str(&String::from_utf8_lossy(&output.stderr));
-        std::fs::write(&log_path, log).map_err(|err| {
-            LocateAnythingError::Io(format!(
-                "failed to write LocateAnything reference log {}: {err}",
-                log_path.display()
-            ))
-        })?;
-        if !output.status.success() {
-            return Err(LocateAnythingError::Runtime(format!(
-                "LocateAnything reference failed with status {}; see {}",
-                output.status,
-                log_path.display()
-            )));
-        }
-        let bytes = std::fs::read(&output_path).map_err(|err| {
-            LocateAnythingError::Io(format!(
-                "failed to read LocateAnything reference output {}: {err}",
-                output_path.display()
-            ))
-        })?;
-        let response = serde_json::from_slice::<LocateAnythingReferenceResponse>(&bytes)?;
-        let mut by_query = Vec::with_capacity(queries.len());
-        for query in queries {
-            let detections = response
-                .results
-                .iter()
-                .find(|result| result.query == query.query)
-                .map(|result| result.detections.clone())
-                .unwrap_or_default();
-            by_query.push(detections);
-        }
-        Ok(by_query)
-    }
-
-    fn reference_run_dir(&self) -> LocateAnythingResult<PathBuf> {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| LocateAnythingError::Runtime(format!("system clock error: {err}")))?
-            .as_millis();
-        let dir = self
-            .config
-            .run_root
-            .join(format!("{millis}_locateanything_reference_detect"));
-        std::fs::create_dir_all(&dir).map_err(|err| {
-            LocateAnythingError::Io(format!("failed to create {}: {err}", dir.display()))
-        })?;
-        Ok(dir)
-    }
-
-    fn python_bin(&self) -> PathBuf {
-        self.config
-            .python_bin
-            .clone()
-            .or_else(|| std::env::var_os("LOCATE_ANYTHING_PYTHON").map(PathBuf::from))
-            .unwrap_or_else(|| {
-                let torch = PathBuf::from("/home/mosure/.venvs/torch/bin/python");
-                if torch.exists() {
-                    torch
-                } else {
-                    PathBuf::from("python3")
-                }
-            })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct LocateAnythingReferenceResponse {
-    results: Vec<LocateAnythingReferenceResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocateAnythingReferenceResult {
-    query: String,
-    #[serde(default)]
-    detections: Vec<Detection>,
 }
 
 #[cfg(test)]
@@ -753,38 +574,6 @@ mod tests {
         assert!(message.contains("prompt_tokens="));
     }
 
-    #[test]
-    fn runtime_python_reference_detect_smoke_when_enabled() {
-        if std::env::var("LOCATE_ANYTHING_REFERENCE_RUNTIME_SMOKE").is_err() {
-            eprintln!(
-                "skipping: set LOCATE_ANYTHING_REFERENCE_RUNTIME_SMOKE=1 to run explicit Python reference runtime smoke"
-            );
-            return;
-        }
-        let repo_root = find_repo_root_for_test().unwrap();
-        let mut runtime = LocateAnythingRuntime::new(LocateAnythingRuntimeConfig {
-            model_root: repo_root.join("assets/models/LocateAnything-3B"),
-            reference_script: repo_root
-                .join("crates/burn_locate_anything/python/locate_anything_reference.py"),
-            run_root: repo_root.join("tmp/runs"),
-            max_new_tokens: 128,
-            in_token_limit: 256,
-            ..LocateAnythingRuntimeConfig::default()
-        })
-        .unwrap();
-        let image = DynamicImage::new_rgb8(224, 224);
-        let results = runtime
-            .detect_batch(
-                &image,
-                &[DetectionQuery {
-                    query: "plain white square".to_string(),
-                    label_hint: None,
-                }],
-            )
-            .unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
     fn find_repo_root_for_test() -> Option<PathBuf> {
         let mut dir = std::env::current_dir().ok()?;
         loop {
@@ -815,9 +604,14 @@ mod wgpu_runtime_tests {
             return;
         };
         let model_root = root.join("assets/models/LocateAnything-3B");
-        let image_path = std::path::Path::new(
-            "/media/mosure/dolos/demo/Cisco/reconstruction/045-LYS01-3-Galaxy.jpg",
-        );
+        let Some(image_path) =
+            std::env::var_os("LOCATE_ANYTHING_PARITY_IMAGE").map(std::path::PathBuf::from)
+        else {
+            eprintln!(
+                "skipping full native detect parity; set LOCATE_ANYTHING_PARITY_IMAGE to the reference scene image"
+            );
+            return;
+        };
         if !model_root.join("config.json").exists() || !image_path.exists() {
             eprintln!(
                 "skipping full native detect parity; missing {} or {}",
@@ -836,7 +630,7 @@ mod wgpu_runtime_tests {
             ..LocateAnythingRuntimeConfig::default()
         })
         .unwrap();
-        let image = image::open(image_path).unwrap();
+        let image = image::open(&image_path).unwrap();
         let query = [
             DetectionQuery {
                 query: "conference table".to_string(),

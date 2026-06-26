@@ -17,7 +17,7 @@ burn = { version = "=0.21.0", default-features = false, features = ["std", "wgpu
 burn_depth = { version = "0.4.1", default-features = false, features = ["backend_wgpu", "backend_fusion", "bpk"] }
 burn_synth = { version = "0.2.0", path = "../burn_synth", features = ["import", "trellis-native-pbr", "trellis-wgpu", "wgpu"] }
 burn_synth_scene = { version = "0.2.0", path = "../burn_synth_scene" }
-burn_locate_anything = { version = "0.1.0", path = "../burn_locate_anything" }
+burn_locate_anything = { version = "0.1.1", path = "../burn_locate_anything" }
 bevy_synth_runtime = { version = "0.2.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 clap = { version = "4.5", features = ["derive"] }
 gltf = "1.4"

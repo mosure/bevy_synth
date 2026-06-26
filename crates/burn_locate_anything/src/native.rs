@@ -917,9 +917,14 @@ mod tests {
             return;
         };
         let model_root = root.join("assets/models/LocateAnything-3B");
-        let image_path = std::path::Path::new(
-            "/media/mosure/dolos/demo/Cisco/reconstruction/045-LYS01-3-Galaxy.jpg",
-        );
+        let Some(image_path) =
+            std::env::var_os("LOCATE_ANYTHING_PARITY_IMAGE").map(std::path::PathBuf::from)
+        else {
+            eprintln!(
+                "skipping native prep fixture; set LOCATE_ANYTHING_PARITY_IMAGE to the reference scene image"
+            );
+            return;
+        };
         if !model_root.join("config.json").exists() || !image_path.exists() {
             eprintln!(
                 "skipping native prep fixture; missing {} or {}",
@@ -929,7 +934,7 @@ mod tests {
             return;
         }
         let model_config = LocateAnythingModelConfig::from_model_root(&model_root).unwrap();
-        let image = image::open(image_path).unwrap();
+        let image = image::open(&image_path).unwrap();
         let prepared = prepare_native_batch_inputs(
             &model_root,
             &model_config,
@@ -1043,9 +1048,14 @@ mod wgpu_full_tests {
                     "tmp/runs/20260626T034651Z_locateanything_f32_qwen3forward_galaxy/hooks.safetensors",
                 )
             });
-        let image_path = std::path::Path::new(
-            "/media/mosure/dolos/demo/Cisco/reconstruction/045-LYS01-3-Galaxy.jpg",
-        );
+        let Some(image_path) =
+            std::env::var_os("LOCATE_ANYTHING_PARITY_IMAGE").map(std::path::PathBuf::from)
+        else {
+            eprintln!(
+                "skipping full Qwen parity; set LOCATE_ANYTHING_PARITY_IMAGE to the reference scene image"
+            );
+            return;
+        };
         if !model_root.join("config.json").exists() || !hooks_path.exists() || !image_path.exists()
         {
             eprintln!(
@@ -1059,7 +1069,7 @@ mod wgpu_full_tests {
 
         let device = burn_wgpu::WgpuDevice::default();
         let model_config = LocateAnythingModelConfig::from_model_root(&model_root).unwrap();
-        let image = image::open(image_path).unwrap();
+        let image = image::open(&image_path).unwrap();
         let prepared = prepare_native_batch_inputs(
             &model_root,
             &model_config,

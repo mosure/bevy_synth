@@ -207,7 +207,6 @@ pub enum SceneLocatorProvider {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocateAnythingBackend {
-    PythonReference,
     BurnNative,
 }
 
@@ -323,31 +322,16 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub depth_allow_download: bool,
 
-    /// Python executable for the explicit upstream LocateAnything reference locator.
-    #[arg(long)]
-    pub locate_anything_python_bin: Option<PathBuf>,
-
-    /// Local LocateAnything HF snapshot root used by the explicit reference locator.
+    /// LocateAnything model root used by the Burn-native locator.
     #[arg(long, default_value = "assets/models/LocateAnything-3B")]
     pub locate_anything_model_root: PathBuf,
 
-    /// Reference runner used by --locator locate-anything.
-    #[arg(
-        long,
-        default_value = "crates/burn_locate_anything/python/locate_anything_reference.py"
-    )]
-    pub locate_anything_reference_script: PathBuf,
-
-    /// Device passed to the explicit upstream LocateAnything reference locator.
-    #[arg(long, default_value = "cuda")]
-    pub locate_anything_device: String,
-
-    /// Image token limit for the explicit LocateAnything reference locator.
+    /// Image token limit for the LocateAnything locator.
     #[arg(long, default_value_t = LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT as usize)]
     pub locate_anything_in_token_limit: usize,
 
     /// LocateAnything execution backend used by scene-ground when --locator locate-anything.
-    #[arg(long, value_enum, default_value_t = LocateAnythingBackend::PythonReference)]
+    #[arg(long, value_enum, default_value_t = LocateAnythingBackend::BurnNative)]
     pub locate_anything_backend: LocateAnythingBackend,
 
     #[command(subcommand)]
@@ -611,10 +595,7 @@ pub struct ServerConfig {
     pub depth_cache_dir: Option<PathBuf>,
     pub depth_precision: SceneDepthPrecision,
     pub depth_allow_download: bool,
-    pub locate_anything_python_bin: Option<PathBuf>,
     pub locate_anything_model_root: PathBuf,
-    pub locate_anything_reference_script: PathBuf,
-    pub locate_anything_device: String,
     pub locate_anything_in_token_limit: usize,
     pub locate_anything_backend: LocateAnythingBackend,
 }
@@ -663,10 +644,7 @@ impl ServerConfig {
             depth_cache_dir: args.depth_cache_dir,
             depth_precision: args.depth_precision,
             depth_allow_download: args.depth_allow_download,
-            locate_anything_python_bin: args.locate_anything_python_bin,
             locate_anything_model_root: args.locate_anything_model_root,
-            locate_anything_reference_script: args.locate_anything_reference_script,
-            locate_anything_device: args.locate_anything_device,
             locate_anything_in_token_limit: args.locate_anything_in_token_limit.max(1),
             locate_anything_backend: args.locate_anything_backend,
         }
@@ -1891,10 +1869,8 @@ impl McpServer {
                 &args.source_scene_path,
                 &output_dir,
             )?;
-            let source = match backend {
-                LocateAnythingBackend::PythonReference => "locate_anything_reference",
-                LocateAnythingBackend::BurnNative => "locate_anything_burn_native",
-            };
+            let LocateAnythingBackend::BurnNative = backend;
+            let source = "locate_anything_burn_native";
             (source, evidence)
         } else {
             ("manifest_fallback", manifest_grounding_evidence(&manifest))
@@ -5793,25 +5769,6 @@ fn estimate_depth_target_footprint(
     Some(footprint)
 }
 
-#[derive(Debug, Deserialize)]
-struct LocateAnythingReferenceResponse {
-    #[serde(default)]
-    load_ms: Option<f64>,
-    #[serde(default)]
-    batch_infer_ms: Option<f64>,
-    #[serde(default)]
-    results: Vec<LocateAnythingReferenceResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocateAnythingReferenceResult {
-    query: String,
-    #[serde(default)]
-    detections: Vec<Detection>,
-    #[serde(default)]
-    timings_ms: Option<HashMap<String, f64>>,
-}
-
 impl McpServer {
     fn locate_anything_grounding_evidence(
         &mut self,
@@ -5820,149 +5777,8 @@ impl McpServer {
         source_scene_path: &Path,
         output_dir: &Path,
     ) -> Result<SceneGroundingEvidence, String> {
-        match backend {
-            LocateAnythingBackend::PythonReference => self
-                .locate_anything_reference_grounding_evidence(
-                    manifest,
-                    source_scene_path,
-                    output_dir,
-                ),
-            LocateAnythingBackend::BurnNative => self
-                .locate_anything_burn_native_grounding_evidence(
-                    manifest,
-                    source_scene_path,
-                    output_dir,
-                ),
-        }
-    }
-
-    fn locate_anything_reference_grounding_evidence(
-        &self,
-        manifest: &SceneObjectManifest,
-        source_scene_path: &Path,
-        output_dir: &Path,
-    ) -> Result<SceneGroundingEvidence, String> {
-        let queries = locate_anything_queries(manifest);
-        if queries.is_empty() {
-            return Err(
-                "LocateAnything locator requires at least one non-empty manifest object label"
-                    .to_string(),
-            );
-        }
-
-        let artifact_dir = output_dir.join("locate_anything_reference");
-        fs::create_dir_all(&artifact_dir).map_err(|err| {
-            format!(
-                "failed to create LocateAnything artifact directory {}: {err}",
-                artifact_dir.display()
-            )
-        })?;
-        let output_path = artifact_dir.join("reference.json");
-        let log_path = artifact_dir.join("reference.log");
-        let python_bin = self.locate_anything_python_bin();
-        let mut command = Command::new(&python_bin);
-        command
-            .arg(&self.config.locate_anything_reference_script)
-            .arg("--model-root")
-            .arg(&self.config.locate_anything_model_root)
-            .arg("--image")
-            .arg(source_scene_path)
-            .arg("--output")
-            .arg(&output_path)
-            .arg("--device")
-            .arg(&self.config.locate_anything_device)
-            .arg("--dtype")
-            .arg("bf16")
-            .arg("--attn")
-            .arg("sdpa")
-            .arg("--generation-mode")
-            .arg("hybrid")
-            .arg("--in-token-limit")
-            .arg(self.config.locate_anything_in_token_limit.to_string())
-            .arg("--max-new-tokens")
-            .arg("1024")
-            .arg("--temperature")
-            .arg("0.0")
-            .env("PYTHONUNBUFFERED", "1");
-        for query in &queries {
-            command.arg("--query").arg(query);
-        }
-
-        let started = Instant::now();
-        let output = command.output().map_err(|err| {
-            format!(
-                "failed to launch LocateAnything reference `{}`: {err}",
-                python_bin.display()
-            )
-        })?;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let mut log = String::new();
-        log.push_str("$ ");
-        log.push_str(&format!("{command:?}\n"));
-        log.push_str("--- stdout ---\n");
-        log.push_str(&String::from_utf8_lossy(&output.stdout));
-        log.push_str("\n--- stderr ---\n");
-        log.push_str(&String::from_utf8_lossy(&output.stderr));
-        log.push_str(&format!("\n--- elapsed_ms: {elapsed_ms:.3} ---\n"));
-        fs::write(&log_path, &log).map_err(|err| {
-            format!(
-                "failed to write LocateAnything reference log {}: {err}",
-                log_path.display()
-            )
-        })?;
-        if !output.status.success() {
-            return Err(format!(
-                "LocateAnything reference failed with status {}; see {}",
-                output.status,
-                log_path.display()
-            ));
-        }
-        let response: LocateAnythingReferenceResponse = read_json_path(&output_path)?;
-        let mut detections = Vec::new();
-        let mut timing_by_query = serde_json::Map::new();
-        for result in &response.results {
-            if let Some(timings) = result.timings_ms.as_ref() {
-                timing_by_query.insert(result.query.clone(), json!(timings));
-            }
-            detections.extend(result.detections.iter().cloned());
-        }
-        if detections.is_empty() {
-            return Err(format!(
-                "LocateAnything reference returned no detections for {} queries; see {}",
-                queries.len(),
-                output_path.display()
-            ));
-        }
-
-        let mut evidence = locate_anything_evidence_from_detections(
-            manifest,
-            source_scene_path,
-            detections,
-            "locate_anything_reference",
-        )?;
-        let metadata = json!({
-            "provider": "locate_anything_reference",
-            "python_bin": python_bin,
-            "model_root": self.config.locate_anything_model_root,
-            "script": self.config.locate_anything_reference_script,
-            "device": self.config.locate_anything_device,
-            "in_token_limit": self.config.locate_anything_in_token_limit,
-            "queries": queries,
-            "load_ms": response.load_ms,
-            "batch_infer_ms": response.batch_infer_ms,
-            "timings_ms": timing_by_query,
-            "elapsed_ms": elapsed_ms,
-            "reference_json": output_path,
-            "reference_log": log_path,
-        });
-        write_json_file(&artifact_dir.join("metadata.json"), &metadata)
-            .map_err(|err| err.to_string())?;
-        for object in &mut evidence.objects {
-            object
-                .provenance
-                .push("locate_anything_reference_scene_ground".to_string());
-        }
-        Ok(evidence)
+        let LocateAnythingBackend::BurnNative = backend;
+        self.locate_anything_burn_native_grounding_evidence(manifest, source_scene_path, output_dir)
     }
 
     fn locate_anything_burn_native_grounding_evidence(
@@ -5998,13 +5814,7 @@ impl McpServer {
             allow_experimental_native_detect: true,
             decode_mode: DecodeMode::Hybrid,
             max_new_tokens: 1024,
-            reference_script: self.config.locate_anything_reference_script.clone(),
-            python_bin: self.config.locate_anything_python_bin.clone(),
-            reference_device: self.config.locate_anything_device.clone(),
-            reference_dtype: "bf16".to_string(),
-            reference_attention: "sdpa".to_string(),
             in_token_limit: self.config.locate_anything_in_token_limit as u32,
-            run_root: artifact_dir.clone(),
             ..LocateAnythingRuntimeConfig::default()
         };
         let cache_key = LocateAnythingBurnNativeCacheKey::from_config(&runtime_config);
@@ -6079,21 +5889,6 @@ impl McpServer {
                 .push("locate_anything_burn_native_scene_ground".to_string());
         }
         Ok(evidence)
-    }
-
-    fn locate_anything_python_bin(&self) -> PathBuf {
-        self.config
-            .locate_anything_python_bin
-            .clone()
-            .or_else(|| env::var_os("LOCATE_ANYTHING_PYTHON").map(PathBuf::from))
-            .unwrap_or_else(|| {
-                let torch_venv = PathBuf::from("/home/mosure/.venvs/torch/bin/python");
-                if torch_venv.exists() {
-                    torch_venv
-                } else {
-                    PathBuf::from("python3")
-                }
-            })
     }
 }
 
@@ -6767,7 +6562,7 @@ fn tool_defs() -> Vec<Value> {
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"] },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"] },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"] },
-                    "locate_anything_backend": { "type": "string", "enum": ["python-reference", "burn-native"], "description": "Optional backend override when locator is locate-anything. Defaults to the server --locate-anything-backend setting." },
+                    "locate_anything_backend": { "type": "string", "enum": ["burn-native"], "description": "Optional backend override when locator is locate-anything. Defaults to the server --locate-anything-backend setting." },
                     "clear_existing": { "type": "boolean" },
                     "apply": { "type": "boolean" },
                     "feedback": { "type": "boolean" },
@@ -7671,7 +7466,7 @@ mod tests {
     }
 
     #[test]
-    fn locate_anything_burn_native_cache_key_ignores_artifact_run_root() {
+    fn locate_anything_burn_native_cache_key_ignores_non_execution_flags() {
         let base = LocateAnythingRuntimeConfig {
             model_root: PathBuf::from("assets/models/LocateAnything-3B"),
             backend: LocateAnythingRuntimeBackend::BurnNative,
@@ -7679,11 +7474,10 @@ mod tests {
             decode_mode: DecodeMode::Hybrid,
             max_new_tokens: 1024,
             in_token_limit: LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT,
-            run_root: PathBuf::from("tmp/runs/a"),
             ..LocateAnythingRuntimeConfig::default()
         };
         let mut same_runtime = base.clone();
-        same_runtime.run_root = PathBuf::from("tmp/runs/b");
+        same_runtime.require_gpu = false;
         assert_eq!(
             LocateAnythingBurnNativeCacheKey::from_config(&base),
             LocateAnythingBurnNativeCacheKey::from_config(&same_runtime)
@@ -7716,8 +7510,13 @@ mod tests {
             eprintln!("skipping LocateAnything MCP cache smoke; repo root not found");
             return;
         };
-        let image_path =
-            PathBuf::from("/media/mosure/dolos/demo/Cisco/reconstruction/045-LYS01-3-Galaxy.jpg");
+        let Some(image_path) = std::env::var_os("LOCATE_ANYTHING_PARITY_IMAGE").map(PathBuf::from)
+        else {
+            eprintln!(
+                "skipping LocateAnything MCP cache smoke; set LOCATE_ANYTHING_PARITY_IMAGE to the reference scene image"
+            );
+            return;
+        };
         let model_root = repo_root.join("assets/models/LocateAnything-3B");
         if !image_path.exists() || !model_root.join("config.json").exists() {
             eprintln!(
@@ -7865,7 +7664,7 @@ mod tests {
             .expect("scene_ground schema");
         assert_eq!(
             scene_ground["inputSchema"]["properties"]["locate_anything_backend"]["enum"],
-            json!(["python-reference", "burn-native"])
+            json!(["burn-native"])
         );
     }
 

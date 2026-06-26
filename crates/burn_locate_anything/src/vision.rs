@@ -963,9 +963,14 @@ mod tests {
             eprintln!("skipping preprocess parity fixture; repo root not found");
             return;
         };
-        let image_path = std::path::Path::new(
-            "/media/mosure/dolos/demo/Cisco/reconstruction/045-LYS01-3-Galaxy.jpg",
-        );
+        let Some(image_path) =
+            std::env::var_os("LOCATE_ANYTHING_PARITY_IMAGE").map(std::path::PathBuf::from)
+        else {
+            eprintln!(
+                "skipping preprocess parity fixture; set LOCATE_ANYTHING_PARITY_IMAGE to the reference scene image"
+            );
+            return;
+        };
         let fixture = root.join(
             "tmp/runs/20260626T020100Z_locateanything_patch_embed_parity_galaxy/preprocess.safetensors",
         );
@@ -977,7 +982,7 @@ mod tests {
             );
             return;
         }
-        let image = image::open(image_path).unwrap();
+        let image = image::open(&image_path).unwrap();
         let out = preprocess_image_to_patches(
             &image,
             &VisionConfig {
