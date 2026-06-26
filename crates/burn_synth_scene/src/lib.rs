@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use burn_locate_anything::Detection;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use image::GenericImageView;
 use image::codecs::jpeg::JpegEncoder;
@@ -227,6 +228,111 @@ pub struct SceneObjectManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_calibration: Option<SceneCalibration>,
     pub objects: Vec<SceneObjectSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneGroundingEvidence {
+    pub source_image_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<DepthEvidenceRef>,
+    #[serde(default)]
+    pub detections: Vec<Detection>,
+    pub camera: EstimatedCamera,
+    pub floor: EstimatedFloorPlane,
+    #[serde(default)]
+    pub objects: Vec<ObjectGroundingEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DepthEvidenceRef {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_length_px: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_fov_degrees: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_map_size: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_sample_count: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct EstimatedCamera {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_length_px: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_point: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_fov_degrees: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct EstimatedFloorPlane {
+    pub normal: [f32; 3],
+    pub distance_m: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_m: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+impl Default for EstimatedFloorPlane {
+    fn default() -> Self {
+        Self {
+            normal: [0.0, 1.0, 0.0],
+            distance_m: 0.0,
+            residual_m: None,
+            confidence: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ObjectGroundingEvidence {
+    pub object_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<Detection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_pixel: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_stats: Option<ObjectDepthStats>,
+    #[serde(default)]
+    pub candidate_floor_contact_rays: Vec<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_contact_point_m: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_footprint_m: Option<[f32; 2]>,
+    #[serde(default)]
+    pub provenance: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ObjectDepthStats {
+    pub median_m: f32,
+    pub min_m: f32,
+    pub max_m: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_m: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_count: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -1191,7 +1297,7 @@ impl SceneAiProvider for OpenAiSceneProvider {
             "plan_scene_bsn",
             &request.prompt,
             scene_bsn_schema(),
-            &[request.source_scene_path.clone()],
+            std::slice::from_ref(&request.source_scene_path),
         )?;
         let bsn = value
             .get("bsn")
@@ -1641,6 +1747,183 @@ pub fn grounded_scene_layout_for_manifest(
     grounded_scene_layout(manifest, assets, config)
 }
 
+pub fn grounded_scene_layout_with_evidence(
+    manifest: &SceneObjectManifest,
+    assets: &[SceneAssetBinding],
+    evidence: &SceneGroundingEvidence,
+) -> SceneResult<GroundedSceneLayout> {
+    let manifest = manifest_with_grounding_evidence(manifest, evidence);
+    let mut config = GroundedSceneLayoutConfig::default();
+    if let Some([width, height]) = evidence
+        .camera
+        .image_size
+        .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.image_size))
+    {
+        config.image_aspect = width.max(1) as f32 / height.max(1) as f32;
+    } else if let Ok(aspect) = image_dimensions_aspect(Path::new(&manifest.source_scene_path)) {
+        config.image_aspect = aspect;
+    }
+    if let Some(vertical_fov) = evidence.camera.vertical_fov_degrees
+        && vertical_fov.is_finite()
+        && vertical_fov > 1.0
+    {
+        config.vertical_fov_degrees = vertical_fov.clamp(20.0, 120.0);
+    }
+    let grounding_geometry = GroundingGeometry::from_evidence(evidence, config.floor_y);
+    grounded_scene_layout_internal(&manifest, assets, config, Some(&grounding_geometry))
+}
+
+pub fn manifest_with_grounding_evidence(
+    manifest: &SceneObjectManifest,
+    evidence: &SceneGroundingEvidence,
+) -> SceneObjectManifest {
+    let mut out = manifest.clone();
+    for object in &mut out.objects {
+        if let Some(object_evidence) = best_object_evidence(evidence, &object.id, None) {
+            apply_object_grounding_evidence(object, object_evidence);
+        }
+        for instance in &mut object.instances {
+            let instance_id = instance.id.as_deref();
+            if let Some(object_evidence) = best_object_evidence(evidence, &object.id, instance_id) {
+                if let Some(detection) = object_evidence.detection.as_ref() {
+                    instance.bbox = normalize_bbox(detection.bbox);
+                }
+                if let Some(contact) = object_evidence
+                    .contact_pixel
+                    .or_else(|| object_evidence.detection.as_ref().and_then(|d| d.point))
+                {
+                    instance.contact = Some(normalize_contact_pixel(contact));
+                }
+                if let Some(footprint) = object_evidence.target_footprint_m {
+                    instance.target_footprint_m = Some(sane_footprint(footprint));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn manifest_grounding_evidence(manifest: &SceneObjectManifest) -> SceneGroundingEvidence {
+    let image_size = image::image_dimensions(&manifest.source_scene_path)
+        .ok()
+        .map(|(width, height)| [width, height]);
+    let mut detections = Vec::new();
+    let mut objects = Vec::new();
+    for object in &manifest.objects {
+        for instance in resolved_object_instances(object) {
+            let source_query = object.label.clone();
+            let detection = Detection {
+                label: object.label.clone(),
+                bbox: instance.bbox,
+                point: Some(instance.contact_pixel),
+                confidence: None,
+                source_query,
+            };
+            detections.push(detection.clone());
+            objects.push(ObjectGroundingEvidence {
+                object_id: object.id.clone(),
+                instance_id: instance.id,
+                reuse_group: object.reuse_group.clone(),
+                detection: Some(detection),
+                asset_id: None,
+                contact_pixel: Some(instance.contact_pixel),
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: vec!["manifest_fallback".to_string()],
+            });
+        }
+    }
+    SceneGroundingEvidence {
+        source_image_path: manifest.source_scene_path.clone(),
+        depth: None,
+        detections,
+        camera: EstimatedCamera {
+            image_size,
+            ..EstimatedCamera::default()
+        },
+        floor: EstimatedFloorPlane::default(),
+        objects,
+    }
+}
+
+fn best_object_evidence<'a>(
+    evidence: &'a SceneGroundingEvidence,
+    object_id: &str,
+    instance_id: Option<&str>,
+) -> Option<&'a ObjectGroundingEvidence> {
+    evidence.objects.iter().find(|object| {
+        object.object_id == object_id
+            && match (instance_id, object.instance_id.as_deref()) {
+                (Some(expected), Some(actual)) => expected == actual,
+                (None, None) => true,
+                (None, Some(_)) => false,
+                (Some(_), None) => false,
+            }
+    })
+}
+
+fn apply_object_grounding_evidence(
+    object: &mut SceneObjectSpec,
+    evidence: &ObjectGroundingEvidence,
+) {
+    if let Some(detection) = evidence.detection.as_ref() {
+        object.bbox = normalize_bbox(detection.bbox);
+        if object.label.trim().is_empty() {
+            object.label = detection.label.clone();
+        }
+    }
+    if let Some(reuse_group) = evidence.reuse_group.as_ref()
+        && object.reuse_group.as_ref() != Some(reuse_group)
+    {
+        object.reuse_group = Some(reuse_group.clone());
+    }
+    if let Some(footprint) = evidence.target_footprint_m {
+        object.target_footprint_m = Some(sane_footprint(footprint));
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct GroundingGeometry {
+    contact_points_by_instance: HashMap<(String, Option<String>), [f32; 3]>,
+}
+
+impl GroundingGeometry {
+    fn from_evidence(evidence: &SceneGroundingEvidence, floor_y: f32) -> Self {
+        let mut out = Self::default();
+        for object in &evidence.objects {
+            let Some(point) = object.metric_contact_point_m else {
+                continue;
+            };
+            if !point.iter().all(|value| value.is_finite()) {
+                continue;
+            }
+            out.contact_points_by_instance.insert(
+                (object.object_id.clone(), object.instance_id.clone()),
+                [point[0], floor_y, point[2]],
+            );
+        }
+        out
+    }
+
+    fn contact_point(
+        &self,
+        object: &SceneObjectSpec,
+        instance: &ResolvedSceneObjectInstance,
+    ) -> Option<[f32; 3]> {
+        let instance_key = (object.id.clone(), instance.id.clone());
+        self.contact_points_by_instance
+            .get(&instance_key)
+            .copied()
+            .or_else(|| {
+                self.contact_points_by_instance
+                    .get(&(object.id.clone(), None))
+                    .copied()
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MetricSceneFrame {
     table_axis_degrees: f32,
@@ -1745,6 +2028,15 @@ pub fn grounded_scene_layout(
     assets: &[SceneAssetBinding],
     config: GroundedSceneLayoutConfig,
 ) -> SceneResult<GroundedSceneLayout> {
+    grounded_scene_layout_internal(manifest, assets, config, None)
+}
+
+fn grounded_scene_layout_internal(
+    manifest: &SceneObjectManifest,
+    assets: &[SceneAssetBinding],
+    config: GroundedSceneLayoutConfig,
+    grounding_geometry: Option<&GroundingGeometry>,
+) -> SceneResult<GroundedSceneLayout> {
     if manifest.objects.is_empty() {
         return Err(SceneError::Validation(
             "grounded scene layout requires at least one object".to_string(),
@@ -1769,7 +2061,14 @@ pub fn grounded_scene_layout(
             resolved_object_instances(object)
                 .into_iter()
                 .next()
-                .map(|instance| object_contact_point(object, &instance, config))
+                .map(|instance| {
+                    object_contact_point_with_geometry(
+                        object,
+                        &instance,
+                        config,
+                        grounding_geometry,
+                    )
+                })
         })
         .transpose()?;
 
@@ -1782,7 +2081,8 @@ pub fn grounded_scene_layout(
             ))
         })?;
         for instance in resolved_object_instances(object) {
-            let contact = object_contact_point(object, &instance, config)?;
+            let contact =
+                object_contact_point_with_geometry(object, &instance, config, grounding_geometry)?;
             raw.push((object, *asset, instance, contact));
         }
     }
@@ -1805,14 +2105,20 @@ pub fn grounded_scene_layout(
         let asset_frame = scene_asset_frame(asset, object, local_aabb);
         let target_footprint = target_footprint_m(object, &instance, asset_frame, metric_frame);
         let scale_value = uniform_asset_scale(local_aabb, target_footprint);
-        let ground_point = metric_ground_point(
-            object,
-            &instance,
-            target_footprint,
-            metric_frame,
-            side_slots.get(&raw_index).copied(),
-        )
-        .unwrap_or([contact[0] - center_x, config.floor_y, contact[2] - center_z]);
+        let depth_ground_point = grounding_geometry
+            .and_then(|geometry| geometry.contact_point(object, &instance))
+            .map(|point| [point[0] - center_x, config.floor_y, point[2] - center_z]);
+        let ground_point = depth_ground_point
+            .or_else(|| {
+                metric_ground_point(
+                    object,
+                    &instance,
+                    target_footprint,
+                    metric_frame,
+                    side_slots.get(&raw_index).copied(),
+                )
+            })
+            .unwrap_or([contact[0] - center_x, config.floor_y, contact[2] - center_z]);
         let translation = [
             ground_point[0],
             config.floor_y - local_aabb.min[1] * scale_value,
@@ -1873,6 +2179,20 @@ pub fn grounded_scene_layout(
         rug_center,
         rug_scale,
     })
+}
+
+fn object_contact_point_with_geometry(
+    object: &SceneObjectSpec,
+    instance: &ResolvedSceneObjectInstance,
+    config: GroundedSceneLayoutConfig,
+    grounding_geometry: Option<&GroundingGeometry>,
+) -> SceneResult<[f32; 3]> {
+    if let Some(point) =
+        grounding_geometry.and_then(|geometry| geometry.contact_point(object, instance))
+    {
+        return Ok(point);
+    }
+    object_contact_point(object, instance, config)
 }
 
 fn object_contact_point(
@@ -2200,10 +2520,9 @@ fn grounded_yaw_degrees(
     }
     if let (Some(frame), Some(side)) = (metric_frame, instance.side)
         && side != SceneInstanceSide::Unknown
+        && let Some(yaw) = bsn_yaw_toward_point_degrees(from, frame.table_point())
     {
-        if let Some(yaw) = bsn_yaw_toward_point_degrees(from, frame.table_point()) {
-            return yaw;
-        }
+        return yaw;
     }
     let Some(target) = table else {
         return 0.0;
@@ -2235,11 +2554,6 @@ fn scene_asset_frame(
         let yaw_offset = if size[0] > size[2] * 1.15 { 90.0 } else { 0.0 };
         SceneAssetFrame {
             yaw_offset_degrees: yaw_offset,
-            footprint_m,
-        }
-    } else if descriptor.contains("chair") {
-        SceneAssetFrame {
-            yaw_offset_degrees: 0.0,
             footprint_m,
         }
     } else {
@@ -2898,7 +3212,7 @@ fn parse_spawn_line(line: &str) -> SceneResult<ScenePlacement> {
     for value in translation
         .into_iter()
         .chain([rotation_y_degrees])
-        .chain(scale.into_iter())
+        .chain(scale)
     {
         if !value.is_finite() {
             return Err(SceneError::Validation(format!(
@@ -3202,6 +3516,256 @@ mod tests {
             .write_to(&mut cursor, image::ImageFormat::Png)
             .unwrap();
         cursor.into_inner()
+    }
+
+    #[test]
+    fn grounding_evidence_overrides_manifest_bbox_and_contact() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.png".to_string(),
+            scene_calibration: None,
+            objects: vec![SceneObjectSpec {
+                id: "chair".to_string(),
+                label: "chair".to_string(),
+                aliases: Vec::new(),
+                bbox: [0.1, 0.2, 0.3, 0.8],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: None,
+                instance_count: 1,
+                object_prompt: "chair".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            }],
+        };
+        let mut evidence = manifest_grounding_evidence(&manifest);
+        let object = evidence.objects.first_mut().unwrap();
+        object.detection.as_mut().unwrap().bbox = [0.2, 0.3, 0.4, 0.9];
+        object.contact_pixel = Some([0.33, 0.88]);
+
+        let adjusted = manifest_with_grounding_evidence(&manifest, &evidence);
+
+        assert_eq!(adjusted.objects[0].bbox, [0.2, 0.3, 0.4, 0.9]);
+        assert_eq!(evidence.detections.len(), 1);
+        assert_eq!(evidence.objects[0].provenance, ["manifest_fallback"]);
+    }
+
+    #[test]
+    fn depth_grounding_evidence_drives_metric_contact_points_and_scale() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/depth_scene.jpg".to_string(),
+            scene_calibration: None,
+            objects: vec![
+                SceneObjectSpec {
+                    id: "conference_table".to_string(),
+                    label: "conference table".to_string(),
+                    aliases: vec!["table".to_string()],
+                    bbox: [0.35, 0.40, 0.65, 0.74],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: None,
+                    instance_count: 1,
+                    object_prompt: "large conference table".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: None,
+                },
+                SceneObjectSpec {
+                    id: "chair_group".to_string(),
+                    label: "conference chair".to_string(),
+                    aliases: vec!["chair".to_string()],
+                    bbox: [0.68, 0.50, 0.82, 0.92],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: Some("conference_chair".to_string()),
+                    instance_count: 1,
+                    object_prompt: "conference chair".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: None,
+                },
+            ],
+        };
+        let assets = vec![
+            SceneAssetBinding {
+                asset_id: "conference_table_asset".to_string(),
+                object_id: "conference_table".to_string(),
+                label: "conference table".to_string(),
+                aliases: Vec::new(),
+                path: None,
+                cache_key: Some("table".to_string()),
+                reusable: true,
+                source_image_path: None,
+                pipeline: Some("trellis".to_string()),
+                local_aabb: Some(SceneAssetAabb {
+                    min: [-0.5, 0.0, -0.5],
+                    max: [0.5, 0.35, 0.5],
+                }),
+                canonical_frame: None,
+                provenance: None,
+            },
+            chair_asset(),
+        ];
+        let mut evidence = manifest_grounding_evidence(&manifest);
+        for object in &mut evidence.objects {
+            match object.object_id.as_str() {
+                "conference_table" => {
+                    object.metric_contact_point_m = Some([2.0, 0.4, 5.0]);
+                    object.target_footprint_m = Some([2.4, 1.0]);
+                    object.provenance.push("depth_pro".to_string());
+                }
+                "chair_group" => {
+                    object.metric_contact_point_m = Some([3.4, 0.8, 6.6]);
+                    object.target_footprint_m = Some([0.72, 0.76]);
+                    object.provenance.push("depth_pro".to_string());
+                }
+                _ => {}
+            }
+        }
+
+        let layout = grounded_scene_layout_with_evidence(&manifest, &assets, &evidence).unwrap();
+        let table = layout
+            .placements
+            .iter()
+            .find(|placement| placement.object_id == "conference_table")
+            .unwrap();
+        let chair = layout
+            .placements
+            .iter()
+            .find(|placement| placement.object_id == "chair_group")
+            .unwrap();
+
+        assert_eq!(table.ground_point, [0.0, 0.0, 0.0]);
+        assert!((chair.ground_point[0] - 1.4).abs() < 1.0e-4);
+        assert!((chair.ground_point[2] - 1.6).abs() < 1.0e-4);
+        assert_eq!(chair.target_footprint_m, [0.72, 0.76]);
+        assert!(chair.scale[0] > 0.7);
+        parse_scene_bsn(&layout.bsn, &assets).expect("depth-grounded BSN parses");
+    }
+
+    #[test]
+    fn depth_metric_contact_overrides_calibrated_side_slot_layout() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/depth_calibrated_scene.jpg".to_string(),
+            scene_calibration: Some(SceneCalibration {
+                table_center: Some([0.5, 0.62]),
+                table_axis_degrees: Some(0.0),
+                table_size_m: Some([1.2, 3.4]),
+                camera_yaw_degrees: Some(0.0),
+                camera_pitch_degrees: Some(-30.0),
+                camera_radius_m: Some(5.0),
+                vertical_fov_degrees: Some(78.0),
+            }),
+            objects: vec![
+                SceneObjectSpec {
+                    id: "conference_table".to_string(),
+                    label: "conference table".to_string(),
+                    aliases: vec!["table".to_string()],
+                    bbox: [0.35, 0.35, 0.65, 0.85],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: None,
+                    instance_count: 1,
+                    object_prompt: "large rectangular conference table".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: Some([1.2, 3.4]),
+                },
+                SceneObjectSpec {
+                    id: "chair_group".to_string(),
+                    label: "conference chair".to_string(),
+                    aliases: vec!["chair".to_string()],
+                    bbox: [0.70, 0.40, 0.82, 0.82],
+                    instances: vec![SceneObjectInstanceSpec {
+                        id: Some("right_01".to_string()),
+                        bbox: [0.70, 0.40, 0.82, 0.82],
+                        contact: Some([0.76, 0.82]),
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: Some(SceneInstanceSide::Right),
+                        slot_index: Some(0),
+                        target_footprint_m: Some([0.58, 0.62]),
+                    }],
+                    representative_instance_id: Some("right_01".to_string()),
+                    reuse_group: Some("conference_chair".to_string()),
+                    instance_count: 1,
+                    object_prompt: "conference chair".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: Some([0.58, 0.62]),
+                },
+            ],
+        };
+        let assets = vec![
+            SceneAssetBinding {
+                asset_id: "conference_table_asset".to_string(),
+                object_id: "conference_table".to_string(),
+                label: "conference table".to_string(),
+                aliases: Vec::new(),
+                path: None,
+                cache_key: Some("table".to_string()),
+                reusable: true,
+                source_image_path: None,
+                pipeline: Some("trellis".to_string()),
+                local_aabb: Some(SceneAssetAabb {
+                    min: [-0.35, 0.0, -1.0],
+                    max: [0.35, 0.32, 1.0],
+                }),
+                canonical_frame: Some(SceneAssetFrame {
+                    yaw_offset_degrees: 0.0,
+                    footprint_m: Some([1.2, 3.4]),
+                }),
+                provenance: None,
+            },
+            chair_asset(),
+        ];
+        let slot_layout =
+            grounded_scene_layout(&manifest, &assets, GroundedSceneLayoutConfig::default())
+                .expect("slot-only grounded layout");
+        let slot_chair = slot_layout
+            .placements
+            .iter()
+            .find(|placement| placement.object_id == "chair_group")
+            .unwrap();
+        assert!(slot_chair.ground_point[0] > 0.9);
+        assert!(slot_chair.ground_point[2].abs() < 0.1);
+
+        let mut evidence = manifest_grounding_evidence(&manifest);
+        for object in &mut evidence.objects {
+            match (object.object_id.as_str(), object.instance_id.as_deref()) {
+                ("conference_table", None) => {
+                    object.metric_contact_point_m = Some([2.0, 0.4, 5.0]);
+                    object.target_footprint_m = Some([1.2, 3.4]);
+                    object.provenance.push("depth_pro".to_string());
+                }
+                ("chair_group", Some("right_01")) => {
+                    object.metric_contact_point_m = Some([5.0, 0.8, 9.0]);
+                    object.target_footprint_m = Some([0.58, 0.62]);
+                    object.provenance.push("depth_pro".to_string());
+                }
+                _ => {}
+            }
+        }
+
+        let depth_layout =
+            grounded_scene_layout_with_evidence(&manifest, &assets, &evidence).unwrap();
+        let table = depth_layout
+            .placements
+            .iter()
+            .find(|placement| placement.object_id == "conference_table")
+            .unwrap();
+        let chair = depth_layout
+            .placements
+            .iter()
+            .find(|placement| placement.object_id == "chair_group")
+            .unwrap();
+
+        assert_eq!(table.ground_point, [0.0, 0.0, 0.0]);
+        assert!((chair.ground_point[0] - 3.0).abs() < 1.0e-4);
+        assert!((chair.ground_point[2] - 4.0).abs() < 1.0e-4);
+        assert!((chair.ground_point[0] - slot_chair.ground_point[0]).abs() > 1.0);
+        assert!((chair.ground_point[2] - slot_chair.ground_point[2]).abs() > 1.0);
+        parse_scene_bsn(&depth_layout.bsn, &assets).expect("depth-calibrated BSN parses");
     }
 
     #[test]

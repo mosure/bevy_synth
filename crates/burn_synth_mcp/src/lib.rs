@@ -18,18 +18,31 @@ use bevy_synth_runtime::{
     SynthMeshPbrTextures as CachedSynthMeshPbrTextures, SynthMeshTexture as CachedSynthMeshTexture,
     TripoMesh as CachedTripoMesh,
 };
+use burn::prelude::{Backend, Tensor};
+use burn_depth::{
+    CameraIntrinsics, DepthCheckpointSource, DepthLoadConfig, DepthLoadEvent, DepthLoadStage,
+    DepthModelKind, DepthPipeline, DepthPrecision, DepthRuntimeConfig, ImageBoundingBox,
+    backproject_depth, depth_at_bbox_contact_region, estimate_floor_plane, pixel_to_ray,
+};
+use burn_locate_anything::{
+    DecodeMode, Detection, DetectionQuery, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT,
+    LocateAnythingDetector, LocateAnythingRuntime, LocateAnythingRuntimeBackend,
+    LocateAnythingRuntimeConfig,
+};
 use burn_synth::{
     AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, ModelSelection,
     RuntimeBatchPolicy, RuntimeConfig, SynthRuntime, SynthesisAsset, mesh_quality_failures,
     mesh_quality_metrics, write_glb_mesh,
 };
 use burn_synth_scene::{
-    DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, GroundedSceneLayout, GroundedScenePlacement,
+    DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, DepthEvidenceRef, EstimatedFloorPlane,
+    GroundedSceneLayout, GroundedScenePlacement, ObjectDepthStats, ObjectGroundingEvidence,
     ObjectImageGenerationPolicy, OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider,
     SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneBsnRequest, SceneBuildConfig,
-    SceneObjectManifest, ScenePipeline, SceneQualityProfile, SceneReasoningRequest, SceneResult,
-    grounded_scene_layout_for_manifest, parse_scene_bsn, scene_plan_to_mcp_commands,
-    write_json_file,
+    SceneGroundingEvidence, SceneObjectInstanceSpec, SceneObjectManifest, SceneObjectSpec,
+    ScenePipeline, SceneQualityProfile, SceneReasoningRequest, SceneResult,
+    grounded_scene_layout_for_manifest, grounded_scene_layout_with_evidence,
+    manifest_grounding_evidence, parse_scene_bsn, scene_plan_to_mcp_commands, write_json_file,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -154,6 +167,50 @@ pub enum AssetOutputFormat {
     Ply,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneCompositionMode {
+    Heuristic,
+    CvGrounded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneDepthProvider {
+    None,
+    DepthPro,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SceneDepthPrecision {
+    F32,
+    F16,
+}
+
+impl From<SceneDepthPrecision> for DepthPrecision {
+    fn from(value: SceneDepthPrecision) -> Self {
+        match value {
+            SceneDepthPrecision::F32 => DepthPrecision::F32,
+            SceneDepthPrecision::F16 => DepthPrecision::F16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneLocatorProvider {
+    Manifest,
+    LocateAnything,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocateAnythingBackend {
+    PythonReference,
+    BurnNative,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "burn_synth_mcp",
@@ -254,14 +311,56 @@ pub struct ServerArgs {
     #[arg(long, default_value = "docs/input_chair.jpg")]
     pub scene_object_reference_image: PathBuf,
 
+    /// Local cache directory for burn_depth CDN model shards and assembled .bpk artifacts.
+    #[arg(long)]
+    pub depth_cache_dir: Option<PathBuf>,
+
+    /// Precision used for the burn_depth DepthPro checkpoint.
+    #[arg(long, value_enum, default_value_t = SceneDepthPrecision::F16)]
+    pub depth_precision: SceneDepthPrecision,
+
+    /// Allow burn_depth to download missing CDN model shards.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub depth_allow_download: bool,
+
+    /// Python executable for the explicit upstream LocateAnything reference locator.
+    #[arg(long)]
+    pub locate_anything_python_bin: Option<PathBuf>,
+
+    /// Local LocateAnything HF snapshot root used by the explicit reference locator.
+    #[arg(long, default_value = "assets/models/LocateAnything-3B")]
+    pub locate_anything_model_root: PathBuf,
+
+    /// Reference runner used by --locator locate-anything.
+    #[arg(
+        long,
+        default_value = "crates/burn_locate_anything/python/locate_anything_reference.py"
+    )]
+    pub locate_anything_reference_script: PathBuf,
+
+    /// Device passed to the explicit upstream LocateAnything reference locator.
+    #[arg(long, default_value = "cuda")]
+    pub locate_anything_device: String,
+
+    /// Image token limit for the explicit LocateAnything reference locator.
+    #[arg(long, default_value_t = LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT as usize)]
+    pub locate_anything_in_token_limit: usize,
+
+    /// LocateAnything execution backend used by scene-ground when --locator locate-anything.
+    #[arg(long, value_enum, default_value_t = LocateAnythingBackend::PythonReference)]
+    pub locate_anything_backend: LocateAnythingBackend,
+
     #[command(subcommand)]
     command: Option<ServerCommand>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 enum ServerCommand {
     /// Run the full source-scene image -> object images -> assets -> grounded BSN pipeline once.
     SceneBuild(SceneBuildCliArgs),
+    /// Recompute scene composition from saved assets and grounding evidence without regenerating assets.
+    SceneGround(SceneGroundCliArgs),
     /// Replay render-capture-feedback using existing scene-build artifacts.
     SceneFeedbackReplay(SceneFeedbackReplayCliArgs),
 }
@@ -366,6 +465,73 @@ struct SceneBuildCliArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct SceneGroundCliArgs {
+    /// Source scene image path.
+    #[arg(long, visible_alias = "scene")]
+    pub source_scene_path: PathBuf,
+
+    /// Existing object manifest JSON.
+    #[arg(long)]
+    pub manifest: PathBuf,
+
+    /// Existing asset bindings JSON produced by scene-build/images_to_assets.
+    #[arg(long)]
+    pub asset_bindings: PathBuf,
+
+    /// Optional grounding evidence JSON. When omitted, manifest bbox/contact evidence is used.
+    #[arg(long)]
+    pub grounding_evidence: Option<PathBuf>,
+
+    /// Output directory for grounded layout, BSN, commands, and metrics.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Composition mode. cv-grounded writes evidence artifacts and uses the evidence adapter.
+    #[arg(long, value_enum, default_value_t = SceneCompositionMode::CvGrounded)]
+    pub composition_mode: SceneCompositionMode,
+
+    /// Depth provider identifier for run metadata.
+    #[arg(long, value_enum, default_value_t = SceneDepthProvider::DepthPro)]
+    pub depth_provider: SceneDepthProvider,
+
+    /// Locator provider identifier for run metadata.
+    #[arg(long, value_enum, default_value_t = SceneLocatorProvider::Manifest)]
+    pub locator: SceneLocatorProvider,
+
+    /// Override the server LocateAnything backend for this scene-ground run.
+    #[arg(long, value_enum)]
+    pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Clear the live Bevy scene before applying generated commands.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub clear_existing: bool,
+
+    /// Apply the generated scene to the configured Bevy scene bridge.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Run bounded render-capture-feedback layout validation/refinement.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback: bool,
+
+    /// Maximum render-capture-feedback iterations.
+    #[arg(long, default_value_t = 3)]
+    pub feedback_iters: usize,
+
+    /// Leave a temporary feedback viewer running after scene-ground completes.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback_keep_viewer: bool,
+
+    /// Optional directory for feedback screenshots, status, metrics, and deltas.
+    #[arg(long)]
+    pub feedback_capture_dir: Option<PathBuf>,
+
+    /// Geometry-first feedback pass/fail threshold profile.
+    #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+}
+
+#[derive(Args, Debug, Clone)]
 struct SceneFeedbackReplayCliArgs {
     /// Existing scene-build output directory with manifest/assets/layout/commands artifacts.
     #[arg(long)]
@@ -442,6 +608,15 @@ pub struct ServerConfig {
     pub openai_reasoning_model: String,
     pub openai_image_model: String,
     pub scene_object_reference_image: PathBuf,
+    pub depth_cache_dir: Option<PathBuf>,
+    pub depth_precision: SceneDepthPrecision,
+    pub depth_allow_download: bool,
+    pub locate_anything_python_bin: Option<PathBuf>,
+    pub locate_anything_model_root: PathBuf,
+    pub locate_anything_reference_script: PathBuf,
+    pub locate_anything_device: String,
+    pub locate_anything_in_token_limit: usize,
+    pub locate_anything_backend: LocateAnythingBackend,
 }
 
 impl ServerConfig {
@@ -485,6 +660,15 @@ impl ServerConfig {
             openai_reasoning_model: args.openai_reasoning_model,
             openai_image_model: args.openai_image_model,
             scene_object_reference_image: args.scene_object_reference_image,
+            depth_cache_dir: args.depth_cache_dir,
+            depth_precision: args.depth_precision,
+            depth_allow_download: args.depth_allow_download,
+            locate_anything_python_bin: args.locate_anything_python_bin,
+            locate_anything_model_root: args.locate_anything_model_root,
+            locate_anything_reference_script: args.locate_anything_reference_script,
+            locate_anything_device: args.locate_anything_device,
+            locate_anything_in_token_limit: args.locate_anything_in_token_limit.max(1),
+            locate_anything_backend: args.locate_anything_backend,
         }
     }
 
@@ -525,6 +709,7 @@ pub fn run_from_args(args: ServerArgs) -> Result<(), String> {
     let config = ServerConfig::from_args(args);
     match command {
         Some(ServerCommand::SceneBuild(args)) => run_scene_build_command(config, args),
+        Some(ServerCommand::SceneGround(args)) => run_scene_ground_command(config, args),
         Some(ServerCommand::SceneFeedbackReplay(args)) => {
             run_scene_feedback_replay_command(config, args)
         }
@@ -564,6 +749,38 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         "{}",
         serde_json::to_string_pretty(&response)
             .map_err(|err| format!("serialize scene-build response: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let response = server.call_scene_ground(SceneGroundToolArgs {
+        source_scene_path: args.source_scene_path,
+        manifest: read_json_path(&args.manifest)?,
+        asset_bindings: read_json_path(&args.asset_bindings)?,
+        grounding_evidence: args
+            .grounding_evidence
+            .as_ref()
+            .map(|path| read_json_path::<SceneGroundingEvidence>(path.as_path()))
+            .transpose()?,
+        output_dir: args.output_dir,
+        composition_mode: args.composition_mode,
+        depth_provider: args.depth_provider,
+        locator: args.locator,
+        locate_anything_backend: args.locate_anything_backend,
+        clear_existing: args.clear_existing,
+        apply: args.apply,
+        feedback: args.feedback,
+        feedback_iters: args.feedback_iters,
+        feedback_keep_viewer: args.feedback_keep_viewer,
+        feedback_capture_dir: args.feedback_capture_dir,
+        feedback_threshold_profile: args.feedback_threshold_profile,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-ground response: {err}"))?
     );
     Ok(())
 }
@@ -652,7 +869,38 @@ pub fn run_stdio_server(config: ServerConfig) -> Result<(), String> {
 struct McpServer {
     config: ServerConfig,
     runtime: SynthRuntime,
+    locate_anything_burn_native_runtime: Option<CachedLocateAnythingRuntime>,
     should_exit: bool,
+}
+
+struct CachedLocateAnythingRuntime {
+    key: LocateAnythingBurnNativeCacheKey,
+    runtime: LocateAnythingRuntime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocateAnythingBurnNativeCacheKey {
+    model_root: PathBuf,
+    decode_mode: DecodeMode,
+    max_new_tokens: usize,
+    in_token_limit: u32,
+    repetition_penalty_bits: u32,
+    top_p_bits: Option<u32>,
+    top_k: Option<usize>,
+}
+
+impl LocateAnythingBurnNativeCacheKey {
+    fn from_config(config: &LocateAnythingRuntimeConfig) -> Self {
+        Self {
+            model_root: config.model_root.clone(),
+            decode_mode: config.decode_mode,
+            max_new_tokens: config.max_new_tokens,
+            in_token_limit: config.in_token_limit,
+            repetition_penalty_bits: config.repetition_penalty.to_bits(),
+            top_p_bits: config.top_p.map(f32::to_bits),
+            top_k: config.top_k,
+        }
+    }
 }
 
 struct NoopSceneProvider;
@@ -686,6 +934,7 @@ impl McpServer {
         Self {
             config,
             runtime,
+            locate_anything_burn_native_runtime: None,
             should_exit: false,
         }
     }
@@ -857,6 +1106,18 @@ impl McpServer {
                     Err(err) => error_tool_result(format!(
                         "invalid arguments for scene_build_from_image: {err}"
                     )),
+                }
+            }
+            "scene_ground" => {
+                let args: Result<SceneGroundToolArgs, _> = serde_json::from_value(params.arguments);
+                match args {
+                    Ok(args) => match self.call_scene_ground(args) {
+                        Ok(value) => success_tool_result(value),
+                        Err(err) => error_tool_result(err),
+                    },
+                    Err(err) => {
+                        error_tool_result(format!("invalid arguments for scene_ground: {err}"))
+                    }
                 }
             }
             "scene_plan_bsn" => {
@@ -1605,6 +1866,143 @@ impl McpServer {
         Ok(response)
     }
 
+    fn call_scene_ground(&mut self, args: SceneGroundToolArgs) -> Result<Value, String> {
+        let started = Instant::now();
+        let output_dir = args.output_dir.unwrap_or_else(default_scene_output_dir);
+        fs::create_dir_all(&output_dir).map_err(|err| {
+            format!(
+                "failed to create scene-ground output directory {}: {err}",
+                output_dir.display()
+            )
+        })?;
+        let mut stage_report = Vec::new();
+        let stage_started = Instant::now();
+        let mut manifest = args.manifest;
+        manifest.source_scene_path = args.source_scene_path.display().to_string();
+        let (grounding_source, mut evidence) = if let Some(evidence) = args.grounding_evidence {
+            ("provided", evidence)
+        } else if args.locator == SceneLocatorProvider::LocateAnything {
+            let backend = args
+                .locate_anything_backend
+                .unwrap_or(self.config.locate_anything_backend);
+            let evidence = self.locate_anything_grounding_evidence(
+                backend,
+                &manifest,
+                &args.source_scene_path,
+                &output_dir,
+            )?;
+            let source = match backend {
+                LocateAnythingBackend::PythonReference => "locate_anything_reference",
+                LocateAnythingBackend::BurnNative => "locate_anything_burn_native",
+            };
+            (source, evidence)
+        } else {
+            ("manifest_fallback", manifest_grounding_evidence(&manifest))
+        };
+        record_stage(&mut stage_report, "load_grounding_evidence", stage_started);
+
+        if args.depth_provider == SceneDepthProvider::DepthPro && evidence.depth.is_none() {
+            let stage_started = Instant::now();
+            self.depth_pro_grounding_evidence(&mut evidence, &args.source_scene_path, &output_dir)?;
+            record_stage(
+                &mut stage_report,
+                "depth_pro_grounding_evidence",
+                stage_started,
+            );
+        }
+
+        let stage_started = Instant::now();
+        let grounded_layout = match args.composition_mode {
+            SceneCompositionMode::Heuristic => {
+                grounded_scene_layout_for_manifest(&manifest, &args.asset_bindings)
+            }
+            SceneCompositionMode::CvGrounded => {
+                grounded_scene_layout_with_evidence(&manifest, &args.asset_bindings, &evidence)
+            }
+        }
+        .map_err(|err| err.to_string())?;
+        let bsn = grounded_layout.bsn.clone();
+        let plan = parse_scene_bsn(&bsn, &args.asset_bindings).map_err(|err| err.to_string())?;
+        let mut commands = scene_commands_with_cache_reload(
+            scene_plan_to_mcp_commands(&plan, &args.asset_bindings, args.clear_existing)
+                .map_err(|err| err.to_string())?,
+        );
+        record_stage(&mut stage_report, "solve_grounded_scene", stage_started);
+
+        let mut response = json!({
+            "tool": "scene_ground",
+            "source_scene_path": args.source_scene_path,
+            "composition_mode": args.composition_mode,
+            "depth_provider": args.depth_provider,
+            "locator": args.locator,
+            "grounding_source": grounding_source,
+            "manifest": manifest,
+            "asset_bindings": args.asset_bindings,
+            "grounding_evidence": evidence,
+            "grounded_layout": grounded_layout,
+            "bsn": bsn,
+            "plan": plan,
+            "commands": commands,
+            "clear_existing": args.clear_existing,
+            "apply": args.apply,
+        });
+
+        if args.feedback {
+            let stage_started = Instant::now();
+            let manifest_value = response["manifest"].clone();
+            let asset_bindings_value = response["asset_bindings"].clone();
+            let grounded_layout_value = response["grounded_layout"].clone();
+            let manifest: SceneObjectManifest = serde_json::from_value(manifest_value)
+                .map_err(|err| format!("decode scene-ground manifest: {err}"))?;
+            let asset_bindings: Vec<SceneAssetBinding> =
+                serde_json::from_value(asset_bindings_value)
+                    .map_err(|err| format!("decode scene-ground asset bindings: {err}"))?;
+            let grounded_layout: GroundedSceneLayout =
+                serde_json::from_value(grounded_layout_value)
+                    .map_err(|err| format!("decode scene-ground layout: {err}"))?;
+            let feedback = self.run_scene_feedback(
+                &output_dir,
+                &manifest,
+                &asset_bindings,
+                &grounded_layout,
+                commands.clone(),
+                SceneFeedbackOptions {
+                    max_iters: args.feedback_iters,
+                    keep_viewer: args.feedback_keep_viewer,
+                    capture_dir: args.feedback_capture_dir.clone(),
+                    threshold_profile: args.feedback_threshold_profile,
+                },
+            )?;
+            if let Some(final_commands) = feedback
+                .get("final_commands")
+                .and_then(Value::as_array)
+                .cloned()
+            {
+                commands = final_commands;
+                response["commands"] = json!(commands);
+            }
+            response["feedback"] = feedback;
+            record_stage(&mut stage_report, "render_capture_feedback", stage_started);
+        }
+
+        if args.apply && !args.feedback {
+            let stage_started = Instant::now();
+            let acknowledgement = self.send_scene_commands(commands)?;
+            response["acknowledgement"] = acknowledgement;
+            record_stage(&mut stage_report, "apply_scene_commands", stage_started);
+        }
+
+        response["stage_report"] = json!(stage_report);
+        response["e2e_summary"] = json!({
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "objects": response["grounded_layout"]["placements"].as_array().map(Vec::len).unwrap_or_default(),
+            "composition_mode": response["composition_mode"],
+            "grounding_source": response["grounding_source"],
+        });
+        write_scene_ground_artifacts(&output_dir, &response)?;
+        Ok(response)
+    }
+
     fn call_scene_apply_bsn(&self, args: SceneApplyBsnArgs) -> Result<Value, String> {
         let plan =
             parse_scene_bsn(&args.bsn, &args.asset_bindings).map_err(|err| err.to_string())?;
@@ -1842,15 +2240,16 @@ impl McpServer {
         let feedback_result = match lock_result {
             Ok(lock_ack) => {
                 let _ = write_json_file(&capture_root.join("interaction_lock_ack.json"), &lock_ack);
-                let mut result = self.run_scene_feedback_iterations(
-                    &capture_root,
-                    manifest,
-                    asset_bindings,
-                    grounded_layout,
-                    initial_commands,
-                    options.max_iters.max(1),
-                    options.threshold_profile,
-                );
+                let mut result =
+                    self.run_scene_feedback_iterations(SceneFeedbackIterationContext {
+                        capture_root: &capture_root,
+                        manifest,
+                        asset_bindings,
+                        grounded_layout,
+                        initial_commands,
+                        max_iters: options.max_iters.max(1),
+                        threshold_profile: options.threshold_profile,
+                    });
                 if let Ok(value) = &mut result {
                     value["interaction_lock_ack"] = lock_ack;
                 }
@@ -1899,14 +2298,17 @@ impl McpServer {
 
     fn run_scene_feedback_iterations(
         &self,
-        capture_root: &Path,
-        manifest: &SceneObjectManifest,
-        asset_bindings: &[SceneAssetBinding],
-        grounded_layout: &GroundedSceneLayout,
-        initial_commands: Vec<Value>,
-        max_iters: usize,
-        threshold_profile: FeedbackThresholdProfile,
+        context: SceneFeedbackIterationContext<'_>,
     ) -> Result<Value, String> {
+        let SceneFeedbackIterationContext {
+            capture_root,
+            manifest,
+            asset_bindings,
+            grounded_layout,
+            initial_commands,
+            max_iters,
+            threshold_profile,
+        } = context;
         let mut commands = initial_commands;
         let thresholds = threshold_profile.thresholds();
         let mut iterations = Vec::new();
@@ -2860,29 +3262,29 @@ fn feedback_project_delta_collisions(
                             }
                         }
                     }
-                    "seating_seating" => {
+                    "seating_seating"
                         if overlap_fraction_smaller
                             > thresholds.max_seating_seating_overlap_fraction
-                            || signed_clearance_m < -thresholds.max_seating_seating_penetration_m
-                        {
-                            let [left_delta, right_delta] =
-                                seating_pair_separation_delta(left, right, signed_clearance_m);
-                            let left_changed = apply_projected_delta(
-                                deltas,
-                                &mut footprints,
-                                left.index,
-                                left_delta,
-                                1.25,
-                            );
-                            let right_changed = apply_projected_delta(
-                                deltas,
-                                &mut footprints,
-                                right.index,
-                                right_delta,
-                                1.25,
-                            );
-                            changed |= left_changed || right_changed;
-                        }
+                            || signed_clearance_m
+                                < -thresholds.max_seating_seating_penetration_m =>
+                    {
+                        let [left_delta, right_delta] =
+                            seating_pair_separation_delta(left, right, signed_clearance_m);
+                        let left_changed = apply_projected_delta(
+                            deltas,
+                            &mut footprints,
+                            left.index,
+                            left_delta,
+                            1.25,
+                        );
+                        let right_changed = apply_projected_delta(
+                            deltas,
+                            &mut footprints,
+                            right.index,
+                            right_delta,
+                            1.25,
+                        );
+                        changed |= left_changed || right_changed;
                     }
                     _ => {}
                 }
@@ -3586,8 +3988,8 @@ fn feedback_physical_layout(
         let Some(left) = footprints[left_index] else {
             continue;
         };
-        for right_index in (left_index + 1)..footprints.len() {
-            let Some(right) = footprints[right_index] else {
+        for right in footprints.iter().skip(left_index + 1) {
+            let Some(right) = *right else {
                 continue;
             };
             let overlap_area = left.rect.overlap_area(right.rect);
@@ -3751,14 +4153,13 @@ fn feedback_predictive_physical_delta(
                     );
                 }
             }
-            "seating_seating" => {
+            "seating_seating"
                 if overlap_fraction_smaller > thresholds.max_seating_seating_overlap_fraction
-                    || signed_clearance_m < -thresholds.max_seating_seating_penetration_m
-                {
-                    let [self_delta, _other_delta] =
-                        seating_pair_separation_delta(predicted, other, signed_clearance_m);
-                    correction = add3(correction, self_delta);
-                }
+                    || signed_clearance_m < -thresholds.max_seating_seating_penetration_m =>
+            {
+                let [self_delta, _other_delta] =
+                    seating_pair_separation_delta(predicted, other, signed_clearance_m);
+                correction = add3(correction, self_delta);
             }
             _ => {}
         }
@@ -4438,11 +4839,14 @@ fn inferred_scene_asset_frame(
 ) -> SceneAssetFrame {
     let descriptor = format!("{} {}", label, aliases.join(" ")).to_ascii_lowercase();
     let yaw_offset_degrees = if descriptor.contains("table") {
-        local_aabb
+        if local_aabb
             .map(|aabb| aabb.max[0] - aabb.min[0] > (aabb.max[2] - aabb.min[2]) * 1.15)
             .unwrap_or(false)
-            .then_some(90.0)
-            .unwrap_or(0.0)
+        {
+            90.0
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -4646,6 +5050,18 @@ fn default_scene_feedback_iters() -> usize {
 
 fn default_scene_feedback_threshold_profile() -> FeedbackThresholdProfile {
     FeedbackThresholdProfile::Standard
+}
+
+fn default_scene_composition_mode() -> SceneCompositionMode {
+    SceneCompositionMode::CvGrounded
+}
+
+fn default_scene_depth_provider() -> SceneDepthProvider {
+    SceneDepthProvider::DepthPro
+}
+
+fn default_scene_locator_provider() -> SceneLocatorProvider {
+    SceneLocatorProvider::Manifest
 }
 
 fn env_or_dotenv_var(key: &str) -> Option<String> {
@@ -4880,6 +5296,1066 @@ fn write_scene_build_artifacts(output_dir: &Path, response: &Value) -> Result<()
         response,
     )
     .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SceneDepthMapEvidence {
+    depth_m: Vec<f32>,
+    width: u32,
+    height: u32,
+    intrinsics: CameraIntrinsics,
+    focal_length_px: Option<f32>,
+    vertical_fov_degrees: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SceneDepthAnnotationSummary {
+    provider: String,
+    annotated_objects: usize,
+    total_objects: usize,
+    depth_map_size: [u32; 2],
+    focal_length_px: Option<f32>,
+    vertical_fov_degrees: Option<f32>,
+    floor_sample_count: usize,
+    floor_residual_m: Option<f32>,
+}
+
+impl McpServer {
+    fn depth_pro_grounding_evidence(
+        &self,
+        evidence: &mut SceneGroundingEvidence,
+        source_scene_path: &Path,
+        output_dir: &Path,
+    ) -> Result<(), String> {
+        let artifact_dir = output_dir.join("depth_pro");
+        fs::create_dir_all(&artifact_dir).map_err(|err| {
+            format!(
+                "failed to create DepthPro artifact directory {}: {err}",
+                artifact_dir.display()
+            )
+        })?;
+
+        let precision: DepthPrecision = self.config.depth_precision.into();
+        let load_config = DepthLoadConfig {
+            model: DepthModelKind::DepthPro,
+            precision,
+            checkpoint: DepthCheckpointSource::default_cdn(DepthModelKind::DepthPro, precision),
+            cache_dir: self.config.depth_cache_dir.clone(),
+            allow_download: self.config.depth_allow_download,
+            require_gpu: true,
+        };
+        let mut progress_events = Vec::new();
+        let device = burn::tensor::Device::<burn_depth::InferenceBackend>::default();
+        let load_started = Instant::now();
+        let pipeline = DepthPipeline::<burn_depth::InferenceBackend>::load_with_progress(
+            &device,
+            load_config,
+            |event| progress_events.push(depth_load_event_json(event)),
+        )
+        .map_err(|err| format!("load DepthPro pipeline: {err}"))?;
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+
+        let image = image::open(source_scene_path).map_err(|err| {
+            format!(
+                "failed to load depth source image {}: {err}",
+                source_scene_path.display()
+            )
+        })?;
+        let infer_started = Instant::now();
+        let prediction = pipeline
+            .predict(
+                image,
+                DepthRuntimeConfig {
+                    output_size: None,
+                    return_gpu_tensors: false,
+                },
+            )
+            .map_err(|err| format!("DepthPro inference failed: {err}"))?;
+        let infer_ms = infer_started.elapsed().as_secs_f64() * 1000.0;
+        let depth_map = scene_depth_map_from_prediction(prediction)?;
+        let mut summary =
+            annotate_grounding_evidence_with_depth_map(evidence, &depth_map, "depth_pro");
+        summary.provider = "depth-pro".to_string();
+        let floor_sample_count = summary.floor_sample_count;
+
+        let summary_path = artifact_dir.join("depth_evidence.json");
+        let metadata = json!({
+            "provider": "depth-pro",
+            "model": "depth-pro",
+            "precision": scene_depth_precision_label(self.config.depth_precision),
+            "load_ms": load_ms,
+            "infer_ms": infer_ms,
+            "load_events": progress_events,
+            "summary": summary,
+        });
+        write_json_file(&summary_path, &metadata).map_err(|err| err.to_string())?;
+
+        evidence.depth = Some(DepthEvidenceRef {
+            provider: "depth-pro".to_string(),
+            model: Some("depth-pro".to_string()),
+            precision: Some(scene_depth_precision_label(self.config.depth_precision).to_string()),
+            artifact_path: Some(summary_path.display().to_string()),
+            focal_length_px: depth_map.focal_length_px,
+            vertical_fov_degrees: depth_map.vertical_fov_degrees,
+            image_size: Some([depth_map.width, depth_map.height]),
+            depth_map_size: Some([depth_map.width, depth_map.height]),
+            floor_sample_count: Some(floor_sample_count),
+        });
+        evidence.camera.focal_length_px = evidence
+            .camera
+            .focal_length_px
+            .or(depth_map.focal_length_px);
+        evidence.camera.vertical_fov_degrees = evidence
+            .camera
+            .vertical_fov_degrees
+            .or(depth_map.vertical_fov_degrees);
+        evidence.camera.principal_point = evidence
+            .camera
+            .principal_point
+            .or(Some([depth_map.intrinsics.cx, depth_map.intrinsics.cy]));
+        evidence.camera.image_size = Some([depth_map.width, depth_map.height]);
+        evidence.floor = estimate_scene_floor_plane(&depth_map).unwrap_or_default();
+
+        Ok(())
+    }
+}
+
+fn scene_depth_precision_label(value: SceneDepthPrecision) -> &'static str {
+    match value {
+        SceneDepthPrecision::F32 => "f32",
+        SceneDepthPrecision::F16 => "f16",
+    }
+}
+
+fn depth_load_event_json(event: DepthLoadEvent) -> Value {
+    json!({
+        "stage": depth_load_stage_label(event.stage),
+        "message": event.message,
+        "current": event.current,
+        "total": event.total,
+    })
+}
+
+fn depth_load_stage_label(stage: DepthLoadStage) -> &'static str {
+    match stage {
+        DepthLoadStage::Manifest => "manifest",
+        DepthLoadStage::CacheHit => "cache_hit",
+        DepthLoadStage::CacheMiss => "cache_miss",
+        DepthLoadStage::Part => "part",
+        DepthLoadStage::Verify => "verify",
+        DepthLoadStage::Deserialize => "deserialize",
+        DepthLoadStage::ModelReady => "model_ready",
+    }
+}
+
+fn scene_depth_map_from_prediction<B: Backend>(
+    prediction: burn_depth::inference::DepthPrediction<B>,
+) -> Result<SceneDepthMapEvidence, String> {
+    let dims: [usize; 3] = prediction.depth_m.shape().dims();
+    if dims[0] != 1 {
+        return Err(format!(
+            "scene depth expects batch size 1, got depth tensor shape {:?}",
+            dims
+        ));
+    }
+    let height = dims[1] as u32;
+    let width = dims[2] as u32;
+    let depth_m = tensor_to_vec_f32(prediction.depth_m)?;
+    let expected = width as usize * height as usize;
+    if depth_m.len() != expected {
+        return Err(format!(
+            "scene depth tensor data length mismatch: expected {expected}, got {}",
+            depth_m.len()
+        ));
+    }
+
+    let focal_length_px = prediction
+        .focallength_px
+        .map(tensor_scalar_f32)
+        .transpose()?;
+    let fovy_rad = prediction.fovy_rad.map(tensor_scalar_f32).transpose()?;
+    let vertical_fov_degrees = prediction
+        .intrinsics
+        .map(|intrinsics| {
+            2.0 * ((height as f32 * 0.5) / intrinsics.fy.max(1.0e-5))
+                .atan()
+                .to_degrees()
+        })
+        .or_else(|| fovy_rad.map(f32::to_degrees))
+        .or_else(|| {
+            focal_length_px.map(|focal| {
+                2.0 * ((height as f32 * 0.5) / focal.max(1.0e-5))
+                    .atan()
+                    .to_degrees()
+            })
+        });
+    let intrinsics = prediction.intrinsics.unwrap_or_else(|| {
+        let fy = fovy_rad
+            .map(|fovy| (height as f32 * 0.5) / (fovy * 0.5).tan().max(1.0e-5))
+            .or(focal_length_px)
+            .unwrap_or(width.max(height) as f32);
+        let fx = focal_length_px.unwrap_or(fy);
+        CameraIntrinsics {
+            fx,
+            fy,
+            cx: (width.saturating_sub(1)) as f32 * 0.5,
+            cy: (height.saturating_sub(1)) as f32 * 0.5,
+            width,
+            height,
+        }
+    });
+
+    Ok(SceneDepthMapEvidence {
+        depth_m,
+        width,
+        height,
+        intrinsics,
+        focal_length_px,
+        vertical_fov_degrees,
+    })
+}
+
+fn tensor_to_vec_f32<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Result<Vec<f32>, String> {
+    tensor
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .map_err(|err| format!("read tensor data: {err}"))
+}
+
+fn tensor_scalar_f32<B: Backend>(tensor: Tensor<B, 1>) -> Result<f32, String> {
+    let values = tensor_to_vec_f32(tensor)?;
+    values
+        .first()
+        .copied()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "depth scalar tensor was empty or non-finite".to_string())
+}
+
+fn annotate_grounding_evidence_with_depth_map(
+    evidence: &mut SceneGroundingEvidence,
+    depth_map: &SceneDepthMapEvidence,
+    provenance_label: &str,
+) -> SceneDepthAnnotationSummary {
+    let floor = estimate_scene_floor_plane(depth_map);
+    let mut annotated_objects = 0usize;
+    for object in &mut evidence.objects {
+        let Some(detection) = object.detection.as_ref() else {
+            continue;
+        };
+        let bbox = normalized_bbox_to_image_bbox(detection.bbox, depth_map.width, depth_map.height);
+        let bbox_stats =
+            depth_stats_for_bbox(&depth_map.depth_m, depth_map.width, depth_map.height, bbox);
+        let contact_pixel = object
+            .contact_pixel
+            .or(detection.point)
+            .unwrap_or_else(|| bbox_bottom_center(detection.bbox));
+        let contact_depth = depth_at_bbox_contact_region(
+            &depth_map.depth_m,
+            depth_map.width,
+            depth_map.height,
+            bbox,
+        )
+        .or_else(|| sample_depth_at_normalized_pixel(depth_map, contact_pixel));
+        let Some(contact_depth) = contact_depth.filter(|value| value.is_finite() && *value > 0.0)
+        else {
+            continue;
+        };
+
+        let pixel = normalized_to_depth_pixel(contact_pixel, depth_map.width, depth_map.height);
+        let ray = pixel_to_ray(pixel[0], pixel[1], depth_map.intrinsics);
+        let point = backproject_depth(pixel[0], pixel[1], contact_depth, depth_map.intrinsics);
+        let target_footprint =
+            estimate_depth_target_footprint(detection, bbox, contact_depth, depth_map.intrinsics);
+        object.depth_stats =
+            bbox_stats.map(|(min_m, median_m, max_m, sample_count)| ObjectDepthStats {
+                median_m,
+                min_m,
+                max_m,
+                contact_m: Some(contact_depth),
+                sample_count: Some(sample_count),
+            });
+        if object.depth_stats.is_none() {
+            object.depth_stats = Some(ObjectDepthStats {
+                median_m: contact_depth,
+                min_m: contact_depth,
+                max_m: contact_depth,
+                contact_m: Some(contact_depth),
+                sample_count: Some(1),
+            });
+        }
+        object.contact_pixel = Some(contact_pixel);
+        object.candidate_floor_contact_rays.push(ray);
+        object.metric_contact_point_m = Some(point);
+        object.target_footprint_m = target_footprint;
+        if !object
+            .provenance
+            .iter()
+            .any(|entry| entry == provenance_label)
+        {
+            object.provenance.push(provenance_label.to_string());
+        }
+        annotated_objects += 1;
+    }
+
+    let floor_sample_count = floor_sample_count(depth_map);
+    SceneDepthAnnotationSummary {
+        provider: provenance_label.to_string(),
+        annotated_objects,
+        total_objects: evidence.objects.len(),
+        depth_map_size: [depth_map.width, depth_map.height],
+        focal_length_px: depth_map.focal_length_px,
+        vertical_fov_degrees: depth_map.vertical_fov_degrees,
+        floor_sample_count,
+        floor_residual_m: floor.and_then(|floor| floor.residual_m),
+    }
+}
+
+fn estimate_scene_floor_plane(depth_map: &SceneDepthMapEvidence) -> Option<EstimatedFloorPlane> {
+    let mut points = Vec::new();
+    let step_x = (depth_map.width / 64).max(1);
+    let step_y = (depth_map.height / 48).max(1);
+    let y_start = (depth_map.height as f32 * 0.62).floor() as u32;
+    for y in (y_start..depth_map.height).step_by(step_y as usize) {
+        for x in (0..depth_map.width).step_by(step_x as usize) {
+            let index = y as usize * depth_map.width as usize + x as usize;
+            let depth = depth_map.depth_m.get(index).copied().unwrap_or_default();
+            if depth.is_finite() && depth > 0.0 {
+                points.push(backproject_depth(
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                    depth,
+                    depth_map.intrinsics,
+                ));
+            }
+        }
+    }
+    let plane = estimate_floor_plane(&points)?;
+    let residual = if points.is_empty() {
+        None
+    } else {
+        let sum = points
+            .iter()
+            .map(|point| {
+                (plane.normal[0] * point[0]
+                    + plane.normal[1] * point[1]
+                    + plane.normal[2] * point[2]
+                    + plane.d)
+                    .abs()
+            })
+            .sum::<f32>();
+        Some(sum / points.len() as f32)
+    };
+    Some(EstimatedFloorPlane {
+        normal: plane.normal,
+        distance_m: plane.d,
+        residual_m: residual,
+        confidence: Some((1.0 / (1.0 + residual.unwrap_or(1.0))).clamp(0.0, 1.0)),
+    })
+}
+
+fn floor_sample_count(depth_map: &SceneDepthMapEvidence) -> usize {
+    let step_x = (depth_map.width / 64).max(1);
+    let step_y = (depth_map.height / 48).max(1);
+    let y_start = (depth_map.height as f32 * 0.62).floor() as u32;
+    let mut count = 0usize;
+    for y in (y_start..depth_map.height).step_by(step_y as usize) {
+        for x in (0..depth_map.width).step_by(step_x as usize) {
+            let index = y as usize * depth_map.width as usize + x as usize;
+            let depth = depth_map.depth_m.get(index).copied().unwrap_or_default();
+            if depth.is_finite() && depth > 0.0 {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn normalized_bbox_to_image_bbox(
+    bbox: [f32; 4],
+    image_width: u32,
+    image_height: u32,
+) -> ImageBoundingBox {
+    let bbox = [
+        bbox[0].clamp(0.0, 1.0),
+        bbox[1].clamp(0.0, 1.0),
+        bbox[2].clamp(0.0, 1.0),
+        bbox[3].clamp(0.0, 1.0),
+    ];
+    let x0 = (bbox[0].min(bbox[2]) * image_width as f32).floor() as u32;
+    let x1 = (bbox[0].max(bbox[2]) * image_width as f32).ceil() as u32;
+    let y0 = (bbox[1].min(bbox[3]) * image_height as f32).floor() as u32;
+    let y1 = (bbox[1].max(bbox[3]) * image_height as f32).ceil() as u32;
+    let x0 = x0.min(image_width.saturating_sub(1));
+    let y0 = y0.min(image_height.saturating_sub(1));
+    let x1 = x1.min(image_width).max(x0 + 1);
+    let y1 = y1.min(image_height).max(y0 + 1);
+    ImageBoundingBox {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    }
+}
+
+fn depth_stats_for_bbox(
+    depth_m: &[f32],
+    image_width: u32,
+    image_height: u32,
+    bbox: ImageBoundingBox,
+) -> Option<(f32, f32, f32, usize)> {
+    if depth_m.len() != image_width as usize * image_height as usize {
+        return None;
+    }
+    let x0 = bbox.x.min(image_width);
+    let x1 = bbox.x.saturating_add(bbox.width).min(image_width);
+    let y0 = bbox.y.min(image_height);
+    let y1 = bbox.y.saturating_add(bbox.height).min(image_height);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let mut values = Vec::new();
+    for y in y0..y1 {
+        let row = y as usize * image_width as usize;
+        for x in x0..x1 {
+            let value = depth_m[row + x as usize];
+            if value.is_finite() && value > 0.0 {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.total_cmp(right));
+    Some((
+        values[0],
+        values[values.len() / 2],
+        values[values.len() - 1],
+        values.len(),
+    ))
+}
+
+fn sample_depth_at_normalized_pixel(
+    depth_map: &SceneDepthMapEvidence,
+    pixel: [f32; 2],
+) -> Option<f32> {
+    let [x, y] = normalized_to_depth_pixel(pixel, depth_map.width, depth_map.height);
+    let x = x
+        .round()
+        .clamp(0.0, depth_map.width.saturating_sub(1) as f32) as u32;
+    let y = y
+        .round()
+        .clamp(0.0, depth_map.height.saturating_sub(1) as f32) as u32;
+    let value = depth_map.depth_m[y as usize * depth_map.width as usize + x as usize];
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+fn normalized_to_depth_pixel(pixel: [f32; 2], width: u32, height: u32) -> [f32; 2] {
+    [
+        pixel[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32,
+        pixel[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32,
+    ]
+}
+
+fn estimate_depth_target_footprint(
+    detection: &Detection,
+    bbox: ImageBoundingBox,
+    contact_depth_m: f32,
+    intrinsics: CameraIntrinsics,
+) -> Option<[f32; 2]> {
+    if !contact_depth_m.is_finite() || contact_depth_m <= 0.0 {
+        return None;
+    }
+    let width_m = bbox.width as f32 * contact_depth_m / intrinsics.fx.max(1.0e-5);
+    if !width_m.is_finite() || width_m <= 0.0 {
+        return None;
+    }
+    let descriptor = format!("{} {}", detection.label, detection.source_query).to_ascii_lowercase();
+    let footprint = if descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+    {
+        [width_m.clamp(1.4, 6.5), (width_m * 0.48).clamp(0.8, 2.8)]
+    } else if descriptor.contains("conference") && descriptor.contains("table") {
+        [width_m.clamp(1.2, 6.5), (width_m * 0.42).clamp(0.7, 2.8)]
+    } else if descriptor.contains("table") {
+        [width_m.clamp(0.6, 4.5), (width_m * 0.55).clamp(0.45, 2.5)]
+    } else if descriptor.contains("chair") || descriptor.contains("seat") {
+        [
+            width_m.clamp(0.42, 0.95),
+            (width_m * 1.05).clamp(0.42, 1.05),
+        ]
+    } else {
+        [width_m.clamp(0.2, 4.0), width_m.clamp(0.2, 4.0)]
+    };
+    Some(footprint)
+}
+
+#[derive(Debug, Deserialize)]
+struct LocateAnythingReferenceResponse {
+    #[serde(default)]
+    load_ms: Option<f64>,
+    #[serde(default)]
+    batch_infer_ms: Option<f64>,
+    #[serde(default)]
+    results: Vec<LocateAnythingReferenceResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocateAnythingReferenceResult {
+    query: String,
+    #[serde(default)]
+    detections: Vec<Detection>,
+    #[serde(default)]
+    timings_ms: Option<HashMap<String, f64>>,
+}
+
+impl McpServer {
+    fn locate_anything_grounding_evidence(
+        &mut self,
+        backend: LocateAnythingBackend,
+        manifest: &SceneObjectManifest,
+        source_scene_path: &Path,
+        output_dir: &Path,
+    ) -> Result<SceneGroundingEvidence, String> {
+        match backend {
+            LocateAnythingBackend::PythonReference => self
+                .locate_anything_reference_grounding_evidence(
+                    manifest,
+                    source_scene_path,
+                    output_dir,
+                ),
+            LocateAnythingBackend::BurnNative => self
+                .locate_anything_burn_native_grounding_evidence(
+                    manifest,
+                    source_scene_path,
+                    output_dir,
+                ),
+        }
+    }
+
+    fn locate_anything_reference_grounding_evidence(
+        &self,
+        manifest: &SceneObjectManifest,
+        source_scene_path: &Path,
+        output_dir: &Path,
+    ) -> Result<SceneGroundingEvidence, String> {
+        let queries = locate_anything_queries(manifest);
+        if queries.is_empty() {
+            return Err(
+                "LocateAnything locator requires at least one non-empty manifest object label"
+                    .to_string(),
+            );
+        }
+
+        let artifact_dir = output_dir.join("locate_anything_reference");
+        fs::create_dir_all(&artifact_dir).map_err(|err| {
+            format!(
+                "failed to create LocateAnything artifact directory {}: {err}",
+                artifact_dir.display()
+            )
+        })?;
+        let output_path = artifact_dir.join("reference.json");
+        let log_path = artifact_dir.join("reference.log");
+        let python_bin = self.locate_anything_python_bin();
+        let mut command = Command::new(&python_bin);
+        command
+            .arg(&self.config.locate_anything_reference_script)
+            .arg("--model-root")
+            .arg(&self.config.locate_anything_model_root)
+            .arg("--image")
+            .arg(source_scene_path)
+            .arg("--output")
+            .arg(&output_path)
+            .arg("--device")
+            .arg(&self.config.locate_anything_device)
+            .arg("--dtype")
+            .arg("bf16")
+            .arg("--attn")
+            .arg("sdpa")
+            .arg("--generation-mode")
+            .arg("hybrid")
+            .arg("--in-token-limit")
+            .arg(self.config.locate_anything_in_token_limit.to_string())
+            .arg("--max-new-tokens")
+            .arg("1024")
+            .arg("--temperature")
+            .arg("0.0")
+            .env("PYTHONUNBUFFERED", "1");
+        for query in &queries {
+            command.arg("--query").arg(query);
+        }
+
+        let started = Instant::now();
+        let output = command.output().map_err(|err| {
+            format!(
+                "failed to launch LocateAnything reference `{}`: {err}",
+                python_bin.display()
+            )
+        })?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut log = String::new();
+        log.push_str("$ ");
+        log.push_str(&format!("{command:?}\n"));
+        log.push_str("--- stdout ---\n");
+        log.push_str(&String::from_utf8_lossy(&output.stdout));
+        log.push_str("\n--- stderr ---\n");
+        log.push_str(&String::from_utf8_lossy(&output.stderr));
+        log.push_str(&format!("\n--- elapsed_ms: {elapsed_ms:.3} ---\n"));
+        fs::write(&log_path, &log).map_err(|err| {
+            format!(
+                "failed to write LocateAnything reference log {}: {err}",
+                log_path.display()
+            )
+        })?;
+        if !output.status.success() {
+            return Err(format!(
+                "LocateAnything reference failed with status {}; see {}",
+                output.status,
+                log_path.display()
+            ));
+        }
+        let response: LocateAnythingReferenceResponse = read_json_path(&output_path)?;
+        let mut detections = Vec::new();
+        let mut timing_by_query = serde_json::Map::new();
+        for result in &response.results {
+            if let Some(timings) = result.timings_ms.as_ref() {
+                timing_by_query.insert(result.query.clone(), json!(timings));
+            }
+            detections.extend(result.detections.iter().cloned());
+        }
+        if detections.is_empty() {
+            return Err(format!(
+                "LocateAnything reference returned no detections for {} queries; see {}",
+                queries.len(),
+                output_path.display()
+            ));
+        }
+
+        let mut evidence = locate_anything_evidence_from_detections(
+            manifest,
+            source_scene_path,
+            detections,
+            "locate_anything_reference",
+        )?;
+        let metadata = json!({
+            "provider": "locate_anything_reference",
+            "python_bin": python_bin,
+            "model_root": self.config.locate_anything_model_root,
+            "script": self.config.locate_anything_reference_script,
+            "device": self.config.locate_anything_device,
+            "in_token_limit": self.config.locate_anything_in_token_limit,
+            "queries": queries,
+            "load_ms": response.load_ms,
+            "batch_infer_ms": response.batch_infer_ms,
+            "timings_ms": timing_by_query,
+            "elapsed_ms": elapsed_ms,
+            "reference_json": output_path,
+            "reference_log": log_path,
+        });
+        write_json_file(&artifact_dir.join("metadata.json"), &metadata)
+            .map_err(|err| err.to_string())?;
+        for object in &mut evidence.objects {
+            object
+                .provenance
+                .push("locate_anything_reference_scene_ground".to_string());
+        }
+        Ok(evidence)
+    }
+
+    fn locate_anything_burn_native_grounding_evidence(
+        &mut self,
+        manifest: &SceneObjectManifest,
+        source_scene_path: &Path,
+        output_dir: &Path,
+    ) -> Result<SceneGroundingEvidence, String> {
+        let queries = locate_anything_queries(manifest);
+        if queries.is_empty() {
+            return Err(
+                "LocateAnything locator requires at least one non-empty manifest object label"
+                    .to_string(),
+            );
+        }
+
+        let artifact_dir = output_dir.join("locate_anything_burn_native");
+        fs::create_dir_all(&artifact_dir).map_err(|err| {
+            format!(
+                "failed to create LocateAnything native artifact directory {}: {err}",
+                artifact_dir.display()
+            )
+        })?;
+        let image = image::open(source_scene_path).map_err(|err| {
+            format!(
+                "failed to load LocateAnything source image {}: {err}",
+                source_scene_path.display()
+            )
+        })?;
+        let runtime_config = LocateAnythingRuntimeConfig {
+            model_root: self.config.locate_anything_model_root.clone(),
+            backend: LocateAnythingRuntimeBackend::BurnNative,
+            allow_experimental_native_detect: true,
+            decode_mode: DecodeMode::Hybrid,
+            max_new_tokens: 1024,
+            reference_script: self.config.locate_anything_reference_script.clone(),
+            python_bin: self.config.locate_anything_python_bin.clone(),
+            reference_device: self.config.locate_anything_device.clone(),
+            reference_dtype: "bf16".to_string(),
+            reference_attention: "sdpa".to_string(),
+            in_token_limit: self.config.locate_anything_in_token_limit as u32,
+            run_root: artifact_dir.clone(),
+            ..LocateAnythingRuntimeConfig::default()
+        };
+        let cache_key = LocateAnythingBurnNativeCacheKey::from_config(&runtime_config);
+        let cache_hit = self
+            .locate_anything_burn_native_runtime
+            .as_ref()
+            .is_some_and(|cached| cached.key == cache_key);
+        if !cache_hit {
+            let runtime = LocateAnythingRuntime::new(runtime_config.clone())
+                .map_err(|err| format!("initialize Burn-native LocateAnything runtime: {err}"))?;
+            self.locate_anything_burn_native_runtime = Some(CachedLocateAnythingRuntime {
+                key: cache_key,
+                runtime,
+            });
+        }
+        let runtime = &mut self
+            .locate_anything_burn_native_runtime
+            .as_mut()
+            .expect("LocateAnything runtime cache initialized")
+            .runtime;
+        let detection_queries = queries
+            .iter()
+            .map(|query| DetectionQuery {
+                query: query.clone(),
+                label_hint: None,
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let batches = runtime
+            .detect_batch(&image, &detection_queries)
+            .map_err(|err| format!("Burn-native LocateAnything detect failed: {err}"))?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let stage_timings = runtime.last_burn_native_stage_timings().cloned();
+        let detections = batches.into_iter().flatten().collect::<Vec<_>>();
+        if detections.is_empty() {
+            return Err(format!(
+                "Burn-native LocateAnything returned no detections for {} queries",
+                queries.len()
+            ));
+        }
+
+        let detections_path = artifact_dir.join("detections.json");
+        write_json_file(&detections_path, &detections).map_err(|err| err.to_string())?;
+        let mut evidence = locate_anything_evidence_from_detections(
+            manifest,
+            source_scene_path,
+            detections,
+            "locate_anything_burn_native",
+        )?;
+        let metadata = json!({
+            "provider": "locate_anything_burn_native",
+            "model_root": self.config.locate_anything_model_root,
+            "backend": "burn_native",
+            "in_token_limit": self.config.locate_anything_in_token_limit,
+            "decode_mode": format!("{:?}", runtime_config.decode_mode),
+            "max_new_tokens": runtime_config.max_new_tokens,
+            "repetition_penalty": runtime_config.repetition_penalty,
+            "top_p": runtime_config.top_p,
+            "top_k": runtime_config.top_k,
+            "queries": queries,
+            "elapsed_ms": elapsed_ms,
+            "stage_timings": stage_timings,
+            "runtime_cache_hit": cache_hit,
+            "detections_json": detections_path,
+            "compile_feature_hint": "build burn_synth_mcp with --features locate-anything-wgpu for WGPU native execution",
+        });
+        write_json_file(&artifact_dir.join("metadata.json"), &metadata)
+            .map_err(|err| err.to_string())?;
+        for object in &mut evidence.objects {
+            object
+                .provenance
+                .push("locate_anything_burn_native_scene_ground".to_string());
+        }
+        Ok(evidence)
+    }
+
+    fn locate_anything_python_bin(&self) -> PathBuf {
+        self.config
+            .locate_anything_python_bin
+            .clone()
+            .or_else(|| env::var_os("LOCATE_ANYTHING_PYTHON").map(PathBuf::from))
+            .unwrap_or_else(|| {
+                let torch_venv = PathBuf::from("/home/mosure/.venvs/torch/bin/python");
+                if torch_venv.exists() {
+                    torch_venv
+                } else {
+                    PathBuf::from("python3")
+                }
+            })
+    }
+}
+
+fn locate_anything_queries(manifest: &SceneObjectManifest) -> Vec<String> {
+    let mut queries = Vec::new();
+    for object in &manifest.objects {
+        let query = object.label.trim();
+        if query.is_empty() {
+            continue;
+        }
+        if !queries.iter().any(|existing: &String| existing == query) {
+            queries.push(query.to_string());
+        }
+    }
+    queries
+}
+
+fn locate_anything_evidence_from_detections(
+    manifest: &SceneObjectManifest,
+    source_scene_path: &Path,
+    detections: Vec<Detection>,
+    provenance_label: &str,
+) -> Result<SceneGroundingEvidence, String> {
+    let image_size = image::image_dimensions(source_scene_path)
+        .ok()
+        .map(|(width, height)| [width, height]);
+    let mut detections_by_query: HashMap<String, Vec<Detection>> = HashMap::new();
+    for detection in &detections {
+        detections_by_query
+            .entry(normalized_query_key(&detection.source_query))
+            .or_default()
+            .push(detection.clone());
+    }
+
+    let mut objects = Vec::new();
+    for object in &manifest.objects {
+        let query_key = normalized_query_key(&object.label);
+        let matched = detections_by_query
+            .get(&query_key)
+            .cloned()
+            .unwrap_or_default();
+        let object_detection = if matched.is_empty() {
+            manifest_detection_for_object(object)
+        } else {
+            Some(union_detection_for_object(object, &matched))
+        };
+        objects.push(ObjectGroundingEvidence {
+            object_id: object.id.clone(),
+            instance_id: None,
+            reuse_group: object.reuse_group.clone(),
+            detection: object_detection,
+            asset_id: None,
+            contact_pixel: None,
+            depth_stats: None,
+            candidate_floor_contact_rays: Vec::new(),
+            metric_contact_point_m: None,
+            target_footprint_m: None,
+            provenance: if matched.is_empty() {
+                vec!["manifest_fallback_missing_detection".to_string()]
+            } else {
+                vec![provenance_label.to_string()]
+            },
+        });
+
+        let instance_evidence =
+            locate_anything_instance_evidence(object, &matched, provenance_label);
+        objects.extend(instance_evidence);
+    }
+
+    Ok(SceneGroundingEvidence {
+        source_image_path: source_scene_path.display().to_string(),
+        depth: None,
+        detections,
+        camera: burn_synth_scene::EstimatedCamera {
+            image_size,
+            ..burn_synth_scene::EstimatedCamera::default()
+        },
+        floor: burn_synth_scene::EstimatedFloorPlane::default(),
+        objects,
+    })
+}
+
+fn locate_anything_instance_evidence(
+    object: &SceneObjectSpec,
+    detections: &[Detection],
+    provenance_label: &str,
+) -> Vec<ObjectGroundingEvidence> {
+    let mut out = Vec::new();
+    let instances = manifest_instances_for_matching(object);
+    let mut used = vec![false; detections.len()];
+    for (instance_id, bbox, contact) in instances {
+        let detection_index = best_detection_match(&bbox, detections, &used);
+        let (detection, provenance) = if let Some(index) = detection_index {
+            used[index] = true;
+            (
+                Some(detections[index].clone()),
+                vec![provenance_label.to_string()],
+            )
+        } else {
+            (
+                Some(Detection {
+                    label: object.label.clone(),
+                    bbox,
+                    point: contact,
+                    confidence: None,
+                    source_query: object.label.clone(),
+                }),
+                vec!["manifest_fallback_missing_detection".to_string()],
+            )
+        };
+        let contact_pixel = detection
+            .as_ref()
+            .and_then(|detection| detection.point)
+            .or_else(|| {
+                detection
+                    .as_ref()
+                    .map(|detection| bbox_bottom_center(detection.bbox))
+            })
+            .or(contact);
+        out.push(ObjectGroundingEvidence {
+            object_id: object.id.clone(),
+            instance_id,
+            reuse_group: object.reuse_group.clone(),
+            detection,
+            asset_id: None,
+            contact_pixel,
+            depth_stats: None,
+            candidate_floor_contact_rays: Vec::new(),
+            metric_contact_point_m: None,
+            target_footprint_m: None,
+            provenance,
+        });
+    }
+    out
+}
+
+type ManifestMatchingInstance = (Option<String>, [f32; 4], Option<[f32; 2]>);
+
+fn manifest_instances_for_matching(object: &SceneObjectSpec) -> Vec<ManifestMatchingInstance> {
+    if object.instances.is_empty() {
+        return vec![(None, object.bbox, Some(bbox_bottom_center(object.bbox)))];
+    }
+    object
+        .instances
+        .iter()
+        .map(|instance: &SceneObjectInstanceSpec| {
+            (
+                instance.id.clone(),
+                instance.bbox,
+                instance
+                    .contact
+                    .or_else(|| Some(bbox_bottom_center(instance.bbox))),
+            )
+        })
+        .collect()
+}
+
+fn manifest_detection_for_object(object: &SceneObjectSpec) -> Option<Detection> {
+    Some(Detection {
+        label: object.label.clone(),
+        bbox: object.bbox,
+        point: Some(bbox_bottom_center(object.bbox)),
+        confidence: None,
+        source_query: object.label.clone(),
+    })
+}
+
+fn union_detection_for_object(object: &SceneObjectSpec, detections: &[Detection]) -> Detection {
+    let bbox = detections
+        .iter()
+        .map(|detection| detection.bbox)
+        .reduce(union_bbox)
+        .unwrap_or(object.bbox);
+    Detection {
+        label: object.label.clone(),
+        bbox,
+        point: Some(bbox_bottom_center(bbox)),
+        confidence: detections
+            .iter()
+            .filter_map(|d| d.confidence)
+            .reduce(f32::max),
+        source_query: object.label.clone(),
+    }
+}
+
+fn best_detection_match(bbox: &[f32; 4], detections: &[Detection], used: &[bool]) -> Option<usize> {
+    detections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used.get(*index).copied().unwrap_or(false))
+        .map(|(index, detection)| (index, bbox_iou(*bbox, detection.bbox)))
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+}
+
+fn normalized_query_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn bbox_bottom_center(bbox: [f32; 4]) -> [f32; 2] {
+    [(bbox[0] + bbox[2]) * 0.5, bbox[3]]
+}
+
+fn union_bbox(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
+    [
+        left[0].min(right[0]),
+        left[1].min(right[1]),
+        left[2].max(right[2]),
+        left[3].max(right[3]),
+    ]
+}
+
+fn bbox_iou(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let ix0 = left[0].max(right[0]);
+    let iy0 = left[1].max(right[1]);
+    let ix1 = left[2].min(right[2]);
+    let iy1 = left[3].min(right[3]);
+    let iw = (ix1 - ix0).max(0.0);
+    let ih = (iy1 - iy0).max(0.0);
+    let intersection = iw * ih;
+    let left_area = (left[2] - left[0]).max(0.0) * (left[3] - left[1]).max(0.0);
+    let right_area = (right[2] - right[0]).max(0.0) * (right[3] - right[1]).max(0.0);
+    let union = left_area + right_area - intersection;
+    if union <= f32::EPSILON {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn write_scene_ground_artifacts(output_dir: &Path, response: &Value) -> Result<(), String> {
+    fs::create_dir_all(output_dir).map_err(|err| {
+        format!(
+            "failed to create scene-ground artifact directory {}: {err}",
+            output_dir.display()
+        )
+    })?;
+    for (key, file_name) in [
+        ("manifest", "manifest.json"),
+        ("asset_bindings", "asset_bindings.json"),
+        ("grounding_evidence", "grounding_evidence.json"),
+        ("grounded_layout", "grounded_layout.json"),
+        ("commands", "commands.json"),
+        ("stage_report", "stage_report.json"),
+        ("e2e_summary", "summary.json"),
+    ] {
+        if let Some(value) = response.get(key) {
+            write_json_file(&output_dir.join(file_name), value).map_err(|err| err.to_string())?;
+        }
+    }
+    if let Some(bsn) = response.get("bsn").and_then(Value::as_str) {
+        fs::write(output_dir.join("scene.bsn"), bsn).map_err(|err| {
+            format!(
+                "failed to write scene-ground BSN {}: {err}",
+                output_dir.join("scene.bsn").display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -5270,6 +6746,37 @@ fn tool_defs() -> Vec<Value> {
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] }
                 },
                 "required": ["source_scene_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "scene_ground",
+            "description": "Recompute source-scene composition from an existing object manifest, asset bindings, and optional grounding evidence without regenerating object images or TRELLIS assets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source_scene_path": { "type": "string" },
+                    "manifest": { "type": "object", "description": "SceneObjectManifest from scene_build_from_image or scene_plan_objects." },
+                    "asset_bindings": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "description": "Generated asset bindings with asset_id plus path/cache_key/local_aabb."
+                    },
+                    "grounding_evidence": { "type": "object", "description": "Optional SceneGroundingEvidence. When omitted, manifest bbox/contact points are used as an explicit fallback." },
+                    "output_dir": { "type": "string" },
+                    "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"] },
+                    "depth_provider": { "type": "string", "enum": ["none", "depth-pro"] },
+                    "locator": { "type": "string", "enum": ["manifest", "locate-anything"] },
+                    "locate_anything_backend": { "type": "string", "enum": ["python-reference", "burn-native"], "description": "Optional backend override when locator is locate-anything. Defaults to the server --locate-anything-backend setting." },
+                    "clear_existing": { "type": "boolean" },
+                    "apply": { "type": "boolean" },
+                    "feedback": { "type": "boolean" },
+                    "feedback_iters": { "type": "integer" },
+                    "feedback_keep_viewer": { "type": "boolean" },
+                    "feedback_capture_dir": { "type": "string" },
+                    "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] }
+                },
+                "required": ["source_scene_path", "manifest", "asset_bindings"],
                 "additionalProperties": false
             }
         }),
@@ -5764,11 +7271,54 @@ struct SceneBuildFromImageArgs {
     pub feedback_threshold_profile: FeedbackThresholdProfile,
 }
 
+#[derive(Debug, Deserialize)]
+struct SceneGroundToolArgs {
+    pub source_scene_path: PathBuf,
+    pub manifest: SceneObjectManifest,
+    pub asset_bindings: Vec<SceneAssetBinding>,
+    #[serde(default)]
+    pub grounding_evidence: Option<SceneGroundingEvidence>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    #[serde(default = "default_scene_composition_mode")]
+    pub composition_mode: SceneCompositionMode,
+    #[serde(default = "default_scene_depth_provider")]
+    pub depth_provider: SceneDepthProvider,
+    #[serde(default = "default_scene_locator_provider")]
+    pub locator: SceneLocatorProvider,
+    #[serde(default)]
+    pub locate_anything_backend: Option<LocateAnythingBackend>,
+    #[serde(default = "default_scene_clear_existing")]
+    pub clear_existing: bool,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default)]
+    pub feedback: bool,
+    #[serde(default = "default_scene_feedback_iters")]
+    pub feedback_iters: usize,
+    #[serde(default)]
+    pub feedback_keep_viewer: bool,
+    #[serde(default)]
+    pub feedback_capture_dir: Option<PathBuf>,
+    #[serde(default = "default_scene_feedback_threshold_profile")]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+}
+
 #[derive(Clone, Debug)]
 struct SceneFeedbackOptions {
     max_iters: usize,
     keep_viewer: bool,
     capture_dir: Option<PathBuf>,
+    threshold_profile: FeedbackThresholdProfile,
+}
+
+struct SceneFeedbackIterationContext<'a> {
+    capture_root: &'a Path,
+    manifest: &'a SceneObjectManifest,
+    asset_bindings: &'a [SceneAssetBinding],
+    grounded_layout: &'a GroundedSceneLayout,
+    initial_commands: Vec<Value>,
+    max_iters: usize,
     threshold_profile: FeedbackThresholdProfile,
 }
 
@@ -6072,6 +7622,409 @@ mod tests {
         assert_eq!(config.flash_min_resolution, 31);
         assert_eq!(config.flash_mini_grid_num, 4);
         assert_eq!(config.flash_num_chunks, 8192);
+    }
+
+    #[test]
+    fn server_args_accept_scene_ground_command() {
+        let args = ServerArgs::parse_from([
+            "burn_synth_mcp",
+            "scene-ground",
+            "--source-scene-path",
+            "/tmp/source.jpg",
+            "--manifest",
+            "/tmp/manifest.json",
+            "--asset-bindings",
+            "/tmp/assets.json",
+            "--composition-mode",
+            "cv-grounded",
+            "--depth-provider",
+            "depth-pro",
+            "--locator",
+            "locate-anything",
+            "--locate-anything-backend",
+            "burn-native",
+            "--feedback-iters",
+            "5",
+        ]);
+        let Some(ServerCommand::SceneGround(command)) = args.command else {
+            panic!("expected scene-ground subcommand");
+        };
+        assert_eq!(command.composition_mode, SceneCompositionMode::CvGrounded);
+        assert_eq!(command.depth_provider, SceneDepthProvider::DepthPro);
+        assert_eq!(command.locator, SceneLocatorProvider::LocateAnything);
+        assert_eq!(
+            command.locate_anything_backend,
+            Some(LocateAnythingBackend::BurnNative)
+        );
+        assert_eq!(command.feedback_iters, 5);
+    }
+
+    #[test]
+    fn server_args_accept_global_locate_anything_backend() {
+        let args =
+            ServerArgs::parse_from(["burn_synth_mcp", "--locate-anything-backend", "burn-native"]);
+        let config = ServerConfig::from_args(args);
+        assert_eq!(
+            config.locate_anything_backend,
+            LocateAnythingBackend::BurnNative
+        );
+    }
+
+    #[test]
+    fn locate_anything_burn_native_cache_key_ignores_artifact_run_root() {
+        let base = LocateAnythingRuntimeConfig {
+            model_root: PathBuf::from("assets/models/LocateAnything-3B"),
+            backend: LocateAnythingRuntimeBackend::BurnNative,
+            allow_experimental_native_detect: true,
+            decode_mode: DecodeMode::Hybrid,
+            max_new_tokens: 1024,
+            in_token_limit: LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT,
+            run_root: PathBuf::from("tmp/runs/a"),
+            ..LocateAnythingRuntimeConfig::default()
+        };
+        let mut same_runtime = base.clone();
+        same_runtime.run_root = PathBuf::from("tmp/runs/b");
+        assert_eq!(
+            LocateAnythingBurnNativeCacheKey::from_config(&base),
+            LocateAnythingBurnNativeCacheKey::from_config(&same_runtime)
+        );
+
+        let mut different_tokens = base;
+        different_tokens.in_token_limit += 1;
+        assert_ne!(
+            LocateAnythingBurnNativeCacheKey::from_config(&same_runtime),
+            LocateAnythingBurnNativeCacheKey::from_config(&different_tokens)
+        );
+
+        let mut different_decode_filter = same_runtime.clone();
+        different_decode_filter.top_p = None;
+        assert_ne!(
+            LocateAnythingBurnNativeCacheKey::from_config(&same_runtime),
+            LocateAnythingBurnNativeCacheKey::from_config(&different_decode_filter)
+        );
+    }
+
+    #[test]
+    fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
+        if std::env::var("LOCATE_ANYTHING_MCP_BURN_NATIVE_CACHE_SMOKE").is_err() {
+            eprintln!(
+                "skipping: set LOCATE_ANYTHING_MCP_BURN_NATIVE_CACHE_SMOKE=1 to run WGPU LocateAnything MCP cache smoke"
+            );
+            return;
+        }
+        let Some(repo_root) = find_repo_root_for_test() else {
+            eprintln!("skipping LocateAnything MCP cache smoke; repo root not found");
+            return;
+        };
+        let image_path =
+            PathBuf::from("/media/mosure/dolos/demo/Cisco/reconstruction/045-LYS01-3-Galaxy.jpg");
+        let model_root = repo_root.join("assets/models/LocateAnything-3B");
+        if !image_path.exists() || !model_root.join("config.json").exists() {
+            eprintln!(
+                "skipping LocateAnything MCP cache smoke; missing {} or {}",
+                image_path.display(),
+                model_root.display()
+            );
+            return;
+        }
+
+        let mut server = McpServer::new(ServerConfig {
+            locate_anything_backend: LocateAnythingBackend::BurnNative,
+            locate_anything_model_root: model_root,
+            ..ServerConfig::from_args(ServerArgs::parse_from(["burn_synth_mcp"]))
+        });
+        let manifest = SceneObjectManifest {
+            source_scene_path: image_path.display().to_string(),
+            scene_calibration: None,
+            objects: vec![
+                SceneObjectSpec {
+                    id: "conference_table".to_string(),
+                    label: "conference table".to_string(),
+                    aliases: vec!["table".to_string()],
+                    bbox: [0.386, 0.519, 0.659, 1.0],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: Some("conference_table".to_string()),
+                    instance_count: 1,
+                    object_prompt: "conference table".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: Some([3.2, 1.2]),
+                },
+                SceneObjectSpec {
+                    id: "conference_chair".to_string(),
+                    label: "conference chair".to_string(),
+                    aliases: vec!["chair".to_string()],
+                    bbox: [0.166, 0.63, 0.36, 1.0],
+                    instances: Vec::new(),
+                    representative_instance_id: None,
+                    reuse_group: Some("conference_chair".to_string()),
+                    instance_count: 1,
+                    object_prompt: "conference chair".to_string(),
+                    camera_hint: None,
+                    rotation_hint_degrees: None,
+                    target_footprint_m: Some([0.65, 0.65]),
+                },
+            ],
+        };
+        let assets = vec![
+            SceneAssetBinding {
+                asset_id: "conference_table_asset".to_string(),
+                object_id: "conference_table".to_string(),
+                label: "conference table".to_string(),
+                aliases: Vec::new(),
+                path: None,
+                cache_key: Some("test/conference_table".to_string()),
+                reusable: true,
+                source_image_path: None,
+                pipeline: None,
+                local_aabb: Some(SceneAssetAabb {
+                    min: [-1.6, 0.0, -0.6],
+                    max: [1.6, 0.2, 0.6],
+                }),
+                canonical_frame: Some(SceneAssetFrame {
+                    yaw_offset_degrees: 0.0,
+                    footprint_m: Some([3.2, 1.2]),
+                }),
+                provenance: None,
+            },
+            SceneAssetBinding {
+                asset_id: "conference_chair_asset".to_string(),
+                object_id: "conference_chair".to_string(),
+                label: "conference chair".to_string(),
+                aliases: Vec::new(),
+                path: None,
+                cache_key: Some("test/conference_chair".to_string()),
+                reusable: true,
+                source_image_path: None,
+                pipeline: None,
+                local_aabb: Some(SceneAssetAabb {
+                    min: [-0.32, 0.0, -0.32],
+                    max: [0.32, 1.1, 0.32],
+                }),
+                canonical_frame: Some(SceneAssetFrame {
+                    yaw_offset_degrees: 0.0,
+                    footprint_m: Some([0.64, 0.64]),
+                }),
+                provenance: None,
+            },
+        ];
+        let root = repo_root.join("tmp/runs").join(format!(
+            "{}_locateanything_mcp_burn_native_cache_smoke",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_millis()
+        ));
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        let make_args = |output_dir: PathBuf| SceneGroundToolArgs {
+            source_scene_path: image_path.clone(),
+            manifest: manifest.clone(),
+            asset_bindings: assets.clone(),
+            grounding_evidence: None,
+            output_dir: Some(output_dir),
+            composition_mode: SceneCompositionMode::CvGrounded,
+            depth_provider: SceneDepthProvider::None,
+            locator: SceneLocatorProvider::LocateAnything,
+            locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
+            clear_existing: true,
+            apply: false,
+            feedback: false,
+            feedback_iters: 0,
+            feedback_keep_viewer: false,
+            feedback_capture_dir: None,
+            feedback_threshold_profile: FeedbackThresholdProfile::Standard,
+        };
+
+        server
+            .call_scene_ground(make_args(first_dir.clone()))
+            .expect("first burn-native scene-ground");
+        server
+            .call_scene_ground(make_args(second_dir.clone()))
+            .expect("second burn-native scene-ground");
+        let first_metadata: Value =
+            read_json_path(&first_dir.join("locate_anything_burn_native/metadata.json")).unwrap();
+        let second_metadata: Value =
+            read_json_path(&second_dir.join("locate_anything_burn_native/metadata.json")).unwrap();
+        assert_eq!(first_metadata["runtime_cache_hit"], json!(false));
+        assert_eq!(second_metadata["runtime_cache_hit"], json!(true));
+    }
+
+    #[test]
+    fn tool_schema_exposes_scene_ground() {
+        let tools = tool_defs();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"scene_ground"));
+        let scene_ground = tools
+            .iter()
+            .find(|tool| tool["name"] == "scene_ground")
+            .expect("scene_ground schema");
+        assert_eq!(
+            scene_ground["inputSchema"]["properties"]["locate_anything_backend"]["enum"],
+            json!(["python-reference", "burn-native"])
+        );
+    }
+
+    #[test]
+    fn locate_anything_evidence_maps_detections_to_instances() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: vec![SceneObjectSpec {
+                id: "chairs".to_string(),
+                label: "chair".to_string(),
+                aliases: Vec::new(),
+                bbox: [0.1, 0.2, 0.8, 0.9],
+                instances: vec![
+                    SceneObjectInstanceSpec {
+                        id: Some("chair_left".to_string()),
+                        bbox: [0.10, 0.40, 0.30, 0.90],
+                        contact: None,
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: None,
+                        slot_index: None,
+                        target_footprint_m: None,
+                    },
+                    SceneObjectInstanceSpec {
+                        id: Some("chair_right".to_string()),
+                        bbox: [0.60, 0.40, 0.80, 0.90],
+                        contact: None,
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: None,
+                        slot_index: None,
+                        target_footprint_m: None,
+                    },
+                ],
+                representative_instance_id: None,
+                reuse_group: Some("chair".to_string()),
+                instance_count: 2,
+                object_prompt: "chair".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            }],
+        };
+        let detections = vec![
+            Detection {
+                label: "chair".to_string(),
+                bbox: [0.61, 0.41, 0.79, 0.91],
+                point: None,
+                confidence: Some(0.8),
+                source_query: "chair".to_string(),
+            },
+            Detection {
+                label: "chair".to_string(),
+                bbox: [0.11, 0.39, 0.29, 0.89],
+                point: None,
+                confidence: Some(0.9),
+                source_query: "chair".to_string(),
+            },
+        ];
+        let evidence = locate_anything_evidence_from_detections(
+            &manifest,
+            Path::new("/tmp/source.jpg"),
+            detections,
+            "locate_anything_test",
+        )
+        .unwrap();
+        assert_eq!(evidence.detections.len(), 2);
+        let left = evidence
+            .objects
+            .iter()
+            .find(|object| object.instance_id.as_deref() == Some("chair_left"))
+            .unwrap();
+        let right = evidence
+            .objects
+            .iter()
+            .find(|object| object.instance_id.as_deref() == Some("chair_right"))
+            .unwrap();
+        assert_eq!(
+            left.detection.as_ref().unwrap().bbox,
+            [0.11, 0.39, 0.29, 0.89]
+        );
+        assert_eq!(
+            right.detection.as_ref().unwrap().bbox,
+            [0.61, 0.41, 0.79, 0.91]
+        );
+        let object_union = evidence
+            .objects
+            .iter()
+            .find(|object| object.object_id == "chairs" && object.instance_id.is_none())
+            .unwrap();
+        assert_eq!(
+            object_union.detection.as_ref().unwrap().bbox,
+            [0.11, 0.39, 0.79, 0.91]
+        );
+    }
+
+    #[test]
+    fn depth_annotation_adds_contact_geometry_and_footprint_hints() {
+        let detection = Detection {
+            label: "conference chair".to_string(),
+            bbox: [0.25, 0.25, 0.75, 0.75],
+            point: Some([0.5, 0.75]),
+            confidence: Some(0.9),
+            source_query: "conference chair".to_string(),
+        };
+        let mut evidence = SceneGroundingEvidence {
+            source_image_path: "/tmp/source.jpg".to_string(),
+            depth: None,
+            detections: vec![detection.clone()],
+            camera: burn_synth_scene::EstimatedCamera::default(),
+            floor: EstimatedFloorPlane::default(),
+            objects: vec![ObjectGroundingEvidence {
+                object_id: "chair".to_string(),
+                instance_id: None,
+                reuse_group: Some("chair".to_string()),
+                detection: Some(detection),
+                asset_id: None,
+                contact_pixel: None,
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: Vec::new(),
+            }],
+        };
+        let depth_map = SceneDepthMapEvidence {
+            depth_m: vec![
+                2.0, 2.0, 2.0, 2.0, //
+                2.0, 2.2, 2.2, 2.0, //
+                2.0, 2.4, 2.4, 2.0, //
+                3.0, 3.0, 3.0, 3.0,
+            ],
+            width: 4,
+            height: 4,
+            intrinsics: CameraIntrinsics {
+                fx: 4.0,
+                fy: 4.0,
+                cx: 1.5,
+                cy: 1.5,
+                width: 4,
+                height: 4,
+            },
+            focal_length_px: Some(4.0),
+            vertical_fov_degrees: Some(53.0),
+        };
+
+        let summary =
+            annotate_grounding_evidence_with_depth_map(&mut evidence, &depth_map, "depth_pro");
+        let object = evidence.objects.first().unwrap();
+
+        assert_eq!(summary.annotated_objects, 1);
+        assert_eq!(summary.depth_map_size, [4, 4]);
+        assert!(summary.floor_sample_count > 0);
+        assert!(object.depth_stats.as_ref().unwrap().contact_m.unwrap() > 0.0);
+        assert_eq!(object.candidate_floor_contact_rays.len(), 1);
+        assert!(object.metric_contact_point_m.unwrap()[2] > 0.0);
+        assert!(object.target_footprint_m.unwrap()[0] >= 0.42);
+        assert!(object.provenance.contains(&"depth_pro".to_string()));
     }
 
     #[test]
@@ -7511,5 +9464,17 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    fn find_repo_root_for_test() -> Option<PathBuf> {
+        let mut dir = std::env::current_dir().ok()?;
+        loop {
+            if dir.join("Cargo.toml").exists() && dir.join("crates/burn_synth_mcp").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
     }
 }

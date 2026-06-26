@@ -14,6 +14,8 @@ tmp/
 docs/reports/
 
 *.py
+!crates/burn_locate_anything/python/
+!crates/burn_locate_anything/python/locate_anything_reference.py
 
 *.ply
 *.obj

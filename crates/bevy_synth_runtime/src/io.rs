@@ -524,6 +524,7 @@ fn gltf_json(mesh: &SynthMesh, layout: &MeshBinaryLayout) -> serde_json::Value {
     gltf
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_mesh_primitive_json(
     mesh: &SynthMesh,
     layout: &MeshBinaryLayout,
