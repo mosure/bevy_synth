@@ -2908,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "burn_locate_anything"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "burn",
  "burn-cuda",

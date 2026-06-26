@@ -1,6 +1,6 @@
 [package]
 name = "burn_locate_anything"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 description = "Burn runtime scaffolding for NVIDIA LocateAnything visual grounding"
