@@ -1235,7 +1235,7 @@ impl McpServer {
                     ),
                     Some(cached_asset_outputs.len()),
                     Some(selected_values.len()),
-                    None,
+                    Some(output_dir.join("assets")),
                     json!({
                         "attempt_index": asset_attempts.len(),
                         "inputs": input_image_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),

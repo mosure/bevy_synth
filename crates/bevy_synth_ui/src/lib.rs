@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
@@ -49,6 +50,11 @@ const MENU_HEIGHT: f32 = 44.0;
 const THUMB_SIZE: f32 = 84.0;
 const ENTRY_GAP: f32 = 10.0;
 const CATALOG_PAGE_SIZE: usize = 6;
+const CATALOG_MODE_SELECTOR_WIDTH: f32 = 92.0;
+const CATALOG_NAV_BUTTON_WIDTH: f32 = 24.0;
+const CATALOG_PAGE_LABEL_WIDTH: f32 = 30.0;
+const CATALOG_DELETE_BUTTON_WIDTH: f32 = 52.0;
+const CATALOG_TOGGLE_BUTTON_WIDTH: f32 = 44.0;
 const PIPELINE_SELECTOR_WIDTH: f32 = 176.0;
 const PIPELINE_SELECTOR_HEIGHT: f32 = 30.0;
 const STATUS_BADGE_WIDTH: f32 = 260.0;
@@ -134,6 +140,8 @@ const VIEWER_GROUND_Y_MIN: f32 = -2.0;
 const VIEWER_GROUND_Y_MAX: f32 = 2.0;
 const PROCESSING_EVENT_LIMIT: usize = 16;
 const PROCESSING_ARTIFACT_LIMIT: usize = 8;
+const DEVELOPER_EVENT_ROWS: usize = 12;
+const DEVELOPER_ARTIFACT_ROWS: usize = 10;
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -200,7 +208,7 @@ pub enum ScenePipelineKind {
 impl ScenePipelineKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Explicit => "Explicit",
+            Self::Explicit => "explicit",
         }
     }
 }
@@ -251,6 +259,8 @@ pub struct SceneProcessingState {
     active: bool,
     run_id: Option<String>,
     source_label: Option<String>,
+    wall_started_at: Option<Instant>,
+    last_event_at: Option<Instant>,
     current_stage: String,
     current_phase: String,
     current_execution: String,
@@ -268,6 +278,8 @@ impl Default for SceneProcessingState {
             active: false,
             run_id: None,
             source_label: None,
+            wall_started_at: None,
+            last_event_at: None,
             current_stage: "idle".to_string(),
             current_phase: "idle".to_string(),
             current_execution: "unknown".to_string(),
@@ -283,9 +295,12 @@ impl Default for SceneProcessingState {
 
 impl SceneProcessingState {
     pub fn begin(&mut self, source_label: impl Into<String>) {
+        let now = Instant::now();
         self.active = true;
         self.run_id = None;
         self.source_label = Some(source_label.into());
+        self.wall_started_at = Some(now);
+        self.last_event_at = Some(now);
         self.current_stage = "scene_build".to_string();
         self.current_phase = "started".to_string();
         self.current_execution = "mixed".to_string();
@@ -298,6 +313,11 @@ impl SceneProcessingState {
     }
 
     pub fn push_event(&mut self, run_id: String, event: SceneProcessingEvent) {
+        let now = Instant::now();
+        if self.wall_started_at.is_none() {
+            self.wall_started_at = now.checked_sub(Duration::from_millis(event.elapsed_ms));
+        }
+        self.last_event_at = Some(now);
         self.active = !event.phase.eq_ignore_ascii_case("completed")
             || !event.stage.eq_ignore_ascii_case("scene_build");
         self.run_id = Some(run_id);
@@ -305,7 +325,7 @@ impl SceneProcessingState {
         self.current_phase = event.phase.clone();
         self.current_execution = event.execution.clone();
         self.current_message = event.message.clone();
-        self.elapsed_ms = event.elapsed_ms;
+        self.elapsed_ms = self.elapsed_ms.max(event.elapsed_ms);
         if event.is_failure {
             self.last_error = Some(event.message.clone());
             self.active = false;
@@ -331,6 +351,7 @@ impl SceneProcessingState {
     }
 
     pub fn finish_success(&mut self, message: impl Into<String>) {
+        self.tick();
         self.active = false;
         self.current_stage = "scene_build".to_string();
         self.current_phase = "completed".to_string();
@@ -339,6 +360,7 @@ impl SceneProcessingState {
     }
 
     pub fn finish_failure(&mut self, message: impl Into<String>) {
+        self.tick();
         self.active = false;
         let message = message.into();
         self.current_stage = "scene_build".to_string();
@@ -355,6 +377,23 @@ impl SceneProcessingState {
     pub fn token_usage_summary(&self) -> Option<&str> {
         self.token_usage_summary.as_deref()
     }
+
+    pub fn tick(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(started_at) = self.wall_started_at {
+            self.elapsed_ms = self.elapsed_ms.max(saturating_elapsed_ms(started_at));
+        }
+    }
+
+    fn last_event_age_ms(&self) -> Option<u64> {
+        self.last_event_at.map(saturating_elapsed_ms)
+    }
+}
+
+fn saturating_elapsed_ms(instant: Instant) -> u64 {
+    instant.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 impl Default for ScenePipelineUiSettings {
@@ -542,6 +581,7 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_viewer_debug_toggle_button,
                     handle_viewer_debug_step_button,
                     (
+                        tick_processing_elapsed,
                         sync_settings_modal,
                         sync_settings_tab_visuals,
                         sync_settings_developer_panel,
@@ -1694,12 +1734,6 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         PipelineValueLabel,
                                         ButtonLabel,
                                     ));
-                                    button.spawn((
-                                        Text::new("v"),
-                                        TextFont::from_font_size(12.0),
-                                        TextColor(BUTTON_TEXT),
-                                        ButtonLabel,
-                                    ));
                                 });
                         } else {
                             selector
@@ -1888,9 +1922,9 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                     .spawn(Node {
                         width: Val::Percent(100.0),
                         height: Val::Px(30.0),
-                        justify_content: JustifyContent::SpaceBetween,
+                        justify_content: JustifyContent::FlexStart,
                         align_items: AlignItems::Center,
-                        column_gap: Val::Px(14.0),
+                        column_gap: Val::Px(8.0),
                         ..default()
                     })
                     .with_children(|header| {
@@ -1899,7 +1933,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                 CatalogModeDropdownHost,
                                 Node {
                                     position_type: PositionType::Relative,
-                                    width: Val::Px(104.0),
+                                    width: Val::Px(CATALOG_MODE_SELECTOR_WIDTH),
                                     height: Val::Px(28.0),
                                     overflow: Overflow::visible(),
                                     ..default()
@@ -1916,7 +1950,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                                         border: UiRect::all(Val::Px(1.0)),
                                         align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::SpaceBetween,
+                                        justify_content: JustifyContent::Center,
                                         ..default()
                                     },
                                     BorderColor::all(BUTTON_ACTIVE_BORDER),
@@ -1930,20 +1964,13 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         CatalogModeValueLabel,
                                         ButtonLabel,
                                     ));
-                                    button.spawn((
-                                        Text::new("v"),
-                                        TextFont::from_font_size(12.0),
-                                        TextColor(BUTTON_TEXT),
-                                        ButtonLabel,
-                                    ));
                                 });
                             });
                         header
                             .spawn(Node {
                                 flex_direction: FlexDirection::Row,
                                 align_items: AlignItems::Center,
-                                column_gap: Val::Px(8.0),
-                                margin: UiRect::left(Val::Px(16.0)),
+                                column_gap: Val::Px(6.0),
                                 ..default()
                             })
                             .with_children(|controls| {
@@ -1953,8 +1980,11 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         CatalogPrevButton,
                                         ControlButton(ControlButtonKind::Nav),
                                         Node {
-                                            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                                            width: Val::Px(CATALOG_NAV_BUTTON_WIDTH),
+                                            height: Val::Px(24.0),
                                             border: UiRect::all(Val::Px(1.0)),
+                                            align_items: AlignItems::Center,
+                                            justify_content: JustifyContent::Center,
                                             ..default()
                                         },
                                         BorderColor::all(BUTTON_BORDER),
@@ -1972,6 +2002,11 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                     Text::new("1/1"),
                                     TextFont::from_font_size(12.0),
                                     TextColor(Color::srgb(0.78, 0.82, 0.9)),
+                                    Node {
+                                        width: Val::Px(CATALOG_PAGE_LABEL_WIDTH),
+                                        justify_content: JustifyContent::Center,
+                                        ..default()
+                                    },
                                     PageLabel,
                                 ));
                                 controls
@@ -1980,8 +2015,11 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         CatalogNextButton,
                                         ControlButton(ControlButtonKind::Nav),
                                         Node {
-                                            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
+                                            width: Val::Px(CATALOG_NAV_BUTTON_WIDTH),
+                                            height: Val::Px(24.0),
                                             border: UiRect::all(Val::Px(1.0)),
+                                            align_items: AlignItems::Center,
+                                            justify_content: JustifyContent::Center,
                                             ..default()
                                         },
                                         BorderColor::all(BUTTON_BORDER),
@@ -2001,8 +2039,11 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         CatalogDeleteButton,
                                         ControlButton(ControlButtonKind::Secondary),
                                         Node {
-                                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                            width: Val::Px(CATALOG_DELETE_BUTTON_WIDTH),
+                                            height: Val::Px(24.0),
                                             border: UiRect::all(Val::Px(1.0)),
+                                            align_items: AlignItems::Center,
+                                            justify_content: JustifyContent::Center,
                                             ..default()
                                         },
                                         BorderColor::all(BUTTON_BORDER),
@@ -2022,8 +2063,11 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                         CatalogToggleButton,
                                         ControlButton(ControlButtonKind::Secondary),
                                         Node {
-                                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                            width: Val::Px(CATALOG_TOGGLE_BUTTON_WIDTH),
+                                            height: Val::Px(24.0),
                                             border: UiRect::all(Val::Px(1.0)),
+                                            align_items: AlignItems::Center,
+                                            justify_content: JustifyContent::Center,
                                             ..default()
                                         },
                                         BorderColor::all(BUTTON_BORDER),
@@ -2031,7 +2075,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                     ))
                                     .with_children(|button| {
                                         button.spawn((
-                                            Text::new("collapse"),
+                                            Text::new("hide"),
                                             TextFont::from_font_size(12.0),
                                             TextColor(BUTTON_TEXT),
                                             ToggleLabel,
@@ -2168,6 +2212,11 @@ fn update_queue_text(
 }
 
 #[allow(clippy::type_complexity)]
+fn tick_processing_elapsed(mut state: ResMut<SceneProcessingState>) {
+    state.tick();
+}
+
+#[allow(clippy::type_complexity)]
 fn sync_processing_panel(
     state: Res<SceneProcessingState>,
     mut roots: Query<&mut Visibility, With<ProcessingPanelRoot>>,
@@ -2268,78 +2317,165 @@ fn sync_settings_developer_panel(
         Query<&mut Text, With<SettingsDeveloperArtifactText>>,
     )>,
 ) {
-    let current_text = format_processing_current_block(&state);
+    let current_text = format_developer_current_block(&state);
     for mut text in &mut text_queries.p0() {
         text.0 = current_text.clone();
     }
 
-    let token_text = state
-        .token_usage_summary
-        .clone()
-        .unwrap_or_else(|| "no token usage reported yet".to_string());
+    let token_text = format_developer_token_block(&state);
     for mut text in &mut text_queries.p1() {
         text.0 = token_text.clone();
     }
 
-    let event_text = state
-        .recent_events
-        .iter()
-        .take(10)
-        .map(format_processing_event)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let event_text = format_developer_event_block(&state);
     for mut text in &mut text_queries.p2() {
-        text.0 = if event_text.is_empty() {
-            "no scene build events yet".to_string()
-        } else {
-            event_text.clone()
-        };
+        text.0 = event_text.clone();
     }
 
-    let artifact_text = state
-        .recent_artifacts
-        .iter()
-        .take(8)
-        .map(|path| ellipsize_text(path, 80))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let artifact_text = format_developer_artifact_block(&state);
     for mut text in &mut text_queries.p3() {
-        text.0 = if artifact_text.is_empty() {
-            "no artifacts yet".to_string()
-        } else {
-            artifact_text.clone()
-        };
+        text.0 = artifact_text.clone();
     }
 }
 
-fn format_processing_current_block(state: &SceneProcessingState) -> String {
+fn format_developer_current_block(state: &SceneProcessingState) -> String {
+    let active = if state.active { "active" } else { "idle" };
+    let last_event = state
+        .last_event_age_ms()
+        .map(format_elapsed_ms)
+        .unwrap_or_else(|| "none".to_string());
+    let error = state
+        .last_error
+        .as_deref()
+        .map(|value| format!("\nerror: {}", ellipsize_text(value, 92)))
+        .unwrap_or_default();
     format!(
-        "run: {}\nsource: {}\nstage: {} / {} / {}\nelapsed: {}\nmessage: {}",
+        "state: {active}\nrun: {}\nsource: {}\nstage: {} / {} / {}\nelapsed: {} | last event: {last_event}\nmessage: {}{}",
         state.run_id.as_deref().unwrap_or("none"),
-        state.source_label.as_deref().unwrap_or("none"),
-        state.current_stage,
+        ellipsize_text(state.source_label.as_deref().unwrap_or("none"), 74),
+        ellipsize_text(&state.current_stage, 40),
         state.current_phase,
         state.current_execution,
         format_elapsed_ms(state.elapsed_ms),
-        state.current_message
+        ellipsize_text(&state.current_message, 92),
+        error
     )
 }
 
+fn format_developer_token_block(state: &SceneProcessingState) -> String {
+    state
+        .token_usage_summary
+        .as_deref()
+        .map(|summary| ellipsize_text(summary, 104))
+        .unwrap_or_else(|| {
+            if state.active {
+                "waiting for provider token usage; local GPU stages do not emit token counts"
+                    .to_string()
+            } else {
+                "no token usage reported yet".to_string()
+            }
+        })
+}
+
+fn format_developer_event_block(state: &SceneProcessingState) -> String {
+    let rows = state
+        .recent_events
+        .iter()
+        .take(DEVELOPER_EVENT_ROWS)
+        .map(format_developer_event)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return if state.active {
+            "worker is active; waiting for first progress event".to_string()
+        } else {
+            "no scene build events yet".to_string()
+        };
+    }
+    rows.join("\n")
+}
+
+fn format_developer_artifact_block(state: &SceneProcessingState) -> String {
+    let rows = state
+        .recent_artifacts
+        .iter()
+        .take(DEVELOPER_ARTIFACT_ROWS)
+        .map(|path| format!("{} {}", artifact_kind_label(path), ellipsize_text(path, 92)))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return if state.active {
+            "waiting for first artifact path; generated files appear under tmp/runs/<run_id>"
+                .to_string()
+        } else {
+            "no artifacts yet".to_string()
+        };
+    }
+    rows.join("\n")
+}
+
 fn format_processing_event(event: &SceneProcessingEvent) -> String {
+    format_event_row(event, 72, true)
+}
+
+fn format_developer_event(event: &SceneProcessingEvent) -> String {
+    format_event_row(event, 96, false)
+}
+
+fn format_event_row(
+    event: &SceneProcessingEvent,
+    max_message_chars: usize,
+    compact: bool,
+) -> String {
     let item = match (event.item_index, event.item_count) {
         (Some(index), Some(total)) => format!(" [{index}/{total}]"),
         (None, Some(total)) => format!(" [{total}]"),
         _ => String::new(),
     };
     let marker = if event.is_failure { "!" } else { "-" };
-    format!(
-        "{marker} {} {} {}{}: {}",
-        format_elapsed_ms(event.elapsed_ms),
-        event.phase,
-        event.stage,
-        item,
-        ellipsize_text(&event.message, 72)
-    )
+    let artifact = event
+        .artifact_path
+        .as_deref()
+        .map(|path| format!(" -> {}", ellipsize_text(path, 40)))
+        .unwrap_or_default();
+    if compact {
+        format!(
+            "{marker} {} {} {}{}: {}",
+            format_elapsed_ms(event.elapsed_ms),
+            event.phase,
+            event.stage,
+            item,
+            ellipsize_text(&event.message, max_message_chars)
+        )
+    } else {
+        format!(
+            "{marker} {} [{}] {} / {}{}: {}{}",
+            format_elapsed_ms(event.elapsed_ms),
+            event.execution,
+            event.phase,
+            event.stage,
+            item,
+            ellipsize_text(&event.message, max_message_chars),
+            artifact
+        )
+    }
+}
+
+fn artifact_kind_label(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".glb") || lower.ends_with(".gltf") || lower.ends_with(".splat") {
+        "asset"
+    } else if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+    {
+        "image"
+    } else if lower.ends_with(".json") || lower.ends_with(".jsonl") {
+        "json "
+    } else if lower.contains("/assets") || lower.ends_with("assets") {
+        "dir  "
+    } else {
+        "file "
+    }
 }
 
 fn compact_worker_status_text(message: &str) -> String {
@@ -2545,9 +2681,9 @@ fn rebuild_catalog_list(
 
     for mut label in toggle_query.iter_mut() {
         label.0 = if catalog.expanded {
-            "collapse".to_string()
+            "hide".to_string()
         } else {
-            "expand".to_string()
+            "show".to_string()
         };
     }
     let page_count = catalog.page_count();
@@ -4602,7 +4738,7 @@ fn spawn_settings_modal(
         .with_children(|root| {
             root.spawn((
                 Node {
-                    width: Val::Px(390.0),
+                    width: Val::Px(520.0),
                     flex_direction: FlexDirection::Column,
                     row_gap: Val::Px(14.0),
                     padding: UiRect::all(Val::Px(16.0)),
@@ -4703,7 +4839,7 @@ fn settings_modal_title(pipeline: CatalogPipelineChoice) -> &'static str {
         CatalogPipelineChoice::Object(SynthesisModel::Triposg) => "TripoSG settings",
         CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => "TripoSplat settings",
         CatalogPipelineChoice::Object(SynthesisModel::Trellis) => "Trellis.2 settings",
-        CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => "Explicit scene settings",
+        CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => "explicit scene settings",
     }
 }
 
@@ -5830,7 +5966,7 @@ fn adjust_scene_setting(
         }
     }
     info!(
-        "Explicit scene settings: quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={}",
+        "explicit scene settings: quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={}",
         settings.quality_profile.label(),
         settings.candidate_count,
         settings.feedback_iterations,
@@ -6857,6 +6993,48 @@ mod tests {
         );
         assert_eq!(text, "scene progress: images_to_assets");
         assert!(text.len() <= 34);
+    }
+
+    #[test]
+    fn scene_processing_heartbeat_advances_elapsed_without_new_events() {
+        let mut state = SceneProcessingState::default();
+        state.begin("source.jpg");
+        state.wall_started_at = Some(Instant::now() - Duration::from_millis(2500));
+        state.tick();
+
+        assert!(
+            state.elapsed_ms >= 2400,
+            "active processing elapsed time should advance from wall clock even without worker events"
+        );
+        assert!(format_developer_current_block(&state).contains("last event:"));
+    }
+
+    #[test]
+    fn developer_processing_blocks_include_artifacts_and_recent_events() {
+        let mut state = SceneProcessingState::default();
+        state.begin("scene.png");
+        state.push_event(
+            "run_001".to_string(),
+            SceneProcessingEvent {
+                stage: "images_to_assets".to_string(),
+                phase: "progress".to_string(),
+                execution: "gpu".to_string(),
+                message: "running TRELLIS batch for 2 image(s)".to_string(),
+                elapsed_ms: 42_000,
+                item_index: Some(1),
+                item_count: Some(2),
+                artifact_path: Some("tmp/runs/run_001/assets".to_string()),
+                token_usage: None,
+                is_failure: false,
+            },
+        );
+
+        let event_text = format_developer_event_block(&state);
+        assert!(event_text.contains("[gpu] progress / images_to_assets"));
+        assert!(event_text.contains("[1/2]"));
+        let artifact_text = format_developer_artifact_block(&state);
+        assert!(artifact_text.contains("dir"));
+        assert!(artifact_text.contains("tmp/runs/run_001/assets"));
     }
 
     #[test]
