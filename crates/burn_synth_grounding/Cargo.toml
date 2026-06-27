@@ -1,0 +1,26 @@
+[package]
+name = "burn_synth_grounding"
+version = "0.2.0"
+edition = "2024"
+
+description = "Scene-scale grounding providers and evidence adapters for burn_synth"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std", "wgpu", "fusion"] }
+burn_depth = { version = "0.4.2", default-features = false, features = ["backend_wgpu", "backend_fusion", "bpk"] }
+burn_locate_anything = { version = "0.1.2", path = "../burn_locate_anything" }
+burn_synth_scene = { version = "0.2.0", path = "../burn_synth_scene" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+locate-anything-wgpu = ["burn_locate_anything/backend_wgpu"]

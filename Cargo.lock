@@ -1857,6 +1857,7 @@ dependencies = [
  "bevy_picking",
  "bevy_synth_runtime",
  "bevy_synth_ui",
+ "burn_synth_mcp",
  "burn_synth_scene",
  "clap",
  "console_error_panic_hook",
@@ -2818,9 +2819,9 @@ dependencies = [
 
 [[package]]
 name = "burn_depth"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b553f1d1fa6070eda16d2ae75e92298ed581ed1005725e708f3ba87c57e673ad"
+checksum = "ffe4ab019359131190b441d3294831c95510170c4342949cbb0b0e98bec0f42a"
 dependencies = [
  "burn",
  "burn-store",
@@ -2962,6 +2963,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn_synth_grounding"
+version = "0.2.0"
+dependencies = [
+ "burn",
+ "burn_depth",
+ "burn_locate_anything",
+ "burn_synth_scene",
+ "image",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "burn_synth_import"
 version = "0.1.0"
 dependencies = [
@@ -2978,10 +2992,8 @@ name = "burn_synth_mcp"
 version = "0.2.0"
 dependencies = [
  "bevy_synth_runtime",
- "burn",
- "burn_depth",
- "burn_locate_anything",
  "burn_synth",
+ "burn_synth_grounding",
  "burn_synth_scene",
  "clap",
  "gltf",
@@ -2996,7 +3008,6 @@ name = "burn_synth_scene"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
- "burn_locate_anything",
  "clap",
  "image",
  "reqwest",

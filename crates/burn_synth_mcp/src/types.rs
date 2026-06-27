@@ -1,0 +1,888 @@
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+
+use burn_synth::{ModelSelection, RuntimeConfig};
+use burn_synth_grounding::{GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT};
+use burn_synth_scene::SceneQualityProfile;
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+
+pub(crate) const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+pub(crate) const DEFAULT_SCENE_TRELLIS_TARGET_FACES: usize = 80_000;
+pub(crate) const DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE: usize = 512;
+pub(crate) static NEXT_SCENE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForegroundModel {
+    Rmbg14,
+    Rmbg2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SynthesisModel {
+    Triposg,
+    Trellis,
+    Triposplat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InferenceBackend {
+    Cpu,
+    Wgpu,
+    Cuda,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrellisQuality {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QualityPreset {
+    Fast,
+    Balanced,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedbackThresholdProfile {
+    Loose,
+    Standard,
+    Strict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeedbackRotationSelector {
+    Deterministic,
+    Openai,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QualityDefaults {
+    num_steps: usize,
+    num_tokens: usize,
+    guidance_scale: f32,
+    flash_octree_depth: usize,
+    flash_min_resolution: usize,
+    flash_mini_grid_num: usize,
+    flash_num_chunks: usize,
+}
+
+impl QualityPreset {
+    fn defaults(self) -> QualityDefaults {
+        match self {
+            Self::Fast => QualityDefaults {
+                num_steps: 12,
+                num_tokens: 512,
+                guidance_scale: 7.0,
+                flash_octree_depth: 7,
+                flash_min_resolution: 31,
+                flash_mini_grid_num: 2,
+                flash_num_chunks: 4096,
+            },
+            Self::Balanced => QualityDefaults {
+                num_steps: 20,
+                num_tokens: 1024,
+                guidance_scale: 7.0,
+                flash_octree_depth: 8,
+                flash_min_resolution: 31,
+                flash_mini_grid_num: 4,
+                flash_num_chunks: 8192,
+            },
+            Self::Full => QualityDefaults {
+                num_steps: 50,
+                num_tokens: 2048,
+                guidance_scale: 7.0,
+                flash_octree_depth: 9,
+                flash_min_resolution: 63,
+                flash_mini_grid_num: 4,
+                flash_num_chunks: 10_000,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshOutputFormat {
+    Obj,
+    Gltf,
+    Glb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetOutputFormat {
+    Auto,
+    Glb,
+    Splat,
+    Ply,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneCompositionMode {
+    Heuristic,
+    CvGrounded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScenePoseFitMode {
+    ProjectedAabb,
+    RenderedSilhouette,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneCanonicalPoseMode {
+    Off,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneDepthProvider {
+    None,
+    DepthPro,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SceneDepthPrecision {
+    F32,
+    F16,
+}
+
+impl From<SceneDepthPrecision> for GroundingDepthPrecision {
+    fn from(value: SceneDepthPrecision) -> Self {
+        match value {
+            SceneDepthPrecision::F32 => GroundingDepthPrecision::F32,
+            SceneDepthPrecision::F16 => GroundingDepthPrecision::F16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneLocatorProvider {
+    Manifest,
+    LocateAnything,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocateAnythingBackend {
+    BurnNative,
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "burn_synth_mcp",
+    version,
+    about = "burn_synth MCP stdio server and scene e2e CLI"
+)]
+pub struct ServerArgs {
+    #[arg(long, value_enum, default_value_t = ForegroundModel::Rmbg2)]
+    pub rmbg_model: ForegroundModel,
+
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_values_t = [SynthesisModel::Triposg]
+    )]
+    /// Synthesis backends, ordered by preference (first is preferred).
+    pub synthesis_models: Vec<SynthesisModel>,
+
+    #[arg(long, value_enum, default_value_t = InferenceBackend::Wgpu)]
+    pub backend: InferenceBackend,
+
+    #[arg(long)]
+    pub weights_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_weights_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_image_large_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_python_bin: Option<PathBuf>,
+
+    #[arg(long)]
+    pub trellis_bridge_script: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
+    pub trellis_quality: TrellisQuality,
+
+    /// Enable TRELLIS PBR UV/material texture baking through the Rust/Burn o_voxel export path.
+    #[arg(long)]
+    pub trellis_pbr: bool,
+
+    /// TRELLIS PBR texture size for Rust/Burn o_voxel GLB export. Uses runtime default when omitted.
+    #[arg(long)]
+    pub trellis_pbr_texture_size: Option<usize>,
+
+    /// Quality preset (fast, balanced, full). Individual flags override this preset.
+    #[arg(long, value_enum, default_value_t = QualityPreset::Balanced)]
+    pub quality: QualityPreset,
+
+    #[arg(long)]
+    pub bg_weights_root: Option<PathBuf>,
+
+    #[arg(long)]
+    pub num_steps: Option<usize>,
+
+    #[arg(long)]
+    pub num_tokens: Option<usize>,
+
+    #[arg(long)]
+    pub guidance_scale: Option<f32>,
+
+    /// Batch chunk size for image generation tools. Use 0 for auto.
+    #[arg(long, default_value_t = 0)]
+    pub batch_size: usize,
+
+    /// Explicit VRAM budget in MB for auto batch planning.
+    #[arg(long)]
+    pub batch_vram_mb: Option<u64>,
+
+    /// Bevy scene command file path for scene_* tools.
+    #[arg(long)]
+    pub scene_control_path: Option<PathBuf>,
+
+    /// Bevy scene status file path. Defaults to <scene-control-path>.status.json.
+    #[arg(long)]
+    pub scene_status_path: Option<PathBuf>,
+
+    /// Shared Bevy asset cache root. Defaults to the normal user cache.
+    #[arg(long)]
+    pub catalog_cache_root: Option<PathBuf>,
+
+    /// Timeout for scene command acknowledgements.
+    #[arg(long, default_value_t = 5000)]
+    pub scene_timeout_ms: u64,
+
+    /// OpenAI reasoning model used by scene planning tools.
+    #[arg(long, default_value = "gpt-5.5")]
+    pub openai_reasoning_model: String,
+
+    /// OpenAI image model used by object-image generation tools.
+    #[arg(long, default_value = "gpt-image-2")]
+    pub openai_image_model: String,
+
+    /// Example/reference isolated-object image for OpenAI object generation.
+    #[arg(long, default_value = "docs/input_chair.jpg")]
+    pub scene_object_reference_image: PathBuf,
+
+    /// Local cache directory for burn_depth CDN model shards and assembled .bpk artifacts.
+    #[arg(long)]
+    pub depth_cache_dir: Option<PathBuf>,
+
+    /// Precision used for the burn_depth DepthPro checkpoint.
+    #[arg(long, value_enum, default_value_t = SceneDepthPrecision::F16)]
+    pub depth_precision: SceneDepthPrecision,
+
+    /// Allow burn_depth to download missing CDN model shards.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub depth_allow_download: bool,
+
+    /// LocateAnything model root used by the Burn-native locator.
+    #[arg(long, default_value = "assets/models/LocateAnything-3B")]
+    pub locate_anything_model_root: PathBuf,
+
+    /// Image token limit for the LocateAnything locator. Defaults to the WGPU-safe limit.
+    #[arg(long, default_value_t = LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT as usize)]
+    pub locate_anything_in_token_limit: usize,
+
+    /// LocateAnything execution backend used by scene-ground when --locator locate-anything.
+    #[arg(long, value_enum, default_value_t = LocateAnythingBackend::BurnNative)]
+    pub locate_anything_backend: LocateAnythingBackend,
+
+    #[command(subcommand)]
+    pub(crate) command: Option<ServerCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum ServerCommand {
+    /// Run the full source-scene image -> object images -> assets -> grounded BSN pipeline once.
+    SceneBuild(SceneBuildCliArgs),
+    /// Recompute scene composition from saved assets and grounding evidence without regenerating assets.
+    SceneGround(SceneGroundCliArgs),
+    /// Replay render-capture-feedback using existing scene-build artifacts.
+    SceneFeedbackReplay(SceneFeedbackReplayCliArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SceneBuildCliArgs {
+    /// Source scene image path.
+    #[arg(long, visible_alias = "scene")]
+    pub source_scene_path: PathBuf,
+
+    /// Example/reference isolated-object image. Defaults to --scene-object-reference-image.
+    #[arg(long, visible_alias = "object-reference")]
+    pub object_reference_image_path: Option<PathBuf>,
+
+    /// Output directory for generated images, assets, BSN, metrics, and response JSON.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Number of generated object-image candidates in the default budget.
+    #[arg(long, visible_alias = "candidates")]
+    pub candidate_count: Option<usize>,
+
+    /// Maximum guarded image-generation attempts per object.
+    #[arg(long)]
+    pub candidate_retry_attempts: Option<usize>,
+
+    /// Image candidates requested per retry attempt.
+    #[arg(long)]
+    pub candidate_batch_size: Option<usize>,
+
+    /// Minimum isolated-object reconstruction score before TRELLIS lifting.
+    #[arg(long)]
+    pub min_reconstruction_score: Option<f32>,
+
+    /// OpenAI object-image generation profile.
+    #[arg(long, value_enum, visible_alias = "profile")]
+    pub quality_profile: Option<SceneQualityProfile>,
+
+    /// Allow object planning to consider existing catalog assets.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub allow_catalog_reuse: bool,
+
+    /// Lift selected generated object images into 3D assets.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub lift_assets: bool,
+
+    /// TRELLIS target face count. Use 0 to disable decimation.
+    #[arg(long)]
+    pub target_faces: Option<usize>,
+
+    /// Batch chunk size for object-image lifting. Use 0 for auto/global default.
+    #[arg(long)]
+    pub batch_size: Option<usize>,
+
+    /// Explicit VRAM budget in MB for auto batch planning.
+    #[arg(long)]
+    pub batch_vram_mb: Option<u64>,
+
+    /// Enable TRELLIS PBR UV/material texture baking through the Rust/Burn o_voxel export path.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub trellis_pbr: bool,
+
+    /// TRELLIS PBR texture size for Rust/Burn o_voxel GLB export.
+    #[arg(long)]
+    pub trellis_pbr_texture_size: Option<usize>,
+
+    /// Add lifted assets to the shared Bevy catalog/cache.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub promote_to_catalog: bool,
+
+    /// Composition mode used after generated object assets are lifted.
+    #[arg(long, value_enum, default_value_t = SceneCompositionMode::CvGrounded)]
+    pub composition_mode: SceneCompositionMode,
+
+    /// Pose fitting strategy used inside cv-grounded composition.
+    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::RenderedSilhouette)]
+    pub pose_fit: ScenePoseFitMode,
+
+    /// Canonical asset orientation strategy.
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Auto)]
+    pub canonical_pose: SceneCanonicalPoseMode,
+
+    /// Maximum pose candidates per object for deterministic cv-grounded fitting.
+    #[arg(long, default_value_t = 32)]
+    pub max_pose_candidates: usize,
+
+    /// Save pose fitting debug sidecars when artifacts are enabled.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub save_pose_debug: bool,
+
+    /// Depth provider used by CV-grounded scene composition.
+    #[arg(long, value_enum, default_value_t = SceneDepthProvider::DepthPro)]
+    pub depth_provider: SceneDepthProvider,
+
+    /// Locator provider used by CV-grounded scene composition.
+    #[arg(long, value_enum, default_value_t = SceneLocatorProvider::LocateAnything)]
+    pub locator: SceneLocatorProvider,
+
+    /// Override the server LocateAnything backend for this scene-build run.
+    #[arg(long, value_enum)]
+    pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Write structured e2e artifacts to the output directory.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub write_artifacts: bool,
+
+    /// Clear the live Bevy scene before applying generated commands.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub clear_existing: bool,
+
+    /// Apply the generated scene to the configured Bevy scene bridge.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Run bounded render-capture-feedback layout validation/refinement.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub feedback: bool,
+
+    /// Maximum render-capture-feedback iterations.
+    #[arg(long, default_value_t = 3)]
+    pub feedback_iters: usize,
+
+    /// Leave a temporary feedback viewer running after scene-build completes.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback_keep_viewer: bool,
+
+    /// Optional directory for feedback screenshots, status, metrics, and deltas.
+    #[arg(long)]
+    pub feedback_capture_dir: Option<PathBuf>,
+
+    /// Geometry-first feedback pass/fail threshold profile.
+    #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+
+    /// Rotation candidate selector used during render-capture feedback.
+    #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
+    pub feedback_rotation_selector: FeedbackRotationSelector,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SceneGroundCliArgs {
+    /// Source scene image path.
+    #[arg(long, visible_alias = "scene")]
+    pub source_scene_path: PathBuf,
+
+    /// Existing object manifest JSON.
+    #[arg(long)]
+    pub manifest: PathBuf,
+
+    /// Existing asset bindings JSON produced by scene-build/images_to_assets.
+    #[arg(long)]
+    pub asset_bindings: PathBuf,
+
+    /// Optional grounding evidence JSON. When omitted, manifest bbox/contact evidence is used.
+    #[arg(long)]
+    pub grounding_evidence: Option<PathBuf>,
+
+    /// Output directory for grounded layout, BSN, commands, and metrics.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Composition mode. cv-grounded writes evidence artifacts and uses the evidence adapter.
+    #[arg(long, value_enum, default_value_t = SceneCompositionMode::CvGrounded)]
+    pub composition_mode: SceneCompositionMode,
+
+    /// Pose fitting strategy used inside cv-grounded composition.
+    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::RenderedSilhouette)]
+    pub pose_fit: ScenePoseFitMode,
+
+    /// Canonical asset orientation strategy.
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Auto)]
+    pub canonical_pose: SceneCanonicalPoseMode,
+
+    /// Maximum pose candidates per object for deterministic cv-grounded fitting.
+    #[arg(long, default_value_t = 32)]
+    pub max_pose_candidates: usize,
+
+    /// Save pose fitting debug sidecars when artifacts are enabled.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub save_pose_debug: bool,
+
+    /// Depth provider identifier for run metadata.
+    #[arg(long, value_enum, default_value_t = SceneDepthProvider::DepthPro)]
+    pub depth_provider: SceneDepthProvider,
+
+    /// Locator provider identifier for run metadata.
+    #[arg(long, value_enum, default_value_t = SceneLocatorProvider::Manifest)]
+    pub locator: SceneLocatorProvider,
+
+    /// Override the server LocateAnything backend for this scene-ground run.
+    #[arg(long, value_enum)]
+    pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Clear the live Bevy scene before applying generated commands.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub clear_existing: bool,
+
+    /// Apply the generated scene to the configured Bevy scene bridge.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Run bounded render-capture-feedback layout validation/refinement.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback: bool,
+
+    /// Maximum render-capture-feedback iterations.
+    #[arg(long, default_value_t = 3)]
+    pub feedback_iters: usize,
+
+    /// Leave a temporary feedback viewer running after scene-ground completes.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback_keep_viewer: bool,
+
+    /// Optional directory for feedback screenshots, status, metrics, and deltas.
+    #[arg(long)]
+    pub feedback_capture_dir: Option<PathBuf>,
+
+    /// Geometry-first feedback pass/fail threshold profile.
+    #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+
+    /// Rotation candidate selector used during render-capture feedback.
+    #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
+    pub feedback_rotation_selector: FeedbackRotationSelector,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SceneFeedbackReplayCliArgs {
+    /// Existing scene-build output directory with manifest/assets/layout/commands artifacts.
+    #[arg(long)]
+    pub output_dir: PathBuf,
+
+    /// Manifest JSON path. Defaults to <output-dir>/manifest.json.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+
+    /// Asset bindings JSON path. Defaults to <output-dir>/asset_bindings.json.
+    #[arg(long)]
+    pub asset_bindings_path: Option<PathBuf>,
+
+    /// Grounded layout JSON path. Defaults to <output-dir>/grounded_layout.json.
+    #[arg(long)]
+    pub grounded_layout_path: Option<PathBuf>,
+
+    /// Scene command JSON path. Defaults to <output-dir>/commands.json.
+    #[arg(long)]
+    pub commands_path: Option<PathBuf>,
+
+    /// Rebuild initial commands from grounded_layout.bsn instead of replaying saved commands.json.
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
+    pub rebuild_commands_from_grounded_layout: bool,
+
+    /// Maximum render-capture-feedback iterations.
+    #[arg(long, default_value_t = 3)]
+    pub feedback_iters: usize,
+
+    /// Leave the temporary feedback viewer running after replay.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub feedback_keep_viewer: bool,
+
+    /// Optional directory for replay screenshots, status, metrics, and deltas.
+    #[arg(long)]
+    pub feedback_capture_dir: Option<PathBuf>,
+
+    /// Geometry-first feedback pass/fail threshold profile.
+    #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
+    pub feedback_threshold_profile: FeedbackThresholdProfile,
+
+    /// Rotation candidate selector used during render-capture feedback.
+    #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
+    pub feedback_rotation_selector: FeedbackRotationSelector,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub default_rmbg_model: ForegroundModel,
+    pub default_synthesis_models: Vec<SynthesisModel>,
+    pub default_backend: InferenceBackend,
+    pub weights_root: Option<PathBuf>,
+    pub trellis_weights_root: Option<PathBuf>,
+    pub trellis_image_large_root: Option<PathBuf>,
+    pub trellis_python_bin: Option<PathBuf>,
+    pub trellis_bridge_script: Option<PathBuf>,
+    pub trellis_quality: TrellisQuality,
+    pub trellis_pbr_enabled: bool,
+    pub trellis_pbr_texture_size: Option<usize>,
+    pub quality: QualityPreset,
+    pub bg_weights_root: Option<PathBuf>,
+    pub num_steps: usize,
+    pub num_tokens: usize,
+    pub guidance_scale: f32,
+    pub flash_octree_depth: usize,
+    pub flash_min_resolution: usize,
+    pub flash_mini_grid_num: usize,
+    pub flash_num_chunks: usize,
+    pub batch_size: Option<usize>,
+    pub batch_vram_mb: Option<u64>,
+    pub scene_control_path: Option<PathBuf>,
+    pub scene_status_path: Option<PathBuf>,
+    pub catalog_cache_root: Option<PathBuf>,
+    pub scene_timeout: Duration,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub openai_project_id: Option<String>,
+    pub openai_reasoning_model: String,
+    pub openai_image_model: String,
+    pub scene_object_reference_image: PathBuf,
+    pub depth_cache_dir: Option<PathBuf>,
+    pub depth_precision: SceneDepthPrecision,
+    pub depth_allow_download: bool,
+    pub locate_anything_model_root: PathBuf,
+    pub locate_anything_in_token_limit: usize,
+    pub locate_anything_backend: LocateAnythingBackend,
+}
+
+impl ServerConfig {
+    pub fn from_args(args: ServerArgs) -> Self {
+        let quality = args.quality;
+        let defaults = quality.defaults();
+        Self {
+            default_rmbg_model: args.rmbg_model,
+            default_synthesis_models: sanitize_synthesis_models(args.synthesis_models),
+            default_backend: args.backend,
+            weights_root: args.weights_root,
+            trellis_weights_root: args.trellis_weights_root,
+            trellis_image_large_root: args.trellis_image_large_root,
+            trellis_python_bin: args.trellis_python_bin,
+            trellis_bridge_script: args.trellis_bridge_script,
+            trellis_quality: args.trellis_quality,
+            trellis_pbr_enabled: args.trellis_pbr,
+            trellis_pbr_texture_size: args.trellis_pbr_texture_size,
+            quality,
+            bg_weights_root: args.bg_weights_root,
+            num_steps: args.num_steps.unwrap_or(defaults.num_steps),
+            num_tokens: args.num_tokens.unwrap_or(defaults.num_tokens),
+            guidance_scale: args.guidance_scale.unwrap_or(defaults.guidance_scale),
+            flash_octree_depth: defaults.flash_octree_depth,
+            flash_min_resolution: defaults.flash_min_resolution,
+            flash_mini_grid_num: defaults.flash_mini_grid_num,
+            flash_num_chunks: defaults.flash_num_chunks,
+            batch_size: (args.batch_size > 0).then_some(args.batch_size),
+            batch_vram_mb: args.batch_vram_mb,
+            scene_status_path: args.scene_status_path.or_else(|| {
+                args.scene_control_path
+                    .as_ref()
+                    .map(|path| path.with_extension("status.json"))
+            }),
+            scene_control_path: args.scene_control_path,
+            catalog_cache_root: args.catalog_cache_root,
+            scene_timeout: Duration::from_millis(args.scene_timeout_ms.max(1)),
+            openai_api_key: env_or_dotenv_var("OPENAI_API_KEY"),
+            openai_base_url: env_or_dotenv_var("OPENAI_BASE_URL"),
+            openai_project_id: env_or_dotenv_var("OPENAI_PROJECT_ID"),
+            openai_reasoning_model: args.openai_reasoning_model,
+            openai_image_model: args.openai_image_model,
+            scene_object_reference_image: args.scene_object_reference_image,
+            depth_cache_dir: args.depth_cache_dir,
+            depth_precision: args.depth_precision,
+            depth_allow_download: args.depth_allow_download,
+            locate_anything_model_root: args.locate_anything_model_root,
+            locate_anything_in_token_limit: args.locate_anything_in_token_limit.max(1),
+            locate_anything_backend: args.locate_anything_backend,
+        }
+    }
+
+    pub(crate) fn runtime_config(&self) -> RuntimeConfig {
+        let mut config = RuntimeConfig {
+            model_selection: ModelSelection::new(
+                self.default_synthesis_models
+                    .iter()
+                    .copied()
+                    .map(Into::into),
+                self.default_rmbg_model.into(),
+            ),
+            backend: self.default_backend.into(),
+            weights_root: self.weights_root.clone(),
+            trellis_weights_root: self.trellis_weights_root.clone(),
+            trellis_image_large_root: self.trellis_image_large_root.clone(),
+            trellis_python_bin: self.trellis_python_bin.clone(),
+            trellis_bridge_script: self.trellis_bridge_script.clone(),
+            trellis_quality: self.trellis_quality.into(),
+            trellis_pbr_enabled: self.trellis_pbr_enabled,
+            trellis_pbr_texture_size: self.trellis_pbr_texture_size,
+            bg_weights_root: self.bg_weights_root.clone(),
+            num_steps: self.num_steps,
+            num_tokens: self.num_tokens,
+            guidance_scale: self.guidance_scale,
+            ..RuntimeConfig::default()
+        };
+        config.flash_extract.octree_depth = self.flash_octree_depth;
+        config.flash_extract.min_resolution = self.flash_min_resolution;
+        config.flash_extract.mini_grid_num = self.flash_mini_grid_num;
+        config.flash_extract.num_chunks = self.flash_num_chunks;
+        config
+    }
+}
+
+pub(crate) fn sanitize_synthesis_models(models: Vec<SynthesisModel>) -> Vec<SynthesisModel> {
+    let mut out = Vec::new();
+    for model in models {
+        if !out.contains(&model) {
+            out.push(model);
+        }
+    }
+    if out.is_empty() {
+        out.push(SynthesisModel::Triposg);
+    }
+    out
+}
+
+fn env_or_dotenv_var(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| dotenv_var(Path::new(".env"), key))
+}
+
+pub(crate) fn dotenv_var(path: &Path, key: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() == key {
+            return Some(parse_dotenv_value(value.trim()));
+        }
+    }
+    None
+}
+
+fn parse_dotenv_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value
+        .split_once(" #")
+        .map(|(prefix, _)| prefix.trim_end())
+        .unwrap_or(value)
+        .to_string()
+}
+
+impl ForegroundModel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ForegroundModel::Rmbg14 => "rmbg14",
+            ForegroundModel::Rmbg2 => "rmbg2",
+        }
+    }
+}
+
+impl SynthesisModel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SynthesisModel::Triposg => "triposg",
+            SynthesisModel::Trellis => "trellis",
+            SynthesisModel::Triposplat => "triposplat",
+        }
+    }
+}
+
+impl InferenceBackend {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InferenceBackend::Cpu => "cpu",
+            InferenceBackend::Wgpu => "wgpu",
+            InferenceBackend::Cuda => "cuda",
+        }
+    }
+}
+
+impl MeshOutputFormat {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MeshOutputFormat::Obj => "obj",
+            MeshOutputFormat::Gltf => "gltf",
+            MeshOutputFormat::Glb => "glb",
+        }
+    }
+}
+
+impl AssetOutputFormat {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AssetOutputFormat::Auto => "auto",
+            AssetOutputFormat::Glb => "glb",
+            AssetOutputFormat::Splat => "splat",
+            AssetOutputFormat::Ply => "ply",
+        }
+    }
+}
+
+pub(crate) fn runtime_foreground_model_str(value: burn_synth::ForegroundModel) -> &'static str {
+    match value {
+        burn_synth::ForegroundModel::Rmbg14 => "rmbg14",
+        burn_synth::ForegroundModel::Rmbg2 => "rmbg2",
+    }
+}
+
+pub(crate) fn runtime_synthesis_model_str(value: burn_synth::SynthesisModel) -> &'static str {
+    match value {
+        burn_synth::SynthesisModel::Triposg => "triposg",
+        burn_synth::SynthesisModel::Trellis => "trellis",
+        burn_synth::SynthesisModel::Triposplat => "triposplat",
+    }
+}
+
+pub(crate) fn runtime_backend_str(value: burn_synth::InferenceBackend) -> &'static str {
+    match value {
+        burn_synth::InferenceBackend::Cpu => "cpu",
+        burn_synth::InferenceBackend::Wgpu => "wgpu",
+        burn_synth::InferenceBackend::Cuda => "cuda",
+    }
+}
+
+impl From<ForegroundModel> for burn_synth::ForegroundModel {
+    fn from(value: ForegroundModel) -> Self {
+        match value {
+            ForegroundModel::Rmbg14 => Self::Rmbg14,
+            ForegroundModel::Rmbg2 => Self::Rmbg2,
+        }
+    }
+}
+
+impl From<SynthesisModel> for burn_synth::SynthesisModel {
+    fn from(value: SynthesisModel) -> Self {
+        match value {
+            SynthesisModel::Triposg => Self::Triposg,
+            SynthesisModel::Trellis => Self::Trellis,
+            SynthesisModel::Triposplat => Self::Triposplat,
+        }
+    }
+}
+
+impl From<InferenceBackend> for burn_synth::InferenceBackend {
+    fn from(value: InferenceBackend) -> Self {
+        match value {
+            InferenceBackend::Cpu => Self::Cpu,
+            InferenceBackend::Wgpu => Self::Wgpu,
+            InferenceBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
+impl From<TrellisQuality> for burn_synth::TrellisQuality {
+    fn from(value: TrellisQuality) -> Self {
+        match value {
+            TrellisQuality::Low => Self::Low,
+            TrellisQuality::Medium => Self::Medium,
+            TrellisQuality::High => Self::High,
+        }
+    }
+}

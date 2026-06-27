@@ -1,0 +1,160 @@
+use crate::prelude::*;
+use crate::server::McpServer;
+use crate::server::run_stdio_server;
+
+pub fn run_from_args(args: ServerArgs) -> Result<(), String> {
+    let command = args.command.clone();
+    let config = ServerConfig::from_args(args);
+    match command {
+        Some(ServerCommand::SceneBuild(args)) => run_scene_build_command(config, args),
+        Some(ServerCommand::SceneGround(args)) => run_scene_ground_command(config, args),
+        Some(ServerCommand::SceneFeedbackReplay(args)) => {
+            run_scene_feedback_replay_command(config, args)
+        }
+        None => run_stdio_server(config),
+    }
+}
+
+fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let response = server.call_scene_build_from_image(SceneBuildFromImageArgs {
+        source_scene_path: args.source_scene_path,
+        object_reference_image_path: args.object_reference_image_path,
+        output_dir: args.output_dir,
+        candidate_count: args.candidate_count,
+        candidate_retry_attempts: args.candidate_retry_attempts,
+        candidate_batch_size: args.candidate_batch_size,
+        min_reconstruction_score: args.min_reconstruction_score,
+        quality_profile: args.quality_profile,
+        allow_catalog_reuse: args.allow_catalog_reuse,
+        lift_assets: args.lift_assets,
+        target_faces: args.target_faces,
+        batch_size: args.batch_size.filter(|value| *value > 0),
+        batch_vram_mb: args.batch_vram_mb,
+        trellis_pbr: Some(args.trellis_pbr),
+        trellis_pbr_texture_size: args.trellis_pbr_texture_size,
+        promote_to_catalog: args.promote_to_catalog,
+        composition_mode: args.composition_mode,
+        pose_fit: args.pose_fit,
+        canonical_pose: args.canonical_pose,
+        max_pose_candidates: args.max_pose_candidates,
+        save_pose_debug: args.save_pose_debug,
+        depth_provider: args.depth_provider,
+        locator: args.locator,
+        locate_anything_backend: args.locate_anything_backend,
+        write_artifacts: args.write_artifacts,
+        apply: args.apply,
+        clear_existing: args.clear_existing,
+        feedback: args.feedback,
+        feedback_iters: args.feedback_iters,
+        feedback_keep_viewer: args.feedback_keep_viewer,
+        feedback_capture_dir: args.feedback_capture_dir,
+        feedback_threshold_profile: args.feedback_threshold_profile,
+        feedback_rotation_selector: args.feedback_rotation_selector,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-build response: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let response = server.call_scene_ground(SceneGroundToolArgs {
+        source_scene_path: args.source_scene_path,
+        manifest: read_json_path(&args.manifest)?,
+        asset_bindings: read_json_path(&args.asset_bindings)?,
+        grounding_evidence: args
+            .grounding_evidence
+            .as_ref()
+            .map(|path| read_json_path::<SceneGroundingEvidence>(path.as_path()))
+            .transpose()?,
+        output_dir: args.output_dir,
+        composition_mode: args.composition_mode,
+        pose_fit: args.pose_fit,
+        canonical_pose: args.canonical_pose,
+        max_pose_candidates: args.max_pose_candidates,
+        save_pose_debug: args.save_pose_debug,
+        depth_provider: args.depth_provider,
+        locator: args.locator,
+        locate_anything_backend: args.locate_anything_backend,
+        clear_existing: args.clear_existing,
+        apply: args.apply,
+        feedback: args.feedback,
+        feedback_iters: args.feedback_iters,
+        feedback_keep_viewer: args.feedback_keep_viewer,
+        feedback_capture_dir: args.feedback_capture_dir,
+        feedback_threshold_profile: args.feedback_threshold_profile,
+        feedback_rotation_selector: args.feedback_rotation_selector,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-ground response: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_scene_feedback_replay_command(
+    config: ServerConfig,
+    args: SceneFeedbackReplayCliArgs,
+) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let manifest_path = args
+        .manifest_path
+        .unwrap_or_else(|| args.output_dir.join("manifest.json"));
+    let asset_bindings_path = args
+        .asset_bindings_path
+        .unwrap_or_else(|| args.output_dir.join("asset_bindings.json"));
+    let grounded_layout_path = args
+        .grounded_layout_path
+        .unwrap_or_else(|| args.output_dir.join("grounded_layout.json"));
+    let commands_path = args
+        .commands_path
+        .unwrap_or_else(|| args.output_dir.join("commands.json"));
+    let capture_dir = args
+        .feedback_capture_dir
+        .unwrap_or_else(|| args.output_dir.join("iterations_replay"));
+    let manifest = read_json_path::<SceneObjectManifest>(&manifest_path)?;
+    let asset_bindings = read_json_path::<Vec<SceneAssetBinding>>(&asset_bindings_path)?;
+    let grounded_layout = read_json_path::<GroundedSceneLayout>(&grounded_layout_path)?;
+    let commands = if args.rebuild_commands_from_grounded_layout {
+        let plan = parse_scene_bsn(&grounded_layout.bsn, &asset_bindings)
+            .map_err(|err| err.to_string())?;
+        scene_commands_with_cache_reload(
+            scene_plan_to_mcp_commands(&plan, &asset_bindings, true)
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        read_json_path::<Vec<Value>>(&commands_path)?
+    };
+    let response = server.run_scene_feedback(
+        &args.output_dir,
+        &manifest,
+        &asset_bindings,
+        &grounded_layout,
+        commands,
+        SceneFeedbackOptions {
+            max_iters: args.feedback_iters,
+            keep_viewer: args.feedback_keep_viewer,
+            capture_dir: Some(capture_dir),
+            threshold_profile: args.feedback_threshold_profile,
+            rotation_selector: args.feedback_rotation_selector,
+        },
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-feedback-replay response: {err}"))?
+    );
+    Ok(())
+}
+
+pub(crate) fn read_json_path<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("failed to read JSON {}: {err}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| format!("failed to parse JSON {}: {err}", path.display()))
+}
