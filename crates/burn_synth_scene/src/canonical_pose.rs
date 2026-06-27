@@ -3,6 +3,14 @@ use crate::{
     SceneAssetFrameSource, SceneAssetSymmetry,
 };
 
+pub fn canonical_spawn_yaw_degrees(
+    instance_yaw_degrees: f32,
+    asset_yaw_offset_degrees: f32,
+    feedback_delta_degrees: f32,
+) -> f32 {
+    normalize_degrees(instance_yaw_degrees - asset_yaw_offset_degrees + feedback_delta_degrees)
+}
+
 pub fn canonical_pose_evidence_for_assets(
     assets: &[SceneAssetBinding],
 ) -> Vec<CanonicalPoseEvidence> {
@@ -118,8 +126,21 @@ impl std::fmt::Display for SceneAssetFrameSource {
             Self::AabbHeuristic => "aabb_heuristic",
             Self::DescriptorHeuristic => "descriptor_heuristic",
             Self::PoseFitHeuristic => "pose_fit_heuristic",
+            Self::VisualRenderSweep => "visual_render_sweep",
+            Self::GptVisualSelection => "gpt_visual_selection",
+            Self::AmbiguousFallback => "ambiguous_fallback",
             Self::Unknown => "unknown",
         };
         f.write_str(value)
     }
+}
+
+fn normalize_degrees(mut degrees: f32) -> f32 {
+    while degrees > 180.0 {
+        degrees -= 360.0;
+    }
+    while degrees <= -180.0 {
+        degrees += 360.0;
+    }
+    degrees
 }

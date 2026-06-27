@@ -29,6 +29,117 @@ pub(crate) struct McpServer {
 
 struct NoopSceneProvider;
 
+struct SceneAssetFrameCalibrationRequest<'a> {
+    output_dir: &'a Path,
+    write_artifacts: bool,
+    mode: SceneCanonicalPoseMode,
+    max_candidates: usize,
+    manifest: &'a SceneObjectManifest,
+    asset_bindings: &'a [SceneAssetBinding],
+    selected_candidates: &'a [Value],
+    object_image_requests: &'a [ObjectImageRequest],
+    evidence: &'a SceneGroundingEvidence,
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalPoseThumbnailSpawnBasis<'a> {
+    Cache(&'a str),
+    Path(&'a str),
+}
+
+impl<'a> CanonicalPoseThumbnailSpawnBasis<'a> {
+    fn from_asset(asset: &'a SceneAssetBinding) -> Option<Self> {
+        asset
+            .cache_key
+            .as_deref()
+            .map(Self::Cache)
+            .or_else(|| asset.path.as_deref().map(Self::Path))
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cache(_) => "cache",
+            Self::Path(_) => "path",
+        }
+    }
+}
+
+fn canonical_pose_thumbnail_spawn_command(
+    spawn_basis: CanonicalPoseThumbnailSpawnBasis<'_>,
+    asset: &SceneAssetBinding,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+) -> Value {
+    let mut command = match spawn_basis {
+        CanonicalPoseThumbnailSpawnBasis::Cache(cache_key) => json!({
+            "type": "spawn_cached",
+            "cache_key": cache_key,
+        }),
+        CanonicalPoseThumbnailSpawnBasis::Path(path) => json!({
+            "type": "spawn_path",
+            "path": path,
+            "cache_key": asset.cache_key.clone().unwrap_or_else(|| asset.asset_id.clone()),
+        }),
+    };
+    command["translation"] = json!(translation);
+    command["rotation"] = json!(rotation);
+    command["scale"] = json!([1.0, 1.0, 1.0]);
+    command["select"] = json!(false);
+    if let Some(local_aabb) = asset.local_aabb {
+        command["local_aabb"] = json!(local_aabb);
+    }
+    command
+}
+
+fn canonical_pose_yaw_file_component(yaw_degrees: f32) -> String {
+    let rounded = yaw_degrees.round() as i32;
+    if rounded < 0 {
+        format!("neg{}", rounded.abs())
+    } else {
+        format!("pos{rounded}")
+    }
+}
+
+fn append_canonical_pose_render_warning(run: &mut CanonicalPoseCalibrationRun, warning: &str) {
+    for report in &mut run.reports {
+        report.warnings.push(warning.to_string());
+    }
+}
+
+fn canonical_pose_thumbnail_status_summary(status: &Value) -> Value {
+    json!({
+        "ok": status.get("ok").cloned().unwrap_or(Value::Null),
+        "message": status.get("message").cloned().unwrap_or(Value::Null),
+        "applied_commands": status
+            .get("applied_commands")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "projected_items": status
+            .get("projected_items")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "camera": status.get("camera").cloned().unwrap_or(Value::Null),
+        "screenshots": status.get("screenshots").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn canonical_pose_thumbnail_capture_summary(capture_ack: &Value) -> Value {
+    json!({
+        "output_path": capture_ack
+            .get("output_path")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "acknowledged": capture_ack
+            .pointer("/acknowledgement/acknowledged")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "sequence": capture_ack
+            .pointer("/acknowledgement/sequence")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
 impl SceneAiProvider for NoopSceneProvider {
     fn plan_objects(&self, _request: &SceneReasoningRequest) -> SceneResult<SceneObjectManifest> {
         Err(burn_synth_scene::SceneError::Provider(
@@ -1044,6 +1155,9 @@ impl McpServer {
             "selected_candidates": selected_values.clone(),
             "lift_assets": args.lift_assets,
         });
+        if args.write_artifacts {
+            write_scene_build_artifacts(&output_dir, &response)?;
+        }
         if !candidate_report.rejected_objects.is_empty() {
             response["stage_report"] = json!(stage_report);
             attach_scene_token_usage(&mut response);
@@ -1242,7 +1356,7 @@ impl McpServer {
                 .unwrap_or("scene mesh quality gate failed")
                 .to_string());
         }
-        let asset_bindings =
+        let mut asset_bindings =
             scene_asset_bindings_from_outputs(&manifest, &selected_values, &asset_outputs)?;
         let stage_started = Instant::now();
         progress.emit(
@@ -1417,6 +1531,66 @@ impl McpServer {
                 }),
             );
         }
+        let initial_asset_bindings = asset_bindings.clone();
+        let stage_started = Instant::now();
+        progress.emit(
+            "canonical_pose_calibration",
+            SceneBuildProgressPhase::Started,
+            if args.canonical_pose == SceneCanonicalPoseMode::Openai {
+                SceneBuildExecutionKind::Network
+            } else {
+                SceneBuildExecutionKind::Cpu
+            },
+            "calibrating generated asset-local canonical yaw frames",
+            json!({
+                "canonical_pose": args.canonical_pose,
+                "asset_bindings": asset_bindings.len(),
+                "max_pose_candidates": args.max_pose_candidates,
+            }),
+        );
+        let canonical_pose_calibration =
+            self.calibrate_scene_asset_frames(SceneAssetFrameCalibrationRequest {
+                output_dir: &output_dir,
+                write_artifacts: args.write_artifacts,
+                mode: args.canonical_pose,
+                max_candidates: args.max_pose_candidates,
+                manifest: &manifest,
+                asset_bindings: &asset_bindings,
+                selected_candidates: &selected_values,
+                object_image_requests: &requests,
+                evidence: &grounding_evidence,
+            })?;
+        asset_bindings = canonical_pose_calibration.asset_bindings.clone();
+        record_stage(
+            &mut stage_report,
+            "canonical_pose_calibration",
+            stage_started,
+        );
+        progress.emit_with_items(
+            "canonical_pose_calibration",
+            SceneBuildProgressPhase::Completed,
+            if args.canonical_pose == SceneCanonicalPoseMode::Openai {
+                SceneBuildExecutionKind::Network
+            } else {
+                SceneBuildExecutionKind::Cpu
+            },
+            "canonical pose calibration complete",
+            None,
+            Some(canonical_pose_calibration.reports.len()),
+            Some(output_dir.join("canonical_pose_calibration_report.json")),
+            json!({
+                "selector": canonical_pose_calibration
+                    .selection_report
+                    .get("selector")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "fallback_count": canonical_pose_calibration
+                    .reports
+                    .iter()
+                    .filter(|report| report.fallback_used)
+                    .count(),
+            }),
+        );
         let stage_started = Instant::now();
         progress.emit(
             "plan_grounded_scene",
@@ -1538,8 +1712,17 @@ impl McpServer {
         let plan = selected_composition.plan;
         let bsn = feedback_bsn_from_commands(&asset_bindings, &grounded_layout, &commands)?;
         response["asset_outputs"] = asset_outputs;
+        response["asset_bindings_initial"] =
+            serde_json::to_value(&initial_asset_bindings).map_err(|err| err.to_string())?;
         response["asset_bindings"] =
             serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["asset_bindings_calibrated"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["canonical_pose_calibration"] =
+            serde_json::to_value(&canonical_pose_calibration.reports)
+                .map_err(|err| err.to_string())?;
+        response["canonical_pose_selection"] = canonical_pose_calibration.selection_report;
+        response["canonical_pose_selection_task"] = canonical_pose_calibration.selection_task;
         response["requested_composition_mode"] = json!(args.composition_mode);
         response["composition_mode"] = json!(selected_composition.mode);
         response["requested_pose_fit"] = json!(args.pose_fit);
@@ -1614,6 +1797,53 @@ impl McpServer {
         response["stage_report"] = json!(stage_report);
         let token_usage = attach_scene_token_usage(&mut response);
         response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+        attach_scene_grounding_contracts(
+            &mut response,
+            &args,
+            grounding_source,
+            &grounding_evidence,
+            segmentation_provider,
+        )?;
+        if args.promote_to_catalog {
+            let stage_started = Instant::now();
+            progress.emit(
+                "promote_scene_to_catalog",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Cache,
+                "promoting accepted scene snapshot to shared catalog",
+                json!({ "catalog_cache_root": self.config.catalog_cache_root.clone() }),
+            );
+            let mut catalog_cache = self.open_catalog_cache()?;
+            let scene_catalog_entry = promote_scene_build_scene_to_catalog(
+                &mut catalog_cache,
+                &args.source_scene_path,
+                &output_dir,
+                response["bsn"].as_str().unwrap_or_default(),
+                &asset_bindings,
+                &grounded_layout,
+                &response,
+            )?;
+            record_stage(&mut stage_report, "promote_scene_to_catalog", stage_started);
+            response["scene_catalog_entry"] = scene_catalog_entry;
+            response["stage_report"] = json!(stage_report);
+            response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+            attach_scene_grounding_contracts(
+                &mut response,
+                &args,
+                grounding_source,
+                &grounding_evidence,
+                segmentation_provider,
+            )?;
+            progress.emit(
+                "promote_scene_to_catalog",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Cache,
+                "scene catalog promotion complete",
+                json!({
+                    "scene_catalog_entry": response.get("scene_catalog_entry").cloned().unwrap_or(Value::Null),
+                }),
+            );
+        }
         if args.write_artifacts {
             progress.emit(
                 "write_scene_build_artifacts",
@@ -1698,7 +1928,7 @@ impl McpServer {
         let stage_started = Instant::now();
         let mut manifest = args.manifest;
         manifest.source_scene_path = args.source_scene_path.display().to_string();
-        let asset_bindings = args.asset_bindings;
+        let mut asset_bindings = args.asset_bindings;
         let (grounding_source, mut evidence) = if let Some(evidence) = args.grounding_evidence {
             ("provided", evidence)
         } else if args.locator == SceneLocatorProvider::LocateAnything {
@@ -1762,6 +1992,27 @@ impl McpServer {
             );
         }
 
+        let initial_asset_bindings = asset_bindings.clone();
+        let stage_started = Instant::now();
+        let canonical_pose_calibration =
+            self.calibrate_scene_asset_frames(SceneAssetFrameCalibrationRequest {
+                output_dir: &output_dir,
+                write_artifacts: true,
+                mode: args.canonical_pose,
+                max_candidates: args.max_pose_candidates,
+                manifest: &manifest,
+                asset_bindings: &asset_bindings,
+                selected_candidates: &[],
+                object_image_requests: &[],
+                evidence: &evidence,
+            })?;
+        asset_bindings = canonical_pose_calibration.asset_bindings.clone();
+        record_stage(
+            &mut stage_report,
+            "canonical_pose_calibration",
+            stage_started,
+        );
+
         let stage_started = Instant::now();
         let composition_candidates = scene_composition_candidates(
             args.composition_mode,
@@ -1796,7 +2047,12 @@ impl McpServer {
             "segmentation_quantization": segmentation_quantization,
             "grounding_source": grounding_source,
             "manifest": manifest.clone(),
+            "asset_bindings_initial": initial_asset_bindings,
             "asset_bindings": asset_bindings.clone(),
+            "asset_bindings_calibrated": asset_bindings.clone(),
+            "canonical_pose_calibration": canonical_pose_calibration.reports,
+            "canonical_pose_selection": canonical_pose_calibration.selection_report,
+            "canonical_pose_selection_task": canonical_pose_calibration.selection_task,
             "grounding_evidence": evidence.clone(),
             "clear_existing": args.clear_existing,
             "apply": args.apply,
@@ -1923,6 +2179,351 @@ impl McpServer {
             ..OpenAiProviderConfig::default()
         })
         .map_err(|err| err.to_string())
+    }
+
+    fn calibrate_scene_asset_frames(
+        &mut self,
+        request: SceneAssetFrameCalibrationRequest<'_>,
+    ) -> Result<CanonicalPoseCalibrationRun, String> {
+        let mut run = build_canonical_pose_calibration(
+            request.mode,
+            request.max_candidates,
+            request.manifest,
+            request.asset_bindings,
+            request.selected_candidates,
+            request.object_image_requests,
+            request.evidence,
+        );
+        let render_report = self.render_canonical_pose_candidate_thumbnails(&request, &mut run);
+        run.selection_report = match request.mode {
+            SceneCanonicalPoseMode::Off => json!({
+                "selector": "disabled",
+                "applied_count": 0,
+                "reason": "canonical pose calibration disabled",
+                "render_report": render_report,
+            }),
+            SceneCanonicalPoseMode::Openai => {
+                if run.reports.is_empty() || run.image_paths.is_empty() {
+                    json!({
+                        "selector": "openai",
+                        "fallback": true,
+                        "applied_count": 0,
+                        "reason": "missing canonical pose image evidence; kept deterministic candidates",
+                        "render_report": render_report,
+                    })
+                } else {
+                    let prompt = canonical_pose_selection_prompt(&run.selection_task);
+                    if request.write_artifacts {
+                        write_json_file(
+                            &request
+                                .output_dir
+                                .join("canonical_pose_selection_request.json"),
+                            &json!({
+                                "prompt": prompt,
+                                "task": run.selection_task.clone(),
+                                "image_paths": run
+                                    .image_paths
+                                    .iter()
+                                    .map(|path| path.display().to_string())
+                                    .collect::<Vec<_>>(),
+                            }),
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                    match self.openai_provider().and_then(|provider| {
+                        provider
+                            .select_rotation_candidates(&SceneRotationSelectionRequest {
+                                prompt,
+                                task: run.selection_task.clone(),
+                                image_paths: run.image_paths.clone(),
+                            })
+                            .map_err(|err| err.to_string())
+                    }) {
+                        Ok(response) => {
+                            if request.write_artifacts {
+                                write_json_file(
+                                    &request
+                                        .output_dir
+                                        .join("canonical_pose_selection_response.json"),
+                                    &serde_json::to_value(&response)
+                                        .map_err(|err| err.to_string())?,
+                                )
+                                .map_err(|err| err.to_string())?;
+                            }
+                            let mut report =
+                                apply_canonical_pose_openai_selection(&mut run, &response);
+                            report["render_report"] = render_report;
+                            report
+                        }
+                        Err(err) => json!({
+                            "selector": "openai",
+                            "fallback": true,
+                            "applied_count": 0,
+                            "error": err,
+                            "reason": "kept deterministic canonical pose candidates",
+                            "render_report": render_report,
+                        }),
+                    }
+                }
+            }
+            SceneCanonicalPoseMode::Heuristic
+            | SceneCanonicalPoseMode::RenderSweep
+            | SceneCanonicalPoseMode::Auto => json!({
+                "selector": canonical_pose_mode_label(request.mode),
+                "applied_count": run
+                    .reports
+                    .iter()
+                    .filter(|report| !report.fallback_used)
+                    .count(),
+                "fallback_count": run
+                    .reports
+                    .iter()
+                    .filter(|report| report.fallback_used)
+                    .count(),
+                "reason": "deterministic canonical pose candidate selection",
+                "render_report": render_report,
+            }),
+        };
+        Ok(run)
+    }
+
+    fn render_canonical_pose_candidate_thumbnails(
+        &mut self,
+        request: &SceneAssetFrameCalibrationRequest<'_>,
+        run: &mut CanonicalPoseCalibrationRun,
+    ) -> Value {
+        if !matches!(
+            request.mode,
+            SceneCanonicalPoseMode::RenderSweep | SceneCanonicalPoseMode::Openai
+        ) {
+            return json!({
+                "enabled": false,
+                "reason": "thumbnail rendering is only enabled for canonical_pose=render-sweep or canonical_pose=openai",
+            });
+        }
+        if run.reports.is_empty() {
+            return json!({
+                "enabled": true,
+                "rendered": 0,
+                "attempted": 0,
+                "reason": "no asset pose reports to render",
+            });
+        }
+
+        let root = request.output_dir.join("canonical_pose_renders");
+        let bridge_dir = root.join("_viewer");
+        let control_path = bridge_dir.join("scene_commands.json");
+        let status_path = control_path.with_extension("status.json");
+        let log_path = bridge_dir.join("viewer.log");
+        if let Err(err) = fs::create_dir_all(&root) {
+            let message = format!(
+                "failed to create canonical pose render directory {}: {err}",
+                root.display()
+            );
+            append_canonical_pose_render_warning(run, &message);
+            return json!({
+                "enabled": true,
+                "attempted": 0,
+                "rendered": 0,
+                "error": message,
+            });
+        }
+
+        let original_control_path = self.config.scene_control_path.clone();
+        let original_status_path = self.config.scene_status_path.clone();
+        let original_timeout = self.config.scene_timeout;
+        let mut spawned_viewer = match spawn_feedback_viewer(&control_path, &log_path) {
+            Ok(child) => child,
+            Err(err) => {
+                let message = format!("failed to spawn canonical pose thumbnail viewer: {err}");
+                append_canonical_pose_render_warning(run, &message);
+                return json!({
+                    "enabled": true,
+                    "attempted": 0,
+                    "rendered": 0,
+                    "root": root.display().to_string(),
+                    "viewer_log": log_path.display().to_string(),
+                    "error": message,
+                });
+            }
+        };
+        self.config.scene_control_path = Some(control_path);
+        self.config.scene_status_path = Some(status_path);
+        self.config.scene_timeout = self.config.scene_timeout.max(Duration::from_secs(60));
+
+        let mut attempted = 0usize;
+        let mut rendered = 0usize;
+        let mut errors = Vec::new();
+        for report_index in 0..run.reports.len() {
+            let asset_id = run.reports[report_index].asset_id.clone();
+            let Some(asset) = request
+                .asset_bindings
+                .iter()
+                .find(|asset| asset.asset_id == asset_id)
+            else {
+                let message = format!("asset binding missing for canonical pose asset {asset_id}");
+                run.reports[report_index].warnings.push(message.clone());
+                errors.push(json!({
+                    "asset_id": asset_id,
+                    "error": message,
+                }));
+                continue;
+            };
+            let Some(spawn_basis) = CanonicalPoseThumbnailSpawnBasis::from_asset(asset) else {
+                let message = format!(
+                    "asset {} has no cache_key or path; cannot render canonical pose thumbnails",
+                    asset.asset_id
+                );
+                run.reports[report_index].warnings.push(message.clone());
+                errors.push(json!({
+                    "asset_id": asset.asset_id,
+                    "error": message,
+                }));
+                continue;
+            };
+            let asset_dir = root.join(sanitize_scene_identifier(&asset.asset_id));
+            if let Err(err) = fs::create_dir_all(&asset_dir) {
+                let message = format!(
+                    "failed to create canonical pose render asset directory {}: {err}",
+                    asset_dir.display()
+                );
+                run.reports[report_index].warnings.push(message.clone());
+                errors.push(json!({
+                    "asset_id": asset.asset_id,
+                    "error": message,
+                }));
+                continue;
+            }
+            for candidate_index in 0..run.reports[report_index].candidates.len() {
+                attempted += 1;
+                let candidate_id =
+                    run.reports[report_index].candidates[candidate_index].candidate_index;
+                let candidate_yaw =
+                    run.reports[report_index].candidates[candidate_index].yaw_offset_degrees;
+                let output_path = asset_dir.join(format!(
+                    "candidate_{:02}_yaw_{}.png",
+                    candidate_id,
+                    canonical_pose_yaw_file_component(candidate_yaw)
+                ));
+                match self.render_canonical_pose_candidate_thumbnail(
+                    asset,
+                    spawn_basis,
+                    candidate_yaw,
+                    &output_path,
+                ) {
+                    Ok(render_info) => {
+                        rendered += 1;
+                        let candidate = &mut run.reports[report_index].candidates[candidate_index];
+                        candidate.rendered_image_path = Some(output_path.display().to_string());
+                        candidate.metrics["rendered_asset_thumbnail"] = json!(true);
+                        candidate.metrics["renderer"] = json!("bevy_synth_private_viewer");
+                        candidate.metrics["render"] = render_info;
+                    }
+                    Err(err) => {
+                        let message = format!(
+                            "failed to render canonical pose thumbnail for {} candidate {}: {err}",
+                            asset.asset_id, candidate_id
+                        );
+                        run.reports[report_index].warnings.push(message.clone());
+                        errors.push(json!({
+                            "asset_id": asset.asset_id,
+                            "candidate_index": candidate_id,
+                            "error": message,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let _ = self.send_scene_commands(vec![json!({ "type": "clear_scene" })]);
+        let _ = spawned_viewer.kill();
+        let _ = spawned_viewer.wait();
+        self.config.scene_control_path = original_control_path;
+        self.config.scene_status_path = original_status_path;
+        self.config.scene_timeout = original_timeout;
+        refresh_canonical_pose_selection_inputs(run);
+
+        json!({
+            "enabled": true,
+            "renderer": "bevy_synth_private_viewer",
+            "root": root.display().to_string(),
+            "viewer_log": log_path.display().to_string(),
+            "attempted": attempted,
+            "rendered": rendered,
+            "error_count": errors.len(),
+            "errors": errors,
+        })
+    }
+
+    fn render_canonical_pose_candidate_thumbnail(
+        &self,
+        asset: &SceneAssetBinding,
+        spawn_basis: CanonicalPoseThumbnailSpawnBasis<'_>,
+        yaw_degrees: f32,
+        output_path: &Path,
+    ) -> Result<Value, String> {
+        let local_aabb = asset.local_aabb.unwrap_or(SceneAssetAabb {
+            min: [-0.5, 0.0, -0.5],
+            max: [0.5, 1.0, 0.5],
+        });
+        let size = local_aabb.size();
+        let center = [
+            (local_aabb.min[0] + local_aabb.max[0]) * 0.5,
+            (local_aabb.min[1] + local_aabb.max[1]) * 0.5,
+            (local_aabb.min[2] + local_aabb.max[2]) * 0.5,
+        ];
+        let radius = size[0].max(size[1]).max(size[2]).max(0.75) * 2.45;
+        let focus = [0.0, (size[1] * 0.48).max(0.15), 0.0];
+        let translation = [-center[0], -local_aabb.min[1], -center[2]];
+        let mut commands = vec![
+            json!({ "type": "clear_scene" }),
+            canonical_pose_thumbnail_spawn_command(
+                spawn_basis,
+                asset,
+                translation,
+                quat_from_y_degrees(yaw_degrees),
+            ),
+            json!({
+                "type": "set_camera",
+                "translation": [0.0, focus[1] + 0.25, radius],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "focus": focus,
+                "yaw": 0.0,
+                "pitch": 20.0,
+                "radius": radius,
+                "vertical_fov": 42.0,
+            }),
+        ];
+        commands = scene_commands_with_cache_reload(commands);
+        let apply_ack = self.send_scene_commands(commands)?;
+        let (capture_ack, status) =
+            self.capture_feedback_when_projected_ready(&apply_ack, output_path, 1)?;
+        let file_size = output_path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if file_size == 0 {
+            return Err(format!(
+                "thumbnail file was not written: {}",
+                output_path.display()
+            ));
+        }
+        Ok(json!({
+            "output_path": output_path.display().to_string(),
+            "yaw_degrees": yaw_degrees,
+            "file_size": file_size,
+            "spawn_basis": spawn_basis.label(),
+            "local_aabb": local_aabb,
+            "camera": {
+                "focus": focus,
+                "radius": radius,
+                "pitch": 20.0,
+                "yaw": 0.0,
+                "vertical_fov": 42.0,
+            },
+            "status": canonical_pose_thumbnail_status_summary(&status),
+            "capture": canonical_pose_thumbnail_capture_summary(&capture_ack),
+        }))
     }
 
     fn open_catalog_cache(&self) -> Result<MeshCache, String> {

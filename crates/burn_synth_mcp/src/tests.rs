@@ -2,6 +2,7 @@ use super::*;
 use crate::cli::read_json_path;
 use crate::prelude::*;
 use crate::server::scene_object_image_generation_policy;
+use burn_synth::{RuntimeConfig, TrellisComputeProfile};
 use burn_synth_grounding::LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT;
 
 fn empty_physical_layout() -> FeedbackPhysicalLayout {
@@ -152,6 +153,205 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
     assert_eq!(
         command.feedback_rotation_selector,
         FeedbackRotationSelector::Deterministic
+    );
+}
+
+#[test]
+fn canonical_pose_calibration_applies_bounded_openai_selection() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_1".to_string(),
+            label: "mesh chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 1,
+            object_prompt: "single mesh chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([0.65, 0.65]),
+        }],
+    };
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair_1".to_string(),
+        label: "mesh chair".to_string(),
+        aliases: vec!["chair".to_string()],
+        path: None,
+        cache_key: Some("test/chair".to_string()),
+        reusable: true,
+        source_image_path: Some("/tmp/generated_chair.png".to_string()),
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.3, 0.0, -0.35],
+            max: [0.3, 1.0, 0.35],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, Some([0.6, 0.7]))),
+        provenance: None,
+    };
+    let request = ObjectImageRequest {
+        object: manifest.objects[0].clone(),
+        source_scene_path: "/tmp/source_1024.jpg".to_string(),
+        source_crop_path: "/tmp/chair_crop.jpg".to_string(),
+        object_reference_image_path: "/tmp/reference.jpg".to_string(),
+        prompt: "chair".to_string(),
+        candidate_count: 1,
+        size: "1024x1024".to_string(),
+        quality: "medium".to_string(),
+    };
+    let selected = vec![json!({
+        "object_id": "chair_1",
+        "candidate_index": 0,
+        "image_path": "/tmp/generated_chair.png",
+    })];
+    let evidence = manifest_grounding_evidence(&manifest);
+    let mut run = build_canonical_pose_calibration(
+        SceneCanonicalPoseMode::Openai,
+        4,
+        &manifest,
+        std::slice::from_ref(&asset),
+        &selected,
+        &[request],
+        &evidence,
+    );
+    run.reports[0].candidates[0].rendered_image_path =
+        Some("/tmp/chair_render_candidate_0.png".to_string());
+    refresh_canonical_pose_selection_inputs(&mut run);
+    assert!(
+        run.image_paths
+            .iter()
+            .any(|path| path == Path::new("/tmp/chair_render_candidate_0.png"))
+    );
+    assert_eq!(
+        run.selection_task["objects"][0]["candidates"][0]["rendered_image_path"],
+        json!("/tmp/chair_render_candidate_0.png")
+    );
+    let candidate = run.reports[0]
+        .candidates
+        .iter()
+        .find(|candidate| (candidate.yaw_offset_degrees - 180.0).abs() <= 1.0e-5)
+        .cloned()
+        .expect("180 degree chair candidate");
+
+    let report = apply_canonical_pose_openai_selection(
+        &mut run,
+        &SceneRotationSelectionResponse {
+            objects: vec![burn_synth_scene::SceneRotationSelection {
+                index: 0,
+                candidate_index: candidate.candidate_index,
+                confidence: 0.84,
+                rationale: "source crop shows the opposite chair face".to_string(),
+            }],
+        },
+    );
+
+    assert_eq!(report["applied_count"], json!(1));
+    assert_eq!(
+        run.asset_bindings[0].canonical_frame.unwrap().source,
+        Some(SceneAssetFrameSource::GptVisualSelection)
+    );
+    assert!(
+        (run.asset_bindings[0]
+            .canonical_frame
+            .unwrap()
+            .yaw_offset_degrees
+            - 180.0)
+            .abs()
+            <= 1.0e-5
+    );
+    assert_eq!(
+        run.selection_task["objects"][0]["source_crop_path"],
+        json!("/tmp/chair_crop.jpg")
+    );
+    assert!(
+        run.image_paths
+            .iter()
+            .any(|path| path == Path::new("/tmp/generated_chair.png"))
+    );
+}
+
+#[test]
+fn canonical_pose_calibration_rejects_untrusted_openai_candidate() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_1".to_string(),
+            label: "mesh chair".to_string(),
+            aliases: Vec::new(),
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: None,
+            instance_count: 1,
+            object_prompt: "single chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: None,
+        }],
+    };
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair_1".to_string(),
+        label: "mesh chair".to_string(),
+        aliases: Vec::new(),
+        path: None,
+        cache_key: None,
+        reusable: true,
+        source_image_path: None,
+        pipeline: None,
+        local_aabb: None,
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, None)),
+        provenance: None,
+    };
+    let evidence = manifest_grounding_evidence(&manifest);
+    let mut run = build_canonical_pose_calibration(
+        SceneCanonicalPoseMode::Openai,
+        4,
+        &manifest,
+        std::slice::from_ref(&asset),
+        &[],
+        &[],
+        &evidence,
+    );
+
+    let report = apply_canonical_pose_openai_selection(
+        &mut run,
+        &SceneRotationSelectionResponse {
+            objects: vec![
+                burn_synth_scene::SceneRotationSelection {
+                    index: 0,
+                    candidate_index: 1,
+                    confidence: 0.20,
+                    rationale: "not enough evidence".to_string(),
+                },
+                burn_synth_scene::SceneRotationSelection {
+                    index: 0,
+                    candidate_index: 999,
+                    confidence: 0.95,
+                    rationale: "invalid candidate".to_string(),
+                },
+            ],
+        },
+    );
+
+    assert_eq!(report["applied_count"], json!(0));
+    assert_eq!(report["ignored_count"], json!(2));
+    assert_eq!(
+        run.asset_bindings[0].canonical_frame.unwrap().source,
+        Some(SceneAssetFrameSource::VisualRenderSweep)
+    );
+    assert!(
+        run.asset_bindings[0]
+            .canonical_frame
+            .unwrap()
+            .yaw_offset_degrees
+            .abs()
+            <= 1.0e-5
     );
 }
 
@@ -640,6 +840,38 @@ fn server_args_quality_and_explicit_overrides_map_to_runtime_config() {
 }
 
 #[test]
+fn wgpu_trellis_runtime_config_uses_fast_compute_profile() {
+    let args = ServerArgs::parse_from([
+        "burn_synth_mcp",
+        "--backend",
+        "wgpu",
+        "--synthesis-models",
+        "trellis",
+    ]);
+    let config = ServerConfig::from_args(args);
+    assert_eq!(
+        config.runtime_config().trellis_compute_profile,
+        TrellisComputeProfile::WgpuFastF16
+    );
+}
+
+#[test]
+fn non_trellis_runtime_config_keeps_default_trellis_compute_profile() {
+    let args = ServerArgs::parse_from([
+        "burn_synth_mcp",
+        "--backend",
+        "wgpu",
+        "--synthesis-models",
+        "triposg",
+    ]);
+    let config = ServerConfig::from_args(args);
+    assert_eq!(
+        config.runtime_config().trellis_compute_profile,
+        RuntimeConfig::default().trellis_compute_profile
+    );
+}
+
+#[test]
 fn server_args_accept_scene_build_subcommand() {
     let args = ServerArgs::parse_from([
         "burn_synth_mcp",
@@ -916,6 +1148,17 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
             }
         },
         "commands": [{ "type": "clear_scene" }],
+        "grounding_contract": {
+            "schema_version": 1,
+            "source_scene_path": "/tmp/scene.jpg",
+            "composition_mode": "cv-grounded",
+            "entries": []
+        },
+        "decision_log": {
+            "schema_version": 1,
+            "source_scene_path": "/tmp/scene.jpg",
+            "entries": []
+        },
         "stage_report": [{ "stage": "generate_object_candidates", "elapsed_ms": 7 }],
         "e2e_summary": {
             "ok": true,
@@ -930,6 +1173,8 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
     assert!(dir.join("asset_outputs.json").exists());
     assert!(dir.join("stage_report.json").exists());
     assert!(dir.join("summary.json").exists());
+    assert!(dir.join("grounding_contract.json").exists());
+    assert!(dir.join("decision_log.json").exists());
     assert!(dir.join("scene.bsn").exists());
     assert!(dir.join("projection_fit_report.json").exists());
     assert!(dir.join("projection_fit_initial.json").exists());
@@ -940,6 +1185,245 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
     assert!(dir.join("camera_grounding_report.json").exists());
     assert!(dir.join("scene_build_response_structured.json").exists());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn grounding_contract_records_evidence_statuses_and_gpt_roles() {
+    let source_scene_path = PathBuf::from("/tmp/scene.jpg");
+    let mut response = json!({
+        "manifest": {
+            "source_scene_path": source_scene_path.display().to_string(),
+            "objects": [{"id": "chair"}]
+        },
+        "object_image_requests": [{"object_id": "chair"}],
+        "candidate_generation": {"rejected_objects": []},
+        "selected_candidates": [{"object_id": "chair"}],
+        "asset_outputs": {
+            "items": [{"output_path": "/tmp/chair.glb"}]
+        },
+        "asset_bindings": [
+            {
+                "asset_id": "chair_asset",
+                "canonical_frame": {
+                    "yaw_offset_degrees": 0.0,
+                    "confidence": 0.7
+                }
+            }
+        ],
+        "grounded_layout": {
+            "projection_fit": {
+                "applied": true,
+                "initial_score": 0.2,
+                "final_score": 0.7,
+                "final_loss": 0.3,
+                "fit_mode": "projected_aabb_canonical_pose"
+            }
+        },
+        "feedback": {
+            "enabled": true,
+            "accepted": true,
+            "accepted_iteration": 1
+        },
+        "e2e_summary": {
+            "ok": true
+        }
+    });
+    let args: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": source_scene_path.display().to_string(),
+        "feedback_rotation_selector": "openai"
+    }))
+    .expect("scene build args");
+    let detection = burn_synth_scene::Detection {
+        label: "chair".to_string(),
+        bbox: [0.2, 0.3, 0.4, 0.8],
+        point: Some([0.3, 0.8]),
+        confidence: Some(0.9),
+        source_query: "chair".to_string(),
+    };
+    let evidence = SceneGroundingEvidence {
+        source_image_path: source_scene_path.display().to_string(),
+        depth: Some(burn_synth_scene::DepthEvidenceRef {
+            provider: "depth-pro".to_string(),
+            model: Some("depth-pro".to_string()),
+            precision: Some("f16".to_string()),
+            artifact_path: None,
+            focal_length_px: Some(900.0),
+            vertical_fov_degrees: Some(55.0),
+            image_size: Some([1600, 900]),
+            depth_map_size: Some([1600, 900]),
+            floor_sample_count: Some(128),
+        }),
+        segmentation: None,
+        detections: vec![detection.clone()],
+        camera: burn_synth_scene::EstimatedCamera {
+            focal_length_px: Some(900.0),
+            principal_point: Some([800.0, 450.0]),
+            image_size: Some([1600, 900]),
+            vertical_fov_degrees: Some(55.0),
+            confidence: Some(0.9),
+        },
+        floor: burn_synth_scene::EstimatedFloorPlane {
+            normal: [0.0, 1.0, 0.0],
+            distance_m: 0.0,
+            residual_m: Some(0.04),
+            confidence: Some(0.96),
+        },
+        objects: vec![burn_synth_scene::ObjectGroundingEvidence {
+            object_id: "chair".to_string(),
+            instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            detection: Some(detection),
+            mask: None,
+            asset_id: Some("chair_asset".to_string()),
+            contact_pixel: Some([0.3, 0.8]),
+            depth_stats: None,
+            candidate_floor_contact_rays: Vec::new(),
+            metric_contact_point_m: Some([0.0, 0.0, 1.0]),
+            target_footprint_m: Some([0.6, 0.6]),
+            provenance: vec!["depth_pro".to_string()],
+        }],
+    };
+
+    attach_scene_grounding_contracts(
+        &mut response,
+        &args,
+        "locate_anything_burn_native",
+        &evidence,
+        SceneSegmentationProvider::None,
+    )
+    .expect("attach grounding contracts");
+
+    let entries = response["grounding_contract"]["entries"]
+        .as_array()
+        .expect("contract entries");
+    let detections = entries
+        .iter()
+        .find(|entry| entry["name"] == "detections")
+        .expect("detections contract");
+    assert_eq!(detections["status"], json!("verified"));
+    let floor = entries
+        .iter()
+        .find(|entry| entry["name"] == "floor_plane")
+        .expect("floor contract");
+    assert_eq!(floor["status"], json!("verified"));
+    let feedback = entries
+        .iter()
+        .find(|entry| entry["name"] == "render_feedback")
+        .expect("feedback contract");
+    assert_eq!(feedback["gpt_role"], json!("bounded_candidate_selection"));
+    let decisions = response["decision_log"]["entries"]
+        .as_array()
+        .expect("decision entries");
+    assert!(decisions.iter().any(|entry| {
+        entry["decision"] == "scene_pose_fit"
+            && entry["source_of_truth"] == "deterministic_projected_aabb_contact_depth_fit"
+    }));
+}
+
+#[test]
+fn scene_build_scene_promotion_writes_scene_catalog_snapshot() {
+    let root = unique_test_dir("scene_catalog_promotion");
+    let source = root.join("source_scene.png");
+    let output_dir = root.join("run_20260627T000000Z_scene_test");
+    fs::create_dir_all(&output_dir).expect("create output dir");
+    fs::write(&source, [137, 80, 78, 71, 13, 10, 26, 10]).expect("write source bytes");
+    let mut cache = MeshCache::load_from_root(root.join("cache")).expect("load cache");
+    let asset_bindings = vec![SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair".to_string(),
+        label: "conference chair".to_string(),
+        aliases: Vec::new(),
+        path: Some("/tmp/chair.glb".to_string()),
+        cache_key: Some("chair-cache-key".to_string()),
+        reusable: true,
+        source_image_path: Some("/tmp/chair.png".to_string()),
+        pipeline: Some("trellis".to_string()),
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.5, 0.0, -0.5],
+            max: [0.5, 1.0, 0.5],
+        }),
+        canonical_frame: None,
+        provenance: None,
+    }];
+    let layout = GroundedSceneLayout {
+        bsn: "synth_scene_v1 {}".to_string(),
+        placements: vec![GroundedScenePlacement {
+            entity_id: "chair_0".to_string(),
+            asset_id: "chair_asset".to_string(),
+            object_id: "chair".to_string(),
+            instance_id: None,
+            label: "conference chair".to_string(),
+            source_bbox: [0.2, 0.3, 0.4, 0.8],
+            contact_pixel: [0.3, 0.8],
+            ground_point: [1.0, 0.0, 2.0],
+            translation: [1.0, 0.0, 2.0],
+            rotation_y_degrees: 90.0,
+            scale: [1.0, 1.0, 1.0],
+            local_aabb: SceneAssetAabb {
+                min: [-0.5, 0.0, -0.5],
+                max: [0.5, 1.0, 0.5],
+            },
+            target_footprint_m: [1.0, 1.0],
+        }],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, 5.0],
+            focus: [0.0, 0.0, 0.0],
+            yaw: None,
+            pitch: None,
+            radius: None,
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let response = json!({
+        "manifest": {
+            "objects": [{"id": "chair"}]
+        },
+        "grounding_contract": {"entries": []},
+        "decision_log": {"entries": []},
+        "stage_report": [],
+        "token_usage": {},
+        "e2e_summary": {
+            "ok": true,
+            "elapsed_ms": 123,
+            "asset_count": 1,
+            "placement_count": 1,
+            "feedback": {
+                "accepted": true,
+                "accepted_iteration": 2
+            }
+        }
+    });
+
+    let metadata = promote_scene_build_scene_to_catalog(
+        &mut cache,
+        &source,
+        &output_dir,
+        "synth_scene_v1 {}",
+        &asset_bindings,
+        &layout,
+        &response,
+    )
+    .expect("promote scene");
+
+    assert_eq!(metadata["pipeline"], json!("explicit"));
+    assert_eq!(cache.scene_entries().len(), 1);
+    assert_eq!(
+        cache.scene_entries()[0].metrics.as_ref().unwrap().ok,
+        Some(true)
+    );
+    let scene_key = cache.scene_entries()[0].scene_key.clone();
+    let payload = cache
+        .load_scene(&scene_key)
+        .expect("load scene payload")
+        .expect("scene payload");
+    assert_eq!(payload.bsn.as_deref(), Some("synth_scene_v1 {}"));
+    assert_eq!(payload.world_items.len(), 1);
+    assert_eq!(payload.world_items[0].cache_key, "chair-cache-key");
+    assert!(payload.asset_bindings.is_some());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

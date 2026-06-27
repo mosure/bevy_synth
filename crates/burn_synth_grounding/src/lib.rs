@@ -437,7 +437,6 @@ impl SceneGroundingRuntime {
             .principal_point
             .or(Some([depth_map.intrinsics.cx, depth_map.intrinsics.cy]));
         evidence.camera.image_size = Some([depth_map.width, depth_map.height]);
-        evidence.floor = estimate_scene_floor_plane(&depth_map).unwrap_or_default();
 
         Ok(DepthProGroundingReport {
             artifact_path: summary_path,
@@ -847,6 +846,8 @@ pub fn annotate_grounding_evidence_with_depth_map(
                 let floor = estimate_scene_floor_plane(depth_map);
                 (floor, floor_sample_count_with_exclusions(depth_map, &[]))
             });
+    let floor_residual_m = floor.and_then(|floor| floor.residual_m);
+    evidence.floor = floor.unwrap_or_default();
     let mut annotated_objects = 0usize;
     for object in &mut evidence.objects {
         let Some(detection) = object.detection.as_ref() else {
@@ -917,7 +918,7 @@ pub fn annotate_grounding_evidence_with_depth_map(
         focal_length_px: depth_map.focal_length_px,
         vertical_fov_degrees: depth_map.vertical_fov_degrees,
         floor_sample_count,
-        floor_residual_m: floor.and_then(|floor| floor.residual_m),
+        floor_residual_m,
     }
 }
 
@@ -2441,6 +2442,78 @@ mod tests {
         assert!(object.metric_contact_point_m.unwrap()[2] > 0.0);
         assert_eq!(object.target_footprint_m, Some([0.7, 0.8]));
         assert!(object.provenance.contains(&"depth_pro".to_string()));
+    }
+
+    #[test]
+    fn depth_annotation_persists_object_excluded_floor_estimate() {
+        let detection = Detection {
+            label: "table".to_string(),
+            bbox: [0.0, 0.62, 0.5, 1.0],
+            point: Some([0.25, 0.98]),
+            confidence: Some(0.9),
+            source_query: "table".to_string(),
+        };
+        let mut evidence = SceneGroundingEvidence {
+            source_image_path: "/tmp/source.jpg".to_string(),
+            depth: None,
+            segmentation: None,
+            detections: vec![detection.clone()],
+            camera: EstimatedCamera::default(),
+            floor: EstimatedFloorPlane::default(),
+            objects: vec![ObjectGroundingEvidence {
+                object_id: "table".to_string(),
+                instance_id: None,
+                reuse_group: Some("table".to_string()),
+                detection: Some(detection),
+                mask: None,
+                asset_id: None,
+                contact_pixel: None,
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: Vec::new(),
+            }],
+        };
+        let width = 96u32;
+        let height = 72u32;
+        let mut depth_m = vec![3.0f32; width as usize * height as usize];
+        let y_start = (height as f32 * 0.62).floor() as u32;
+        for y in y_start..height {
+            for x in 0..(width / 2) {
+                depth_m[y as usize * width as usize + x as usize] = 12.0;
+            }
+        }
+        let depth_map = SceneDepthMapEvidence {
+            depth_m,
+            width,
+            height,
+            intrinsics: CameraIntrinsics {
+                fx: 90.0,
+                fy: 90.0,
+                cx: width as f32 * 0.5,
+                cy: height as f32 * 0.5,
+                width,
+                height,
+            },
+            focal_length_px: Some(90.0),
+            vertical_fov_degrees: Some(45.0),
+        };
+        let exclusion_bboxes = floor_sample_exclusion_bboxes(&evidence);
+        let (expected_floor, expected_count) =
+            estimate_scene_floor_plane_with_exclusions(&depth_map, &exclusion_bboxes)
+                .expect("excluded floor");
+        let unexcluded_floor = estimate_scene_floor_plane(&depth_map).expect("unexcluded floor");
+
+        let summary =
+            annotate_grounding_evidence_with_depth_map(&mut evidence, &depth_map, "depth_pro");
+
+        assert_eq!(summary.floor_sample_count, expected_count);
+        assert_eq!(evidence.floor, expected_floor);
+        assert!(
+            (evidence.floor.distance_m - unexcluded_floor.distance_m).abs() > 1.0e-3,
+            "excluded floor should not be overwritten by unexcluded estimate"
+        );
     }
 
     #[test]

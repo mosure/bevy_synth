@@ -802,22 +802,21 @@ fn grounded_scene_layout_internal(
             config.floor_y - local_aabb.min[1] * scale[1],
             ground_point[2],
         ];
-        let rotation_y_degrees = normalize_degrees(
-            instance
-                .rotation_hint_degrees
-                .or(instance.facing_yaw_degrees)
-                .or(object.rotation_hint_degrees)
-                .unwrap_or_else(|| {
-                    grounded_yaw_degrees(
-                        object,
-                        &instance,
-                        ground_point,
-                        table_centered,
-                        metric_frame,
-                    )
-                })
-                - asset_frame.yaw_offset_degrees,
-        );
+        let instance_yaw_degrees = instance
+            .rotation_hint_degrees
+            .or(instance.facing_yaw_degrees)
+            .or(object.rotation_hint_degrees)
+            .unwrap_or_else(|| {
+                grounded_yaw_degrees(
+                    object,
+                    &instance,
+                    ground_point,
+                    table_centered,
+                    metric_frame,
+                )
+            });
+        let rotation_y_degrees =
+            canonical_spawn_yaw_degrees(instance_yaw_degrees, asset_frame.yaw_offset_degrees, 0.0);
         let entity_id = if let Some(instance_id) = instance.id.as_deref() {
             sanitize_bsn_identifier(&format!("{}_{}", object.id, instance_id))
         } else {

@@ -93,6 +93,12 @@ fn canonical_pose_evidence_marks_table_axis_and_chair_symmetry() {
     assert_eq!(evidence[1].symmetry, SceneAssetSymmetry::Bilateral);
 }
 
+#[test]
+fn canonical_spawn_yaw_subtracts_asset_offset_then_applies_feedback_delta() {
+    assert!((canonical_spawn_yaw_degrees(20.0, 180.0, -10.0) + 170.0).abs() <= 1.0e-5);
+    assert!((canonical_spawn_yaw_degrees(-175.0, 20.0, 0.0) - 165.0).abs() <= 1.0e-5);
+}
+
 fn png_bytes(image: image::RgbImage) -> Vec<u8> {
     let mut cursor = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(image)
@@ -1598,7 +1604,7 @@ fn grounded_scene_layout_uses_calibrated_table_slots_and_source_camera() {
             .expect("projection fit report")
             .camera
             .basis,
-        "layout-camera"
+        "source-depth-intrinsics"
     );
 }
 

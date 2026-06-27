@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use burn_synth::{ModelSelection, RuntimeConfig};
+use burn_synth::{ModelSelection, RuntimeConfig, TrellisComputeProfile};
 use burn_synth_grounding::{
     GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, SegmentationPrecision,
     SegmentationQuantization,
@@ -191,6 +191,9 @@ pub enum ScenePoseFitMode {
 #[serde(rename_all = "kebab-case")]
 pub enum SceneCanonicalPoseMode {
     Off,
+    Heuristic,
+    RenderSweep,
+    Openai,
     Auto,
 }
 
@@ -888,6 +891,7 @@ impl ServerConfig {
             trellis_python_bin: self.trellis_python_bin.clone(),
             trellis_bridge_script: self.trellis_bridge_script.clone(),
             trellis_quality: self.trellis_quality.into(),
+            trellis_compute_profile: self.trellis_compute_profile(),
             trellis_pbr_enabled: self.trellis_pbr_enabled,
             trellis_pbr_texture_size: self.trellis_pbr_texture_size,
             bg_weights_root: self.bg_weights_root.clone(),
@@ -901,6 +905,19 @@ impl ServerConfig {
         config.flash_extract.mini_grid_num = self.flash_mini_grid_num;
         config.flash_extract.num_chunks = self.flash_num_chunks;
         config
+    }
+
+    fn trellis_compute_profile(&self) -> TrellisComputeProfile {
+        if self.default_backend == InferenceBackend::Wgpu
+            && self
+                .default_synthesis_models
+                .iter()
+                .any(|model| matches!(model, SynthesisModel::Trellis))
+        {
+            TrellisComputeProfile::WgpuFastF16
+        } else {
+            RuntimeConfig::default().trellis_compute_profile
+        }
     }
 }
 

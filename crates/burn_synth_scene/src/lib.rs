@@ -17,7 +17,7 @@ pub use bsn::{
 };
 pub use canonical_pose::{
     canonical_frame_for_asset, canonical_pose_evidence_for_asset,
-    canonical_pose_evidence_for_assets,
+    canonical_pose_evidence_for_assets, canonical_spawn_yaw_degrees, symmetry_for_descriptor,
 };
 pub use cli::{Cli, run_cli};
 pub use error::{SceneError, SceneResult};

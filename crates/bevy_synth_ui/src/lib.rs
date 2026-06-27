@@ -2167,6 +2167,7 @@ fn update_queue_text(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn sync_processing_panel(
     state: Res<SceneProcessingState>,
     mut roots: Query<&mut Visibility, With<ProcessingPanelRoot>>,
@@ -2257,6 +2258,7 @@ fn sync_processing_panel(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn sync_settings_developer_panel(
     state: Res<SceneProcessingState>,
     mut text_queries: ParamSet<(
@@ -3602,6 +3604,7 @@ fn handle_pipeline_option_button(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_pipeline_dropdown(
     mut commands: Commands,
     catalog: Res<CatalogState>,
@@ -4195,7 +4198,7 @@ fn sync_settings_tab_visuals(
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_settings_labels(
     args: Option<Res<AppArgs>>,
     scene_settings: Res<ScenePipelineUiSettings>,
@@ -4336,6 +4339,7 @@ fn update_settings_labels(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn update_viewer_debug_labels(
     viewer_debug: Res<ViewerDebugSettings>,
     mut aabb_labels: Query<

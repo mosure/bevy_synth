@@ -91,7 +91,8 @@ use burn_synth_mcp::{
     LocateAnythingBackend, QualityPreset as McpQualityPreset, SceneBuildExecutionKind,
     SceneBuildFromImageArgs, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
-    ScenePoseFitMode, ServerArgs, ServerConfig, run_scene_build_from_image_with_progress,
+    ScenePoseFitMode, SceneSegmentationProvider, ServerArgs, ServerConfig,
+    run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
@@ -708,6 +709,10 @@ pub(crate) fn should_share_wgpu_inference_device_for_platform(
     _is_linux: bool,
 ) -> bool {
     matches!(args.backend, BackendKind::Wgpu)
+        && !args
+            .available_synthesis_models
+            .iter()
+            .any(|model| matches!(model, bevy_synth_runtime::args::SynthesisModel::Trellis))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2071,7 +2076,7 @@ fn scene_preview_items_from_world(
 fn unique_world_asset_count(world_items: &[CachedWorldItem]) -> usize {
     let mut keys = Vec::<&str>::new();
     for item in world_items {
-        if !keys.iter().any(|key| *key == item.cache_key.as_str()) {
+        if !keys.contains(&item.cache_key.as_str()) {
             keys.push(item.cache_key.as_str());
         }
     }
@@ -2865,6 +2870,7 @@ fn handle_dropped_files(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_scene_save_requests(
     mut requests: MessageReader<SceneSaveRequest>,
     mut commands: Commands,
@@ -3600,6 +3606,9 @@ fn run_scene_build_for_ui(
             depth_provider: SceneDepthProvider::DepthPro,
             locator: SceneLocatorProvider::LocateAnything,
             locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
+            segmentation_provider: Some(SceneSegmentationProvider::None),
+            segmentation_precision: None,
+            segmentation_quantization: None,
             write_artifacts: true,
             apply: false,
             clear_existing: true,
@@ -4866,11 +4875,8 @@ fn drain_scene_build_progress(
         processing.finish_failure("scene build progress receiver lock poisoned");
         return;
     };
-    loop {
-        match receiver.try_recv() {
-            Ok(event) => apply_scene_build_progress_event(event, processing, status),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-        }
+    while let Ok(event) = receiver.try_recv() {
+        apply_scene_build_progress_event(event, processing, status);
     }
 }
 
@@ -5281,6 +5287,7 @@ fn sync_panorbit_bindings(mut cameras: Query<&mut PanOrbitCamera>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_panorbit_enabled(
     gizmos: Query<&TransformGizmo>,
     gizmo_handles_hover: Query<&PickingInteraction, With<bevy_transform_gizmos::InteractionKind>>,

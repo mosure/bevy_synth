@@ -8,7 +8,10 @@ pub(crate) use std::sync::atomic::Ordering;
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub(crate) use bevy_synth_runtime::cache::{CachedAssetAabb, CachedMeshMetadata, MeshCache};
+pub(crate) use bevy_synth_runtime::cache::{
+    CachedAssetAabb, CachedCameraState, CachedMeshMetadata, CachedSceneMetrics, CachedScenePayload,
+    CachedWorldItem, MeshCache,
+};
 pub(crate) use bevy_synth_runtime::{
     SynthMesh as CachedSynthMesh, SynthMeshMaterial as CachedSynthMeshMaterial,
     SynthMeshPbrTextures as CachedSynthMeshPbrTextures, SynthMeshTexture as CachedSynthMeshTexture,
@@ -24,20 +27,25 @@ pub(crate) use burn_synth_grounding::{
     SegmentationModelKind, SegmentationRuntimeBackend,
 };
 pub(crate) use burn_synth_scene::{
-    DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, GroundedSceneLayout, GroundedScenePlacement,
-    ObjectImageGenerationPolicy, OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider,
-    SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneAssetFrameSource, SceneAssetSymmetry,
-    SceneBsnRequest, SceneBuildConfig, SceneGroundingEvidence, SceneObjectManifest, ScenePipeline,
-    ScenePlan, SceneQualityProfile, SceneReasoningRequest, SceneResult,
+    CanonicalPoseCalibrationReport, CanonicalPoseCandidate, CanonicalPoseSelection,
+    DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, GptDelegationRole, GroundedSceneLayout,
+    GroundedScenePlacement, GroundingContractEntry, GroundingContractReport,
+    GroundingVerificationStatus, ObjectImageGenerationPolicy, ObjectImageRequest,
+    OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider, SceneAssetAabb, SceneAssetBinding,
+    SceneAssetFrame, SceneAssetFrameSource, SceneAssetSymmetry, SceneBsnRequest, SceneBuildConfig,
+    SceneDecisionLog, SceneDecisionLogEntry, SceneGroundingEvidence, SceneObjectManifest,
+    ScenePipeline, ScenePlan, SceneQualityProfile, SceneReasoningRequest, SceneResult,
     SceneRotationSelectionRequest, SceneRotationSelectionResponse,
     canonical_pose_evidence_for_assets, grounded_scene_layout_for_manifest,
     grounded_scene_layout_with_evidence, manifest_grounding_evidence, parse_scene_bsn,
-    scene_plan_to_mcp_commands, select_object_image_candidates_with_exclusions, write_json_file,
+    scene_plan_to_mcp_commands, select_object_image_candidates_with_exclusions,
+    symmetry_for_descriptor, write_json_file,
 };
 pub(crate) use serde::{Deserialize, de::DeserializeOwned};
 pub(crate) use serde_json::{Value, json};
 
 pub(crate) use crate::assets::*;
+pub(crate) use crate::canonical_pose::*;
 pub(crate) use crate::feedback::*;
 pub(crate) use crate::protocol::*;
 pub(crate) use crate::scene_layout::{

@@ -747,6 +747,859 @@ pub(crate) fn scene_build_summary(response: &Value, elapsed: Duration) -> Value 
     })
 }
 
+pub(crate) fn attach_scene_grounding_contracts(
+    response: &mut Value,
+    args: &SceneBuildFromImageArgs,
+    grounding_source: &str,
+    evidence: &SceneGroundingEvidence,
+    segmentation_provider: SceneSegmentationProvider,
+) -> Result<(), String> {
+    let contract = scene_grounding_contract_report(
+        response,
+        args,
+        grounding_source,
+        evidence,
+        segmentation_provider,
+    );
+    let decision_log = scene_decision_log(response, args, grounding_source, evidence);
+    response["grounding_contract"] = serde_json::to_value(contract)
+        .map_err(|err| format!("serialize grounding contract: {err}"))?;
+    response["decision_log"] = serde_json::to_value(decision_log)
+        .map_err(|err| format!("serialize decision log: {err}"))?;
+    Ok(())
+}
+
+fn scene_grounding_contract_report(
+    response: &Value,
+    args: &SceneBuildFromImageArgs,
+    grounding_source: &str,
+    evidence: &SceneGroundingEvidence,
+    segmentation_provider: SceneSegmentationProvider,
+) -> GroundingContractReport {
+    let valid_detections = evidence
+        .detections
+        .iter()
+        .filter(|detection| detection_bbox_is_sane(detection.bbox))
+        .count();
+    let invalid_detections = evidence.detections.len().saturating_sub(valid_detections);
+    let object_count = evidence.objects.len();
+    let grounded_objects = evidence
+        .objects
+        .iter()
+        .filter(|object| object.detection.is_some())
+        .count();
+    let detected_status = if args.locator == SceneLocatorProvider::LocateAnything {
+        if valid_detections > 0 && invalid_detections == 0 {
+            GroundingVerificationStatus::Verified
+        } else if valid_detections > 0 {
+            GroundingVerificationStatus::Fallback
+        } else {
+            GroundingVerificationStatus::Invalid
+        }
+    } else {
+        GroundingVerificationStatus::Fallback
+    };
+    let camera_status = if source_camera_is_sane(evidence) {
+        GroundingVerificationStatus::Verified
+    } else if evidence.depth.is_some() {
+        GroundingVerificationStatus::Invalid
+    } else if args.depth_provider == SceneDepthProvider::None {
+        GroundingVerificationStatus::Absent
+    } else {
+        GroundingVerificationStatus::Invalid
+    };
+    let floor_status = if floor_is_sane(evidence) {
+        GroundingVerificationStatus::Verified
+    } else if evidence.depth.is_some() {
+        GroundingVerificationStatus::Invalid
+    } else {
+        GroundingVerificationStatus::Absent
+    };
+    let crop_count = response
+        .get("object_image_requests")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let selected_count = response
+        .get("selected_candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let rejected_count = response
+        .pointer("/candidate_generation/rejected_objects")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let asset_items = response
+        .pointer("/asset_outputs/items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let mesh_quality_failure_count = response
+        .get("mesh_quality_failures")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let (canonical_frame_count, verified_canonical_frame_count) =
+        canonical_frame_counts(response.get("asset_bindings").unwrap_or(&Value::Null));
+    let feedback_enabled = response
+        .pointer("/feedback/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(args.feedback && args.lift_assets);
+    let feedback_accepted = response
+        .pointer("/feedback/accepted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let projection_applied = response
+        .pointer("/grounded_layout/projection_fit/applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let projection_final_score = response
+        .pointer("/grounded_layout/projection_fit/final_score")
+        .and_then(Value::as_f64);
+    let segmentation_status = match segmentation_provider {
+        SceneSegmentationProvider::None => GroundingVerificationStatus::Absent,
+        _ => response
+            .get("segmentation_grounding")
+            .and_then(|report| report.get("mask_count"))
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+            .map(|_| GroundingVerificationStatus::Verified)
+            .unwrap_or(GroundingVerificationStatus::Invalid),
+    };
+
+    GroundingContractReport {
+        schema_version: 1,
+        source_scene_path: args.source_scene_path.display().to_string(),
+        composition_mode: serde_json::to_value(args.composition_mode)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_string()),
+        entries: vec![
+            contract_entry(
+                "object_manifest",
+                "openai_reasoning",
+                "plan_objects",
+                if response.get("manifest").is_some() {
+                    GroundingVerificationStatus::Fallback
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                GptDelegationRole::Hypothesis,
+                ["object_image_requests", "asset_reuse_groups"],
+                json!({
+                    "object_count": response.pointer("/manifest/objects").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                    "allow_catalog_reuse": args.allow_catalog_reuse,
+                }),
+                ["openai_object_plan"],
+                Some("object manifest is a planning prior and must be checked against visual grounding".to_string()),
+            ),
+            contract_entry(
+                "detections",
+                grounding_source,
+                "load_grounding_evidence",
+                detected_status,
+                GptDelegationRole::None,
+                ["object_count_binding", "source_crops", "projection_fit", "contact_estimation"],
+                json!({
+                    "total_detections": evidence.detections.len(),
+                    "valid_detections": valid_detections,
+                    "invalid_detections": invalid_detections,
+                    "grounded_objects": grounded_objects,
+                    "objects": object_count,
+                    "locator": args.locator,
+                }),
+                [grounding_source],
+                detection_reason(args.locator, valid_detections, invalid_detections),
+            ),
+            contract_entry(
+                "source_camera_depth",
+                args.depth_provider_label(),
+                "depth_pro_grounding_evidence",
+                camera_status,
+                GptDelegationRole::None,
+                ["camera_rays", "projection_fit", "floor_fit"],
+                json!({
+                    "focal_length_px": evidence.camera.focal_length_px,
+                    "principal_point": evidence.camera.principal_point,
+                    "image_size": evidence.camera.image_size,
+                    "vertical_fov_degrees": evidence.camera.vertical_fov_degrees,
+                }),
+                ["depth_pro"],
+                camera_reason(evidence),
+            ),
+            contract_entry(
+                "floor_plane",
+                args.depth_provider_label(),
+                "depth_pro_grounding_evidence",
+                floor_status,
+                GptDelegationRole::None,
+                ["floor_contact", "object_y", "projection_fit"],
+                json!({
+                    "normal": evidence.floor.normal,
+                    "distance_m": evidence.floor.distance_m,
+                    "residual_m": evidence.floor.residual_m,
+                    "confidence": evidence.floor.confidence,
+                    "floor_sample_count": evidence.depth.as_ref().and_then(|depth| depth.floor_sample_count),
+                    "residual_threshold_m": 0.18,
+                    "sample_threshold": 64,
+                }),
+                ["depth_pro_floor_samples_excluding_object_bboxes"],
+                floor_reason(evidence),
+            ),
+            contract_entry(
+                "segmentation_masks",
+                segmentation_provider_label(segmentation_provider),
+                "segmentation_grounding_evidence",
+                segmentation_status,
+                GptDelegationRole::None,
+                ["future_visible_surface_fit"],
+                json!({
+                    "provider": segmentation_provider,
+                    "mask_count": response.pointer("/segmentation_grounding/mask_count").cloned().unwrap_or(Value::Null),
+                }),
+                ["segmentation_provider"],
+                (segmentation_provider == SceneSegmentationProvider::None)
+                    .then(|| "mask grounding is optional and disabled by default".to_string()),
+            ),
+            contract_entry(
+                "source_crops",
+                "deterministic_cropper",
+                "prepare_object_image_requests",
+                if crop_count > 0 {
+                    GroundingVerificationStatus::Verified
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                GptDelegationRole::None,
+                ["openai_image_generation", "rotation_feedback"],
+                json!({ "crop_request_count": crop_count }),
+                ["source_bboxes"],
+                None,
+            ),
+            contract_entry(
+                "generated_object_images",
+                "openai_image",
+                "generate_object_candidates",
+                if selected_count > 0 && rejected_count == 0 {
+                    GroundingVerificationStatus::Verified
+                } else if selected_count > 0 {
+                    GroundingVerificationStatus::Fallback
+                } else {
+                    GroundingVerificationStatus::Invalid
+                },
+                GptDelegationRole::ImageSynthesis,
+                ["trellis_asset_lifting"],
+                json!({
+                    "selected_count": selected_count,
+                    "rejected_count": rejected_count,
+                    "min_reconstruction_score": args.min_reconstruction_score.unwrap_or(DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE),
+                }),
+                ["openai_image_candidates", "reconstruction_score_guard"],
+                None,
+            ),
+            contract_entry(
+                "trellis_assets",
+                "trellis2",
+                "images_to_assets",
+                if asset_items > 0 && mesh_quality_failure_count == 0 {
+                    GroundingVerificationStatus::Verified
+                } else if asset_items > 0 {
+                    GroundingVerificationStatus::Invalid
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                GptDelegationRole::None,
+                ["canonical_pose", "projection_fit", "scene_catalog"],
+                json!({
+                    "asset_count": asset_items,
+                    "mesh_quality_failure_count": mesh_quality_failure_count,
+                    "trellis_pbr": args.trellis_pbr,
+                    "target_faces": args.target_faces,
+                }),
+                ["mesh_quality_gate"],
+                None,
+            ),
+            contract_entry(
+                "canonical_asset_frame",
+                "canonical_pose_calibration",
+                "canonical_pose_calibration",
+                if verified_canonical_frame_count > 0 && verified_canonical_frame_count == canonical_frame_count {
+                    GroundingVerificationStatus::Verified
+                } else if canonical_frame_count > 0 {
+                    GroundingVerificationStatus::Fallback
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                if args.canonical_pose == SceneCanonicalPoseMode::Openai {
+                    GptDelegationRole::BoundedCandidateSelection
+                } else {
+                    GptDelegationRole::None
+                },
+                ["layout_yaw_offsets", "feedback_rotation_candidates"],
+                json!({
+                    "canonical_frame_count": canonical_frame_count,
+                    "verified_canonical_frame_count": verified_canonical_frame_count,
+                    "confidence_threshold": 0.55,
+                    "mode": args.canonical_pose,
+                    "calibration_report_count": response
+                        .get("canonical_pose_calibration")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                    "selection": response
+                        .get("canonical_pose_selection")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }),
+                ["asset_aabb_descriptor_heuristics", "source_crops", "generated_object_images"],
+                (canonical_frame_count > verified_canonical_frame_count)
+                    .then(|| "some asset frames are low-confidence; rotation feedback must treat them as priors".to_string()),
+            ),
+            contract_entry(
+                "projected_layout_fit",
+                "deterministic_cv_optimizer",
+                "plan_grounded_scene",
+                if projection_final_score.is_some_and(|score| score.is_finite()) {
+                    GroundingVerificationStatus::Verified
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                GptDelegationRole::None,
+                ["bsn_scene", "render_feedback"],
+                json!({
+                    "applied": projection_applied,
+                    "initial_score": response.pointer("/grounded_layout/projection_fit/initial_score").cloned().unwrap_or(Value::Null),
+                    "final_score": response.pointer("/grounded_layout/projection_fit/final_score").cloned().unwrap_or(Value::Null),
+                    "final_loss": response.pointer("/grounded_layout/projection_fit/final_loss").cloned().unwrap_or(Value::Null),
+                    "fit_mode": response.pointer("/grounded_layout/projection_fit/fit_mode").cloned().unwrap_or(Value::Null),
+                }),
+                ["detections", "source_camera_depth", "floor_plane", "asset_aabbs"],
+                None,
+            ),
+            contract_entry(
+                "render_feedback",
+                "bevy_headless_capture",
+                "render_capture_feedback",
+                if feedback_enabled && feedback_accepted {
+                    GroundingVerificationStatus::Verified
+                } else if feedback_enabled {
+                    GroundingVerificationStatus::Invalid
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                if args.feedback_rotation_selector == FeedbackRotationSelector::Openai {
+                    GptDelegationRole::BoundedCandidateSelection
+                } else {
+                    GptDelegationRole::None
+                },
+                ["accepted_scene_selection", "scene_catalog"],
+                json!({
+                    "enabled": feedback_enabled,
+                    "accepted": feedback_accepted,
+                    "accepted_iteration": response.pointer("/feedback/accepted_iteration").cloned().unwrap_or(Value::Null),
+                    "rotation_selector": args.feedback_rotation_selector,
+                    "threshold_profile": args.feedback_threshold_profile,
+                }),
+                ["screenshots", "screen_bboxes", "physical_overlap_metrics"],
+                (!feedback_enabled).then(|| "feedback disabled; scene relies on deterministic projected fit".to_string()),
+            ),
+        ],
+    }
+}
+
+fn scene_decision_log(
+    response: &Value,
+    args: &SceneBuildFromImageArgs,
+    grounding_source: &str,
+    evidence: &SceneGroundingEvidence,
+) -> SceneDecisionLog {
+    let feedback_enabled = response
+        .pointer("/feedback/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(args.feedback && args.lift_assets);
+    let feedback_accepted = response
+        .pointer("/feedback/accepted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let scene_ok = response.pointer("/e2e_summary/ok").and_then(Value::as_bool);
+    SceneDecisionLog {
+        schema_version: 1,
+        source_scene_path: args.source_scene_path.display().to_string(),
+        entries: vec![
+            decision_entry(
+                "object_manifest",
+                "plan_objects",
+                "openai_reasoning_hypothesis",
+                response
+                    .pointer("/manifest/objects")
+                    .and_then(Value::as_array)
+                    .filter(|objects| !objects.is_empty())
+                    .map(|_| GroundingVerificationStatus::Fallback)
+                    .unwrap_or(GroundingVerificationStatus::Absent),
+                GptDelegationRole::Hypothesis,
+                json!({
+                    "manifest_objects": response.pointer("/manifest/objects").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                    "allow_catalog_reuse": args.allow_catalog_reuse,
+                }),
+                ["locate_anything_detections", "manifest_bbox_fallback"],
+                Some("GPT proposes object hypotheses; visual grounding owns count and placement when available".to_string()),
+            ),
+            decision_entry(
+                "object_count_and_bbox_binding",
+                "load_grounding_evidence",
+                grounding_source,
+                if evidence.objects.iter().any(|object| object.detection.is_some()) {
+                    GroundingVerificationStatus::Verified
+                } else {
+                    GroundingVerificationStatus::Fallback
+                },
+                GptDelegationRole::None,
+                json!({
+                    "detections": evidence.detections.len(),
+                    "objects": evidence.objects.len(),
+                    "objects_with_detection": evidence.objects.iter().filter(|object| object.detection.is_some()).count(),
+                }),
+                ["manifest_bbox_fallback"],
+                None,
+            ),
+            decision_entry(
+                "floor_and_contact_source",
+                "depth_pro_grounding_evidence",
+                "depth_pro_excluded_floor_fit",
+                if floor_is_sane(evidence) {
+                    GroundingVerificationStatus::Verified
+                } else {
+                    GroundingVerificationStatus::Invalid
+                },
+                GptDelegationRole::None,
+                json!({
+                    "floor_residual_m": evidence.floor.residual_m,
+                    "floor_sample_count": evidence.depth.as_ref().and_then(|depth| depth.floor_sample_count),
+                    "metric_contact_objects": evidence.objects.iter().filter(|object| object.metric_contact_point_m.is_some()).count(),
+                }),
+                ["bbox_bottom_center_depth", "manifest_floor_y"],
+                None,
+            ),
+            decision_entry(
+                "asset_selection",
+                "images_to_assets",
+                "reconstruction_score_and_mesh_quality_gate",
+                if response
+                    .get("mesh_quality_failures")
+                    .and_then(Value::as_array)
+                    .is_none_or(|failures| failures.is_empty())
+                {
+                    GroundingVerificationStatus::Verified
+                } else {
+                    GroundingVerificationStatus::Invalid
+                },
+                GptDelegationRole::ImageSynthesis,
+                json!({
+                    "selected_candidates": response.get("selected_candidates").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                    "asset_count": response.pointer("/asset_outputs/items").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                    "mesh_quality_failures": response.get("mesh_quality_failures").cloned().unwrap_or(Value::Null),
+                }),
+                ["retry_next_image_candidate"],
+                None,
+            ),
+            decision_entry(
+                "scene_pose_fit",
+                "plan_grounded_scene",
+                "deterministic_projected_aabb_contact_depth_fit",
+                response
+                    .pointer("/grounded_layout/projection_fit/final_score")
+                    .and_then(Value::as_f64)
+                    .filter(|score| score.is_finite())
+                    .map(|_| GroundingVerificationStatus::Verified)
+                    .unwrap_or(GroundingVerificationStatus::Fallback),
+                GptDelegationRole::None,
+                json!({
+                    "composition_mode": args.composition_mode,
+                    "pose_fit": args.pose_fit,
+                    "initial_score": response.pointer("/grounded_layout/projection_fit/initial_score").cloned().unwrap_or(Value::Null),
+                    "final_score": response.pointer("/grounded_layout/projection_fit/final_score").cloned().unwrap_or(Value::Null),
+                    "candidate_reports": response.get("composition_candidate_reports").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                }),
+                ["heuristic_candidate"],
+                None,
+            ),
+            decision_entry(
+                "feedback_acceptance",
+                "render_capture_feedback",
+                "bevy_render_metrics",
+                if feedback_enabled && feedback_accepted {
+                    GroundingVerificationStatus::Verified
+                } else if feedback_enabled {
+                    GroundingVerificationStatus::Invalid
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                if args.feedback_rotation_selector == FeedbackRotationSelector::Openai {
+                    GptDelegationRole::BoundedCandidateSelection
+                } else {
+                    GptDelegationRole::None
+                },
+                json!({
+                    "enabled": feedback_enabled,
+                    "accepted": feedback_accepted,
+                    "accepted_iteration": response.pointer("/feedback/accepted_iteration").cloned().unwrap_or(Value::Null),
+                    "threshold_profile": args.feedback_threshold_profile,
+                    "rotation_selector": args.feedback_rotation_selector,
+                }),
+                ["deterministic_best_candidate"],
+                None,
+            ),
+            decision_entry(
+                "scene_catalog_promotion",
+                "write_scene_build_artifacts",
+                "shared_mesh_cache_scene_snapshot",
+                if args.promote_to_catalog && scene_ok.unwrap_or(false) {
+                    GroundingVerificationStatus::Verified
+                } else if args.promote_to_catalog {
+                    GroundingVerificationStatus::Fallback
+                } else {
+                    GroundingVerificationStatus::Absent
+                },
+                GptDelegationRole::None,
+                json!({
+                    "requested": args.promote_to_catalog,
+                    "catalog_entry": response.get("scene_catalog_entry").cloned().unwrap_or(Value::Null),
+                }),
+                ["artifact_only_scene"],
+                None,
+            ),
+        ],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contract_entry(
+    name: impl Into<String>,
+    producer: impl Into<String>,
+    pipeline_stage: impl Into<String>,
+    status: GroundingVerificationStatus,
+    gpt_role: GptDelegationRole,
+    consumers: impl IntoIterator<Item = impl Into<String>>,
+    metrics: Value,
+    provenance: impl IntoIterator<Item = impl Into<String>>,
+    reason: Option<String>,
+) -> GroundingContractEntry {
+    GroundingContractEntry {
+        name: name.into(),
+        producer: producer.into(),
+        pipeline_stage: pipeline_stage.into(),
+        status,
+        gpt_role,
+        consumers: consumers.into_iter().map(Into::into).collect(),
+        metrics,
+        provenance: provenance.into_iter().map(Into::into).collect(),
+        reason,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decision_entry(
+    decision: impl Into<String>,
+    pipeline_stage: impl Into<String>,
+    source_of_truth: impl Into<String>,
+    status: GroundingVerificationStatus,
+    gpt_role: GptDelegationRole,
+    metrics: Value,
+    alternatives: impl IntoIterator<Item = impl Into<String>>,
+    reason: Option<String>,
+) -> SceneDecisionLogEntry {
+    SceneDecisionLogEntry {
+        decision: decision.into(),
+        pipeline_stage: pipeline_stage.into(),
+        source_of_truth: source_of_truth.into(),
+        status,
+        gpt_role,
+        metrics,
+        alternatives: alternatives.into_iter().map(Into::into).collect(),
+        reason,
+    }
+}
+
+trait SceneBuildDepthProviderLabel {
+    fn depth_provider_label(&self) -> &'static str;
+}
+
+impl SceneBuildDepthProviderLabel for SceneBuildFromImageArgs {
+    fn depth_provider_label(&self) -> &'static str {
+        match self.depth_provider {
+            SceneDepthProvider::None => "none",
+            SceneDepthProvider::DepthPro => "depth-pro",
+        }
+    }
+}
+
+fn segmentation_provider_label(provider: SceneSegmentationProvider) -> &'static str {
+    match provider {
+        SceneSegmentationProvider::None => "none",
+        SceneSegmentationProvider::BboxPrompt => "bbox-prompt",
+        SceneSegmentationProvider::Sam2 => "sam2",
+        SceneSegmentationProvider::Sam3 => "sam3",
+    }
+}
+
+fn detection_bbox_is_sane(bbox: [f32; 4]) -> bool {
+    if !bbox.iter().all(|value| value.is_finite()) {
+        return false;
+    }
+    let x0 = bbox[0].min(bbox[2]);
+    let x1 = bbox[0].max(bbox[2]);
+    let y0 = bbox[1].min(bbox[3]);
+    let y1 = bbox[1].max(bbox[3]);
+    if x0 < -0.001 || y0 < -0.001 || x1 > 1.001 || y1 > 1.001 {
+        return false;
+    }
+    let area = ((x1 - x0).max(0.0) * (y1 - y0).max(0.0)).clamp(0.0, 1.0);
+    (0.001..=0.90).contains(&area)
+}
+
+fn source_camera_is_sane(evidence: &SceneGroundingEvidence) -> bool {
+    let Some(depth) = evidence.depth.as_ref() else {
+        return false;
+    };
+    let Some([width, height]) = evidence.camera.image_size.or(depth.image_size) else {
+        return false;
+    };
+    let Some(focal_length) = evidence.camera.focal_length_px.or(depth.focal_length_px) else {
+        return false;
+    };
+    width > 0
+        && height > 0
+        && focal_length.is_finite()
+        && focal_length > 1.0
+        && evidence
+            .camera
+            .principal_point
+            .is_some_and(|point| point.iter().all(|value| value.is_finite()))
+}
+
+fn floor_is_sane(evidence: &SceneGroundingEvidence) -> bool {
+    let sample_count = evidence
+        .depth
+        .as_ref()
+        .and_then(|depth| depth.floor_sample_count)
+        .unwrap_or_default();
+    let normal_len_sq = evidence
+        .floor
+        .normal
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>();
+    evidence.floor.normal.iter().all(|value| value.is_finite())
+        && evidence.floor.distance_m.is_finite()
+        && normal_len_sq.is_finite()
+        && normal_len_sq > 0.25
+        && evidence.floor.normal[1].abs() >= 0.45
+        && evidence
+            .floor
+            .residual_m
+            .is_some_and(|residual| residual.is_finite() && residual <= 0.18)
+        && sample_count >= 64
+}
+
+fn detection_reason(
+    locator: SceneLocatorProvider,
+    valid_detections: usize,
+    invalid_detections: usize,
+) -> Option<String> {
+    if locator == SceneLocatorProvider::Manifest {
+        Some(
+            "manifest locator is an explicit fallback, not independent visual grounding"
+                .to_string(),
+        )
+    } else if valid_detections == 0 {
+        Some("LocateAnything produced no sane bboxes; downstream layout must not trust visual object count".to_string())
+    } else if invalid_detections > 0 {
+        Some("some LocateAnything bboxes failed finite/range/area sanity checks".to_string())
+    } else {
+        None
+    }
+}
+
+fn camera_reason(evidence: &SceneGroundingEvidence) -> Option<String> {
+    (!source_camera_is_sane(evidence)).then(|| {
+        "source camera requires finite focal length, principal point, and image size from depth evidence"
+            .to_string()
+    })
+}
+
+fn floor_reason(evidence: &SceneGroundingEvidence) -> Option<String> {
+    (!floor_is_sane(evidence)).then(|| {
+        "floor contact grounding requires object-excluded depth samples, residual <= 0.18m, and at least 64 samples"
+            .to_string()
+    })
+}
+
+fn canonical_frame_counts(asset_bindings: &Value) -> (usize, usize) {
+    let Some(bindings) = asset_bindings.as_array() else {
+        return (0, 0);
+    };
+    let mut frame_count = 0usize;
+    let mut verified_count = 0usize;
+    for binding in bindings {
+        let Some(frame) = binding.get("canonical_frame") else {
+            continue;
+        };
+        frame_count += 1;
+        let confidence = frame
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        if confidence >= 0.55 {
+            verified_count += 1;
+        }
+    }
+    (frame_count, verified_count)
+}
+
+pub(crate) fn promote_scene_build_scene_to_catalog(
+    catalog_cache: &mut MeshCache,
+    source_scene_path: &Path,
+    output_dir: &Path,
+    bsn: &str,
+    asset_bindings: &[SceneAssetBinding],
+    grounded_layout: &GroundedSceneLayout,
+    response: &Value,
+) -> Result<Value, String> {
+    let source_image_bytes = fs::read(source_scene_path).map_err(|err| {
+        format!(
+            "failed to read source scene image for scene catalog promotion {}: {err}",
+            source_scene_path.display()
+        )
+    })?;
+    let payload = CachedScenePayload {
+        world_items: scene_world_items_from_layout(asset_bindings, grounded_layout),
+        camera: Some(cached_camera_from_scene_camera(&grounded_layout.camera)),
+        bsn: Some(bsn.to_string()),
+        asset_bindings: Some(
+            serde_json::to_value(asset_bindings)
+                .map_err(|err| format!("serialize scene asset bindings: {err}"))?,
+        ),
+        e2e_summary: response.get("e2e_summary").cloned(),
+        response_summary: Some(json!({
+            "grounding_contract": response.get("grounding_contract").cloned().unwrap_or(Value::Null),
+            "decision_log": response.get("decision_log").cloned().unwrap_or(Value::Null),
+            "stage_report": response.get("stage_report").cloned().unwrap_or(Value::Null),
+            "token_usage": response.get("token_usage").cloned().unwrap_or(Value::Null),
+        })),
+    };
+    let metadata = catalog_cache
+        .upsert_scene_snapshot(
+            source_scene_path,
+            Some(&source_image_bytes),
+            scene_catalog_label(output_dir, source_scene_path),
+            "explicit",
+            &payload,
+            Some(output_dir.display().to_string()),
+            Some(scene_cache_metrics_from_response(response)),
+        )
+        .map_err(|err| format!("failed to promote scene to shared catalog: {err}"))?;
+    serde_json::to_value(metadata).map_err(|err| format!("serialize scene catalog metadata: {err}"))
+}
+
+fn scene_world_items_from_layout(
+    asset_bindings: &[SceneAssetBinding],
+    grounded_layout: &GroundedSceneLayout,
+) -> Vec<CachedWorldItem> {
+    let cache_keys = asset_bindings
+        .iter()
+        .filter_map(|binding| {
+            binding
+                .cache_key
+                .as_ref()
+                .map(|cache_key| (binding.asset_id.as_str(), cache_key.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    grounded_layout
+        .placements
+        .iter()
+        .filter_map(|placement| {
+            let cache_key = cache_keys.get(placement.asset_id.as_str())?;
+            Some(CachedWorldItem {
+                cache_key: (*cache_key).to_string(),
+                translation: placement.translation,
+                rotation: yaw_degrees_to_quat_y(placement.rotation_y_degrees),
+                scale: placement.scale,
+            })
+        })
+        .collect()
+}
+
+fn cached_camera_from_scene_camera(camera: &burn_synth_scene::SceneCamera) -> CachedCameraState {
+    let dx = camera.translation[0] - camera.focus[0];
+    let dy = camera.translation[1] - camera.focus[1];
+    let dz = camera.translation[2] - camera.focus[2];
+    let radius = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0e-5);
+    let yaw = camera.yaw.unwrap_or_else(|| dx.atan2(dz));
+    let pitch = camera
+        .pitch
+        .unwrap_or_else(|| (dy / radius).clamp(-1.0, 1.0).asin());
+    CachedCameraState {
+        translation: camera.translation,
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        focus: camera.focus,
+        yaw,
+        pitch,
+        radius: camera.radius.unwrap_or(radius),
+        vertical_fov_degrees: camera.vertical_fov_degrees,
+    }
+}
+
+fn yaw_degrees_to_quat_y(yaw_degrees: f32) -> [f32; 4] {
+    let half = yaw_degrees.to_radians() * 0.5;
+    [0.0, half.sin(), 0.0, half.cos()]
+}
+
+fn scene_catalog_label(output_dir: &Path, source_scene_path: &Path) -> String {
+    output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            source_scene_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(|stem| format!("{stem}_scene"))
+        })
+        .unwrap_or_else(|| "generated_scene".to_string())
+}
+
+fn scene_cache_metrics_from_response(response: &Value) -> CachedSceneMetrics {
+    let summary = response.get("e2e_summary").unwrap_or(&Value::Null);
+    CachedSceneMetrics {
+        ok: summary.get("ok").and_then(Value::as_bool),
+        elapsed_ms: summary.get("elapsed_ms").and_then(Value::as_u64),
+        object_count: response
+            .pointer("/manifest/objects")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        asset_count: summary
+            .get("asset_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        placement_count: summary
+            .get("placement_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        feedback_accepted: summary
+            .pointer("/feedback/accepted")
+            .and_then(Value::as_bool),
+        feedback_iteration: summary
+            .pointer("/feedback/accepted_iteration")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        failed_stage: response
+            .get("failed_stage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SceneAssetQualityFailure {
     pub(crate) object_id: String,
@@ -956,11 +1809,27 @@ pub(crate) fn write_scene_build_artifacts(
         ("asset_outputs", "asset_outputs.json"),
         ("asset_lift_attempts", "asset_lift_attempts.json"),
         ("mesh_quality_failures", "mesh_quality_failures.json"),
+        ("asset_bindings_initial", "asset_bindings_initial.json"),
         ("asset_bindings", "asset_bindings.json"),
+        (
+            "asset_bindings_calibrated",
+            "asset_bindings_calibrated.json",
+        ),
+        (
+            "canonical_pose_calibration",
+            "canonical_pose_calibration_report.json",
+        ),
+        ("canonical_pose_selection", "canonical_pose_selection.json"),
+        (
+            "canonical_pose_selection_task",
+            "canonical_pose_selection_task.json",
+        ),
         ("plan", "plan.json"),
         ("grounded_layout", "grounded_layout.json"),
         ("commands", "commands.json"),
         ("feedback", "feedback_report.json"),
+        ("grounding_contract", "grounding_contract.json"),
+        ("decision_log", "decision_log.json"),
         (
             "composition_candidate_reports",
             "composition_candidate_reports.json",
@@ -1105,7 +1974,21 @@ pub(crate) fn write_scene_ground_artifacts(
     })?;
     for (key, file_name) in [
         ("manifest", "manifest.json"),
+        ("asset_bindings_initial", "asset_bindings_initial.json"),
         ("asset_bindings", "asset_bindings.json"),
+        (
+            "asset_bindings_calibrated",
+            "asset_bindings_calibrated.json",
+        ),
+        (
+            "canonical_pose_calibration",
+            "canonical_pose_calibration_report.json",
+        ),
+        ("canonical_pose_selection", "canonical_pose_selection.json"),
+        (
+            "canonical_pose_selection_task",
+            "canonical_pose_selection_task.json",
+        ),
         ("grounding_evidence", "grounding_evidence.json"),
         ("grounded_layout", "grounded_layout.json"),
         ("commands", "commands.json"),

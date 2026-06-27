@@ -1027,3 +1027,20 @@ fn current_wgpu_stack_uses_shared_device_for_lighter_workloads() {
         "Bevy and Burn both use wgpu 29, so native WGPU inference should share the render device"
     );
 }
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+#[test]
+fn trellis_capable_sessions_use_isolated_wgpu_inference_device() {
+    let mut args = test_args();
+    args.backend = BackendKind::Wgpu;
+    args.available_synthesis_models = vec![
+        SynthesisModel::Triposg,
+        SynthesisModel::Trellis,
+        SynthesisModel::Triposplat,
+    ];
+
+    assert!(
+        !should_share_wgpu_inference_device_for_platform(&args, true),
+        "TRELLIS scene builds use an isolated Burn WGPU runtime to avoid sharing the Bevy render device with heavy model loading"
+    );
+}

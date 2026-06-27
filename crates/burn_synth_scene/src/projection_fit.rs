@@ -198,8 +198,8 @@ pub(crate) fn fit_grounded_scene_projection(
     if targets.iter().all(Option::is_none) {
         return None;
     }
-    let camera = ProjectionCamera::from_scene_camera(camera, aspect)
-        .or_else(|| ProjectionCamera::from_evidence(evidence, &targets))?;
+    let camera = ProjectionCamera::from_evidence(evidence, &targets)
+        .or_else(|| ProjectionCamera::from_scene_camera(camera, aspect))?;
 
     let initial_eval = evaluate_scene(placements, &targets, camera, floor_y);
     let mut best_loss = initial_eval.total_loss;
@@ -609,7 +609,7 @@ fn source_projection_floor(floor: &EstimatedFloorPlane) -> Option<EstimatedFloor
     let residual_ok = floor
         .residual_m
         .filter(|value| value.is_finite())
-        .is_none_or(|value| value <= 0.35);
+        .is_none_or(|value| value <= 0.18);
     (normal_len_sq.is_finite()
         && normal_len_sq > 0.25
         && floor.normal[1].abs() > 1.0e-5
@@ -1465,7 +1465,7 @@ mod tests {
             fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
         let object = &report.objects[0];
 
-        assert_eq!(report.camera.basis, "layout-camera");
+        assert_eq!(report.camera.basis, "source-depth-intrinsics");
         assert_eq!(object.ground_anchor_basis, "camera-ray-ground-plane");
         assert_eq!(object.target_ground_point, initial_anchor);
         assert!(
@@ -1537,7 +1537,7 @@ mod tests {
         let report =
             fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
 
-        assert_eq!(report.camera.basis, "layout-camera");
+        assert_eq!(report.camera.basis, "source-depth-intrinsics");
         assert_eq!(
             report.objects[0].ground_anchor_basis,
             "metric-depth-contact"

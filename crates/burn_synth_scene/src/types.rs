@@ -63,6 +63,72 @@ pub struct SceneGroundingEvidence {
     pub objects: Vec<ObjectGroundingEvidence>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingVerificationStatus {
+    Verified,
+    Fallback,
+    Invalid,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GptDelegationRole {
+    None,
+    Hypothesis,
+    ImageSynthesis,
+    BoundedCandidateSelection,
+    DeveloperDiagnosis,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GroundingContractEntry {
+    pub name: String,
+    pub producer: String,
+    pub pipeline_stage: String,
+    pub status: GroundingVerificationStatus,
+    pub gpt_role: GptDelegationRole,
+    #[serde(default)]
+    pub consumers: Vec<String>,
+    #[serde(default)]
+    pub metrics: Value,
+    #[serde(default)]
+    pub provenance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GroundingContractReport {
+    pub schema_version: u32,
+    pub source_scene_path: String,
+    pub composition_mode: String,
+    pub entries: Vec<GroundingContractEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneDecisionLogEntry {
+    pub decision: String,
+    pub pipeline_stage: String,
+    pub source_of_truth: String,
+    pub status: GroundingVerificationStatus,
+    pub gpt_role: GptDelegationRole,
+    #[serde(default)]
+    pub metrics: Value,
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneDecisionLog {
+    pub schema_version: u32,
+    pub source_scene_path: String,
+    pub entries: Vec<SceneDecisionLogEntry>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SegmentationEvidenceRef {
     pub provider: String,
@@ -405,6 +471,9 @@ pub enum SceneAssetFrameSource {
     AabbHeuristic,
     DescriptorHeuristic,
     PoseFitHeuristic,
+    VisualRenderSweep,
+    GptVisualSelection,
+    AmbiguousFallback,
     Unknown,
 }
 
@@ -422,6 +491,44 @@ pub struct CanonicalPoseEvidence {
     pub method: String,
     pub confidence: f32,
     pub symmetry: SceneAssetSymmetry,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CanonicalPoseCandidate {
+    pub candidate_index: usize,
+    pub yaw_offset_degrees: f32,
+    pub candidate_yaw_degrees: f32,
+    pub score: f32,
+    pub source_crop_path: Option<String>,
+    pub rendered_image_path: Option<String>,
+    #[serde(default)]
+    pub metrics: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CanonicalPoseSelection {
+    pub candidate_index: usize,
+    pub yaw_offset_degrees: f32,
+    pub confidence: f32,
+    pub source: SceneAssetFrameSource,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CanonicalPoseCalibrationReport {
+    pub schema_version: u32,
+    pub mode: String,
+    pub asset_id: String,
+    pub object_id: String,
+    pub label: String,
+    pub source_crop_path: Option<String>,
+    pub generated_image_path: Option<String>,
+    pub selected: CanonicalPoseSelection,
+    #[serde(default)]
+    pub candidates: Vec<CanonicalPoseCandidate>,
+    pub fallback_used: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]

@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod assets;
+mod canonical_pose;
 mod cli;
 mod feedback;
 mod prelude;
@@ -43,6 +44,8 @@ where
 
 #[cfg(test)]
 pub(crate) use assets::*;
+#[cfg(test)]
+pub(crate) use canonical_pose::*;
 #[cfg(test)]
 pub(crate) use feedback::*;
 #[cfg(test)]

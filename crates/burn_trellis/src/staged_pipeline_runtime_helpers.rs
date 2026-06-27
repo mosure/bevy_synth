@@ -4,14 +4,7 @@ fn runtime_parity_strict() -> bool {
 
 #[cfg(feature = "runtime-model")]
 fn runtime_lazy_model_load_enabled() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        true
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        false
-    }
+    true
 }
 
 #[cfg(feature = "runtime-model")]
