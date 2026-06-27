@@ -41,10 +41,12 @@ pub fn object_image_prompt(reference_path: &Path, object: &SceneObjectSpec) -> S
         });
     let background = reconstruction_background_guidance(object);
     let geometry = object_geometry_guardrails(object);
+    let crop_edges = source_crop_edge_guidance(object);
     format!(
-        "{}\n{}\nReference style image: `{}`.\nObject id: {}.\nObject label: {}.\nSource crop bbox: [{:.4},{:.4},{:.4},{:.4}].\nCamera/orientation: {} {}\nSource-preserving edit requirement: use the source crop as the geometry anchor. Isolate and clean up the same observed object instead of inventing a new product render, new plan shape, or canonical showroom pose. Keep the object's visible perspective, footprint, proportions, curvature, and contact points consistent with the crop. Generate a clean isolated object image for 3D reconstruction. Preserve the source object geometry, material, color, scale proportions, and camera angle. If the observed object is cut off by the source image border, preserve that partial visible source shape instead of completing hidden ends into a new closed product. Do not include the room, rug, table clutter, extra chairs, people, walls, text, shadows cast by the original scene, or background furniture. Do not replace the object with a proxy, cube, simplified block, alternate furniture type, or stylized approximation. Full object visible when possible, but do not hallucinate unobserved shape or wraparound structure to make it look complete. {}\n{}",
+        "{}\n{}\n{}\nReference style image: `{}`.\nObject id: {}.\nObject label: {}.\nSource crop bbox: [{:.4},{:.4},{:.4},{:.4}].\nInput image priority: image 1 is the source object crop and is the hard geometry/camera/crop anchor; image 2 is whole-scene context only; image 3 is style reference only. Do not let image 2 or image 3 override the object shape from image 1.\nCamera/orientation: {} {}\nSource-preserving edit requirement: use the source crop as the geometry anchor. Isolate and clean up the same observed object instead of inventing a new product render, new plan shape, or canonical showroom pose. Keep the object's visible perspective, footprint, proportions, curvature, and contact points consistent with the crop. Generate a clean isolated object image for 3D reconstruction. Preserve the source object geometry, material, color, scale proportions, and camera angle. If the observed object is cut off by the source image border, preserve that partial visible source shape instead of completing hidden ends into a new closed product. Do not include the room, rug, table clutter, extra chairs, people, walls, text, shadows cast by the original scene, or background furniture. Do not replace the object with a proxy, cube, simplified block, alternate furniture type, or stylized approximation. Full object visible when possible, but do not hallucinate unobserved shape or wraparound structure to make it look complete. {}\n{}",
         object.object_prompt,
         geometry,
+        crop_edges,
         reference_path.display(),
         object.id,
         object.label,
@@ -57,6 +59,42 @@ pub fn object_image_prompt(reference_path: &Path, object: &SceneObjectSpec) -> S
         background,
         "Keep edges crisp and leave clear separation between every thin leg/arm/frame member and the background; avoid contact shadows that merge into the object silhouette."
     )
+}
+
+fn source_crop_edge_guidance(object: &SceneObjectSpec) -> String {
+    let bbox = normalize_bbox(object.bbox);
+    let mut edges = Vec::new();
+    if bbox[0] <= 0.035 {
+        edges.push("left");
+    }
+    if bbox[1] <= 0.035 {
+        edges.push("top");
+    }
+    if bbox[2] >= 0.965 {
+        edges.push("right");
+    }
+    if bbox[3] >= 0.965 {
+        edges.push("bottom");
+    }
+    if edges.is_empty() {
+        return "Source crop edge constraint: no source image border crop was detected, so keep a complete visible silhouette without adding scene context.".to_string();
+    }
+
+    let descriptor = object_descriptor(object);
+    let edges = edges.join(", ");
+    if descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("banquette")
+    {
+        format!(
+            "Source crop edge constraint: the observed sofa bbox touches the source image {edges} edge(s). The generated foreground silhouette must continue to the same {edges} edge(s) of the image with no blue/background margin on those cropped sides. Treat those sides as intentional open cut lines from the source photo. Do not center the sofa with padding on cropped sides, do not complete hidden left/right/bottom ends, and do not turn the crop into a finished showroom product sofa."
+        )
+    } else {
+        format!(
+            "Source crop edge constraint: the source bbox touches the image {edges} edge(s). Preserve the same cropped extent on those generated image edge(s), with no background padding that changes the visible source silhouette."
+        )
+    }
 }
 
 pub fn object_image_prompt_template() -> String {
@@ -131,6 +169,7 @@ pub(crate) struct ObjectImageSuitability {
 pub(crate) struct ObjectImageMatteStats {
     pub(crate) alpha_coverage: f32,
     pub(crate) alpha_bbox: Option<[u32; 4]>,
+    pub(crate) image_size: [u32; 2],
 }
 
 pub(crate) fn decode_generated_object_rgb(bytes: &[u8]) -> SceneResult<image::RgbImage> {
@@ -267,6 +306,7 @@ pub(crate) fn matte_generated_object_rgb(
         ObjectImageMatteStats {
             alpha_coverage: foreground as f32 / total,
             alpha_bbox,
+            image_size: [width, height],
         },
     )
 }
@@ -347,6 +387,82 @@ pub(crate) fn generated_shape_consistency_score(
     let ratio =
         (source_aspect.min(generated_aspect) / source_aspect.max(generated_aspect)).clamp(0.0, 1.0);
     if ratio < min_ratio { 0.0 } else { ratio }
+}
+
+pub(crate) fn generated_source_crop_edge_mismatch(
+    object: &SceneObjectSpec,
+    matte: &ObjectImageMatteStats,
+) -> bool {
+    let Some(alpha_bbox) = matte.alpha_bbox else {
+        return true;
+    };
+    generated_open_sofa_lost_source_crop_edge(
+        &object_descriptor(object),
+        normalize_bbox(object.bbox),
+        matte,
+        alpha_bbox,
+    )
+}
+
+pub(crate) fn object_reconstruction_min_score(
+    object: &SceneObjectSpec,
+    base_min_score: f32,
+) -> f32 {
+    let base_min_score = base_min_score.clamp(0.0, 1.0);
+    if object.instance_count > 1 || !object.instances.is_empty() {
+        return base_min_score;
+    }
+    let descriptor = object_descriptor(object);
+    if descriptor.contains("table") || descriptor.contains("desk") || descriptor.contains("counter")
+    {
+        base_min_score.max(0.60)
+    } else if descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("banquette")
+    {
+        base_min_score.max(0.48)
+    } else {
+        base_min_score
+    }
+}
+
+fn generated_open_sofa_lost_source_crop_edge(
+    descriptor: &str,
+    source_bbox: [f32; 4],
+    matte: &ObjectImageMatteStats,
+    alpha_bbox: [u32; 4],
+) -> bool {
+    let sofa_like = descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("banquette");
+    let open_like = descriptor.contains("open")
+        || descriptor.contains("crescent")
+        || descriptor.contains("curved")
+        || descriptor.contains("semicircular")
+        || descriptor.contains("semicircle")
+        || descriptor.contains("sectional");
+    if !(sofa_like && open_like) {
+        return false;
+    }
+
+    let [width, height] = matte.image_size;
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let generated = [
+        alpha_bbox[0] as f32 / width,
+        alpha_bbox[1] as f32 / height,
+        alpha_bbox[2] as f32 / width,
+        alpha_bbox[3] as f32 / height,
+    ];
+    let source_edge = 0.035;
+    let generated_edge = 0.042;
+    let generated_far_edge = 0.958;
+    (source_bbox[0] <= source_edge && generated[0] > generated_edge)
+        || (source_bbox[1] <= source_edge && generated[1] > generated_edge)
+        || (source_bbox[2] >= 1.0 - source_edge && generated[2] < generated_far_edge)
+        || (source_bbox[3] >= 1.0 - source_edge && generated[3] < generated_far_edge)
 }
 
 pub(crate) fn image_dimensions_aspect(path: &Path) -> SceneResult<f32> {

@@ -2927,6 +2927,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn_segmentation"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cuda",
+ "burn-wgpu",
+ "burn_synth_import",
+ "clap",
+ "half",
+ "image",
+ "memmap2",
+ "safetensors 0.6.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "burn_synth"
 version = "0.2.0"
 dependencies = [
@@ -2969,6 +2987,7 @@ dependencies = [
  "burn",
  "burn_depth",
  "burn_locate_anything",
+ "burn_segmentation",
  "burn_synth_scene",
  "image",
  "serde",
@@ -2996,6 +3015,7 @@ dependencies = [
  "burn_synth_grounding",
  "burn_synth_scene",
  "clap",
+ "cubecl",
  "gltf",
  "image",
  "meshopt",

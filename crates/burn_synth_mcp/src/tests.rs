@@ -1,6 +1,7 @@
 use super::*;
 use crate::cli::read_json_path;
 use crate::prelude::*;
+use crate::server::scene_object_image_generation_policy;
 use burn_synth_grounding::LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT;
 
 fn empty_physical_layout() -> FeedbackPhysicalLayout {
@@ -13,8 +14,6 @@ fn empty_physical_layout() -> FeedbackPhysicalLayout {
         object_failure_count: 0,
         max_overlap_fraction_smaller: 0.0,
         min_signed_clearance_m: 0.0,
-        table_center_xz: None,
-        footprint_centers: HashMap::new(),
     }
 }
 
@@ -83,6 +82,12 @@ fn server_args_accept_scene_ground_command() {
         "locate-anything",
         "--locate-anything-backend",
         "burn-native",
+        "--segmentation-provider",
+        "bbox-prompt",
+        "--segmentation-precision",
+        "bf16",
+        "--segmentation-quantization",
+        "q8",
         "--pose-fit",
         "rendered-silhouette",
         "--canonical-pose",
@@ -103,6 +108,18 @@ fn server_args_accept_scene_ground_command() {
     assert_eq!(
         command.locate_anything_backend,
         Some(LocateAnythingBackend::BurnNative)
+    );
+    assert_eq!(
+        command.segmentation_provider,
+        Some(SceneSegmentationProvider::BboxPrompt)
+    );
+    assert_eq!(
+        command.segmentation_precision,
+        Some(SceneSegmentationPrecision::Bf16)
+    );
+    assert_eq!(
+        command.segmentation_quantization,
+        Some(SceneSegmentationQuantization::Q8)
     );
     assert_eq!(command.pose_fit, ScenePoseFitMode::RenderedSilhouette);
     assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::Auto);
@@ -126,7 +143,7 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
         panic!("expected scene-build subcommand");
     };
     assert_eq!(command.composition_mode, SceneCompositionMode::CvGrounded);
-    assert_eq!(command.pose_fit, ScenePoseFitMode::RenderedSilhouette);
+    assert_eq!(command.pose_fit, ScenePoseFitMode::ProjectedAabb);
     assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::Auto);
     assert_eq!(command.max_pose_candidates, 32);
     assert_eq!(command.depth_provider, SceneDepthProvider::DepthPro);
@@ -136,6 +153,47 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
         command.feedback_rotation_selector,
         FeedbackRotationSelector::Deterministic
     );
+}
+
+#[test]
+fn scene_ground_rejects_unimplemented_rendered_silhouette_pose_fit() {
+    let args = ServerArgs::parse_from(["burn_synth_mcp"]);
+    let config = ServerConfig::from_args(args);
+    let mut server = McpServer::new(config);
+    let err = server
+        .call_scene_ground(SceneGroundToolArgs {
+            source_scene_path: PathBuf::from("/tmp/source.jpg"),
+            manifest: SceneObjectManifest {
+                source_scene_path: "/tmp/source.jpg".to_string(),
+                scene_calibration: None,
+                objects: Vec::new(),
+            },
+            asset_bindings: Vec::new(),
+            grounding_evidence: None,
+            output_dir: None,
+            composition_mode: SceneCompositionMode::CvGrounded,
+            pose_fit: ScenePoseFitMode::RenderedSilhouette,
+            canonical_pose: SceneCanonicalPoseMode::Auto,
+            max_pose_candidates: 32,
+            save_pose_debug: true,
+            depth_provider: SceneDepthProvider::None,
+            locator: SceneLocatorProvider::Manifest,
+            locate_anything_backend: None,
+            segmentation_provider: None,
+            segmentation_precision: None,
+            segmentation_quantization: None,
+            clear_existing: true,
+            apply: false,
+            feedback: false,
+            feedback_iters: 0,
+            feedback_keep_viewer: false,
+            feedback_capture_dir: None,
+            feedback_threshold_profile: FeedbackThresholdProfile::Standard,
+            feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        })
+        .unwrap_err();
+
+    assert!(err.contains("pose_fit=rendered-silhouette is not implemented yet"));
 }
 
 #[test]
@@ -157,6 +215,96 @@ fn server_args_accept_global_locate_anything_backend() {
         config.locate_anything_backend,
         LocateAnythingBackend::BurnNative
     );
+}
+
+#[test]
+fn server_args_accept_global_scene_segmentation_provider() {
+    let args = ServerArgs::parse_from([
+        "burn_synth_mcp",
+        "--scene-segmentation-provider",
+        "bbox-prompt",
+        "--scene-segmentation-precision",
+        "bf16",
+        "--scene-segmentation-quantization",
+        "q4",
+        "--scene-segmentation-model-root",
+        "/tmp/sam",
+        "--scene-segmentation-cache-dir",
+        "/tmp/sam-cache",
+        "--scene-segmentation-cdn-base-url",
+        "https://cdn.example.invalid/models",
+        "--scene-segmentation-allow-download",
+        "true",
+    ]);
+    let config = ServerConfig::from_args(args);
+    assert_eq!(
+        config.scene_segmentation_provider,
+        SceneSegmentationProvider::BboxPrompt
+    );
+    assert_eq!(
+        config.scene_segmentation_precision,
+        SceneSegmentationPrecision::Bf16
+    );
+    assert_eq!(
+        config.scene_segmentation_quantization,
+        SceneSegmentationQuantization::Q4
+    );
+    assert_eq!(
+        config.scene_segmentation_model_root.as_deref(),
+        Some(Path::new("/tmp/sam"))
+    );
+    assert_eq!(
+        config.scene_segmentation_cache_dir.as_deref(),
+        Some(Path::new("/tmp/sam-cache"))
+    );
+    assert_eq!(
+        config.scene_segmentation_cdn_base_url.as_deref(),
+        Some("https://cdn.example.invalid/models")
+    );
+    assert!(config.scene_segmentation_allow_download);
+}
+
+#[test]
+fn server_args_accept_cubecl_autotune_controls() {
+    let args = ServerArgs::parse_from([
+        "burn_synth_mcp",
+        "--cubecl-autotune-level",
+        "minimal",
+        "--cubecl-autotune-cache",
+        "global",
+    ]);
+    let config = ServerConfig::from_args(args);
+    assert_eq!(
+        config.cubecl_autotune_level,
+        CubeClAutotuneLevelSetting::Minimal
+    );
+    assert_eq!(
+        config.cubecl_autotune_cache,
+        CubeClAutotuneCacheSetting::Global
+    );
+}
+
+#[test]
+fn repo_burn_toml_sets_cubecl_autotune_cache_global() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let config =
+        <cubecl::config::CubeClRuntimeConfig as cubecl::config::RuntimeConfig>::from_section_file_path(
+            repo_root.join("Burn.toml"),
+            "cubecl",
+        )
+        .expect("parse workspace Burn.toml cubecl section");
+    assert!(matches!(
+        config.autotune.level,
+        cubecl::config::autotune::AutotuneLevel::Balanced
+    ));
+    assert!(matches!(
+        config.autotune.cache,
+        cubecl::config::cache::CacheConfig::Global
+    ));
 }
 
 #[test]
@@ -279,13 +427,16 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         grounding_evidence: None,
         output_dir: Some(output_dir),
         composition_mode: SceneCompositionMode::CvGrounded,
-        pose_fit: ScenePoseFitMode::RenderedSilhouette,
+        pose_fit: ScenePoseFitMode::ProjectedAabb,
         canonical_pose: SceneCanonicalPoseMode::Auto,
         max_pose_candidates: 32,
         save_pose_debug: true,
         depth_provider: SceneDepthProvider::None,
         locator: SceneLocatorProvider::LocateAnything,
         locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
+        segmentation_provider: None,
+        segmentation_precision: None,
+        segmentation_quantization: None,
         clear_existing: true,
         apply: false,
         feedback: false,
@@ -311,6 +462,123 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
 }
 
 #[test]
+fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
+    if std::env::var("DEPTH_PRO_MCP_CACHE_SMOKE").is_err() {
+        eprintln!("skipping: set DEPTH_PRO_MCP_CACHE_SMOKE=1 to run WGPU DepthPro MCP cache smoke");
+        return;
+    }
+    let Some(repo_root) = find_repo_root_for_test() else {
+        eprintln!("skipping DepthPro MCP cache smoke; repo root not found");
+        return;
+    };
+    let Some(image_path) = std::env::var_os("DEPTH_PRO_PARITY_IMAGE")
+        .or_else(|| std::env::var_os("LOCATE_ANYTHING_PARITY_IMAGE"))
+        .map(PathBuf::from)
+    else {
+        eprintln!("skipping DepthPro MCP cache smoke; set DEPTH_PRO_PARITY_IMAGE to a scene image");
+        return;
+    };
+    if !image_path.exists() {
+        eprintln!(
+            "skipping DepthPro MCP cache smoke; missing {}",
+            image_path.display()
+        );
+        return;
+    }
+
+    let mut server = McpServer::new(ServerConfig::from_args(ServerArgs::parse_from([
+        "burn_synth_mcp",
+    ])));
+    let manifest = SceneObjectManifest {
+        source_scene_path: image_path.display().to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "conference_table".to_string(),
+            label: "conference table".to_string(),
+            aliases: vec!["table".to_string()],
+            bbox: [0.386, 0.519, 0.659, 0.96],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("conference_table".to_string()),
+            instance_count: 1,
+            object_prompt: "conference table".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([3.2, 1.2]),
+        }],
+    };
+    let assets = vec![SceneAssetBinding {
+        asset_id: "conference_table_asset".to_string(),
+        object_id: "conference_table".to_string(),
+        label: "conference table".to_string(),
+        aliases: Vec::new(),
+        path: None,
+        cache_key: Some("test/conference_table".to_string()),
+        reusable: true,
+        source_image_path: None,
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-1.6, 0.0, -0.6],
+            max: [1.6, 0.2, 0.6],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, Some([3.2, 1.2]))),
+        provenance: None,
+    }];
+    let root = repo_root.join("tmp/runs").join(format!(
+        "{}_depthpro_mcp_cache_smoke",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis()
+    ));
+    let make_args = |output_dir: PathBuf| SceneGroundToolArgs {
+        source_scene_path: image_path.clone(),
+        manifest: manifest.clone(),
+        asset_bindings: assets.clone(),
+        grounding_evidence: None,
+        output_dir: Some(output_dir),
+        composition_mode: SceneCompositionMode::CvGrounded,
+        pose_fit: ScenePoseFitMode::ProjectedAabb,
+        canonical_pose: SceneCanonicalPoseMode::Auto,
+        max_pose_candidates: 32,
+        save_pose_debug: true,
+        depth_provider: SceneDepthProvider::DepthPro,
+        locator: SceneLocatorProvider::Manifest,
+        locate_anything_backend: None,
+        segmentation_provider: None,
+        segmentation_precision: None,
+        segmentation_quantization: None,
+        clear_existing: true,
+        apply: false,
+        feedback: false,
+        feedback_iters: 0,
+        feedback_keep_viewer: false,
+        feedback_capture_dir: None,
+        feedback_threshold_profile: FeedbackThresholdProfile::Standard,
+        feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+    };
+    let first_dir = root.join("first");
+    let second_dir = root.join("second");
+
+    server
+        .call_scene_ground(make_args(first_dir.clone()))
+        .expect("first DepthPro scene-ground");
+    server
+        .call_scene_ground(make_args(second_dir.clone()))
+        .expect("second DepthPro scene-ground");
+    let first_metadata: Value =
+        read_json_path(&first_dir.join("depth_pro/depth_evidence.json")).unwrap();
+    let second_metadata: Value =
+        read_json_path(&second_dir.join("depth_pro/depth_evidence.json")).unwrap();
+    assert_eq!(first_metadata["runtime_cache_hit"], json!(false));
+    assert_eq!(second_metadata["runtime_cache_hit"], json!(true));
+    assert!(
+        second_metadata["load_ms"].as_f64().unwrap_or(f64::MAX)
+            < first_metadata["load_ms"].as_f64().unwrap_or(0.0)
+    );
+}
+
+#[test]
 fn tool_schema_exposes_scene_ground() {
     let tools = tool_defs();
     let names = tools
@@ -325,6 +593,18 @@ fn tool_schema_exposes_scene_ground() {
     assert_eq!(
         scene_ground["inputSchema"]["properties"]["locate_anything_backend"]["enum"],
         json!(["burn-native"])
+    );
+    assert_eq!(
+        scene_ground["inputSchema"]["properties"]["segmentation_provider"]["enum"],
+        json!(["none", "bbox-prompt", "sam2", "sam3"])
+    );
+    assert_eq!(
+        scene_ground["inputSchema"]["properties"]["segmentation_precision"]["enum"],
+        json!(["f32", "f16", "bf16"])
+    );
+    assert_eq!(
+        scene_ground["inputSchema"]["properties"]["segmentation_quantization"]["enum"],
+        json!(["none", "q8", "q4"])
     );
 }
 
@@ -660,6 +940,56 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
     assert!(dir.join("camera_grounding_report.json").exists());
     assert!(dir.join("scene_build_response_structured.json").exists());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scene_token_usage_summary_groups_openai_usage_by_stage() {
+    let provider_metadata = json!({
+        "provider": "openai",
+        "requests": [
+            {
+                "operation": "plan_objects",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "total_tokens": 125,
+                    "input_tokens_details": {
+                        "image_tokens": 60,
+                        "text_tokens": 40
+                    }
+                }
+            },
+            {
+                "operation": "generate_object_images",
+                "usage": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 10,
+                    "total_tokens": 40
+                }
+            },
+            {
+                "operation": "generate_object_images",
+                "usage": null
+            }
+        ]
+    });
+
+    let summary = scene_token_usage_summary(&provider_metadata);
+
+    assert_eq!(summary["total"]["requests"], json!(3));
+    assert_eq!(summary["total"]["reported_requests"], json!(2));
+    assert_eq!(summary["total"]["unreported_requests"], json!(1));
+    assert_eq!(summary["total"]["input_tokens"], json!(130));
+    assert_eq!(summary["total"]["output_tokens"], json!(35));
+    assert_eq!(summary["total"]["total_tokens"], json!(165));
+    assert_eq!(summary["total"]["image_tokens"], json!(60));
+    let stages = summary["by_stage"].as_array().expect("stage array");
+    assert_eq!(stages.len(), 2);
+    assert_eq!(stages[0]["stage"], json!("generate_object_images"));
+    assert_eq!(stages[0]["requests"], json!(2));
+    assert_eq!(stages[0]["reported_requests"], json!(1));
+    assert_eq!(stages[1]["stage"], json!("plan_objects"));
+    assert_eq!(stages[1]["total_tokens"], json!(125));
 }
 
 #[test]
@@ -1108,6 +1438,50 @@ fn scene_commands_with_cache_reload_preserves_clear_first() {
 }
 
 #[test]
+fn scene_commands_with_asset_local_aabbs_enriches_saved_replay_commands() {
+    let commands = vec![
+        json!({ "type": "clear_scene" }),
+        json!({
+            "type": "spawn_path",
+            "cache_key": "table_asset",
+            "path": "/tmp/table.glb",
+        }),
+    ];
+    let assets = vec![SceneAssetBinding {
+        asset_id: "table_asset".to_string(),
+        object_id: "table".to_string(),
+        label: "table".to_string(),
+        aliases: Vec::new(),
+        path: Some("/tmp/table.glb".to_string()),
+        cache_key: None,
+        reusable: false,
+        source_image_path: None,
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-1.0, -0.1, -0.5],
+            max: [1.0, 0.1, 0.5],
+        }),
+        canonical_frame: None,
+        provenance: None,
+    }];
+
+    let enriched = scene_commands_with_asset_local_aabbs(commands, &assets);
+
+    let min = enriched[1]["local_aabb"]["min"]
+        .as_array()
+        .expect("min array");
+    let max = enriched[1]["local_aabb"]["max"]
+        .as_array()
+        .expect("max array");
+    assert!((min[0].as_f64().unwrap() + 1.0).abs() < 1.0e-6);
+    assert!((min[1].as_f64().unwrap() + 0.1).abs() < 1.0e-6);
+    assert!((min[2].as_f64().unwrap() + 0.5).abs() < 1.0e-6);
+    assert!((max[0].as_f64().unwrap() - 1.0).abs() < 1.0e-6);
+    assert!((max[1].as_f64().unwrap() - 0.1).abs() < 1.0e-6);
+    assert!((max[2].as_f64().unwrap() - 0.5).abs() < 1.0e-6);
+}
+
+#[test]
 fn scene_interaction_lock_command_uses_viewer_control_protocol() {
     let command = scene_interaction_lock_command(true, "iterative scene composition");
 
@@ -1194,6 +1568,67 @@ fn feedback_deltas_clamp_spawn_translation_to_ground_anchor() {
 }
 
 #[test]
+fn feedback_layout_deltas_prefer_target_ground_point_as_anchor() {
+    let metrics = json!({
+        "objects": [{
+            "index": 0,
+            "object_id": "chair",
+            "label": "chair",
+            "cache_key": "chair-cache",
+            "translation_delta": [0.75, 0.0, -0.25],
+            "scale_multiplier": 1.0,
+            "yaw_delta_degrees": 0.0,
+            "ground_anchor_point": [0.0, 0.0, 0.0],
+            "target_ground_point": [2.0, 0.0, -1.0],
+            "ground_anchor_max_drift_m": 0.6
+        }]
+    });
+
+    let deltas = feedback_layout_deltas(&metrics);
+
+    assert_eq!(
+        deltas["objects"][0]["ground_anchor_point"],
+        json!([2.0, 0.0, -1.0])
+    );
+}
+
+#[test]
+fn projected_collision_correction_clears_anchor_clamp() {
+    let mut deltas = vec![FeedbackDeltaDraft {
+        index: json!(0),
+        translation_delta: [0.0, 0.0, 0.0],
+        scale_multiplier: 1.0,
+        scale_multiplier_xyz: None,
+        scale_group_key: None,
+        scale_source: "object_projection",
+        yaw_delta_degrees: json!(0.0),
+        ground_anchor_point: Some([0.0, 0.0, 0.0]),
+        ground_anchor_max_drift_m: Some(0.25),
+    }];
+    let mut footprints = vec![Some(FeedbackFootprint {
+        index: 0,
+        kind: FeedbackPhysicalKind::Seating,
+        rect: FootprintRect {
+            min_x: -0.2,
+            min_z: -0.2,
+            max_x: 0.2,
+            max_z: 0.2,
+        },
+    })];
+
+    assert!(apply_projected_delta(
+        &mut deltas,
+        &mut footprints,
+        0,
+        [0.4, 0.0, 0.0],
+        1.0
+    ));
+
+    assert_eq!(deltas[0].ground_anchor_point, None);
+    assert_eq!(deltas[0].ground_anchor_max_drift_m, None);
+}
+
+#[test]
 fn feedback_deltas_apply_axis_scale_for_table_projection() {
     let commands = vec![json!({
         "type": "spawn_cached",
@@ -1256,7 +1691,7 @@ fn feedback_deltas_normalize_existing_reused_command_scales() {
             "type": "spawn_cached",
             "cache_key": "chair-cache",
             "translation": [1.0, 0.0, 0.0],
-            "scale": [2.0, 2.0, 2.0],
+            "scale": [2.0, 1.5, 1.0],
         }),
         json!({
             "type": "spawn_cached",
@@ -1275,8 +1710,8 @@ fn feedback_deltas_normalize_existing_reused_command_scales() {
 
     let adjusted = apply_feedback_deltas_to_commands(&commands, &deltas).unwrap();
 
-    assert_eq!(adjusted[0]["scale"], json!([1.5, 1.5, 1.5]));
-    assert_eq!(adjusted[1]["scale"], json!([1.5, 1.5, 1.5]));
+    assert_eq!(adjusted[0]["scale"], json!([1.5, 1.25, 1.0]));
+    assert_eq!(adjusted[1]["scale"], json!([1.5, 1.25, 1.0]));
     assert_eq!(adjusted[2]["scale"], json!([0.75, 0.75, 0.75]));
 }
 
@@ -1489,9 +1924,94 @@ fn feedback_metrics_fail_chair_contained_inside_table_footprint() {
 }
 
 #[test]
+fn feedback_metrics_allow_open_sectional_table_rect_overlap_as_warning() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let table = test_feedback_placement(
+        "white_coffee_table",
+        "white coffee table",
+        [0.0, 0.0, 0.0],
+        [0.30, 0.40, 0.70, 0.70],
+    );
+    let sofa = test_feedback_placement(
+        "tan_open_sectional_sofa",
+        "tan open crescent sectional sofa",
+        [0.0, 0.0, 0.0],
+        [0.13, 0.12, 0.87, 1.0],
+    );
+    let layout = GroundedSceneLayout {
+        bsn: "scene {}".to_string(),
+        placements: vec![table, sofa],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, 5.0],
+            focus: [0.0, 0.0, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(5.0),
+            vertical_fov_degrees: Some(72.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [
+            {
+                "cache_key": "table",
+                "screen_bbox": [0.30, 0.40, 0.70, 0.70],
+                "screen_contact": [0.50, 0.55],
+                "world_aabb": {
+                    "min": [-1.5, 0.0, -0.6],
+                    "max": [1.5, 0.4, 0.6]
+                }
+            },
+            {
+                "cache_key": "sofa",
+                "screen_bbox": [0.13, 0.12, 0.87, 1.0],
+                "screen_contact": [0.50, 1.0],
+                "world_aabb": {
+                    "min": [-1.8, 0.0, -1.2],
+                    "max": [1.8, 1.0, 1.2]
+                }
+            }
+        ],
+        "camera": { "radius": 5.0 }
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/open-sectional.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["projection_passed"], json!(true));
+    assert_eq!(metrics["physical_passed"], json!(true));
+    assert_eq!(metrics["physical_layout"]["hard_failure_count"], json!(0));
+    assert_eq!(
+        metrics["physical_layout"]["pairs"][0]["hard_failure"],
+        json!(false)
+    );
+    let deltas = feedback_layout_deltas(&metrics);
+    let sofa_delta = json_array3(&deltas["objects"][1]["translation_delta"]).unwrap();
+    assert!(sofa_delta[0].abs() + sofa_delta[2].abs() < 0.05);
+}
+
+#[test]
 fn feedback_selection_score_penalizes_hard_overlap_failures() {
     let clean = json!({
         "score": 0.60,
+        "object_count": 2,
+        "object_pass_count": 2,
+        "rotation_pass_count": 2,
+        "projection_passed": true,
+        "rotation_passed": true,
         "physical_layout": {
             "hard_failure_count": 0,
             "max_overlap_fraction_smaller": 0.0
@@ -1499,6 +2019,11 @@ fn feedback_selection_score_penalizes_hard_overlap_failures() {
     });
     let overlapped = json!({
         "score": 0.95,
+        "object_count": 2,
+        "object_pass_count": 2,
+        "rotation_pass_count": 2,
+        "projection_passed": true,
+        "rotation_passed": true,
         "physical_layout": {
             "hard_failure_count": 1,
             "max_overlap_fraction_smaller": 1.0
@@ -1506,6 +2031,36 @@ fn feedback_selection_score_penalizes_hard_overlap_failures() {
     });
 
     assert!(feedback_selection_score(&clean) > feedback_selection_score(&overlapped));
+}
+
+#[test]
+fn feedback_selection_score_prefers_rotation_fixed_candidate_over_slight_bbox_gain() {
+    let yaw_failed = json!({
+        "score": 0.7625,
+        "object_count": 7,
+        "object_pass_count": 7,
+        "rotation_pass_count": 3,
+        "projection_passed": true,
+        "rotation_passed": false,
+        "physical_layout": {
+            "hard_failure_count": 0,
+            "max_overlap_fraction_smaller": 0.0
+        }
+    });
+    let yaw_fixed = json!({
+        "score": 0.7197,
+        "object_count": 7,
+        "object_pass_count": 5,
+        "rotation_pass_count": 7,
+        "projection_passed": false,
+        "rotation_passed": true,
+        "physical_layout": {
+            "hard_failure_count": 0,
+            "max_overlap_fraction_smaller": 0.0
+        }
+    });
+
+    assert!(feedback_selection_score(&yaw_fixed) > feedback_selection_score(&yaw_failed));
 }
 
 #[test]
@@ -1551,21 +2106,20 @@ fn feedback_predictive_delta_prevents_move_into_table() {
 }
 
 #[test]
-fn feedback_yaw_uses_table_facing_target_when_available() {
-    let mut physical = empty_physical_layout();
-    physical.table_center_xz = Some([0.0, 0.0]);
-    physical.footprint_centers.insert(0, [1.0, 0.0]);
-    let placement = test_feedback_placement(
+fn feedback_yaw_prefers_canonical_source_pose_over_table_facing() {
+    let physical = empty_physical_layout();
+    let mut placement = test_feedback_placement(
         "conference_chair",
         "conference chair",
         [1.0, 0.0, 0.0],
         [0.6, 0.5, 0.8, 0.9],
     );
+    placement.rotation_y_degrees = 35.0;
 
     let correction = feedback_yaw_correction(0, &placement, 0.0, &physical);
 
-    assert_eq!(correction.basis, "table-facing-yaw");
-    assert!(correction.delta_degrees < -3.0);
+    assert_eq!(correction.basis, "canonical-bsn-yaw");
+    assert!(correction.delta_degrees > 3.0);
 }
 
 #[test]
@@ -1774,6 +2328,33 @@ fn feedback_status_prefers_capture_acknowledgement_for_screenshot_metrics() {
 }
 
 #[test]
+fn feedback_projected_status_readiness_requires_loaded_aabb_projection() {
+    let not_ready = json!({
+        "projected_items": [{
+            "screen_bbox": null,
+            "projected_corners": 0,
+            "world_aabb": null
+        }]
+    });
+    let ready = json!({
+        "projected_items": [{
+            "screen_bbox": [0.1, 0.1, 0.4, 0.5],
+            "projected_corners": 8,
+            "world_aabb": {
+                "min": [-1.0, 0.0, -1.0],
+                "max": [1.0, 1.0, 1.0]
+            }
+        }]
+    });
+
+    assert!(!McpServer::feedback_status_projected_items_ready(
+        &not_ready, 1
+    ));
+    assert!(McpServer::feedback_status_projected_items_ready(&ready, 1));
+    assert!(!McpServer::feedback_status_projected_items_ready(&ready, 2));
+}
+
+#[test]
 fn feedback_metrics_use_camera_ray_grounding_when_status_has_world_aabb() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.jpg".to_string(),
@@ -1855,6 +2436,303 @@ fn feedback_metrics_use_camera_ray_grounding_when_status_has_world_aabb() {
 }
 
 #[test]
+fn feedback_metrics_allow_contact_aligned_edge_cropped_chair() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/curry.png".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_left".to_string(),
+            label: "conference chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.13, 0.12, 0.87, 1.0],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 1,
+            object_prompt: "conference chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([0.7, 0.7]),
+        }],
+    };
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![test_feedback_placement(
+            "chair_left",
+            "conference chair",
+            [0.0, 0.0, 0.0],
+            [0.13, 0.12, 0.87, 1.0],
+        )],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "chair_left",
+            "screen_bbox": [0.16, 0.62, 0.84, 1.74],
+            "screen_contact": [0.50, 1.0],
+            "projected_corners": 8,
+            "total_corners": 8
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/edge-cropped.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["object_pass_count"], json!(1));
+    assert_eq!(metrics["objects"][0]["passed"], json!(true));
+    assert_eq!(metrics["objects"][0]["source_edge_cropped"], json!(true));
+}
+
+#[test]
+fn feedback_metrics_reject_bad_edge_cropped_sofa_projection() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/curry.png".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![test_feedback_placement(
+            "tan_open_sectional_sofa",
+            "tan open crescent sectional sofa",
+            [0.0, 0.0, 0.0],
+            [0.13, 0.12, 0.87, 1.0],
+        )],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "tan_open_sectional_sofa",
+            "screen_bbox": [0.23055391, 0.6355549, 1.0096982, 1.9141463],
+            "screen_contact": [0.50, 1.0],
+            "projected_corners": 8,
+            "total_corners": 8
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/bad-curry-sofa.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["object_pass_count"], json!(0));
+    assert_eq!(metrics["objects"][0]["passed"], json!(false));
+    assert_eq!(metrics["objects"][0]["source_edge_cropped"], json!(true));
+    assert!(metrics["objects"][0]["area_log2_error"].as_f64().unwrap() > 1.0);
+    assert!(metrics["objects"][0]["scale_multiplier"].as_f64().unwrap() > 1.20);
+}
+
+#[test]
+fn feedback_metrics_use_visible_bbox_for_frame_clipped_seating() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.png".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![test_feedback_placement(
+            "chair_left_near",
+            "conference chair",
+            [0.0, 0.0, 0.0],
+            [0.162, 0.531, 0.339, 0.972],
+        )],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "chair_left_near",
+            "screen_bbox": [0.15, 0.61, 0.35, 1.12],
+            "screen_contact": [0.2505, 0.972],
+            "projected_corners": 8,
+            "total_corners": 8
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/clipped-chair.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["object_pass_count"], json!(1));
+    assert_eq!(metrics["projection_passed"], json!(true));
+    assert_eq!(metrics["objects"][0]["source_edge_cropped"], json!(true));
+    assert_eq!(metrics["objects"][0]["visible_bbox_scoring"], json!(true));
+    let visible = json_array4(&metrics["objects"][0]["visible_observed_bbox"]).unwrap();
+    assert!((visible[0] - 0.15).abs() <= 1.0e-5);
+    assert!((visible[1] - 0.61).abs() <= 1.0e-5);
+    assert!((visible[2] - 0.35).abs() <= 1.0e-5);
+    assert!((visible[3] - 1.0).abs() <= 1.0e-5);
+}
+
+#[test]
+fn feedback_metrics_do_not_fail_reused_chair_for_area_only_when_contact_aligned() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.png".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let mut placement = test_feedback_placement(
+        "chair_group",
+        "reusable conference chair group",
+        [0.0, 0.0, 0.0],
+        [0.495, 0.045, 0.645, 0.400],
+    );
+    placement.instance_id = Some("chair_center".to_string());
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![placement],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "chair_group",
+            "screen_bbox": [0.530, 0.168, 0.641, 0.427],
+            "screen_contact": [0.570, 0.385],
+            "projected_corners": 8,
+            "total_corners": 8
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/reused-chair.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["object_pass_count"], json!(1));
+    assert_eq!(metrics["objects"][0]["passed"], json!(true));
+    assert!(metrics["objects"][0]["area_log2_error"].as_f64().unwrap() > 0.65);
+}
+
+#[test]
+fn feedback_metrics_require_yaw_convergence_before_projection_passes() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.png".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![test_feedback_placement(
+            "chair",
+            "conference chair",
+            [0.0, 0.0, 0.0],
+            [0.40, 0.40, 0.60, 0.80],
+        )],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "chair",
+            "screen_bbox": [0.40, 0.40, 0.60, 0.80],
+            "screen_contact": [0.50, 0.80],
+            "projected_corners": 8,
+            "total_corners": 8
+        }],
+        "world_items": [{
+            "cache_key": "chair",
+            "rotation": quat_from_y_degrees(30.0)
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/yaw.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["objects"][0]["yaw_passed"], json!(false));
+    assert_eq!(metrics["objects"][0]["passed"], json!(true));
+    assert_eq!(metrics["projection_passed"], json!(true));
+    assert_eq!(metrics["rotation_passed"], json!(false));
+    assert_eq!(metrics["passed"], json!(false));
+    assert!(
+        metrics["objects"][0]["yaw_delta_abs_degrees"]
+            .as_f64()
+            .unwrap()
+            > 8.0
+    );
+    let deltas = feedback_layout_deltas(&metrics);
+    assert!(deltas["objects"][0]["yaw_delta_degrees"].as_f64().unwrap() < -8.0);
+}
+
+#[test]
 fn feedback_metrics_use_bbox_center_anchor_for_tabletops() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.jpg".to_string(),
@@ -1931,6 +2809,182 @@ fn feedback_metrics_use_bbox_center_anchor_for_tabletops() {
     assert_eq!(object["expected_anchor"], json!([0.5, 0.75]));
     assert_eq!(object["observed_anchor"], json!([0.5, 0.5]));
     assert!(translation_delta[2].abs() <= 0.850001);
+}
+
+#[test]
+fn feedback_metrics_relax_centered_edge_cropped_table_area() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let layout = GroundedSceneLayout {
+        bsn: "scene {}".to_string(),
+        placements: vec![GroundedScenePlacement {
+            entity_id: "table_1".to_string(),
+            asset_id: "table".to_string(),
+            object_id: "conference_table".to_string(),
+            instance_id: None,
+            label: "conference table".to_string(),
+            source_bbox: [0.299, 0.475, 0.648, 1.0],
+            contact_pixel: [0.4735, 1.0],
+            ground_point: [0.0, 0.0, 0.0],
+            translation: [0.0, 0.0, 0.0],
+            rotation_y_degrees: 0.0,
+            scale: [1.0, 1.0, 1.0],
+            local_aabb: SceneAssetAabb {
+                min: [-1.0, 0.0, -0.4],
+                max: [1.0, 0.2, 0.4],
+            },
+            target_footprint_m: [4.2, 1.4],
+        }],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "table",
+            "screen_bbox": [0.402, 0.518, 0.526, 0.963],
+            "screen_contact": [0.474, 0.738],
+            "world_aabb": {
+                "min": [-1.0, 0.0, -0.4],
+                "max": [1.0, 0.2, 0.4]
+            },
+            "projected_corners": 8,
+            "total_corners": 8
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/no_screenshot.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+    let object = &metrics["objects"][0];
+
+    assert_eq!(object["source_edge_cropped"], json!(true));
+    assert_eq!(object["anchor_basis"], json!("bbox-center"));
+    assert!(object["area_log2_error"].as_f64().unwrap() > 1.0);
+    assert_eq!(object["passed"], json!(true));
+    assert_eq!(metrics["projection_passed"], json!(true));
+}
+
+#[test]
+fn feedback_deltas_do_not_axis_scale_edge_cropped_tables() {
+    let metrics = json!({
+        "score": 0.61,
+        "thresholds": {
+            "max_center_error": 0.08,
+            "max_contact_error": 0.08,
+            "max_area_log2_error": 0.65,
+            "min_overall_score": 0.55,
+            "max_seating_table_overlap_fraction": 0.38,
+            "max_seating_table_penetration_m": 0.18,
+            "max_seating_seating_overlap_fraction": 0.42,
+            "max_seating_seating_penetration_m": 0.12
+        },
+        "objects": [{
+            "index": 0,
+            "object_id": "white_conference_table_01",
+            "label": "white rectangular conference table",
+            "cache_key": "white_conference_table_01_asset",
+            "expected_bbox": [0.299, 0.475, 0.648, 1.0],
+            "observed_bbox": [0.3107, 0.4609, 0.5918, 1.1847],
+            "visible_bbox_scoring": true,
+            "source_edge_cropped": true,
+            "grounding_basis": "camera-ray-ground-plane",
+            "contact_error": 0.088,
+            "center_error": 0.023,
+            "area_log2_error": 0.274,
+            "translation_delta": [0.03, 0.0, -0.14],
+            "scale_multiplier": 0.95,
+            "yaw_delta_degrees": 0.0,
+            "physical_kind": "table",
+            "physical_failures": [],
+            "world_footprint": {
+                "min_x": -1.0,
+                "min_z": -0.5,
+                "max_x": 1.0,
+                "max_z": 0.5
+            }
+        }],
+        "physical_layout": {
+            "pairs": []
+        }
+    });
+
+    let deltas = feedback_layout_deltas(&metrics);
+    assert!(deltas["objects"][0]["scale_multiplier_xyz"].is_null());
+    assert_eq!(deltas["objects"][0]["scale_multiplier"], json!(1.0));
+    assert_eq!(
+        deltas["objects"][0]["scale_source"],
+        json!("object_projection")
+    );
+}
+
+#[test]
+fn feedback_deltas_apply_full_bounded_scale_for_large_edge_cropped_sofa() {
+    let metrics = json!({
+        "score": 0.70,
+        "thresholds": {
+            "max_center_error": 0.08,
+            "max_contact_error": 0.08,
+            "max_area_log2_error": 0.65,
+            "min_overall_score": 0.55,
+            "max_seating_table_overlap_fraction": 0.38,
+            "max_seating_table_penetration_m": 0.18,
+            "max_seating_seating_overlap_fraction": 0.42,
+            "max_seating_seating_penetration_m": 0.12
+        },
+        "objects": [{
+            "index": 0,
+            "object_id": "tan_open_sectional_sofa",
+            "label": "tan open crescent sectional sofa",
+            "cache_key": "tan_open_sectional_sofa_asset",
+            "expected_bbox": [0.13, 0.12, 0.871, 1.0],
+            "observed_bbox": [0.209, 0.654, 0.793, 1.628],
+            "source_edge_cropped": true,
+            "visible_bbox_scoring": true,
+            "grounding_basis": "camera-ray-ground-plane",
+            "contact_error": 0.0047,
+            "center_error": 0.267,
+            "area_log2_error": 1.69,
+            "translation_delta": [0.0, 0.0, 0.16],
+            "scale_multiplier": 1.071,
+            "yaw_delta_degrees": 0.0,
+            "physical_kind": "other",
+            "physical_failures": [],
+            "world_footprint": {
+                "min_x": -1.0,
+                "min_z": -0.5,
+                "max_x": 1.0,
+                "max_z": 0.5
+            }
+        }],
+        "physical_layout": {
+            "pairs": []
+        }
+    });
+
+    let deltas = feedback_layout_deltas(&metrics);
+    assert!(deltas["objects"][0]["scale_multiplier"].as_f64().unwrap() > 1.06);
+    assert_eq!(
+        deltas["objects"][0]["scale_source"],
+        json!("object_projection")
+    );
 }
 
 #[test]
@@ -2244,6 +3298,96 @@ fn scene_sequence_is_strictly_monotonic() {
     let first = next_scene_sequence();
     let second = next_scene_sequence();
     assert!(second > first);
+}
+
+#[test]
+fn scene_build_candidate_policy_defaults_to_guarded_sequential_retries() {
+    let args: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": "/tmp/scene.jpg",
+        "candidate_count": 3
+    }))
+    .expect("scene build args deserialize");
+
+    let policy = scene_object_image_generation_policy(&args, 2);
+
+    assert_eq!(policy.max_attempts_per_object, 3);
+    assert_eq!(policy.candidates_per_attempt, 1);
+    assert_eq!(policy.min_score, DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE);
+
+    let explicit: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": "/tmp/scene.jpg",
+        "candidate_count": 3,
+        "candidate_batch_size": 2,
+        "candidate_retry_attempts": 5,
+        "min_reconstruction_score": 0.72,
+        "segmentation_provider": "bbox-prompt",
+        "segmentation_precision": "bf16",
+        "segmentation_quantization": "q8"
+    }))
+    .expect("scene build args deserialize");
+    let policy = scene_object_image_generation_policy(&explicit, 2);
+    assert_eq!(policy.max_attempts_per_object, 5);
+    assert_eq!(policy.candidates_per_attempt, 2);
+    assert_eq!(policy.min_score, 0.72);
+    assert_eq!(
+        explicit.segmentation_provider,
+        Some(SceneSegmentationProvider::BboxPrompt)
+    );
+    assert_eq!(
+        explicit.segmentation_precision,
+        Some(SceneSegmentationPrecision::Bf16)
+    );
+    assert_eq!(
+        explicit.segmentation_quantization,
+        Some(SceneSegmentationQuantization::Q8)
+    );
+}
+
+#[test]
+fn scene_build_progress_events_are_emitted_and_persisted_on_failure() {
+    let root = unique_test_dir("scene_build_progress");
+    let _ = fs::remove_dir_all(&root);
+    let source = root.join("missing_scene.jpg");
+    let output_dir = root.join("run");
+    let args: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": source,
+        "output_dir": output_dir,
+        "write_artifacts": true,
+        "lift_assets": false,
+        "feedback": false
+    }))
+    .expect("scene build args deserialize");
+    let config = ServerConfig::from_args(ServerArgs::parse_from(["burn_synth_mcp"]));
+    let mut events = Vec::new();
+
+    let result = run_scene_build_from_image_with_progress(config, args, |event| {
+        events.push(event);
+    });
+
+    assert!(
+        result.is_err(),
+        "missing source image should fail before model work"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.stage == "prepare_openai_inputs"
+                && event.phase == SceneBuildProgressPhase::Started),
+        "prepare event should be emitted"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.stage == "scene_build"
+                && event.phase == SceneBuildProgressPhase::Failed),
+        "failed event should be emitted"
+    );
+    let progress_path = root.join("run").join("progress_events.jsonl");
+    let progress_log =
+        fs::read_to_string(&progress_path).expect("progress jsonl should be written");
+    assert!(progress_log.contains("\"stage\":\"scene_build\""));
+    assert!(progress_log.contains("\"phase\":\"failed\""));
+    fs::remove_dir_all(root).expect("remove temp dir");
 }
 
 #[test]

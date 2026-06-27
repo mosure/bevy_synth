@@ -198,8 +198,8 @@ pub(crate) fn fit_grounded_scene_projection(
     if targets.iter().all(Option::is_none) {
         return None;
     }
-    let camera = ProjectionCamera::from_evidence(evidence, &targets)
-        .or_else(|| ProjectionCamera::from_scene_camera(camera, aspect))?;
+    let camera = ProjectionCamera::from_scene_camera(camera, aspect)
+        .or_else(|| ProjectionCamera::from_evidence(evidence, &targets))?;
 
     let initial_eval = evaluate_scene(placements, &targets, camera, floor_y);
     let mut best_loss = initial_eval.total_loss;
@@ -262,7 +262,13 @@ impl ProjectionTarget {
     ) -> Option<Self> {
         let object_evidence = best_evidence_for_placement(placement, evidence);
         let source_bbox = object_evidence
-            .and_then(|evidence| evidence.detection.as_ref().map(|detection| detection.bbox))
+            .and_then(|evidence| {
+                evidence
+                    .mask
+                    .as_ref()
+                    .map(|mask| mask.bbox)
+                    .or_else(|| evidence.detection.as_ref().map(|detection| detection.bbox))
+            })
             .unwrap_or(placement.source_bbox);
         let contact_pixel = object_evidence
             .and_then(|evidence| {
@@ -285,7 +291,7 @@ impl ProjectionTarget {
             contact_pixel: normalize_point(contact_pixel),
             depth_stats: object_evidence.and_then(|evidence| evidence.depth_stats),
             yaw_prior_degrees: placement.rotation_y_degrees,
-            initial_scale: placement.scale[0].abs().max(1.0e-5),
+            initial_scale: representative_scale(placement.scale).max(1.0e-5),
             ground_anchor: placement.ground_point,
             ground_anchor_basis,
             source_camera_anchor,
@@ -775,9 +781,10 @@ fn apply_candidate_delta(
             placement.ground_point[2] += delta[2];
         }
         CandidateDelta::Scale(multiplier) => {
-            let next = (placement.scale[0] * multiplier).clamp(0.05, 20.0);
-            placement.scale = [next, next, next];
-            placement.translation[1] = floor_y - placement.local_aabb.min[1] * next;
+            for axis in &mut placement.scale {
+                *axis = (*axis * multiplier).clamp(0.05, 20.0);
+            }
+            placement.translation[1] = floor_y - placement.local_aabb.min[1] * placement.scale[1];
         }
         CandidateDelta::Yaw(delta) => {
             placement.rotation_y_degrees = normalize_degrees(placement.rotation_y_degrees + delta);
@@ -808,15 +815,19 @@ fn enforce_candidate_bounds(
     let initial_scale = target
         .as_ref()
         .map(|target| target.initial_scale)
-        .unwrap_or(baseline.scale[0].abs().max(1.0e-5));
+        .unwrap_or_else(|| representative_scale(baseline.scale).max(1.0e-5));
     let (min_scale, max_scale) = match kind {
         ProjectionObjectKind::Table => (initial_scale * 0.70, initial_scale * 1.36),
         ProjectionObjectKind::Seating => (initial_scale * 0.66, initial_scale * 1.50),
         ProjectionObjectKind::Other => (initial_scale * 0.65, initial_scale * 1.55),
     };
-    let scale = placement.scale[0].clamp(min_scale.max(0.05), max_scale.min(20.0));
-    placement.scale = [scale, scale, scale];
-    placement.translation[1] = floor_y - placement.local_aabb.min[1] * scale;
+    let current_scale = representative_scale(placement.scale).max(1.0e-5);
+    let next_scale = current_scale.clamp(min_scale.max(0.05), max_scale.min(20.0));
+    let multiplier = next_scale / current_scale;
+    for axis in &mut placement.scale {
+        *axis = (*axis * multiplier).clamp(0.05, 20.0);
+    }
+    placement.translation[1] = floor_y - placement.local_aabb.min[1] * placement.scale[1];
 }
 
 fn clamp_ground_anchor_drift(
@@ -841,27 +852,40 @@ fn clamp_ground_anchor_drift(
 }
 
 fn enforce_repeated_asset_scale(placements: &mut [GroundedScenePlacement], floor_y: f32) {
-    let mut grouped = std::collections::HashMap::<String, (f32, usize)>::new();
+    let mut grouped = std::collections::HashMap::<String, ([f32; 3], usize)>::new();
     for placement in placements.iter() {
         let entry = grouped
             .entry(placement.asset_id.clone())
-            .or_insert((0.0, 0));
-        entry.0 += placement.scale[0].abs();
+            .or_insert(([0.0; 3], 0));
+        for axis in 0..3 {
+            entry.0[axis] += placement.scale[axis].abs();
+        }
         entry.1 += 1;
     }
     let repeated = grouped
         .into_iter()
         .filter_map(|(asset_id, (sum, count))| {
-            (count > 1).then_some((asset_id, (sum / count as f32).clamp(0.05, 20.0)))
+            (count > 1).then_some((
+                asset_id,
+                [
+                    (sum[0] / count as f32).clamp(0.05, 20.0),
+                    (sum[1] / count as f32).clamp(0.05, 20.0),
+                    (sum[2] / count as f32).clamp(0.05, 20.0),
+                ],
+            ))
         })
         .collect::<std::collections::HashMap<_, _>>();
     for placement in placements {
         let Some(scale) = repeated.get(&placement.asset_id).copied() else {
             continue;
         };
-        placement.scale = [scale, scale, scale];
-        placement.translation[1] = floor_y - placement.local_aabb.min[1] * scale;
+        placement.scale = scale;
+        placement.translation[1] = floor_y - placement.local_aabb.min[1] * scale[1];
     }
+}
+
+fn representative_scale(scale: [f32; 3]) -> f32 {
+    ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0)
 }
 
 fn evaluate_scene_loss(
@@ -1089,24 +1113,24 @@ fn overlap_penalty(
     targets: &[Option<ProjectionTarget>],
 ) -> f32 {
     let mut penalty = 0.0f32;
-    for left in 0..placements.len() {
-        let Some(left_rect) = footprint_rect(&placements[left]) else {
+    for (left, left_placement) in placements.iter().enumerate() {
+        let Some(left_rect) = footprint_rect(left_placement) else {
             continue;
         };
         let left_kind = targets
             .get(left)
             .and_then(Option::as_ref)
             .map(|target| target.kind)
-            .unwrap_or_else(|| placement_kind(&placements[left]));
-        for right in (left + 1)..placements.len() {
-            let Some(right_rect) = footprint_rect(&placements[right]) else {
+            .unwrap_or_else(|| placement_kind(left_placement));
+        for (right, right_placement) in placements.iter().enumerate().skip(left + 1) {
+            let Some(right_rect) = footprint_rect(right_placement) else {
                 continue;
             };
             let right_kind = targets
                 .get(right)
                 .and_then(Option::as_ref)
                 .map(|target| target.kind)
-                .unwrap_or_else(|| placement_kind(&placements[right]));
+                .unwrap_or_else(|| placement_kind(right_placement));
             let overlap = rect_overlap_area(left_rect, right_rect);
             if overlap <= 1.0e-5 {
                 continue;
@@ -1359,6 +1383,7 @@ mod tests {
                 depth_map_size: Some([1600, 900]),
                 floor_sample_count: Some(64),
             }),
+            segmentation: None,
             detections: Vec::new(),
             camera: EstimatedCamera {
                 image_size: Some([1600, 900]),
@@ -1401,6 +1426,7 @@ mod tests {
                 depth_map_size: Some([1600, 900]),
                 floor_sample_count: Some(64),
             }),
+            segmentation: None,
             detections: Vec::new(),
             camera: EstimatedCamera {
                 image_size: Some([1600, 900]),
@@ -1424,6 +1450,7 @@ mod tests {
                     confidence: Some(0.95),
                     source_query: "chair".to_string(),
                 }),
+                mask: None,
                 asset_id: None,
                 contact_pixel: Some(placement.contact_pixel),
                 depth_stats: None,
@@ -1438,7 +1465,7 @@ mod tests {
             fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
         let object = &report.objects[0];
 
-        assert_eq!(report.camera.basis, "source-depth-intrinsics");
+        assert_eq!(report.camera.basis, "layout-camera");
         assert_eq!(object.ground_anchor_basis, "camera-ray-ground-plane");
         assert_eq!(object.target_ground_point, initial_anchor);
         assert!(
@@ -1470,6 +1497,7 @@ mod tests {
                 depth_map_size: Some([1600, 900]),
                 floor_sample_count: Some(64),
             }),
+            segmentation: None,
             detections: Vec::new(),
             camera: EstimatedCamera {
                 focal_length_px: Some(800.0),
@@ -1495,6 +1523,7 @@ mod tests {
                     confidence: Some(0.95),
                     source_query: "chair".to_string(),
                 }),
+                mask: None,
                 asset_id: None,
                 contact_pixel: Some(placement.contact_pixel),
                 depth_stats: None,
@@ -1508,7 +1537,7 @@ mod tests {
         let report =
             fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
 
-        assert_eq!(report.camera.basis, "source-depth-intrinsics");
+        assert_eq!(report.camera.basis, "layout-camera");
         assert_eq!(
             report.objects[0].ground_anchor_basis,
             "metric-depth-contact"
@@ -1545,6 +1574,7 @@ mod tests {
                 depth_map_size: Some([width as u32, height as u32]),
                 floor_sample_count: Some(64),
             }),
+            segmentation: None,
             detections: Vec::new(),
             camera: EstimatedCamera {
                 focal_length_px: Some(fy),
@@ -1570,6 +1600,7 @@ mod tests {
                     confidence: Some(0.95),
                     source_query: "chair".to_string(),
                 }),
+                mask: None,
                 asset_id: None,
                 contact_pixel: Some(placement.contact_pixel),
                 depth_stats: None,

@@ -14,10 +14,18 @@ pub use burn_locate_anything::{
     LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, LocateAnythingRuntime, LocateAnythingRuntimeBackend,
     LocateAnythingRuntimeConfig,
 };
+use burn_segmentation::{
+    BinaryMask, SegmentationPrompt, SegmentationRuntime, SegmentationRuntimeConfig,
+    write_mask_overlay, write_mask_png,
+};
+pub use burn_segmentation::{
+    SegmentationModelKind, SegmentationPrecision, SegmentationQuantization,
+    SegmentationRuntimeBackend,
+};
 use burn_synth_scene::{
     DepthEvidenceRef, Detection, EstimatedCamera, EstimatedFloorPlane, ObjectDepthStats,
-    ObjectGroundingEvidence, SceneGroundingEvidence, SceneObjectInstanceSpec, SceneObjectManifest,
-    SceneObjectSpec, write_json_file,
+    ObjectGroundingEvidence, ObjectMaskEvidence, SceneGroundingEvidence, SceneObjectInstanceSpec,
+    SceneObjectManifest, SceneObjectSpec, SegmentationEvidenceRef, write_json_file,
 };
 use image::{Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -93,6 +101,52 @@ impl Default for LocateAnythingGroundingConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SegmentationGroundingConfig {
+    pub model: SegmentationModelKind,
+    pub backend: SegmentationRuntimeBackend,
+    pub model_root: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub cdn_base_url: Option<String>,
+    pub precision: SegmentationPrecision,
+    pub quantization: SegmentationQuantization,
+    pub allow_download: bool,
+    pub require_gpu: bool,
+}
+
+impl Default for SegmentationGroundingConfig {
+    fn default() -> Self {
+        Self {
+            model: SegmentationModelKind::BboxPrompt,
+            backend: SegmentationRuntimeBackend::BboxPrompt,
+            model_root: None,
+            cache_dir: None,
+            cdn_base_url: None,
+            precision: SegmentationPrecision::default(),
+            quantization: SegmentationQuantization::default(),
+            allow_download: false,
+            require_gpu: true,
+        }
+    }
+}
+
+impl SegmentationGroundingConfig {
+    fn runtime_config(&self) -> SegmentationRuntimeConfig {
+        SegmentationRuntimeConfig {
+            model: self.model,
+            backend: self.backend,
+            model_root: self.model_root.clone(),
+            cache_dir: self.cache_dir.clone(),
+            cdn_base_url: self.cdn_base_url.clone(),
+            precision: self.precision,
+            quantization: self.quantization,
+            allow_download: self.allow_download,
+            require_gpu: self.require_gpu,
+            profile_stages: false,
+        }
+    }
+}
+
 impl LocateAnythingGroundingConfig {
     fn runtime_config(&self) -> LocateAnythingRuntimeConfig {
         LocateAnythingRuntimeConfig {
@@ -137,7 +191,29 @@ impl LocateAnythingBurnNativeCacheKey {
 
 #[derive(Default)]
 pub struct SceneGroundingRuntime {
+    depth_pro_runtime: Option<CachedDepthProRuntime>,
     locate_anything_burn_native_runtime: Option<CachedLocateAnythingRuntime>,
+    segmentation_runtime: Option<CachedSegmentationRuntime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepthProRuntimeCacheKey {
+    cache_dir: Option<PathBuf>,
+    precision: GroundingDepthPrecision,
+}
+
+impl DepthProRuntimeCacheKey {
+    pub fn from_config(config: &DepthProGroundingConfig) -> Self {
+        Self {
+            cache_dir: config.cache_dir.clone(),
+            precision: config.precision,
+        }
+    }
+}
+
+struct CachedDepthProRuntime {
+    key: DepthProRuntimeCacheKey,
+    pipeline: DepthPipeline<burn_depth::InferenceBackend>,
 }
 
 struct CachedLocateAnythingRuntime {
@@ -145,11 +221,42 @@ struct CachedLocateAnythingRuntime {
     runtime: LocateAnythingRuntime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentationRuntimeCacheKey {
+    model: SegmentationModelKind,
+    backend: SegmentationRuntimeBackend,
+    model_root: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    cdn_base_url: Option<String>,
+    precision: SegmentationPrecision,
+    quantization: SegmentationQuantization,
+}
+
+impl SegmentationRuntimeCacheKey {
+    pub fn from_config(config: &SegmentationRuntimeConfig) -> Self {
+        Self {
+            model: config.model,
+            backend: config.backend,
+            model_root: config.model_root.clone(),
+            cache_dir: config.cache_dir.clone(),
+            cdn_base_url: config.cdn_base_url.clone(),
+            precision: config.precision,
+            quantization: config.quantization,
+        }
+    }
+}
+
+struct CachedSegmentationRuntime {
+    key: SegmentationRuntimeCacheKey,
+    runtime: SegmentationRuntime,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DepthProGroundingReport {
     pub artifact_path: PathBuf,
     pub load_ms: f64,
     pub infer_ms: f64,
+    pub runtime_cache_hit: bool,
     pub summary: SceneDepthAnnotationSummary,
 }
 
@@ -161,6 +268,16 @@ pub struct LocateAnythingGroundingReport {
     pub elapsed_ms: f64,
     pub runtime_cache_hit: bool,
     pub detection_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SegmentationGroundingReport {
+    pub artifact_dir: PathBuf,
+    pub masks_path: PathBuf,
+    pub overlay_path: PathBuf,
+    pub elapsed_ms: f64,
+    pub runtime_cache_hit: bool,
+    pub mask_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -213,25 +330,41 @@ impl SceneGroundingRuntime {
             )
         })?;
 
-        let precision: DepthPrecision = config.precision.into();
-        let load_config = DepthLoadConfig {
-            model: DepthModelKind::DepthPro,
-            precision,
-            checkpoint: DepthCheckpointSource::default_cdn(DepthModelKind::DepthPro, precision),
-            cache_dir: config.cache_dir.clone(),
-            allow_download: config.allow_download,
-            require_gpu: config.require_gpu,
-        };
+        let cache_key = DepthProRuntimeCacheKey::from_config(&config);
+        let cache_hit = self
+            .depth_pro_runtime
+            .as_ref()
+            .is_some_and(|cached| cached.key == cache_key);
         let mut progress_events = Vec::new();
-        let device = burn::tensor::Device::<burn_depth::InferenceBackend>::default();
         let load_started = Instant::now();
-        let pipeline = DepthPipeline::<burn_depth::InferenceBackend>::load_with_progress(
-            &device,
-            load_config,
-            |event| progress_events.push(depth_load_event_json(event)),
-        )
-        .map_err(|err| format!("load DepthPro pipeline: {err}"))?;
+        if !cache_hit {
+            let precision: DepthPrecision = config.precision.into();
+            let load_config = DepthLoadConfig {
+                model: DepthModelKind::DepthPro,
+                precision,
+                checkpoint: DepthCheckpointSource::default_cdn(DepthModelKind::DepthPro, precision),
+                cache_dir: config.cache_dir.clone(),
+                allow_download: config.allow_download,
+                require_gpu: config.require_gpu,
+            };
+            let device = burn::tensor::Device::<burn_depth::InferenceBackend>::default();
+            let pipeline = DepthPipeline::<burn_depth::InferenceBackend>::load_with_progress(
+                &device,
+                load_config,
+                |event| progress_events.push(depth_load_event_json(event)),
+            )
+            .map_err(|err| format!("load DepthPro pipeline: {err}"))?;
+            self.depth_pro_runtime = Some(CachedDepthProRuntime {
+                key: cache_key,
+                pipeline,
+            });
+        }
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let pipeline = &self
+            .depth_pro_runtime
+            .as_ref()
+            .expect("DepthPro runtime cache initialized")
+            .pipeline;
 
         let image = image::open(source_scene_path).map_err(|err| {
             format!(
@@ -272,6 +405,7 @@ impl SceneGroundingRuntime {
             "precision": config.precision.label(),
             "load_ms": load_ms,
             "infer_ms": infer_ms,
+            "runtime_cache_hit": cache_hit,
             "load_events": progress_events,
             "summary": summary,
             "far_field_filter": far_field_filter,
@@ -309,6 +443,7 @@ impl SceneGroundingRuntime {
             artifact_path: summary_path,
             load_ms,
             infer_ms,
+            runtime_cache_hit: cache_hit,
             summary,
         })
     }
@@ -430,6 +565,158 @@ impl SceneGroundingRuntime {
         };
         Ok((evidence, report))
     }
+
+    pub fn segmentation_grounding_evidence(
+        &mut self,
+        evidence: &mut SceneGroundingEvidence,
+        source_scene_path: &Path,
+        output_dir: &Path,
+        config: SegmentationGroundingConfig,
+    ) -> Result<SegmentationGroundingReport, String> {
+        let artifact_dir = output_dir.join(format!("segmentation_{}", config.model.label()));
+        let masks_dir = artifact_dir.join("masks");
+        fs::create_dir_all(&masks_dir).map_err(|err| {
+            format!(
+                "failed to create segmentation artifact directory {}: {err}",
+                masks_dir.display()
+            )
+        })?;
+        let image = image::open(source_scene_path).map_err(|err| {
+            format!(
+                "failed to load segmentation source image {}: {err}",
+                source_scene_path.display()
+            )
+        })?;
+        let (object_indices, prompts) = segmentation_prompts_from_evidence(evidence);
+        if prompts.is_empty() {
+            return Err(
+                "segmentation grounding requires at least one object with bbox evidence"
+                    .to_string(),
+            );
+        }
+
+        let runtime_config = config.runtime_config();
+        let cache_key = SegmentationRuntimeCacheKey::from_config(&runtime_config);
+        let cache_hit = self
+            .segmentation_runtime
+            .as_ref()
+            .is_some_and(|cached| cached.key == cache_key);
+        if !cache_hit {
+            let runtime = SegmentationRuntime::new(runtime_config.clone())
+                .map_err(|err| format!("initialize segmentation runtime: {err}"))?;
+            self.segmentation_runtime = Some(CachedSegmentationRuntime {
+                key: cache_key,
+                runtime,
+            });
+        }
+        let runtime = &mut self
+            .segmentation_runtime
+            .as_mut()
+            .expect("segmentation runtime cache initialized")
+            .runtime;
+
+        let started = Instant::now();
+        let mut masks = runtime
+            .segment(&image, &prompts)
+            .map_err(|err| format!("segmentation inference failed: {err}"))?;
+        for (index, mask) in masks.iter_mut().enumerate() {
+            let png_path = masks_dir.join(format!(
+                "{index:03}_{}.png",
+                sanitize_artifact_stem(&mask.object_id)
+            ));
+            let binary = BinaryMask::decode_rle(mask.width, mask.height, &mask.mask_rle)
+                .map_err(|err| format!("decode segmentation mask {}: {err}", mask.object_id))?;
+            write_mask_png(&binary, &png_path)
+                .map_err(|err| format!("write segmentation mask {}: {err}", mask.object_id))?;
+            mask.mask_png_path = Some(png_path.display().to_string());
+        }
+        let overlay_path = artifact_dir.join("masks_overlay.png");
+        write_mask_overlay(&image, &masks, &overlay_path)
+            .map_err(|err| format!("write segmentation overlay: {err}"))?;
+        let masks_path = artifact_dir.join("masks.json");
+        write_json_file(&masks_path, &masks).map_err(|err| err.to_string())?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        evidence.segmentation = Some(SegmentationEvidenceRef {
+            provider: config.backend.label().to_string(),
+            model: config.model.label().to_string(),
+            artifact_path: Some(masks_path.display().to_string()),
+            overlay_path: Some(overlay_path.display().to_string()),
+            mask_count: Some(masks.len()),
+        });
+        for (mask, object_index) in masks.iter().zip(object_indices.iter().copied()) {
+            if let Some(object) = evidence.objects.get_mut(object_index) {
+                object.mask = Some(ObjectMaskEvidence {
+                    provider: mask.provider.clone(),
+                    model: mask.model.clone(),
+                    bbox: mask.bbox,
+                    score: mask.score,
+                    area_px: mask.area_px,
+                    image_size: [mask.width, mask.height],
+                    artifact_path: Some(masks_path.display().to_string()),
+                    mask_png_path: mask.mask_png_path.clone(),
+                });
+                let provenance = format!("segmentation_{}", config.model.label());
+                if !object.provenance.iter().any(|entry| entry == &provenance) {
+                    object.provenance.push(provenance);
+                }
+            }
+        }
+
+        Ok(SegmentationGroundingReport {
+            artifact_dir,
+            masks_path,
+            overlay_path,
+            elapsed_ms,
+            runtime_cache_hit: cache_hit,
+            mask_count: masks.len(),
+        })
+    }
+}
+
+fn segmentation_prompts_from_evidence(
+    evidence: &SceneGroundingEvidence,
+) -> (Vec<usize>, Vec<SegmentationPrompt>) {
+    let mut object_indices = Vec::new();
+    let mut prompts = Vec::new();
+    for (index, object) in evidence.objects.iter().enumerate() {
+        let Some(detection) = object.detection.as_ref() else {
+            continue;
+        };
+        let label = if detection.label.trim().is_empty() {
+            object.object_id.clone()
+        } else {
+            detection.label.clone()
+        };
+        object_indices.push(index);
+        prompts.push(SegmentationPrompt {
+            object_id: segmentation_prompt_object_id(index, object),
+            label,
+            bbox: detection.bbox,
+            point: detection.point.or(object.contact_pixel),
+            source_query: Some(detection.source_query.clone()),
+        });
+    }
+    (object_indices, prompts)
+}
+
+fn segmentation_prompt_object_id(index: usize, object: &ObjectGroundingEvidence) -> String {
+    match object.instance_id.as_deref() {
+        Some(instance_id) => format!("{:03}_{}_{}", index, object.object_id, instance_id),
+        None => format!("{:03}_{}", index, object.object_id),
+    }
+}
+
+fn sanitize_artifact_stem(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().max(1));
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "_".to_string() } else { out }
 }
 
 fn scene_detection_from_locate_anything(detection: LocateAnythingDetection) -> Detection {
@@ -845,10 +1132,10 @@ fn floor_sample_exclusion_bboxes(evidence: &SceneGroundingEvidence) -> Vec<[f32;
         .map(|detection| detection.bbox)
         .collect::<Vec<_>>();
     for object in &evidence.objects {
-        if let Some(detection) = object.detection.as_ref() {
-            if !bboxes.iter().any(|bbox| bbox == &detection.bbox) {
-                bboxes.push(detection.bbox);
-            }
+        if let Some(detection) = object.detection.as_ref()
+            && !bboxes.iter().any(|bbox| bbox == &detection.bbox)
+        {
+            bboxes.push(detection.bbox);
         }
     }
     bboxes
@@ -1331,6 +1618,7 @@ pub fn locate_anything_evidence_from_detections(
             instance_id: None,
             reuse_group: object.reuse_group.clone(),
             detection: object_detection,
+            mask: None,
             asset_id: None,
             contact_pixel: None,
             depth_stats: None,
@@ -1352,6 +1640,7 @@ pub fn locate_anything_evidence_from_detections(
     Ok(SceneGroundingEvidence {
         source_image_path: source_scene_path.display().to_string(),
         depth: None,
+        segmentation: None,
         detections,
         camera: EstimatedCamera {
             image_size,
@@ -1409,6 +1698,7 @@ fn locate_anything_instance_evidence(
             instance_id,
             reuse_group: object.reuse_group.clone(),
             detection,
+            mask: None,
             asset_id: None,
             contact_pixel,
             depth_stats: None,
@@ -1433,6 +1723,7 @@ fn locate_anything_instance_evidence(
                 instance_id: Some(instance_id),
                 reuse_group: object.reuse_group.clone(),
                 detection: Some(detection.clone()),
+                mask: None,
                 asset_id: None,
                 contact_pixel: detection
                     .point
@@ -1629,6 +1920,81 @@ mod tests {
     };
 
     #[test]
+    fn segmentation_grounding_attaches_bbox_masks_and_artifacts() {
+        let run_id = format!(
+            "burn_synth_grounding_segmentation_test_{}_{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        );
+        let root = std::env::temp_dir().join(run_id);
+        fs::create_dir_all(&root).unwrap();
+        let image_path = root.join("source.png");
+        RgbaImage::from_pixel(20, 10, Rgba([24, 48, 72, 255]))
+            .save(&image_path)
+            .unwrap();
+        let detection = Detection {
+            label: "chair".to_string(),
+            bbox: [0.10, 0.20, 0.40, 0.80],
+            point: Some([0.25, 0.80]),
+            confidence: Some(0.9),
+            source_query: "chair".to_string(),
+        };
+        let mut evidence = SceneGroundingEvidence {
+            source_image_path: image_path.display().to_string(),
+            depth: None,
+            segmentation: None,
+            detections: vec![detection.clone()],
+            camera: EstimatedCamera::default(),
+            floor: EstimatedFloorPlane::default(),
+            objects: vec![ObjectGroundingEvidence {
+                object_id: "chair".to_string(),
+                instance_id: Some("chair_01".to_string()),
+                reuse_group: Some("chair".to_string()),
+                detection: Some(detection),
+                mask: None,
+                asset_id: None,
+                contact_pixel: Some([0.25, 0.80]),
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: Vec::new(),
+            }],
+        };
+        let mut runtime = SceneGroundingRuntime::default();
+        let report = runtime
+            .segmentation_grounding_evidence(
+                &mut evidence,
+                &image_path,
+                &root,
+                SegmentationGroundingConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.mask_count, 1);
+        assert!(report.masks_path.exists());
+        assert!(report.overlay_path.exists());
+        assert_eq!(
+            evidence
+                .segmentation
+                .as_ref()
+                .and_then(|segmentation| segmentation.mask_count),
+            Some(1)
+        );
+        let object_mask = evidence.objects[0].mask.as_ref().unwrap();
+        assert_eq!(object_mask.image_size, [20, 10]);
+        assert_eq!(object_mask.area_px, 6 * 6);
+        assert!(
+            object_mask
+                .mask_png_path
+                .as_ref()
+                .is_some_and(|path| Path::new(path).exists())
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn locate_anything_cache_key_ignores_non_execution_flags() {
         let base = LocateAnythingRuntimeConfig {
             model_root: PathBuf::from("assets/models/LocateAnything-3B"),
@@ -1658,6 +2024,48 @@ mod tests {
         assert_ne!(
             LocateAnythingBurnNativeCacheKey::from_config(&same_runtime),
             LocateAnythingBurnNativeCacheKey::from_config(&different_decode_filter)
+        );
+    }
+
+    #[test]
+    fn depth_pro_cache_key_ignores_non_execution_policy_flags() {
+        let base = DepthProGroundingConfig {
+            cache_dir: Some(PathBuf::from("/tmp/depth-cache")),
+            precision: GroundingDepthPrecision::F16,
+            allow_download: true,
+            require_gpu: true,
+        };
+        let mut same = base.clone();
+        assert_eq!(
+            DepthProRuntimeCacheKey::from_config(&base),
+            DepthProRuntimeCacheKey::from_config(&same)
+        );
+
+        same.precision = GroundingDepthPrecision::F32;
+        assert_ne!(
+            DepthProRuntimeCacheKey::from_config(&base),
+            DepthProRuntimeCacheKey::from_config(&same)
+        );
+
+        same = base.clone();
+        same.allow_download = false;
+        assert_eq!(
+            DepthProRuntimeCacheKey::from_config(&base),
+            DepthProRuntimeCacheKey::from_config(&same)
+        );
+
+        same = base.clone();
+        same.require_gpu = false;
+        assert_eq!(
+            DepthProRuntimeCacheKey::from_config(&base),
+            DepthProRuntimeCacheKey::from_config(&same)
+        );
+
+        same = base.clone();
+        same.cache_dir = Some(PathBuf::from("/tmp/other-depth-cache"));
+        assert_ne!(
+            DepthProRuntimeCacheKey::from_config(&base),
+            DepthProRuntimeCacheKey::from_config(&same)
         );
     }
 
@@ -1981,6 +2389,7 @@ mod tests {
         let mut evidence = SceneGroundingEvidence {
             source_image_path: "/tmp/source.jpg".to_string(),
             depth: None,
+            segmentation: None,
             detections: vec![detection.clone()],
             camera: EstimatedCamera::default(),
             floor: EstimatedFloorPlane::default(),
@@ -1989,6 +2398,7 @@ mod tests {
                 instance_id: None,
                 reuse_group: Some("chair".to_string()),
                 detection: Some(detection),
+                mask: None,
                 asset_id: None,
                 contact_pixel: None,
                 depth_stats: None,
@@ -2052,6 +2462,7 @@ mod tests {
         let mut evidence = SceneGroundingEvidence {
             source_image_path: "/tmp/source.jpg".to_string(),
             depth: None,
+            segmentation: None,
             detections: vec![near_detection.clone(), far_detection.clone()],
             camera: EstimatedCamera::default(),
             floor: EstimatedFloorPlane::default(),
@@ -2061,6 +2472,7 @@ mod tests {
                     instance_id: None,
                     reuse_group: Some("chair".to_string()),
                     detection: Some(near_detection),
+                    mask: None,
                     asset_id: None,
                     contact_pixel: Some([0.20, 0.90]),
                     depth_stats: Some(ObjectDepthStats {
@@ -2080,6 +2492,7 @@ mod tests {
                     instance_id: None,
                     reuse_group: Some("chair".to_string()),
                     detection: Some(far_detection),
+                    mask: None,
                     asset_id: None,
                     contact_pixel: Some([0.82, 0.50]),
                     depth_stats: Some(ObjectDepthStats {

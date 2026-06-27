@@ -19,7 +19,9 @@ pub(crate) use burn_synth::{
     SynthRuntime, SynthesisAsset, mesh_quality_failures, mesh_quality_metrics, write_glb_mesh,
 };
 pub(crate) use burn_synth_grounding::{
-    DepthProGroundingConfig, LocateAnythingGroundingConfig, SceneGroundingRuntime,
+    DepthProGroundingConfig, DepthProGroundingReport, LocateAnythingGroundingConfig,
+    SceneGroundingRuntime, SegmentationGroundingConfig, SegmentationGroundingReport,
+    SegmentationModelKind, SegmentationRuntimeBackend,
 };
 pub(crate) use burn_synth_scene::{
     DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, GroundedSceneLayout, GroundedScenePlacement,

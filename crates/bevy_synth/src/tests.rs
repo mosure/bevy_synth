@@ -13,7 +13,10 @@ use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dH
 use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogState, CatalogStatus,
+    SceneProcessingState, ViewerAabbOverlayMode,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use burn_synth_mcp::{SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::prepare_startup_bsn_scene;
@@ -21,9 +24,10 @@ use crate::app::prepare_startup_bsn_scene;
 use crate::app::should_share_wgpu_inference_device_for_platform;
 use crate::app::{
     CachedMeshInstance, MeshCacheResource, SceneInteractionLock, SceneReadOnlyMode,
-    UiVisibilityState, drive_inference, enqueue_inference, handle_catalog_delete_requests,
-    handle_ui_visibility_shortcut, processing_window_title, scene_bsn_export_for_world,
-    scene_glb_export_for_world, should_run_headless_once, title_rattler_frame,
+    UiVisibilityState, apply_scene_build_progress_event, drive_inference, enqueue_inference,
+    handle_catalog_delete_requests, handle_ui_visibility_shortcut, processing_window_title,
+    scene_bsn_export_for_world, scene_glb_export_for_world, should_run_headless_once,
+    title_rattler_frame,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
@@ -34,7 +38,7 @@ use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DEFAULT_TRELLIS_PBR_TEXTURE_SIZE, DinoBackend, MeshMode, QualityPreset,
     RmbgBackend, RmbgModel, SynthesisModel, TrellisQuality, TripoSplatProfile, WeightPrecision,
 };
-use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
+use bevy_synth_runtime::cache::{CachedAssetAabb, CachedCameraState, CachedWorldItem, MeshCache};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::io::write_glb;
 use bevy_synth_runtime::state::{
@@ -283,6 +287,29 @@ fn scene_glb_export_rejects_splats_and_exports_mesh_instances() {
     std::fs::remove_dir_all(dir).expect("remove temp dir");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn projected_feedback_uses_explicit_bounds_for_fresh_path_assets() {
+    let item = CachedWorldItem {
+        cache_key: "generated-chair".to_string(),
+        translation: [0.0, 0.0, 0.0],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.0, 1.0, 1.0],
+    };
+    let aabb = CachedAssetAabb {
+        min: [-0.5, 0.0, -0.5],
+        max: [0.5, 1.0, 0.5],
+    };
+    let metadata_by_key = std::collections::HashMap::new();
+    let mut explicit_bounds = std::collections::HashMap::new();
+    explicit_bounds.insert(item.cache_key.clone(), aabb);
+
+    assert_eq!(
+        crate::app::world_item_local_aabb(&metadata_by_key, &explicit_bounds, &item),
+        Some(aabb)
+    );
+}
+
 fn isolated_cache_root() -> PathBuf {
     let nonce = TEST_CACHE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
@@ -321,6 +348,60 @@ fn build_test_app(worker: InferenceWorker, queue: InferenceQueue, status: UiStat
         (drive_inference, crate::app::sync_gaussian_splat_pick_bounds).chain(),
     );
     app
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scene_progress_event_updates_processing_status() {
+    let mut processing = SceneProcessingState::default();
+    processing.begin("scene.jpg");
+    let mut status = UiStatus {
+        message: String::new(),
+        processing: false,
+        worker_message: None,
+    };
+    apply_scene_build_progress_event(
+        SceneBuildProgressEvent {
+            run_id: "run-1".to_string(),
+            sequence: 1,
+            stage: "depth_pro_grounding_evidence".to_string(),
+            phase: SceneBuildProgressPhase::Waiting,
+            execution: SceneBuildExecutionKind::Gpu,
+            message: "running DepthPro".to_string(),
+            elapsed_ms: 1200,
+            item_index: None,
+            item_count: Some(1),
+            artifact_path: Some("tmp/runs/run-1/depth_pro/depth_evidence.json".to_string()),
+            detail: serde_json::json!({
+                "has_depth": true,
+                "token_usage": {
+                    "total": {
+                        "requests": 2,
+                        "reported_requests": 2,
+                        "input_tokens": 120,
+                        "output_tokens": 30,
+                        "total_tokens": 150
+                    },
+                    "by_stage": [
+                        { "stage": "plan_objects", "total_tokens": 90 },
+                        { "stage": "generate_object_images", "total_tokens": 60 }
+                    ]
+                }
+            }),
+        },
+        &mut processing,
+        &mut status,
+    );
+
+    let worker_message = status.worker_message.expect("worker message");
+    assert!(worker_message.contains("waiting"));
+    assert!(worker_message.contains("depth_pro_grounding_evidence"));
+    assert!(processing.is_visible());
+    assert!(
+        processing
+            .token_usage_summary()
+            .is_some_and(|summary| summary.contains("tokens total=150"))
+    );
 }
 
 #[test]
@@ -672,6 +753,42 @@ fn gaussian_splat_pick_bounds_cover_cloud_extent() {
 }
 
 #[test]
+fn viewer_debug_entity_visibility_modes_match_settings() {
+    assert!(!crate::app::viewer_debug_entity_visible(
+        ViewerAabbOverlayMode::Off,
+        true
+    ));
+    assert!(crate::app::viewer_debug_entity_visible(
+        ViewerAabbOverlayMode::Selected,
+        true
+    ));
+    assert!(!crate::app::viewer_debug_entity_visible(
+        ViewerAabbOverlayMode::Selected,
+        false
+    ));
+    assert!(crate::app::viewer_debug_entity_visible(
+        ViewerAabbOverlayMode::All,
+        false
+    ));
+}
+
+#[test]
+fn viewer_ground_contact_state_classifies_gap_direction() {
+    assert_eq!(
+        crate::app::viewer_ground_contact_state(0.01, 0.0, 0.02),
+        crate::app::ViewerGroundContactState::Grounded
+    );
+    assert_eq!(
+        crate::app::viewer_ground_contact_state(0.05, 0.0, 0.02),
+        crate::app::ViewerGroundContactState::Floating
+    );
+    assert_eq!(
+        crate::app::viewer_ground_contact_state(-0.05, 0.0, 0.02),
+        crate::app::ViewerGroundContactState::BelowGround
+    );
+}
+
+#[test]
 fn ui_plugin_update_has_no_query_conflicts() {
     let mut app = App::new();
     app.insert_resource(InferenceQueue::default());
@@ -737,6 +854,7 @@ fn catalog_delete_request_removes_cache_backed_instances_in_same_update() {
         .world_mut()
         .spawn(CachedMeshInstance {
             cache_key: "cache-key".to_string(),
+            local_aabb: None,
         })
         .id();
     app.add_systems(
@@ -770,6 +888,7 @@ fn catalog_delete_request_is_ignored_while_scene_interaction_locked() {
         .world_mut()
         .spawn(CachedMeshInstance {
             cache_key: "cache-key".to_string(),
+            local_aabb: None,
         })
         .id();
     app.add_systems(
@@ -801,6 +920,7 @@ fn catalog_delete_request_is_ignored_in_read_only_mode() {
         .world_mut()
         .spawn(CachedMeshInstance {
             cache_key: "cache-key".to_string(),
+            local_aabb: None,
         })
         .id();
     app.add_systems(

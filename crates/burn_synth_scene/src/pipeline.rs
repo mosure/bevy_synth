@@ -9,8 +9,9 @@ use crate::bsn::{
     default_run_id, representative_crop_bbox, stable_hash_hex, unix_ms, validate_build_config,
 };
 use crate::object_images::{
-    decode_generated_object_rgb, generated_shape_consistency_score, image_dimensions_aspect,
-    matte_generated_object_rgb, score_generated_object_rgb,
+    decode_generated_object_rgb, generated_shape_consistency_score,
+    generated_source_crop_edge_mismatch, image_dimensions_aspect, matte_generated_object_rgb,
+    object_reconstruction_min_score, score_generated_object_rgb,
 };
 use crate::*;
 
@@ -190,9 +191,11 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
         };
         let mut attempts = Vec::new();
         let mut candidates = Vec::new();
+        let mut processed_request_count = 0usize;
         for request in requests {
             let mut accepted = false;
             let mut next_candidate_index = 0usize;
+            let min_score = object_reconstruction_min_score(&request.object, policy.min_score);
             for attempt_index in 0..policy.max_attempts_per_object {
                 let mut attempt_request = request.clone();
                 attempt_request.candidate_count = policy.candidates_per_attempt;
@@ -206,7 +209,7 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                 candidates.append(&mut generated);
                 let best_score = best_candidate_for_object(&candidates, &request.object.id)
                     .map(|candidate| candidate.score);
-                accepted = best_score.is_some_and(|score| score >= policy.min_score);
+                accepted = best_score.is_some_and(|score| score >= min_score);
                 attempts.push(ObjectImageAttemptReport {
                     object_id: request.object.id.clone(),
                     attempt_index,
@@ -225,7 +228,8 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                         "requested_candidates": attempt_request.candidate_count,
                         "generated_candidates": next_candidate_index,
                         "best_score_after_attempt": best_score,
-                        "min_score": policy.min_score,
+                        "base_min_score": policy.min_score,
+                        "min_score": min_score,
                         "accepted": accepted,
                     }),
                 )?;
@@ -233,6 +237,7 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                     break;
                 }
             }
+            processed_request_count += 1;
             if !accepted {
                 write_metric(
                     &self.config.output_dir,
@@ -240,18 +245,31 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                     json!({
                         "object_id": request.object.id,
                         "best_score": best_candidate_for_object(&candidates, &request.object.id).map(|candidate| candidate.score),
-                        "min_score": policy.min_score,
+                        "base_min_score": policy.min_score,
+                        "min_score": min_score,
                     }),
                 )?;
+                write_metric(
+                    &self.config.output_dir,
+                    "openai.object_image.guardrail_abort",
+                    json!({
+                        "object_id": request.object.id,
+                        "processed_objects": processed_request_count,
+                        "total_objects": requests.len(),
+                        "reason": "required object exhausted image candidate attempts",
+                    }),
+                )?;
+                break;
             }
         }
+        let processed_requests = &requests[..processed_request_count.min(requests.len())];
         let rejected_objects =
-            object_image_candidate_rejections(requests, &candidates, policy.min_score);
+            object_image_candidate_rejections(processed_requests, &candidates, policy.min_score);
         let selected_candidates = if rejected_objects.is_empty() {
             let manifest = SceneObjectManifest {
                 source_scene_path: self.config.source_scene_path.display().to_string(),
                 scene_calibration: None,
-                objects: requests
+                objects: processed_requests
                     .iter()
                     .map(|request| request.object.clone())
                     .collect(),
@@ -331,6 +349,8 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                 &matte_stats,
                 source_image_aspect,
             );
+            let source_crop_edge_mismatch =
+                generated_source_crop_edge_mismatch(&request.object, &matte_stats);
             let score = (suitability.score * shape_score).clamp(0.0, 1.0);
             fs::write(&raw_image_path, &bytes)?;
             matted.save(&image_path)?;
@@ -352,6 +372,7 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                     "alpha_coverage": matte_stats.alpha_coverage,
                     "alpha_bbox": matte_stats.alpha_bbox,
                     "shape_score": shape_score,
+                    "source_crop_edge_mismatch": source_crop_edge_mismatch,
                     "score_after_shape": score,
                 }),
             )?;
@@ -431,11 +452,12 @@ pub fn select_object_image_candidates_with_exclusions(
                     object.id
                 ))
             })?;
-        if candidate.score < min_score {
+        let object_min_score = object_reconstruction_min_score(object, min_score);
+        if candidate.score < object_min_score {
             return Err(SceneError::Validation(candidate_rejection_message(
                 &object.id,
                 Some(candidate.score),
-                min_score,
+                object_min_score,
             )));
         }
         selected.push(SelectedObjectImageCandidate {
@@ -461,14 +483,19 @@ pub fn object_image_candidate_rejections(
         .filter_map(|request| {
             let best_score = best_candidate_for_object(candidates, &request.object.id)
                 .map(|candidate| candidate.score);
-            if best_score.is_some_and(|score| score >= min_score) {
+            let object_min_score = object_reconstruction_min_score(&request.object, min_score);
+            if best_score.is_some_and(|score| score >= object_min_score) {
                 None
             } else {
                 Some(RejectedObjectImageCandidates {
                     object_id: request.object.id.clone(),
                     best_score,
-                    min_score,
-                    message: candidate_rejection_message(&request.object.id, best_score, min_score),
+                    min_score: object_min_score,
+                    message: candidate_rejection_message(
+                        &request.object.id,
+                        best_score,
+                        object_min_score,
+                    ),
                 })
             }
         })

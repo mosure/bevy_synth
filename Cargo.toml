@@ -16,6 +16,7 @@ members = [
   "crates/burn_synth_grounding",
   "crates/burn_synth_mcp",
   "crates/burn_locate_anything",
+  "crates/burn_segmentation",
 ]
 exclude = [
   "third_party/burn_dino",

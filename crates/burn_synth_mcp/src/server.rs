@@ -52,6 +52,121 @@ impl SceneAiProvider for NoopSceneProvider {
     }
 }
 
+fn validate_scene_pose_fit_mode(mode: ScenePoseFitMode) -> Result<(), String> {
+    match mode {
+        ScenePoseFitMode::ProjectedAabb => Ok(()),
+        ScenePoseFitMode::RenderedSilhouette => Err(
+            "scene pose_fit=rendered-silhouette is not implemented yet; use pose_fit=projected-aabb until rendered mask/depth candidate scoring is wired"
+                .to_string(),
+        ),
+    }
+}
+
+pub(crate) fn scene_object_image_generation_policy(
+    args: &SceneBuildFromImageArgs,
+    default_candidate_count: usize,
+) -> ObjectImageGenerationPolicy {
+    let requested_candidate_count = args
+        .candidate_count
+        .unwrap_or(default_candidate_count)
+        .max(1);
+    ObjectImageGenerationPolicy {
+        min_score: args
+            .min_reconstruction_score
+            .unwrap_or(DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE),
+        max_attempts_per_object: args
+            .candidate_retry_attempts
+            .unwrap_or(requested_candidate_count)
+            .max(1),
+        candidates_per_attempt: args.candidate_batch_size.unwrap_or(1).max(1),
+    }
+}
+
+struct SceneBuildProgressReporter<'a, F>
+where
+    F: FnMut(SceneBuildProgressEvent),
+{
+    emit: &'a mut F,
+    run_id: String,
+    started: Instant,
+    sequence: u64,
+    output_dir: Option<PathBuf>,
+    write_artifacts: bool,
+}
+
+impl<'a, F> SceneBuildProgressReporter<'a, F>
+where
+    F: FnMut(SceneBuildProgressEvent),
+{
+    fn new(emit: &'a mut F, write_artifacts: bool) -> Self {
+        Self {
+            emit,
+            run_id: format!("scene_build_{}", next_scene_sequence()),
+            started: Instant::now(),
+            sequence: 0,
+            output_dir: None,
+            write_artifacts,
+        }
+    }
+
+    fn set_output_dir(&mut self, output_dir: PathBuf) {
+        if let Some(name) = output_dir.file_name().and_then(|value| value.to_str())
+            && !name.trim().is_empty()
+        {
+            self.run_id = name.to_string();
+        }
+        self.output_dir = Some(output_dir);
+    }
+
+    fn emit(
+        &mut self,
+        stage: impl Into<String>,
+        phase: SceneBuildProgressPhase,
+        execution: SceneBuildExecutionKind,
+        message: impl Into<String>,
+        detail: Value,
+    ) {
+        self.emit_with_items(stage, phase, execution, message, None, None, None, detail);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_with_items(
+        &mut self,
+        stage: impl Into<String>,
+        phase: SceneBuildProgressPhase,
+        execution: SceneBuildExecutionKind,
+        message: impl Into<String>,
+        item_index: Option<usize>,
+        item_count: Option<usize>,
+        artifact_path: Option<PathBuf>,
+        detail: Value,
+    ) {
+        self.sequence = self.sequence.saturating_add(1);
+        let event = SceneBuildProgressEvent {
+            run_id: self.run_id.clone(),
+            sequence: self.sequence,
+            stage: stage.into(),
+            phase,
+            execution,
+            message: message.into(),
+            elapsed_ms: elapsed_ms(self.started.elapsed()),
+            item_index,
+            item_count,
+            artifact_path: artifact_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            detail,
+        };
+        if self.write_artifacts
+            && let Some(output_dir) = self.output_dir.as_ref()
+            && let Err(err) = append_scene_progress_event(output_dir, &event)
+        {
+            eprintln!("burn_synth_mcp: failed to write scene progress event: {err}");
+        }
+        (self.emit)(event);
+    }
+}
+
 impl McpServer {
     pub(crate) fn new(config: ServerConfig) -> Self {
         let runtime = SynthRuntime::new(config.runtime_config());
@@ -735,52 +850,117 @@ impl McpServer {
         &mut self,
         args: SceneBuildFromImageArgs,
     ) -> Result<Value, String> {
+        let mut noop = |_| {};
+        self.call_scene_build_from_image_with_progress(args, &mut noop)
+    }
+
+    pub(crate) fn call_scene_build_from_image_with_progress<F>(
+        &mut self,
+        args: SceneBuildFromImageArgs,
+        progress: &mut F,
+    ) -> Result<Value, String>
+    where
+        F: FnMut(SceneBuildProgressEvent),
+    {
+        let mut reporter = SceneBuildProgressReporter::new(progress, args.write_artifacts);
+        let result = self.call_scene_build_from_image_inner(args, &mut reporter);
+        if let Err(err) = result.as_ref() {
+            reporter.emit(
+                "scene_build",
+                SceneBuildProgressPhase::Failed,
+                SceneBuildExecutionKind::Mixed,
+                format!("scene build failed: {err}"),
+                json!({ "error": err }),
+            );
+        }
+        result
+    }
+
+    fn call_scene_build_from_image_inner<F>(
+        &mut self,
+        args: SceneBuildFromImageArgs,
+        progress: &mut SceneBuildProgressReporter<'_, F>,
+    ) -> Result<Value, String>
+    where
+        F: FnMut(SceneBuildProgressEvent),
+    {
+        validate_scene_pose_fit_mode(args.pose_fit)?;
         let e2e_started = Instant::now();
         let mut stage_report = Vec::new();
         let prepare_args = ScenePrepareBuildArgs {
             source_scene_path: args.source_scene_path.clone(),
-            object_reference_image_path: args.object_reference_image_path,
-            output_dir: args.output_dir,
+            object_reference_image_path: args.object_reference_image_path.clone(),
+            output_dir: args.output_dir.clone(),
             candidate_count: args.candidate_count,
             quality_profile: args.quality_profile,
             allow_catalog_reuse: args.allow_catalog_reuse,
         };
         let stage_started = Instant::now();
+        progress.emit(
+            "prepare_openai_inputs",
+            SceneBuildProgressPhase::Started,
+            SceneBuildExecutionKind::FileIo,
+            format!(
+                "preparing scene build for {}",
+                args.source_scene_path.display()
+            ),
+            json!({
+                "source_scene_path": args.source_scene_path.display().to_string(),
+                "lift_assets": args.lift_assets,
+                "feedback": args.feedback,
+            }),
+        );
         let config = self.scene_build_config(prepare_args)?;
         let output_dir = config.output_dir.clone();
-        let requested_candidate_count = args
-            .candidate_count
-            .unwrap_or(config.candidate_count)
-            .max(1);
-        let candidates_per_attempt = args
-            .candidate_batch_size
-            .unwrap_or(requested_candidate_count)
-            .max(1);
-        let max_attempts_per_object = args
-            .candidate_retry_attempts
-            .unwrap_or(if args.candidate_batch_size.is_some() {
-                requested_candidate_count
-            } else {
-                1
-            })
-            .max(1);
-        let candidate_policy = ObjectImageGenerationPolicy {
-            min_score: args
-                .min_reconstruction_score
-                .unwrap_or(DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE),
-            max_attempts_per_object,
-            candidates_per_attempt,
-        };
+        progress.set_output_dir(output_dir.clone());
+        let candidate_policy = scene_object_image_generation_policy(&args, config.candidate_count);
         let provider = self.openai_provider()?;
         let mut pipeline = ScenePipeline::new(config, provider);
         let preparation = pipeline
             .prepare_openai_inputs()
             .map_err(|err| err.to_string())?;
         record_stage(&mut stage_report, "prepare_openai_inputs", stage_started);
+        progress.emit_with_items(
+            "prepare_openai_inputs",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::FileIo,
+            "scene build inputs prepared",
+            None,
+            None,
+            Some(output_dir.clone()),
+            json!({ "output_dir": output_dir.display().to_string() }),
+        );
         let stage_started = Instant::now();
+        progress.emit(
+            "plan_objects",
+            SceneBuildProgressPhase::Waiting,
+            SceneBuildExecutionKind::Network,
+            "requesting object plan from OpenAI",
+            json!({
+                "reasoning_model": self.config.openai_reasoning_model,
+                "execution": "network"
+            }),
+        );
         let manifest = pipeline.plan_objects().map_err(|err| err.to_string())?;
         record_stage(&mut stage_report, "plan_objects", stage_started);
+        progress.emit_with_items(
+            "plan_objects",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::Network,
+            format!("planned {} object(s)", manifest.objects.len()),
+            None,
+            Some(manifest.objects.len()),
+            Some(output_dir.join("manifest.json")),
+            json!({ "objects": manifest.objects.len() }),
+        );
         let stage_started = Instant::now();
+        progress.emit(
+            "prepare_object_image_requests",
+            SceneBuildProgressPhase::Started,
+            SceneBuildExecutionKind::Cpu,
+            "preparing isolated object image prompts and crops",
+            json!({ "objects": manifest.objects.len() }),
+        );
         let requests = pipeline
             .prepare_object_image_requests(&manifest)
             .map_err(|err| err.to_string())?;
@@ -789,7 +969,37 @@ impl McpServer {
             "prepare_object_image_requests",
             stage_started,
         );
+        progress.emit_with_items(
+            "prepare_object_image_requests",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::Cpu,
+            format!("prepared {} object image request(s)", requests.len()),
+            None,
+            Some(requests.len()),
+            Some(output_dir.join("object_image_requests.json")),
+            json!({ "requests": requests.len() }),
+        );
         let stage_started = Instant::now();
+        progress.emit_with_items(
+            "generate_object_candidates",
+            SceneBuildProgressPhase::Waiting,
+            SceneBuildExecutionKind::Network,
+            format!(
+                "generating object images: {} request(s), {} candidate(s) per attempt",
+                requests.len(),
+                candidate_policy.candidates_per_attempt
+            ),
+            None,
+            Some(requests.len()),
+            None,
+            json!({
+                "requests": requests.len(),
+                "max_attempts_per_object": candidate_policy.max_attempts_per_object,
+                "candidates_per_attempt": candidate_policy.candidates_per_attempt,
+                "min_score": candidate_policy.min_score,
+                "execution": "network"
+            }),
+        );
         let candidate_report = pipeline
             .generate_object_candidates_with_policy(&requests, candidate_policy)
             .map_err(|err| err.to_string())?;
@@ -797,6 +1007,24 @@ impl McpServer {
             &mut stage_report,
             "generate_object_candidates",
             stage_started,
+        );
+        progress.emit_with_items(
+            "generate_object_candidates",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::Network,
+            format!(
+                "generated {} candidate image(s), selected {}",
+                candidate_report.candidates.len(),
+                candidate_report.selected_candidates.len()
+            ),
+            None,
+            Some(candidate_report.candidates.len()),
+            Some(output_dir.join("candidate_generation.json")),
+            json!({
+                "candidates": candidate_report.candidates.len(),
+                "selected": candidate_report.selected_candidates.len(),
+                "rejected": candidate_report.rejected_objects.len(),
+            }),
         );
         let mut selected = if candidate_report.rejected_objects.is_empty() {
             candidate_report.selected_candidates.clone()
@@ -818,6 +1046,7 @@ impl McpServer {
         });
         if !candidate_report.rejected_objects.is_empty() {
             response["stage_report"] = json!(stage_report);
+            attach_scene_token_usage(&mut response);
             response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
             if args.write_artifacts {
                 write_scene_build_artifacts(&output_dir, &response)?;
@@ -831,6 +1060,7 @@ impl McpServer {
         }
         if !args.lift_assets {
             response["stage_report"] = json!(stage_report);
+            attach_scene_token_usage(&mut response);
             response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
             if args.write_artifacts {
                 write_scene_build_artifacts(&output_dir, &response)?;
@@ -839,6 +1069,25 @@ impl McpServer {
         }
 
         let stage_started = Instant::now();
+        progress.emit_with_items(
+            "images_to_assets",
+            SceneBuildProgressPhase::Started,
+            SceneBuildExecutionKind::Gpu,
+            format!(
+                "lifting {} selected image(s) into TRELLIS assets",
+                selected_values.len()
+            ),
+            None,
+            Some(selected_values.len()),
+            None,
+            json!({
+                "selected": selected_values.len(),
+                "backend": self.config.default_backend,
+                "batch_size": args.batch_size,
+                "batch_vram_mb": args.batch_vram_mb,
+                "trellis_pbr": args.trellis_pbr.unwrap_or(true),
+            }),
+        );
         let mut excluded_asset_candidates = HashSet::new();
         let mut cached_asset_outputs = HashMap::<(String, usize), Value>::new();
         let mut asset_attempts = Vec::new();
@@ -862,6 +1111,22 @@ impl McpServer {
                             .ok_or_else(|| "selected candidate missing image_path".to_string())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                progress.emit_with_items(
+                    "images_to_assets",
+                    SceneBuildProgressPhase::Progress,
+                    SceneBuildExecutionKind::Gpu,
+                    format!(
+                        "running TRELLIS batch for {} image(s)",
+                        input_image_paths.len()
+                    ),
+                    Some(cached_asset_outputs.len()),
+                    Some(selected_values.len()),
+                    None,
+                    json!({
+                        "attempt_index": asset_attempts.len(),
+                        "inputs": input_image_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                    }),
+                );
                 let new_outputs = self.call_images_to_assets(ImagesToAssetsToolArgs {
                     input_image_paths,
                     output_dir: Some(output_dir.join("assets")),
@@ -887,6 +1152,19 @@ impl McpServer {
                     &missing_selected,
                     &new_outputs,
                 )?;
+                progress.emit_with_items(
+                    "images_to_assets",
+                    SceneBuildProgressPhase::Progress,
+                    SceneBuildExecutionKind::Gpu,
+                    "TRELLIS batch complete; checking mesh quality",
+                    Some(cached_asset_outputs.len()),
+                    Some(selected_values.len()),
+                    Some(output_dir.join("assets")),
+                    json!({
+                        "stats": new_outputs.get("stats").cloned().unwrap_or(Value::Null),
+                        "items": new_outputs.get("items").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                    }),
+                );
             }
             let outputs =
                 scene_cached_asset_outputs_for_selected(&selected_values, &cached_asset_outputs)?;
@@ -922,6 +1200,19 @@ impl McpServer {
             selected_values = selected_candidates_to_values(&selected);
         };
         record_stage(&mut stage_report, "images_to_assets", stage_started);
+        progress.emit_with_items(
+            "images_to_assets",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::Gpu,
+            "asset lifting and mesh quality gates complete",
+            None,
+            Some(selected_values.len()),
+            Some(output_dir.join("asset_outputs.json")),
+            json!({
+                "attempts": asset_attempts.len(),
+                "items": asset_outputs.get("items").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+            }),
+        );
         let mesh_quality_failures =
             scene_asset_quality_failures_with_selected(&asset_outputs, &selected_values)
                 .into_iter()
@@ -939,6 +1230,7 @@ impl McpServer {
                 "reason": "Bad mesh topology should not be allowed to propagate into scene placement, feedback, or catalog reuse.",
             });
             response["stage_report"] = json!(stage_report);
+            attach_scene_token_usage(&mut response);
             response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
             if args.write_artifacts {
                 write_scene_build_artifacts(&output_dir, &response)?;
@@ -953,6 +1245,24 @@ impl McpServer {
         let asset_bindings =
             scene_asset_bindings_from_outputs(&manifest, &selected_values, &asset_outputs)?;
         let stage_started = Instant::now();
+        progress.emit(
+            "load_grounding_evidence",
+            SceneBuildProgressPhase::Started,
+            if args.locator == SceneLocatorProvider::LocateAnything {
+                SceneBuildExecutionKind::Gpu
+            } else {
+                SceneBuildExecutionKind::Cpu
+            },
+            if args.locator == SceneLocatorProvider::LocateAnything {
+                "running LocateAnything grounding"
+            } else {
+                "using manifest grounding fallback"
+            },
+            json!({
+                "composition_mode": args.composition_mode,
+                "locator": args.locator,
+            }),
+        );
         let (grounding_source, mut grounding_evidence) =
             if args.composition_mode == SceneCompositionMode::CvGrounded {
                 if args.locator == SceneLocatorProvider::LocateAnything {
@@ -974,12 +1284,53 @@ impl McpServer {
                 ("disabled", manifest_grounding_evidence(&manifest))
             };
         record_stage(&mut stage_report, "load_grounding_evidence", stage_started);
+        let segmentation_provider = args
+            .segmentation_provider
+            .unwrap_or(self.config.scene_segmentation_provider);
+        let segmentation_precision = args
+            .segmentation_precision
+            .unwrap_or(self.config.scene_segmentation_precision);
+        let segmentation_quantization = args
+            .segmentation_quantization
+            .unwrap_or(self.config.scene_segmentation_quantization);
+        let mut segmentation_report = None;
+        progress.emit_with_items(
+            "load_grounding_evidence",
+            SceneBuildProgressPhase::Completed,
+            if args.locator == SceneLocatorProvider::LocateAnything {
+                SceneBuildExecutionKind::Gpu
+            } else {
+                SceneBuildExecutionKind::Cpu
+            },
+            format!(
+                "grounding evidence loaded from {grounding_source}; {} object(s)",
+                grounding_evidence.objects.len()
+            ),
+            None,
+            Some(grounding_evidence.objects.len()),
+            Some(output_dir.join("grounding_evidence.json")),
+            json!({
+                "grounding_source": grounding_source,
+                "objects": grounding_evidence.objects.len(),
+            }),
+        );
         if args.composition_mode == SceneCompositionMode::CvGrounded
             && args.depth_provider == SceneDepthProvider::DepthPro
             && grounding_evidence.depth.is_none()
         {
             let stage_started = Instant::now();
-            self.depth_pro_grounding_evidence(
+            progress.emit(
+                "depth_pro_grounding_evidence",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Gpu,
+                "running DepthPro camera/depth/floor grounding",
+                json!({
+                    "depth_provider": args.depth_provider,
+                    "cache_dir": self.config.depth_cache_dir.clone(),
+                    "precision": self.config.depth_precision,
+                }),
+            );
+            let depth_report = self.depth_pro_grounding_evidence(
                 &mut grounding_evidence,
                 &args.source_scene_path,
                 &output_dir,
@@ -989,8 +1340,97 @@ impl McpServer {
                 "depth_pro_grounding_evidence",
                 stage_started,
             );
+            progress.emit_with_items(
+                "depth_pro_grounding_evidence",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Gpu,
+                "DepthPro grounding complete",
+                None,
+                Some(grounding_evidence.objects.len()),
+                Some(output_dir.join("depth_pro").join("depth_evidence.json")),
+                json!({
+                    "has_depth": grounding_evidence.depth.is_some(),
+                    "runtime_cache_hit": depth_report.runtime_cache_hit,
+                    "load_ms": depth_report.load_ms,
+                    "infer_ms": depth_report.infer_ms,
+                    "floor_sample_count": grounding_evidence
+                        .depth
+                        .as_ref()
+                        .and_then(|depth| depth.floor_sample_count),
+                }),
+            );
+        }
+        if args.composition_mode == SceneCompositionMode::CvGrounded
+            && segmentation_provider != SceneSegmentationProvider::None
+            && grounding_evidence.segmentation.is_none()
+        {
+            let stage_started = Instant::now();
+            progress.emit(
+                "segmentation_grounding_evidence",
+                SceneBuildProgressPhase::Started,
+                if segmentation_provider == SceneSegmentationProvider::BboxPrompt {
+                    SceneBuildExecutionKind::Cpu
+                } else {
+                    SceneBuildExecutionKind::Gpu
+                },
+                "running segmentation mask grounding",
+                json!({
+                    "segmentation_provider": segmentation_provider,
+                    "segmentation_precision": segmentation_precision,
+                    "segmentation_quantization": segmentation_quantization,
+                    "objects": grounding_evidence.objects.len(),
+                }),
+            );
+            segmentation_report = self.segmentation_grounding_evidence(
+                segmentation_provider,
+                Some(segmentation_precision),
+                Some(segmentation_quantization),
+                &mut grounding_evidence,
+                &args.source_scene_path,
+                &output_dir,
+            )?;
+            record_stage(
+                &mut stage_report,
+                "segmentation_grounding_evidence",
+                stage_started,
+            );
+            progress.emit_with_items(
+                "segmentation_grounding_evidence",
+                SceneBuildProgressPhase::Completed,
+                if segmentation_provider == SceneSegmentationProvider::BboxPrompt {
+                    SceneBuildExecutionKind::Cpu
+                } else {
+                    SceneBuildExecutionKind::Gpu
+                },
+                "segmentation mask grounding complete",
+                None,
+                segmentation_report.as_ref().map(|report| report.mask_count),
+                segmentation_report
+                    .as_ref()
+                    .map(|report| report.overlay_path.clone()),
+                json!({
+                    "segmentation_provider": segmentation_provider,
+                    "segmentation_precision": segmentation_precision,
+                    "segmentation_quantization": segmentation_quantization,
+                    "mask_count": segmentation_report.as_ref().map(|report| report.mask_count),
+                    "runtime_cache_hit": segmentation_report.as_ref().map(|report| report.runtime_cache_hit),
+                }),
+            );
         }
         let stage_started = Instant::now();
+        progress.emit(
+            "plan_grounded_scene",
+            SceneBuildProgressPhase::Started,
+            SceneBuildExecutionKind::Cpu,
+            "solving grounded scene layout and projection fit",
+            json!({
+                "asset_bindings": asset_bindings.len(),
+                "objects": grounding_evidence.objects.len(),
+                "composition_mode": args.composition_mode,
+                "requested_pose_fit": args.pose_fit,
+                "pose_fit": ScenePoseFitMode::ProjectedAabb,
+            }),
+        );
         let composition_candidates = scene_composition_candidates(
             args.composition_mode,
             args.feedback && args.lift_assets,
@@ -1006,8 +1446,42 @@ impl McpServer {
         let mut commands = selected_composition.commands.clone();
         let mut feedback_candidate_reports = Vec::new();
         record_stage(&mut stage_report, "plan_grounded_scene", stage_started);
+        progress.emit_with_items(
+            "plan_grounded_scene",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::Cpu,
+            format!(
+                "planned {} composition candidate(s)",
+                composition_candidates.len()
+            ),
+            None,
+            Some(composition_candidates.len()),
+            Some(output_dir.join("grounded_layout.json")),
+            json!({
+                "candidate_count": composition_candidates.len(),
+                "initial_mode": selected_composition.mode,
+                "commands": commands.len(),
+            }),
+        );
         if args.feedback && args.lift_assets {
             let stage_started = Instant::now();
+            progress.emit_with_items(
+                "render_capture_feedback",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Viewer,
+                format!(
+                    "running render-capture-feedback for up to {} iteration(s)",
+                    args.feedback_iters
+                ),
+                None,
+                Some(args.feedback_iters),
+                args.feedback_capture_dir.clone(),
+                json!({
+                    "feedback_iters": args.feedback_iters,
+                    "threshold_profile": args.feedback_threshold_profile,
+                    "rotation_selector": args.feedback_rotation_selector,
+                }),
+            );
             let selection = self.run_scene_composition_feedback_selection(
                 &output_dir,
                 &manifest,
@@ -1040,6 +1514,25 @@ impl McpServer {
             }
             response["feedback"] = feedback;
             record_stage(&mut stage_report, "render_capture_feedback", stage_started);
+            progress.emit_with_items(
+                "render_capture_feedback",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Viewer,
+                "render-capture-feedback complete",
+                None,
+                Some(args.feedback_iters),
+                feedback_report_path_from_result(response.get("feedback").unwrap_or(&Value::Null))
+                    .map(PathBuf::from)
+                    .or_else(|| Some(output_dir.join("feedback_report.json"))),
+                json!({
+                    "candidate_reports": feedback_candidate_reports.len(),
+                    "accepted": response
+                        .get("feedback")
+                        .and_then(|feedback| feedback.get("accepted"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }),
+            );
         }
         let grounded_layout = selected_composition.layout;
         let plan = selected_composition.plan;
@@ -1049,7 +1542,11 @@ impl McpServer {
             serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
         response["requested_composition_mode"] = json!(args.composition_mode);
         response["composition_mode"] = json!(selected_composition.mode);
-        response["pose_fit"] = json!(args.pose_fit);
+        response["requested_pose_fit"] = json!(args.pose_fit);
+        response["pose_fit"] = json!(ScenePoseFitMode::ProjectedAabb);
+        response["pose_fit_note"] = json!(
+            "projected-aabb/contact/depth feedback is the currently implemented deterministic pose fit path"
+        );
         response["canonical_pose"] = json!(args.canonical_pose);
         response["max_pose_candidates"] = json!(args.max_pose_candidates);
         response["save_pose_debug"] = json!(args.save_pose_debug);
@@ -1058,6 +1555,12 @@ impl McpServer {
         }
         response["depth_provider"] = json!(args.depth_provider);
         response["locator"] = json!(args.locator);
+        response["segmentation_provider"] = json!(segmentation_provider);
+        response["segmentation_precision"] = json!(segmentation_precision);
+        response["segmentation_quantization"] = json!(segmentation_quantization);
+        if let Some(report) = segmentation_report {
+            response["segmentation_grounding"] = json!(report);
+        }
         response["grounding_source"] = json!(grounding_source);
         response["grounding_evidence"] =
             serde_json::to_value(&grounding_evidence).map_err(|err| err.to_string())?;
@@ -1065,11 +1568,19 @@ impl McpServer {
         response["plan"] = serde_json::to_value(&plan).map_err(|err| err.to_string())?;
         response["grounded_layout"] =
             serde_json::to_value(&grounded_layout).map_err(|err| err.to_string())?;
+        let command_count = commands.len();
         response["commands"] = json!(commands);
         response["clear_existing"] = json!(args.clear_existing);
         response["apply"] = json!(args.apply);
         if args.apply && !args.feedback {
             let stage_started = Instant::now();
+            progress.emit(
+                "apply_scene_commands",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Viewer,
+                format!("applying {command_count} scene command(s) to Bevy bridge"),
+                json!({ "commands": command_count }),
+            );
             match self
                 .send_scene_commands(response["commands"].as_array().cloned().unwrap_or_default())
             {
@@ -1080,6 +1591,7 @@ impl McpServer {
                     record_stage(&mut stage_report, "apply_scene_commands", stage_started);
                     response["apply_error"] = json!(err);
                     response["stage_report"] = json!(stage_report);
+                    attach_scene_token_usage(&mut response);
                     response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
                     if args.write_artifacts {
                         write_scene_build_artifacts(&output_dir, &response)?;
@@ -1091,12 +1603,42 @@ impl McpServer {
                 }
             }
             record_stage(&mut stage_report, "apply_scene_commands", stage_started);
+            progress.emit(
+                "apply_scene_commands",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Viewer,
+                "scene commands applied",
+                json!({ "commands": command_count }),
+            );
         }
         response["stage_report"] = json!(stage_report);
+        let token_usage = attach_scene_token_usage(&mut response);
         response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
         if args.write_artifacts {
+            progress.emit(
+                "write_scene_build_artifacts",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::FileIo,
+                "writing scene build artifacts",
+                json!({ "output_dir": output_dir.display().to_string() }),
+            );
             write_scene_build_artifacts(&output_dir, &response)?;
         }
+        progress.emit_with_items(
+            "scene_build",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::Mixed,
+            "scene build complete",
+            None,
+            Some(command_count),
+            Some(output_dir.join("scene_build_response_structured.json")),
+            json!({
+                "commands": command_count,
+                "elapsed_ms": elapsed_ms(e2e_started.elapsed()),
+                "failed_stage": response.get("failed_stage").cloned().unwrap_or(Value::Null),
+                "token_usage": token_usage,
+            }),
+        );
         Ok(response)
     }
 
@@ -1143,6 +1685,7 @@ impl McpServer {
     }
 
     pub(crate) fn call_scene_ground(&mut self, args: SceneGroundToolArgs) -> Result<Value, String> {
+        validate_scene_pose_fit_mode(args.pose_fit)?;
         let started = Instant::now();
         let output_dir = args.output_dir.unwrap_or_else(default_scene_output_dir);
         fs::create_dir_all(&output_dir).map_err(|err| {
@@ -1175,13 +1718,46 @@ impl McpServer {
             ("manifest_fallback", manifest_grounding_evidence(&manifest))
         };
         record_stage(&mut stage_report, "load_grounding_evidence", stage_started);
+        let segmentation_provider = args
+            .segmentation_provider
+            .unwrap_or(self.config.scene_segmentation_provider);
+        let segmentation_precision = args
+            .segmentation_precision
+            .unwrap_or(self.config.scene_segmentation_precision);
+        let segmentation_quantization = args
+            .segmentation_quantization
+            .unwrap_or(self.config.scene_segmentation_quantization);
+        let mut segmentation_report = None;
 
         if args.depth_provider == SceneDepthProvider::DepthPro && evidence.depth.is_none() {
             let stage_started = Instant::now();
-            self.depth_pro_grounding_evidence(&mut evidence, &args.source_scene_path, &output_dir)?;
+            let _depth_report = self.depth_pro_grounding_evidence(
+                &mut evidence,
+                &args.source_scene_path,
+                &output_dir,
+            )?;
             record_stage(
                 &mut stage_report,
                 "depth_pro_grounding_evidence",
+                stage_started,
+            );
+        }
+        if args.composition_mode == SceneCompositionMode::CvGrounded
+            && segmentation_provider != SceneSegmentationProvider::None
+            && evidence.segmentation.is_none()
+        {
+            let stage_started = Instant::now();
+            segmentation_report = self.segmentation_grounding_evidence(
+                segmentation_provider,
+                Some(segmentation_precision),
+                Some(segmentation_quantization),
+                &mut evidence,
+                &args.source_scene_path,
+                &output_dir,
+            )?;
+            record_stage(
+                &mut stage_report,
+                "segmentation_grounding_evidence",
                 stage_started,
             );
         }
@@ -1207,12 +1783,17 @@ impl McpServer {
             "tool": "scene_ground",
             "source_scene_path": args.source_scene_path,
             "requested_composition_mode": args.composition_mode,
-            "pose_fit": args.pose_fit,
+            "requested_pose_fit": args.pose_fit,
+            "pose_fit": ScenePoseFitMode::ProjectedAabb,
+            "pose_fit_note": "projected-aabb/contact/depth feedback is the currently implemented deterministic pose fit path",
             "canonical_pose": args.canonical_pose,
             "max_pose_candidates": args.max_pose_candidates,
             "save_pose_debug": args.save_pose_debug,
             "depth_provider": args.depth_provider,
             "locator": args.locator,
+            "segmentation_provider": segmentation_provider,
+            "segmentation_precision": segmentation_precision,
+            "segmentation_quantization": segmentation_quantization,
             "grounding_source": grounding_source,
             "manifest": manifest.clone(),
             "asset_bindings": asset_bindings.clone(),
@@ -1220,6 +1801,9 @@ impl McpServer {
             "clear_existing": args.clear_existing,
             "apply": args.apply,
         });
+        if let Some(report) = segmentation_report {
+            response["segmentation_grounding"] = json!(report);
+        }
 
         if args.feedback {
             let stage_started = Instant::now();
@@ -1260,6 +1844,8 @@ impl McpServer {
         let plan = selected_composition.plan;
         let bsn = feedback_bsn_from_commands(&asset_bindings, &grounded_layout, &commands)?;
         response["composition_mode"] = json!(selected_composition.mode);
+        response["requested_pose_fit"] = json!(args.pose_fit);
+        response["pose_fit"] = json!(ScenePoseFitMode::ProjectedAabb);
         if !feedback_candidate_reports.is_empty() {
             response["composition_candidate_reports"] = json!(feedback_candidate_reports);
         }
@@ -1690,7 +2276,7 @@ impl McpServer {
             threshold_profile,
             rotation_selector,
         } = context;
-        let mut commands = initial_commands;
+        let mut commands = scene_commands_with_asset_local_aabbs(initial_commands, asset_bindings);
         let thresholds = threshold_profile.thresholds();
         let mut iterations = Vec::new();
         let mut accepted_iteration = None;
@@ -1721,14 +2307,14 @@ impl McpServer {
             let apply_ack = self.send_scene_commands(commands.clone())?;
             write_json_file(&iteration_dir.join("apply_ack.json"), &apply_ack)
                 .map_err(|err| err.to_string())?;
-            thread::sleep(Duration::from_millis(250));
             let screenshot_path = iteration_dir.join("screenshot.png");
-            let capture = self.call_scene_capture(SceneCaptureArgs {
-                output_path: screenshot_path.clone(),
-            })?;
+            let (capture, status) = self.capture_feedback_when_projected_ready(
+                &apply_ack,
+                &screenshot_path,
+                grounded_layout.placements.len(),
+            )?;
             write_json_file(&iteration_dir.join("capture_ack.json"), &capture)
                 .map_err(|err| err.to_string())?;
-            let status = Self::feedback_capture_status(&apply_ack, &capture);
             write_json_file(&iteration_dir.join("status.json"), &status)
                 .map_err(|err| err.to_string())?;
             let mut metrics = scene_feedback_metrics(
@@ -1918,6 +2504,32 @@ impl McpServer {
         }))
     }
 
+    fn capture_feedback_when_projected_ready(
+        &self,
+        apply_ack: &Value,
+        screenshot_path: &Path,
+        expected_items: usize,
+    ) -> Result<(Value, Value), String> {
+        let timeout = self.config.scene_timeout.max(Duration::from_secs(10));
+        let started = Instant::now();
+        let mut attempt = 0usize;
+        loop {
+            let capture = self.call_scene_capture(SceneCaptureArgs {
+                output_path: screenshot_path.to_path_buf(),
+            })?;
+            let status = Self::feedback_capture_status(apply_ack, &capture);
+            if Self::feedback_status_projected_items_ready(&status, expected_items) {
+                return Ok((capture, status));
+            }
+            if started.elapsed() >= timeout {
+                return Ok((capture, status));
+            }
+            attempt = attempt.saturating_add(1);
+            let sleep_ms = if attempt < 4 { 250 } else { 500 };
+            thread::sleep(Duration::from_millis(sleep_ms));
+        }
+    }
+
     fn apply_feedback_rotation_selector(
         &self,
         selector: FeedbackRotationSelector,
@@ -1990,6 +2602,29 @@ impl McpServer {
             .cloned()
             .or_else(|| apply_ack.get("status").cloned())
             .unwrap_or(Value::Null)
+    }
+
+    pub(crate) fn feedback_status_projected_items_ready(
+        status: &Value,
+        expected_items: usize,
+    ) -> bool {
+        if expected_items == 0 {
+            return true;
+        }
+        let Some(projected_items) = status.get("projected_items").and_then(Value::as_array) else {
+            return false;
+        };
+        if projected_items.len() < expected_items {
+            return false;
+        }
+        projected_items.iter().take(expected_items).all(|item| {
+            item.get("screen_bbox").and_then(Value::as_array).is_some()
+                && item
+                    .get("projected_corners")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|corners| corners > 0)
+                && item.get("world_aabb").is_some_and(|value| !value.is_null())
+        })
     }
 
     pub(crate) fn send_scene_commands(&self, commands: Vec<Value>) -> Result<Value, String> {

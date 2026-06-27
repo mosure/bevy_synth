@@ -3,6 +3,7 @@ use crate::server::McpServer;
 use crate::server::run_stdio_server;
 
 pub fn run_from_args(args: ServerArgs) -> Result<(), String> {
+    configure_cubecl_runtime(&args)?;
     let command = args.command.clone();
     let config = ServerConfig::from_args(args);
     match command {
@@ -13,6 +14,38 @@ pub fn run_from_args(args: ServerArgs) -> Result<(), String> {
         }
         None => run_stdio_server(config),
     }
+}
+
+fn configure_cubecl_runtime(args: &ServerArgs) -> Result<(), String> {
+    if args.cubecl_autotune_level == CubeClAutotuneLevelSetting::Default
+        && args.cubecl_autotune_cache == CubeClAutotuneCacheSetting::Default
+    {
+        return Ok(());
+    }
+
+    let mut config = cubecl::config::CubeClRuntimeConfig::default();
+    config.autotune.level = match args.cubecl_autotune_level {
+        CubeClAutotuneLevelSetting::Default => config.autotune.level,
+        CubeClAutotuneLevelSetting::Minimal => cubecl::config::autotune::AutotuneLevel::Minimal,
+        CubeClAutotuneLevelSetting::Balanced => cubecl::config::autotune::AutotuneLevel::Balanced,
+        CubeClAutotuneLevelSetting::Extensive => cubecl::config::autotune::AutotuneLevel::Extensive,
+        CubeClAutotuneLevelSetting::Full => cubecl::config::autotune::AutotuneLevel::Full,
+    };
+    config.autotune.cache = match args.cubecl_autotune_cache {
+        CubeClAutotuneCacheSetting::Default => config.autotune.cache,
+        CubeClAutotuneCacheSetting::Local => cubecl::config::cache::CacheConfig::Local,
+        CubeClAutotuneCacheSetting::Target => cubecl::config::cache::CacheConfig::Target,
+        CubeClAutotuneCacheSetting::Global => cubecl::config::cache::CacheConfig::Global,
+    };
+
+    std::panic::catch_unwind(move || {
+        <cubecl::config::CubeClRuntimeConfig as cubecl::config::RuntimeConfig>::set(config);
+    })
+    .map_err(|_| {
+        "CubeCL runtime configuration was already initialized before MCP startup; pass \
+         --cubecl-autotune-* flags earlier or use Burn.toml/cubecl.toml configuration"
+            .to_string()
+    })
 }
 
 fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Result<(), String> {
@@ -42,6 +75,9 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         depth_provider: args.depth_provider,
         locator: args.locator,
         locate_anything_backend: args.locate_anything_backend,
+        segmentation_provider: args.segmentation_provider,
+        segmentation_precision: args.segmentation_precision,
+        segmentation_quantization: args.segmentation_quantization,
         write_artifacts: args.write_artifacts,
         apply: args.apply,
         clear_existing: args.clear_existing,
@@ -80,6 +116,9 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         depth_provider: args.depth_provider,
         locator: args.locator,
         locate_anything_backend: args.locate_anything_backend,
+        segmentation_provider: args.segmentation_provider,
+        segmentation_precision: args.segmentation_precision,
+        segmentation_quantization: args.segmentation_quantization,
         clear_existing: args.clear_existing,
         apply: args.apply,
         feedback: args.feedback,

@@ -1,6 +1,7 @@
 __pycache__/
 
 .env
+Burn.toml
 debug/
 target/
 vendor/
@@ -16,6 +17,10 @@ docs/reports/
 *.py
 !crates/burn_locate_anything/python/
 !crates/burn_locate_anything/python/locate_anything_reference.py
+!crates/burn_segmentation/python/
+!crates/burn_segmentation/python/sam2_export_components.py
+!crates/burn_segmentation/python/sam2_python_bench.py
+!crates/burn_segmentation/python/sam2_reference.py
 
 *.ply
 *.obj

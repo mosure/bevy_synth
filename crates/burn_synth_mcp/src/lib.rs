@@ -13,19 +13,32 @@ pub use cli::run_from_args;
 pub use protocol::SceneBuildFromImageArgs;
 pub use server::run_stdio_server;
 pub use types::{
-    AssetOutputFormat, FeedbackRotationSelector, FeedbackThresholdProfile, ForegroundModel,
-    InferenceBackend, LocateAnythingBackend, MeshOutputFormat, QualityPreset,
-    SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthPrecision, SceneDepthProvider,
-    SceneLocatorProvider, ScenePoseFitMode, ServerArgs, ServerConfig, SynthesisModel,
-    TrellisQuality,
+    AssetOutputFormat, CubeClAutotuneCacheSetting, CubeClAutotuneLevelSetting,
+    FeedbackRotationSelector, FeedbackThresholdProfile, ForegroundModel, InferenceBackend,
+    LocateAnythingBackend, MeshOutputFormat, QualityPreset, SceneBuildExecutionKind,
+    SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
+    SceneDepthPrecision, SceneDepthProvider, SceneLocatorProvider, ScenePoseFitMode,
+    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
+    ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(
     config: ServerConfig,
     args: SceneBuildFromImageArgs,
 ) -> Result<serde_json::Value, String> {
+    run_scene_build_from_image_with_progress(config, args, |_| {})
+}
+
+pub fn run_scene_build_from_image_with_progress<F>(
+    config: ServerConfig,
+    args: SceneBuildFromImageArgs,
+    mut progress: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnMut(SceneBuildProgressEvent),
+{
     let mut server = server::McpServer::new(config);
-    server.call_scene_build_from_image(args)
+    server.call_scene_build_from_image_with_progress(args, &mut progress)
 }
 
 #[cfg(test)]

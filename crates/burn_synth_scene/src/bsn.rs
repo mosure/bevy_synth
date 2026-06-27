@@ -218,6 +218,7 @@ pub fn scene_plan_to_mcp_commands(
             commands.push(json!({
                 "type": "spawn_cached",
                 "cache_key": cache_key,
+                "local_aabb": asset.local_aabb,
                 "translation": placement.translation,
                 "rotation": rotation,
                 "scale": placement.scale,
@@ -228,6 +229,7 @@ pub fn scene_plan_to_mcp_commands(
                 "type": "spawn_path",
                 "path": path,
                 "cache_key": asset.asset_id,
+                "local_aabb": asset.local_aabb,
                 "translation": placement.translation,
                 "rotation": rotation,
                 "scale": placement.scale,

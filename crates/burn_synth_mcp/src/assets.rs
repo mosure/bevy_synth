@@ -439,7 +439,7 @@ pub(crate) fn default_scene_composition_mode() -> SceneCompositionMode {
 }
 
 pub(crate) fn default_scene_pose_fit_mode() -> ScenePoseFitMode {
-    ScenePoseFitMode::RenderedSilhouette
+    ScenePoseFitMode::ProjectedAabb
 }
 
 pub(crate) fn default_scene_canonical_pose_mode() -> SceneCanonicalPoseMode {
@@ -502,8 +502,149 @@ pub(crate) fn record_stage(stage_report: &mut Vec<Value>, stage: &str, started: 
     }));
 }
 
+pub(crate) fn append_scene_progress_event(
+    output_dir: &Path,
+    event: &SceneBuildProgressEvent,
+) -> Result<(), String> {
+    fs::create_dir_all(output_dir).map_err(|err| {
+        format!(
+            "create scene progress artifact directory {}: {err}",
+            output_dir.display()
+        )
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_dir.join("progress_events.jsonl"))
+        .map_err(|err| {
+            format!(
+                "open scene progress artifact {}: {err}",
+                output_dir.join("progress_events.jsonl").display()
+            )
+        })?;
+    let line = serde_json::to_string(event)
+        .map_err(|err| format!("serialize scene progress event: {err}"))?;
+    writeln!(file, "{line}").map_err(|err| {
+        format!(
+            "write scene progress artifact {}: {err}",
+            output_dir.join("progress_events.jsonl").display()
+        )
+    })
+}
+
 pub(crate) fn elapsed_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Clone, Debug, Default)]
+struct TokenUsageAccumulator {
+    requests: usize,
+    reported_requests: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    image_tokens: u64,
+    text_tokens: u64,
+}
+
+impl TokenUsageAccumulator {
+    fn record(&mut self, usage: Option<&Value>) {
+        self.requests = self.requests.saturating_add(1);
+        let Some(usage) = usage else {
+            return;
+        };
+        if usage.is_null() {
+            return;
+        }
+        self.reported_requests = self.reported_requests.saturating_add(1);
+        let input_tokens = usage_u64(usage, &["input_tokens", "prompt_tokens"]);
+        let output_tokens = usage_u64(usage, &["output_tokens", "completion_tokens"]);
+        let total_tokens = usage_u64(usage, &["total_tokens"]).unwrap_or_else(|| {
+            input_tokens
+                .unwrap_or(0)
+                .saturating_add(output_tokens.unwrap_or(0))
+        });
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens.unwrap_or(0));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(output_tokens.unwrap_or(0));
+        self.total_tokens = self.total_tokens.saturating_add(total_tokens);
+        self.image_tokens = self.image_tokens.saturating_add(
+            usage_pointer_u64(usage, "/input_tokens_details/image_tokens")
+                .or_else(|| usage_pointer_u64(usage, "/prompt_tokens_details/image_tokens"))
+                .unwrap_or(0),
+        );
+        self.text_tokens = self.text_tokens.saturating_add(
+            usage_pointer_u64(usage, "/input_tokens_details/text_tokens")
+                .or_else(|| usage_pointer_u64(usage, "/prompt_tokens_details/text_tokens"))
+                .unwrap_or(0),
+        );
+    }
+
+    fn as_value(&self) -> Value {
+        json!({
+            "requests": self.requests,
+            "reported_requests": self.reported_requests,
+            "unreported_requests": self.requests.saturating_sub(self.reported_requests),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "image_tokens": self.image_tokens,
+            "text_tokens": self.text_tokens,
+        })
+    }
+}
+
+pub(crate) fn scene_token_usage_summary(provider_metadata: &Value) -> Value {
+    let mut total = TokenUsageAccumulator::default();
+    let mut by_stage = std::collections::BTreeMap::<String, TokenUsageAccumulator>::new();
+    if let Some(requests) = provider_metadata.get("requests").and_then(Value::as_array) {
+        for request in requests {
+            let stage = request
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let usage = request.get("usage");
+            total.record(usage);
+            by_stage.entry(stage).or_default().record(usage);
+        }
+    }
+    let by_stage = by_stage
+        .into_iter()
+        .map(|(stage, usage)| {
+            let mut value = usage.as_value();
+            value["stage"] = json!(stage);
+            value
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "provider": provider_metadata.get("provider").cloned().unwrap_or(Value::Null),
+        "total": total.as_value(),
+        "by_stage": by_stage,
+    })
+}
+
+pub(crate) fn attach_scene_token_usage(response: &mut Value) -> Value {
+    let summary =
+        scene_token_usage_summary(response.get("provider_metadata").unwrap_or(&Value::Null));
+    response["token_usage"] = summary.clone();
+    summary
+}
+
+fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(value_as_u64))
+}
+
+fn usage_pointer_u64(value: &Value, pointer: &str) -> Option<u64> {
+    value.pointer(pointer).and_then(value_as_u64)
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().map(|value| value.max(0.0).round() as u64))
 }
 
 pub(crate) fn scene_build_summary(response: &Value, elapsed: Duration) -> Value {
@@ -602,6 +743,7 @@ pub(crate) fn scene_build_summary(response: &Value, elapsed: Duration) -> Value 
             "gate_passed": feedback_gate_passed,
         })).unwrap_or(Value::Null),
         "stage_report": response.get("stage_report").cloned().unwrap_or(Value::Null),
+        "token_usage": response.get("token_usage").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -807,6 +949,7 @@ pub(crate) fn write_scene_build_artifacts(
         ("manifest", "manifest.json"),
         ("object_image_requests", "object_image_requests.json"),
         ("provider_metadata", "provider_metadata.json"),
+        ("token_usage", "token_usage.json"),
         ("candidate_generation", "candidate_generation.json"),
         ("candidates", "candidates.json"),
         ("selected_candidates", "selected_candidates.json"),
@@ -852,7 +995,7 @@ impl McpServer {
         evidence: &mut SceneGroundingEvidence,
         source_scene_path: &Path,
         output_dir: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<DepthProGroundingReport, String> {
         let config = DepthProGroundingConfig {
             cache_dir: self.config.depth_cache_dir.clone(),
             precision: self.config.depth_precision.into(),
@@ -861,7 +1004,58 @@ impl McpServer {
         };
         self.grounding
             .depth_pro_grounding_evidence(evidence, source_scene_path, output_dir, config)
-            .map(|_| ())
+    }
+
+    pub(crate) fn segmentation_grounding_evidence(
+        &mut self,
+        provider: SceneSegmentationProvider,
+        precision: Option<SceneSegmentationPrecision>,
+        quantization: Option<SceneSegmentationQuantization>,
+        evidence: &mut SceneGroundingEvidence,
+        source_scene_path: &Path,
+        output_dir: &Path,
+    ) -> Result<Option<SegmentationGroundingReport>, String> {
+        let precision = precision.unwrap_or(self.config.scene_segmentation_precision);
+        let quantization = quantization.unwrap_or(self.config.scene_segmentation_quantization);
+        let config = match provider {
+            SceneSegmentationProvider::None => return Ok(None),
+            SceneSegmentationProvider::BboxPrompt => SegmentationGroundingConfig {
+                model: SegmentationModelKind::BboxPrompt,
+                backend: SegmentationRuntimeBackend::BboxPrompt,
+                model_root: self.config.scene_segmentation_model_root.clone(),
+                cache_dir: self.config.scene_segmentation_cache_dir.clone(),
+                cdn_base_url: self.config.scene_segmentation_cdn_base_url.clone(),
+                precision: precision.into(),
+                quantization: quantization.into(),
+                allow_download: self.config.scene_segmentation_allow_download,
+                require_gpu: false,
+            },
+            SceneSegmentationProvider::Sam2 => SegmentationGroundingConfig {
+                model: SegmentationModelKind::Sam2,
+                backend: SegmentationRuntimeBackend::BurnNative,
+                model_root: self.config.scene_segmentation_model_root.clone(),
+                cache_dir: self.config.scene_segmentation_cache_dir.clone(),
+                cdn_base_url: self.config.scene_segmentation_cdn_base_url.clone(),
+                precision: precision.into(),
+                quantization: quantization.into(),
+                allow_download: self.config.scene_segmentation_allow_download,
+                require_gpu: true,
+            },
+            SceneSegmentationProvider::Sam3 => SegmentationGroundingConfig {
+                model: SegmentationModelKind::Sam3,
+                backend: SegmentationRuntimeBackend::BurnNative,
+                model_root: self.config.scene_segmentation_model_root.clone(),
+                cache_dir: self.config.scene_segmentation_cache_dir.clone(),
+                cdn_base_url: self.config.scene_segmentation_cdn_base_url.clone(),
+                precision: precision.into(),
+                quantization: quantization.into(),
+                allow_download: self.config.scene_segmentation_allow_download,
+                require_gpu: true,
+            },
+        };
+        self.grounding
+            .segmentation_grounding_evidence(evidence, source_scene_path, output_dir, config)
+            .map(Some)
     }
 }
 

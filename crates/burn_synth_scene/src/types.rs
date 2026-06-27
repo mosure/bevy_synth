@@ -53,12 +53,26 @@ pub struct SceneGroundingEvidence {
     pub source_image_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<DepthEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segmentation: Option<SegmentationEvidenceRef>,
     #[serde(default)]
     pub detections: Vec<Detection>,
     pub camera: EstimatedCamera,
     pub floor: EstimatedFloorPlane,
     #[serde(default)]
     pub objects: Vec<ObjectGroundingEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SegmentationEvidenceRef {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -127,6 +141,8 @@ pub struct ObjectGroundingEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detection: Option<Detection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<ObjectMaskEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_pixel: Option<[f32; 2]>,
@@ -140,6 +156,20 @@ pub struct ObjectGroundingEvidence {
     pub target_footprint_m: Option<[f32; 2]>,
     #[serde(default)]
     pub provenance: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ObjectMaskEvidence {
+    pub provider: String,
+    pub model: String,
+    pub bbox: [f32; 4],
+    pub score: f32,
+    pub area_px: u32,
+    pub image_size: [u32; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_png_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]

@@ -249,13 +249,16 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "trellis_pbr_texture_size": { "type": "integer", "description": "TRELLIS PBR texture size." },
                     "promote_to_catalog": { "type": "boolean", "description": "Add lifted objects to the shared Bevy catalog/cache for later reuse. Defaults to true; fresh scene mode still does not read existing catalog assets while planning." },
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"], "description": "Scene composition path after lifting. Full scene-build defaults to cv-grounded." },
-                    "pose_fit": { "type": "string", "enum": ["projected-aabb", "rendered-silhouette"], "description": "Pose fitting strategy used inside cv-grounded composition." },
+                    "pose_fit": { "type": "string", "enum": ["projected-aabb"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette is reserved but not implemented yet." },
                     "canonical_pose": { "type": "string", "enum": ["off", "auto"], "description": "Canonical asset orientation strategy for cv-grounded composition." },
                     "max_pose_candidates": { "type": "integer", "description": "Maximum deterministic pose candidates per object." },
                     "save_pose_debug": { "type": "boolean", "description": "Write canonical pose, pose-fit candidate, and camera grounding artifacts." },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"], "description": "Depth provider for CV-grounded scene composition." },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"], "description": "Object locator for CV-grounded scene composition. Full scene-build defaults to locate-anything." },
                     "locate_anything_backend": { "type": "string", "enum": ["burn-native"], "description": "Optional backend override when locator is locate-anything." },
+                    "segmentation_provider": { "type": "string", "enum": ["none", "bbox-prompt", "sam2", "sam3"], "description": "Optional mask provider for CV-grounded composition. bbox-prompt writes deterministic bbox masks; SAM modes require Burn-native support." },
+                    "segmentation_precision": { "type": "string", "enum": ["f32", "f16", "bf16"], "description": "Segmentation artifact precision override." },
+                    "segmentation_quantization": { "type": "string", "enum": ["none", "q8", "q4"], "description": "Segmentation artifact quantization override." },
                     "write_artifacts": { "type": "boolean", "description": "Write structured e2e artifacts such as selected candidates, asset outputs, grounded layout, commands, summary, and scene.bsn to output_dir. Defaults to true." },
                     "clear_existing": { "type": "boolean" },
                     "apply": { "type": "boolean" },
@@ -286,13 +289,16 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "grounding_evidence": { "type": "object", "description": "Optional SceneGroundingEvidence. When omitted, manifest bbox/contact points are used as an explicit fallback." },
                     "output_dir": { "type": "string" },
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"] },
-                    "pose_fit": { "type": "string", "enum": ["projected-aabb", "rendered-silhouette"] },
+                    "pose_fit": { "type": "string", "enum": ["projected-aabb"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette is reserved but not implemented yet." },
                     "canonical_pose": { "type": "string", "enum": ["off", "auto"] },
                     "max_pose_candidates": { "type": "integer" },
                     "save_pose_debug": { "type": "boolean" },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"] },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"] },
                     "locate_anything_backend": { "type": "string", "enum": ["burn-native"], "description": "Optional backend override when locator is locate-anything. Defaults to the server --locate-anything-backend setting." },
+                    "segmentation_provider": { "type": "string", "enum": ["none", "bbox-prompt", "sam2", "sam3"], "description": "Optional mask provider for CV-grounded composition." },
+                    "segmentation_precision": { "type": "string", "enum": ["f32", "f16", "bf16"] },
+                    "segmentation_quantization": { "type": "string", "enum": ["none", "q8", "q4"] },
                     "clear_existing": { "type": "boolean" },
                     "apply": { "type": "boolean" },
                     "feedback": { "type": "boolean" },
@@ -795,6 +801,12 @@ pub struct SceneBuildFromImageArgs {
     pub locator: SceneLocatorProvider,
     #[serde(default)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+    #[serde(default)]
+    pub segmentation_provider: Option<SceneSegmentationProvider>,
+    #[serde(default)]
+    pub segmentation_precision: Option<SceneSegmentationPrecision>,
+    #[serde(default)]
+    pub segmentation_quantization: Option<SceneSegmentationQuantization>,
     #[serde(default = "default_scene_write_artifacts")]
     pub write_artifacts: bool,
     #[serde(default)]
@@ -840,6 +852,12 @@ pub(crate) struct SceneGroundToolArgs {
     pub locator: SceneLocatorProvider,
     #[serde(default)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+    #[serde(default)]
+    pub segmentation_provider: Option<SceneSegmentationProvider>,
+    #[serde(default)]
+    pub segmentation_precision: Option<SceneSegmentationPrecision>,
+    #[serde(default)]
+    pub segmentation_quantization: Option<SceneSegmentationQuantization>,
     #[serde(default = "default_scene_clear_existing")]
     pub clear_existing: bool,
     #[serde(default)]

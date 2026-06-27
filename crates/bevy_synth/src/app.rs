@@ -88,9 +88,10 @@ use std::sync::{
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_mcp::{
     FeedbackRotationSelector, FeedbackThresholdProfile, InferenceBackend as McpInferenceBackend,
-    LocateAnythingBackend, QualityPreset as McpQualityPreset, SceneBuildFromImageArgs,
+    LocateAnythingBackend, QualityPreset as McpQualityPreset, SceneBuildExecutionKind,
+    SceneBuildFromImageArgs, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
-    ScenePoseFitMode, ServerArgs, ServerConfig, run_scene_build_from_image,
+    ScenePoseFitMode, ServerArgs, ServerConfig, run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
@@ -140,12 +141,15 @@ use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
 use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
 #[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_ui::SceneProcessingEvent;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_ui::SceneQualityProfileSetting;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogMode,
     CatalogScenePreviewItem, CatalogSpawnAsset, CatalogSpawnRequest, CatalogState, CatalogStatus,
     CatalogUiState, DragState, MainCamera, SceneBuildRequest, SceneDeleteRequest, SceneLoadRequest,
-    ScenePipelineUiSettings, SceneSaveKind, SceneSaveRequest, UiRootNode, preview_light_layers,
+    ScenePipelineUiSettings, SceneProcessingState, SceneSaveKind, SceneSaveRequest, UiRootNode,
+    ViewerAabbOverlayMode, ViewerDebugSettings, preview_light_layers,
 };
 
 use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -215,6 +219,7 @@ impl Plugin for PanOrbitCameraPlugin {
 #[derive(Component, Clone, Debug)]
 pub(crate) struct CachedMeshInstance {
     pub(crate) cache_key: String,
+    pub(crate) local_aabb: Option<CachedAssetAabb>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +237,7 @@ struct PendingSceneBsnSave {
 #[derive(Resource, Default)]
 struct PendingSceneBuild {
     receiver: Option<Mutex<Receiver<Result<SceneBuildOutput, String>>>>,
+    progress_receiver: Option<Mutex<Receiver<SceneBuildProgressEvent>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -721,6 +727,8 @@ enum McpSceneCommand {
     SpawnCached {
         cache_key: String,
         #[serde(default)]
+        local_aabb: Option<CachedAssetAabb>,
+        #[serde(default)]
         translation: Option<[f32; 3]>,
         #[serde(default)]
         rotation: Option<[f32; 4]>,
@@ -733,6 +741,8 @@ enum McpSceneCommand {
         path: PathBuf,
         #[serde(default)]
         cache_key: Option<String>,
+        #[serde(default)]
+        local_aabb: Option<CachedAssetAabb>,
         #[serde(default)]
         translation: Option<[f32; 3]>,
         #[serde(default)]
@@ -997,6 +1007,7 @@ pub(crate) fn run() {
                 update_selection_from_primary_click
                     .after(TransformGizmoSystems::Main)
                     .after(sync_gaussian_splat_pick_bounds),
+                draw_viewer_debug_overlays.after(sync_gaussian_splat_pick_bounds),
             ),
         );
     }
@@ -1012,6 +1023,7 @@ pub(crate) fn run() {
                 update_selection_from_primary_click
                     .after(TransformGizmoSystems::Main)
                     .after(sync_gaussian_splat_pick_bounds),
+                draw_viewer_debug_overlays.after(sync_gaussian_splat_pick_bounds),
             ),
         );
     }
@@ -1974,7 +1986,13 @@ fn hydrate_from_cache(
             );
             continue;
         };
-        spawn_cached_asset_instance(commands, handles, transform, Some(item.cache_key.clone()));
+        spawn_cached_asset_instance(
+            commands,
+            handles,
+            transform,
+            Some(item.cache_key.clone()),
+            None,
+        );
         loaded_world_items += 1;
     }
 
@@ -2735,6 +2753,7 @@ fn handle_file_dialog_loads(
     scene_settings: Res<ScenePipelineUiSettings>,
     #[cfg(not(target_arch = "wasm32"))] mut pending_scene_build: ResMut<PendingSceneBuild>,
     exit_state: Res<ExitState>,
+    mut processing: ResMut<SceneProcessingState>,
     mut interaction_lock: ResMut<SceneInteractionLock>,
     read_only: Res<SceneReadOnlyMode>,
 ) {
@@ -2755,6 +2774,7 @@ fn handle_file_dialog_loads(
                 &args,
                 &scene_settings,
                 &mut status,
+                &mut processing,
                 &mut interaction_lock,
                 #[cfg(not(target_arch = "wasm32"))]
                 pending_scene_build.as_mut(),
@@ -2797,6 +2817,7 @@ fn handle_dropped_files(
     scene_settings: Res<ScenePipelineUiSettings>,
     #[cfg(not(target_arch = "wasm32"))] mut pending_scene_build: ResMut<PendingSceneBuild>,
     exit_state: Res<ExitState>,
+    mut processing: ResMut<SceneProcessingState>,
     mut interaction_lock: ResMut<SceneInteractionLock>,
     read_only: Res<SceneReadOnlyMode>,
 ) {
@@ -2817,6 +2838,7 @@ fn handle_dropped_files(
                 &args,
                 &scene_settings,
                 &mut status,
+                &mut processing,
                 &mut interaction_lock,
                 #[cfg(not(target_arch = "wasm32"))]
                 pending_scene_build.as_mut(),
@@ -2874,7 +2896,7 @@ fn handle_scene_save_requests(
         return;
     };
 
-    let world_items = collect_cached_world_items(&cached_query);
+    let (world_items, _) = collect_cached_world_items(&cached_query);
     let camera_state = camera_query
         .single()
         .ok()
@@ -3400,6 +3422,7 @@ fn ingest_scene_candidate_file(
     args: &AppArgs,
     scene_settings: &ScenePipelineUiSettings,
     status: &mut UiStatus,
+    processing: &mut SceneProcessingState,
     interaction_lock: &mut SceneInteractionLock,
     pending: &mut PendingSceneBuild,
 ) -> usize {
@@ -3430,19 +3453,26 @@ fn ingest_scene_candidate_file(
     let app_args = args.clone();
     let source_path_for_thread = source_path.clone();
     let (sender, receiver) = mpsc::channel();
+    let (progress_sender, progress_receiver) = mpsc::channel();
     pending.receiver = Some(Mutex::new(receiver));
+    pending.progress_receiver = Some(Mutex::new(progress_receiver));
     interaction_lock.set(true, Some("building scene".to_string()));
-    status.worker_message = Some(format!(
-        "scene build: {}",
-        source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("image")
-    ));
+    let source_label = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string();
+    processing.begin(source_label.clone());
+    status.worker_message = Some(format!("scene build queued: {source_label}"));
     status.message = status.worker_message.clone().unwrap_or_default();
     std::thread::spawn(move || {
-        let result =
-            run_scene_build_for_ui(source_path_for_thread, source_bytes, app_args, settings);
+        let result = run_scene_build_for_ui(
+            source_path_for_thread,
+            source_bytes,
+            app_args,
+            settings,
+            progress_sender,
+        );
         let _ = sender.send(result);
     });
     1
@@ -3457,6 +3487,7 @@ fn ingest_scene_candidate_file(
     _args: &AppArgs,
     _scene_settings: &ScenePipelineUiSettings,
     status: &mut UiStatus,
+    _processing: &mut SceneProcessingState,
     _interaction_lock: &mut SceneInteractionLock,
 ) -> usize {
     status.message =
@@ -3510,6 +3541,7 @@ fn run_scene_build_for_ui(
     source_image_bytes: Option<Vec<u8>>,
     app_args: AppArgs,
     settings: ScenePipelineUiSettings,
+    progress_sender: mpsc::Sender<SceneBuildProgressEvent>,
 ) -> Result<SceneBuildOutput, String> {
     let mut server_args = ServerArgs::parse_from(["burn_synth_mcp"]);
     server_args.backend = match app_args.backend {
@@ -3536,7 +3568,7 @@ fn run_scene_build_for_ui(
             .join("runs")
             .join(format!("{}_scene_ui_explicit", unix_seconds_run_id())),
     );
-    let response = run_scene_build_from_image(
+    let response = run_scene_build_from_image_with_progress(
         config,
         SceneBuildFromImageArgs {
             source_scene_path: source_scene_path.clone(),
@@ -3561,7 +3593,7 @@ fn run_scene_build_for_ui(
             trellis_pbr_texture_size: Some(settings.pbr_texture_size),
             promote_to_catalog: true,
             composition_mode: SceneCompositionMode::CvGrounded,
-            pose_fit: ScenePoseFitMode::RenderedSilhouette,
+            pose_fit: ScenePoseFitMode::ProjectedAabb,
             canonical_pose: SceneCanonicalPoseMode::Auto,
             max_pose_candidates: 32,
             save_pose_debug: true,
@@ -3577,6 +3609,9 @@ fn run_scene_build_for_ui(
             feedback_capture_dir: None,
             feedback_threshold_profile: FeedbackThresholdProfile::Standard,
             feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        },
+        |event| {
+            let _ = progress_sender.send(event);
         },
     )?;
     Ok(SceneBuildOutput {
@@ -3659,6 +3694,7 @@ fn poll_mcp_scene_control(
     let mut force_cache_flush = false;
     let mut screenshots = Vec::new();
     let mut predicted_world_items = Vec::new();
+    let mut predicted_world_aabbs = HashMap::<String, CachedAssetAabb>::new();
     let mut deleted_cache_keys = Vec::new();
     let mut cleared_scene = false;
     let mut command_results = Vec::with_capacity(requested_commands);
@@ -3666,6 +3702,7 @@ fn poll_mcp_scene_control(
         match command {
             McpSceneCommand::SpawnCached {
                 cache_key,
+                local_aabb,
                 translation,
                 rotation,
                 scale,
@@ -3733,6 +3770,7 @@ fn poll_mcp_scene_control(
                         canonical_frame: None,
                         updated_at_unix_ms: 0,
                     });
+                let effective_local_aabb = local_aabb.or(metadata.local_aabb);
                 let Some(handles) = cached_asset_handles(
                     asset,
                     &metadata,
@@ -3753,11 +3791,15 @@ fn poll_mcp_scene_control(
                 };
                 let predicted_item =
                     cached_world_item_from_transform(cache_key.clone(), &transform);
+                if let Some(local_aabb) = effective_local_aabb {
+                    predicted_world_aabbs.insert(cache_key.clone(), local_aabb);
+                }
                 let entity = spawn_cached_asset_instance(
                     &mut commands,
                     &handles,
                     transform,
                     Some(cache_key.clone()),
+                    effective_local_aabb,
                 );
                 if select {
                     selection.set(entity);
@@ -3776,6 +3818,7 @@ fn poll_mcp_scene_control(
             McpSceneCommand::SpawnPath {
                 path,
                 cache_key,
+                local_aabb,
                 translation,
                 rotation,
                 scale,
@@ -3825,6 +3868,9 @@ fn poll_mcp_scene_control(
                 let path_label = path.display().to_string();
                 let predicted_item =
                     cached_world_item_from_transform(cache_key.clone(), &transform);
+                if let Some(local_aabb) = local_aabb {
+                    predicted_world_aabbs.insert(cache_key.clone(), local_aabb);
+                }
                 let entity = match spawn_mesh_asset_with_transform(
                     &mut commands,
                     &asset_server,
@@ -3834,6 +3880,7 @@ fn poll_mcp_scene_control(
                     path.clone(),
                     transform,
                     Some(cache_key.clone()),
+                    local_aabb,
                 ) {
                     Ok(entity) => entity,
                     Err(err) => {
@@ -4180,21 +4227,30 @@ fn poll_mcp_scene_control(
                     camera_state_from_components(transform, orbit, Some(projection))
                 })
         };
-        let mut world_items = {
+        let (mut world_items, mut world_item_aabbs) = {
             let cached_query = query_set.p1();
             if cleared_scene {
-                Vec::new()
+                (Vec::new(), HashMap::new())
             } else {
                 collect_cached_world_items(&cached_query)
             }
         };
         if !deleted_cache_keys.is_empty() {
             world_items.retain(|item| !deleted_cache_keys.contains(&item.cache_key));
+            for cache_key in &deleted_cache_keys {
+                world_item_aabbs.remove(cache_key);
+            }
         }
         world_items.extend(predicted_world_items);
+        world_item_aabbs.extend(predicted_world_aabbs);
         let projected_items = {
             let camera_query = query_set.p2();
-            collect_projected_world_items(&cache.cache, &world_items, &camera_query)
+            collect_projected_world_items(
+                &cache.cache,
+                &world_items,
+                &world_item_aabbs,
+                &camera_query,
+            )
         };
         let status = McpSceneStatus {
             session_id,
@@ -4452,12 +4508,14 @@ fn handle_catalog_spawn_requests(
                 material.clone(),
                 request.transform,
                 request.cache_key.clone(),
+                None,
             ),
             CatalogSpawnAsset::GaussianSplat { cloud } => spawn_gaussian_splat_instance(
                 &mut commands,
                 cloud.clone(),
                 request.transform,
                 request.cache_key.clone(),
+                None,
             ),
         };
         if request.select_spawned
@@ -4605,6 +4663,7 @@ fn handle_scene_build_requests(
     mut requests: MessageReader<SceneBuildRequest>,
     args: Res<AppArgs>,
     mut status: ResMut<UiStatus>,
+    mut processing: ResMut<SceneProcessingState>,
     mut interaction_lock: ResMut<SceneInteractionLock>,
     mut pending_scene_build: ResMut<PendingSceneBuild>,
 ) {
@@ -4621,6 +4680,7 @@ fn handle_scene_build_requests(
             &args,
             &request.settings,
             &mut status,
+            &mut processing,
             &mut interaction_lock,
             pending_scene_build.as_mut(),
         );
@@ -4647,6 +4707,7 @@ fn poll_scene_build_results(
     mut queue: ResMut<InferenceQueue>,
     mut catalog: ResMut<CatalogState>,
     mut status: ResMut<UiStatus>,
+    mut processing: ResMut<SceneProcessingState>,
     mut interaction_lock: ResMut<SceneInteractionLock>,
     mut world_cache: ResMut<WorldCachePersistence>,
     mut meshes: ResMut<Assets<BevyMesh>>,
@@ -4660,6 +4721,8 @@ fn poll_scene_build_results(
         With<MainCamera>,
     >,
 ) {
+    drain_scene_build_progress(&pending, &mut processing, &mut status);
+
     let result = match pending.receiver.as_ref() {
         Some(receiver) => match receiver.lock() {
             Ok(receiver) => match receiver.try_recv() {
@@ -4677,6 +4740,7 @@ fn poll_scene_build_results(
         return;
     };
     pending.receiver = None;
+    pending.progress_receiver = None;
     interaction_lock.set(false, None);
     status.worker_message = None;
 
@@ -4684,6 +4748,7 @@ fn poll_scene_build_results(
         Ok(output) => output,
         Err(err) => {
             status.message = format!("scene build failed: {err}");
+            processing.finish_failure(status.message.clone());
             warn!("{}", status.message);
             return;
         }
@@ -4702,12 +4767,14 @@ fn poll_scene_build_results(
         Ok(payload) => payload,
         Err(err) => {
             status.message = format!("scene build cache failed: {err}");
+            processing.finish_failure(status.message.clone());
             warn!("{}", status.message);
             return;
         }
     };
     if payload.world_items.is_empty() {
         status.message = "scene build produced no spawnable cached objects.".to_string();
+        processing.finish_failure(status.message.clone());
         warn!("{}", status.message);
         return;
     }
@@ -4727,6 +4794,7 @@ fn poll_scene_build_results(
         Ok(metadata) => metadata,
         Err(err) => {
             status.message = format!("failed to cache generated scene: {err}");
+            processing.finish_failure(status.message.clone());
             warn!("{}", status.message);
             return;
         }
@@ -4749,6 +4817,7 @@ fn poll_scene_build_results(
         Ok(applied) => applied,
         Err(err) => {
             status.message = format!("scene build load failed: {err}");
+            processing.finish_failure(status.message.clone());
             warn!("{}", status.message);
             return;
         }
@@ -4780,6 +4849,131 @@ fn poll_scene_build_results(
     world_cache.dirty = false;
     world_cache.timer.reset();
     status.message = format!("scene build complete: {applied} item(s) loaded.");
+    processing.finish_success(status.message.clone());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_scene_build_progress(
+    pending: &PendingSceneBuild,
+    processing: &mut SceneProcessingState,
+    status: &mut UiStatus,
+) {
+    let Some(receiver) = pending.progress_receiver.as_ref() else {
+        return;
+    };
+    let Ok(receiver) = receiver.lock() else {
+        status.worker_message = Some("scene build progress receiver lock poisoned".to_string());
+        processing.finish_failure("scene build progress receiver lock poisoned");
+        return;
+    };
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => apply_scene_build_progress_event(event, processing, status),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn apply_scene_build_progress_event(
+    event: SceneBuildProgressEvent,
+    processing: &mut SceneProcessingState,
+    status: &mut UiStatus,
+) {
+    let phase = scene_progress_phase_label(event.phase).to_string();
+    let execution = scene_progress_execution_label(event.execution).to_string();
+    let stage = event.stage.clone();
+    let message = event.message.clone();
+    let is_failure = event.phase == SceneBuildProgressPhase::Failed;
+    let token_usage = scene_progress_token_usage_label(&event.detail);
+    status.worker_message = Some(format!("scene {phase}: {stage} - {message}"));
+    processing.push_event(
+        event.run_id,
+        SceneProcessingEvent {
+            stage,
+            phase,
+            execution,
+            message,
+            elapsed_ms: event.elapsed_ms,
+            item_index: event.item_index,
+            item_count: event.item_count,
+            artifact_path: event.artifact_path,
+            token_usage,
+            is_failure,
+        },
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_progress_token_usage_label(detail: &serde_json::Value) -> Option<String> {
+    let usage = detail.get("token_usage")?;
+    let total = json_u64(usage.pointer("/total/total_tokens")).unwrap_or_default();
+    let requests = json_u64(usage.pointer("/total/requests")).unwrap_or_default();
+    if total == 0 && requests == 0 {
+        return None;
+    }
+    let input = json_u64(usage.pointer("/total/input_tokens")).unwrap_or_default();
+    let output = json_u64(usage.pointer("/total/output_tokens")).unwrap_or_default();
+    let reported = json_u64(usage.pointer("/total/reported_requests")).unwrap_or_default();
+    let stage_text = usage
+        .get("by_stage")
+        .and_then(serde_json::Value::as_array)
+        .map(|stages| {
+            stages
+                .iter()
+                .filter_map(|stage| {
+                    let label = stage.get("stage").and_then(serde_json::Value::as_str)?;
+                    let total = json_u64(stage.get("total_tokens")).unwrap_or_default();
+                    Some(format!("{label}:{total}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|text| !text.is_empty());
+    Some(match stage_text {
+        Some(stage_text) => format!(
+            "tokens total={total} input={input} output={output} reported={reported}/{requests} stages=[{stage_text}]"
+        ),
+        None => {
+            format!(
+                "tokens total={total} input={input} output={output} reported={reported}/{requests}"
+            )
+        }
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_f64().map(|number| number.max(0.0).round() as u64))
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_progress_phase_label(phase: SceneBuildProgressPhase) -> &'static str {
+    match phase {
+        SceneBuildProgressPhase::Started => "started",
+        SceneBuildProgressPhase::Progress => "progress",
+        SceneBuildProgressPhase::Waiting => "waiting",
+        SceneBuildProgressPhase::Completed => "completed",
+        SceneBuildProgressPhase::Failed => "failed",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_progress_execution_label(execution: SceneBuildExecutionKind) -> &'static str {
+    match execution {
+        SceneBuildExecutionKind::Cpu => "cpu",
+        SceneBuildExecutionKind::Gpu => "gpu",
+        SceneBuildExecutionKind::Network => "network",
+        SceneBuildExecutionKind::Cache => "cache",
+        SceneBuildExecutionKind::FileIo => "file-io",
+        SceneBuildExecutionKind::Viewer => "viewer",
+        SceneBuildExecutionKind::Mixed => "mixed",
+        SceneBuildExecutionKind::Unknown => "unknown",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4834,7 +5028,13 @@ fn apply_cached_scene_payload(
             );
             continue;
         };
-        spawn_cached_asset_instance(commands, handles, transform, Some(item.cache_key.clone()));
+        spawn_cached_asset_instance(
+            commands,
+            handles,
+            transform,
+            Some(item.cache_key.clone()),
+            None,
+        );
         applied_items.push(item.clone());
     }
 
@@ -5309,6 +5509,9 @@ fn handle_inference_result(
             let cache_key = cached_metadata
                 .as_ref()
                 .map(|metadata| metadata.cache_key.clone());
+            let local_aabb = cached_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.local_aabb);
 
             let bevy_mesh = to_bevy_mesh_synth(&mesh);
             let mesh_handle = meshes.add(bevy_mesh);
@@ -5319,6 +5522,7 @@ fn handle_inference_result(
                 material.clone(),
                 Transform::default(),
                 cache_key.clone(),
+                local_aabb,
             );
             if let Some(entry) = catalog.entry_mut(request.id) {
                 entry.status = CatalogStatus::Ready;
@@ -5371,6 +5575,9 @@ fn handle_inference_result(
             let cache_key = cached_metadata
                 .as_ref()
                 .map(|metadata| metadata.cache_key.clone());
+            let local_aabb = cached_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.local_aabb);
 
             match gaussian_splat_cloud_handle(&splats, gaussian_clouds) {
                 Ok(cloud_handle) => {
@@ -5383,6 +5590,7 @@ fn handle_inference_result(
                         cloud_handle.clone(),
                         Transform::default(),
                         cache_key.clone(),
+                        local_aabb,
                     );
                     if let Some(entry) = catalog.entry_mut(request.id) {
                         entry.status = CatalogStatus::Ready;
@@ -5652,6 +5860,7 @@ fn spawn_mesh_asset(
         mesh_path,
         Transform::default(),
         None,
+        None,
     )
 }
 
@@ -5665,6 +5874,7 @@ fn spawn_mesh_asset_with_transform(
     mesh_path: PathBuf,
     transform: Transform,
     cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
 ) -> Result<Entity, String> {
     #[cfg(target_arch = "wasm32")]
     let _ = (&mut *meshes, &mut *images);
@@ -5679,6 +5889,7 @@ fn spawn_mesh_asset_with_transform(
             material,
             transform,
             cache_key,
+            local_aabb,
         ));
     }
 
@@ -5701,6 +5912,7 @@ fn spawn_mesh_asset_with_transform(
             material,
             transform,
             cache_key,
+            local_aabb,
         ));
     }
 
@@ -5716,6 +5928,7 @@ fn spawn_mesh_asset_with_transform(
         material,
         transform,
         cache_key,
+        local_aabb,
     ))
 }
 
@@ -5762,6 +5975,7 @@ pub(crate) fn spawn_mesh_instance(
     material: Handle<StandardMaterial>,
     transform: Transform,
     cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
 ) -> Entity {
     let mut entity_commands = commands.spawn((
         GizmoTransformable,
@@ -5776,7 +5990,10 @@ pub(crate) fn spawn_mesh_instance(
         RenderLayers::layer(0),
     ));
     if let Some(cache_key) = cache_key {
-        entity_commands.insert(CachedMeshInstance { cache_key });
+        entity_commands.insert(CachedMeshInstance {
+            cache_key,
+            local_aabb,
+        });
     }
     entity_commands.id()
 }
@@ -5786,6 +6003,7 @@ fn spawn_cached_asset_instance(
     handles: &CachedAssetHandles,
     transform: Transform,
     cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
 ) -> Entity {
     match handles {
         CachedAssetHandles::Mesh { mesh, material } => spawn_mesh_instance(
@@ -5794,9 +6012,10 @@ fn spawn_cached_asset_instance(
             material.clone(),
             transform,
             cache_key,
+            local_aabb,
         ),
         CachedAssetHandles::GaussianSplat { cloud } => {
-            spawn_gaussian_splat_instance(commands, cloud.clone(), transform, cache_key)
+            spawn_gaussian_splat_instance(commands, cloud.clone(), transform, cache_key, local_aabb)
         }
     }
 }
@@ -5806,6 +6025,7 @@ pub(crate) fn spawn_gaussian_splat_instance(
     cloud_handle: Handle<PlanarGaussian3d>,
     transform: Transform,
     cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
 ) -> Entity {
     let mut entity_commands = commands.spawn((
         GizmoTransformable,
@@ -5821,7 +6041,10 @@ pub(crate) fn spawn_gaussian_splat_instance(
         Name::new("triposplat_gaussian_cloud"),
     ));
     if let Some(cache_key) = cache_key {
-        entity_commands.insert(CachedMeshInstance { cache_key });
+        entity_commands.insert(CachedMeshInstance {
+            cache_key,
+            local_aabb,
+        });
     }
     entity_commands.id()
 }
@@ -5928,21 +6151,26 @@ fn persist_world_cache(
 
 fn collect_cached_world_items(
     query: &Query<(&CachedMeshInstance, &Transform)>,
-) -> Vec<CachedWorldItem> {
+) -> (Vec<CachedWorldItem>, HashMap<String, CachedAssetAabb>) {
     let mut world_items = Vec::new();
+    let mut local_aabbs = HashMap::new();
     for (cached, transform) in query.iter() {
         world_items.push(cached_world_item_from_transform(
             cached.cache_key.clone(),
             transform,
         ));
+        if let Some(local_aabb) = cached.local_aabb {
+            local_aabbs.insert(cached.cache_key.clone(), local_aabb);
+        }
     }
-    world_items
+    (world_items, local_aabbs)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn collect_projected_world_items(
     cache: &MeshCache,
     world_items: &[CachedWorldItem],
+    explicit_local_aabbs: &HashMap<String, CachedAssetAabb>,
     camera_query: &Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) -> Vec<McpProjectedWorldItem> {
     let metadata_by_key = cache
@@ -5954,9 +6182,7 @@ fn collect_projected_world_items(
     world_items
         .iter()
         .map(|item| {
-            let world_aabb = metadata_by_key
-                .get(item.cache_key.as_str())
-                .and_then(|metadata| metadata.local_aabb)
+            let world_aabb = world_item_local_aabb(&metadata_by_key, explicit_local_aabbs, item)
                 .and_then(|aabb| {
                     transform_from_cached_world_item(item)
                         .map(|transform| transformed_world_aabb(&transform, aabb))
@@ -5981,6 +6207,22 @@ fn collect_projected_world_items(
             }
         })
         .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn world_item_local_aabb(
+    metadata_by_key: &HashMap<&str, &CachedMeshMetadata>,
+    explicit_local_aabbs: &HashMap<String, CachedAssetAabb>,
+    item: &CachedWorldItem,
+) -> Option<CachedAssetAabb> {
+    explicit_local_aabbs
+        .get(item.cache_key.as_str())
+        .copied()
+        .or_else(|| {
+            metadata_by_key
+                .get(item.cache_key.as_str())
+                .and_then(|metadata| metadata.local_aabb)
+        })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -6099,7 +6341,7 @@ fn flush_world_cache_now(
 ) -> Result<(), String> {
     cache
         .cache
-        .set_world_items(collect_cached_world_items(query))
+        .set_world_items(collect_cached_world_items(query).0)
         .map_err(|err| err.to_string())?;
     cache
         .cache
@@ -6243,6 +6485,163 @@ pub(crate) fn gaussian_splat_pick_bounds(
         center,
         half_extents,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewerGroundContactState {
+    Grounded,
+    Floating,
+    BelowGround,
+}
+
+#[allow(clippy::type_complexity)]
+fn draw_viewer_debug_overlays(
+    settings: Res<ViewerDebugSettings>,
+    selection: Res<EditorSelection>,
+    mut gizmos: Gizmos,
+    meshes: Res<Assets<BevyMesh>>,
+    mesh_transformables: Query<(Entity, &Mesh3d, &GlobalTransform), With<GizmoTransformable>>,
+    gaussian_transformables: Query<
+        (Entity, &GaussianSplatPickBounds, &GlobalTransform),
+        With<GizmoTransformable>,
+    >,
+) {
+    if settings.aabb_overlay == ViewerAabbOverlayMode::Off {
+        return;
+    }
+
+    for (entity, mesh3d, transform) in mesh_transformables.iter() {
+        let selected = selection.contains(entity);
+        if !viewer_debug_entity_visible(settings.aabb_overlay, selected) {
+            continue;
+        }
+        let Some(mesh) = meshes.get(&mesh3d.0) else {
+            continue;
+        };
+        let Some(aabb) = mesh.compute_aabb() else {
+            continue;
+        };
+        let (world_min, world_max) =
+            world_aabb(aabb.center.into(), aabb.half_extents.into(), transform);
+        draw_debug_world_aabb(&mut gizmos, world_min, world_max, selected, &settings);
+    }
+
+    for (entity, bounds, transform) in gaussian_transformables.iter() {
+        let selected = selection.contains(entity);
+        if !viewer_debug_entity_visible(settings.aabb_overlay, selected) {
+            continue;
+        }
+        let (world_min, world_max) = world_aabb(bounds.center, bounds.half_extents, transform);
+        draw_debug_world_aabb(&mut gizmos, world_min, world_max, selected, &settings);
+    }
+}
+
+pub(crate) fn viewer_debug_entity_visible(mode: ViewerAabbOverlayMode, selected: bool) -> bool {
+    match mode {
+        ViewerAabbOverlayMode::Off => false,
+        ViewerAabbOverlayMode::Selected => selected,
+        ViewerAabbOverlayMode::All => true,
+    }
+}
+
+fn draw_debug_world_aabb(
+    gizmos: &mut Gizmos,
+    world_min: Vec3,
+    world_max: Vec3,
+    selected: bool,
+    settings: &ViewerDebugSettings,
+) {
+    let box_color = if selected {
+        Color::srgb(0.28, 0.72, 1.0)
+    } else {
+        Color::srgba(0.78, 0.84, 0.94, 0.72)
+    };
+    draw_debug_box_lines(gizmos, world_min, world_max, box_color);
+
+    if settings.draw_ground_contact {
+        let contact = Vec3::new(
+            (world_min.x + world_max.x) * 0.5,
+            world_min.y,
+            (world_min.z + world_max.z) * 0.5,
+        );
+        let ground = Vec3::new(contact.x, settings.ground_y, contact.z);
+        let contact_color = viewer_ground_contact_color(viewer_ground_contact_state(
+            contact.y,
+            settings.ground_y,
+            settings.contact_tolerance,
+        ));
+        gizmos.line(contact, ground, contact_color);
+        draw_debug_cross(gizmos, contact, 0.045, contact_color);
+        draw_debug_ground_marker(gizmos, ground, 0.08, contact_color);
+    }
+}
+
+fn draw_debug_box_lines(gizmos: &mut Gizmos, min: Vec3, max: Vec3, color: Color) {
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    for (a, b) in [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ] {
+        gizmos.line(corners[a], corners[b], color);
+    }
+}
+
+fn draw_debug_cross(gizmos: &mut Gizmos, center: Vec3, radius: f32, color: Color) {
+    gizmos.line(center - Vec3::X * radius, center + Vec3::X * radius, color);
+    gizmos.line(center - Vec3::Y * radius, center + Vec3::Y * radius, color);
+    gizmos.line(center - Vec3::Z * radius, center + Vec3::Z * radius, color);
+}
+
+fn draw_debug_ground_marker(gizmos: &mut Gizmos, center: Vec3, radius: f32, color: Color) {
+    let x = Vec3::X * radius;
+    let z = Vec3::Z * radius;
+    gizmos.line(center - x - z, center + x - z, color);
+    gizmos.line(center + x - z, center + x + z, color);
+    gizmos.line(center + x + z, center - x + z, color);
+    gizmos.line(center - x + z, center - x - z, color);
+}
+
+pub(crate) fn viewer_ground_contact_state(
+    bottom_y: f32,
+    ground_y: f32,
+    tolerance: f32,
+) -> ViewerGroundContactState {
+    let gap = bottom_y - ground_y;
+    let tolerance = tolerance.max(0.0);
+    if gap.abs() <= tolerance {
+        ViewerGroundContactState::Grounded
+    } else if gap > 0.0 {
+        ViewerGroundContactState::Floating
+    } else {
+        ViewerGroundContactState::BelowGround
+    }
+}
+
+fn viewer_ground_contact_color(state: ViewerGroundContactState) -> Color {
+    match state {
+        ViewerGroundContactState::Grounded => Color::srgb(0.2, 0.9, 0.46),
+        ViewerGroundContactState::Floating => Color::srgb(0.95, 0.74, 0.18),
+        ViewerGroundContactState::BelowGround => Color::srgb(0.95, 0.22, 0.24),
+    }
 }
 
 fn delete_selected_meshes(

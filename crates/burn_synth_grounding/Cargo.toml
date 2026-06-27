@@ -16,6 +16,7 @@ readme = "README.md"
 burn = { version = "=0.21.0", default-features = false, features = ["std", "wgpu", "fusion"] }
 burn_depth = { version = "0.4.2", default-features = false, features = ["backend_wgpu", "backend_fusion", "bpk"] }
 burn_locate_anything = { version = "0.1.2", path = "../burn_locate_anything" }
+burn_segmentation = { version = "0.1.0", path = "../burn_segmentation" }
 burn_synth_scene = { version = "0.2.0", path = "../burn_synth_scene" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -24,3 +25,5 @@ serde_json = "1.0"
 [features]
 default = []
 locate-anything-wgpu = ["burn_locate_anything/backend_wgpu"]
+segmentation-wgpu = ["burn_segmentation/backend_wgpu"]
+segmentation-cuda = ["burn_segmentation/backend_cuda"]

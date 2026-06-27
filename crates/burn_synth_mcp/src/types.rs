@@ -5,15 +5,57 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use burn_synth::{ModelSelection, RuntimeConfig};
-use burn_synth_grounding::{GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT};
+use burn_synth_grounding::{
+    GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, SegmentationPrecision,
+    SegmentationQuantization,
+};
 use burn_synth_scene::SceneQualityProfile;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub(crate) const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const DEFAULT_SCENE_TRELLIS_TARGET_FACES: usize = 80_000;
 pub(crate) const DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE: usize = 512;
 pub(crate) static NEXT_SCENE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneBuildProgressPhase {
+    Started,
+    Progress,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneBuildExecutionKind {
+    Cpu,
+    Gpu,
+    Network,
+    Cache,
+    FileIo,
+    Viewer,
+    Mixed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SceneBuildProgressEvent {
+    pub run_id: String,
+    pub sequence: u64,
+    pub stage: String,
+    pub phase: SceneBuildProgressPhase,
+    pub execution: SceneBuildExecutionKind,
+    pub message: String,
+    pub elapsed_ms: u64,
+    pub item_index: Option<usize>,
+    pub item_count: Option<usize>,
+    pub artifact_path: Option<String>,
+    pub detail: Value,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -184,8 +226,72 @@ pub enum SceneLocatorProvider {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum SceneSegmentationProvider {
+    None,
+    BboxPrompt,
+    Sam2,
+    Sam3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SceneSegmentationPrecision {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl From<SceneSegmentationPrecision> for SegmentationPrecision {
+    fn from(value: SceneSegmentationPrecision) -> Self {
+        match value {
+            SceneSegmentationPrecision::F32 => SegmentationPrecision::F32,
+            SceneSegmentationPrecision::F16 => SegmentationPrecision::F16,
+            SceneSegmentationPrecision::Bf16 => SegmentationPrecision::Bf16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneSegmentationQuantization {
+    None,
+    Q8,
+    Q4,
+}
+
+impl From<SceneSegmentationQuantization> for SegmentationQuantization {
+    fn from(value: SceneSegmentationQuantization) -> Self {
+        match value {
+            SceneSegmentationQuantization::None => SegmentationQuantization::None,
+            SceneSegmentationQuantization::Q8 => SegmentationQuantization::Q8,
+            SceneSegmentationQuantization::Q4 => SegmentationQuantization::Q4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LocateAnythingBackend {
     BurnNative,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CubeClAutotuneLevelSetting {
+    Default,
+    Minimal,
+    Balanced,
+    Extensive,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CubeClAutotuneCacheSetting {
+    Default,
+    Local,
+    Target,
+    Global,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -209,6 +315,14 @@ pub struct ServerArgs {
 
     #[arg(long, value_enum, default_value_t = InferenceBackend::Wgpu)]
     pub backend: InferenceBackend,
+
+    /// CubeCL autotune effort. `default` respects Burn.toml/cubecl.toml/env configuration.
+    #[arg(long, value_enum, default_value_t = CubeClAutotuneLevelSetting::Default)]
+    pub cubecl_autotune_level: CubeClAutotuneLevelSetting,
+
+    /// CubeCL autotune cache location. Use `global` to persist across cargo clean/workspace moves.
+    #[arg(long, value_enum, default_value_t = CubeClAutotuneCacheSetting::Default)]
+    pub cubecl_autotune_cache: CubeClAutotuneCacheSetting,
 
     #[arg(long)]
     pub weights_root: Option<PathBuf>,
@@ -312,6 +426,34 @@ pub struct ServerArgs {
     #[arg(long, value_enum, default_value_t = LocateAnythingBackend::BurnNative)]
     pub locate_anything_backend: LocateAnythingBackend,
 
+    /// Optional segmentation/mask provider used by CV-grounded scene composition.
+    #[arg(long, value_enum, default_value_t = SceneSegmentationProvider::None)]
+    pub scene_segmentation_provider: SceneSegmentationProvider,
+
+    /// Segmentation checkpoint precision/artifact variant.
+    #[arg(long, value_enum, default_value_t = SceneSegmentationPrecision::F16)]
+    pub scene_segmentation_precision: SceneSegmentationPrecision,
+
+    /// Segmentation checkpoint quantization/artifact variant.
+    #[arg(long, value_enum, default_value_t = SceneSegmentationQuantization::None)]
+    pub scene_segmentation_quantization: SceneSegmentationQuantization,
+
+    /// Local segmentation model root for SAM-family Burn artifacts.
+    #[arg(long)]
+    pub scene_segmentation_model_root: Option<PathBuf>,
+
+    /// Local segmentation cache directory for CDN-resolved artifacts.
+    #[arg(long)]
+    pub scene_segmentation_cache_dir: Option<PathBuf>,
+
+    /// CDN base URL for segmentation model manifests/shards.
+    #[arg(long)]
+    pub scene_segmentation_cdn_base_url: Option<String>,
+
+    /// Allow segmentation runtime to fetch missing CDN artifacts when a loader is available.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub scene_segmentation_allow_download: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<ServerCommand>,
 }
@@ -341,15 +483,15 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
 
-    /// Number of generated object-image candidates in the default budget.
+    /// Total guarded generated object-image candidate budget per reusable object.
     #[arg(long, visible_alias = "candidates")]
     pub candidate_count: Option<usize>,
 
-    /// Maximum guarded image-generation attempts per object.
+    /// Maximum guarded image-generation attempts per object. Defaults to candidate_count.
     #[arg(long)]
     pub candidate_retry_attempts: Option<usize>,
 
-    /// Image candidates requested per retry attempt.
+    /// Image candidates requested per retry attempt. Defaults to 1.
     #[arg(long)]
     pub candidate_batch_size: Option<usize>,
 
@@ -398,7 +540,7 @@ pub(crate) struct SceneBuildCliArgs {
     pub composition_mode: SceneCompositionMode,
 
     /// Pose fitting strategy used inside cv-grounded composition.
-    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::RenderedSilhouette)]
+    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::ProjectedAabb)]
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
@@ -424,6 +566,18 @@ pub(crate) struct SceneBuildCliArgs {
     /// Override the server LocateAnything backend for this scene-build run.
     #[arg(long, value_enum)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Override the server scene segmentation provider for this scene-build run.
+    #[arg(long, value_enum)]
+    pub segmentation_provider: Option<SceneSegmentationProvider>,
+
+    /// Override the server scene segmentation precision for this scene-build run.
+    #[arg(long, value_enum)]
+    pub segmentation_precision: Option<SceneSegmentationPrecision>,
+
+    /// Override the server scene segmentation quantization for this scene-build run.
+    #[arg(long, value_enum)]
+    pub segmentation_quantization: Option<SceneSegmentationQuantization>,
 
     /// Write structured e2e artifacts to the output directory.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -489,7 +643,7 @@ pub(crate) struct SceneGroundCliArgs {
     pub composition_mode: SceneCompositionMode,
 
     /// Pose fitting strategy used inside cv-grounded composition.
-    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::RenderedSilhouette)]
+    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::ProjectedAabb)]
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
@@ -515,6 +669,18 @@ pub(crate) struct SceneGroundCliArgs {
     /// Override the server LocateAnything backend for this scene-ground run.
     #[arg(long, value_enum)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Override the server scene segmentation provider for this scene-ground run.
+    #[arg(long, value_enum)]
+    pub segmentation_provider: Option<SceneSegmentationProvider>,
+
+    /// Override the server scene segmentation precision for this scene-ground run.
+    #[arg(long, value_enum)]
+    pub segmentation_precision: Option<SceneSegmentationPrecision>,
+
+    /// Override the server scene segmentation quantization for this scene-ground run.
+    #[arg(long, value_enum)]
+    pub segmentation_quantization: Option<SceneSegmentationQuantization>,
 
     /// Clear the live Bevy scene before applying generated commands.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -636,6 +802,15 @@ pub struct ServerConfig {
     pub locate_anything_model_root: PathBuf,
     pub locate_anything_in_token_limit: usize,
     pub locate_anything_backend: LocateAnythingBackend,
+    pub scene_segmentation_provider: SceneSegmentationProvider,
+    pub scene_segmentation_precision: SceneSegmentationPrecision,
+    pub scene_segmentation_quantization: SceneSegmentationQuantization,
+    pub scene_segmentation_model_root: Option<PathBuf>,
+    pub scene_segmentation_cache_dir: Option<PathBuf>,
+    pub scene_segmentation_cdn_base_url: Option<String>,
+    pub scene_segmentation_allow_download: bool,
+    pub cubecl_autotune_level: CubeClAutotuneLevelSetting,
+    pub cubecl_autotune_cache: CubeClAutotuneCacheSetting,
 }
 
 impl ServerConfig {
@@ -685,6 +860,15 @@ impl ServerConfig {
             locate_anything_model_root: args.locate_anything_model_root,
             locate_anything_in_token_limit: args.locate_anything_in_token_limit.max(1),
             locate_anything_backend: args.locate_anything_backend,
+            scene_segmentation_provider: args.scene_segmentation_provider,
+            scene_segmentation_precision: args.scene_segmentation_precision,
+            scene_segmentation_quantization: args.scene_segmentation_quantization,
+            scene_segmentation_model_root: args.scene_segmentation_model_root,
+            scene_segmentation_cache_dir: args.scene_segmentation_cache_dir,
+            scene_segmentation_cdn_base_url: args.scene_segmentation_cdn_base_url,
+            scene_segmentation_allow_download: args.scene_segmentation_allow_download,
+            cubecl_autotune_level: args.cubecl_autotune_level,
+            cubecl_autotune_cache: args.cubecl_autotune_cache,
         }
     }
 

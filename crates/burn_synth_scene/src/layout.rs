@@ -157,8 +157,8 @@ pub fn manifest_with_grounding_evidence(
         for instance in &mut object.instances {
             let instance_id = instance.id.as_deref();
             if let Some(object_evidence) = best_object_evidence(evidence, &object.id, instance_id) {
-                if let Some(detection) = object_evidence.detection.as_ref() {
-                    instance.bbox = normalize_bbox(detection.bbox);
+                if let Some(bbox) = object_evidence_bbox(object_evidence) {
+                    instance.bbox = normalize_bbox(bbox);
                 }
                 if let Some(contact) = object_evidence
                     .contact_pixel
@@ -171,6 +171,7 @@ pub fn manifest_with_grounding_evidence(
                 }
             }
         }
+        dedupe_object_instances_by_bbox(&mut object.instances);
         let mut existing_instance_ids = object
             .instances
             .iter()
@@ -194,7 +195,8 @@ pub fn manifest_with_grounding_evidence(
             let Some(detection) = object_evidence.detection.as_ref() else {
                 continue;
             };
-            let bbox = normalize_bbox(detection.bbox);
+            let bbox =
+                normalize_bbox(object_evidence_bbox(object_evidence).unwrap_or(detection.bbox));
             if duplicate_instance_bbox(bbox, &existing_instance_bboxes) {
                 continue;
             }
@@ -218,9 +220,75 @@ pub fn manifest_with_grounding_evidence(
                     .map(sane_footprint),
             });
         }
-        object.instance_count = object.instance_count.max(object.instances.len());
+        if object.instances.is_empty() {
+            object.instance_count = object.instance_count.max(1);
+        } else {
+            object.instance_count = object.instances.len();
+        }
     }
+    filter_table_embedded_seating_instances(&mut out.objects);
     out
+}
+
+fn filter_table_embedded_seating_instances(objects: &mut [SceneObjectSpec]) {
+    let table_bboxes = objects
+        .iter()
+        .filter(|object| is_table_like(object))
+        .map(|object| normalize_bbox(object.bbox))
+        .collect::<Vec<_>>();
+    if table_bboxes.is_empty() {
+        return;
+    }
+    for object in objects {
+        if !is_seating_like(object) || object.instances.is_empty() {
+            continue;
+        }
+        object.instances.retain(|instance| {
+            let bbox = normalize_bbox(instance.bbox);
+            !table_bboxes
+                .iter()
+                .any(|table_bbox| bbox_embedded_in_table(bbox, *table_bbox))
+        });
+        if object.instances.is_empty() {
+            object.instance_count = 1;
+        } else {
+            object.instance_count = object.instances.len();
+        }
+    }
+}
+
+fn bbox_embedded_in_table(bbox: [f32; 4], table_bbox: [f32; 4]) -> bool {
+    let center = bbox_center(bbox);
+    if center[0] < table_bbox[0]
+        || center[0] > table_bbox[2]
+        || center[1] < table_bbox[1]
+        || center[1] > table_bbox[3]
+    {
+        return false;
+    }
+    let embedded_fraction = bbox_intersection_area(bbox, table_bbox) / bbox_area(bbox).max(1.0e-6);
+    embedded_fraction >= 0.82
+}
+
+fn bbox_intersection_area(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let ix0 = left[0].max(right[0]);
+    let iy0 = left[1].max(right[1]);
+    let ix1 = left[2].min(right[2]);
+    let iy1 = left[3].min(right[3]);
+    (ix1 - ix0).max(0.0) * (iy1 - iy0).max(0.0)
+}
+
+fn dedupe_object_instances_by_bbox(instances: &mut Vec<SceneObjectInstanceSpec>) {
+    let mut existing = Vec::new();
+    instances.retain(|instance| {
+        let bbox = normalize_bbox(instance.bbox);
+        if duplicate_instance_bbox(bbox, &existing) {
+            false
+        } else {
+            existing.push(bbox);
+            true
+        }
+    });
 }
 
 pub fn manifest_grounding_evidence(manifest: &SceneObjectManifest) -> SceneGroundingEvidence {
@@ -245,6 +313,7 @@ pub fn manifest_grounding_evidence(manifest: &SceneObjectManifest) -> SceneGroun
                 instance_id: instance.id,
                 reuse_group: object.reuse_group.clone(),
                 detection: Some(detection),
+                mask: None,
                 asset_id: None,
                 contact_pixel: Some(instance.contact_pixel),
                 depth_stats: None,
@@ -258,6 +327,7 @@ pub fn manifest_grounding_evidence(manifest: &SceneObjectManifest) -> SceneGroun
     SceneGroundingEvidence {
         source_image_path: manifest.source_scene_path.clone(),
         depth: None,
+        segmentation: None,
         detections,
         camera: EstimatedCamera {
             image_size,
@@ -288,11 +358,13 @@ fn apply_object_grounding_evidence(
     object: &mut SceneObjectSpec,
     evidence: &ObjectGroundingEvidence,
 ) {
-    if let Some(detection) = evidence.detection.as_ref() {
-        object.bbox = normalize_bbox(detection.bbox);
-        if object.label.trim().is_empty() {
-            object.label = detection.label.clone();
-        }
+    if let Some(bbox) = object_evidence_bbox(evidence) {
+        object.bbox = normalize_bbox(bbox);
+    }
+    if let Some(detection) = evidence.detection.as_ref()
+        && object.label.trim().is_empty()
+    {
+        object.label = detection.label.clone();
     }
     if let Some(reuse_group) = evidence.reuse_group.as_ref()
         && object.reuse_group.as_ref() != Some(reuse_group)
@@ -302,6 +374,14 @@ fn apply_object_grounding_evidence(
     if let Some(footprint) = evidence.target_footprint_m {
         object.target_footprint_m = Some(sane_footprint(footprint));
     }
+}
+
+fn object_evidence_bbox(evidence: &ObjectGroundingEvidence) -> Option<[f32; 4]> {
+    evidence
+        .mask
+        .as_ref()
+        .map(|mask| mask.bbox)
+        .or_else(|| evidence.detection.as_ref().map(|detection| detection.bbox))
 }
 
 fn duplicate_instance_bbox(candidate: [f32; 4], existing: &[[f32; 4]]) -> bool {
@@ -400,7 +480,9 @@ fn table_center_point_from_evidence(
         .map(|stats| stats.median_m)
         .filter(|value| value.is_finite() && *value > 0.0)?;
     let (fx, fy, cx, cy, width, height) = source_intrinsics_from_evidence(evidence)?;
-    let center = bbox_center(normalize_bbox(detection.bbox));
+    let center = bbox_center(normalize_bbox(
+        object_evidence_bbox(object).unwrap_or(detection.bbox),
+    ));
     let pixel_x = center[0] * (width - 1.0).max(1.0);
     let pixel_y = center[1] * (height - 1.0).max(1.0);
     Some([
@@ -422,6 +504,14 @@ fn object_grounding_is_table_like(object: &ObjectGroundingEvidence) -> bool {
     )
     .to_ascii_lowercase();
     descriptor.contains("table") || descriptor.contains("desk") || descriptor.contains("counter")
+}
+
+fn is_seating_like(object: &SceneObjectSpec) -> bool {
+    let descriptor = object_descriptor(object);
+    descriptor.contains("chair")
+        || descriptor.contains("seat")
+        || descriptor.contains("sofa")
+        || descriptor.contains("couch")
 }
 
 fn source_intrinsics_from_evidence(
@@ -686,10 +776,16 @@ fn grounded_scene_layout_internal(
         });
         let asset_frame = scene_asset_frame(asset, object, local_aabb);
         let target_footprint = target_footprint_m(object, &instance, asset_frame, metric_frame);
-        let scale_value = uniform_asset_scale(local_aabb, target_footprint);
+        let scale = asset_scale_for_footprint(object, local_aabb, target_footprint, asset_frame);
         let depth_ground_point = grounding_geometry
             .and_then(|(geometry, _)| geometry.contact_point(object, &instance))
-            .map(|point| [point[0] - center_x, config.floor_y, point[2] - center_z]);
+            .map(|point| {
+                source_metric_delta_to_layout(
+                    [point[0] - center_x, point[2] - center_z],
+                    metric_frame,
+                    config.floor_y,
+                )
+            });
         let ground_point = depth_ground_point
             .or_else(|| {
                 metric_ground_point(
@@ -703,7 +799,7 @@ fn grounded_scene_layout_internal(
             .unwrap_or([contact[0] - center_x, config.floor_y, contact[2] - center_z]);
         let translation = [
             ground_point[0],
-            config.floor_y - local_aabb.min[1] * scale_value,
+            config.floor_y - local_aabb.min[1] * scale[1],
             ground_point[2],
         ];
         let rotation_y_degrees = normalize_degrees(
@@ -738,7 +834,7 @@ fn grounded_scene_layout_internal(
             ground_point,
             translation,
             rotation_y_degrees,
-            scale: [scale_value, scale_value, scale_value],
+            scale,
             local_aabb,
             target_footprint_m: target_footprint,
         });
@@ -766,6 +862,26 @@ fn grounded_scene_layout_internal(
         rug_scale,
         projection_fit,
     })
+}
+
+fn source_metric_delta_to_layout(
+    delta_xz: [f32; 2],
+    metric_frame: Option<MetricSceneFrame>,
+    floor_y: f32,
+) -> [f32; 3] {
+    let Some(camera_yaw_degrees) = metric_frame.and_then(|frame| frame.camera_yaw_degrees) else {
+        return [delta_xz[0], floor_y, delta_xz[1]];
+    };
+    let image_side_sign = if camera_yaw_degrees.to_radians().cos() >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    [
+        delta_xz[0] * image_side_sign,
+        floor_y,
+        delta_xz[1] * -image_side_sign,
+    ]
 }
 
 fn object_contact_point_with_geometry(
@@ -951,20 +1067,57 @@ fn uniform_asset_scale(local_aabb: SceneAssetAabb, target_footprint: [f32; 2]) -
     (target / local_footprint).clamp(0.05, 20.0)
 }
 
+fn asset_scale_for_footprint(
+    object: &SceneObjectSpec,
+    local_aabb: SceneAssetAabb,
+    target_footprint: [f32; 2],
+    asset_frame: SceneAssetFrame,
+) -> [f32; 3] {
+    let uniform = uniform_asset_scale(local_aabb, target_footprint);
+    if !is_table_like(object) {
+        return [uniform, uniform, uniform];
+    }
+
+    let size = local_aabb.size();
+    if size[0] <= 1.0e-5 || size[2] <= 1.0e-5 {
+        return [uniform, uniform, uniform];
+    }
+
+    let yaw_offset = normalize_degrees(asset_frame.yaw_offset_degrees).abs();
+    let local_targets = if yaw_offset > 45.0 && yaw_offset < 135.0 {
+        [target_footprint[1], target_footprint[0]]
+    } else {
+        target_footprint
+    };
+    let scale_x = (local_targets[0].max(0.1) / size[0]).clamp(0.05, 20.0);
+    let scale_z = (local_targets[1].max(0.1) / size[2]).clamp(0.05, 20.0);
+    let scale_y = (scale_x * scale_z).sqrt().clamp(0.05, 20.0);
+    [scale_x, scale_y, scale_z]
+}
+
 fn normalize_repeated_asset_scales(placements: &mut [GroundedScenePlacement], floor_y: f32) {
-    let mut grouped: HashMap<String, (f32, usize)> = HashMap::new();
+    let mut grouped: HashMap<String, ([f32; 3], usize)> = HashMap::new();
     for placement in placements.iter() {
         let entry = grouped
             .entry(placement.asset_id.clone())
-            .or_insert((0.0, 0));
-        entry.0 += placement.scale[0].abs();
+            .or_insert(([0.0; 3], 0));
+        for axis in 0..3 {
+            entry.0[axis] += placement.scale[axis].abs();
+        }
         entry.1 += 1;
     }
     let repeated_scale = grouped
         .into_iter()
         .filter_map(|(asset_id, (sum, count))| {
             if count > 1 {
-                Some((asset_id, (sum / count as f32).clamp(0.05, 20.0)))
+                Some((
+                    asset_id,
+                    [
+                        (sum[0] / count as f32).clamp(0.05, 20.0),
+                        (sum[1] / count as f32).clamp(0.05, 20.0),
+                        (sum[2] / count as f32).clamp(0.05, 20.0),
+                    ],
+                ))
             } else {
                 None
             }
@@ -974,8 +1127,8 @@ fn normalize_repeated_asset_scales(placements: &mut [GroundedScenePlacement], fl
         let Some(scale) = repeated_scale.get(&placement.asset_id).copied() else {
             continue;
         };
-        placement.scale = [scale, scale, scale];
-        placement.translation[1] = floor_y - placement.local_aabb.min[1] * scale;
+        placement.scale = scale;
+        placement.translation[1] = floor_y - placement.local_aabb.min[1] * scale[1];
     }
 }
 

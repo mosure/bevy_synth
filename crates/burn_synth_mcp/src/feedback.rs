@@ -65,6 +65,39 @@ pub(crate) fn scene_commands_with_cache_reload(mut commands: Vec<Value>) -> Vec<
     commands
 }
 
+pub(crate) fn scene_commands_with_asset_local_aabbs(
+    mut commands: Vec<Value>,
+    asset_bindings: &[SceneAssetBinding],
+) -> Vec<Value> {
+    for command in &mut commands {
+        let Some(command_type) = command.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if command_type != "spawn_cached" && command_type != "spawn_path" {
+            continue;
+        }
+        if command
+            .get("local_aabb")
+            .is_some_and(|value| !value.is_null())
+        {
+            continue;
+        }
+        let cache_key = command.get("cache_key").and_then(Value::as_str);
+        let path = command.get("path").and_then(Value::as_str);
+        let Some(asset) = asset_bindings.iter().find(|asset| {
+            cache_key
+                .is_some_and(|key| key == asset.asset_id || asset.cache_key.as_deref() == Some(key))
+                || path.is_some_and(|path| asset.path.as_deref() == Some(path))
+        }) else {
+            continue;
+        };
+        if let Some(local_aabb) = asset.local_aabb {
+            command["local_aabb"] = json!(local_aabb);
+        }
+    }
+    commands
+}
+
 pub(crate) fn scene_composition_candidates(
     requested_mode: SceneCompositionMode,
     compare_feedback_candidates: bool,
@@ -231,6 +264,7 @@ pub(crate) fn scene_feedback_metrics(
     let floor_y = grounded_layout.rug_center[1];
     let footprints = feedback_projected_footprints(&grounded_layout.placements, projected);
     let physical = feedback_physical_layout(&grounded_layout.placements, &footprints, thresholds);
+    let mut yaw_passed_count = 0usize;
     for (index, placement) in grounded_layout.placements.iter().enumerate() {
         let projected_item = projected.get(index).unwrap_or(&Value::Null);
         let observed_bbox = projected_item.get("screen_bbox").and_then(json_array4);
@@ -240,28 +274,75 @@ pub(crate) fn scene_feedback_metrics(
         let expected_anchor = feedback_expected_anchor_pixel(placement);
         let anchor_basis = feedback_anchor_basis(placement);
         let uses_center_anchor = feedback_uses_bbox_center_anchor(placement);
+        let source_edge_cropped = feedback_source_bbox_edge_cropped(placement);
+        let projected_cache_key = projected_item.get("cache_key").and_then(Value::as_str);
+        let current_yaw_degrees = status_world_item_yaw_degrees(status, index, projected_cache_key)
+            .unwrap_or(placement.rotation_y_degrees);
+        let yaw_correction =
+            feedback_yaw_correction(index, placement, current_yaw_degrees, &physical);
+        let rotation_selection = feedback_rotation_selection(
+            current_yaw_degrees,
+            yaw_correction.delta_degrees,
+            yaw_correction.basis,
+        );
+        let selected_yaw_delta = rotation_selection
+            .get("selected_yaw_delta_degrees")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(yaw_correction.delta_degrees);
+        let yaw_delta_abs = selected_yaw_delta.abs();
+        let max_yaw_delta = feedback_max_yaw_delta_for_pass(profile, placement);
         let (center_error, area_log2_error, aspect_log2_error, contact_error, score, passed) =
             if let Some(observed_bbox) = observed_bbox {
-                let expected_center = bbox_center(expected_bbox);
-                let observed_center = bbox_center(observed_bbox);
+                let edge_crop_relax = source_edge_cropped
+                    && (feedback_edge_crop_can_relax_projection(placement) || uses_center_anchor);
+                let visible_bbox_scoring =
+                    source_edge_cropped || feedback_bbox_outside_frame(observed_bbox);
+                let expected_score_bbox = if visible_bbox_scoring {
+                    feedback_visible_bbox(expected_bbox).unwrap_or(expected_bbox)
+                } else {
+                    expected_bbox
+                };
+                let observed_score_bbox = if visible_bbox_scoring {
+                    feedback_visible_bbox(observed_bbox).unwrap_or(observed_bbox)
+                } else {
+                    observed_bbox
+                };
+                let expected_center = bbox_center(expected_score_bbox);
+                let observed_center = bbox_center(observed_score_bbox);
                 let center_error = distance2(expected_center, observed_center);
-                let expected_area = bbox_area(expected_bbox);
-                let observed_area = bbox_area(observed_bbox);
+                let expected_area = bbox_area(expected_score_bbox);
+                let observed_area = bbox_area(observed_score_bbox);
                 let area_log2_error = safe_log2_ratio(observed_area, expected_area).abs();
-                let aspect_log2_error =
-                    safe_log2_ratio(bbox_aspect(observed_bbox), bbox_aspect(expected_bbox)).abs();
+                let aspect_log2_error = safe_log2_ratio(
+                    bbox_aspect(observed_score_bbox),
+                    bbox_aspect(expected_score_bbox),
+                )
+                .abs();
                 let observed_anchor =
                     feedback_observed_anchor_pixel(placement, observed_bbox, observed_contact);
                 let contact_error = distance2(expected_anchor, observed_anchor);
-                let center_limit = feedback_center_error_limit(
+                let mut center_limit = feedback_center_error_limit(
                     uses_center_anchor,
                     contact_error,
                     thresholds.max_center_error,
                     thresholds.max_contact_error,
                 );
+                if edge_crop_relax
+                    && !uses_center_anchor
+                    && contact_error <= thresholds.max_contact_error
+                {
+                    center_limit = center_limit.max(1.0);
+                }
                 let area_limit = feedback_area_log2_error_limit(
                     uses_center_anchor,
+                    feedback_repeated_object_like(placement),
+                    edge_crop_relax,
+                    center_error,
+                    contact_error,
                     thresholds.max_area_log2_error,
+                    thresholds.max_center_error,
+                    thresholds.max_contact_error,
                 );
                 let center_score = (1.0 - center_error / center_limit.max(1.0e-5)).clamp(0.0, 1.0);
                 let contact_score = (1.0
@@ -290,20 +371,38 @@ pub(crate) fn scene_feedback_metrics(
         if passed {
             passed_count += 1;
         }
+        if yaw_delta_abs <= max_yaw_delta {
+            yaw_passed_count += 1;
+        }
         score_total += score;
         let observed_bbox = observed_bbox.unwrap_or([0.0, 0.0, 0.0, 0.0]);
         let observed_contact = observed_contact.unwrap_or(bbox_center(observed_bbox));
         let observed_anchor =
             feedback_observed_anchor_pixel(placement, observed_bbox, Some(observed_contact));
-        let expected_area = bbox_area(expected_bbox);
-        let observed_area = bbox_area(observed_bbox);
+        let visible_bbox_scoring =
+            source_edge_cropped || feedback_bbox_outside_frame(observed_bbox);
+        let expected_delta_bbox = if visible_bbox_scoring {
+            feedback_visible_bbox(expected_bbox).unwrap_or(expected_bbox)
+        } else {
+            expected_bbox
+        };
+        let observed_delta_bbox = if visible_bbox_scoring {
+            feedback_visible_bbox(observed_bbox).unwrap_or(observed_bbox)
+        } else {
+            observed_bbox
+        };
+        let expected_area = bbox_area(expected_delta_bbox);
+        let observed_area = bbox_area(observed_delta_bbox);
         let scale_multiplier = if observed_area > 1.0e-5 {
             (expected_area / observed_area).sqrt().clamp(0.82, 1.22)
         } else {
             1.0
         };
         let contact_delta = vec2_sub(expected_anchor, observed_anchor);
-        let center_delta = vec2_sub(bbox_center(expected_bbox), bbox_center(observed_bbox));
+        let center_delta = vec2_sub(
+            bbox_center(expected_delta_bbox),
+            bbox_center(observed_delta_bbox),
+        );
         let fallback_delta = [
             (center_delta[0] * 2.0).clamp(-0.35, 0.35),
             0.0,
@@ -378,21 +477,6 @@ pub(crate) fn scene_feedback_metrics(
                 "max_z": footprint.rect.max_z,
             })
         });
-        let projected_cache_key = projected_item.get("cache_key").and_then(Value::as_str);
-        let current_yaw_degrees = status_world_item_yaw_degrees(status, index, projected_cache_key)
-            .unwrap_or(placement.rotation_y_degrees);
-        let yaw_correction =
-            feedback_yaw_correction(index, placement, current_yaw_degrees, &physical);
-        let rotation_selection = feedback_rotation_selection(
-            current_yaw_degrees,
-            yaw_correction.delta_degrees,
-            yaw_correction.basis,
-        );
-        let selected_yaw_delta = rotation_selection
-            .get("selected_yaw_delta_degrees")
-            .and_then(Value::as_f64)
-            .map(|value| value as f32)
-            .unwrap_or(yaw_correction.delta_degrees);
         let canonical_yaw_error =
             normalize_degrees(placement.rotation_y_degrees - current_yaw_degrees);
         let physical_failures = physical
@@ -409,11 +493,15 @@ pub(crate) fn scene_feedback_metrics(
             "cache_key": projected_item.get("cache_key").cloned().unwrap_or(Value::Null),
             "expected_bbox": expected_bbox,
             "observed_bbox": observed_bbox,
+            "visible_expected_bbox": feedback_visible_bbox(expected_bbox),
+            "visible_observed_bbox": feedback_visible_bbox(observed_bbox),
+            "visible_bbox_scoring": visible_bbox_scoring,
             "expected_contact": expected_contact,
             "observed_contact": observed_contact,
             "expected_anchor": expected_anchor,
             "observed_anchor": observed_anchor,
             "anchor_basis": anchor_basis,
+            "source_edge_cropped": source_edge_cropped,
             "center_error": center_error,
             "contact_error": contact_error,
             "area_log2_error": area_log2_error,
@@ -436,6 +524,9 @@ pub(crate) fn scene_feedback_metrics(
             "ground_anchor_max_drift_m": placement.ground_anchor_max_drift_m(),
             "scale_multiplier": scale_multiplier,
             "yaw_delta_degrees": selected_yaw_delta,
+            "yaw_delta_abs_degrees": yaw_delta_abs,
+            "max_yaw_delta_degrees": max_yaw_delta,
+            "yaw_passed": yaw_delta_abs <= max_yaw_delta,
             "yaw_basis": yaw_correction.basis,
             "rotation_selection": rotation_selection,
             "current_yaw_degrees": current_yaw_degrees,
@@ -450,15 +541,18 @@ pub(crate) fn scene_feedback_metrics(
     let projection_passed = passed_count == grounded_layout.placements.len()
         && mean_score >= thresholds.min_overall_score;
     let physical_passed = physical.hard_failure_count == 0;
-    let passed = projection_passed && physical_passed;
+    let rotation_passed = yaw_passed_count == grounded_layout.placements.len();
+    let passed = projection_passed && physical_passed && rotation_passed;
     Ok(json!({
         "profile": profile,
         "passed": passed,
         "score": mean_score,
         "projection_passed": projection_passed,
         "physical_passed": physical_passed,
+        "rotation_passed": rotation_passed,
         "object_count": grounded_layout.placements.len(),
         "object_pass_count": passed_count,
+        "rotation_pass_count": yaw_passed_count,
         "physical_pass_count": grounded_layout.placements.len().saturating_sub(physical.object_failure_count),
         "source_scene_path": manifest.source_scene_path,
         "screenshot_path": screenshot_path.display().to_string(),
@@ -501,12 +595,32 @@ pub(crate) fn feedback_center_error_limit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn feedback_area_log2_error_limit(
     uses_center_anchor: bool,
+    repeated_object_like: bool,
+    edge_cropped: bool,
+    center_error: f32,
+    contact_error: f32,
     max_area_log2_error: f32,
+    max_center_error: f32,
+    max_contact_error: f32,
 ) -> f32 {
-    if uses_center_anchor {
+    if uses_center_anchor
+        && edge_cropped
+        && center_error <= max_center_error
+        && contact_error <= max_contact_error
+    {
+        max_area_log2_error.max(2.05)
+    } else if uses_center_anchor {
         max_area_log2_error
+    } else if edge_cropped && contact_error <= max_contact_error {
+        max_area_log2_error.max(1.35)
+    } else if repeated_object_like
+        && contact_error <= max_contact_error * 0.35
+        && center_error <= max_center_error
+    {
+        max_area_log2_error.max(0.98)
     } else {
         max_area_log2_error * 1.25
     }
@@ -546,6 +660,55 @@ pub(crate) fn feedback_uses_bbox_center_anchor(placement: &GroundedScenePlacemen
         || descriptor.contains("desk")
         || descriptor.contains("counter")
         || descriptor.contains("bench")
+}
+
+pub(crate) fn feedback_source_bbox_edge_cropped(placement: &GroundedScenePlacement) -> bool {
+    let [x0, y0, x1, y1] = placement.source_bbox;
+    x0 <= 0.035 || y0 <= 0.035 || x1 >= 0.965 || y1 >= 0.965
+}
+
+pub(crate) fn feedback_max_yaw_delta_for_pass(
+    profile: FeedbackThresholdProfile,
+    placement: &GroundedScenePlacement,
+) -> f32 {
+    let base = match profile {
+        FeedbackThresholdProfile::Loose => 16.0,
+        FeedbackThresholdProfile::Standard => 8.0,
+        FeedbackThresholdProfile::Strict => 4.0,
+    };
+    if feedback_uses_bbox_center_anchor(placement) {
+        (base * 0.75_f32).max(3.0)
+    } else {
+        base
+    }
+}
+
+pub(crate) fn feedback_repeated_object_like(placement: &GroundedScenePlacement) -> bool {
+    placement.instance_id.is_some()
+        || placement.object_id.to_ascii_lowercase().contains("group")
+        || placement.asset_id.to_ascii_lowercase().contains("group")
+}
+
+pub(crate) fn feedback_edge_crop_can_relax_projection(placement: &GroundedScenePlacement) -> bool {
+    if feedback_repeated_object_like(placement) {
+        return true;
+    }
+    let descriptor = format!("{} {}", placement.object_id, placement.label).to_ascii_lowercase();
+    descriptor.contains("chair") || descriptor.contains("stool")
+}
+
+pub(crate) fn feedback_bbox_outside_frame(bbox: [f32; 4]) -> bool {
+    bbox[0] < -1.0e-3 || bbox[1] < -1.0e-3 || bbox[2] > 1.0 + 1.0e-3 || bbox[3] > 1.0 + 1.0e-3
+}
+
+pub(crate) fn feedback_visible_bbox(bbox: [f32; 4]) -> Option<[f32; 4]> {
+    let clipped = [
+        bbox[0].clamp(0.0, 1.0),
+        bbox[1].clamp(0.0, 1.0),
+        bbox[2].clamp(0.0, 1.0),
+        bbox[3].clamp(0.0, 1.0),
+    ];
+    (bbox_area(clipped) > 1.0e-5).then_some(clipped)
 }
 
 pub(crate) fn feedback_layout_deltas(metrics: &Value) -> Value {
@@ -664,7 +827,10 @@ pub(crate) fn feedback_layout_deltas(metrics: &Value) -> Value {
                     .get("yaw_delta_degrees")
                     .cloned()
                     .unwrap_or(json!(0.0)),
-                ground_anchor_point: object.get("ground_anchor_point").and_then(json_array3),
+                ground_anchor_point: object
+                    .get("target_ground_point")
+                    .and_then(json_array3)
+                    .or_else(|| object.get("ground_anchor_point").and_then(json_array3)),
                 ground_anchor_max_drift_m: object
                     .get("ground_anchor_max_drift_m")
                     .and_then(Value::as_f64)
@@ -697,19 +863,30 @@ pub(crate) fn feedback_layout_deltas(metrics: &Value) -> Value {
 
 #[derive(Debug)]
 pub(crate) struct FeedbackDeltaDraft {
-    index: Value,
-    translation_delta: [f32; 3],
-    scale_multiplier: f64,
-    scale_multiplier_xyz: Option<[f64; 3]>,
-    scale_group_key: Option<String>,
-    scale_source: &'static str,
-    yaw_delta_degrees: Value,
-    ground_anchor_point: Option<[f32; 3]>,
-    ground_anchor_max_drift_m: Option<f32>,
+    pub(crate) index: Value,
+    pub(crate) translation_delta: [f32; 3],
+    pub(crate) scale_multiplier: f64,
+    pub(crate) scale_multiplier_xyz: Option<[f64; 3]>,
+    pub(crate) scale_group_key: Option<String>,
+    pub(crate) scale_source: &'static str,
+    pub(crate) yaw_delta_degrees: Value,
+    pub(crate) ground_anchor_point: Option<[f32; 3]>,
+    pub(crate) ground_anchor_max_drift_m: Option<f32>,
 }
 
 pub(crate) fn feedback_axis_scale_multiplier(object: &Value) -> Option<[f64; 3]> {
     if !feedback_json_object_is_table_like(object) {
+        return None;
+    }
+    let source_edge_cropped = object
+        .get("source_edge_cropped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let visible_bbox_scoring = object
+        .get("visible_bbox_scoring")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if source_edge_cropped || visible_bbox_scoring {
         return None;
     }
     let expected = object.get("expected_bbox").and_then(json_array4)?;
@@ -838,6 +1015,12 @@ pub(crate) fn feedback_project_delta_collisions(
                         } else {
                             (right, left)
                         };
+                        if objects
+                            .get(seating.index)
+                            .is_some_and(feedback_json_object_is_open_sectional_seating)
+                        {
+                            continue;
+                        }
                         let seating_center_inside_table =
                             table.rect.contains_point(seating.rect.center());
                         if seating_center_inside_table
@@ -919,6 +1102,8 @@ pub(crate) fn apply_projected_delta(
         return false;
     }
     delta.translation_delta = next_delta;
+    delta.ground_anchor_point = None;
+    delta.ground_anchor_max_drift_m = None;
     if let Some(Some(footprint)) = footprints.get_mut(index) {
         footprint.rect = footprint.rect.translated(applied);
     }
@@ -967,6 +1152,17 @@ pub(crate) fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite())
         .unwrap_or(1.0);
+    let area_error = object
+        .get("area_log2_error")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    if feedback_json_object_is_large_edge_cropped_furniture(object)
+        && contact_error <= 0.05
+        && (center_error > 0.16 || area_error > 1.0)
+    {
+        return raw_scale;
+    }
     let weight = if contact_error <= 0.05 && center_error <= 0.08 {
         1.0
     } else if contact_error <= 0.10 && center_error <= 0.16 {
@@ -988,6 +1184,51 @@ pub(crate) fn feedback_json_object_is_table_like(object: &Value) -> bool {
     )
     .to_lowercase();
     descriptor.contains("table") || descriptor.contains("desk") || descriptor.contains("counter")
+}
+
+pub(crate) fn feedback_json_object_is_large_edge_cropped_furniture(object: &Value) -> bool {
+    if !object
+        .get("source_edge_cropped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if object.get("instance_id").and_then(Value::as_str).is_some()
+        || object
+            .get("object_id")
+            .and_then(Value::as_str)
+            .is_some_and(|object_id| object_id.to_ascii_lowercase().contains("group"))
+    {
+        return false;
+    }
+    let descriptor = format!(
+        "{} {}",
+        object
+            .get("object_id")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        object.get("label").and_then(Value::as_str).unwrap_or("")
+    )
+    .to_lowercase();
+    descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+        || descriptor.contains("banquette")
+}
+
+pub(crate) fn feedback_json_object_is_open_sectional_seating(object: &Value) -> bool {
+    let descriptor = format!(
+        "{} {}",
+        object
+            .get("object_id")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        object.get("label").and_then(Value::as_str).unwrap_or("")
+    )
+    .to_lowercase();
+    feedback_descriptor_is_open_sectional_seating(&descriptor)
 }
 
 pub(crate) fn feedback_scale_group_key(object: &Value) -> Option<String> {
@@ -1038,7 +1279,7 @@ pub(crate) fn apply_feedback_deltas_to_commands(
 }
 
 pub(crate) fn normalize_reused_command_scales(commands: &mut [Value]) {
-    let mut groups: HashMap<String, (f32, usize)> = HashMap::new();
+    let mut groups: HashMap<String, ([f32; 3], usize)> = HashMap::new();
     for command in commands.iter() {
         let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
         if command_type != "spawn_cached" && command_type != "spawn_path" {
@@ -1054,17 +1295,24 @@ pub(crate) fn normalize_reused_command_scales(commands: &mut [Value]) {
         let Some(scale) = command.get("scale").and_then(json_array3) else {
             continue;
         };
-        let uniform_scale =
-            ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0);
-        let entry = groups.entry(group_key.to_string()).or_insert((0.0, 0));
-        entry.0 += uniform_scale;
+        let entry = groups.entry(group_key.to_string()).or_insert(([0.0; 3], 0));
+        for (axis, value) in scale.iter().enumerate() {
+            entry.0[axis] += value.abs().clamp(0.05, 20.0);
+        }
         entry.1 += 1;
     }
     let repeated_scale = groups
         .into_iter()
         .filter_map(|(key, (sum, count))| {
             if count > 1 {
-                Some((key, (sum / count as f32).clamp(0.05, 20.0)))
+                Some((
+                    key,
+                    [
+                        (sum[0] / count as f32).clamp(0.05, 20.0),
+                        (sum[1] / count as f32).clamp(0.05, 20.0),
+                        (sum[2] / count as f32).clamp(0.05, 20.0),
+                    ],
+                ))
             } else {
                 None
             }
@@ -1085,7 +1333,7 @@ pub(crate) fn normalize_reused_command_scales(commands: &mut [Value]) {
         let Some(scale) = repeated_scale.get(group_key).copied() else {
             continue;
         };
-        command["scale"] = json!([scale, scale, scale]);
+        command["scale"] = json!(scale);
     }
 }
 
@@ -1335,6 +1583,31 @@ pub(crate) fn feedback_markdown_report(
             .get("passed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let projection_passed = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("projection_passed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let rotation_passed = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("rotation_passed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let object_pass_count = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("object_pass_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let object_count = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("object_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rotation_pass_count = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("rotation_pass_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let hard_failures = physical
             .get("hard_failure_count")
             .and_then(Value::as_u64)
@@ -1348,7 +1621,7 @@ pub(crate) fn feedback_markdown_report(
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         out.push_str(&format!(
-            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nphysical_passed: {physical_passed}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\n\n![iteration {index}]({})\n\n",
+            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nprojection_passed: {projection_passed} ({object_pass_count}/{object_count})\nrotation_passed: {rotation_passed} ({rotation_pass_count}/{object_count})\nphysical_passed: {physical_passed}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\n\n![iteration {index}]({})\n\n",
             path_relative_to(capture_root, Path::new(screenshot))
         ));
         if let Some(pairs) = physical.get("pairs").and_then(Value::as_array) {
@@ -1417,6 +1690,33 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite())
         .unwrap_or(f64::NEG_INFINITY);
+    let object_count = metrics
+        .get("object_count")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let object_pass_fraction = metrics
+        .get("object_pass_count")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        / object_count;
+    let rotation_pass_fraction = metrics
+        .get("rotation_pass_count")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        / object_count;
+    let projection_bonus = metrics
+        .get("projection_passed")
+        .and_then(Value::as_bool)
+        .map(|passed| if passed { 0.35 } else { 0.0 })
+        .unwrap_or(0.0);
+    let rotation_bonus = metrics
+        .get("rotation_passed")
+        .and_then(Value::as_bool)
+        .map(|passed| if passed { 0.35 } else { 0.0 })
+        .unwrap_or(0.0);
     let physical = metrics.get("physical_layout").unwrap_or(&Value::Null);
     let hard_failures = physical
         .get("hard_failure_count")
@@ -1426,9 +1726,16 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         .get("max_overlap_fraction_smaller")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
-    score - hard_failures * 2.0 - max_overlap
+    score
+        + object_pass_fraction * 0.75
+        + rotation_pass_fraction * 0.75
+        + projection_bonus
+        + rotation_bonus
+        - hard_failures * 2.0
+        - max_overlap
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn feedback_iteration_context(
     iteration_index: usize,
     previous_iteration: Option<&Value>,
@@ -1919,8 +2226,10 @@ pub(crate) fn feedback_metrics_summary(metrics: &Value) -> Value {
         "score": metrics.get("score").cloned().unwrap_or(Value::Null),
         "projection_passed": metrics.get("projection_passed").cloned().unwrap_or(Value::Null),
         "physical_passed": metrics.get("physical_passed").cloned().unwrap_or(Value::Null),
+        "rotation_passed": metrics.get("rotation_passed").cloned().unwrap_or(Value::Null),
         "object_count": metrics.get("object_count").cloned().unwrap_or(Value::Null),
         "object_pass_count": metrics.get("object_pass_count").cloned().unwrap_or(Value::Null),
+        "rotation_pass_count": metrics.get("rotation_pass_count").cloned().unwrap_or(Value::Null),
         "physical_layout": metrics.get("physical_layout").cloned().unwrap_or(Value::Null),
     })
 }
@@ -2188,8 +2497,6 @@ pub(crate) struct FeedbackPhysicalLayout {
     pub(crate) object_failure_count: usize,
     pub(crate) max_overlap_fraction_smaller: f32,
     pub(crate) min_signed_clearance_m: f32,
-    pub(crate) table_center_xz: Option<[f32; 2]>,
-    pub(crate) footprint_centers: HashMap<usize, [f32; 2]>,
 }
 
 pub(crate) fn feedback_projected_footprints(
@@ -2224,17 +2531,6 @@ pub(crate) fn feedback_physical_layout(
     let mut warning_count = 0usize;
     let mut max_overlap_fraction_smaller = 0.0f32;
     let mut min_signed_clearance_m = f32::INFINITY;
-    let table_center_xz = footprints
-        .iter()
-        .flatten()
-        .find(|footprint| footprint.kind == FeedbackPhysicalKind::Table)
-        .map(|footprint| footprint.rect.center());
-    let footprint_centers = footprints
-        .iter()
-        .flatten()
-        .map(|footprint| (footprint.index, footprint.rect.center()))
-        .collect::<HashMap<_, _>>();
-
     for left_index in 0..footprints.len() {
         let Some(left) = footprints[left_index] else {
             continue;
@@ -2273,13 +2569,19 @@ pub(crate) fn feedback_physical_layout(
                 if signed_clearance_m < -thresholds.max_seating_table_penetration_m {
                     reasons.push("seating_table_penetration");
                 }
+                let open_sectional_table_pair =
+                    feedback_open_sectional_table_pair(placements, left, right);
                 if !reasons.is_empty() {
-                    let delta = seating_table_outward_delta(
-                        table,
-                        seating,
-                        placements[seating.index].source_bbox,
-                    );
-                    accumulate_feedback_delta(&mut corrections, seating.index, delta, 1.10);
+                    if open_sectional_table_pair {
+                        reasons.clear();
+                    } else {
+                        let delta = seating_table_outward_delta(
+                            table,
+                            seating,
+                            placements[seating.index].source_bbox,
+                        );
+                        accumulate_feedback_delta(&mut corrections, seating.index, delta, 1.10);
+                    }
                 }
             } else if seating_seating {
                 if overlap_fraction_smaller > thresholds.max_seating_seating_overlap_fraction {
@@ -2355,8 +2657,6 @@ pub(crate) fn feedback_physical_layout(
         } else {
             0.0
         },
-        table_center_xz,
-        footprint_centers,
     }
 }
 
@@ -2392,6 +2692,9 @@ pub(crate) fn feedback_predictive_physical_delta(
         match feedback_pair_relationship(predicted.kind, other.kind) {
             "seating_table" => {
                 let table = other;
+                if feedback_open_sectional_descriptor(placement) {
+                    continue;
+                }
                 let seating_center_inside_table =
                     table.rect.contains_point(predicted.rect.center());
                 if seating_center_inside_table
@@ -2433,6 +2736,41 @@ pub(crate) fn feedback_physical_kind(placement: &GroundedScenePlacement) -> Feed
     } else {
         FeedbackPhysicalKind::Other
     }
+}
+
+pub(crate) fn feedback_open_sectional_table_pair(
+    placements: &[GroundedScenePlacement],
+    left: FeedbackFootprint,
+    right: FeedbackFootprint,
+) -> bool {
+    let seating_index = match (left.kind, right.kind) {
+        (FeedbackPhysicalKind::Table, FeedbackPhysicalKind::Seating) => right.index,
+        (FeedbackPhysicalKind::Seating, FeedbackPhysicalKind::Table) => left.index,
+        _ => return false,
+    };
+    placements
+        .get(seating_index)
+        .is_some_and(feedback_open_sectional_descriptor)
+}
+
+pub(crate) fn feedback_open_sectional_descriptor(placement: &GroundedScenePlacement) -> bool {
+    let descriptor = format!("{} {}", placement.object_id, placement.label).to_lowercase();
+    feedback_descriptor_is_open_sectional_seating(&descriptor)
+}
+
+pub(crate) fn feedback_descriptor_is_open_sectional_seating(descriptor: &str) -> bool {
+    let sofa_like = descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat");
+    let open_like = descriptor.contains("open")
+        || descriptor.contains("crescent")
+        || descriptor.contains("curved")
+        || descriptor.contains("sectional")
+        || descriptor.contains("u-shape")
+        || descriptor.contains("u shaped")
+        || descriptor.contains("u-shaped");
+    sofa_like && open_like
 }
 
 pub(crate) fn feedback_physical_kind_str(kind: FeedbackPhysicalKind) -> &'static str {
@@ -2800,27 +3138,11 @@ pub(crate) fn world_item_yaw_degrees(item: &Value) -> Option<f32> {
 }
 
 pub(crate) fn feedback_yaw_correction(
-    placement_index: usize,
+    _placement_index: usize,
     placement: &GroundedScenePlacement,
     current_yaw_degrees: f32,
-    physical: &FeedbackPhysicalLayout,
+    _physical: &FeedbackPhysicalLayout,
 ) -> FeedbackYawCorrection {
-    if feedback_physical_kind(placement) == FeedbackPhysicalKind::Seating
-        && let (Some(table_center), Some(object_center)) = (
-            physical.table_center_xz,
-            physical.footprint_centers.get(&placement_index),
-        )
-        && let Some(target_yaw) = yaw_toward_xz(*object_center, table_center)
-    {
-        let semantic_error = normalize_degrees(target_yaw - current_yaw_degrees);
-        if semantic_error.abs() > 6.0 {
-            let step_degrees = (semantic_error.abs() * 0.65).clamp(4.0, 20.0);
-            return FeedbackYawCorrection {
-                delta_degrees: semantic_error.clamp(-step_degrees, step_degrees),
-                basis: "table-facing-yaw",
-            };
-        }
-    }
     let canonical_error = normalize_degrees(placement.rotation_y_degrees - current_yaw_degrees);
     if canonical_error.abs() > 2.0 {
         let step_degrees = (canonical_error.abs() * 0.70).clamp(3.0, 24.0);
@@ -2833,15 +3155,6 @@ pub(crate) fn feedback_yaw_correction(
         delta_degrees: 0.0,
         basis: "canonical-bsn-yaw-within-threshold",
     }
-}
-
-pub(crate) fn yaw_toward_xz(from: [f32; 2], target: [f32; 2]) -> Option<f32> {
-    let dx = target[0] - from[0];
-    let dz = target[1] - from[1];
-    if !dx.is_finite() || !dz.is_finite() || dx.abs() + dz.abs() <= 1.0e-5 {
-        return None;
-    }
-    Some(normalize_degrees(dx.atan2(dz).to_degrees()))
 }
 
 pub(crate) fn quat_y_degrees(quat: [f32; 4]) -> f32 {

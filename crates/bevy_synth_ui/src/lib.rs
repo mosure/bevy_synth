@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{CameraOutputMode, RenderTarget};
@@ -49,6 +51,7 @@ const ENTRY_GAP: f32 = 10.0;
 const CATALOG_PAGE_SIZE: usize = 6;
 const PIPELINE_SELECTOR_WIDTH: f32 = 176.0;
 const PIPELINE_SELECTOR_HEIGHT: f32 = 30.0;
+const STATUS_BADGE_WIDTH: f32 = 260.0;
 const PREVIEW_SIZE: u32 = 128;
 const PREVIEW_MAX_LAYER: usize = 30;
 const GIZMO_LAYER: usize = 12;
@@ -123,9 +126,54 @@ const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 3] = [
     SynthesisModel::Trellis,
     SynthesisModel::Triposplat,
 ];
+const VIEWER_GROUND_Y_STEP: f32 = 0.05;
+const VIEWER_CONTACT_TOLERANCE_STEP: f32 = 0.01;
+const VIEWER_CONTACT_TOLERANCE_MIN: f32 = 0.0;
+const VIEWER_CONTACT_TOLERANCE_MAX: f32 = 0.25;
+const VIEWER_GROUND_Y_MIN: f32 = -2.0;
+const VIEWER_GROUND_Y_MAX: f32 = 2.0;
+const PROCESSING_EVENT_LIMIT: usize = 16;
+const PROCESSING_ARTIFACT_LIMIT: usize = 8;
 
 #[derive(Component)]
 pub struct MainCamera;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewerAabbOverlayMode {
+    Off,
+    #[default]
+    Selected,
+    All,
+}
+
+impl ViewerAabbOverlayMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Selected => "selected",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Resource, PartialEq)]
+pub struct ViewerDebugSettings {
+    pub aabb_overlay: ViewerAabbOverlayMode,
+    pub draw_ground_contact: bool,
+    pub ground_y: f32,
+    pub contact_tolerance: f32,
+}
+
+impl Default for ViewerDebugSettings {
+    fn default() -> Self {
+        Self {
+            aabb_overlay: ViewerAabbOverlayMode::Selected,
+            draw_ground_contact: true,
+            ground_y: 0.0,
+            contact_tolerance: 0.02,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CatalogMode {
@@ -182,6 +230,131 @@ pub struct ScenePipelineUiSettings {
     pub pbr_texture_size: usize,
     pub target_faces: usize,
     pub allow_catalog_reuse: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SceneProcessingEvent {
+    pub stage: String,
+    pub phase: String,
+    pub execution: String,
+    pub message: String,
+    pub elapsed_ms: u64,
+    pub item_index: Option<usize>,
+    pub item_count: Option<usize>,
+    pub artifact_path: Option<String>,
+    pub token_usage: Option<String>,
+    pub is_failure: bool,
+}
+
+#[derive(Clone, Debug, Resource)]
+pub struct SceneProcessingState {
+    active: bool,
+    run_id: Option<String>,
+    source_label: Option<String>,
+    current_stage: String,
+    current_phase: String,
+    current_execution: String,
+    current_message: String,
+    elapsed_ms: u64,
+    recent_events: VecDeque<SceneProcessingEvent>,
+    recent_artifacts: VecDeque<String>,
+    token_usage_summary: Option<String>,
+    last_error: Option<String>,
+}
+
+impl Default for SceneProcessingState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            run_id: None,
+            source_label: None,
+            current_stage: "idle".to_string(),
+            current_phase: "idle".to_string(),
+            current_execution: "unknown".to_string(),
+            current_message: "idle".to_string(),
+            elapsed_ms: 0,
+            recent_events: VecDeque::new(),
+            recent_artifacts: VecDeque::new(),
+            token_usage_summary: None,
+            last_error: None,
+        }
+    }
+}
+
+impl SceneProcessingState {
+    pub fn begin(&mut self, source_label: impl Into<String>) {
+        self.active = true;
+        self.run_id = None;
+        self.source_label = Some(source_label.into());
+        self.current_stage = "scene_build".to_string();
+        self.current_phase = "started".to_string();
+        self.current_execution = "mixed".to_string();
+        self.current_message = "scene build queued".to_string();
+        self.elapsed_ms = 0;
+        self.recent_events.clear();
+        self.recent_artifacts.clear();
+        self.token_usage_summary = None;
+        self.last_error = None;
+    }
+
+    pub fn push_event(&mut self, run_id: String, event: SceneProcessingEvent) {
+        self.active = !event.phase.eq_ignore_ascii_case("completed")
+            || !event.stage.eq_ignore_ascii_case("scene_build");
+        self.run_id = Some(run_id);
+        self.current_stage = event.stage.clone();
+        self.current_phase = event.phase.clone();
+        self.current_execution = event.execution.clone();
+        self.current_message = event.message.clone();
+        self.elapsed_ms = event.elapsed_ms;
+        if event.is_failure {
+            self.last_error = Some(event.message.clone());
+            self.active = false;
+        }
+        if let Some(token_usage) = event.token_usage.as_ref() {
+            self.token_usage_summary = Some(token_usage.clone());
+        }
+        if let Some(path) = event.artifact_path.as_ref()
+            && !self
+                .recent_artifacts
+                .iter()
+                .any(|existing| existing == path)
+        {
+            self.recent_artifacts.push_front(path.clone());
+            while self.recent_artifacts.len() > PROCESSING_ARTIFACT_LIMIT {
+                self.recent_artifacts.pop_back();
+            }
+        }
+        self.recent_events.push_front(event);
+        while self.recent_events.len() > PROCESSING_EVENT_LIMIT {
+            self.recent_events.pop_back();
+        }
+    }
+
+    pub fn finish_success(&mut self, message: impl Into<String>) {
+        self.active = false;
+        self.current_stage = "scene_build".to_string();
+        self.current_phase = "completed".to_string();
+        self.current_execution = "mixed".to_string();
+        self.current_message = message.into();
+    }
+
+    pub fn finish_failure(&mut self, message: impl Into<String>) {
+        self.active = false;
+        let message = message.into();
+        self.current_stage = "scene_build".to_string();
+        self.current_phase = "failed".to_string();
+        self.current_execution = "mixed".to_string();
+        self.current_message = message.clone();
+        self.last_error = Some(message);
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.active || self.last_error.is_some() || !self.recent_events.is_empty()
+    }
+
+    pub fn token_usage_summary(&self) -> Option<&str> {
+        self.token_usage_summary.as_deref()
+    }
 }
 
 impl Default for ScenePipelineUiSettings {
@@ -304,6 +477,8 @@ impl Plugin for BurnSynthUiPlugin {
             .init_resource::<DragState>()
             .init_resource::<CatalogSelectionState>()
             .init_resource::<ScenePipelineUiSettings>()
+            .init_resource::<ViewerDebugSettings>()
+            .init_resource::<SceneProcessingState>()
             .init_resource::<CatalogModeDropdownState>()
             .init_resource::<SettingsModalState>()
             .init_resource::<PipelineDropdownState>()
@@ -362,8 +537,18 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_scene_quality_button,
                     handle_scene_setting_step_button,
                     handle_scene_setting_toggle_button,
-                    sync_settings_modal,
-                    update_settings_labels,
+                    handle_settings_tab_button,
+                    handle_viewer_aabb_mode_button,
+                    handle_viewer_debug_toggle_button,
+                    handle_viewer_debug_step_button,
+                    (
+                        sync_settings_modal,
+                        sync_settings_tab_visuals,
+                        sync_settings_developer_panel,
+                        update_settings_labels,
+                        update_viewer_debug_labels,
+                    )
+                        .chain(),
                 ),
             )
             .add_systems(
@@ -374,6 +559,7 @@ impl Plugin for BurnSynthUiPlugin {
                     sync_source_image_modal,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
                     update_button_visuals,
+                    sync_processing_panel,
                     (
                         handle_catalog_entry_interaction,
                         handle_catalog_scene_load_button,
@@ -876,6 +1062,33 @@ struct QueueStatusBadge;
 struct QueueStatusDot;
 
 #[derive(Component)]
+struct ProcessingPanelRoot;
+
+#[derive(Component)]
+struct ProcessingCurrentText;
+
+#[derive(Component)]
+struct ProcessingTimelineText;
+
+#[derive(Component)]
+struct ProcessingArtifactText;
+
+#[derive(Component)]
+struct ProcessingErrorText;
+
+#[derive(Component, Default)]
+struct SettingsDeveloperCurrentText;
+
+#[derive(Component, Default)]
+struct SettingsDeveloperTokenText;
+
+#[derive(Component, Default)]
+struct SettingsDeveloperEventsText;
+
+#[derive(Component, Default)]
+struct SettingsDeveloperArtifactText;
+
+#[derive(Component)]
 struct CatalogList;
 
 #[derive(Component)]
@@ -968,6 +1181,36 @@ struct CatalogSourceImageCloseButton;
 
 #[derive(Component)]
 struct SettingsModalRoot;
+
+#[derive(Component)]
+struct SettingsTabButton {
+    tab: SettingsModalTab,
+}
+
+#[derive(Component)]
+struct SettingsTabPanel {
+    tab: SettingsModalTab,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsModalTab {
+    #[default]
+    Pipeline,
+    General,
+    Physics,
+    Developer,
+}
+
+impl SettingsModalTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pipeline => "pipeline",
+            Self::General => "general",
+            Self::Physics => "physics",
+            Self::Developer => "developer",
+        }
+    }
+}
 
 #[derive(Component)]
 struct TripoSplatProfileButton {
@@ -1103,6 +1346,46 @@ struct SceneToggleValueLabel {
 struct SceneQualityValueLabel;
 
 #[derive(Component)]
+struct ViewerAabbModeButton {
+    mode: ViewerAabbOverlayMode,
+}
+
+#[derive(Component)]
+struct ViewerAabbModeValueLabel;
+
+#[derive(Component)]
+struct ViewerDebugToggleButton {
+    setting: ViewerDebugToggleSetting,
+}
+
+#[derive(Component)]
+struct ViewerDebugStepButton {
+    setting: ViewerDebugNumericSetting,
+    delta: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerDebugToggleSetting {
+    GroundContact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerDebugNumericSetting {
+    GroundY,
+    ContactTolerance,
+}
+
+#[derive(Component)]
+struct ViewerDebugToggleValueLabel {
+    setting: ViewerDebugToggleSetting,
+}
+
+#[derive(Component)]
+struct ViewerDebugNumericValueLabel {
+    setting: ViewerDebugNumericSetting,
+}
+
+#[derive(Component)]
 struct TrellisSettingValueLabel {
     setting: TrellisSetting,
 }
@@ -1143,6 +1426,7 @@ struct SettingsModalState {
     open: bool,
     entity: Option<Entity>,
     pipeline: Option<CatalogPipelineChoice>,
+    tab: SettingsModalTab,
 }
 
 #[derive(Resource, Default)]
@@ -1504,11 +1788,14 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                     right
                         .spawn((
                             Node {
+                                width: Val::Px(STATUS_BADGE_WIDTH),
                                 flex_direction: FlexDirection::Row,
                                 align_items: AlignItems::Center,
+                                justify_content: JustifyContent::FlexStart,
                                 column_gap: Val::Px(7.0),
                                 padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
                                 border: UiRect::all(Val::Px(1.0)),
+                                overflow: Overflow::clip_x(),
                                 ..default()
                             },
                             BackgroundColor(STATUS_BADGE_BG),
@@ -1537,6 +1824,53 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
 
         parent
             .spawn((
+                ProcessingPanelRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(MENU_HEIGHT + 12.0),
+                    right: Val::Px(12.0),
+                    width: Val::Px(330.0),
+                    max_height: Val::Px(220.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(8.0),
+                    padding: UiRect::all(Val::Px(12.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    overflow: Overflow::clip_y(),
+                    ..default()
+                },
+                Visibility::Hidden,
+                BackgroundColor(Color::srgba(0.045, 0.05, 0.065, 0.94)),
+                BorderColor::all(Color::srgb(0.24, 0.28, 0.36)),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("processing"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.88, 0.91, 0.96)),
+                    ProcessingCurrentText,
+                ));
+                panel.spawn((
+                    Text::new(""),
+                    TextFont::from_font_size(11.0),
+                    TextColor(Color::srgb(0.72, 0.78, 0.88)),
+                    ProcessingTimelineText,
+                ));
+                panel.spawn((
+                    Text::new(""),
+                    TextFont::from_font_size(10.0),
+                    TextColor(Color::srgb(0.58, 0.66, 0.76)),
+                    ProcessingArtifactText,
+                ));
+                panel.spawn((
+                    Text::new(""),
+                    TextFont::from_font_size(11.0),
+                    TextColor(Color::srgb(0.96, 0.62, 0.62)),
+                    ProcessingErrorText,
+                ));
+            });
+
+        parent
+            .spawn((
                 Node {
                     width: Val::Px(PANEL_WIDTH),
                     flex_direction: FlexDirection::Column,
@@ -1556,6 +1890,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                         height: Val::Px(30.0),
                         justify_content: JustifyContent::SpaceBetween,
                         align_items: AlignItems::Center,
+                        column_gap: Val::Px(14.0),
                         ..default()
                     })
                     .with_children(|header| {
@@ -1607,7 +1942,8 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                             .spawn(Node {
                                 flex_direction: FlexDirection::Row,
                                 align_items: AlignItems::Center,
-                                column_gap: Val::Px(6.0),
+                                column_gap: Val::Px(8.0),
+                                margin: UiRect::left(Val::Px(16.0)),
                                 ..default()
                             })
                             .with_children(|controls| {
@@ -1752,7 +2088,7 @@ fn update_queue_text(
     {
         let is_failure = worker_message.to_ascii_lowercase().contains("failed");
         (
-            worker_message.clone(),
+            compact_worker_status_text(worker_message),
             if is_failure {
                 Color::srgb(0.96, 0.72, 0.72)
             } else {
@@ -1829,6 +2165,209 @@ fn update_queue_text(
         }
         *border = BorderColor::all(badge_border);
     }
+}
+
+fn sync_processing_panel(
+    state: Res<SceneProcessingState>,
+    mut roots: Query<&mut Visibility, With<ProcessingPanelRoot>>,
+    mut text_queries: ParamSet<(
+        Query<&mut Text, With<ProcessingCurrentText>>,
+        Query<&mut Text, With<ProcessingTimelineText>>,
+        Query<&mut Text, With<ProcessingArtifactText>>,
+        Query<&mut Text, With<ProcessingErrorText>>,
+    )>,
+) {
+    let visible = state.is_visible();
+    for mut visibility in &mut roots {
+        *visibility = if visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !visible {
+        return;
+    }
+
+    let status = if state.active {
+        "running"
+    } else {
+        &state.current_phase
+    };
+    let source = state
+        .source_label
+        .as_deref()
+        .map(ellipsize_processing_text)
+        .unwrap_or_else(|| "scene".to_string());
+    let elapsed = format_elapsed_ms(state.elapsed_ms);
+    let mut current_rows = vec![
+        format!(
+            "{status} | {elapsed} | {}",
+            ellipsize_text(&state.current_stage, 32)
+        ),
+        source,
+        format!(
+            "{} | {}",
+            state.current_phase,
+            ellipsize_text(&state.current_execution, 16)
+        ),
+        ellipsize_text(&state.current_message, 64),
+    ];
+    if let Some(token_usage) = state.token_usage_summary.as_ref() {
+        current_rows.push(ellipsize_text(token_usage, 64));
+    }
+    let current_text = current_rows.join("\n");
+    for mut text in &mut text_queries.p0() {
+        text.0 = current_text.clone();
+    }
+
+    let rows = state
+        .recent_events
+        .iter()
+        .take(2)
+        .map(format_processing_event)
+        .collect::<Vec<_>>();
+    let timeline_text = if rows.is_empty() {
+        String::new()
+    } else {
+        rows.join("\n")
+    };
+    for mut text in &mut text_queries.p1() {
+        text.0 = timeline_text.clone();
+    }
+
+    let artifact_text = state
+        .recent_artifacts
+        .iter()
+        .take(1)
+        .map(|path| format!("artifact: {}", ellipsize_text(path, 48)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for mut text in &mut text_queries.p2() {
+        text.0 = artifact_text.clone();
+    }
+
+    let error_text = state
+        .last_error
+        .as_deref()
+        .map(|error| format!("error: {}", ellipsize_text(error, 96)))
+        .unwrap_or_default();
+    for mut text in &mut text_queries.p3() {
+        text.0 = error_text.clone();
+    }
+}
+
+fn sync_settings_developer_panel(
+    state: Res<SceneProcessingState>,
+    mut text_queries: ParamSet<(
+        Query<&mut Text, With<SettingsDeveloperCurrentText>>,
+        Query<&mut Text, With<SettingsDeveloperTokenText>>,
+        Query<&mut Text, With<SettingsDeveloperEventsText>>,
+        Query<&mut Text, With<SettingsDeveloperArtifactText>>,
+    )>,
+) {
+    let current_text = format_processing_current_block(&state);
+    for mut text in &mut text_queries.p0() {
+        text.0 = current_text.clone();
+    }
+
+    let token_text = state
+        .token_usage_summary
+        .clone()
+        .unwrap_or_else(|| "no token usage reported yet".to_string());
+    for mut text in &mut text_queries.p1() {
+        text.0 = token_text.clone();
+    }
+
+    let event_text = state
+        .recent_events
+        .iter()
+        .take(10)
+        .map(format_processing_event)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for mut text in &mut text_queries.p2() {
+        text.0 = if event_text.is_empty() {
+            "no scene build events yet".to_string()
+        } else {
+            event_text.clone()
+        };
+    }
+
+    let artifact_text = state
+        .recent_artifacts
+        .iter()
+        .take(8)
+        .map(|path| ellipsize_text(path, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for mut text in &mut text_queries.p3() {
+        text.0 = if artifact_text.is_empty() {
+            "no artifacts yet".to_string()
+        } else {
+            artifact_text.clone()
+        };
+    }
+}
+
+fn format_processing_current_block(state: &SceneProcessingState) -> String {
+    format!(
+        "run: {}\nsource: {}\nstage: {} / {} / {}\nelapsed: {}\nmessage: {}",
+        state.run_id.as_deref().unwrap_or("none"),
+        state.source_label.as_deref().unwrap_or("none"),
+        state.current_stage,
+        state.current_phase,
+        state.current_execution,
+        format_elapsed_ms(state.elapsed_ms),
+        state.current_message
+    )
+}
+
+fn format_processing_event(event: &SceneProcessingEvent) -> String {
+    let item = match (event.item_index, event.item_count) {
+        (Some(index), Some(total)) => format!(" [{index}/{total}]"),
+        (None, Some(total)) => format!(" [{total}]"),
+        _ => String::new(),
+    };
+    let marker = if event.is_failure { "!" } else { "-" };
+    format!(
+        "{marker} {} {} {}{}: {}",
+        format_elapsed_ms(event.elapsed_ms),
+        event.phase,
+        event.stage,
+        item,
+        ellipsize_text(&event.message, 72)
+    )
+}
+
+fn compact_worker_status_text(message: &str) -> String {
+    let normalized = message.trim();
+    if let Some(rest) = normalized.strip_prefix("scene ") {
+        let (phase, stage_and_message) = rest.split_once(": ").unwrap_or((rest, ""));
+        let (stage, _) = stage_and_message
+            .split_once(" - ")
+            .unwrap_or((stage_and_message, ""));
+        if !stage.is_empty() {
+            let label = format!("scene {phase}: {stage}");
+            return ellipsize_text(&label, 34);
+        }
+    }
+    ellipsize_text(normalized, 34)
+}
+
+fn format_elapsed_ms(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms as f64 / 1000.0;
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        let minutes = (seconds / 60.0).floor() as u64;
+        let seconds = (seconds as u64) % 60;
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn ellipsize_processing_text(text: &str) -> String {
+    ellipsize_text(text, 64)
 }
 
 fn handle_catalog_toggle(
@@ -2511,6 +3050,7 @@ fn update_button_visuals(
     args: Option<Res<AppArgs>>,
     available: Option<Res<AvailablePipelines>>,
     modal: Res<SettingsModalState>,
+    viewer_debug: Res<ViewerDebugSettings>,
     mut selection: ResMut<CatalogSelectionState>,
     mut controls: Query<
         (
@@ -2525,6 +3065,7 @@ fn update_button_visuals(
             Option<&TripoSplatProfileButton>,
             Option<&TrellisQualityButton>,
             Option<&TrellisPbrToggleButton>,
+            Option<&ViewerAabbModeButton>,
             &Children,
             &mut BackgroundColor,
             &mut BorderColor,
@@ -2565,6 +3106,7 @@ fn update_button_visuals(
         profile,
         trellis_quality,
         trellis_pbr,
+        viewer_aabb,
         children,
         mut bg,
         mut border,
@@ -2595,7 +3137,8 @@ fn update_button_visuals(
                 .is_some_and(|(button, args)| button.quality == args.trellis_quality)
             || trellis_pbr
                 .zip(args_ref)
-                .is_some_and(|(_, args)| args.trellis_pbr_enabled);
+                .is_some_and(|(_, args)| args.trellis_pbr_enabled)
+            || viewer_aabb.is_some_and(|button| button.mode == viewer_debug.aabb_overlay);
         let (button_bg, button_border, text_color) =
             control_button_palette(button.0, *interaction, disabled, active);
         if bg.0 != button_bg {
@@ -3508,6 +4051,65 @@ fn handle_scene_setting_toggle_button(
     }
 }
 
+fn handle_settings_tab_button(
+    mut modal: ResMut<SettingsModalState>,
+    mut interactions: Query<(&Interaction, &SettingsTabButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed && modal.tab != button.tab {
+            modal.tab = button.tab;
+        }
+    }
+}
+
+fn handle_viewer_aabb_mode_button(
+    mut settings: ResMut<ViewerDebugSettings>,
+    mut interactions: Query<(&Interaction, &ViewerAabbModeButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            settings.aabb_overlay = button.mode;
+        }
+    }
+}
+
+fn handle_viewer_debug_toggle_button(
+    mut settings: ResMut<ViewerDebugSettings>,
+    mut interactions: Query<(&Interaction, &ViewerDebugToggleButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match button.setting {
+            ViewerDebugToggleSetting::GroundContact => {
+                settings.draw_ground_contact = !settings.draw_ground_contact;
+            }
+        }
+    }
+}
+
+fn handle_viewer_debug_step_button(
+    mut settings: ResMut<ViewerDebugSettings>,
+    mut interactions: Query<(&Interaction, &ViewerDebugStepButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match button.setting {
+            ViewerDebugNumericSetting::GroundY => {
+                settings.ground_y = (settings.ground_y + button.delta)
+                    .clamp(VIEWER_GROUND_Y_MIN, VIEWER_GROUND_Y_MAX);
+            }
+            ViewerDebugNumericSetting::ContactTolerance => {
+                settings.contact_tolerance = (settings.contact_tolerance + button.delta)
+                    .clamp(VIEWER_CONTACT_TOLERANCE_MIN, VIEWER_CONTACT_TOLERANCE_MAX);
+            }
+        }
+    }
+}
+
 fn sync_settings_modal(
     mut commands: Commands,
     catalog: Res<CatalogState>,
@@ -3527,12 +4129,13 @@ fn sync_settings_modal(
             commands.entity(entity).despawn();
         }
         modal.pipeline = None;
+        modal.tab = SettingsModalTab::Pipeline;
     }
     ui.settings_modal_open = modal.open;
     match (modal.open, modal.entity) {
         (true, None) => {
             if let Some(pipeline) = active_pipeline {
-                modal.entity = Some(spawn_settings_modal(&mut commands, pipeline));
+                modal.entity = Some(spawn_settings_modal(&mut commands, pipeline, modal.tab));
                 modal.pipeline = Some(pipeline);
             }
         }
@@ -3543,6 +4146,52 @@ fn sync_settings_modal(
             modal.pipeline = None;
         }
         _ => {}
+    }
+}
+
+fn sync_settings_tab_visuals(
+    modal: Res<SettingsModalState>,
+    mut panels: Query<(&SettingsTabPanel, &mut Node, &mut Visibility)>,
+    mut tabs: Query<
+        (
+            &SettingsTabButton,
+            &Interaction,
+            &Children,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
+        With<Button>,
+    >,
+    mut labels: Query<&mut TextColor, With<ButtonLabel>>,
+) {
+    for (panel, mut node, mut visibility) in panels.iter_mut() {
+        let (next_visibility, next_display) = if panel.tab == modal.tab {
+            (Visibility::Visible, Display::Flex)
+        } else {
+            (Visibility::Hidden, Display::None)
+        };
+        if *visibility != next_visibility {
+            *visibility = next_visibility;
+        }
+        if node.display != next_display {
+            node.display = next_display;
+        }
+    }
+    for (tab, interaction, children, mut bg, mut border) in tabs.iter_mut() {
+        let active = tab.tab == modal.tab;
+        let (button_bg, button_border, text_color) =
+            control_button_palette(ControlButtonKind::Secondary, *interaction, false, active);
+        if bg.0 != button_bg {
+            bg.0 = button_bg;
+        }
+        *border = BorderColor::all(button_border);
+        for child in children.iter() {
+            if let Ok(mut label) = labels.get_mut(child)
+                && label.0 != text_color
+            {
+                label.0 = text_color;
+            }
+        }
     }
 }
 
@@ -3681,6 +4330,65 @@ fn update_settings_labels(
     }
     for (value, mut label) in scene_toggle_labels.iter_mut() {
         let next = scene_toggle_value_text(&scene_settings, value.setting);
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+}
+
+fn update_viewer_debug_labels(
+    viewer_debug: Res<ViewerDebugSettings>,
+    mut aabb_labels: Query<
+        &mut Text,
+        (
+            With<ViewerAabbModeValueLabel>,
+            Without<ViewerDebugToggleValueLabel>,
+            Without<ViewerDebugNumericValueLabel>,
+        ),
+    >,
+    mut toggle_labels: Query<
+        (&ViewerDebugToggleValueLabel, &mut Text),
+        (
+            Without<ViewerAabbModeValueLabel>,
+            Without<ViewerDebugNumericValueLabel>,
+        ),
+    >,
+    mut numeric_labels: Query<
+        (&ViewerDebugNumericValueLabel, &mut Text),
+        (
+            Without<ViewerAabbModeValueLabel>,
+            Without<ViewerDebugToggleValueLabel>,
+        ),
+    >,
+) {
+    for mut label in aabb_labels.iter_mut() {
+        let next = viewer_debug.aabb_overlay.label().to_string();
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+    for (value, mut label) in toggle_labels.iter_mut() {
+        let next = match value.setting {
+            ViewerDebugToggleSetting::GroundContact => {
+                if viewer_debug.draw_ground_contact {
+                    "on"
+                } else {
+                    "off"
+                }
+            }
+        }
+        .to_string();
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+    for (value, mut label) in numeric_labels.iter_mut() {
+        let next = match value.setting {
+            ViewerDebugNumericSetting::GroundY => format!("{:.2}", viewer_debug.ground_y),
+            ViewerDebugNumericSetting::ContactTolerance => {
+                format!("{:.2}", viewer_debug.contact_tolerance)
+            }
+        };
         if label.0 != next {
             label.0 = next;
         }
@@ -3867,7 +4575,11 @@ fn spawn_scene_details_stats(parent: &mut ChildSpawnerCommands, entry: &CatalogE
         });
 }
 
-fn spawn_settings_modal(commands: &mut Commands, pipeline: CatalogPipelineChoice) -> Entity {
+fn spawn_settings_modal(
+    commands: &mut Commands,
+    pipeline: CatalogPipelineChoice,
+    active_tab: SettingsModalTab,
+) -> Entity {
     commands
         .spawn((
             SettingsModalRoot,
@@ -3933,20 +4645,50 @@ fn spawn_settings_modal(commands: &mut Commands, pipeline: CatalogPipelineChoice
                             });
                     });
 
-                match pipeline {
-                    CatalogPipelineChoice::Object(SynthesisModel::Triposg) => {
-                        spawn_triposg_settings(panel)
-                    }
-                    CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => {
-                        spawn_triposplat_settings(panel)
-                    }
-                    CatalogPipelineChoice::Object(SynthesisModel::Trellis) => {
-                        spawn_trellis_settings(panel)
-                    }
-                    CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => {
-                        spawn_scene_settings(panel)
-                    }
-                }
+                spawn_settings_tabs(panel);
+                spawn_settings_tab_panel(
+                    panel,
+                    SettingsModalTab::Pipeline,
+                    active_tab == SettingsModalTab::Pipeline,
+                    |panel| match pipeline {
+                        CatalogPipelineChoice::Object(SynthesisModel::Triposg) => {
+                            spawn_triposg_settings(panel)
+                        }
+                        CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => {
+                            spawn_triposplat_settings(panel)
+                        }
+                        CatalogPipelineChoice::Object(SynthesisModel::Trellis) => {
+                            spawn_trellis_settings(panel)
+                        }
+                        CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => {
+                            spawn_scene_settings(panel)
+                        }
+                    },
+                );
+                spawn_settings_tab_panel(
+                    panel,
+                    SettingsModalTab::General,
+                    active_tab == SettingsModalTab::General,
+                    |panel| {
+                        spawn_general_settings(panel);
+                    },
+                );
+                spawn_settings_tab_panel(
+                    panel,
+                    SettingsModalTab::Physics,
+                    active_tab == SettingsModalTab::Physics,
+                    |panel| {
+                        spawn_physics_settings(panel);
+                    },
+                );
+                spawn_settings_tab_panel(
+                    panel,
+                    SettingsModalTab::Developer,
+                    active_tab == SettingsModalTab::Developer,
+                    |panel| {
+                        spawn_developer_settings(panel);
+                    },
+                );
             });
         })
         .id()
@@ -3959,6 +4701,74 @@ fn settings_modal_title(pipeline: CatalogPipelineChoice) -> &'static str {
         CatalogPipelineChoice::Object(SynthesisModel::Trellis) => "Trellis.2 settings",
         CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => "Explicit scene settings",
     }
+}
+
+fn spawn_settings_tabs(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|row| {
+            for tab in [
+                SettingsModalTab::Pipeline,
+                SettingsModalTab::General,
+                SettingsModalTab::Physics,
+                SettingsModalTab::Developer,
+            ] {
+                row.spawn((
+                    Button,
+                    SettingsTabButton { tab },
+                    Node {
+                        height: Val::Px(28.0),
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BUTTON_BORDER),
+                    BackgroundColor(BUTTON_BG),
+                ))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new(tab.label()),
+                        TextFont::from_font_size(12.0),
+                        TextColor(BUTTON_TEXT),
+                        ButtonLabel,
+                    ));
+                });
+            }
+        });
+}
+
+fn spawn_settings_tab_panel(
+    parent: &mut ChildSpawnerCommands,
+    tab: SettingsModalTab,
+    visible: bool,
+    spawn_content: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    parent
+        .spawn((
+            SettingsTabPanel { tab },
+            Node {
+                display: if visible {
+                    Display::Flex
+                } else {
+                    Display::None
+                },
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(10.0),
+                ..default()
+            },
+            if visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            },
+        ))
+        .with_children(spawn_content);
 }
 
 fn spawn_triposplat_settings(panel: &mut ChildSpawnerCommands) {
@@ -4164,6 +4974,259 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
         TRELLIS_FACE_STEP as isize,
     );
     spawn_scene_toggle_row(panel, "catalog reuse", SceneToggleSetting::CatalogReuse);
+}
+
+fn spawn_general_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_viewer_aabb_row(panel);
+}
+
+fn spawn_physics_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_viewer_debug_toggle_row(
+        panel,
+        "ground/contact",
+        ViewerDebugToggleSetting::GroundContact,
+    );
+    spawn_viewer_debug_numeric_row(
+        panel,
+        "ground y",
+        ViewerDebugNumericSetting::GroundY,
+        VIEWER_GROUND_Y_STEP,
+    );
+    spawn_viewer_debug_numeric_row(
+        panel,
+        "contact tolerance",
+        ViewerDebugNumericSetting::ContactTolerance,
+        VIEWER_CONTACT_TOLERANCE_STEP,
+    );
+}
+
+fn spawn_developer_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_developer_text_block::<SettingsDeveloperCurrentText>(panel, "current", "idle");
+    spawn_developer_text_block::<SettingsDeveloperTokenText>(panel, "tokens", "no token usage");
+    spawn_developer_text_block::<SettingsDeveloperEventsText>(
+        panel,
+        "events",
+        "no scene build events yet",
+    );
+    spawn_developer_text_block::<SettingsDeveloperArtifactText>(
+        panel,
+        "artifacts",
+        "no artifacts yet",
+    );
+}
+
+fn spawn_developer_text_block<T: Component + Default>(
+    panel: &mut ChildSpawnerCommands,
+    label: &'static str,
+    value: &'static str,
+) {
+    panel
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+            ..default()
+        })
+        .with_children(|block| {
+            block.spawn((
+                Text::new(label),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgb(0.58, 0.64, 0.74)),
+            ));
+            block.spawn((
+                Text::new(value),
+                TextFont::from_font_size(10.5),
+                TextColor(Color::srgb(0.76, 0.81, 0.9)),
+                T::default(),
+            ));
+        });
+}
+
+fn spawn_viewer_aabb_row(parent: &mut ChildSpawnerCommands) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(7.0),
+            ..default()
+        })
+        .with_children(|column| {
+            column
+                .spawn(Node {
+                    width: Val::Percent(100.0),
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("object AABB"),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.82, 0.86, 0.94)),
+                    ));
+                    row.spawn((
+                        Text::new(ViewerAabbOverlayMode::Selected.label()),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                        ViewerAabbModeValueLabel,
+                    ));
+                });
+            column
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    for mode in [
+                        ViewerAabbOverlayMode::Off,
+                        ViewerAabbOverlayMode::Selected,
+                        ViewerAabbOverlayMode::All,
+                    ] {
+                        row.spawn((
+                            Button,
+                            ViewerAabbModeButton { mode },
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                height: Val::Px(28.0),
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(mode.label()),
+                                TextFont::from_font_size(12.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+                    }
+                });
+        });
+}
+
+fn spawn_viewer_debug_toggle_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: ViewerDebugToggleSetting,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn((
+                Button,
+                ViewerDebugToggleButton { setting },
+                ControlButton(ControlButtonKind::Secondary),
+                Node {
+                    width: Val::Px(72.0),
+                    height: Val::Px(26.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BorderColor::all(BUTTON_BORDER),
+                BackgroundColor(BUTTON_BG),
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("on"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(BUTTON_TEXT),
+                    ButtonLabel,
+                    ViewerDebugToggleValueLabel { setting },
+                ));
+            });
+        });
+}
+
+fn spawn_viewer_debug_numeric_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: ViewerDebugNumericSetting,
+    step: f32,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(7.0),
+                ..default()
+            })
+            .with_children(|control| {
+                spawn_viewer_debug_step_button(control, setting, -step);
+                control.spawn((
+                    Text::new("0.00"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                    ViewerDebugNumericValueLabel { setting },
+                ));
+                spawn_viewer_debug_step_button(control, setting, step);
+            });
+        });
+}
+
+fn spawn_viewer_debug_step_button(
+    parent: &mut ChildSpawnerCommands,
+    setting: ViewerDebugNumericSetting,
+    delta: f32,
+) {
+    parent
+        .spawn((
+            Button,
+            ViewerDebugStepButton { setting, delta },
+            ControlButton(ControlButtonKind::Nav),
+            Node {
+                width: Val::Px(28.0),
+                height: Val::Px(24.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(BUTTON_BORDER),
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(if delta > 0.0 { "+" } else { "-" }),
+                TextFont::from_font_size(14.0),
+                TextColor(BUTTON_TEXT),
+                ButtonLabel,
+            ));
+        });
 }
 
 fn spawn_triposg_setting_row(
@@ -5724,6 +6787,124 @@ mod tests {
                 .iter(world)
                 .count(),
             5
+        );
+    }
+
+    #[test]
+    fn settings_modal_uses_tabs_for_pipeline_general_physics_and_developer() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Triposg];
+        let mut app = ui_test_app(Some(args));
+
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        app.update();
+
+        {
+            let world = app.world_mut();
+            assert_eq!(world.query::<&SettingsTabButton>().iter(world).count(), 4);
+            assert_eq!(world.query::<&SettingsTabPanel>().iter(world).count(), 4);
+            let mut panels = world.query::<(&SettingsTabPanel, &Node)>();
+            let visible_tabs: Vec<_> = panels
+                .iter(world)
+                .filter_map(|(panel, node)| (node.display != Display::None).then_some(panel.tab))
+                .collect();
+            assert_eq!(visible_tabs, vec![SettingsModalTab::Pipeline]);
+        }
+
+        app.world_mut().resource_mut::<SettingsModalState>().tab = SettingsModalTab::General;
+        app.update();
+
+        let world = app.world_mut();
+        let mut panels = world.query::<(&SettingsTabPanel, &Node)>();
+        let visible_tabs: Vec<_> = panels
+            .iter(world)
+            .filter_map(|(panel, node)| (node.display != Display::None).then_some(panel.tab))
+            .collect();
+        assert_eq!(visible_tabs, vec![SettingsModalTab::General]);
+        assert_eq!(
+            world.query::<&ViewerAabbModeButton>().iter(world).count(),
+            3
+        );
+
+        app.world_mut().resource_mut::<SettingsModalState>().tab = SettingsModalTab::Developer;
+        app.update();
+
+        let world = app.world_mut();
+        let mut panels = world.query::<(&SettingsTabPanel, &Node)>();
+        let visible_tabs: Vec<_> = panels
+            .iter(world)
+            .filter_map(|(panel, node)| (node.display != Display::None).then_some(panel.tab))
+            .collect();
+        assert_eq!(visible_tabs, vec![SettingsModalTab::Developer]);
+        assert_eq!(
+            world
+                .query::<&SettingsDeveloperEventsText>()
+                .iter(world)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn worker_status_text_is_compacted_for_menu_bar() {
+        let text = compact_worker_status_text(
+            "scene progress: images_to_assets - running TRELLIS batch for 2 image(s)",
+        );
+        assert_eq!(text, "scene progress: images_to_assets");
+        assert!(text.len() <= 34);
+    }
+
+    #[test]
+    fn viewer_debug_buttons_update_shared_settings() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Triposg];
+        let mut app = ui_test_app(Some(args));
+
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        app.update();
+
+        let all_button = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &ViewerAabbModeButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.mode == ViewerAabbOverlayMode::All).then_some(entity)
+                })
+                .expect("all AABB button")
+        };
+        app.world_mut()
+            .entity_mut(all_button)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world().resource::<ViewerDebugSettings>().aabb_overlay,
+            ViewerAabbOverlayMode::All
+        );
+
+        let tolerance_step = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &ViewerDebugStepButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.setting == ViewerDebugNumericSetting::ContactTolerance
+                        && button.delta > 0.0)
+                        .then_some(entity)
+                })
+                .expect("contact tolerance step button")
+        };
+        app.world_mut()
+            .entity_mut(tolerance_step)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ViewerDebugSettings>()
+                .contact_tolerance
+                > 0.02
         );
     }
 

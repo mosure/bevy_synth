@@ -143,6 +143,7 @@ impl OpenAiSceneProvider {
         }
         let response_model = value.get("model").and_then(Value::as_str);
         self.warn_model_mismatch(operation, &self.config.reasoning_model, response_model);
+        let usage = value.get("usage").cloned().unwrap_or(Value::Null);
         self.record_request(json!({
             "operation": operation,
             "api": "responses",
@@ -150,6 +151,7 @@ impl OpenAiSceneProvider {
             "response_id": value.get("id").and_then(Value::as_str),
             "response_model": response_model,
             "image_count": image_paths.len(),
+            "usage": usage,
         }));
         extract_structured_output(value)
     }
@@ -184,8 +186,8 @@ impl OpenAiSceneProvider {
             .text("quality", request.quality.clone())
             .text("background", "opaque");
         for image_path in [
-            request.source_scene_path.as_str(),
             request.source_crop_path.as_str(),
+            request.source_scene_path.as_str(),
             request.object_reference_image_path.as_str(),
         ] {
             let bytes = fs::read(image_path)?;
@@ -228,6 +230,7 @@ impl OpenAiSceneProvider {
             &self.config.image_model,
             response_model,
         );
+        let usage = value.get("usage").cloned().unwrap_or(Value::Null);
         self.record_request(json!({
             "operation": "generate_object_images",
             "api": "images.edits",
@@ -238,6 +241,7 @@ impl OpenAiSceneProvider {
             "requested_candidates": request.candidate_count,
             "quality": request.quality,
             "size": request.size,
+            "usage": usage,
         }));
         let data = value
             .get("data")
