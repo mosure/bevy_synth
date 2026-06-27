@@ -79,15 +79,28 @@ use bevy_synth_ui::bevy_transform_gizmos::{
 use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{
+    Mutex,
+    mpsc::{self, Receiver},
+};
 
+#[cfg(not(target_arch = "wasm32"))]
+use burn_synth_mcp::{
+    FeedbackRotationSelector, FeedbackThresholdProfile, InferenceBackend as McpInferenceBackend,
+    LocateAnythingBackend, QualityPreset as McpQualityPreset, SceneBuildFromImageArgs,
+    SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
+    ScenePoseFitMode, ServerArgs, ServerConfig, run_scene_build_from_image,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::{
-    SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneCamera, parse_scene_bsn,
+    SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneCamera, SceneQualityProfile,
+    parse_scene_bsn,
 };
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
+#[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::args::BackendKind;
 use bevy_synth_runtime::args::SynthesisModel;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
@@ -95,9 +108,11 @@ use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 use bevy_synth_runtime::args::{QualityPreset, RmbgModel, TripoSplatProfile, WeightPrecision};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::cache::CachedAssetKind;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::cache::{CachedAssetAabb, CachedAssetFrame};
 use bevy_synth_runtime::cache::{
-    CachedAssetAabb, CachedAssetFrame, CachedCameraState, CachedMeshMetadata, CachedWorldItem,
-    MeshCache,
+    CachedCameraState, CachedMeshMetadata, CachedSceneMetadata, CachedSceneMetrics,
+    CachedScenePayload, CachedWorldItem, MeshCache,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::io::mesh_from_glb_bytes;
@@ -124,10 +139,13 @@ use bevy_synth_runtime::worker::{
 use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
 use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_ui::SceneQualityProfileSetting;
 use bevy_synth_ui::{
-    BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogSpawnAsset,
-    CatalogSpawnRequest, CatalogState, CatalogStatus, CatalogUiState, DragState, MainCamera,
-    SceneSaveKind, SceneSaveRequest, UiRootNode, preview_light_layers,
+    BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogMode,
+    CatalogScenePreviewItem, CatalogSpawnAsset, CatalogSpawnRequest, CatalogState, CatalogStatus,
+    CatalogUiState, DragState, MainCamera, SceneBuildRequest, SceneDeleteRequest, SceneLoadRequest,
+    ScenePipelineUiSettings, SceneSaveKind, SceneSaveRequest, UiRootNode, preview_light_layers,
 };
 
 use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
@@ -210,6 +228,20 @@ struct PendingSceneBsnSave {
     assets_json: Option<Vec<u8>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct PendingSceneBuild {
+    receiver: Option<Mutex<Receiver<Result<SceneBuildOutput, String>>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SceneBuildOutput {
+    source_scene_path: PathBuf,
+    source_image_bytes: Option<Vec<u8>>,
+    response: serde_json::Value,
+}
+
+#[allow(dead_code)]
 #[derive(Resource, Clone, Debug, Default)]
 pub(crate) struct SceneInteractionLock {
     pub(crate) locked: bool,
@@ -217,6 +249,7 @@ pub(crate) struct SceneInteractionLock {
 }
 
 impl SceneInteractionLock {
+    #[allow(dead_code)]
     pub(crate) fn set(&mut self, locked: bool, reason: Option<String>) {
         self.locked = locked;
         self.reason = if locked {
@@ -873,6 +906,8 @@ pub(crate) fn run() {
     app.init_resource::<McpSceneScreenshotQueue>();
     #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.insert_resource(PendingSceneBuild::default());
     add_default_plugins(&mut app);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
     app.add_plugins(SharedWgpuInferenceDevicePlugin);
@@ -911,6 +946,16 @@ pub(crate) fn run() {
             update_spinner,
             rotate_spinner,
             update_window_title,
+        ),
+    );
+    app.add_systems(
+        Update,
+        (
+            handle_scene_load_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            handle_scene_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            handle_scene_build_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            #[cfg(not(target_arch = "wasm32"))]
+            poll_scene_build_results,
         ),
     );
     #[cfg(not(target_arch = "wasm32"))]
@@ -1853,12 +1898,11 @@ fn hydrate_from_cache(
 
     let asset_entries = cache.cache.asset_entries().to_vec();
     let world_items = cache.cache.world_items().to_vec();
-    if asset_entries.is_empty() && world_items.is_empty() {
-        return;
-    }
+    let scene_entries = cache.cache.scene_entries().to_vec();
 
     let mut loaded_assets = 0usize;
     let mut loaded_world_items = 0usize;
+    let mut loaded_scenes = 0usize;
     let mut handles_by_key: HashMap<String, CachedAssetHandles> = HashMap::new();
 
     for metadata in asset_entries {
@@ -1915,7 +1959,7 @@ fn hydrate_from_cache(
         loaded_assets += 1;
     }
 
-    for item in world_items {
+    for item in &world_items {
         let Some(handles) = handles_by_key.get(&item.cache_key) else {
             warn!(
                 "skipping cached world item for unknown cache key {}",
@@ -1923,7 +1967,7 @@ fn hydrate_from_cache(
             );
             continue;
         };
-        let Some(transform) = transform_from_cached_world_item(&item) else {
+        let Some(transform) = transform_from_cached_world_item(item) else {
             warn!(
                 "skipping cached world item with invalid transform for key {}",
                 item.cache_key
@@ -1934,13 +1978,190 @@ fn hydrate_from_cache(
         loaded_world_items += 1;
     }
 
+    catalog.upsert_unsaved_scene(
+        scene_preview_items_from_world(&world_items, &handles_by_key),
+        None,
+    );
+
+    for metadata in scene_entries {
+        let payload = match cache.cache.load_scene(&metadata.scene_key) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => {
+                warn!(
+                    "scene metadata exists for key {} but scene payload is missing.",
+                    metadata.scene_key
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!("failed to load cached scene {}: {err}", metadata.scene_key);
+                continue;
+            }
+        };
+        let scene_items = scene_preview_items_from_world(&payload.world_items, &handles_by_key);
+        let source_image =
+            cached_scene_source_image_handle(&cache.cache, &metadata, images.as_mut());
+        let entry_id = queue.counter;
+        queue.counter = queue.counter.wrapping_add(1);
+        catalog.add_ready_scene(
+            entry_id,
+            metadata.label.clone(),
+            Some(metadata.scene_key.clone()),
+            scene_items,
+            Some(metadata.source_scene_path.clone()),
+            source_image,
+            Some(metadata.pipeline.clone()),
+            metadata.metrics.clone(),
+            metadata.artifact_dir.clone(),
+        );
+        loaded_scenes += 1;
+    }
+
     if loaded_assets > 0 {
         queue.completed = queue.completed.max(loaded_assets);
     }
-    if loaded_assets > 0 || loaded_world_items > 0 {
+    if loaded_assets > 0 || loaded_world_items > 0 || loaded_scenes > 0 {
         info!(
-            "loaded {loaded_assets} cached catalog asset(s) and {loaded_world_items} cached world item(s)."
+            "loaded {loaded_assets} cached catalog asset(s), {loaded_world_items} cached world item(s), and {loaded_scenes} cached scene(s)."
         );
+    }
+}
+
+fn scene_preview_items_from_world(
+    world_items: &[CachedWorldItem],
+    handles_by_key: &HashMap<String, CachedAssetHandles>,
+) -> Vec<CatalogScenePreviewItem> {
+    world_items
+        .iter()
+        .filter_map(|item| {
+            let handles = handles_by_key.get(&item.cache_key)?;
+            let transform = transform_from_cached_world_item(item)?;
+            let asset = match handles {
+                CachedAssetHandles::Mesh { mesh, material } => CatalogSpawnAsset::Mesh {
+                    mesh: mesh.clone(),
+                    material: material.clone(),
+                },
+                CachedAssetHandles::GaussianSplat { cloud } => CatalogSpawnAsset::GaussianSplat {
+                    cloud: cloud.clone(),
+                },
+            };
+            Some(CatalogScenePreviewItem { asset, transform })
+        })
+        .collect()
+}
+
+fn unique_world_asset_count(world_items: &[CachedWorldItem]) -> usize {
+    let mut keys = Vec::<&str>::new();
+    for item in world_items {
+        if !keys.iter().any(|key| *key == item.cache_key.as_str()) {
+            keys.push(item.cache_key.as_str());
+        }
+    }
+    keys.len()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_cached_asset_handles_by_key(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+) -> HashMap<String, CachedAssetHandles> {
+    let metadata_by_key = cache
+        .asset_entries()
+        .iter()
+        .cloned()
+        .map(|metadata| (metadata.cache_key.clone(), metadata))
+        .collect::<HashMap<_, _>>();
+    let mut handles_by_key = HashMap::new();
+    for item in world_items {
+        if handles_by_key.contains_key(&item.cache_key) {
+            continue;
+        }
+        let Some(metadata) = metadata_by_key.get(&item.cache_key) else {
+            warn!(
+                "scene item skipped: cache metadata missing for {}",
+                item.cache_key
+            );
+            continue;
+        };
+        let asset = match cache.load_asset(&item.cache_key) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                warn!(
+                    "scene item skipped: asset payload missing for {}",
+                    item.cache_key
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    "scene item skipped: failed to load {}: {err}",
+                    item.cache_key
+                );
+                continue;
+            }
+        };
+        if let Some(handles) =
+            cached_asset_handles(asset, metadata, meshes, images, materials, gaussian_clouds)
+        {
+            handles_by_key.insert(item.cache_key.clone(), handles);
+        }
+    }
+    handles_by_key
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_object_catalog_entries_for_scene(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    handles_by_key: &HashMap<String, CachedAssetHandles>,
+    catalog: &mut CatalogState,
+    queue: &mut InferenceQueue,
+    images: &mut Assets<Image>,
+) {
+    let metadata_by_key = cache
+        .asset_entries()
+        .iter()
+        .map(|metadata| (metadata.cache_key.as_str(), metadata))
+        .collect::<HashMap<_, _>>();
+    for item in world_items {
+        if catalog.has_object_cache_key(&item.cache_key) {
+            continue;
+        }
+        let Some(metadata) = metadata_by_key.get(item.cache_key.as_str()) else {
+            continue;
+        };
+        let Some(handles) = handles_by_key.get(&item.cache_key) else {
+            continue;
+        };
+        let source_image = cached_source_image_handle(cache, metadata, images);
+        let id = queue.counter;
+        queue.counter = queue.counter.wrapping_add(1);
+        match handles {
+            CachedAssetHandles::Mesh { mesh, material } => {
+                catalog.add_ready(
+                    id,
+                    metadata.label.clone(),
+                    mesh.clone(),
+                    material.clone(),
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+            CachedAssetHandles::GaussianSplat { cloud } => {
+                catalog.add_ready_gaussian_splat(
+                    id,
+                    metadata.label.clone(),
+                    cloud.clone(),
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+        }
+        catalog.set_source_image(id, source_image);
     }
 }
 
@@ -2001,6 +2222,33 @@ fn cached_source_image_handle(
             warn!(
                 "failed to load cached source image for key {}: {err}",
                 metadata.cache_key
+            );
+            None
+        }
+    }
+}
+
+fn cached_scene_source_image_handle(
+    cache: &MeshCache,
+    metadata: &CachedSceneMetadata,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    match cache.load_scene_source_image(metadata) {
+        Ok(Some(source)) => match image_bytes_to_bevy_image(source.bytes.as_slice()) {
+            Ok(image) => Some(images.add(image)),
+            Err(err) => {
+                warn!(
+                    "failed to decode cached scene source image for key {}: {err}",
+                    metadata.scene_key
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                "failed to load cached scene source image for key {}: {err}",
+                metadata.scene_key
             );
             None
         }
@@ -2484,8 +2732,10 @@ fn handle_file_dialog_loads(
     args: Res<AppArgs>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
+    scene_settings: Res<ScenePipelineUiSettings>,
+    #[cfg(not(target_arch = "wasm32"))] mut pending_scene_build: ResMut<PendingSceneBuild>,
     exit_state: Res<ExitState>,
-    interaction_lock: Res<SceneInteractionLock>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
     read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
@@ -2497,6 +2747,20 @@ fn handle_file_dialog_loads(
     }
     let mut queued = 0usize;
     for event in events.read() {
+        if catalog.active_mode() == CatalogMode::Scene {
+            queued += ingest_scene_candidate_file(
+                event.path(),
+                &event.file_name,
+                event.contents.as_slice(),
+                &args,
+                &scene_settings,
+                &mut status,
+                &mut interaction_lock,
+                #[cfg(not(target_arch = "wasm32"))]
+                pending_scene_build.as_mut(),
+            );
+            continue;
+        }
         queued += ingest_candidate_file(
             event.path(),
             &event.file_name,
@@ -2530,8 +2794,10 @@ fn handle_dropped_files(
     args: Res<AppArgs>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
+    scene_settings: Res<ScenePipelineUiSettings>,
+    #[cfg(not(target_arch = "wasm32"))] mut pending_scene_build: ResMut<PendingSceneBuild>,
     exit_state: Res<ExitState>,
-    interaction_lock: Res<SceneInteractionLock>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
     read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
@@ -2543,6 +2809,20 @@ fn handle_dropped_files(
     }
     let mut queued = 0usize;
     for event in events.read() {
+        if catalog.active_mode() == CatalogMode::Scene {
+            queued += ingest_scene_candidate_file(
+                event.path(),
+                &event.file_name,
+                event.contents.as_slice(),
+                &args,
+                &scene_settings,
+                &mut status,
+                &mut interaction_lock,
+                #[cfg(not(target_arch = "wasm32"))]
+                pending_scene_build.as_mut(),
+            );
+            continue;
+        }
         queued += ingest_candidate_file(
             event.path(),
             &event.file_name,
@@ -2566,7 +2846,13 @@ fn handle_dropped_files(
 fn handle_scene_save_requests(
     mut requests: MessageReader<SceneSaveRequest>,
     mut commands: Commands,
-    cache: Res<MeshCacheResource>,
+    mut cache: ResMut<MeshCacheResource>,
+    mut catalog: ResMut<CatalogState>,
+    mut queue: ResMut<InferenceQueue>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
     cached_query: Query<(&CachedMeshInstance, &Transform)>,
     camera_query: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
     mut pending_bsn: ResMut<PendingSceneBsnSave>,
@@ -2595,6 +2881,81 @@ fn handle_scene_save_requests(
         .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
 
     match kind {
+        SceneSaveKind::Catalog => {
+            if world_items.is_empty() {
+                status.message = "scene catalog save skipped: scene is empty.".to_string();
+                warn!("{}", status.message);
+                return;
+            }
+            let label = format!("scene {}", unix_seconds_run_id());
+            #[cfg(not(target_arch = "wasm32"))]
+            let bsn = {
+                scene_bsn_export_for_world(&cache.cache, &world_items, camera_state.clone())
+                    .ok()
+                    .map(|(bsn, _)| bsn)
+            };
+            #[cfg(target_arch = "wasm32")]
+            let bsn: Option<String> = None;
+            let payload = CachedScenePayload {
+                world_items: world_items.clone(),
+                camera: camera_state.clone(),
+                bsn,
+                asset_bindings: None,
+                e2e_summary: None,
+                response_summary: Some(serde_json::json!({
+                    "source": "bevy_synth_manual_snapshot",
+                    "label": label,
+                })),
+            };
+            let metrics = CachedSceneMetrics {
+                ok: Some(true),
+                object_count: Some(world_items.len()),
+                asset_count: Some(unique_world_asset_count(&world_items)),
+                placement_count: Some(world_items.len()),
+                ..default()
+            };
+            let metadata = match cache.cache.upsert_scene_snapshot(
+                Path::new("current_scene"),
+                None,
+                label,
+                "manual",
+                &payload,
+                None,
+                Some(metrics),
+            ) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    status.message = format!("scene catalog save failed: {err}");
+                    warn!("{}", status.message);
+                    return;
+                }
+            };
+            let handles_by_key = load_cached_asset_handles_by_key(
+                &cache.cache,
+                &world_items,
+                &mut meshes,
+                &mut images,
+                &mut materials,
+                &mut gaussian_clouds,
+            );
+            let scene_items = scene_preview_items_from_world(&world_items, &handles_by_key);
+            let source_image =
+                cached_scene_source_image_handle(&cache.cache, &metadata, images.as_mut());
+            let id = queue.counter;
+            queue.counter = queue.counter.wrapping_add(1);
+            catalog.add_ready_scene(
+                id,
+                metadata.label.clone(),
+                Some(metadata.scene_key.clone()),
+                scene_items,
+                Some(metadata.source_scene_path.clone()),
+                source_image,
+                Some(metadata.pipeline.clone()),
+                metadata.metrics.clone(),
+                metadata.artifact_dir.clone(),
+            );
+            status.message = format!("saved {} to scene catalog.", metadata.label);
+        }
         SceneSaveKind::Bsn => {
             #[cfg(not(target_arch = "wasm32"))]
             match scene_bsn_export_for_world(&cache.cache, &world_items, camera_state) {
@@ -2863,6 +3224,9 @@ fn scene_frame_from_cached(frame: CachedAssetFrame) -> SceneAssetFrame {
     SceneAssetFrame {
         yaw_offset_degrees: frame.yaw_offset_degrees,
         footprint_m: frame.footprint_m,
+        symmetry: None,
+        confidence: None,
+        source: None,
     }
 }
 
@@ -3025,6 +3389,201 @@ fn virtual_upload_path(file_name: &str, request_id: u32) -> PathBuf {
         sanitized.push_str("upload_image");
     }
     PathBuf::from(format!("uploaded/{request_id:03}_{sanitized}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+fn ingest_scene_candidate_file(
+    path: Option<&Path>,
+    file_name: &str,
+    contents: &[u8],
+    args: &AppArgs,
+    scene_settings: &ScenePipelineUiSettings,
+    status: &mut UiStatus,
+    interaction_lock: &mut SceneInteractionLock,
+    pending: &mut PendingSceneBuild,
+) -> usize {
+    if pending.receiver.is_some() {
+        status.message = "scene build already running.".to_string();
+        return 0;
+    }
+    let source_path = match scene_source_path_for_input(path, file_name, contents) {
+        Ok(path) => path,
+        Err(err) => {
+            status.message = format!("scene input rejected: {err}");
+            warn!("{}", status.message);
+            return 0;
+        }
+    };
+    if !is_image_file(&source_path) {
+        status.message = "scene catalog accepts source images only.".to_string();
+        warn!("{}", status.message);
+        return 0;
+    }
+
+    let source_bytes = if contents.is_empty() {
+        fs::read(&source_path).ok()
+    } else {
+        Some(contents.to_vec())
+    };
+    let settings = scene_settings.clone();
+    let app_args = args.clone();
+    let source_path_for_thread = source_path.clone();
+    let (sender, receiver) = mpsc::channel();
+    pending.receiver = Some(Mutex::new(receiver));
+    interaction_lock.set(true, Some("building scene".to_string()));
+    status.worker_message = Some(format!(
+        "scene build: {}",
+        source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image")
+    ));
+    status.message = status.worker_message.clone().unwrap_or_default();
+    std::thread::spawn(move || {
+        let result =
+            run_scene_build_for_ui(source_path_for_thread, source_bytes, app_args, settings);
+        let _ = sender.send(result);
+    });
+    1
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "wasm32")]
+fn ingest_scene_candidate_file(
+    _path: Option<&Path>,
+    _file_name: &str,
+    _contents: &[u8],
+    _args: &AppArgs,
+    _scene_settings: &ScenePipelineUiSettings,
+    status: &mut UiStatus,
+    _interaction_lock: &mut SceneInteractionLock,
+) -> usize {
+    status.message =
+        "scene generation is native-only in this build; cached scenes can still be viewed."
+            .to_string();
+    status.worker_message = Some(status.message.clone());
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_source_path_for_input(
+    path: Option<&Path>,
+    file_name: &str,
+    contents: &[u8],
+) -> Result<PathBuf, String> {
+    if let Some(path) = path {
+        return Ok(path.to_path_buf());
+    }
+    if contents.is_empty() {
+        return Err("uploaded scene image has no bytes".to_string());
+    }
+    let output_dir = PathBuf::from("tmp")
+        .join("runs")
+        .join(format!("{}_bevy_scene_upload", unix_seconds_run_id()));
+    fs::create_dir_all(&output_dir)
+        .map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let path = output_dir.join(file_name);
+    fs::write(&path, contents)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unix_seconds_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{seconds}")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unix_seconds_run_id() -> String {
+    format!("{}", (js_sys::Date::now() / 1000.0).floor() as u64)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_scene_build_for_ui(
+    source_scene_path: PathBuf,
+    source_image_bytes: Option<Vec<u8>>,
+    app_args: AppArgs,
+    settings: ScenePipelineUiSettings,
+) -> Result<SceneBuildOutput, String> {
+    let mut server_args = ServerArgs::parse_from(["burn_synth_mcp"]);
+    server_args.backend = match app_args.backend {
+        BackendKind::Cpu => McpInferenceBackend::Cpu,
+        BackendKind::Wgpu => McpInferenceBackend::Wgpu,
+        BackendKind::Cuda => McpInferenceBackend::Cuda,
+    };
+    server_args.weights_root = app_args.weights_root.clone();
+    server_args.trellis_weights_root = app_args.trellis_weights_root.clone();
+    server_args.trellis_image_large_root = app_args.trellis_image_large_root.clone();
+    server_args.trellis_python_bin = app_args.trellis_python_bin.clone();
+    server_args.trellis_bridge_script = app_args.trellis_bridge_script.clone();
+    server_args.trellis_pbr = settings.pbr_enabled;
+    server_args.trellis_pbr_texture_size = Some(settings.pbr_texture_size);
+    server_args.batch_size = app_args.max_batch_size;
+    server_args.quality = match settings.quality_profile {
+        SceneQualityProfileSetting::Fast => McpQualityPreset::Fast,
+        SceneQualityProfileSetting::Balanced => McpQualityPreset::Balanced,
+        SceneQualityProfileSetting::Full => McpQualityPreset::Full,
+    };
+    let config = ServerConfig::from_args(server_args);
+    let output_dir = Some(
+        PathBuf::from("tmp")
+            .join("runs")
+            .join(format!("{}_scene_ui_explicit", unix_seconds_run_id())),
+    );
+    let response = run_scene_build_from_image(
+        config,
+        SceneBuildFromImageArgs {
+            source_scene_path: source_scene_path.clone(),
+            object_reference_image_path: None,
+            output_dir,
+            candidate_count: Some(settings.candidate_count),
+            candidate_retry_attempts: None,
+            candidate_batch_size: None,
+            min_reconstruction_score: None,
+            quality_profile: Some(match settings.quality_profile {
+                SceneQualityProfileSetting::Fast => SceneQualityProfile::Draft,
+                SceneQualityProfileSetting::Balanced | SceneQualityProfileSetting::Full => {
+                    SceneQualityProfile::Quality
+                }
+            }),
+            allow_catalog_reuse: settings.allow_catalog_reuse,
+            lift_assets: true,
+            target_faces: Some(settings.target_faces),
+            batch_size: Some(app_args.max_batch_size.max(1)),
+            batch_vram_mb: None,
+            trellis_pbr: Some(settings.pbr_enabled),
+            trellis_pbr_texture_size: Some(settings.pbr_texture_size),
+            promote_to_catalog: true,
+            composition_mode: SceneCompositionMode::CvGrounded,
+            pose_fit: ScenePoseFitMode::RenderedSilhouette,
+            canonical_pose: SceneCanonicalPoseMode::Auto,
+            max_pose_candidates: 32,
+            save_pose_debug: true,
+            depth_provider: SceneDepthProvider::DepthPro,
+            locator: SceneLocatorProvider::LocateAnything,
+            locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
+            write_artifacts: true,
+            apply: false,
+            clear_existing: true,
+            feedback: settings.feedback_iterations > 0,
+            feedback_iters: settings.feedback_iterations,
+            feedback_keep_viewer: false,
+            feedback_capture_dir: None,
+            feedback_threshold_profile: FeedbackThresholdProfile::Standard,
+            feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        },
+    )?;
+    Ok(SceneBuildOutput {
+        source_scene_path,
+        source_image_bytes,
+        response,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3944,6 +4503,561 @@ pub(crate) fn handle_catalog_delete_requests(
             commands.entity(entity).despawn();
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_scene_load_requests(
+    mut requests: MessageReader<SceneLoadRequest>,
+    mut commands: Commands,
+    mut cache: ResMut<MeshCacheResource>,
+    mut queue: ResMut<InferenceQueue>,
+    mut catalog: ResMut<CatalogState>,
+    mut status: ResMut<UiStatus>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    mut selection: ResMut<EditorSelection>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+    interaction_lock: Res<SceneInteractionLock>,
+    cached_instances: Query<(Entity, &CachedMeshInstance)>,
+    mut camera_query: Query<
+        (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+        With<MainCamera>,
+    >,
+) {
+    let mut last_scene_key = None;
+    for request in requests.read() {
+        last_scene_key = Some(request.scene_key.clone());
+    }
+    if interaction_lock.locked {
+        return;
+    }
+    let Some(scene_key) = last_scene_key else {
+        return;
+    };
+    let payload = match cache.cache.load_scene(&scene_key) {
+        Ok(Some(payload)) => payload,
+        Ok(None) => {
+            status.message = "cached scene payload is missing.".to_string();
+            warn!("cached scene payload missing for {scene_key}");
+            return;
+        }
+        Err(err) => {
+            status.message = format!("failed to load cached scene: {err}");
+            warn!("{}", status.message);
+            return;
+        }
+    };
+    match apply_cached_scene_payload(
+        &mut commands,
+        &mut cache,
+        &payload,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut gaussian_clouds,
+        &mut catalog,
+        &mut queue,
+        &mut selection,
+        &cached_instances,
+        &mut camera_query,
+    ) {
+        Ok(applied) => {
+            world_cache.dirty = false;
+            world_cache.timer.reset();
+            status.message = format!("loaded cached scene with {applied} item(s).");
+        }
+        Err(err) => {
+            status.message = format!("scene load failed: {err}");
+            warn!("{}", status.message);
+        }
+    }
+}
+
+fn handle_scene_delete_requests(
+    mut requests: MessageReader<SceneDeleteRequest>,
+    mut cache: ResMut<MeshCacheResource>,
+    mut status: ResMut<UiStatus>,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
+) {
+    if interaction_lock.locked || read_only.enabled {
+        for _ in requests.read() {}
+        return;
+    }
+    for request in requests.read() {
+        match cache.cache.remove_scene_entry(&request.scene_key) {
+            Ok(true) => {
+                status.message = "removed scene catalog entry.".to_string();
+            }
+            Ok(false) => {}
+            Err(err) => {
+                status.message = format!("failed to remove scene entry: {err}");
+                warn!("{}", status.message);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn handle_scene_build_requests(
+    mut requests: MessageReader<SceneBuildRequest>,
+    args: Res<AppArgs>,
+    mut status: ResMut<UiStatus>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    mut pending_scene_build: ResMut<PendingSceneBuild>,
+) {
+    if interaction_lock.locked {
+        for _ in requests.read() {}
+        return;
+    }
+    for request in requests.read() {
+        let contents = request.contents.as_deref().unwrap_or(&[]);
+        let _ = ingest_scene_candidate_file(
+            request.source_path.as_deref(),
+            &request.file_name,
+            contents,
+            &args,
+            &request.settings,
+            &mut status,
+            &mut interaction_lock,
+            pending_scene_build.as_mut(),
+        );
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn handle_scene_build_requests(
+    mut requests: MessageReader<SceneBuildRequest>,
+    mut status: ResMut<UiStatus>,
+) {
+    if requests.read().next().is_some() {
+        status.message = "scene generation is native-only in this build.".to_string();
+        status.worker_message = Some(status.message.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_scene_build_results(
+    mut pending: ResMut<PendingSceneBuild>,
+    mut commands: Commands,
+    mut cache: ResMut<MeshCacheResource>,
+    mut queue: ResMut<InferenceQueue>,
+    mut catalog: ResMut<CatalogState>,
+    mut status: ResMut<UiStatus>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    mut selection: ResMut<EditorSelection>,
+    cached_instances: Query<(Entity, &CachedMeshInstance)>,
+    mut camera_query: Query<
+        (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+        With<MainCamera>,
+    >,
+) {
+    let result = match pending.receiver.as_ref() {
+        Some(receiver) => match receiver.lock() {
+            Ok(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("scene build worker disconnected".to_string()))
+                }
+            },
+            Err(_) => Some(Err("scene build receiver lock poisoned".to_string())),
+        },
+        None => None,
+    };
+    let Some(result) = result else {
+        return;
+    };
+    pending.receiver = None;
+    interaction_lock.set(false, None);
+    status.worker_message = None;
+
+    let output = match result {
+        Ok(output) => output,
+        Err(err) => {
+            status.message = format!("scene build failed: {err}");
+            warn!("{}", status.message);
+            return;
+        }
+    };
+
+    match MeshCache::load_default() {
+        Ok(reloaded_cache) => {
+            cache.cache = reloaded_cache;
+        }
+        Err(err) => {
+            warn!("failed to reload asset cache after scene build: {err}");
+        }
+    }
+
+    let payload = match scene_payload_from_build_response(&output.response) {
+        Ok(payload) => payload,
+        Err(err) => {
+            status.message = format!("scene build cache failed: {err}");
+            warn!("{}", status.message);
+            return;
+        }
+    };
+    if payload.world_items.is_empty() {
+        status.message = "scene build produced no spawnable cached objects.".to_string();
+        warn!("{}", status.message);
+        return;
+    }
+
+    let label = generated_scene_label(&output.source_scene_path);
+    let metrics = scene_metrics_from_build_response(&output.response);
+    let artifact_dir = scene_artifact_dir_from_build_response(&output.response);
+    let metadata = match cache.cache.upsert_scene_snapshot(
+        &output.source_scene_path,
+        output.source_image_bytes.as_deref(),
+        label,
+        "explicit",
+        &payload,
+        artifact_dir,
+        Some(metrics),
+    ) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            status.message = format!("failed to cache generated scene: {err}");
+            warn!("{}", status.message);
+            return;
+        }
+    };
+
+    let applied = match apply_cached_scene_payload(
+        &mut commands,
+        &mut cache,
+        &payload,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut gaussian_clouds,
+        &mut catalog,
+        &mut queue,
+        &mut selection,
+        &cached_instances,
+        &mut camera_query,
+    ) {
+        Ok(applied) => applied,
+        Err(err) => {
+            status.message = format!("scene build load failed: {err}");
+            warn!("{}", status.message);
+            return;
+        }
+    };
+
+    let handles_by_key = load_cached_asset_handles_by_key(
+        &cache.cache,
+        &payload.world_items,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut gaussian_clouds,
+    );
+    let scene_items = scene_preview_items_from_world(&payload.world_items, &handles_by_key);
+    let source_image = cached_scene_source_image_handle(&cache.cache, &metadata, images.as_mut());
+    let id = queue.counter;
+    queue.counter = queue.counter.wrapping_add(1);
+    catalog.add_ready_scene(
+        id,
+        metadata.label.clone(),
+        Some(metadata.scene_key.clone()),
+        scene_items,
+        Some(metadata.source_scene_path.clone()),
+        source_image,
+        Some(metadata.pipeline.clone()),
+        metadata.metrics.clone(),
+        metadata.artifact_dir.clone(),
+    );
+    world_cache.dirty = false;
+    world_cache.timer.reset();
+    status.message = format!("scene build complete: {applied} item(s) loaded.");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_cached_scene_payload(
+    commands: &mut Commands,
+    cache: &mut ResMut<MeshCacheResource>,
+    payload: &CachedScenePayload,
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+    catalog: &mut CatalogState,
+    queue: &mut InferenceQueue,
+    selection: &mut EditorSelection,
+    cached_instances: &Query<(Entity, &CachedMeshInstance)>,
+    camera_query: &mut Query<
+        (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+        With<MainCamera>,
+    >,
+) -> Result<usize, String> {
+    for (entity, _) in cached_instances.iter() {
+        commands.entity(entity).despawn();
+    }
+    selection.clear();
+
+    let handles_by_key = load_cached_asset_handles_by_key(
+        &cache.cache,
+        &payload.world_items,
+        meshes,
+        images,
+        materials,
+        gaussian_clouds,
+    );
+    ensure_object_catalog_entries_for_scene(
+        &cache.cache,
+        &payload.world_items,
+        &handles_by_key,
+        catalog,
+        queue,
+        images.as_mut(),
+    );
+
+    let mut applied_items = Vec::new();
+    for item in &payload.world_items {
+        let Some(handles) = handles_by_key.get(&item.cache_key) else {
+            continue;
+        };
+        let Some(transform) = transform_from_cached_world_item(item) else {
+            warn!(
+                "scene item skipped: non-finite transform for {}",
+                item.cache_key
+            );
+            continue;
+        };
+        spawn_cached_asset_instance(commands, handles, transform, Some(item.cache_key.clone()));
+        applied_items.push(item.clone());
+    }
+
+    if let Some(camera_state) = payload.camera.as_ref()
+        && let Ok((mut transform, mut orbit, mut projection)) = camera_query.single_mut()
+        && apply_cached_camera_state(camera_state, &mut transform, &mut orbit)
+        && let Some(vertical_fov) = camera_state.vertical_fov_degrees
+        && let Projection::Perspective(perspective) = projection.as_mut()
+    {
+        perspective.fov = vertical_fov.to_radians();
+    }
+
+    cache
+        .cache
+        .set_world_items(applied_items.clone())
+        .map_err(|err| err.to_string())?;
+    cache
+        .cache
+        .set_camera_state(payload.camera.clone())
+        .map_err(|err| err.to_string())?;
+    let scene_items = scene_preview_items_from_world(&applied_items, &handles_by_key);
+    catalog.upsert_unsaved_scene(scene_items, None);
+    Ok(applied_items.len())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_payload_from_build_response(
+    response: &serde_json::Value,
+) -> Result<CachedScenePayload, String> {
+    let world_items = scene_world_items_from_response_commands(response)?;
+    let camera = scene_camera_from_response_commands(response);
+    Ok(CachedScenePayload {
+        world_items,
+        camera,
+        bsn: response
+            .get("bsn")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        asset_bindings: response.get("asset_bindings").cloned(),
+        e2e_summary: response.get("e2e_summary").cloned(),
+        response_summary: Some(serde_json::json!({
+            "tool": response.get("tool").cloned().unwrap_or(serde_json::Value::Null),
+            "composition_mode": response.get("composition_mode").cloned().unwrap_or(serde_json::Value::Null),
+            "grounding_source": response.get("grounding_source").cloned().unwrap_or(serde_json::Value::Null),
+            "failed_stage": response.get("failed_stage").cloned().unwrap_or(serde_json::Value::Null),
+        })),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_world_items_from_response_commands(
+    response: &serde_json::Value,
+) -> Result<Vec<CachedWorldItem>, String> {
+    let commands = response
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "scene build response missing commands array".to_string())?;
+    let mut out = Vec::new();
+    for command in commands {
+        let command_type = command
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(command_type, "spawn_cached" | "spawn_path") {
+            continue;
+        }
+        let Some(cache_key) = command
+            .get("cache_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(transform) = transform_from_optional_parts(
+            json_fixed_f32_array::<3>(command.get("translation")),
+            json_fixed_f32_array::<4>(command.get("rotation")),
+            json_fixed_f32_array::<3>(command.get("scale")),
+        ) else {
+            warn!("scene command skipped: invalid transform for {cache_key}");
+            continue;
+        };
+        out.push(cached_world_item_from_transform(cache_key, &transform));
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_camera_from_response_commands(response: &serde_json::Value) -> Option<CachedCameraState> {
+    response
+        .get("commands")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .find_map(scene_camera_from_response_command)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_camera_from_response_command(command: &serde_json::Value) -> Option<CachedCameraState> {
+    let command_type = command.get("type").and_then(serde_json::Value::as_str)?;
+    if command_type != "set_camera" {
+        return None;
+    }
+    let translation = json_fixed_f32_array::<3>(command.get("translation"))?;
+    let rotation =
+        json_fixed_f32_array::<4>(command.get("rotation")).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let focus = json_fixed_f32_array::<3>(command.get("focus")).unwrap_or([0.0, 0.0, 0.0]);
+    let translation_vec = Vec3::from_array(translation);
+    let focus_vec = Vec3::from_array(focus);
+    let offset = translation_vec - focus_vec;
+    let radius = json_f32(command.get("radius"))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| offset.length().max(0.05));
+    let direction = if offset.length_squared() > 0.000_001 {
+        offset.normalize()
+    } else {
+        Vec3::Z
+    };
+    let yaw = json_f32(command.get("yaw"))
+        .map(f32::to_radians)
+        .unwrap_or_else(|| direction.x.atan2(direction.z));
+    let pitch = json_f32(command.get("pitch"))
+        .map(f32::to_radians)
+        .unwrap_or_else(|| direction.y.clamp(-1.0, 1.0).asin());
+    let vertical_fov_degrees =
+        json_f32(command.get("vertical_fov")).filter(|value| value.is_finite() && *value > 0.0);
+    Some(CachedCameraState {
+        translation,
+        rotation,
+        focus,
+        yaw,
+        pitch,
+        radius,
+        vertical_fov_degrees,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_metrics_from_build_response(response: &serde_json::Value) -> CachedSceneMetrics {
+    let summary = response
+        .get("e2e_summary")
+        .unwrap_or(&serde_json::Value::Null);
+    CachedSceneMetrics {
+        ok: summary.get("ok").and_then(serde_json::Value::as_bool),
+        elapsed_ms: summary.get("elapsed_ms").and_then(json_u64_or_f64_to_u64),
+        object_count: summary
+            .get("selected_count")
+            .or_else(|| response.pointer("/manifest/objects"))
+            .and_then(json_len_or_u64),
+        asset_count: summary.get("asset_count").and_then(json_len_or_u64),
+        placement_count: summary.get("placement_count").and_then(json_len_or_u64),
+        feedback_accepted: summary
+            .pointer("/feedback/accepted")
+            .and_then(serde_json::Value::as_bool),
+        feedback_iteration: summary
+            .pointer("/feedback/accepted_iteration")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        failed_stage: summary
+            .get("failed_stage")
+            .or_else(|| response.get("failed_stage"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_artifact_dir_from_build_response(response: &serde_json::Value) -> Option<String> {
+    response
+        .pointer("/preparation/output_dir")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            response
+                .pointer("/e2e_summary/feedback/capture_dir")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn generated_scene_label(source_scene_path: &Path) -> String {
+    let stem = source_scene_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scene");
+    format!("{stem} {}", unix_seconds_run_id())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_fixed_f32_array<const N: usize>(value: Option<&serde_json::Value>) -> Option<[f32; N]> {
+    let array = value?.as_array()?;
+    if array.len() != N {
+        return None;
+    }
+    let mut out = [0.0_f32; N];
+    for (index, value) in array.iter().enumerate() {
+        out[index] = json_f32(Some(value))?;
+    }
+    Some(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_f32(value: Option<&serde_json::Value>) -> Option<f32> {
+    let value = value?.as_f64()? as f32;
+    value.is_finite().then_some(value)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_u64_or_f64_to_u64(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value.round() as u64)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_len_or_u64(value: &serde_json::Value) -> Option<usize> {
+    value
+        .as_array()
+        .map(Vec::len)
+        .or_else(|| value.as_u64().and_then(|value| usize::try_from(value).ok()))
 }
 
 fn enforce_scene_interaction_lock(

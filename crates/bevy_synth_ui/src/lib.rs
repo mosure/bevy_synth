@@ -39,6 +39,7 @@ use bevy_synth_runtime::args::{
     TRIPOSPLAT_GAUSSIAN_STEP, TRIPOSPLAT_MAX_NUM_GAUSSIANS, TRIPOSPLAT_MIN_NUM_GAUSSIANS,
     TrellisQuality, TripoSplatProfile,
 };
+use bevy_synth_runtime::cache::CachedSceneMetrics;
 use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest, UiStatus};
 
 const PANEL_WIDTH: f32 = 336.0;
@@ -116,6 +117,7 @@ const TRELLIS_FACE_STEP: usize = 100_000;
 const TRELLIS_MAX_FACES: usize = 2_000_000;
 const TRELLIS_SPARSE_COORD_STEP: usize = 512;
 const TRELLIS_MAX_SPARSE_COORDS: usize = 49_152;
+pub const UNSAVED_SCENE_ENTRY_ID: u32 = u32::MAX;
 const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 3] = [
     SynthesisModel::Triposg,
     SynthesisModel::Trellis,
@@ -124,6 +126,96 @@ const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 3] = [
 
 #[derive(Component)]
 pub struct MainCamera;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogMode {
+    #[default]
+    Object,
+    Scene,
+}
+
+impl CatalogMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Scene => "scene",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScenePipelineKind {
+    #[default]
+    Explicit,
+}
+
+impl ScenePipelineKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Explicit => "Explicit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogPipelineChoice {
+    Object(SynthesisModel),
+    Scene(ScenePipelineKind),
+}
+
+impl CatalogPipelineChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Object(model) => pipeline_label(model),
+            Self::Scene(pipeline) => pipeline.label(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Resource)]
+pub struct ScenePipelineUiSettings {
+    pub pipeline: ScenePipelineKind,
+    pub quality_profile: SceneQualityProfileSetting,
+    pub candidate_count: usize,
+    pub feedback_iterations: usize,
+    pub pbr_enabled: bool,
+    pub pbr_texture_size: usize,
+    pub target_faces: usize,
+    pub allow_catalog_reuse: bool,
+}
+
+impl Default for ScenePipelineUiSettings {
+    fn default() -> Self {
+        Self {
+            pipeline: ScenePipelineKind::Explicit,
+            quality_profile: SceneQualityProfileSetting::Balanced,
+            candidate_count: 2,
+            feedback_iterations: 8,
+            pbr_enabled: true,
+            pbr_texture_size: DEFAULT_TRELLIS_PBR_TEXTURE_SIZE,
+            target_faces: 100_000,
+            allow_catalog_reuse: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneQualityProfileSetting {
+    Fast,
+    #[default]
+    Balanced,
+    Full,
+}
+
+impl SceneQualityProfileSetting {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Full => "full",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ImagePickDialog;
@@ -139,6 +231,12 @@ pub enum CatalogSpawnAsset {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct CatalogScenePreviewItem {
+    pub asset: CatalogSpawnAsset,
+    pub transform: Transform,
+}
+
 #[derive(Message, Clone, Debug)]
 pub struct CatalogSpawnRequest {
     pub asset: CatalogSpawnAsset,
@@ -152,8 +250,38 @@ pub struct CatalogDeleteRequest {
     pub cache_key: Option<String>,
 }
 
+#[derive(Message, Clone, Debug)]
+pub struct SceneLoadRequest {
+    pub scene_key: String,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct SceneDeleteRequest {
+    pub scene_key: String,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct SceneSaveToCatalogRequest {
+    pub label: Option<String>,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct SceneRenameRequest {
+    pub scene_key: String,
+    pub label: String,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct SceneBuildRequest {
+    pub source_path: Option<std::path::PathBuf>,
+    pub file_name: String,
+    pub contents: Option<Vec<u8>>,
+    pub settings: ScenePipelineUiSettings,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneSaveKind {
+    Catalog,
     Bsn,
     Glb,
 }
@@ -175,12 +303,19 @@ impl Plugin for BurnSynthUiPlugin {
         app.init_resource::<CatalogState>()
             .init_resource::<DragState>()
             .init_resource::<CatalogSelectionState>()
+            .init_resource::<ScenePipelineUiSettings>()
+            .init_resource::<CatalogModeDropdownState>()
             .init_resource::<SettingsModalState>()
             .init_resource::<PipelineDropdownState>()
             .init_resource::<SaveSceneMenuState>()
             .init_resource::<CatalogSourceImageModalState>()
             .add_message::<CatalogSpawnRequest>()
             .add_message::<CatalogDeleteRequest>()
+            .add_message::<SceneLoadRequest>()
+            .add_message::<SceneDeleteRequest>()
+            .add_message::<SceneSaveToCatalogRequest>()
+            .add_message::<SceneRenameRequest>()
+            .add_message::<SceneBuildRequest>()
             .add_message::<SceneSaveRequest>()
             .add_systems(Startup, setup_ui)
             .add_systems(
@@ -191,6 +326,13 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_page_buttons,
                     handle_catalog_delete_button.in_set(BurnSynthUiSystemSet::CatalogRequests),
                     handle_catalog_delete_shortcut.in_set(BurnSynthUiSystemSet::CatalogRequests),
+                    (
+                        handle_catalog_mode_selector_button,
+                        handle_catalog_mode_option_button,
+                        sync_catalog_mode_dropdown,
+                        update_catalog_mode_value_label,
+                    )
+                        .chain(),
                     (
                         handle_pipeline_selector_button,
                         handle_pipeline_option_button,
@@ -217,6 +359,9 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_trellis_quality_button,
                     handle_trellis_pbr_toggle_button,
                     handle_trellis_setting_step_button,
+                    handle_scene_quality_button,
+                    handle_scene_setting_step_button,
+                    handle_scene_setting_toggle_button,
                     sync_settings_modal,
                     update_settings_labels,
                 ),
@@ -231,6 +376,7 @@ impl Plugin for BurnSynthUiPlugin {
                     update_button_visuals,
                     (
                         handle_catalog_entry_interaction,
+                        handle_catalog_scene_load_button,
                         update_drag_ghost,
                         handle_drag_release.in_set(BurnSynthUiSystemSet::CatalogRequests),
                         cleanup_drag_ghosts,
@@ -247,8 +393,10 @@ impl Plugin for BurnSynthUiPlugin {
 #[derive(Resource)]
 pub struct CatalogState {
     entries: Vec<CatalogEntry>,
+    active_mode: CatalogMode,
     expanded: bool,
-    page: usize,
+    object_page: usize,
+    scene_page: usize,
     available_layers: Vec<usize>,
     revision: u64,
 }
@@ -257,8 +405,10 @@ impl Default for CatalogState {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            active_mode: CatalogMode::Object,
             expanded: true,
-            page: 0,
+            object_page: 0,
+            scene_page: 0,
             available_layers: (1..=PREVIEW_MAX_LAYER)
                 .rev()
                 .filter(|layer| *layer != GIZMO_LAYER)
@@ -270,7 +420,19 @@ impl Default for CatalogState {
 
 impl CatalogState {
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.active_entries_len() == 0
+    }
+
+    pub fn active_mode(&self) -> CatalogMode {
+        self.active_mode
+    }
+
+    pub fn set_active_mode(&mut self, mode: CatalogMode) {
+        if self.active_mode != mode {
+            self.active_mode = mode;
+            self.clamp_page();
+            self.bump_revision();
+        }
     }
 
     pub fn add_pending(&mut self, request: &InferenceRequest) {
@@ -282,11 +444,17 @@ impl CatalogState {
             .to_string();
         self.entries.push(CatalogEntry {
             id: request.id,
+            kind: CatalogEntryKind::Object,
             label,
             status: CatalogStatus::Pending,
             mesh: None,
             material: None,
             gaussian: None,
+            scene_key: None,
+            scene_items: Vec::new(),
+            scene_pipeline: None,
+            scene_metrics: None,
+            scene_artifact_dir: None,
             source_image_path: Some(request.image_path.display().to_string()),
             source_image: None,
             cache_key: None,
@@ -307,11 +475,17 @@ impl CatalogState {
     ) {
         self.entries.push(CatalogEntry {
             id,
+            kind: CatalogEntryKind::Object,
             label,
             status: CatalogStatus::Ready,
             mesh: Some(mesh),
             material: Some(material),
             gaussian: None,
+            scene_key: None,
+            scene_items: Vec::new(),
+            scene_pipeline: None,
+            scene_metrics: None,
+            scene_artifact_dir: None,
             source_image_path,
             source_image: None,
             cache_key,
@@ -330,11 +504,17 @@ impl CatalogState {
     ) {
         self.entries.push(CatalogEntry {
             id,
+            kind: CatalogEntryKind::Object,
             label,
             status: CatalogStatus::Ready,
             mesh: None,
             material: None,
             gaussian: None,
+            scene_key: None,
+            scene_items: Vec::new(),
+            scene_pipeline: None,
+            scene_metrics: None,
+            scene_artifact_dir: None,
             source_image_path,
             source_image: None,
             cache_key,
@@ -354,11 +534,17 @@ impl CatalogState {
     ) {
         self.entries.push(CatalogEntry {
             id,
+            kind: CatalogEntryKind::Object,
             label,
             status: CatalogStatus::Ready,
             mesh: None,
             material: None,
             gaussian: Some(gaussian),
+            scene_key: None,
+            scene_items: Vec::new(),
+            scene_pipeline: None,
+            scene_metrics: None,
+            scene_artifact_dir: None,
             source_image_path,
             source_image: None,
             cache_key,
@@ -366,6 +552,60 @@ impl CatalogState {
         });
         self.clamp_page();
         self.bump_revision();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_ready_scene(
+        &mut self,
+        id: u32,
+        label: String,
+        scene_key: Option<String>,
+        scene_items: Vec<CatalogScenePreviewItem>,
+        source_image_path: Option<String>,
+        source_image: Option<Handle<Image>>,
+        pipeline: Option<String>,
+        metrics: Option<CachedSceneMetrics>,
+        artifact_dir: Option<String>,
+    ) {
+        self.remove_entry(id);
+        self.entries.push(CatalogEntry {
+            id,
+            kind: CatalogEntryKind::Scene,
+            label,
+            status: CatalogStatus::Ready,
+            mesh: None,
+            material: None,
+            gaussian: None,
+            scene_key,
+            scene_items,
+            scene_pipeline: pipeline,
+            scene_metrics: metrics,
+            scene_artifact_dir: artifact_dir,
+            source_image_path,
+            source_image,
+            cache_key: None,
+            preview: None,
+        });
+        self.clamp_page();
+        self.bump_revision();
+    }
+
+    pub fn upsert_unsaved_scene(
+        &mut self,
+        scene_items: Vec<CatalogScenePreviewItem>,
+        source_image: Option<Handle<Image>>,
+    ) {
+        self.add_ready_scene(
+            UNSAVED_SCENE_ENTRY_ID,
+            "unsaved scene".to_string(),
+            None,
+            scene_items,
+            None,
+            source_image,
+            Some("current".to_string()),
+            None,
+            None,
+        );
     }
 
     pub fn entry(&self, id: u32) -> Option<&CatalogEntry> {
@@ -409,7 +649,7 @@ impl CatalogState {
     }
 
     pub fn page_count(&self) -> usize {
-        let total = self.entries.len();
+        let total = self.active_entries_len();
         if total == 0 {
             1
         } else {
@@ -419,48 +659,113 @@ impl CatalogState {
 
     pub fn clamp_page(&mut self) {
         let max_page = self.page_count().saturating_sub(1);
-        if self.page > max_page {
-            self.page = max_page;
+        let page = self.active_page_mut();
+        if *page > max_page {
+            *page = max_page;
         }
     }
 
     pub fn set_page(&mut self, page: usize) {
-        self.page = page;
+        *self.active_page_mut() = page;
         self.clamp_page();
     }
 
     pub fn page(&self) -> usize {
-        self.page
+        match self.active_mode {
+            CatalogMode::Object => self.object_page,
+            CatalogMode::Scene => self.scene_page,
+        }
     }
 
     pub fn visible_indices(&self) -> Vec<usize> {
-        let total = self.entries.len();
+        let active = self.active_indices();
+        let total = active.len();
         if total == 0 {
             return Vec::new();
         }
-        let start = total.saturating_sub(CATALOG_PAGE_SIZE * (self.page + 1));
-        let end = total.saturating_sub(CATALOG_PAGE_SIZE * self.page);
-        (start..end).rev().collect()
+        let page = self.page();
+        let start = total.saturating_sub(CATALOG_PAGE_SIZE * (page + 1));
+        let end = total.saturating_sub(CATALOG_PAGE_SIZE * page);
+        (start..end).rev().map(|index| active[index]).collect()
     }
 
     pub fn has_ready_cube_entry(&self) -> bool {
         self.entries.iter().any(|entry| {
-            matches!(entry.status, CatalogStatus::Ready) && entry.label.eq_ignore_ascii_case("cube")
+            entry.kind == CatalogEntryKind::Object
+                && matches!(entry.status, CatalogStatus::Ready)
+                && entry.label.eq_ignore_ascii_case("cube")
         })
     }
+
+    pub fn has_object_cache_key(&self, cache_key: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.kind == CatalogEntryKind::Object
+                && entry
+                    .cache_key
+                    .as_deref()
+                    .is_some_and(|key| key == cache_key)
+        })
+    }
+
+    fn active_entries_len(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.mode() == self.active_mode)
+            .count()
+    }
+
+    fn active_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry.mode() == self.active_mode).then_some(index))
+            .collect()
+    }
+
+    fn active_page_mut(&mut self) -> &mut usize {
+        match self.active_mode {
+            CatalogMode::Object => &mut self.object_page,
+            CatalogMode::Scene => &mut self.scene_page,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogEntryKind {
+    Object,
+    Scene,
 }
 
 pub struct CatalogEntry {
     pub id: u32,
+    pub kind: CatalogEntryKind,
     pub label: String,
     pub status: CatalogStatus,
     pub mesh: Option<Handle<BevyMesh>>,
     pub material: Option<Handle<StandardMaterial>>,
     pub gaussian: Option<Handle<PlanarGaussian3d>>,
+    pub scene_key: Option<String>,
+    pub scene_items: Vec<CatalogScenePreviewItem>,
+    pub scene_pipeline: Option<String>,
+    pub scene_metrics: Option<CachedSceneMetrics>,
+    pub scene_artifact_dir: Option<String>,
     pub source_image_path: Option<String>,
     pub source_image: Option<Handle<Image>>,
     pub cache_key: Option<String>,
     pub preview: Option<PreviewScene>,
+}
+
+impl CatalogEntry {
+    fn mode(&self) -> CatalogMode {
+        match self.kind {
+            CatalogEntryKind::Object => CatalogMode::Object,
+            CatalogEntryKind::Scene => CatalogMode::Scene,
+        }
+    }
+
+    fn is_unsaved_scene(&self) -> bool {
+        self.kind == CatalogEntryKind::Scene && self.id == UNSAVED_SCENE_ENTRY_ID
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -472,7 +777,7 @@ pub enum CatalogStatus {
 
 pub struct PreviewScene {
     pub image: Handle<Image>,
-    pub asset_entity: Entity,
+    pub asset_entities: Vec<Entity>,
     pub camera_entity: Entity,
     pub light_entities: Vec<Entity>,
     pub layer_index: usize,
@@ -494,6 +799,9 @@ enum PreviewAsset {
     GaussianSplat {
         cloud: Handle<PlanarGaussian3d>,
     },
+    Scene {
+        items: Vec<CatalogScenePreviewItem>,
+    },
 }
 
 impl PreviewFit {
@@ -512,6 +820,7 @@ pub struct CatalogUiState {
     last_revision: u64,
     last_expanded: bool,
     panel_width: f32,
+    catalog_mode_menu_open: bool,
     settings_modal_open: bool,
     source_modal_open: bool,
     pipeline_menu_open: bool,
@@ -520,7 +829,8 @@ pub struct CatalogUiState {
 
 impl CatalogUiState {
     pub fn cursor_over_ui(&self, window: &Window) -> bool {
-        if self.settings_modal_open
+        if self.catalog_mode_menu_open
+            || self.settings_modal_open
             || self.source_modal_open
             || self.pipeline_menu_open
             || self.save_menu_open
@@ -575,7 +885,29 @@ struct CatalogToggleButton;
 struct ToggleLabel;
 
 #[derive(Component)]
+struct CatalogModeDropdownHost;
+
+#[derive(Component)]
+struct CatalogModeSelectorButton;
+
+#[derive(Component)]
+struct CatalogModeOptionButton {
+    mode: CatalogMode,
+}
+
+#[derive(Component)]
+struct CatalogModeDropdownRoot;
+
+#[derive(Component)]
+struct CatalogModeValueLabel;
+
+#[derive(Component)]
 struct CatalogEntryButton {
+    id: u32,
+}
+
+#[derive(Component)]
+struct CatalogSceneLoadButton {
     id: u32,
 }
 
@@ -613,7 +945,7 @@ struct PipelineSelectorButton;
 
 #[derive(Component)]
 struct PipelineOptionButton {
-    model: SynthesisModel,
+    choice: CatalogPipelineChoice,
 }
 
 #[derive(Component)]
@@ -723,6 +1055,54 @@ enum TrellisSettingDelta {
 }
 
 #[derive(Component)]
+struct SceneQualityButton {
+    quality: SceneQualityProfileSetting,
+}
+
+#[derive(Component)]
+struct SceneSettingStepButton {
+    setting: SceneSetting,
+    delta: SceneSettingDelta,
+}
+
+#[derive(Component)]
+struct SceneSettingToggleButton {
+    setting: SceneToggleSetting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneSetting {
+    CandidateCount,
+    FeedbackIterations,
+    PbrTextureSize,
+    TargetFaces,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SceneSettingDelta {
+    Integer(isize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneToggleSetting {
+    Pbr,
+    CatalogReuse,
+}
+
+#[derive(Component)]
+struct SceneSettingValueLabel {
+    setting: SceneSetting,
+}
+
+#[derive(Component)]
+struct SceneToggleValueLabel {
+    setting: SceneToggleSetting,
+}
+
+#[derive(Component)]
+struct SceneQualityValueLabel;
+
+#[derive(Component)]
 struct TrellisSettingValueLabel {
     setting: TrellisSetting,
 }
@@ -753,10 +1133,16 @@ struct ButtonLabel;
 pub struct UiRootNode;
 
 #[derive(Resource, Default)]
+struct CatalogModeDropdownState {
+    open: bool,
+    entity: Option<Entity>,
+}
+
+#[derive(Resource, Default)]
 struct SettingsModalState {
     open: bool,
     entity: Option<Entity>,
-    model: Option<SynthesisModel>,
+    pipeline: Option<CatalogPipelineChoice>,
 }
 
 #[derive(Resource, Default)]
@@ -780,7 +1166,8 @@ struct CatalogSourceImageModalState {
 
 #[derive(Resource, Clone, Debug, PartialEq, Eq)]
 struct AvailablePipelines {
-    models: Vec<SynthesisModel>,
+    object_models: Vec<SynthesisModel>,
+    scene_pipelines: Vec<ScenePipelineKind>,
 }
 
 fn pipeline_label(model: SynthesisModel) -> &'static str {
@@ -791,11 +1178,11 @@ fn pipeline_label(model: SynthesisModel) -> &'static str {
     }
 }
 
-fn pipeline_selector_value_text(model: SynthesisModel, option_count: usize) -> String {
+fn pipeline_selector_value_text(choice: CatalogPipelineChoice, option_count: usize) -> String {
     if option_count <= 1 {
-        format!("{} only", pipeline_label(model))
+        format!("{} only", choice.label())
     } else {
-        pipeline_label(model).to_string()
+        choice.label().to_string()
     }
 }
 
@@ -816,20 +1203,64 @@ fn available_pipeline_models(args: Option<&AppArgs>) -> Vec<SynthesisModel> {
     out
 }
 
-fn pipeline_available(available: Option<&AvailablePipelines>, model: SynthesisModel) -> bool {
-    available
-        .map(|available| available.models.contains(&model))
-        .unwrap_or(true)
+fn active_pipeline_choices(
+    mode: CatalogMode,
+    available: Option<&AvailablePipelines>,
+) -> Vec<CatalogPipelineChoice> {
+    match mode {
+        CatalogMode::Object => available
+            .map(|available| {
+                available
+                    .object_models
+                    .iter()
+                    .copied()
+                    .map(CatalogPipelineChoice::Object)
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                DEFAULT_PIPELINE_OPTIONS
+                    .into_iter()
+                    .map(CatalogPipelineChoice::Object)
+                    .collect()
+            }),
+        CatalogMode::Scene => available
+            .map(|available| {
+                available
+                    .scene_pipelines
+                    .iter()
+                    .copied()
+                    .map(CatalogPipelineChoice::Scene)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit)]),
+    }
 }
 
-fn pipeline_supported(args: Option<&AppArgs>, model: SynthesisModel) -> bool {
+fn pipeline_available(
+    available: Option<&AvailablePipelines>,
+    choice: CatalogPipelineChoice,
+) -> bool {
+    match choice {
+        CatalogPipelineChoice::Object(model) => available
+            .map(|available| available.object_models.contains(&model))
+            .unwrap_or(true),
+        CatalogPipelineChoice::Scene(pipeline) => available
+            .map(|available| available.scene_pipelines.contains(&pipeline))
+            .unwrap_or(true),
+    }
+}
+
+fn pipeline_supported(args: Option<&AppArgs>, choice: CatalogPipelineChoice) -> bool {
     let Some(args) = args else {
         return true;
     };
-    match model {
-        SynthesisModel::Triposplat => triposplat_supported_for_backend(args.backend.clone()),
-        SynthesisModel::Trellis => trellis_supported_for_backend(args.backend.clone()),
-        SynthesisModel::Triposg => true,
+    match choice {
+        CatalogPipelineChoice::Scene(_) => true,
+        CatalogPipelineChoice::Object(model) => match model {
+            SynthesisModel::Triposplat => triposplat_supported_for_backend(args.backend.clone()),
+            SynthesisModel::Trellis => trellis_supported_for_backend(args.backend.clone()),
+            SynthesisModel::Triposg => true,
+        },
     }
 }
 
@@ -856,15 +1287,22 @@ fn trellis_supported_for_backend(backend: BackendKind) -> bool {
 fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
     let mut list_entity = Entity::PLACEHOLDER;
     let pipeline_models = available_pipeline_models(args.as_deref());
-    let selected_pipeline = args
+    let selected_object_pipeline = args
         .as_deref()
         .and_then(|args| args.synthesis_models.first().copied())
         .or_else(|| pipeline_models.first().copied())
         .unwrap_or(SynthesisModel::Triposg);
-    let multiple_pipelines = pipeline_models.len() > 1;
     commands.insert_resource(AvailablePipelines {
-        models: pipeline_models.clone(),
+        object_models: pipeline_models.clone(),
+        scene_pipelines: vec![ScenePipelineKind::Explicit],
     });
+    let selected_pipeline = CatalogPipelineChoice::Object(selected_object_pipeline);
+    let pipeline_choices: Vec<_> = pipeline_models
+        .iter()
+        .copied()
+        .map(CatalogPipelineChoice::Object)
+        .collect();
+    let multiple_pipelines = pipeline_choices.len() > 1;
 
     let root = commands
         .spawn((
@@ -965,7 +1403,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                     button.spawn((
                                         Text::new(pipeline_selector_value_text(
                                             selected_pipeline,
-                                            pipeline_models.len(),
+                                            pipeline_choices.len(),
                                         )),
                                         TextFont::from_font_size(12.0),
                                         TextColor(BUTTON_TEXT),
@@ -999,7 +1437,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                                     selector.spawn((
                                         Text::new(pipeline_selector_value_text(
                                             selected_pipeline,
-                                            pipeline_models.len(),
+                                            pipeline_choices.len(),
                                         )),
                                         TextFont::from_font_size(12.0),
                                         TextColor(BUTTON_TEXT),
@@ -1121,11 +1559,50 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                         ..default()
                     })
                     .with_children(|header| {
-                        header.spawn((
-                            Text::new("catalog"),
-                            TextFont::from_font_size(14.0),
-                            TextColor(Color::srgb(0.82, 0.86, 0.94)),
-                        ));
+                        header
+                            .spawn((
+                                CatalogModeDropdownHost,
+                                Node {
+                                    position_type: PositionType::Relative,
+                                    width: Val::Px(104.0),
+                                    height: Val::Px(28.0),
+                                    overflow: Overflow::visible(),
+                                    ..default()
+                                },
+                            ))
+                            .with_children(|host| {
+                                host.spawn((
+                                    Button,
+                                    CatalogModeSelectorButton,
+                                    ControlButton(ControlButtonKind::Secondary),
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Percent(100.0),
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        ..default()
+                                    },
+                                    BorderColor::all(BUTTON_ACTIVE_BORDER),
+                                    BackgroundColor(BUTTON_ACTIVE_BG),
+                                ))
+                                .with_children(|button| {
+                                    button.spawn((
+                                        Text::new(CatalogMode::Object.label()),
+                                        TextFont::from_font_size(13.0),
+                                        TextColor(BUTTON_TEXT),
+                                        CatalogModeValueLabel,
+                                        ButtonLabel,
+                                    ));
+                                    button.spawn((
+                                        Text::new("v"),
+                                        TextFont::from_font_size(12.0),
+                                        TextColor(BUTTON_TEXT),
+                                        ButtonLabel,
+                                    ));
+                                });
+                            });
                         header
                             .spawn(Node {
                                 flex_direction: FlexDirection::Row,
@@ -1250,6 +1727,7 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
         last_revision: 0,
         last_expanded: true,
         panel_width: PANEL_WIDTH,
+        catalog_mode_menu_open: false,
         settings_modal_open: false,
         source_modal_open: false,
         pipeline_menu_open: false,
@@ -1365,6 +1843,150 @@ fn handle_catalog_toggle(
     }
 }
 
+fn handle_catalog_mode_selector_button(
+    mut interactions: Query<&Interaction, (Changed<Interaction>, With<CatalogModeSelectorButton>)>,
+    mut dropdown: ResMut<CatalogModeDropdownState>,
+) {
+    for interaction in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            dropdown.open = !dropdown.open;
+        }
+    }
+}
+
+fn handle_catalog_mode_option_button(
+    mut interactions: Query<(&Interaction, &CatalogModeOptionButton), Changed<Interaction>>,
+    mut dropdown: ResMut<CatalogModeDropdownState>,
+    mut pipeline_dropdown: ResMut<PipelineDropdownState>,
+    mut settings: ResMut<SettingsModalState>,
+    mut selection: ResMut<CatalogSelectionState>,
+    mut drag: ResMut<DragState>,
+    mut catalog: ResMut<CatalogState>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        catalog.set_active_mode(button.mode);
+        selection.selected = None;
+        selection.last_pressed = None;
+        drag.active = None;
+        drag.ghost_entry = None;
+        dropdown.open = false;
+        pipeline_dropdown.open = false;
+        settings.open = false;
+    }
+}
+
+fn sync_catalog_mode_dropdown(
+    mut commands: Commands,
+    catalog: Res<CatalogState>,
+    mut dropdown: ResMut<CatalogModeDropdownState>,
+    mut ui: ResMut<CatalogUiState>,
+    hosts: Query<Entity, With<CatalogModeDropdownHost>>,
+    children: Query<&Children>,
+) {
+    ui.catalog_mode_menu_open = dropdown.open;
+    match (dropdown.open, dropdown.entity) {
+        (true, None) => {
+            let Ok(host) = hosts.single() else {
+                dropdown.open = false;
+                ui.catalog_mode_menu_open = false;
+                return;
+            };
+            dropdown.entity = Some(spawn_catalog_mode_dropdown(
+                &mut commands,
+                host,
+                catalog.active_mode(),
+            ));
+        }
+        (false, Some(entity)) => {
+            despawn_children_recursive(entity, &mut commands, &children);
+            commands.entity(entity).despawn();
+            dropdown.entity = None;
+        }
+        _ => {}
+    }
+}
+
+fn update_catalog_mode_value_label(
+    catalog: Res<CatalogState>,
+    mut labels: Query<&mut Text, With<CatalogModeValueLabel>>,
+) {
+    let next = catalog.active_mode().label().to_string();
+    for mut label in labels.iter_mut() {
+        if label.0 != next {
+            label.0 = next.clone();
+        }
+    }
+}
+
+fn spawn_catalog_mode_dropdown(
+    commands: &mut Commands,
+    host: Entity,
+    active: CatalogMode,
+) -> Entity {
+    let mut menu_entity = Entity::PLACEHOLDER;
+    commands.entity(host).with_children(|host| {
+        menu_entity = host
+            .spawn((
+                CatalogModeDropdownRoot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(32.0),
+                    left: Val::Px(0.0),
+                    width: Val::Px(104.0),
+                    padding: UiRect::all(Val::Px(4.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(3.0),
+                    ..default()
+                },
+                ZIndex(100),
+                GlobalZIndex(20_000),
+                BorderColor::all(PANEL_BORDER),
+                BackgroundColor(PANEL_BG),
+            ))
+            .with_children(|menu| {
+                for mode in [CatalogMode::Object, CatalogMode::Scene] {
+                    menu.spawn((
+                        Button,
+                        CatalogModeOptionButton { mode },
+                        ControlButton(ControlButtonKind::Secondary),
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(26.0),
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BorderColor::all(if mode == active {
+                            BUTTON_ACTIVE_BORDER
+                        } else {
+                            BUTTON_BORDER
+                        }),
+                        BackgroundColor(if mode == active {
+                            BUTTON_ACTIVE_BG
+                        } else {
+                            BUTTON_BG
+                        }),
+                    ))
+                    .with_children(|button| {
+                        button.spawn((
+                            Text::new(mode.label()),
+                            TextFont::from_font_size(12.0),
+                            TextColor(BUTTON_TEXT),
+                            ButtonLabel,
+                        ));
+                    });
+                }
+            })
+            .id();
+    });
+    menu_entity
+}
+
 fn rebuild_catalog_list(
     mut commands: Commands,
     catalog: Res<CatalogState>,
@@ -1401,6 +2023,16 @@ fn rebuild_catalog_list(
     let indices = catalog.visible_indices();
     commands.entity(ui.list_entity).with_children(|parent| {
         if indices.is_empty() {
+            let (empty_title, empty_hint) = match catalog.active_mode() {
+                CatalogMode::Object => (
+                    "No object catalog items yet",
+                    "Drop an image, or click open image to queue one.",
+                ),
+                CatalogMode::Scene => (
+                    "No saved scenes yet",
+                    "Open an image in scene mode to run the explicit scene pipeline.",
+                ),
+            };
             parent
                 .spawn((
                     Node {
@@ -1416,12 +2048,12 @@ fn rebuild_catalog_list(
                 ))
                 .with_children(|empty| {
                     empty.spawn((
-                        Text::new("No catalog items yet"),
+                        Text::new(empty_title),
                         TextFont::from_font_size(13.0),
                         TextColor(Color::srgb(0.88, 0.9, 0.95)),
                     ));
                     empty.spawn((
-                        Text::new("Drop an image, or click open image to queue one."),
+                        Text::new(empty_hint),
                         TextFont::from_font_size(12.0),
                         TextColor(Color::srgb(0.66, 0.7, 0.78)),
                     ));
@@ -1433,6 +2065,11 @@ fn rebuild_catalog_list(
             let entry = &catalog.entries[index];
             let (status_label, status_color) = match &entry.status {
                 CatalogStatus::Pending => ("pending".to_string(), Color::srgb(0.9, 0.7, 0.2)),
+                CatalogStatus::Ready if entry.kind == CatalogEntryKind::Scene => {
+                    let mut label = scene_entry_status_text(entry);
+                    label = ellipsize_text(&label, CATALOG_STATUS_MAX_CHARS);
+                    (label, Color::srgb(0.4, 0.85, 0.55))
+                }
                 CatalogStatus::Ready => ("ready".to_string(), Color::srgb(0.4, 0.85, 0.55)),
                 CatalogStatus::Failed(err) => {
                     let mut label = if err.is_empty() {
@@ -1492,7 +2129,7 @@ fn rebuild_catalog_list(
                     }
 
                     row.spawn(Node {
-                        width: Val::Px(PANEL_WIDTH - THUMB_SIZE - 78.0),
+                        width: Val::Px(PANEL_WIDTH - THUMB_SIZE - 96.0),
                         min_width: Val::Px(0.0),
                         flex_direction: FlexDirection::Column,
                         justify_content: JustifyContent::Center,
@@ -1514,18 +2151,77 @@ fn rebuild_catalog_list(
                         ));
                     });
 
-                    row.spawn((
-                        Node {
-                            width: Val::Px(10.0),
-                            height: Val::Px(10.0),
-                            margin: UiRect::left(Val::Auto),
-                            ..default()
-                        },
-                        BackgroundColor(status_color),
-                    ));
+                    if entry.kind == CatalogEntryKind::Scene && !entry.is_unsaved_scene() {
+                        row.spawn((
+                            Button,
+                            CatalogSceneLoadButton { id: entry.id },
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                width: Val::Px(46.0),
+                                height: Val::Px(26.0),
+                                margin: UiRect::left(Val::Auto),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new("load"),
+                                TextFont::from_font_size(12.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+                    } else {
+                        row.spawn((
+                            Node {
+                                width: Val::Px(10.0),
+                                height: Val::Px(10.0),
+                                margin: UiRect::left(Val::Auto),
+                                ..default()
+                            },
+                            BackgroundColor(status_color),
+                        ));
+                    }
                 });
         }
     });
+}
+
+fn scene_entry_status_text(entry: &CatalogEntry) -> String {
+    if entry.is_unsaved_scene() {
+        return "current world".to_string();
+    }
+    let Some(metrics) = entry.scene_metrics.as_ref() else {
+        return entry
+            .scene_pipeline
+            .as_deref()
+            .unwrap_or("scene")
+            .to_string();
+    };
+    let mut parts = Vec::new();
+    if let Some(count) = metrics.object_count.or(metrics.placement_count) {
+        parts.push(format!("{count} objects"));
+    }
+    if let Some(elapsed_ms) = metrics.elapsed_ms {
+        parts.push(format!("{:.1}s", elapsed_ms as f32 / 1000.0));
+    }
+    if metrics.ok == Some(false) {
+        parts.push("needs review".to_string());
+    }
+    if parts.is_empty() {
+        entry
+            .scene_pipeline
+            .as_deref()
+            .unwrap_or("scene")
+            .to_string()
+    } else {
+        parts.join(" | ")
+    }
 }
 
 fn despawn_children_recursive(
@@ -1545,6 +2241,7 @@ fn despawn_children_recursive(
 fn handle_catalog_entry_interaction(
     mut interactions: Query<(&Interaction, &CatalogEntryButton), Changed<Interaction>>,
     time: Res<Time>,
+    catalog: Res<CatalogState>,
     mut drag: ResMut<DragState>,
     mut selection: ResMut<CatalogSelectionState>,
     mut source_modal: ResMut<CatalogSourceImageModalState>,
@@ -1563,10 +2260,32 @@ fn handle_catalog_entry_interaction(
                 return;
             } else {
                 selection.selected = Some(entry.id);
-                drag.active = Some(entry.id);
+                let is_object = catalog
+                    .entry(entry.id)
+                    .is_some_and(|entry| entry.kind == CatalogEntryKind::Object);
+                drag.active = is_object.then_some(entry.id);
                 drag.ghost_entry = None;
             }
         }
+    }
+}
+
+fn handle_catalog_scene_load_button(
+    mut interactions: Query<(&Interaction, &CatalogSceneLoadButton), Changed<Interaction>>,
+    catalog: Res<CatalogState>,
+    mut requests: MessageWriter<SceneLoadRequest>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(entry) = catalog.entry(button.id) else {
+            continue;
+        };
+        let Some(scene_key) = entry.scene_key.clone() else {
+            continue;
+        };
+        requests.write(SceneLoadRequest { scene_key });
     }
 }
 
@@ -1638,6 +2357,7 @@ fn delete_catalog_entry(
     drag: &mut DragState,
     commands: &mut Commands,
     delete_requests: &mut MessageWriter<CatalogDeleteRequest>,
+    scene_delete_requests: &mut MessageWriter<SceneDeleteRequest>,
 ) {
     let Some(entry) = catalog.remove_entry(id) else {
         if selection.selected == Some(id) {
@@ -1651,9 +2371,17 @@ fn delete_catalog_entry(
         }
         return;
     };
+    if entry.is_unsaved_scene() {
+        catalog.entries.push(entry);
+        catalog.clamp_page();
+        catalog.bump_revision();
+        return;
+    }
 
     if let Some(preview) = entry.preview {
-        commands.entity(preview.asset_entity).despawn();
+        for entity in preview.asset_entities {
+            commands.entity(entity).despawn();
+        }
         commands.entity(preview.camera_entity).despawn();
         for light in preview.light_entities {
             commands.entity(light).despawn();
@@ -1670,9 +2398,18 @@ fn delete_catalog_entry(
         clear_drag_ghost(drag, commands);
     }
 
-    delete_requests.write(CatalogDeleteRequest {
-        cache_key: entry.cache_key,
-    });
+    match entry.kind {
+        CatalogEntryKind::Object => {
+            delete_requests.write(CatalogDeleteRequest {
+                cache_key: entry.cache_key,
+            });
+        }
+        CatalogEntryKind::Scene => {
+            if let Some(scene_key) = entry.scene_key {
+                scene_delete_requests.write(SceneDeleteRequest { scene_key });
+            }
+        }
+    }
 }
 
 fn handle_catalog_delete_button(
@@ -1682,6 +2419,7 @@ fn handle_catalog_delete_button(
     mut drag: ResMut<DragState>,
     mut commands: Commands,
     mut delete_requests: MessageWriter<CatalogDeleteRequest>,
+    mut scene_delete_requests: MessageWriter<SceneDeleteRequest>,
 ) {
     for interaction in interactions.iter_mut() {
         if *interaction != Interaction::Pressed {
@@ -1697,6 +2435,7 @@ fn handle_catalog_delete_button(
             &mut drag,
             &mut commands,
             &mut delete_requests,
+            &mut scene_delete_requests,
         );
     }
 }
@@ -1711,6 +2450,7 @@ fn handle_catalog_delete_shortcut(
     mut drag: ResMut<DragState>,
     mut commands: Commands,
     mut delete_requests: MessageWriter<CatalogDeleteRequest>,
+    mut scene_delete_requests: MessageWriter<SceneDeleteRequest>,
 ) {
     if !keys.just_pressed(KeyCode::Delete) && !keys.just_pressed(KeyCode::Backspace) {
         return;
@@ -1731,6 +2471,7 @@ fn handle_catalog_delete_shortcut(
         &mut drag,
         &mut commands,
         &mut delete_requests,
+        &mut scene_delete_requests,
     );
 }
 
@@ -1809,8 +2550,8 @@ fn update_button_visuals(
 
     let args_ref = args.as_deref();
     let available_ref = available.as_deref();
-    let selected_pipeline = args_ref.and_then(|args| args.synthesis_models.first().copied());
-    let settings_enabled = pipeline_settings_enabled(args_ref);
+    let selected_pipeline = active_pipeline_choice(&catalog, args_ref, None);
+    let settings_enabled = pipeline_settings_enabled(&catalog, args_ref);
 
     for (
         interaction,
@@ -1836,15 +2577,15 @@ fn update_button_visuals(
         } else if delete.is_some() {
             selection.selected.is_none()
         } else if let Some(pipeline_option) = pipeline_option {
-            !pipeline_available(available_ref, pipeline_option.model)
-                || !pipeline_supported(args_ref, pipeline_option.model)
+            !pipeline_available(available_ref, pipeline_option.choice)
+                || !pipeline_supported(args_ref, pipeline_option.choice)
         } else if settings_button.is_some() {
             !settings_enabled
         } else {
             false
         };
         let active = pipeline_selector.is_some()
-            || pipeline_option.is_some_and(|pipeline| Some(pipeline.model) == selected_pipeline)
+            || pipeline_option.is_some_and(|pipeline| Some(pipeline.choice) == selected_pipeline)
             || settings_button.is_some_and(|_| settings_enabled && modal.open)
             || profile
                 .zip(args_ref)
@@ -2134,7 +2875,9 @@ fn sync_catalog_previews(
     for (index, entry) in catalog.entries.iter().enumerate() {
         let should_show = visible_ids.contains(&entry.id)
             && matches!(entry.status, CatalogStatus::Ready)
-            && ((entry.mesh.is_some() && entry.material.is_some()) || entry.gaussian.is_some());
+            && ((entry.mesh.is_some() && entry.material.is_some())
+                || entry.gaussian.is_some()
+                || (entry.kind == CatalogEntryKind::Scene && !entry.scene_items.is_empty()));
 
         match (should_show, entry.preview.is_some()) {
             (true, false) => {
@@ -2156,6 +2899,16 @@ fn sync_catalog_previews(
                     actions.push(PreviewAction::Create {
                         index,
                         asset: PreviewAsset::GaussianSplat { cloud },
+                        fit,
+                    });
+                } else if entry.kind == CatalogEntryKind::Scene && !entry.scene_items.is_empty() {
+                    let fit =
+                        preview_fit_for_scene_items(&entry.scene_items, &meshes, &gaussian_clouds);
+                    actions.push(PreviewAction::Create {
+                        index,
+                        asset: PreviewAsset::Scene {
+                            items: entry.scene_items.clone(),
+                        },
                         fit,
                     });
                 }
@@ -2184,7 +2937,9 @@ fn sync_catalog_previews(
                     .get_mut(index)
                     .and_then(|entry| entry.preview.take());
                 if let Some(preview) = preview {
-                    commands.entity(preview.asset_entity).despawn();
+                    for entity in preview.asset_entities {
+                        commands.entity(entity).despawn();
+                    }
                     commands.entity(preview.camera_entity).despawn();
                     for light in preview.light_entities {
                         commands.entity(light).despawn();
@@ -2229,14 +2984,12 @@ fn handle_open_button(
 }
 
 fn handle_pipeline_selector_button(
+    catalog: Res<CatalogState>,
     available: Option<Res<AvailablePipelines>>,
     mut dropdown: ResMut<PipelineDropdownState>,
     mut interactions: Query<&Interaction, (Changed<Interaction>, With<PipelineSelectorButton>)>,
 ) {
-    let option_count = available
-        .as_deref()
-        .map(|available| available.models.len())
-        .unwrap_or(DEFAULT_PIPELINE_OPTIONS.len());
+    let option_count = active_pipeline_choices(catalog.active_mode(), available.as_deref()).len();
     for interaction in interactions.iter_mut() {
         if *interaction != Interaction::Pressed {
             continue;
@@ -2246,64 +2999,71 @@ fn handle_pipeline_selector_button(
 }
 
 fn handle_pipeline_option_button(
-    args: Option<ResMut<AppArgs>>,
+    mut args: Option<ResMut<AppArgs>>,
+    mut scene_settings: ResMut<ScenePipelineUiSettings>,
     available: Option<Res<AvailablePipelines>>,
     mut dropdown: ResMut<PipelineDropdownState>,
     mut modal: ResMut<SettingsModalState>,
     mut interactions: Query<(&Interaction, &PipelineOptionButton), Changed<Interaction>>,
 ) {
-    let Some(mut args) = args else {
-        return;
-    };
     let available_ref = available.as_deref();
     for (interaction, button) in interactions.iter_mut() {
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if !pipeline_available(available_ref, button.model) {
+        if !pipeline_available(available_ref, button.choice) {
             info!(
                 "synthesis pipeline {} is not enabled for this app launch",
-                pipeline_label(button.model)
+                button.choice.label()
             );
             continue;
         }
-        if args
-            .synthesis_models
-            .first()
-            .is_some_and(|current| *current == button.model)
-        {
-            dropdown.open = false;
-            continue;
+        match button.choice {
+            CatalogPipelineChoice::Object(model) => {
+                let Some(args) = args.as_deref_mut() else {
+                    return;
+                };
+                if args
+                    .synthesis_models
+                    .first()
+                    .is_some_and(|current| *current == model)
+                {
+                    dropdown.open = false;
+                    continue;
+                }
+                if !pipeline_supported(Some(&*args), button.choice) {
+                    info!(
+                        "synthesis pipeline {} is unavailable for backend {:?}",
+                        pipeline_label(model),
+                        args.backend
+                    );
+                    continue;
+                }
+                args.synthesis_models = vec![model];
+                if !pipeline_has_settings(model) {
+                    modal.open = false;
+                }
+                if matches!(model, SynthesisModel::Triposplat)
+                    && args.triposplat_profile != TripoSplatProfile::Custom
+                {
+                    let profile = args.triposplat_profile;
+                    args.apply_triposplat_profile(profile);
+                }
+            }
+            CatalogPipelineChoice::Scene(pipeline) => {
+                scene_settings.pipeline = pipeline;
+            }
         }
-        if !pipeline_supported(Some(&args), button.model) {
-            info!(
-                "synthesis pipeline {} is unavailable for backend {:?}",
-                pipeline_label(button.model),
-                args.backend
-            );
-            continue;
-        }
-        args.synthesis_models = vec![button.model];
         dropdown.open = false;
-        if !pipeline_has_settings(button.model) {
-            modal.open = false;
-        }
-        if matches!(button.model, SynthesisModel::Triposplat)
-            && args.triposplat_profile != TripoSplatProfile::Custom
-        {
-            let profile = args.triposplat_profile;
-            args.apply_triposplat_profile(profile);
-        }
-        info!(
-            "selected synthesis pipeline: {}",
-            pipeline_label(button.model)
-        );
+        info!("selected synthesis pipeline: {}", button.choice.label());
     }
 }
 
 fn sync_pipeline_dropdown(
     mut commands: Commands,
+    catalog: Res<CatalogState>,
     args: Option<Res<AppArgs>>,
+    scene_settings: Res<ScenePipelineUiSettings>,
     available: Option<Res<AvailablePipelines>>,
     mut dropdown: ResMut<PipelineDropdownState>,
     mut ui: ResMut<CatalogUiState>,
@@ -2320,7 +3080,8 @@ fn sync_pipeline_dropdown(
         }
         return;
     };
-    if available.models.len() <= 1 {
+    let choices = active_pipeline_choices(catalog.active_mode(), Some(&available));
+    if choices.len() <= 1 {
         dropdown.open = false;
         ui.pipeline_menu_open = false;
     }
@@ -2334,7 +3095,9 @@ fn sync_pipeline_dropdown(
             dropdown.entity = Some(spawn_pipeline_dropdown(
                 &mut commands,
                 host,
+                catalog.active_mode(),
                 args.as_deref(),
+                &scene_settings,
                 &available,
             ));
         }
@@ -2408,7 +3171,7 @@ fn spawn_save_scene_menu(commands: &mut Commands, host: Entity) -> Entity {
                     position_type: PositionType::Absolute,
                     top: Val::Px(32.0),
                     right: Val::Px(0.0),
-                    width: Val::Px(132.0),
+                    width: Val::Px(154.0),
                     padding: UiRect::all(Val::Px(4.0)),
                     border: UiRect::all(Val::Px(1.0)),
                     flex_direction: FlexDirection::Column,
@@ -2421,6 +3184,7 @@ fn spawn_save_scene_menu(commands: &mut Commands, host: Entity) -> Entity {
                 BackgroundColor(PANEL_BG),
             ))
             .with_children(|menu| {
+                spawn_save_scene_option(menu, SceneSaveKind::Catalog, "save to catalog");
                 spawn_save_scene_option(menu, SceneSaveKind::Bsn, "save BSN");
                 spawn_save_scene_option(menu, SceneSaveKind::Glb, "export GLB");
             })
@@ -2461,23 +3225,15 @@ fn spawn_save_scene_option(
 }
 
 fn update_pipeline_value_label(
+    catalog: Res<CatalogState>,
     args: Option<Res<AppArgs>>,
+    scene_settings: Res<ScenePipelineUiSettings>,
     available: Option<Res<AvailablePipelines>>,
     mut labels: Query<&mut Text, With<PipelineValueLabel>>,
 ) {
-    let selected = args
-        .as_deref()
-        .and_then(|args| args.synthesis_models.first().copied())
-        .or_else(|| {
-            available
-                .as_deref()
-                .and_then(|available| available.models.first().copied())
-        })
-        .unwrap_or(SynthesisModel::Triposg);
-    let option_count = available
-        .as_deref()
-        .map(|available| available.models.len())
-        .unwrap_or(DEFAULT_PIPELINE_OPTIONS.len());
+    let selected = active_pipeline_choice(&catalog, args.as_deref(), Some(&scene_settings))
+        .unwrap_or(CatalogPipelineChoice::Object(SynthesisModel::Triposg));
+    let option_count = active_pipeline_choices(catalog.active_mode(), available.as_deref()).len();
     let next = pipeline_selector_value_text(selected, option_count);
     for mut label in labels.iter_mut() {
         if label.0 != next {
@@ -2489,10 +3245,13 @@ fn update_pipeline_value_label(
 fn spawn_pipeline_dropdown(
     commands: &mut Commands,
     host: Entity,
+    mode: CatalogMode,
     args: Option<&AppArgs>,
+    scene_settings: &ScenePipelineUiSettings,
     available: &AvailablePipelines,
 ) -> Entity {
-    let selected_pipeline = args.and_then(|args| args.synthesis_models.first().copied());
+    let selected_pipeline = active_pipeline_choice_for_mode(mode, args, Some(scene_settings));
+    let choices = active_pipeline_choices(mode, Some(available));
     let mut dropdown_entity = Entity::PLACEHOLDER;
     commands.entity(host).with_children(|host| {
         dropdown_entity = host
@@ -2515,10 +3274,10 @@ fn spawn_pipeline_dropdown(
                 BackgroundColor(PANEL_BG),
             ))
             .with_children(|menu| {
-                for model in available.models.iter().copied() {
+                for choice in choices {
                     menu.spawn((
                         Button,
-                        PipelineOptionButton { model },
+                        PipelineOptionButton { choice },
                         ControlButton(ControlButtonKind::Secondary),
                         Node {
                             width: Val::Percent(100.0),
@@ -2529,12 +3288,12 @@ fn spawn_pipeline_dropdown(
                             justify_content: JustifyContent::SpaceBetween,
                             ..default()
                         },
-                        BorderColor::all(if Some(model) == selected_pipeline {
+                        BorderColor::all(if Some(choice) == selected_pipeline {
                             BUTTON_ACTIVE_BORDER
                         } else {
                             BUTTON_BORDER
                         }),
-                        BackgroundColor(if Some(model) == selected_pipeline {
+                        BackgroundColor(if Some(choice) == selected_pipeline {
                             BUTTON_ACTIVE_BG
                         } else {
                             BUTTON_BG
@@ -2542,7 +3301,7 @@ fn spawn_pipeline_dropdown(
                     ))
                     .with_children(|button| {
                         button.spawn((
-                            Text::new(pipeline_label(model)),
+                            Text::new(choice.label()),
                             TextFont::from_font_size(12.0),
                             TextColor(BUTTON_TEXT),
                             ButtonLabel,
@@ -2557,12 +3316,13 @@ fn spawn_pipeline_dropdown(
 
 fn handle_settings_button(
     mut interactions: Query<&Interaction, (Changed<Interaction>, With<SettingsButton>)>,
+    catalog: Res<CatalogState>,
     args: Option<Res<AppArgs>>,
     mut modal: ResMut<SettingsModalState>,
 ) {
     for interaction in interactions.iter_mut() {
         if *interaction == Interaction::Pressed {
-            if pipeline_settings_enabled(args.as_deref()) {
+            if pipeline_settings_enabled(&catalog, args.as_deref()) {
                 modal.open = !modal.open;
             } else {
                 modal.open = false;
@@ -2707,37 +3467,80 @@ fn handle_trellis_setting_step_button(
     }
 }
 
+fn handle_scene_quality_button(
+    mut scene_settings: ResMut<ScenePipelineUiSettings>,
+    mut interactions: Query<(&Interaction, &SceneQualityButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        scene_settings.quality_profile = button.quality;
+    }
+}
+
+fn handle_scene_setting_step_button(
+    mut scene_settings: ResMut<ScenePipelineUiSettings>,
+    mut interactions: Query<(&Interaction, &SceneSettingStepButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        adjust_scene_setting(&mut scene_settings, button.setting, button.delta);
+    }
+}
+
+fn handle_scene_setting_toggle_button(
+    mut scene_settings: ResMut<ScenePipelineUiSettings>,
+    mut interactions: Query<(&Interaction, &SceneSettingToggleButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match button.setting {
+            SceneToggleSetting::Pbr => scene_settings.pbr_enabled = !scene_settings.pbr_enabled,
+            SceneToggleSetting::CatalogReuse => {
+                scene_settings.allow_catalog_reuse = !scene_settings.allow_catalog_reuse
+            }
+        }
+    }
+}
+
 fn sync_settings_modal(
     mut commands: Commands,
+    catalog: Res<CatalogState>,
     args: Option<Res<AppArgs>>,
+    scene_settings: Res<ScenePipelineUiSettings>,
     mut modal: ResMut<SettingsModalState>,
     mut ui: ResMut<CatalogUiState>,
     children: Query<&Children>,
 ) {
-    let active_model = active_settings_pipeline(args.as_deref());
-    if active_model.is_none() {
+    let active_pipeline = active_pipeline_choice(&catalog, args.as_deref(), Some(&scene_settings));
+    if active_pipeline.is_none() || !pipeline_settings_enabled(&catalog, args.as_deref()) {
         modal.open = false;
     }
-    if modal.entity.is_some() && modal.model != active_model {
+    if modal.entity.is_some() && modal.pipeline != active_pipeline {
         if let Some(entity) = modal.entity.take() {
             despawn_children_recursive(entity, &mut commands, &children);
             commands.entity(entity).despawn();
         }
-        modal.model = None;
+        modal.pipeline = None;
     }
     ui.settings_modal_open = modal.open;
     match (modal.open, modal.entity) {
         (true, None) => {
-            if let Some(model) = active_model {
-                modal.entity = Some(spawn_settings_modal(&mut commands, model));
-                modal.model = Some(model);
+            if let Some(pipeline) = active_pipeline {
+                modal.entity = Some(spawn_settings_modal(&mut commands, pipeline));
+                modal.pipeline = Some(pipeline);
             }
         }
         (false, Some(entity)) => {
             despawn_children_recursive(entity, &mut commands, &children);
             commands.entity(entity).despawn();
             modal.entity = None;
-            modal.model = None;
+            modal.pipeline = None;
         }
         _ => {}
     }
@@ -2746,6 +3549,7 @@ fn sync_settings_modal(
 #[allow(clippy::type_complexity)]
 fn update_settings_labels(
     args: Option<Res<AppArgs>>,
+    scene_settings: Res<ScenePipelineUiSettings>,
     mut profile_labels: Query<
         &mut Text,
         (
@@ -2793,36 +3597,90 @@ fn update_settings_labels(
             Without<TrellisQualityValueLabel>,
         ),
     >,
+    mut scene_quality_labels: Query<
+        &mut Text,
+        (
+            With<SceneQualityValueLabel>,
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
+            Without<SceneSettingValueLabel>,
+            Without<SceneToggleValueLabel>,
+        ),
+    >,
+    mut scene_value_labels: Query<
+        (&SceneSettingValueLabel, &mut Text),
+        (
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
+            Without<SceneQualityValueLabel>,
+            Without<SceneToggleValueLabel>,
+        ),
+    >,
+    mut scene_toggle_labels: Query<
+        (&SceneToggleValueLabel, &mut Text),
+        (
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
+            Without<SceneQualityValueLabel>,
+            Without<SceneSettingValueLabel>,
+        ),
+    >,
 ) {
-    let Some(args) = args else {
-        return;
-    };
-    for mut label in profile_labels.iter_mut() {
-        let next = triposplat_profile_label(args.triposplat_profile).to_string();
+    if let Some(args) = args {
+        for mut label in profile_labels.iter_mut() {
+            let next = triposplat_profile_label(args.triposplat_profile).to_string();
+            if label.0 != next {
+                label.0 = next;
+            }
+        }
+        for (value, mut label) in value_labels.iter_mut() {
+            let next = triposplat_setting_value_text(&args, value.setting);
+            if label.0 != next {
+                label.0 = next;
+            }
+        }
+        for (value, mut label) in triposg_value_labels.iter_mut() {
+            let next = triposg_setting_value_text(&args, value.setting);
+            if label.0 != next {
+                label.0 = next;
+            }
+        }
+        for mut label in trellis_quality_labels.iter_mut() {
+            let next = trellis_quality_value_text(args.trellis_quality);
+            if label.0 != next {
+                label.0 = next;
+            }
+        }
+        for (value, mut label) in trellis_value_labels.iter_mut() {
+            let next = trellis_setting_value_text(&args, value.setting);
+            if label.0 != next {
+                label.0 = next;
+            }
+        }
+    }
+    for mut label in scene_quality_labels.iter_mut() {
+        let next = scene_settings.quality_profile.label().to_string();
         if label.0 != next {
             label.0 = next;
         }
     }
-    for (value, mut label) in value_labels.iter_mut() {
-        let next = triposplat_setting_value_text(&args, value.setting);
+    for (value, mut label) in scene_value_labels.iter_mut() {
+        let next = scene_setting_value_text(&scene_settings, value.setting);
         if label.0 != next {
             label.0 = next;
         }
     }
-    for (value, mut label) in triposg_value_labels.iter_mut() {
-        let next = triposg_setting_value_text(&args, value.setting);
-        if label.0 != next {
-            label.0 = next;
-        }
-    }
-    for mut label in trellis_quality_labels.iter_mut() {
-        let next = trellis_quality_value_text(args.trellis_quality);
-        if label.0 != next {
-            label.0 = next;
-        }
-    }
-    for (value, mut label) in trellis_value_labels.iter_mut() {
-        let next = trellis_setting_value_text(&args, value.setting);
+    for (value, mut label) in scene_toggle_labels.iter_mut() {
+        let next = scene_toggle_value_text(&scene_settings, value.setting);
         if label.0 != next {
             label.0 = next;
         }
@@ -2944,12 +3802,72 @@ fn spawn_source_image_modal(commands: &mut Commands, entry: &CatalogEntry) -> En
                             ));
                         });
                 }
+
+                if entry.kind == CatalogEntryKind::Scene {
+                    spawn_scene_details_stats(panel, entry);
+                }
             });
         })
         .id()
 }
 
-fn spawn_settings_modal(commands: &mut Commands, model: SynthesisModel) -> Entity {
+fn spawn_scene_details_stats(parent: &mut ChildSpawnerCommands, entry: &CatalogEntry) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(5.0),
+            padding: UiRect::top(Val::Px(4.0)),
+            ..default()
+        })
+        .with_children(|stats| {
+            let pipeline = entry.scene_pipeline.as_deref().unwrap_or("scene");
+            stats.spawn((
+                Text::new(format!("pipeline: {pipeline}")),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb(0.78, 0.82, 0.9)),
+            ));
+            if let Some(metrics) = entry.scene_metrics.as_ref() {
+                let mut parts = Vec::new();
+                if let Some(elapsed_ms) = metrics.elapsed_ms {
+                    parts.push(format!("runtime {:.1}s", elapsed_ms as f32 / 1000.0));
+                }
+                if let Some(count) = metrics.object_count {
+                    parts.push(format!("{count} objects"));
+                }
+                if let Some(count) = metrics.asset_count {
+                    parts.push(format!("{count} assets"));
+                }
+                if let Some(count) = metrics.placement_count {
+                    parts.push(format!("{count} placements"));
+                }
+                if let Some(accepted) = metrics.feedback_accepted {
+                    parts.push(format!(
+                        "feedback {}",
+                        if accepted { "accepted" } else { "failed" }
+                    ));
+                }
+                if let Some(stage) = metrics.failed_stage.as_deref() {
+                    parts.push(format!("failed stage {stage}"));
+                }
+                if !parts.is_empty() {
+                    stats.spawn((
+                        Text::new(parts.join(" | ")),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::srgb(0.7, 0.74, 0.82)),
+                    ));
+                }
+            }
+            if let Some(dir) = entry.scene_artifact_dir.as_deref() {
+                stats.spawn((
+                    Text::new(format!("artifacts: {}", ellipsize_text(dir, 76))),
+                    TextFont::from_font_size(12.0),
+                    TextColor(Color::srgb(0.62, 0.67, 0.76)),
+                ));
+            }
+        });
+}
+
+fn spawn_settings_modal(commands: &mut Commands, pipeline: CatalogPipelineChoice) -> Entity {
     commands
         .spawn((
             SettingsModalRoot,
@@ -2988,7 +3906,7 @@ fn spawn_settings_modal(commands: &mut Commands, model: SynthesisModel) -> Entit
                     })
                     .with_children(|header| {
                         header.spawn((
-                            Text::new(settings_modal_title(model)),
+                            Text::new(settings_modal_title(pipeline)),
                             TextFont::from_font_size(16.0),
                             TextColor(Color::srgb(0.92, 0.94, 0.98)),
                         ));
@@ -3015,21 +3933,31 @@ fn spawn_settings_modal(commands: &mut Commands, model: SynthesisModel) -> Entit
                             });
                     });
 
-                match model {
-                    SynthesisModel::Triposg => spawn_triposg_settings(panel),
-                    SynthesisModel::Triposplat => spawn_triposplat_settings(panel),
-                    SynthesisModel::Trellis => spawn_trellis_settings(panel),
+                match pipeline {
+                    CatalogPipelineChoice::Object(SynthesisModel::Triposg) => {
+                        spawn_triposg_settings(panel)
+                    }
+                    CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => {
+                        spawn_triposplat_settings(panel)
+                    }
+                    CatalogPipelineChoice::Object(SynthesisModel::Trellis) => {
+                        spawn_trellis_settings(panel)
+                    }
+                    CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => {
+                        spawn_scene_settings(panel)
+                    }
                 }
             });
         })
         .id()
 }
 
-fn settings_modal_title(model: SynthesisModel) -> &'static str {
-    match model {
-        SynthesisModel::Triposg => "TripoSG settings",
-        SynthesisModel::Triposplat => "TripoSplat settings",
-        SynthesisModel::Trellis => "Trellis.2 settings",
+fn settings_modal_title(pipeline: CatalogPipelineChoice) -> &'static str {
+    match pipeline {
+        CatalogPipelineChoice::Object(SynthesisModel::Triposg) => "TripoSG settings",
+        CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => "TripoSplat settings",
+        CatalogPipelineChoice::Object(SynthesisModel::Trellis) => "Trellis.2 settings",
+        CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => "Explicit scene settings",
     }
 }
 
@@ -3162,6 +4090,80 @@ fn spawn_trellis_settings(panel: &mut ChildSpawnerCommands) {
     spawn_trellis_setting_row(panel, "pbr texture size", TrellisSetting::PbrTextureSize);
     spawn_trellis_setting_row(panel, "target faces", TrellisSetting::TargetFaces);
     spawn_trellis_setting_row(panel, "sparse cap", TrellisSetting::MaxSparseCoords);
+}
+
+fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|profiles| {
+            profiles.spawn((
+                Text::new("quality"),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb(0.66, 0.7, 0.78)),
+            ));
+            profiles
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|row| {
+                    for quality in [
+                        SceneQualityProfileSetting::Fast,
+                        SceneQualityProfileSetting::Balanced,
+                        SceneQualityProfileSetting::Full,
+                    ] {
+                        row.spawn((
+                            Button,
+                            SceneQualityButton { quality },
+                            ControlButton(ControlButtonKind::Secondary),
+                            Node {
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(BUTTON_BORDER),
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                Text::new(quality.label()),
+                                TextFont::from_font_size(12.0),
+                                TextColor(BUTTON_TEXT),
+                                ButtonLabel,
+                            ));
+                        });
+                    }
+                    row.spawn((
+                        Text::new(SceneQualityProfileSetting::Balanced.label()),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::srgb(0.72, 0.76, 0.84)),
+                        SceneQualityValueLabel,
+                    ));
+                });
+        });
+
+    spawn_scene_setting_row(panel, "candidates", SceneSetting::CandidateCount, 1);
+    spawn_scene_setting_row(panel, "feedback iters", SceneSetting::FeedbackIterations, 1);
+    spawn_scene_toggle_row(panel, "pbr textures", SceneToggleSetting::Pbr);
+    spawn_scene_setting_row(
+        panel,
+        "pbr texture size",
+        SceneSetting::PbrTextureSize,
+        TRELLIS_PBR_TEXTURE_STEP as isize,
+    );
+    spawn_scene_setting_row(
+        panel,
+        "target faces",
+        SceneSetting::TargetFaces,
+        TRELLIS_FACE_STEP as isize,
+    );
+    spawn_scene_toggle_row(panel, "catalog reuse", SceneToggleSetting::CatalogReuse);
 }
 
 fn spawn_triposg_setting_row(
@@ -3309,6 +4311,125 @@ fn spawn_trellis_setting_row(
                 ));
                 spawn_trellis_setting_step_button(control, setting, true);
             });
+        });
+}
+
+fn spawn_scene_setting_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: SceneSetting,
+    step: isize,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(7.0),
+                ..default()
+            })
+            .with_children(|control| {
+                spawn_scene_setting_step_button(control, setting, -step);
+                control.spawn((
+                    Text::new("0"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                    SceneSettingValueLabel { setting },
+                ));
+                spawn_scene_setting_step_button(control, setting, step);
+            });
+        });
+}
+
+fn spawn_scene_toggle_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &'static str,
+    setting: SceneToggleSetting,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn((
+                Button,
+                SceneSettingToggleButton { setting },
+                ControlButton(ControlButtonKind::Secondary),
+                Node {
+                    width: Val::Px(72.0),
+                    height: Val::Px(26.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BorderColor::all(BUTTON_BORDER),
+                BackgroundColor(BUTTON_BG),
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("on"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(BUTTON_TEXT),
+                    ButtonLabel,
+                    SceneToggleValueLabel { setting },
+                ));
+            });
+        });
+}
+
+fn spawn_scene_setting_step_button(
+    parent: &mut ChildSpawnerCommands,
+    setting: SceneSetting,
+    delta: isize,
+) {
+    parent
+        .spawn((
+            Button,
+            SceneSettingStepButton {
+                setting,
+                delta: SceneSettingDelta::Integer(delta),
+            },
+            ControlButton(ControlButtonKind::Nav),
+            Node {
+                width: Val::Px(28.0),
+                height: Val::Px(24.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(BUTTON_BORDER),
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(if delta > 0 { "+" } else { "-" }),
+                TextFont::from_font_size(14.0),
+                TextColor(BUTTON_TEXT),
+                ButtonLabel,
+            ));
         });
 }
 
@@ -3611,6 +4732,52 @@ fn adjust_trellis_setting(args: &mut AppArgs, setting: TrellisSetting, delta: Tr
     );
 }
 
+fn adjust_scene_setting(
+    settings: &mut ScenePipelineUiSettings,
+    setting: SceneSetting,
+    delta: SceneSettingDelta,
+) {
+    match (setting, delta) {
+        (SceneSetting::CandidateCount, SceneSettingDelta::Integer(delta)) => {
+            settings.candidate_count = apply_integer_delta(settings.candidate_count, delta, 1, 6);
+        }
+        (SceneSetting::FeedbackIterations, SceneSettingDelta::Integer(delta)) => {
+            settings.feedback_iterations =
+                apply_integer_delta(settings.feedback_iterations, delta, 0, 24);
+        }
+        (SceneSetting::PbrTextureSize, SceneSettingDelta::Integer(delta)) => {
+            settings.pbr_texture_size = apply_integer_delta(
+                settings.pbr_texture_size,
+                delta,
+                TRELLIS_PBR_TEXTURE_MIN,
+                TRELLIS_PBR_TEXTURE_MAX,
+            );
+        }
+        (SceneSetting::TargetFaces, SceneSettingDelta::Integer(delta)) => {
+            settings.target_faces = apply_integer_delta(
+                settings.target_faces,
+                delta,
+                TRELLIS_FACE_STEP,
+                TRELLIS_MAX_FACES,
+            );
+        }
+    }
+    info!(
+        "Explicit scene settings: quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={}",
+        settings.quality_profile.label(),
+        settings.candidate_count,
+        settings.feedback_iterations,
+        if settings.pbr_enabled { "on" } else { "off" },
+        format_grouped_usize(settings.pbr_texture_size),
+        format_grouped_usize(settings.target_faces),
+        if settings.allow_catalog_reuse {
+            "on"
+        } else {
+            "off"
+        }
+    );
+}
+
 fn apply_integer_delta(value: usize, delta: isize, min: usize, max: usize) -> usize {
     value.saturating_add_signed(delta).clamp(min, max)
 }
@@ -3697,6 +4864,36 @@ fn trellis_setting_value_text(args: &AppArgs, setting: TrellisSetting) -> String
     }
 }
 
+fn scene_setting_value_text(settings: &ScenePipelineUiSettings, setting: SceneSetting) -> String {
+    match setting {
+        SceneSetting::CandidateCount => settings.candidate_count.to_string(),
+        SceneSetting::FeedbackIterations => settings.feedback_iterations.to_string(),
+        SceneSetting::PbrTextureSize => {
+            if settings.pbr_enabled {
+                format_grouped_usize(settings.pbr_texture_size)
+            } else {
+                "disabled".to_string()
+            }
+        }
+        SceneSetting::TargetFaces => format_grouped_usize(settings.target_faces),
+    }
+}
+
+fn scene_toggle_value_text(
+    settings: &ScenePipelineUiSettings,
+    setting: SceneToggleSetting,
+) -> String {
+    let enabled = match setting {
+        SceneToggleSetting::Pbr => settings.pbr_enabled,
+        SceneToggleSetting::CatalogReuse => settings.allow_catalog_reuse,
+    };
+    if enabled {
+        "on".to_string()
+    } else {
+        "off".to_string()
+    }
+}
+
 fn pipeline_has_settings(model: SynthesisModel) -> bool {
     matches!(
         model,
@@ -3709,8 +4906,36 @@ fn active_settings_pipeline(args: Option<&AppArgs>) -> Option<SynthesisModel> {
         .filter(|model| pipeline_has_settings(*model))
 }
 
-fn pipeline_settings_enabled(args: Option<&AppArgs>) -> bool {
-    active_settings_pipeline(args).is_some()
+fn active_pipeline_choice(
+    catalog: &CatalogState,
+    args: Option<&AppArgs>,
+    scene_settings: Option<&ScenePipelineUiSettings>,
+) -> Option<CatalogPipelineChoice> {
+    active_pipeline_choice_for_mode(catalog.active_mode(), args, scene_settings)
+}
+
+fn active_pipeline_choice_for_mode(
+    mode: CatalogMode,
+    args: Option<&AppArgs>,
+    scene_settings: Option<&ScenePipelineUiSettings>,
+) -> Option<CatalogPipelineChoice> {
+    match mode {
+        CatalogMode::Object => args
+            .and_then(|args| args.synthesis_models.first().copied())
+            .map(CatalogPipelineChoice::Object),
+        CatalogMode::Scene => Some(CatalogPipelineChoice::Scene(
+            scene_settings
+                .map(|settings| settings.pipeline)
+                .unwrap_or(ScenePipelineKind::Explicit),
+        )),
+    }
+}
+
+fn pipeline_settings_enabled(catalog: &CatalogState, args: Option<&AppArgs>) -> bool {
+    match catalog.active_mode() {
+        CatalogMode::Object => active_settings_pipeline(args).is_some(),
+        CatalogMode::Scene => true,
+    }
 }
 
 fn ellipsize_text(value: &str, max_chars: usize) -> String {
@@ -3770,35 +4995,80 @@ fn spawn_preview_scene(
     let camera_distance =
         (fit.radius / half_fov.tan()).max(fit.radius + 0.35) + PREVIEW_CAMERA_MARGIN;
 
-    let asset_entity = match asset {
-        PreviewAsset::Mesh { mesh, material } => commands
-            .spawn((
-                Pickable::IGNORE,
-                Mesh3d(mesh),
-                MeshMaterial3d(material),
-                Transform {
-                    translation: fit.mesh_translation,
-                    scale: Vec3::splat(fit.mesh_scale),
-                    ..default()
-                },
-                layer.clone(),
-                ThumbnailSpin,
-            ))
-            .id(),
-        PreviewAsset::GaussianSplat { cloud } => commands
-            .spawn((
-                Pickable::IGNORE,
-                PlanarGaussian3dHandle(cloud),
-                triposplat_preview_cloud_settings(),
-                Transform {
-                    translation: fit.mesh_translation,
-                    scale: Vec3::splat(fit.mesh_scale),
-                    ..default()
-                },
-                layer.clone(),
-                ThumbnailSpin,
-            ))
-            .id(),
+    let mut asset_entities = Vec::new();
+    match asset {
+        PreviewAsset::Mesh { mesh, material } => {
+            asset_entities.push(
+                commands
+                    .spawn((
+                        Pickable::IGNORE,
+                        Mesh3d(mesh),
+                        MeshMaterial3d(material),
+                        Transform {
+                            translation: fit.mesh_translation,
+                            scale: Vec3::splat(fit.mesh_scale),
+                            ..default()
+                        },
+                        layer.clone(),
+                        ThumbnailSpin,
+                    ))
+                    .id(),
+            );
+        }
+        PreviewAsset::GaussianSplat { cloud } => {
+            asset_entities.push(
+                commands
+                    .spawn((
+                        Pickable::IGNORE,
+                        PlanarGaussian3dHandle(cloud),
+                        triposplat_preview_cloud_settings(),
+                        Transform {
+                            translation: fit.mesh_translation,
+                            scale: Vec3::splat(fit.mesh_scale),
+                            ..default()
+                        },
+                        layer.clone(),
+                        ThumbnailSpin,
+                    ))
+                    .id(),
+            );
+        }
+        PreviewAsset::Scene { items } => {
+            for item in items {
+                let mut transform = item.transform;
+                transform.translation =
+                    fit.mesh_translation + transform.translation * fit.mesh_scale;
+                transform.scale *= fit.mesh_scale;
+                match item.asset {
+                    CatalogSpawnAsset::Mesh { mesh, material } => {
+                        asset_entities.push(
+                            commands
+                                .spawn((
+                                    Pickable::IGNORE,
+                                    Mesh3d(mesh),
+                                    MeshMaterial3d(material),
+                                    transform,
+                                    layer.clone(),
+                                ))
+                                .id(),
+                        );
+                    }
+                    CatalogSpawnAsset::GaussianSplat { cloud } => {
+                        asset_entities.push(
+                            commands
+                                .spawn((
+                                    Pickable::IGNORE,
+                                    PlanarGaussian3dHandle(cloud),
+                                    triposplat_preview_cloud_settings(),
+                                    transform,
+                                    layer.clone(),
+                                ))
+                                .id(),
+                        );
+                    }
+                }
+            }
+        }
     };
     let light_entities = vec![
         commands
@@ -3855,7 +5125,7 @@ fn spawn_preview_scene(
 
     PreviewScene {
         image: image_handle,
-        asset_entity,
+        asset_entities,
         camera_entity,
         light_entities,
         layer_index,
@@ -3868,6 +5138,34 @@ fn triposplat_preview_cloud_settings() -> CloudSettings {
         color_space: GaussianColorSpace::SrgbRec709Display,
         ..default()
     }
+}
+
+fn preview_fit_for_scene_items(
+    items: &[CatalogScenePreviewItem],
+    meshes: &Assets<BevyMesh>,
+    gaussian_clouds: &Assets<PlanarGaussian3d>,
+) -> PreviewFit {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut any = false;
+    for item in items {
+        match &item.asset {
+            CatalogSpawnAsset::Mesh { mesh, .. } => {
+                if let Some(mesh) = meshes.get(mesh) {
+                    accumulate_mesh_bounds(mesh, item.transform, &mut min, &mut max, &mut any);
+                }
+            }
+            CatalogSpawnAsset::GaussianSplat { cloud } => {
+                if let Some(cloud) = gaussian_clouds.get(cloud) {
+                    accumulate_gaussian_bounds(cloud, item.transform, &mut min, &mut max, &mut any);
+                }
+            }
+        }
+    }
+    if !any || !min.is_finite() || !max.is_finite() {
+        return PreviewFit::fallback();
+    }
+    preview_fit_from_bounds(min, max)
 }
 
 fn preview_fit_for_mesh(mesh: &BevyMesh) -> PreviewFit {
@@ -3889,6 +5187,10 @@ fn preview_fit_for_mesh(mesh: &BevyMesh) -> PreviewFit {
         max = max.max(point);
     }
 
+    preview_fit_from_bounds(min, max)
+}
+
+fn preview_fit_from_bounds(min: Vec3, max: Vec3) -> PreviewFit {
     if !min.is_finite() || !max.is_finite() {
         return PreviewFit::fallback();
     }
@@ -3909,6 +5211,52 @@ fn preview_fit_for_mesh(mesh: &BevyMesh) -> PreviewFit {
         mesh_translation: -center * mesh_scale,
         mesh_scale,
         radius: (raw_radius * mesh_scale).max(0.05),
+    }
+}
+
+fn accumulate_mesh_bounds(
+    mesh: &BevyMesh,
+    transform: Transform,
+    min: &mut Vec3,
+    max: &mut Vec3,
+    any: &mut bool,
+) {
+    let Some(positions) = mesh
+        .attribute(BevyMesh::ATTRIBUTE_POSITION)
+        .and_then(|attribute| attribute.as_float3())
+    else {
+        return;
+    };
+    let matrix = transform.to_matrix();
+    for position in positions {
+        let point = matrix.transform_point3(Vec3::new(position[0], position[1], position[2]));
+        if point.is_finite() {
+            *min = min.min(point);
+            *max = max.max(point);
+            *any = true;
+        }
+    }
+}
+
+fn accumulate_gaussian_bounds(
+    cloud: &PlanarGaussian3d,
+    transform: Transform,
+    min: &mut Vec3,
+    max: &mut Vec3,
+    any: &mut bool,
+) {
+    let matrix = transform.to_matrix();
+    for position_visibility in cloud.position_visibility.iter() {
+        let point = matrix.transform_point3(Vec3::new(
+            position_visibility.position[0],
+            position_visibility.position[1],
+            position_visibility.position[2],
+        ));
+        if point.is_finite() {
+            *min = min.min(point);
+            *max = max.max(point);
+            *any = true;
+        }
     }
 }
 
@@ -4023,7 +5371,7 @@ mod tests {
             0
         );
         assert_eq!(
-            world.resource::<AvailablePipelines>().models,
+            world.resource::<AvailablePipelines>().object_models,
             vec![SynthesisModel::Triposplat]
         );
     }
@@ -4058,7 +5406,13 @@ mod tests {
 
         let world = app.world_mut();
         let mut query = world.query::<&PipelineOptionButton>();
-        let models: Vec<_> = query.iter(world).map(|button| button.model).collect();
+        let models: Vec<_> = query
+            .iter(world)
+            .filter_map(|button| match button.choice {
+                CatalogPipelineChoice::Object(model) => Some(model),
+                CatalogPipelineChoice::Scene(_) => None,
+            })
+            .collect();
         assert_eq!(
             models,
             vec![
@@ -4072,15 +5426,20 @@ mod tests {
     #[test]
     fn unavailable_launch_models_are_not_selectable() {
         let available = AvailablePipelines {
-            models: vec![SynthesisModel::Triposplat],
+            object_models: vec![SynthesisModel::Triposplat],
+            scene_pipelines: vec![ScenePipelineKind::Explicit],
         };
         assert!(pipeline_available(
             Some(&available),
-            SynthesisModel::Triposplat
+            CatalogPipelineChoice::Object(SynthesisModel::Triposplat)
         ));
         assert!(!pipeline_available(
             Some(&available),
-            SynthesisModel::Triposg
+            CatalogPipelineChoice::Object(SynthesisModel::Triposg)
+        ));
+        assert!(pipeline_available(
+            Some(&available),
+            CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit)
         ));
     }
 
@@ -4089,8 +5448,14 @@ mod tests {
     fn triposplat_pipeline_is_supported_on_native_wgpu() {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
-        assert!(pipeline_supported(Some(&args), SynthesisModel::Triposplat));
-        assert!(pipeline_supported(Some(&args), SynthesisModel::Trellis));
+        assert!(pipeline_supported(
+            Some(&args),
+            CatalogPipelineChoice::Object(SynthesisModel::Triposplat)
+        ));
+        assert!(pipeline_supported(
+            Some(&args),
+            CatalogPipelineChoice::Object(SynthesisModel::Trellis)
+        ));
     }
 
     #[test]
@@ -4545,26 +5910,30 @@ mod tests {
 
     #[test]
     fn pipeline_setting_gate_tracks_active_pipeline() {
+        let mut catalog = CatalogState::default();
         let mut args = AppArgs::default();
         args.synthesis_models = vec![SynthesisModel::Triposg, SynthesisModel::Triposplat];
         assert_eq!(
             active_settings_pipeline(Some(&args)),
             Some(SynthesisModel::Triposg)
         );
-        assert!(pipeline_settings_enabled(Some(&args)));
+        assert!(pipeline_settings_enabled(&catalog, Some(&args)));
 
         args.synthesis_models = vec![SynthesisModel::Triposplat, SynthesisModel::Triposg];
         assert_eq!(
             active_settings_pipeline(Some(&args)),
             Some(SynthesisModel::Triposplat)
         );
-        assert!(pipeline_settings_enabled(Some(&args)));
+        assert!(pipeline_settings_enabled(&catalog, Some(&args)));
 
         args.synthesis_models = vec![SynthesisModel::Trellis];
         assert_eq!(
             active_settings_pipeline(Some(&args)),
             Some(SynthesisModel::Trellis)
         );
-        assert!(pipeline_settings_enabled(Some(&args)));
+        assert!(pipeline_settings_enabled(&catalog, Some(&args)));
+
+        catalog.set_active_mode(CatalogMode::Scene);
+        assert!(pipeline_settings_enabled(&catalog, Some(&args)));
     }
 }
