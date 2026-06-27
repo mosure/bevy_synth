@@ -61,6 +61,7 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         quality_profile: args.quality_profile,
         allow_catalog_reuse: args.allow_catalog_reuse,
         lift_assets: args.lift_assets,
+        synthesis_models: args.synthesis_models,
         target_faces: args.target_faces,
         batch_size: args.batch_size.filter(|value| *value > 0),
         batch_vram_mb: args.batch_vram_mb,

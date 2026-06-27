@@ -514,6 +514,10 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub lift_assets: bool,
 
+    /// Image-to-3D asset model list for scene object lifting, ordered by preference.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub synthesis_models: Option<Vec<SynthesisModel>>,
+
     /// TRELLIS target face count. Use 0 to disable decimation.
     #[arg(long)]
     pub target_faces: Option<usize>,

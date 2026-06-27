@@ -146,6 +146,225 @@ pub struct CachedSceneMetrics {
     pub feedback_iteration: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub category_breakdown: Vec<CachedSceneCategoryMetric>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CachedSceneCategoryMetric {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_count: Option<usize>,
+}
+
+impl CachedSceneMetrics {
+    pub fn from_scene_build_response(response: &serde_json::Value) -> Self {
+        let summary = response
+            .get("e2e_summary")
+            .unwrap_or(&serde_json::Value::Null);
+        Self {
+            ok: summary.get("ok").and_then(serde_json::Value::as_bool),
+            elapsed_ms: summary.get("elapsed_ms").and_then(scene_metric_u64),
+            object_count: summary
+                .get("selected_count")
+                .or_else(|| response.pointer("/manifest/objects"))
+                .and_then(scene_metric_len_or_u64),
+            asset_count: summary
+                .get("asset_count")
+                .or_else(|| response.pointer("/asset_outputs/items"))
+                .and_then(scene_metric_len_or_u64),
+            placement_count: summary
+                .get("placement_count")
+                .or_else(|| response.pointer("/grounded_layout/placements"))
+                .and_then(scene_metric_len_or_u64),
+            feedback_accepted: summary
+                .pointer("/feedback/accepted")
+                .and_then(serde_json::Value::as_bool),
+            feedback_iteration: summary
+                .pointer("/feedback/accepted_iteration")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
+            failed_stage: summary
+                .get("failed_stage")
+                .or_else(|| response.get("failed_stage"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            category_breakdown: scene_category_breakdown_from_response(response),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SceneCategoryAccumulator {
+    object_count: usize,
+    detection_count: usize,
+    asset_count: usize,
+    placement_count: usize,
+}
+
+fn scene_category_breakdown_from_response(
+    response: &serde_json::Value,
+) -> Vec<CachedSceneCategoryMetric> {
+    let mut categories = std::collections::BTreeMap::<String, SceneCategoryAccumulator>::new();
+
+    if let Some(objects) = response
+        .pointer("/manifest/objects")
+        .and_then(|v| v.as_array())
+    {
+        for object in objects {
+            let label = object
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| object.get("id").and_then(serde_json::Value::as_str));
+            let Some(label) = label.and_then(scene_category_label) else {
+                continue;
+            };
+            let count = object
+                .get("instance_count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(1)
+                .max(1);
+            categories.entry(label).or_default().object_count += count;
+        }
+    }
+
+    for pointer in [
+        "/pre_generation_grounding_evidence/detections",
+        "/grounding_evidence/detections",
+    ] {
+        let Some(detections) = response.pointer(pointer).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if detections.is_empty() {
+            continue;
+        }
+        for detection in detections {
+            let label = detection
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    detection
+                        .get("source_query")
+                        .and_then(serde_json::Value::as_str)
+                });
+            let Some(label) = label.and_then(scene_category_label) else {
+                continue;
+            };
+            categories.entry(label).or_default().detection_count += 1;
+        }
+        break;
+    }
+
+    if let Some(items) = response
+        .pointer("/asset_outputs/items")
+        .and_then(|v| v.as_array())
+    {
+        for item in items {
+            let label = item
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    item.get("catalog_entry")
+                        .and_then(|entry| entry.get("label"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .or_else(|| item.get("id").and_then(serde_json::Value::as_str));
+            let Some(label) = label.and_then(scene_category_label) else {
+                continue;
+            };
+            categories.entry(label).or_default().asset_count += 1;
+        }
+    }
+
+    if let Some(placements) = response
+        .pointer("/grounded_layout/placements")
+        .and_then(|v| v.as_array())
+    {
+        for placement in placements {
+            let label = placement
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    placement
+                        .get("object_id")
+                        .and_then(serde_json::Value::as_str)
+                });
+            let Some(label) = label.and_then(scene_category_label) else {
+                continue;
+            };
+            categories.entry(label).or_default().placement_count += 1;
+        }
+    }
+
+    categories
+        .into_iter()
+        .map(|(label, counts)| CachedSceneCategoryMetric {
+            label,
+            object_count: nonzero_usize(counts.object_count),
+            detection_count: nonzero_usize(counts.detection_count),
+            asset_count: nonzero_usize(counts.asset_count),
+            placement_count: nonzero_usize(counts.placement_count),
+        })
+        .collect()
+}
+
+fn scene_metric_u64(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value.round() as u64)
+    })
+}
+
+fn scene_metric_len_or_u64(value: &serde_json::Value) -> Option<usize> {
+    value
+        .as_array()
+        .map(Vec::len)
+        .or_else(|| scene_metric_u64(value).and_then(|value| usize::try_from(value).ok()))
+}
+
+fn nonzero_usize(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
+}
+
+fn scene_category_label(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    for keyword in [
+        "chair",
+        "table",
+        "sofa",
+        "couch",
+        "plant",
+        "desk",
+        "bench",
+        "stool",
+        "rug",
+        "lamp",
+        "cabinet",
+        "shelf",
+        "whiteboard",
+        "monitor",
+    ] {
+        if lower.contains(keyword) {
+            return Some(if keyword == "couch" { "sofa" } else { keyword }.to_string());
+        }
+    }
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .find(|part| !part.is_empty() && *part != "group")
+        .map(str::to_string)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1852,6 +2071,7 @@ mod tests {
             feedback_accepted: Some(true),
             feedback_iteration: Some(2),
             failed_stage: None,
+            category_breakdown: Vec::new(),
         };
 
         let metadata = cache
@@ -2012,6 +2232,74 @@ mod tests {
         assert!(parsed.bin.is_some());
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[test]
+    fn scene_build_metrics_extract_category_breakdown() {
+        let response = serde_json::json!({
+            "e2e_summary": {
+                "ok": true,
+                "elapsed_ms": 1234.0,
+                "asset_count": 2,
+                "placement_count": 4,
+                "feedback": {
+                    "accepted": true,
+                    "accepted_iteration": 3
+                }
+            },
+            "manifest": {
+                "objects": [
+                    { "id": "chair_group", "label": "mesh conference chair", "instance_count": 3 },
+                    { "id": "table", "label": "white meeting table", "instance_count": 1 }
+                ]
+            },
+            "grounding_evidence": {
+                "detections": [
+                    { "label": "chair", "bbox": [0.0, 0.0, 0.1, 0.1], "source_query": "chair" },
+                    { "label": "chair", "bbox": [0.1, 0.0, 0.2, 0.1], "source_query": "chair" },
+                    { "label": "meeting table", "bbox": [0.2, 0.0, 0.5, 0.2], "source_query": "table" }
+                ]
+            },
+            "asset_outputs": {
+                "items": [
+                    { "id": "chair_asset", "label": "conference chair" },
+                    { "id": "table_asset", "label": "meeting table" }
+                ]
+            },
+            "grounded_layout": {
+                "placements": [
+                    { "object_id": "chair_group", "label": "conference chair" },
+                    { "object_id": "chair_group", "label": "conference chair" },
+                    { "object_id": "chair_group", "label": "conference chair" },
+                    { "object_id": "table", "label": "meeting table" }
+                ]
+            }
+        });
+
+        let metrics = CachedSceneMetrics::from_scene_build_response(&response);
+
+        assert_eq!(metrics.ok, Some(true));
+        assert_eq!(metrics.elapsed_ms, Some(1234));
+        assert_eq!(metrics.object_count, Some(2));
+        assert_eq!(metrics.asset_count, Some(2));
+        assert_eq!(metrics.placement_count, Some(4));
+        assert_eq!(metrics.feedback_accepted, Some(true));
+        let chair = metrics
+            .category_breakdown
+            .iter()
+            .find(|category| category.label == "chair")
+            .expect("chair category");
+        assert_eq!(chair.object_count, Some(3));
+        assert_eq!(chair.detection_count, Some(2));
+        assert_eq!(chair.asset_count, Some(1));
+        assert_eq!(chair.placement_count, Some(3));
+        let table = metrics
+            .category_breakdown
+            .iter()
+            .find(|category| category.label == "table")
+            .expect("table category");
+        assert_eq!(table.object_count, Some(1));
+        assert_eq!(table.detection_count, Some(1));
     }
 
     #[test]

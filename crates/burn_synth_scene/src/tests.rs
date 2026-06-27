@@ -247,6 +247,158 @@ fn grounding_evidence_overrides_manifest_bbox_and_contact() {
 }
 
 #[test]
+fn object_image_requests_use_grounded_manifest_bbox_for_crop() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("scene.png");
+    image::RgbImage::from_pixel(100, 100, image::Rgb([32, 32, 32]))
+        .save(&source_path)
+        .unwrap();
+    let manifest = SceneObjectManifest {
+        source_scene_path: source_path.display().to_string(),
+        scene_calibration: None,
+        objects: vec![SceneObjectSpec {
+            id: "table".to_string(),
+            label: "white table".to_string(),
+            aliases: vec!["table".to_string()],
+            bbox: [0.0, 0.0, 1.0, 1.0],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: None,
+            instance_count: 1,
+            object_prompt: "white table".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: None,
+        }],
+    };
+    let mut evidence = manifest_grounding_evidence(&manifest);
+    evidence.objects[0].detection.as_mut().unwrap().bbox = [0.45, 0.35, 0.55, 0.60];
+    evidence.objects[0].contact_pixel = Some([0.50, 0.60]);
+    let grounded_manifest = manifest_with_grounding_evidence(&manifest, &evidence);
+    let pipeline = ScenePipeline::new(
+        SceneBuildConfig {
+            source_scene_path: source_path.clone(),
+            object_reference_image_path: source_path,
+            output_dir: dir.path().join("run"),
+            candidate_count: 1,
+            quality_profile: SceneQualityProfile::Draft,
+            reasoning_model: "test-reasoning".to_string(),
+            image_model: "test-image".to_string(),
+            allow_catalog_reuse: false,
+        },
+        RetryImageProvider::new(Vec::new()),
+    );
+
+    let requests = pipeline
+        .prepare_object_image_requests(&grounded_manifest)
+        .expect("prepare grounded object image requests");
+
+    assert_eq!(requests[0].object.bbox, [0.45, 0.35, 0.55, 0.60]);
+    let crop = image::open(&requests[0].source_crop_path).expect("grounded crop should exist");
+    assert_eq!((crop.width(), crop.height()), (15, 31));
+}
+
+#[test]
+fn object_image_requests_use_grounded_single_instance_bbox_for_reuse_group_crop() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("scene.png");
+    image::RgbImage::from_pixel(100, 100, image::Rgb([32, 32, 32]))
+        .save(&source_path)
+        .unwrap();
+    let manifest = SceneObjectManifest {
+        source_scene_path: source_path.display().to_string(),
+        scene_calibration: None,
+        objects: vec![SceneObjectSpec {
+            id: "chair_group".to_string(),
+            label: "reusable chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.0, 0.0, 1.0, 1.0],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 2,
+            object_prompt: "one chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: None,
+        }],
+    };
+    let evidence = SceneGroundingEvidence {
+        source_image_path: source_path.display().to_string(),
+        depth: None,
+        segmentation: None,
+        detections: Vec::new(),
+        camera: EstimatedCamera::default(),
+        floor: EstimatedFloorPlane::default(),
+        objects: vec![
+            ObjectGroundingEvidence {
+                object_id: "chair_group".to_string(),
+                instance_id: Some("chair_left".to_string()),
+                reuse_group: Some("chair".to_string()),
+                detection: Some(Detection {
+                    label: "chair".to_string(),
+                    bbox: [0.10, 0.20, 0.22, 0.55],
+                    point: Some([0.16, 0.55]),
+                    confidence: Some(0.9),
+                    source_query: "chair".to_string(),
+                }),
+                mask: None,
+                asset_id: None,
+                contact_pixel: Some([0.16, 0.55]),
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: vec!["locate_anything".to_string()],
+            },
+            ObjectGroundingEvidence {
+                object_id: "chair_group".to_string(),
+                instance_id: Some("chair_right".to_string()),
+                reuse_group: Some("chair".to_string()),
+                detection: Some(Detection {
+                    label: "chair".to_string(),
+                    bbox: [0.62, 0.24, 0.86, 0.78],
+                    point: Some([0.74, 0.78]),
+                    confidence: Some(0.92),
+                    source_query: "chair".to_string(),
+                }),
+                mask: None,
+                asset_id: None,
+                contact_pixel: Some([0.74, 0.78]),
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: vec!["locate_anything".to_string()],
+            },
+        ],
+    };
+    let grounded_manifest = manifest_with_grounding_evidence(&manifest, &evidence);
+    let pipeline = ScenePipeline::new(
+        SceneBuildConfig {
+            source_scene_path: source_path.clone(),
+            object_reference_image_path: source_path,
+            output_dir: dir.path().join("run"),
+            candidate_count: 1,
+            quality_profile: SceneQualityProfile::Draft,
+            reasoning_model: "test-reasoning".to_string(),
+            image_model: "test-image".to_string(),
+            allow_catalog_reuse: false,
+        },
+        RetryImageProvider::new(Vec::new()),
+    );
+
+    let requests = pipeline
+        .prepare_object_image_requests(&grounded_manifest)
+        .expect("prepare grounded repeated-object image requests");
+
+    assert_eq!(requests[0].object.bbox, [0.62, 0.24, 0.86, 0.78]);
+    let crop =
+        image::open(&requests[0].source_crop_path).expect("single-instance crop should exist");
+    assert_eq!((crop.width(), crop.height()), (30, 66));
+}
+
+#[test]
 fn grounding_evidence_prefers_mask_bbox_when_available() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.png".to_string(),

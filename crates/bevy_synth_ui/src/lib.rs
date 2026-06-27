@@ -42,7 +42,7 @@ use bevy_synth_runtime::args::{
     TRIPOSPLAT_GAUSSIAN_STEP, TRIPOSPLAT_MAX_NUM_GAUSSIANS, TRIPOSPLAT_MIN_NUM_GAUSSIANS,
     TrellisQuality, TripoSplatProfile,
 };
-use bevy_synth_runtime::cache::CachedSceneMetrics;
+use bevy_synth_runtime::cache::{CachedSceneCategoryMetric, CachedSceneMetrics};
 use bevy_synth_runtime::state::{InferenceQueue, InferenceRequest, UiStatus};
 
 const PANEL_WIDTH: f32 = 336.0;
@@ -231,6 +231,7 @@ impl CatalogPipelineChoice {
 #[derive(Clone, Debug, Resource)]
 pub struct ScenePipelineUiSettings {
     pub pipeline: ScenePipelineKind,
+    pub image_to_3d_model: SynthesisModel,
     pub quality_profile: SceneQualityProfileSetting,
     pub candidate_count: usize,
     pub feedback_iterations: usize,
@@ -400,6 +401,7 @@ impl Default for ScenePipelineUiSettings {
     fn default() -> Self {
         Self {
             pipeline: ScenePipelineKind::Explicit,
+            image_to_3d_model: SynthesisModel::Trellis,
             quality_profile: SceneQualityProfileSetting::Balanced,
             candidate_count: 2,
             feedback_iterations: 8,
@@ -595,8 +597,10 @@ impl Plugin for BurnSynthUiPlugin {
                 Update,
                 (
                     handle_source_image_modal_close_button,
+                    handle_source_image_modal_tab_button,
                     handle_source_image_modal_escape,
                     sync_source_image_modal,
+                    sync_source_image_modal_tab_visuals,
                     (sync_catalog_previews, rebuild_catalog_list).chain(),
                     update_button_visuals,
                     sync_processing_panel,
@@ -1220,6 +1224,16 @@ struct CatalogSourceImageModalRoot;
 struct CatalogSourceImageCloseButton;
 
 #[derive(Component)]
+struct CatalogSourceImageTabButton {
+    tab: CatalogSourceImageTab,
+}
+
+#[derive(Component)]
+struct CatalogSourceImageTabPanel {
+    tab: CatalogSourceImageTab,
+}
+
+#[derive(Component)]
 struct SettingsModalRoot;
 
 #[derive(Component)]
@@ -1386,6 +1400,9 @@ struct SceneToggleValueLabel {
 struct SceneQualityValueLabel;
 
 #[derive(Component)]
+struct SceneImageTo3dModelValueLabel;
+
+#[derive(Component)]
 struct ViewerAabbModeButton {
     mode: ViewerAabbOverlayMode,
 }
@@ -1486,6 +1503,23 @@ struct CatalogSourceImageModalState {
     entry_id: Option<u32>,
     rendered_entry_id: Option<u32>,
     entity: Option<Entity>,
+    tab: CatalogSourceImageTab,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CatalogSourceImageTab {
+    #[default]
+    Image,
+    Stats,
+}
+
+impl CatalogSourceImageTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Stats => "stats",
+        }
+    }
 }
 
 #[derive(Resource, Clone, Debug, PartialEq, Eq)]
@@ -1611,22 +1645,10 @@ fn trellis_supported_for_backend(backend: BackendKind) -> bool {
 fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
     let mut list_entity = Entity::PLACEHOLDER;
     let pipeline_models = available_pipeline_models(args.as_deref());
-    let selected_object_pipeline = args
-        .as_deref()
-        .and_then(|args| args.synthesis_models.first().copied())
-        .or_else(|| pipeline_models.first().copied())
-        .unwrap_or(SynthesisModel::Triposg);
     commands.insert_resource(AvailablePipelines {
-        object_models: pipeline_models.clone(),
+        object_models: pipeline_models,
         scene_pipelines: vec![ScenePipelineKind::Explicit],
     });
-    let selected_pipeline = CatalogPipelineChoice::Object(selected_object_pipeline);
-    let pipeline_choices: Vec<_> = pipeline_models
-        .iter()
-        .copied()
-        .map(CatalogPipelineChoice::Object)
-        .collect();
-    let multiple_pipelines = pipeline_choices.len() > 1;
 
     let root = commands
         .spawn((
@@ -1691,78 +1713,6 @@ fn setup_ui(mut commands: Commands, args: Option<Res<AppArgs>>) {
                             TextColor(BUTTON_TEXT),
                             ButtonLabel,
                         ));
-                    });
-
-                    left.spawn((
-                        PipelineDropdownHost,
-                        Node {
-                            position_type: PositionType::Relative,
-                            width: Val::Px(PIPELINE_SELECTOR_WIDTH),
-                            height: Val::Px(PIPELINE_SELECTOR_HEIGHT),
-                            overflow: Overflow::visible(),
-                            ..default()
-                        },
-                    ))
-                    .with_children(|selector| {
-                        if multiple_pipelines {
-                            selector
-                                .spawn((
-                                    Button,
-                                    PipelineSelectorButton,
-                                    ControlButton(ControlButtonKind::Secondary),
-                                    Node {
-                                        width: Val::Px(PIPELINE_SELECTOR_WIDTH),
-                                        height: Val::Px(PIPELINE_SELECTOR_HEIGHT),
-                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-                                        border: UiRect::all(Val::Px(1.0)),
-                                        column_gap: Val::Px(8.0),
-                                        align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::SpaceBetween,
-                                        ..default()
-                                    },
-                                    BorderColor::all(BUTTON_ACTIVE_BORDER),
-                                    BackgroundColor(BUTTON_ACTIVE_BG),
-                                ))
-                                .with_children(|button| {
-                                    button.spawn((
-                                        Text::new(pipeline_selector_value_text(
-                                            selected_pipeline,
-                                            pipeline_choices.len(),
-                                        )),
-                                        TextFont::from_font_size(12.0),
-                                        TextColor(BUTTON_TEXT),
-                                        PipelineValueLabel,
-                                        ButtonLabel,
-                                    ));
-                                });
-                        } else {
-                            selector
-                                .spawn((
-                                    Node {
-                                        width: Val::Px(PIPELINE_SELECTOR_WIDTH),
-                                        height: Val::Px(PIPELINE_SELECTOR_HEIGHT),
-                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
-                                        border: UiRect::all(Val::Px(1.0)),
-                                        column_gap: Val::Px(8.0),
-                                        align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::FlexStart,
-                                        ..default()
-                                    },
-                                    BorderColor::all(BUTTON_ACTIVE_BORDER),
-                                    BackgroundColor(BUTTON_ACTIVE_BG),
-                                ))
-                                .with_children(|selector| {
-                                    selector.spawn((
-                                        Text::new(pipeline_selector_value_text(
-                                            selected_pipeline,
-                                            pipeline_choices.len(),
-                                        )),
-                                        TextFont::from_font_size(12.0),
-                                        TextColor(BUTTON_TEXT),
-                                        PipelineValueLabel,
-                                    ));
-                                });
-                        }
                     });
                 });
 
@@ -2934,6 +2884,7 @@ fn handle_catalog_entry_interaction(
                 drag.active = None;
                 drag.ghost_entry = None;
                 source_modal.entry_id = Some(entry.id);
+                source_modal.tab = CatalogSourceImageTab::Image;
                 return;
             } else {
                 selection.selected = Some(entry.id);
@@ -2980,6 +2931,17 @@ fn handle_source_image_modal_close_button(
     }
 }
 
+fn handle_source_image_modal_tab_button(
+    mut modal: ResMut<CatalogSourceImageModalState>,
+    mut interactions: Query<(&Interaction, &CatalogSourceImageTabButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            modal.tab = button.tab;
+        }
+    }
+}
+
 fn handle_source_image_modal_escape(
     keys: Res<ButtonInput<KeyCode>>,
     mut modal: ResMut<CatalogSourceImageModalState>,
@@ -3021,9 +2983,60 @@ fn sync_source_image_modal(
             commands.entity(entity).despawn();
             modal.entity = None;
             modal.rendered_entry_id = None;
+            modal.tab = CatalogSourceImageTab::Image;
         }
         (Some(_), Some(_)) => {}
         _ => {}
+    }
+}
+
+fn sync_source_image_modal_tab_visuals(
+    modal: Res<CatalogSourceImageModalState>,
+    mut panels: Query<(&CatalogSourceImageTabPanel, &mut Node, &mut Visibility)>,
+    mut tabs: Query<
+        (
+            &CatalogSourceImageTabButton,
+            &Interaction,
+            &Children,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
+        With<Button>,
+    >,
+    mut labels: Query<&mut TextColor, With<ButtonLabel>>,
+) {
+    for (panel, mut node, mut visibility) in panels.iter_mut() {
+        let (next_visibility, next_display) = if panel.tab == modal.tab {
+            (Visibility::Visible, Display::Flex)
+        } else {
+            (Visibility::Hidden, Display::None)
+        };
+        if *visibility != next_visibility {
+            *visibility = next_visibility;
+        }
+        if node.display != next_display {
+            node.display = next_display;
+        }
+    }
+
+    for (button, interaction, children, mut background, mut border) in tabs.iter_mut() {
+        let active = button.tab == modal.tab;
+        let (bg, br) = if active {
+            (BUTTON_ACTIVE_BG, BUTTON_ACTIVE_BORDER)
+        } else {
+            match *interaction {
+                Interaction::Pressed => (BUTTON_BG_PRESSED, BUTTON_BORDER_PRESSED),
+                Interaction::Hovered => (BUTTON_BG_HOVER, BUTTON_BORDER_HOVER),
+                Interaction::None => (BUTTON_BG, BUTTON_BORDER),
+            }
+        };
+        *background = BackgroundColor(bg);
+        *border = BorderColor::all(br);
+        for child in children.iter() {
+            if let Ok(mut label) = labels.get_mut(child) {
+                label.0 = if active { Color::WHITE } else { BUTTON_TEXT };
+            }
+        }
     }
 }
 
@@ -3681,6 +3694,7 @@ fn handle_pipeline_selector_button(
 
 fn handle_pipeline_option_button(
     mut args: Option<ResMut<AppArgs>>,
+    catalog: Res<CatalogState>,
     mut scene_settings: ResMut<ScenePipelineUiSettings>,
     available: Option<Res<AvailablePipelines>>,
     mut dropdown: ResMut<PipelineDropdownState>,
@@ -3696,6 +3710,27 @@ fn handle_pipeline_option_button(
             info!(
                 "synthesis pipeline {} is not enabled for this app launch",
                 button.choice.label()
+            );
+            continue;
+        }
+        if matches!(catalog.active_mode(), CatalogMode::Scene)
+            && let CatalogPipelineChoice::Object(model) = button.choice
+        {
+            if !pipeline_supported(args.as_deref(), button.choice) {
+                if let Some(args) = args.as_deref() {
+                    info!(
+                        "scene image-to-3d model {} is unavailable for backend {:?}",
+                        pipeline_label(model),
+                        args.backend
+                    );
+                }
+                continue;
+            }
+            scene_settings.image_to_3d_model = model;
+            dropdown.open = false;
+            info!(
+                "selected scene image-to-3d model: {}",
+                pipeline_label(model)
             );
             continue;
         }
@@ -4254,6 +4289,7 @@ fn sync_settings_modal(
     catalog: Res<CatalogState>,
     args: Option<Res<AppArgs>>,
     scene_settings: Res<ScenePipelineUiSettings>,
+    available: Option<Res<AvailablePipelines>>,
     mut modal: ResMut<SettingsModalState>,
     mut ui: ResMut<CatalogUiState>,
     children: Query<&Children>,
@@ -4274,7 +4310,12 @@ fn sync_settings_modal(
     match (modal.open, modal.entity) {
         (true, None) => {
             if let Some(pipeline) = active_pipeline {
-                modal.entity = Some(spawn_settings_modal(&mut commands, pipeline, modal.tab));
+                modal.entity = Some(spawn_settings_modal(
+                    &mut commands,
+                    pipeline,
+                    modal.tab,
+                    available.as_deref(),
+                ));
                 modal.pipeline = Some(pipeline);
             }
         }
@@ -4346,6 +4387,7 @@ fn update_settings_labels(
             Without<TripoSgSettingValueLabel>,
             Without<TrellisQualityValueLabel>,
             Without<TrellisSettingValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut value_labels: Query<
@@ -4355,6 +4397,7 @@ fn update_settings_labels(
             Without<TripoSgSettingValueLabel>,
             Without<TrellisQualityValueLabel>,
             Without<TrellisSettingValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut triposg_value_labels: Query<
@@ -4364,6 +4407,7 @@ fn update_settings_labels(
             Without<TripoSplatSettingValueLabel>,
             Without<TrellisQualityValueLabel>,
             Without<TrellisSettingValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut trellis_quality_labels: Query<
@@ -4374,6 +4418,7 @@ fn update_settings_labels(
             Without<TripoSplatSettingValueLabel>,
             Without<TripoSgSettingValueLabel>,
             Without<TrellisSettingValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut trellis_value_labels: Query<
@@ -4383,6 +4428,7 @@ fn update_settings_labels(
             Without<TripoSplatSettingValueLabel>,
             Without<TripoSgSettingValueLabel>,
             Without<TrellisQualityValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut scene_quality_labels: Query<
@@ -4396,6 +4442,7 @@ fn update_settings_labels(
             Without<TrellisSettingValueLabel>,
             Without<SceneSettingValueLabel>,
             Without<SceneToggleValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut scene_value_labels: Query<
@@ -4408,6 +4455,7 @@ fn update_settings_labels(
             Without<TrellisSettingValueLabel>,
             Without<SceneQualityValueLabel>,
             Without<SceneToggleValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
         ),
     >,
     mut scene_toggle_labels: Query<
@@ -4420,6 +4468,21 @@ fn update_settings_labels(
             Without<TrellisSettingValueLabel>,
             Without<SceneQualityValueLabel>,
             Without<SceneSettingValueLabel>,
+            Without<SceneImageTo3dModelValueLabel>,
+        ),
+    >,
+    mut scene_image_model_labels: Query<
+        &mut Text,
+        (
+            With<SceneImageTo3dModelValueLabel>,
+            Without<TripoSplatProfileValueLabel>,
+            Without<TripoSplatSettingValueLabel>,
+            Without<TripoSgSettingValueLabel>,
+            Without<TrellisQualityValueLabel>,
+            Without<TrellisSettingValueLabel>,
+            Without<SceneQualityValueLabel>,
+            Without<SceneSettingValueLabel>,
+            Without<SceneToggleValueLabel>,
         ),
     >,
 ) {
@@ -4469,6 +4532,12 @@ fn update_settings_labels(
     }
     for (value, mut label) in scene_toggle_labels.iter_mut() {
         let next = scene_toggle_value_text(&scene_settings, value.setting);
+        if label.0 != next {
+            label.0 = next;
+        }
+    }
+    for mut label in scene_image_model_labels.iter_mut() {
+        let next = pipeline_label(scene_settings.image_to_3d_model).to_string();
         if label.0 != next {
             label.0 = next;
         }
@@ -4615,110 +4684,309 @@ fn spawn_source_image_modal(commands: &mut Commands, entry: &CatalogEntry) -> En
                     TextColor(Color::srgb(0.7, 0.74, 0.82)),
                 ));
 
-                if let Some(image) = entry.source_image.as_ref() {
-                    panel.spawn((
-                        Node {
-                            width: Val::Px(512.0),
-                            height: Val::Px(512.0),
-                            border: UiRect::all(Val::Px(1.0)),
-                            align_self: AlignSelf::Center,
-                            ..default()
-                        },
-                        BorderColor::all(Color::srgb(0.24, 0.27, 0.34)),
-                        ImageNode::new(image.clone()),
-                    ));
-                } else {
-                    panel
-                        .spawn((
-                            Node {
-                                width: Val::Px(512.0),
-                                height: Val::Px(220.0),
-                                border: UiRect::all(Val::Px(1.0)),
-                                align_self: AlignSelf::Center,
-                                justify_content: JustifyContent::Center,
-                                align_items: AlignItems::Center,
-                                ..default()
-                            },
-                            BorderColor::all(Color::srgb(0.24, 0.27, 0.34)),
-                            BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
-                        ))
-                        .with_children(|missing| {
-                            missing.spawn((
-                                Text::new("source image unavailable"),
-                                TextFont::from_font_size(13.0),
-                                TextColor(Color::srgb(0.8, 0.84, 0.9)),
-                            ));
-                        });
-                }
-
                 if entry.kind == CatalogEntryKind::Scene {
-                    spawn_scene_details_stats(panel, entry);
+                    spawn_source_image_tabs(panel);
+                    spawn_source_image_tab_panel(
+                        panel,
+                        CatalogSourceImageTab::Image,
+                        true,
+                        |panel| spawn_source_image_body(panel, entry),
+                    );
+                    spawn_source_image_tab_panel(
+                        panel,
+                        CatalogSourceImageTab::Stats,
+                        false,
+                        |panel| spawn_scene_details_stats(panel, entry),
+                    );
+                } else {
+                    spawn_source_image_body(panel, entry);
                 }
             });
         })
         .id()
 }
 
+fn spawn_source_image_tabs(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|row| {
+            for tab in [CatalogSourceImageTab::Image, CatalogSourceImageTab::Stats] {
+                row.spawn((
+                    Button,
+                    CatalogSourceImageTabButton { tab },
+                    Node {
+                        height: Val::Px(28.0),
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BUTTON_BORDER),
+                    BackgroundColor(BUTTON_BG),
+                ))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new(tab.label()),
+                        TextFont::from_font_size(12.0),
+                        TextColor(BUTTON_TEXT),
+                        ButtonLabel,
+                    ));
+                });
+            }
+        });
+}
+
+fn spawn_source_image_tab_panel(
+    parent: &mut ChildSpawnerCommands,
+    tab: CatalogSourceImageTab,
+    visible: bool,
+    spawn_content: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    parent
+        .spawn((
+            CatalogSourceImageTabPanel { tab },
+            Node {
+                display: if visible {
+                    Display::Flex
+                } else {
+                    Display::None
+                },
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(10.0),
+                ..default()
+            },
+            if visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            },
+        ))
+        .with_children(spawn_content);
+}
+
+fn spawn_source_image_body(parent: &mut ChildSpawnerCommands, entry: &CatalogEntry) {
+    if let Some(image) = entry.source_image.as_ref() {
+        parent.spawn((
+            Node {
+                width: Val::Px(512.0),
+                height: Val::Px(512.0),
+                border: UiRect::all(Val::Px(1.0)),
+                align_self: AlignSelf::Center,
+                ..default()
+            },
+            BorderColor::all(Color::srgb(0.24, 0.27, 0.34)),
+            ImageNode::new(image.clone()),
+        ));
+    } else {
+        parent
+            .spawn((
+                Node {
+                    width: Val::Px(512.0),
+                    height: Val::Px(220.0),
+                    border: UiRect::all(Val::Px(1.0)),
+                    align_self: AlignSelf::Center,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.24, 0.27, 0.34)),
+                BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+            ))
+            .with_children(|missing| {
+                missing.spawn((
+                    Text::new("source image unavailable"),
+                    TextFont::from_font_size(13.0),
+                    TextColor(Color::srgb(0.8, 0.84, 0.9)),
+                ));
+            });
+    }
+}
+
 fn spawn_scene_details_stats(parent: &mut ChildSpawnerCommands, entry: &CatalogEntry) {
     parent
         .spawn(Node {
             flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(5.0),
-            padding: UiRect::top(Val::Px(4.0)),
+            row_gap: Val::Px(12.0),
             ..default()
         })
         .with_children(|stats| {
             let pipeline = entry.scene_pipeline.as_deref().unwrap_or("scene");
-            stats.spawn((
-                Text::new(format!("pipeline: {pipeline}")),
-                TextFont::from_font_size(12.0),
-                TextColor(Color::srgb(0.78, 0.82, 0.9)),
-            ));
+            spawn_scene_stats_section(stats, "summary", |section| {
+                spawn_scene_stat_row(section, "pipeline", pipeline.to_string());
+                if let Some(scene_key) = entry.scene_key.as_deref() {
+                    spawn_scene_stat_row(section, "scene key", ellipsize_text(scene_key, 52));
+                }
+                if let Some(metrics) = entry.scene_metrics.as_ref() {
+                    spawn_scene_stat_row(section, "status", scene_metric_status(metrics));
+                    if let Some(elapsed_ms) = metrics.elapsed_ms {
+                        spawn_scene_stat_row(
+                            section,
+                            "runtime",
+                            format!("{:.1}s", elapsed_ms as f32 / 1000.0),
+                        );
+                    }
+                    spawn_scene_stat_row(section, "counts", scene_metric_counts_text(metrics));
+                } else {
+                    spawn_scene_stat_row(section, "status", "no cached metrics".to_string());
+                }
+            });
+
             if let Some(metrics) = entry.scene_metrics.as_ref() {
-                let mut parts = Vec::new();
-                if let Some(elapsed_ms) = metrics.elapsed_ms {
-                    parts.push(format!("runtime {:.1}s", elapsed_ms as f32 / 1000.0));
-                }
-                if let Some(count) = metrics.object_count {
-                    parts.push(format!("{count} objects"));
-                }
-                if let Some(count) = metrics.asset_count {
-                    parts.push(format!("{count} assets"));
-                }
-                if let Some(count) = metrics.placement_count {
-                    parts.push(format!("{count} placements"));
-                }
-                if let Some(accepted) = metrics.feedback_accepted {
-                    parts.push(format!(
-                        "feedback {}",
-                        if accepted { "accepted" } else { "failed" }
-                    ));
-                }
-                if let Some(stage) = metrics.failed_stage.as_deref() {
-                    parts.push(format!("failed stage {stage}"));
-                }
-                if !parts.is_empty() {
-                    stats.spawn((
-                        Text::new(parts.join(" | ")),
-                        TextFont::from_font_size(12.0),
-                        TextColor(Color::srgb(0.7, 0.74, 0.82)),
-                    ));
-                }
+                spawn_scene_stats_section(stats, "categories", |section| {
+                    if metrics.category_breakdown.is_empty() {
+                        spawn_scene_stat_row(section, "breakdown", "unavailable".to_string());
+                    } else {
+                        for category in metrics.category_breakdown.iter().take(10) {
+                            spawn_scene_category_row(section, category);
+                        }
+                    }
+                });
+
+                spawn_scene_stats_section(stats, "quality", |section| {
+                    spawn_scene_stat_row(section, "feedback", scene_feedback_text(metrics));
+                    if let Some(stage) = metrics.failed_stage.as_deref() {
+                        spawn_scene_stat_row(section, "failed stage", stage.to_string());
+                    }
+                });
             }
-            if let Some(dir) = entry.scene_artifact_dir.as_deref() {
-                stats.spawn((
-                    Text::new(format!("artifacts: {}", ellipsize_text(dir, 76))),
-                    TextFont::from_font_size(12.0),
-                    TextColor(Color::srgb(0.62, 0.67, 0.76)),
-                ));
-            }
+
+            spawn_scene_stats_section(stats, "artifacts", |section| {
+                if let Some(path) = entry.source_image_path.as_deref() {
+                    spawn_scene_stat_row(section, "source", ellipsize_text(path, 58));
+                }
+                if let Some(dir) = entry.scene_artifact_dir.as_deref() {
+                    spawn_scene_stat_row(section, "run dir", ellipsize_text(dir, 58));
+                }
+            });
         });
+}
+
+fn spawn_scene_stats_section(
+    parent: &mut ChildSpawnerCommands,
+    title: &'static str,
+    spawn_content: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(5.0),
+            ..default()
+        })
+        .with_children(|section| {
+            section.spawn((
+                Text::new(title),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgb(0.58, 0.64, 0.74)),
+            ));
+            spawn_content(section);
+        });
+}
+
+fn spawn_scene_stat_row(parent: &mut ChildSpawnerCommands, label: &'static str, value: String) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::FlexStart,
+            column_gap: Val::Px(16.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb(0.66, 0.7, 0.78)),
+            ));
+            row.spawn((
+                Text::new(value),
+                TextFont::from_font_size(12.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+        });
+}
+
+fn spawn_scene_category_row(
+    parent: &mut ChildSpawnerCommands,
+    category: &CachedSceneCategoryMetric,
+) {
+    spawn_scene_stat_row(
+        parent,
+        "category",
+        format!(
+            "{} | {}",
+            category.label,
+            scene_category_counts_text(category)
+        ),
+    );
+}
+
+fn scene_metric_status(metrics: &CachedSceneMetrics) -> String {
+    match metrics.ok {
+        Some(true) => "ok".to_string(),
+        Some(false) => "needs review".to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn scene_metric_counts_text(metrics: &CachedSceneMetrics) -> String {
+    let mut parts = Vec::new();
+    if let Some(count) = metrics.object_count {
+        parts.push(format!("{count} objects"));
+    }
+    if let Some(count) = metrics.asset_count {
+        parts.push(format!("{count} assets"));
+    }
+    if let Some(count) = metrics.placement_count {
+        parts.push(format!("{count} placements"));
+    }
+    if parts.is_empty() {
+        "unavailable".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn scene_feedback_text(metrics: &CachedSceneMetrics) -> String {
+    match (metrics.feedback_accepted, metrics.feedback_iteration) {
+        (Some(true), Some(iteration)) => format!("accepted at iter {iteration}"),
+        (Some(true), None) => "accepted".to_string(),
+        (Some(false), Some(iteration)) => format!("failed after iter {iteration}"),
+        (Some(false), None) => "failed".to_string(),
+        (None, _) => "not recorded".to_string(),
+    }
+}
+
+fn scene_category_counts_text(category: &CachedSceneCategoryMetric) -> String {
+    let mut parts = Vec::new();
+    if let Some(count) = category.object_count {
+        parts.push(format!("{count} planned"));
+    }
+    if let Some(count) = category.detection_count {
+        parts.push(format!("{count} detected"));
+    }
+    if let Some(count) = category.asset_count {
+        parts.push(format!("{count} assets"));
+    }
+    if let Some(count) = category.placement_count {
+        parts.push(format!("{count} placed"));
+    }
+    if parts.is_empty() {
+        "no counts".to_string()
+    } else {
+        parts.join(" / ")
+    }
 }
 
 fn spawn_settings_modal(
     commands: &mut Commands,
     pipeline: CatalogPipelineChoice,
     active_tab: SettingsModalTab,
+    available: Option<&AvailablePipelines>,
 ) -> Entity {
     commands
         .spawn((
@@ -4792,15 +5060,19 @@ fn spawn_settings_modal(
                     active_tab == SettingsModalTab::Pipeline,
                     |panel| match pipeline {
                         CatalogPipelineChoice::Object(SynthesisModel::Triposg) => {
+                            spawn_object_pipeline_selector(panel, available, pipeline);
                             spawn_triposg_settings(panel)
                         }
                         CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => {
+                            spawn_object_pipeline_selector(panel, available, pipeline);
                             spawn_triposplat_settings(panel)
                         }
                         CatalogPipelineChoice::Object(SynthesisModel::Trellis) => {
+                            spawn_object_pipeline_selector(panel, available, pipeline);
                             spawn_trellis_settings(panel)
                         }
                         CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => {
+                            spawn_scene_pipeline_selector(panel, available);
                             spawn_scene_settings(panel)
                         }
                     },
@@ -4909,6 +5181,143 @@ fn spawn_settings_tab_panel(
             },
         ))
         .with_children(spawn_content);
+}
+
+fn spawn_object_pipeline_selector(
+    panel: &mut ChildSpawnerCommands,
+    available: Option<&AvailablePipelines>,
+    selected: CatalogPipelineChoice,
+) {
+    let choices = active_pipeline_choices(CatalogMode::Object, available);
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(7.0),
+            ..default()
+        })
+        .with_children(|column| {
+            column
+                .spawn(Node {
+                    width: Val::Percent(100.0),
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("pipeline"),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.82, 0.86, 0.94)),
+                    ));
+                    row.spawn((
+                        Text::new(selected.label()),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                        PipelineValueLabel,
+                    ));
+                });
+            spawn_pipeline_button_row(column, choices);
+        });
+}
+
+fn spawn_scene_pipeline_selector(
+    panel: &mut ChildSpawnerCommands,
+    available: Option<&AvailablePipelines>,
+) {
+    panel
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new("scene pipeline"),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.82, 0.86, 0.94)),
+            ));
+            row.spawn((
+                Text::new(ScenePipelineKind::Explicit.label()),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.92, 0.94, 0.98)),
+            ));
+        });
+
+    let choices = active_pipeline_choices(CatalogMode::Object, available);
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(7.0),
+            ..default()
+        })
+        .with_children(|column| {
+            column
+                .spawn(Node {
+                    width: Val::Percent(100.0),
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("image to 3d"),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.82, 0.86, 0.94)),
+                    ));
+                    row.spawn((
+                        Text::new(pipeline_label(SynthesisModel::Trellis)),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgb(0.92, 0.94, 0.98)),
+                        SceneImageTo3dModelValueLabel,
+                    ));
+                });
+            spawn_pipeline_button_row(column, choices);
+        });
+}
+
+fn spawn_pipeline_button_row(
+    parent: &mut ChildSpawnerCommands,
+    choices: Vec<CatalogPipelineChoice>,
+) {
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(6.0),
+            align_items: AlignItems::Center,
+            flex_wrap: FlexWrap::Wrap,
+            ..default()
+        })
+        .with_children(|row| {
+            for choice in choices {
+                row.spawn((
+                    Button,
+                    PipelineOptionButton { choice },
+                    ControlButton(ControlButtonKind::Secondary),
+                    Node {
+                        height: Val::Px(28.0),
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BUTTON_BORDER),
+                    BackgroundColor(BUTTON_BG),
+                ))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new(choice.label()),
+                        TextFont::from_font_size(12.0),
+                        TextColor(BUTTON_TEXT),
+                        ButtonLabel,
+                    ));
+                });
+            }
+        });
 }
 
 fn spawn_triposplat_settings(panel: &mut ChildSpawnerCommands) {
@@ -5966,7 +6375,8 @@ fn adjust_scene_setting(
         }
     }
     info!(
-        "explicit scene settings: quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={}",
+        "explicit scene settings: image_to_3d={} quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={}",
+        pipeline_label(settings.image_to_3d_model),
         settings.quality_profile.label(),
         settings.candidate_count,
         settings.feedback_iterations,
@@ -6549,7 +6959,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_selector_collapses_to_single_launch_model() {
+    fn pipeline_selector_is_owned_by_settings_modal_for_single_launch_model() {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
         args.synthesis_models = vec![SynthesisModel::Triposplat];
@@ -6559,12 +6969,6 @@ mod tests {
         app.update();
 
         let world = app.world_mut();
-        let mut value_query = world.query_filtered::<&Text, With<PipelineValueLabel>>();
-        let values: Vec<_> = value_query
-            .iter(world)
-            .map(|label| label.0.clone())
-            .collect();
-        assert_eq!(values, vec!["TripoSplat only".to_string()]);
         assert_eq!(
             world.query::<&PipelineSelectorButton>().iter(world).count(),
             0
@@ -6577,10 +6981,117 @@ mod tests {
             world.resource::<AvailablePipelines>().object_models,
             vec![SynthesisModel::Triposplat]
         );
+
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        app.update();
+
+        let world = app.world_mut();
+        assert_eq!(
+            world.query::<&PipelineOptionButton>().iter(world).count(),
+            1
+        );
     }
 
     #[test]
-    fn pipeline_dropdown_spawns_enabled_model_options() {
+    fn scene_source_modal_has_image_and_stats_tabs() {
+        let mut app = ui_test_app(None);
+        let metrics = CachedSceneMetrics {
+            ok: Some(true),
+            elapsed_ms: Some(42_000),
+            object_count: Some(3),
+            asset_count: Some(2),
+            placement_count: Some(3),
+            feedback_accepted: Some(true),
+            feedback_iteration: Some(2),
+            failed_stage: None,
+            category_breakdown: vec![
+                CachedSceneCategoryMetric {
+                    label: "chair".to_string(),
+                    object_count: Some(2),
+                    detection_count: Some(4),
+                    asset_count: Some(1),
+                    placement_count: Some(2),
+                },
+                CachedSceneCategoryMetric {
+                    label: "table".to_string(),
+                    object_count: Some(1),
+                    detection_count: Some(1),
+                    asset_count: Some(1),
+                    placement_count: Some(1),
+                },
+            ],
+        };
+        app.world_mut()
+            .resource_mut::<CatalogState>()
+            .add_ready_scene(
+                42,
+                "meeting scene".to_string(),
+                Some("scene_cache_key".to_string()),
+                Vec::new(),
+                Some("/tmp/source_scene.jpg".to_string()),
+                None,
+                Some("explicit".to_string()),
+                Some(metrics),
+                Some("tmp/runs/demo_scene".to_string()),
+            );
+        app.world_mut()
+            .resource_mut::<CatalogSourceImageModalState>()
+            .entry_id = Some(42);
+
+        app.update();
+        app.update();
+
+        {
+            let world = app.world_mut();
+            assert_eq!(
+                world
+                    .query::<&CatalogSourceImageTabButton>()
+                    .iter(world)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                world
+                    .query::<&CatalogSourceImageTabPanel>()
+                    .iter(world)
+                    .count(),
+                2
+            );
+            let mut texts = world.query::<&Text>();
+            let values: Vec<_> = texts.iter(world).map(|text| text.0.clone()).collect();
+            assert!(values.iter().any(|text| text == "categories"));
+            assert!(values.iter().any(|text| {
+                text.contains("chair | 2 planned / 4 detected / 1 assets / 2 placed")
+            }));
+        }
+
+        let stats_button = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &CatalogSourceImageTabButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.tab == CatalogSourceImageTab::Stats).then_some(entity)
+                })
+                .expect("stats tab button")
+        };
+        app.world_mut()
+            .entity_mut(stats_button)
+            .insert(Interaction::Pressed);
+        app.update();
+
+        let world = app.world_mut();
+        let mut panels = world.query::<(&CatalogSourceImageTabPanel, &Node)>();
+        let visible_tabs: Vec<_> = panels
+            .iter(world)
+            .filter_map(|(panel, node)| (node.display != Display::None).then_some(panel.tab))
+            .collect();
+        assert_eq!(visible_tabs, vec![CatalogSourceImageTab::Stats]);
+    }
+
+    #[test]
+    fn settings_modal_spawns_enabled_model_options() {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
         args.synthesis_models = vec![SynthesisModel::Triposg];
@@ -6592,19 +7103,8 @@ mod tests {
         let mut app = ui_test_app(Some(args));
 
         app.update();
-        {
-            let world = app.world_mut();
-            assert_eq!(
-                world.query::<&PipelineSelectorButton>().iter(world).count(),
-                1
-            );
-            assert_eq!(
-                world.query::<&PipelineOptionButton>().iter(world).count(),
-                0
-            );
-        }
-
-        app.world_mut().resource_mut::<PipelineDropdownState>().open = true;
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
         app.update();
 
         let world = app.world_mut();
@@ -6623,6 +7123,56 @@ mod tests {
                 SynthesisModel::Trellis,
                 SynthesisModel::Triposplat
             ]
+        );
+    }
+
+    #[test]
+    fn scene_settings_model_buttons_update_scene_asset_model() {
+        let mut args = AppArgs::default();
+        args.backend = BackendKind::Wgpu;
+        args.synthesis_models = vec![SynthesisModel::Triposg];
+        args.available_synthesis_models = vec![
+            SynthesisModel::Triposg,
+            SynthesisModel::Trellis,
+            SynthesisModel::Triposplat,
+        ];
+        let mut app = ui_test_app(Some(args));
+        app.world_mut()
+            .resource_mut::<CatalogState>()
+            .set_active_mode(CatalogMode::Scene);
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        app.update();
+
+        let triposplat_button = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &PipelineOptionButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    matches!(
+                        button.choice,
+                        CatalogPipelineChoice::Object(SynthesisModel::Triposplat)
+                    )
+                    .then_some(entity)
+                })
+                .expect("TripoSplat scene image-to-3d button")
+        };
+        app.world_mut()
+            .entity_mut(triposplat_button)
+            .insert(Interaction::Pressed);
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<ScenePipelineUiSettings>()
+                .image_to_3d_model,
+            SynthesisModel::Triposplat
+        );
+        assert_eq!(
+            app.world().resource::<AppArgs>().synthesis_models,
+            vec![SynthesisModel::Triposg],
+            "scene image-to-3d selection must not mutate the object catalog pipeline"
         );
     }
 

@@ -92,7 +92,7 @@ use burn_synth_mcp::{
     SceneBuildFromImageArgs, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
     ScenePoseFitMode, SceneSegmentationProvider, ServerArgs, ServerConfig,
-    run_scene_build_from_image_with_progress,
+    SynthesisModel as McpSynthesisModel, run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
@@ -3542,6 +3542,15 @@ fn unix_seconds_run_id() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn mcp_synthesis_model(model: SynthesisModel) -> McpSynthesisModel {
+    match model {
+        SynthesisModel::Triposg => McpSynthesisModel::Triposg,
+        SynthesisModel::Trellis => McpSynthesisModel::Trellis,
+        SynthesisModel::Triposplat => McpSynthesisModel::Triposplat,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run_scene_build_for_ui(
     source_scene_path: PathBuf,
     source_image_bytes: Option<Vec<u8>>,
@@ -3562,6 +3571,8 @@ fn run_scene_build_for_ui(
     server_args.trellis_bridge_script = app_args.trellis_bridge_script.clone();
     server_args.trellis_pbr = settings.pbr_enabled;
     server_args.trellis_pbr_texture_size = Some(settings.pbr_texture_size);
+    let scene_synthesis_models = vec![mcp_synthesis_model(settings.image_to_3d_model)];
+    server_args.synthesis_models = scene_synthesis_models.clone();
     server_args.batch_size = app_args.max_batch_size;
     server_args.quality = match settings.quality_profile {
         SceneQualityProfileSetting::Fast => McpQualityPreset::Fast,
@@ -3592,6 +3603,7 @@ fn run_scene_build_for_ui(
             }),
             allow_catalog_reuse: settings.allow_catalog_reuse,
             lift_assets: true,
+            synthesis_models: Some(scene_synthesis_models),
             target_faces: Some(settings.target_faces),
             batch_size: Some(app_args.max_batch_size.max(1)),
             batch_vram_mb: None,
@@ -5179,32 +5191,7 @@ fn scene_camera_from_response_command(command: &serde_json::Value) -> Option<Cac
 
 #[cfg(not(target_arch = "wasm32"))]
 fn scene_metrics_from_build_response(response: &serde_json::Value) -> CachedSceneMetrics {
-    let summary = response
-        .get("e2e_summary")
-        .unwrap_or(&serde_json::Value::Null);
-    CachedSceneMetrics {
-        ok: summary.get("ok").and_then(serde_json::Value::as_bool),
-        elapsed_ms: summary.get("elapsed_ms").and_then(json_u64_or_f64_to_u64),
-        object_count: summary
-            .get("selected_count")
-            .or_else(|| response.pointer("/manifest/objects"))
-            .and_then(json_len_or_u64),
-        asset_count: summary.get("asset_count").and_then(json_len_or_u64),
-        placement_count: summary.get("placement_count").and_then(json_len_or_u64),
-        feedback_accepted: summary
-            .pointer("/feedback/accepted")
-            .and_then(serde_json::Value::as_bool),
-        feedback_iteration: summary
-            .pointer("/feedback/accepted_iteration")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok()),
-        failed_stage: summary
-            .get("failed_stage")
-            .or_else(|| response.get("failed_stage"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    }
+    CachedSceneMetrics::from_scene_build_response(response)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5249,23 +5236,6 @@ fn json_f32(value: Option<&serde_json::Value>) -> Option<f32> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn json_u64_or_f64_to_u64(value: &serde_json::Value) -> Option<u64> {
-    value.as_u64().or_else(|| {
-        value
-            .as_f64()
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .map(|value| value.round() as u64)
-    })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn json_len_or_u64(value: &serde_json::Value) -> Option<usize> {
-    value
-        .as_array()
-        .map(Vec::len)
-        .or_else(|| value.as_u64().and_then(|value| usize::try_from(value).ok()))
-}
-
 fn enforce_scene_interaction_lock(
     interaction_lock: Res<SceneInteractionLock>,
     read_only: Res<SceneReadOnlyMode>,

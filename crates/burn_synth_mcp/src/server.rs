@@ -1052,7 +1052,8 @@ impl McpServer {
                 "execution": "network"
             }),
         );
-        let manifest = pipeline.plan_objects().map_err(|err| err.to_string())?;
+        let manifest_initial = pipeline.plan_objects().map_err(|err| err.to_string())?;
+        let mut manifest = manifest_initial.clone();
         record_stage(&mut stage_report, "plan_objects", stage_started);
         progress.emit_with_items(
             "plan_objects",
@@ -1061,9 +1062,104 @@ impl McpServer {
             format!("planned {} object(s)", manifest.objects.len()),
             None,
             Some(manifest.objects.len()),
-            Some(output_dir.join("manifest.json")),
+            Some(output_dir.join("manifest_initial.json")),
             json!({ "objects": manifest.objects.len() }),
         );
+        if args.write_artifacts {
+            write_json_file(&output_dir.join("manifest_initial.json"), &manifest_initial)
+                .map_err(|err| err.to_string())?;
+            write_json_file(&output_dir.join("manifest.json"), &manifest)
+                .map_err(|err| err.to_string())?;
+        }
+        let mut pre_generation_grounding_source = "not_requested".to_string();
+        let mut pre_generation_grounding_evidence: Option<SceneGroundingEvidence> = None;
+        let mut pre_generation_locate_anything_report: Option<LocateAnythingGroundingReport> = None;
+        if args.composition_mode == SceneCompositionMode::CvGrounded {
+            if args.locator == SceneLocatorProvider::LocateAnything {
+                let stage_started = Instant::now();
+                let backend = args
+                    .locate_anything_backend
+                    .unwrap_or(self.config.locate_anything_backend);
+                progress.emit(
+                    "pre_generation_locate_anything_grounding",
+                    SceneBuildProgressPhase::Started,
+                    SceneBuildExecutionKind::Gpu,
+                    "running LocateAnything before object crops",
+                    json!({
+                        "locator": args.locator,
+                        "backend": backend,
+                        "purpose": "refine object-image source bboxes before gpt-image-2",
+                    }),
+                );
+                let (evidence, report) = self.locate_anything_grounding_evidence_with_report(
+                    backend,
+                    &manifest,
+                    &args.source_scene_path,
+                    &output_dir,
+                )?;
+                let grounded_manifest = manifest_with_grounding_evidence(&manifest, &evidence);
+                manifest = grounded_manifest;
+                pre_generation_grounding_source =
+                    "locate_anything_burn_native_pre_generation".to_string();
+                pre_generation_grounding_evidence = Some(evidence);
+                pre_generation_locate_anything_report = Some(report);
+                record_stage(
+                    &mut stage_report,
+                    "pre_generation_locate_anything_grounding",
+                    stage_started,
+                );
+                progress.emit_with_items(
+                    "pre_generation_locate_anything_grounding",
+                    SceneBuildProgressPhase::Completed,
+                    SceneBuildExecutionKind::Gpu,
+                    "LocateAnything crop grounding complete",
+                    None,
+                    pre_generation_grounding_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.objects.len()),
+                    pre_generation_locate_anything_report
+                        .as_ref()
+                        .map(|report| report.overlay_path.clone()),
+                    json!({
+                        "grounding_source": pre_generation_grounding_source,
+                        "detections": pre_generation_grounding_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.detections.len())
+                            .unwrap_or_default(),
+                        "objects": pre_generation_grounding_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.objects.len())
+                            .unwrap_or_default(),
+                        "manifest_artifact": output_dir.join("manifest_grounded_for_crops.json"),
+                    }),
+                );
+                if args.write_artifacts {
+                    write_json_file(&output_dir.join("manifest.json"), &manifest)
+                        .map_err(|err| err.to_string())?;
+                    write_json_file(
+                        &output_dir.join("manifest_grounded_for_crops.json"),
+                        &manifest,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    if let Some(evidence) = pre_generation_grounding_evidence.as_ref() {
+                        write_json_file(
+                            &output_dir.join("pre_generation_grounding_evidence.json"),
+                            evidence,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                    if let Some(report) = pre_generation_locate_anything_report.as_ref() {
+                        write_json_file(
+                            &output_dir.join("pre_generation_locate_anything_report.json"),
+                            report,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                }
+            } else {
+                pre_generation_grounding_source = "manifest_fallback".to_string();
+            }
+        }
         let stage_started = Instant::now();
         progress.emit(
             "prepare_object_image_requests",
@@ -1090,6 +1186,10 @@ impl McpServer {
             Some(output_dir.join("object_image_requests.json")),
             json!({ "requests": requests.len() }),
         );
+        if args.write_artifacts {
+            write_json_file(&output_dir.join("object_image_requests.json"), &requests)
+                .map_err(|err| err.to_string())?;
+        }
         let stage_started = Instant::now();
         progress.emit_with_items(
             "generate_object_candidates",
@@ -1148,7 +1248,12 @@ impl McpServer {
             "tool": "scene_build_from_image",
             "preparation": preparation,
             "provider_metadata": pipeline.provider_metadata(),
-            "manifest": manifest,
+            "manifest_initial": manifest_initial.clone(),
+            "manifest_grounded_for_crops": manifest.clone(),
+            "pre_generation_grounding_source": pre_generation_grounding_source.clone(),
+            "pre_generation_grounding_evidence": pre_generation_grounding_evidence.clone(),
+            "pre_generation_locate_anything_report": pre_generation_locate_anything_report.clone(),
+            "manifest": manifest.clone(),
             "object_image_requests": requests,
             "candidate_generation": candidate_report.clone(),
             "candidates": candidate_report.candidates.clone(),
@@ -1182,20 +1287,37 @@ impl McpServer {
             return Ok(response);
         }
 
+        let selected_synthesis_models = args
+            .synthesis_models
+            .clone()
+            .map(sanitize_synthesis_models)
+            .unwrap_or_else(|| vec![SynthesisModel::Trellis]);
+        let selected_asset_model = selected_synthesis_models
+            .first()
+            .copied()
+            .unwrap_or(SynthesisModel::Trellis);
+        response["asset_synthesis_models"] = json!(
+            selected_synthesis_models
+                .iter()
+                .map(|model| model.as_str())
+                .collect::<Vec<_>>()
+        );
         let stage_started = Instant::now();
         progress.emit_with_items(
             "images_to_assets",
             SceneBuildProgressPhase::Started,
             SceneBuildExecutionKind::Gpu,
             format!(
-                "lifting {} selected image(s) into TRELLIS assets",
-                selected_values.len()
+                "lifting {} selected image(s) into {} assets",
+                selected_values.len(),
+                selected_asset_model.as_str()
             ),
             None,
             Some(selected_values.len()),
             None,
             json!({
                 "selected": selected_values.len(),
+                "synthesis_models": selected_synthesis_models.iter().map(|model| model.as_str()).collect::<Vec<_>>(),
                 "backend": self.config.default_backend,
                 "batch_size": args.batch_size,
                 "batch_vram_mb": args.batch_vram_mb,
@@ -1230,7 +1352,8 @@ impl McpServer {
                     SceneBuildProgressPhase::Progress,
                     SceneBuildExecutionKind::Gpu,
                     format!(
-                        "running TRELLIS batch for {} image(s)",
+                        "running {} batch for {} image(s)",
+                        selected_asset_model.as_str(),
                         input_image_paths.len()
                     ),
                     Some(cached_asset_outputs.len()),
@@ -1238,6 +1361,7 @@ impl McpServer {
                     Some(output_dir.join("assets")),
                     json!({
                         "attempt_index": asset_attempts.len(),
+                        "synthesis_models": selected_synthesis_models.iter().map(|model| model.as_str()).collect::<Vec<_>>(),
                         "inputs": input_image_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
                     }),
                 );
@@ -1245,9 +1369,9 @@ impl McpServer {
                     input_image_paths,
                     output_dir: Some(output_dir.join("assets")),
                     output_paths: None,
-                    output_format: Some(AssetOutputFormat::Glb),
+                    output_format: Some(AssetOutputFormat::Auto),
                     rmbg_model: Some(ForegroundModel::Rmbg2),
-                    synthesis_models: Some(vec![SynthesisModel::Trellis]),
+                    synthesis_models: Some(selected_synthesis_models.clone()),
                     backend: Some(self.config.default_backend),
                     target_faces: args
                         .target_faces
@@ -1270,7 +1394,10 @@ impl McpServer {
                     "images_to_assets",
                     SceneBuildProgressPhase::Progress,
                     SceneBuildExecutionKind::Gpu,
-                    "TRELLIS batch complete; checking mesh quality",
+                    format!(
+                        "{} batch complete; checking asset quality",
+                        selected_asset_model.as_str()
+                    ),
                     Some(cached_asset_outputs.len()),
                     Some(selected_values.len()),
                     Some(output_dir.join("assets")),
@@ -1377,8 +1504,10 @@ impl McpServer {
                 "locator": args.locator,
             }),
         );
-        let (grounding_source, mut grounding_evidence) =
-            if args.composition_mode == SceneCompositionMode::CvGrounded {
+        let (grounding_source, mut grounding_evidence): (String, SceneGroundingEvidence) =
+            if let Some(evidence) = pre_generation_grounding_evidence.clone() {
+                (pre_generation_grounding_source.clone(), evidence)
+            } else if args.composition_mode == SceneCompositionMode::CvGrounded {
                 if args.locator == SceneLocatorProvider::LocateAnything {
                     let backend = args
                         .locate_anything_backend
@@ -1390,12 +1519,18 @@ impl McpServer {
                         &output_dir,
                     )?;
                     let LocateAnythingBackend::BurnNative = backend;
-                    ("locate_anything_burn_native", evidence)
+                    ("locate_anything_burn_native".to_string(), evidence)
                 } else {
-                    ("manifest_fallback", manifest_grounding_evidence(&manifest))
+                    (
+                        "manifest_fallback".to_string(),
+                        manifest_grounding_evidence(&manifest),
+                    )
                 }
             } else {
-                ("disabled", manifest_grounding_evidence(&manifest))
+                (
+                    "disabled".to_string(),
+                    manifest_grounding_evidence(&manifest),
+                )
             };
         record_stage(&mut stage_report, "load_grounding_evidence", stage_started);
         let segmentation_provider = args
@@ -1800,7 +1935,7 @@ impl McpServer {
         attach_scene_grounding_contracts(
             &mut response,
             &args,
-            grounding_source,
+            &grounding_source,
             &grounding_evidence,
             segmentation_provider,
         )?;
@@ -1830,7 +1965,7 @@ impl McpServer {
             attach_scene_grounding_contracts(
                 &mut response,
                 &args,
-                grounding_source,
+                &grounding_source,
                 &grounding_evidence,
                 segmentation_provider,
             )?;

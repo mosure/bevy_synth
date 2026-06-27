@@ -1570,34 +1570,7 @@ fn scene_catalog_label(output_dir: &Path, source_scene_path: &Path) -> String {
 }
 
 fn scene_cache_metrics_from_response(response: &Value) -> CachedSceneMetrics {
-    let summary = response.get("e2e_summary").unwrap_or(&Value::Null);
-    CachedSceneMetrics {
-        ok: summary.get("ok").and_then(Value::as_bool),
-        elapsed_ms: summary.get("elapsed_ms").and_then(Value::as_u64),
-        object_count: response
-            .pointer("/manifest/objects")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        asset_count: summary
-            .get("asset_count")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        placement_count: summary
-            .get("placement_count")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        feedback_accepted: summary
-            .pointer("/feedback/accepted")
-            .and_then(Value::as_bool),
-        feedback_iteration: summary
-            .pointer("/feedback/accepted_iteration")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        failed_stage: response
-            .get("failed_stage")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    }
+    CachedSceneMetrics::from_scene_build_response(response)
 }
 
 #[derive(Clone, Debug)]
@@ -1799,7 +1772,20 @@ pub(crate) fn write_scene_build_artifacts(
     })?;
     for (key, file_name) in [
         ("preparation", "preparation.json"),
+        ("manifest_initial", "manifest_initial.json"),
         ("manifest", "manifest.json"),
+        (
+            "manifest_grounded_for_crops",
+            "manifest_grounded_for_crops.json",
+        ),
+        (
+            "pre_generation_grounding_evidence",
+            "pre_generation_grounding_evidence.json",
+        ),
+        (
+            "pre_generation_locate_anything_report",
+            "pre_generation_locate_anything_report.json",
+        ),
         ("object_image_requests", "object_image_requests.json"),
         ("provider_metadata", "provider_metadata.json"),
         ("token_usage", "token_usage.json"),
@@ -1936,6 +1922,22 @@ impl McpServer {
         source_scene_path: &Path,
         output_dir: &Path,
     ) -> Result<SceneGroundingEvidence, String> {
+        self.locate_anything_grounding_evidence_with_report(
+            backend,
+            manifest,
+            source_scene_path,
+            output_dir,
+        )
+        .map(|(evidence, _report)| evidence)
+    }
+
+    pub(crate) fn locate_anything_grounding_evidence_with_report(
+        &mut self,
+        backend: LocateAnythingBackend,
+        manifest: &SceneObjectManifest,
+        source_scene_path: &Path,
+        output_dir: &Path,
+    ) -> Result<(SceneGroundingEvidence, LocateAnythingGroundingReport), String> {
         let LocateAnythingBackend::BurnNative = backend;
         self.locate_anything_burn_native_grounding_evidence(manifest, source_scene_path, output_dir)
     }
@@ -1945,7 +1947,7 @@ impl McpServer {
         manifest: &SceneObjectManifest,
         source_scene_path: &Path,
         output_dir: &Path,
-    ) -> Result<SceneGroundingEvidence, String> {
+    ) -> Result<(SceneGroundingEvidence, LocateAnythingGroundingReport), String> {
         let config = LocateAnythingGroundingConfig {
             model_root: self.config.locate_anything_model_root.clone(),
             in_token_limit: self.config.locate_anything_in_token_limit,
@@ -1958,7 +1960,6 @@ impl McpServer {
                 output_dir,
                 config,
             )
-            .map(|(evidence, _report)| evidence)
     }
 }
 

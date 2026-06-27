@@ -242,6 +242,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "quality_profile": { "type": "string", "enum": ["draft", "quality"] },
                     "allow_catalog_reuse": { "type": "boolean" },
                     "lift_assets": { "type": "boolean", "description": "When false, stop after object image generation." },
+                    "synthesis_models": { "type": "array", "items": { "type": "string", "enum": ["triposg", "trellis", "triposplat"] }, "description": "Optional image-to-3D asset model list override for the scene asset-lift stage. The first model is used for generated scene objects." },
                     "target_faces": { "type": "integer" },
                     "batch_size": { "type": "integer" },
                     "batch_vram_mb": { "type": "integer" },
@@ -773,6 +774,8 @@ pub struct SceneBuildFromImageArgs {
     pub allow_catalog_reuse: bool,
     #[serde(default = "default_scene_lift_assets")]
     pub lift_assets: bool,
+    #[serde(default)]
+    pub synthesis_models: Option<Vec<SynthesisModel>>,
     #[serde(default)]
     pub target_faces: Option<usize>,
     #[serde(default)]

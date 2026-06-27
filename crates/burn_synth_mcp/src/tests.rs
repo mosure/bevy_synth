@@ -1036,6 +1036,7 @@ fn scene_build_tool_schema_exposes_retry_and_artifact_controls() {
         "candidate_retry_attempts",
         "candidate_batch_size",
         "min_reconstruction_score",
+        "synthesis_models",
         "batch_size",
         "batch_vram_mb",
         "write_artifacts",
@@ -1065,9 +1066,33 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
     let _ = fs::remove_dir_all(&dir);
     let response = json!({
         "tool": "scene_build_from_image",
+        "manifest_initial": {
+            "source_scene_path": "/tmp/scene.jpg",
+            "objects": []
+        },
         "manifest": {
             "source_scene_path": "/tmp/scene.jpg",
             "objects": []
+        },
+        "manifest_grounded_for_crops": {
+            "source_scene_path": "/tmp/scene.jpg",
+            "objects": []
+        },
+        "pre_generation_grounding_evidence": {
+            "source_image_path": "/tmp/scene.jpg",
+            "detections": [],
+            "camera": {},
+            "floor": {},
+            "objects": []
+        },
+        "pre_generation_locate_anything_report": {
+            "artifact_dir": "/tmp/scene/locate_anything_burn_native",
+            "detections_path": "/tmp/scene/locate_anything_burn_native/detections.json",
+            "overlay_path": "/tmp/scene/locate_anything_burn_native/detections_overlay.png",
+            "metadata_path": "/tmp/scene/locate_anything_burn_native/metadata.json",
+            "elapsed_ms": 1.0,
+            "runtime_cache_hit": false,
+            "detection_count": 0
         },
         "candidates": [],
         "selected_candidates": [],
@@ -1170,6 +1195,13 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
     write_scene_build_artifacts(&dir, &response).unwrap();
 
     assert!(dir.join("manifest.json").exists());
+    assert!(dir.join("manifest_initial.json").exists());
+    assert!(dir.join("manifest_grounded_for_crops.json").exists());
+    assert!(dir.join("pre_generation_grounding_evidence.json").exists());
+    assert!(
+        dir.join("pre_generation_locate_anything_report.json")
+            .exists()
+    );
     assert!(dir.join("asset_outputs.json").exists());
     assert!(dir.join("stage_report.json").exists());
     assert!(dir.join("summary.json").exists());
@@ -3824,6 +3856,20 @@ fn scene_build_candidate_policy_defaults_to_guarded_sequential_retries() {
     assert_eq!(
         explicit.segmentation_quantization,
         Some(SceneSegmentationQuantization::Q8)
+    );
+}
+
+#[test]
+fn scene_build_args_accept_asset_synthesis_model_override() {
+    let args: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": "/tmp/scene.jpg",
+        "synthesis_models": ["triposplat", "trellis"]
+    }))
+    .expect("scene build args deserialize");
+
+    assert_eq!(
+        args.synthesis_models,
+        Some(vec![SynthesisModel::Triposplat, SynthesisModel::Trellis])
     );
 }
 

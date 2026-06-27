@@ -264,6 +264,7 @@ pub struct DepthProGroundingReport {
 pub struct LocateAnythingGroundingReport {
     pub artifact_dir: PathBuf,
     pub detections_path: PathBuf,
+    pub overlay_path: PathBuf,
     pub metadata_path: PathBuf,
     pub elapsed_ms: f64,
     pub runtime_cache_hit: bool,
@@ -557,6 +558,7 @@ impl SceneGroundingRuntime {
         let report = LocateAnythingGroundingReport {
             artifact_dir,
             detections_path,
+            overlay_path,
             metadata_path,
             elapsed_ms,
             runtime_cache_hit: cache_hit,
