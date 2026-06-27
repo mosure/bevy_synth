@@ -20,11 +20,14 @@ use crate::{
     SynthMeshTexture,
 };
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 const TRIPOSPLAT_SPLAT_CACHE_NAMESPACE: &str = "triposplat-v2";
+const SCENE_CACHE_NAMESPACE: &str = "scene-v1";
 const INDEX_FILE_NAME: &str = "index.json";
 #[cfg(not(target_arch = "wasm32"))]
 const MESH_DIR_NAME: &str = "meshes";
+#[cfg(not(target_arch = "wasm32"))]
+const SCENE_DIR_NAME: &str = "scenes";
 #[cfg(not(target_arch = "wasm32"))]
 const SOURCE_IMAGE_DIR_NAME: &str = "source_images";
 
@@ -125,11 +128,69 @@ pub struct CachedCameraState {
     pub vertical_fov_degrees: Option<f32>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CachedSceneMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_accepted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_iteration: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_stage: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CachedSceneMetadata {
+    pub scene_key: String,
+    pub label: String,
+    pub source_scene_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image_payload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image_mime: Option<String>,
+    pub scene_payload_id: String,
+    pub pipeline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<CachedSceneMetrics>,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CachedScenePayload {
+    #[serde(default)]
+    pub world_items: Vec<CachedWorldItem>,
+    #[serde(default)]
+    pub camera: Option<CachedCameraState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bsn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_bindings: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e_summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_summary: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CacheIndex {
     version: u32,
     #[serde(default)]
     meshes: Vec<CachedMeshMetadata>,
+    #[serde(default)]
+    scenes: Vec<CachedSceneMetadata>,
     #[serde(default)]
     world_items: Vec<CachedWorldItem>,
     #[serde(default)]
@@ -141,6 +202,7 @@ impl Default for CacheIndex {
         Self {
             version: CACHE_VERSION,
             meshes: Vec::new(),
+            scenes: Vec::new(),
             world_items: Vec::new(),
             camera: None,
         }
@@ -365,6 +427,10 @@ impl MeshCache {
         &self.index.meshes
     }
 
+    pub fn scene_entries(&self) -> &[CachedSceneMetadata] {
+        &self.index.scenes
+    }
+
     pub fn world_items(&self) -> &[CachedWorldItem] {
         &self.index.world_items
     }
@@ -430,6 +496,37 @@ impl MeshCache {
                 return Ok(Some(CachedSourceImage {
                     file_name: source_image_file_name(&metadata.source_image_path),
                     mime_type: source_image_mime(&metadata.source_image_path),
+                    bytes,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn load_scene_source_image(
+        &self,
+        metadata: &CachedSceneMetadata,
+    ) -> CacheResult<Option<CachedSourceImage>> {
+        if let Some(bytes) = self.read_scene_source_image_payload(metadata)? {
+            return Ok(Some(CachedSourceImage {
+                file_name: metadata
+                    .source_image_name
+                    .clone()
+                    .unwrap_or_else(|| source_image_file_name(&metadata.source_scene_path)),
+                mime_type: metadata.source_image_mime.clone(),
+                bytes,
+            }));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = Path::new(&metadata.source_scene_path);
+            if path.is_file() {
+                let bytes = fs::read(path).map_err(|err| CacheError::Io(err.to_string()))?;
+                return Ok(Some(CachedSourceImage {
+                    file_name: source_image_file_name(&metadata.source_scene_path),
+                    mime_type: source_image_mime(&metadata.source_scene_path),
                     bytes,
                 }));
             }
@@ -596,6 +693,103 @@ impl MeshCache {
         Ok(metadata)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_scene_snapshot(
+        &mut self,
+        source_scene_path: &Path,
+        source_image_bytes: Option<&[u8]>,
+        label: impl Into<String>,
+        pipeline: impl Into<String>,
+        payload: &CachedScenePayload,
+        artifact_dir: Option<String>,
+        metrics: Option<CachedSceneMetrics>,
+    ) -> CacheResult<CachedSceneMetadata> {
+        let source_scene_path = normalize_source_image_path(source_scene_path);
+        let label = label.into();
+        let pipeline = pipeline.into();
+        let scene_key = scene_cache_key(&source_scene_path, &label);
+
+        let payload_json = serde_json::to_string_pretty(payload)
+            .map_err(|err| CacheError::Serialization(err.to_string()))?;
+        self.write_scene_payload(&scene_key, &payload_json)?;
+        let scene_payload_id = self.scene_payload_id(&scene_key);
+        let source_image_payload =
+            self.write_source_image_payload(&scene_key, &source_scene_path, source_image_bytes)?;
+
+        let metadata = CachedSceneMetadata {
+            scene_key: scene_key.clone(),
+            label,
+            source_scene_path: source_scene_path.clone(),
+            source_image_payload_id: source_image_payload
+                .as_ref()
+                .map(|payload| payload.payload_id.clone()),
+            source_image_name: source_image_payload
+                .as_ref()
+                .map(|payload| payload.file_name.clone()),
+            source_image_mime: source_image_payload
+                .as_ref()
+                .and_then(|payload| payload.mime_type.clone()),
+            scene_payload_id,
+            pipeline,
+            artifact_dir,
+            metrics,
+            updated_at_unix_ms: now_unix_ms(),
+        };
+
+        if let Some(position) = self
+            .index
+            .scenes
+            .iter()
+            .position(|entry| entry.scene_key == scene_key)
+        {
+            self.index.scenes[position] = metadata.clone();
+        } else {
+            self.index.scenes.push(metadata.clone());
+        }
+        self.save_index()?;
+        Ok(metadata)
+    }
+
+    pub fn load_scene(&self, scene_key: &str) -> CacheResult<Option<CachedScenePayload>> {
+        let Some(payload) = self.read_scene_payload(scene_key)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&payload)
+            .map(Some)
+            .map_err(|err| CacheError::Serialization(err.to_string()))
+    }
+
+    pub fn rename_scene(&mut self, scene_key: &str, label: impl Into<String>) -> CacheResult<bool> {
+        let Some(entry) = self
+            .index
+            .scenes
+            .iter_mut()
+            .find(|entry| entry.scene_key == scene_key)
+        else {
+            return Ok(false);
+        };
+        entry.label = label.into();
+        entry.updated_at_unix_ms = now_unix_ms();
+        self.save_index()?;
+        Ok(true)
+    }
+
+    pub fn remove_scene_entry(&mut self, scene_key: &str) -> CacheResult<bool> {
+        let Some(position) = self
+            .index
+            .scenes
+            .iter()
+            .position(|entry| entry.scene_key == scene_key)
+        else {
+            return Ok(false);
+        };
+        self.index.scenes.remove(position);
+        self.remove_scene_payload(scene_key)?;
+        self.remove_source_image_payload(scene_key)?;
+        self.save_index()?;
+        Ok(true)
+    }
+
     pub fn remove_mesh_entry(&mut self, cache_key: &str) -> CacheResult<bool> {
         let Some(position) = self
             .index
@@ -720,6 +914,40 @@ impl MeshCache {
             .map_err(|err| CacheError::InvalidData(err.to_string()))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_scene_source_image_payload(
+        &self,
+        metadata: &CachedSceneMetadata,
+    ) -> CacheResult<Option<Vec<u8>>> {
+        let Some(payload_id) = metadata.source_image_payload_id.as_ref() else {
+            return Ok(None);
+        };
+        let path = Path::new(payload_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        fs::read(path)
+            .map(Some)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_scene_source_image_payload(
+        &self,
+        metadata: &CachedSceneMetadata,
+    ) -> CacheResult<Option<Vec<u8>>> {
+        let Some(payload_id) = metadata.source_image_payload_id.as_ref() else {
+            return Ok(None);
+        };
+        let Some(encoded) = web_storage_get(payload_id)? else {
+            return Ok(None);
+        };
+        BASE64_STANDARD
+            .decode(encoded)
+            .map(Some)
+            .map_err(|err| CacheError::InvalidData(err.to_string()))
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn read_glb_output(&self, cache_key: &str) -> CacheResult<Option<Vec<u8>>> {
         let Some(encoded) = web_storage_get(&self.glb_output_storage_key(cache_key))? else {
@@ -789,6 +1017,47 @@ impl MeshCache {
     #[cfg(target_arch = "wasm32")]
     fn remove_source_image_payload(&self, cache_key: &str) -> CacheResult<()> {
         web_storage_remove(&self.source_image_storage_key(cache_key))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_scene_payload(&self, scene_key: &str) -> CacheResult<Option<String>> {
+        let path = self.scene_payload_path(scene_key);
+        if !path.exists() {
+            return Ok(None);
+        }
+        fs::read_to_string(path)
+            .map(Some)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_scene_payload(&self, scene_key: &str) -> CacheResult<Option<String>> {
+        web_storage_get(&self.scene_payload_storage_key(scene_key))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_scene_payload(&self, scene_key: &str, payload: &str) -> CacheResult<()> {
+        fs::write(self.scene_payload_path(scene_key), payload)
+            .map_err(|err| CacheError::Io(err.to_string()))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write_scene_payload(&self, scene_key: &str, payload: &str) -> CacheResult<()> {
+        web_storage_set(&self.scene_payload_storage_key(scene_key), payload)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remove_scene_payload(&self, scene_key: &str) -> CacheResult<()> {
+        let path = self.scene_payload_path(scene_key);
+        if path.exists() {
+            fs::remove_file(path).map_err(|err| CacheError::Io(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn remove_scene_payload(&self, scene_key: &str) -> CacheResult<()> {
+        web_storage_remove(&self.scene_payload_storage_key(scene_key))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -887,6 +1156,30 @@ impl MeshCache {
         self.root
             .join(MESH_DIR_NAME)
             .join(format!("{cache_key}.glb"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn scene_payload_path(&self, scene_key: &str) -> PathBuf {
+        self.root
+            .join(SCENE_DIR_NAME)
+            .join(format!("{scene_key}.scene.json"))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn scene_payload_storage_key(&self, scene_key: &str) -> String {
+        format!("{}/scene/{scene_key}", self.prefix)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn scene_payload_id(&self, scene_key: &str) -> String {
+        self.scene_payload_path(scene_key)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn scene_payload_id(&self, scene_key: &str) -> String {
+        self.scene_payload_storage_key(scene_key)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1026,6 +1319,10 @@ fn cache_key_from_source_and_kind(source: &str, kind: CachedAssetKind) -> String
             cache_key_from_source(&format!("{source}#{TRIPOSPLAT_SPLAT_CACHE_NAMESPACE}"))
         }
     }
+}
+
+fn scene_cache_key(source: &str, label: &str) -> String {
+    cache_key_from_source(&format!("{source}#{SCENE_CACHE_NAMESPACE}#{label}"))
 }
 
 fn asset_label(source_image_path: &str, kind: CachedAssetKind) -> String {
@@ -1173,12 +1470,13 @@ fn migrate_legacy_native_cache_root() -> CacheResult<()> {
 
 #[cfg(target_arch = "wasm32")]
 fn default_web_cache_prefix() -> String {
-    "burn_synth/cache/v5".to_string()
+    "burn_synth/cache/v6".to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ensure_native_layout(root: &Path) -> CacheResult<()> {
     fs::create_dir_all(root.join(MESH_DIR_NAME)).map_err(|err| CacheError::Io(err.to_string()))?;
+    fs::create_dir_all(root.join(SCENE_DIR_NAME)).map_err(|err| CacheError::Io(err.to_string()))?;
     fs::create_dir_all(root.join(SOURCE_IMAGE_DIR_NAME))
         .map_err(|err| CacheError::Io(err.to_string()))
 }
@@ -1513,6 +1811,130 @@ mod tests {
 
         let cache = MeshCache::load_from_root(root.clone()).expect("reload cache");
         assert_eq!(cache.camera_state(), Some(&state));
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn scene_snapshot_round_trips_with_source_image_and_metrics() {
+        let root = temp_root("scene_snapshot");
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let source = PathBuf::from("C:/data/scenes/room.png");
+        let source_bytes = [137, 80, 78, 71, 13, 10, 26, 10];
+        let payload = CachedScenePayload {
+            world_items: vec![CachedWorldItem {
+                cache_key: "chair".to_string(),
+                translation: [1.0, 0.0, 2.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+            }],
+            camera: Some(CachedCameraState {
+                translation: [0.0, 2.0, 5.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                focus: [0.0, 0.0, 0.0],
+                yaw: 0.0,
+                pitch: -0.2,
+                radius: 5.0,
+                vertical_fov_degrees: Some(70.0),
+            }),
+            bsn: Some("synth_scene_v1 {}".to_string()),
+            asset_bindings: Some(serde_json::json!([])),
+            e2e_summary: Some(serde_json::json!({ "ok": true })),
+            response_summary: None,
+        };
+        let metrics = CachedSceneMetrics {
+            ok: Some(true),
+            elapsed_ms: Some(1234),
+            object_count: Some(1),
+            asset_count: Some(1),
+            placement_count: Some(1),
+            feedback_accepted: Some(true),
+            feedback_iteration: Some(2),
+            failed_stage: None,
+        };
+
+        let metadata = cache
+            .upsert_scene_snapshot(
+                &source,
+                Some(&source_bytes),
+                "demo scene",
+                "explicit",
+                &payload,
+                Some("tmp/runs/demo".to_string()),
+                Some(metrics.clone()),
+            )
+            .expect("write scene");
+
+        assert_eq!(cache.scene_entries().len(), 1);
+        assert_eq!(cache.scene_entries()[0].pipeline, "explicit");
+        assert_eq!(cache.scene_entries()[0].metrics, Some(metrics));
+        let loaded = cache
+            .load_scene(&metadata.scene_key)
+            .expect("load scene")
+            .expect("scene exists");
+        assert_eq!(loaded, payload);
+        let image = cache
+            .load_scene_source_image(&metadata)
+            .expect("load scene source")
+            .expect("source exists");
+        assert_eq!(image.file_name, "room.png");
+        assert_eq!(image.bytes, source_bytes);
+
+        let cache = MeshCache::load_from_root(root.clone()).expect("reload cache");
+        assert_eq!(cache.scene_entries().len(), 1);
+        let reloaded = cache
+            .load_scene(&metadata.scene_key)
+            .expect("load scene after reload")
+            .expect("scene exists after reload");
+        assert_eq!(reloaded.world_items.len(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp cache root");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn scene_rename_and_delete_do_not_delete_object_assets() {
+        let root = temp_root("scene_delete");
+        let image = PathBuf::from("C:/data/input/chair.png");
+        let source = PathBuf::from("C:/data/scenes/room.png");
+
+        let mut cache = MeshCache::load_from_root(root.clone()).expect("create cache");
+        let asset = cache
+            .upsert_mesh_for_image(&image, &dummy_mesh(1.0))
+            .expect("insert mesh");
+        let payload = CachedScenePayload {
+            world_items: vec![CachedWorldItem {
+                cache_key: asset.cache_key.clone(),
+                translation: [0.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+            }],
+            ..Default::default()
+        };
+        let scene = cache
+            .upsert_scene_snapshot(&source, None, "before", "explicit", &payload, None, None)
+            .expect("write scene");
+
+        assert!(
+            cache
+                .rename_scene(&scene.scene_key, "after")
+                .expect("rename scene")
+        );
+        assert_eq!(cache.scene_entries()[0].label, "after");
+        assert!(
+            cache
+                .remove_scene_entry(&scene.scene_key)
+                .expect("remove scene")
+        );
+        assert!(cache.scene_entries().is_empty());
+        assert!(
+            cache
+                .load_asset(&asset.cache_key)
+                .expect("load object asset")
+                .is_some(),
+            "scene deletion must not remove reusable object assets"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp cache root");
     }
