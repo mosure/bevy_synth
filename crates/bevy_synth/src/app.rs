@@ -91,8 +91,9 @@ use burn_synth_mcp::{
     LocateAnythingBackend, QualityPreset as McpQualityPreset, SceneBuildExecutionKind,
     SceneBuildFromImageArgs, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
-    ScenePoseFitMode, SceneSegmentationProvider, ServerArgs, ServerConfig,
-    SynthesisModel as McpSynthesisModel, run_scene_build_from_image_with_progress,
+    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider, ServerArgs, ServerConfig,
+    SynthesisModel as McpSynthesisModel, TrellisQuality as McpTrellisQuality,
+    run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
@@ -3577,67 +3578,116 @@ fn run_scene_build_for_ui(
         SceneQualityProfileSetting::Balanced => McpQualityPreset::Balanced,
         SceneQualityProfileSetting::Full => McpQualityPreset::Full,
     };
+    server_args.trellis_quality = match settings.quality_profile {
+        SceneQualityProfileSetting::Fast => McpTrellisQuality::Low,
+        SceneQualityProfileSetting::Balanced => McpTrellisQuality::Medium,
+        SceneQualityProfileSetting::Full => McpTrellisQuality::High,
+    };
     let config = ServerConfig::from_args(server_args);
     let output_dir = Some(
         PathBuf::from("tmp")
             .join("runs")
             .join(format!("{}_scene_ui_explicit", unix_seconds_run_id())),
     );
-    let response = run_scene_build_from_image_with_progress(
-        config,
-        SceneBuildFromImageArgs {
-            source_scene_path: source_scene_path.clone(),
-            object_reference_image_path: None,
-            output_dir,
-            candidate_count: Some(settings.candidate_count),
-            candidate_retry_attempts: None,
-            candidate_batch_size: None,
-            min_reconstruction_score: None,
-            quality_profile: Some(match settings.quality_profile {
-                SceneQualityProfileSetting::Fast => SceneQualityProfile::Draft,
-                SceneQualityProfileSetting::Balanced | SceneQualityProfileSetting::Full => {
-                    SceneQualityProfile::Quality
-                }
-            }),
-            allow_catalog_reuse: settings.allow_catalog_reuse,
-            lift_assets: true,
-            synthesis_models: Some(scene_synthesis_models),
-            target_faces: Some(settings.target_faces),
-            batch_size: Some(app_args.max_batch_size.max(1)),
-            batch_vram_mb: None,
-            trellis_pbr: Some(settings.pbr_enabled),
-            trellis_pbr_texture_size: Some(settings.pbr_texture_size),
-            promote_to_catalog: true,
-            composition_mode: SceneCompositionMode::CvGrounded,
-            pose_fit: ScenePoseFitMode::ProjectedAabb,
-            canonical_pose: SceneCanonicalPoseMode::Auto,
-            max_pose_candidates: 32,
-            save_pose_debug: true,
-            depth_provider: SceneDepthProvider::DepthPro,
-            locator: SceneLocatorProvider::LocateAnything,
-            locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
-            segmentation_provider: Some(SceneSegmentationProvider::None),
-            segmentation_precision: None,
-            segmentation_quantization: None,
-            write_artifacts: true,
-            apply: false,
-            clear_existing: true,
-            feedback: settings.feedback_iterations > 0,
-            feedback_iters: settings.feedback_iterations,
-            feedback_keep_viewer: false,
-            feedback_capture_dir: None,
-            feedback_threshold_profile: FeedbackThresholdProfile::Standard,
-            feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
-        },
-        |event| {
-            let _ = progress_sender.send(event);
-        },
-    )?;
+    let scene_args = scene_build_args_from_ui_settings(
+        source_scene_path.clone(),
+        output_dir,
+        app_args.max_batch_size,
+        scene_synthesis_models,
+        &settings,
+    );
+    let response = run_scene_build_from_image_with_progress(config, scene_args, |event| {
+        let _ = progress_sender.send(event);
+    })?;
     Ok(SceneBuildOutput {
         source_scene_path,
         source_image_bytes,
         response,
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scene_build_args_from_ui_settings(
+    source_scene_path: PathBuf,
+    output_dir: Option<PathBuf>,
+    max_batch_size: usize,
+    scene_synthesis_models: Vec<McpSynthesisModel>,
+    settings: &ScenePipelineUiSettings,
+) -> SceneBuildFromImageArgs {
+    let composition_mode = if settings.pose_fit_enabled {
+        SceneCompositionMode::CvGrounded
+    } else {
+        SceneCompositionMode::Heuristic
+    };
+    let feedback_enabled =
+        settings.feedback_enabled && settings.feedback_iterations > 0 && settings.lift_assets;
+    SceneBuildFromImageArgs {
+        source_scene_path,
+        object_reference_image_path: None,
+        output_dir,
+        candidate_count: Some(settings.candidate_count),
+        candidate_retry_attempts: None,
+        candidate_batch_size: None,
+        min_reconstruction_score: None,
+        quality_profile: Some(match settings.quality_profile {
+            SceneQualityProfileSetting::Fast => SceneQualityProfile::Draft,
+            SceneQualityProfileSetting::Balanced | SceneQualityProfileSetting::Full => {
+                SceneQualityProfile::Quality
+            }
+        }),
+        allow_catalog_reuse: settings.allow_catalog_reuse,
+        lift_assets: settings.lift_assets,
+        synthesis_models: Some(scene_synthesis_models),
+        target_faces: Some(settings.target_faces),
+        batch_size: Some(max_batch_size.max(1)),
+        batch_vram_mb: None,
+        trellis_pbr: Some(settings.pbr_enabled),
+        trellis_pbr_texture_size: Some(settings.pbr_texture_size),
+        promote_to_catalog: settings.promote_to_catalog,
+        composition_mode,
+        pose_fit: ScenePoseFitMode::ProjectedAabb,
+        canonical_pose: if settings.canonical_pose_enabled {
+            SceneCanonicalPoseMode::RenderSweep
+        } else {
+            SceneCanonicalPoseMode::Off
+        },
+        scale_policy: SceneScalePolicy::AssetPreserving,
+        max_pose_candidates: 32,
+        save_pose_debug: settings.write_artifacts,
+        depth_provider: if settings.depth_enabled {
+            SceneDepthProvider::DepthPro
+        } else {
+            SceneDepthProvider::None
+        },
+        locator: if settings.locate_anything_enabled {
+            SceneLocatorProvider::LocateAnything
+        } else {
+            SceneLocatorProvider::Manifest
+        },
+        locate_anything_backend: settings
+            .locate_anything_enabled
+            .then_some(LocateAnythingBackend::BurnNative),
+        segmentation_provider: Some(if settings.segmentation_enabled {
+            SceneSegmentationProvider::Sam2
+        } else {
+            SceneSegmentationProvider::None
+        }),
+        segmentation_precision: None,
+        segmentation_quantization: None,
+        write_artifacts: settings.write_artifacts,
+        apply: false,
+        clear_existing: true,
+        feedback: feedback_enabled,
+        feedback_iters: if feedback_enabled {
+            settings.feedback_iterations
+        } else {
+            0
+        },
+        feedback_keep_viewer: false,
+        feedback_capture_dir: None,
+        feedback_threshold_profile: FeedbackThresholdProfile::Standard,
+        feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

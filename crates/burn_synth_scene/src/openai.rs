@@ -1,7 +1,7 @@
-use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine;
@@ -38,7 +38,7 @@ impl Default for OpenAiProviderConfig {
 pub struct OpenAiSceneProvider {
     config: OpenAiProviderConfig,
     client: reqwest::blocking::Client,
-    request_log: RefCell<Vec<Value>>,
+    request_log: Mutex<Vec<Value>>,
 }
 
 impl OpenAiSceneProvider {
@@ -64,7 +64,7 @@ impl OpenAiSceneProvider {
         Ok(Self {
             config,
             client,
-            request_log: RefCell::new(Vec::new()),
+            request_log: Mutex::new(Vec::new()),
         })
     }
 
@@ -157,7 +157,9 @@ impl OpenAiSceneProvider {
     }
 
     fn record_request(&self, value: Value) {
-        self.request_log.borrow_mut().push(value);
+        if let Ok(mut request_log) = self.request_log.lock() {
+            request_log.push(value);
+        }
     }
 
     fn warn_model_mismatch(&self, operation: &str, requested: &str, response_model: Option<&str>) {
@@ -333,13 +335,18 @@ impl SceneAiProvider for OpenAiSceneProvider {
     }
 
     fn provider_metadata(&self) -> Value {
+        let requests = self
+            .request_log
+            .lock()
+            .map(|request_log| request_log.clone())
+            .unwrap_or_default();
         json!({
             "provider": "openai",
             "base_url": self.config.base_url,
             "project_id_set": self.config.project_id.is_some(),
             "requested_reasoning_model": self.config.reasoning_model,
             "requested_image_model": self.config.image_model,
-            "requests": self.request_log.borrow().clone(),
+            "requests": requests,
         })
     }
 }

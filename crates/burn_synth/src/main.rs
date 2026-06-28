@@ -58,7 +58,7 @@ struct Cli {
     trellis_pbr_texture_size: Option<usize>,
 
     /// Enable Trellis PBR texture baking through the Rust/Burn o_voxel export path.
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     trellis_pbr: bool,
 
     #[arg(long, value_enum, default_value_t = CliTrellisQuality::Low)]
@@ -1169,7 +1169,7 @@ mod tests {
             "input.png",
         ]);
         assert_eq!(cli.trellis_quality, CliTrellisQuality::Low);
-        assert!(!cli.trellis_pbr);
+        assert!(cli.trellis_pbr);
         assert_eq!(
             cli.trellis_compute_profile,
             CliTrellisComputeProfile::ReferenceF32

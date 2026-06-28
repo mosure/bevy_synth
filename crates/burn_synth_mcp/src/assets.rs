@@ -423,7 +423,7 @@ pub(crate) fn default_scene_feedback() -> bool {
 }
 
 pub(crate) fn default_scene_feedback_iters() -> usize {
-    3
+    DEFAULT_SCENE_FEEDBACK_ITERS
 }
 
 pub(crate) fn default_scene_feedback_threshold_profile() -> FeedbackThresholdProfile {
@@ -443,7 +443,11 @@ pub(crate) fn default_scene_pose_fit_mode() -> ScenePoseFitMode {
 }
 
 pub(crate) fn default_scene_canonical_pose_mode() -> SceneCanonicalPoseMode {
-    SceneCanonicalPoseMode::Auto
+    SceneCanonicalPoseMode::RenderSweep
+}
+
+pub(crate) fn default_scene_scale_policy() -> SceneScalePolicy {
+    SceneScalePolicy::AssetPreserving
 }
 
 pub(crate) fn default_scene_max_pose_candidates() -> usize {
@@ -1821,6 +1825,10 @@ pub(crate) fn write_scene_build_artifacts(
             "canonical_pose_selection_task",
             "canonical_pose_selection_task.json",
         ),
+        (
+            "canonical_pose_verification",
+            "canonical_pose_verification.json",
+        ),
         ("plan", "plan.json"),
         ("grounded_layout", "grounded_layout.json"),
         ("commands", "commands.json"),
@@ -2004,6 +2012,10 @@ pub(crate) fn write_scene_ground_artifacts(
         (
             "canonical_pose_selection_task",
             "canonical_pose_selection_task.json",
+        ),
+        (
+            "canonical_pose_verification",
+            "canonical_pose_verification.json",
         ),
         ("grounding_evidence", "grounding_evidence.json"),
         ("grounded_layout", "grounded_layout.json"),

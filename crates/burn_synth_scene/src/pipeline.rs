@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -71,6 +72,22 @@ pub struct ScenePipeline<P> {
     config: SceneBuildConfig,
     provider: P,
     run_id: String,
+}
+
+struct ObjectImageRequestGenerationResult {
+    attempts: Vec<ObjectImageAttemptReport>,
+    candidates: Vec<ObjectImageCandidate>,
+    accepted: bool,
+}
+
+fn normalize_object_image_generation_policy(
+    policy: ObjectImageGenerationPolicy,
+) -> ObjectImageGenerationPolicy {
+    ObjectImageGenerationPolicy {
+        min_score: policy.min_score.clamp(0.0, 1.0),
+        max_attempts_per_object: policy.max_attempts_per_object.max(1),
+        candidates_per_attempt: policy.candidates_per_attempt.max(1),
+    }
 }
 
 impl<P: SceneAiProvider> ScenePipeline<P> {
@@ -184,71 +201,17 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
     ) -> SceneResult<ObjectImageGenerationReport> {
         let output_dir = self.config.output_dir.join("objects").join("generated");
         fs::create_dir_all(&output_dir)?;
-        let policy = ObjectImageGenerationPolicy {
-            min_score: policy.min_score.clamp(0.0, 1.0),
-            max_attempts_per_object: policy.max_attempts_per_object.max(1),
-            candidates_per_attempt: policy.candidates_per_attempt.max(1),
-        };
+        let policy = normalize_object_image_generation_policy(policy);
         let mut attempts = Vec::new();
         let mut candidates = Vec::new();
         let mut processed_request_count = 0usize;
         for request in requests {
-            let mut accepted = false;
-            let mut next_candidate_index = 0usize;
-            let min_score = object_reconstruction_min_score(&request.object, policy.min_score);
-            for attempt_index in 0..policy.max_attempts_per_object {
-                let mut attempt_request = request.clone();
-                attempt_request.candidate_count = policy.candidates_per_attempt;
-                let (mut generated, elapsed_ms) = self.generate_candidates_for_request(
-                    &attempt_request,
-                    &output_dir,
-                    next_candidate_index,
-                    attempt_index,
-                )?;
-                next_candidate_index += generated.len();
-                candidates.append(&mut generated);
-                let best_score = best_candidate_for_object(&candidates, &request.object.id)
-                    .map(|candidate| candidate.score);
-                accepted = best_score.is_some_and(|score| score >= min_score);
-                attempts.push(ObjectImageAttemptReport {
-                    object_id: request.object.id.clone(),
-                    attempt_index,
-                    requested_candidates: attempt_request.candidate_count,
-                    generated_candidates: next_candidate_index,
-                    best_score_after_attempt: best_score,
-                    accepted,
-                    elapsed_ms,
-                });
-                write_metric(
-                    &self.config.output_dir,
-                    "openai.object_image.guardrail_attempt",
-                    json!({
-                        "object_id": request.object.id,
-                        "attempt_index": attempt_index,
-                        "requested_candidates": attempt_request.candidate_count,
-                        "generated_candidates": next_candidate_index,
-                        "best_score_after_attempt": best_score,
-                        "base_min_score": policy.min_score,
-                        "min_score": min_score,
-                        "accepted": accepted,
-                    }),
-                )?;
-                if accepted {
-                    break;
-                }
-            }
+            let result =
+                self.generate_candidates_for_request_with_policy(request, &output_dir, policy)?;
+            attempts.extend(result.attempts);
+            candidates.extend(result.candidates);
             processed_request_count += 1;
-            if !accepted {
-                write_metric(
-                    &self.config.output_dir,
-                    "openai.object_image.guardrail_rejected",
-                    json!({
-                        "object_id": request.object.id,
-                        "best_score": best_candidate_for_object(&candidates, &request.object.id).map(|candidate| candidate.score),
-                        "base_min_score": policy.min_score,
-                        "min_score": min_score,
-                    }),
-                )?;
+            if !result.accepted {
                 write_metric(
                     &self.config.output_dir,
                     "openai.object_image.guardrail_abort",
@@ -284,6 +247,178 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
             candidates,
             selected_candidates,
             rejected_objects,
+        })
+    }
+
+    pub fn generate_object_candidates_with_policy_parallel(
+        &self,
+        requests: &[ObjectImageRequest],
+        policy: ObjectImageGenerationPolicy,
+        max_parallel_requests: usize,
+    ) -> SceneResult<ObjectImageGenerationReport>
+    where
+        P: Sync,
+    {
+        let output_dir = self.config.output_dir.join("objects").join("generated");
+        fs::create_dir_all(&output_dir)?;
+        let policy = normalize_object_image_generation_policy(policy);
+        let max_parallel_requests = max_parallel_requests.max(1);
+        if max_parallel_requests == 1 || requests.len() <= 1 {
+            return self.generate_object_candidates_with_policy(requests, policy);
+        }
+
+        let mut per_request_results = Vec::new();
+        for (chunk_index, chunk) in requests.chunks(max_parallel_requests).enumerate() {
+            let chunk_start = chunk_index * max_parallel_requests;
+            let mut chunk_results = thread::scope(|scope| -> SceneResult<_> {
+                let mut handles = Vec::new();
+                for (offset, request) in chunk.iter().enumerate() {
+                    let request_index = chunk_start + offset;
+                    let output_dir = &output_dir;
+                    handles.push(scope.spawn(move || {
+                        self.generate_candidates_for_request_with_policy(
+                            request, output_dir, policy,
+                        )
+                        .map(|result| (request_index, result))
+                    }));
+                }
+
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    results.push(handle.join().map_err(|_| {
+                        SceneError::Provider("object image generation worker panicked".to_string())
+                    })??);
+                }
+                Ok(results)
+            })?;
+            chunk_results.sort_by_key(|(request_index, _)| *request_index);
+            let rejected = chunk_results.iter().any(|(_, result)| !result.accepted);
+            per_request_results.extend(chunk_results);
+            if rejected {
+                break;
+            }
+        }
+
+        per_request_results.sort_by_key(|(request_index, _)| *request_index);
+        let processed_request_count = per_request_results.len();
+        let mut attempts = Vec::new();
+        let mut candidates = Vec::new();
+        let mut first_rejected_object = None;
+        for (request_index, result) in per_request_results {
+            if !result.accepted && first_rejected_object.is_none() {
+                first_rejected_object = Some(request_index);
+            }
+            attempts.extend(result.attempts);
+            candidates.extend(result.candidates);
+        }
+        if let Some(request_index) = first_rejected_object {
+            let request = &requests[request_index];
+            write_metric(
+                &self.config.output_dir,
+                "openai.object_image.guardrail_abort",
+                json!({
+                    "object_id": request.object.id,
+                    "processed_objects": processed_request_count,
+                    "total_objects": requests.len(),
+                    "reason": "required object exhausted image candidate attempts",
+                    "parallel_requests": max_parallel_requests,
+                }),
+            )?;
+        }
+
+        let processed_requests = &requests[..processed_request_count.min(requests.len())];
+        let rejected_objects =
+            object_image_candidate_rejections(processed_requests, &candidates, policy.min_score);
+        let selected_candidates = if rejected_objects.is_empty() {
+            let manifest = SceneObjectManifest {
+                source_scene_path: self.config.source_scene_path.display().to_string(),
+                scene_calibration: None,
+                objects: processed_requests
+                    .iter()
+                    .map(|request| request.object.clone())
+                    .collect(),
+            };
+            select_object_image_candidates(&manifest, &candidates, policy.min_score)?
+        } else {
+            Vec::new()
+        };
+        Ok(ObjectImageGenerationReport {
+            policy,
+            attempts,
+            candidates,
+            selected_candidates,
+            rejected_objects,
+        })
+    }
+
+    fn generate_candidates_for_request_with_policy(
+        &self,
+        request: &ObjectImageRequest,
+        output_dir: &Path,
+        policy: ObjectImageGenerationPolicy,
+    ) -> SceneResult<ObjectImageRequestGenerationResult> {
+        let mut attempts = Vec::new();
+        let mut candidates = Vec::new();
+        let mut accepted = false;
+        let mut next_candidate_index = 0usize;
+        let min_score = object_reconstruction_min_score(&request.object, policy.min_score);
+        for attempt_index in 0..policy.max_attempts_per_object {
+            let mut attempt_request = request.clone();
+            attempt_request.candidate_count = policy.candidates_per_attempt;
+            let (mut generated, elapsed_ms) = self.generate_candidates_for_request(
+                &attempt_request,
+                output_dir,
+                next_candidate_index,
+                attempt_index,
+            )?;
+            next_candidate_index += generated.len();
+            candidates.append(&mut generated);
+            let best_score = best_candidate_for_object(&candidates, &request.object.id)
+                .map(|candidate| candidate.score);
+            accepted = best_score.is_some_and(|score| score >= min_score);
+            attempts.push(ObjectImageAttemptReport {
+                object_id: request.object.id.clone(),
+                attempt_index,
+                requested_candidates: attempt_request.candidate_count,
+                generated_candidates: next_candidate_index,
+                best_score_after_attempt: best_score,
+                accepted,
+                elapsed_ms,
+            });
+            write_metric(
+                &self.config.output_dir,
+                "openai.object_image.guardrail_attempt",
+                json!({
+                    "object_id": request.object.id,
+                    "attempt_index": attempt_index,
+                    "requested_candidates": attempt_request.candidate_count,
+                    "generated_candidates": next_candidate_index,
+                    "best_score_after_attempt": best_score,
+                    "base_min_score": policy.min_score,
+                    "min_score": min_score,
+                    "accepted": accepted,
+                }),
+            )?;
+            if accepted {
+                break;
+            }
+        }
+        if !accepted {
+            write_metric(
+                &self.config.output_dir,
+                "openai.object_image.guardrail_rejected",
+                json!({
+                    "object_id": request.object.id,
+                    "best_score": best_candidate_for_object(&candidates, &request.object.id).map(|candidate| candidate.score),
+                    "base_min_score": policy.min_score,
+                    "min_score": min_score,
+                }),
+            )?;
+        }
+        Ok(ObjectImageRequestGenerationResult {
+            attempts,
+            candidates,
+            accepted,
         })
     }
 

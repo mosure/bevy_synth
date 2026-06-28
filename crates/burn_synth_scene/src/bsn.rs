@@ -3,6 +3,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -14,6 +15,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::*;
+
+static METRIC_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn object_manifest_schema() -> Value {
     json!({
@@ -291,6 +294,10 @@ pub fn scene_bsn_file_to_mcp_command_envelope(
 }
 
 pub fn write_metric(output_dir: &Path, stage: &str, value: Value) -> SceneResult<()> {
+    let _guard = METRIC_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| SceneError::Io("metric write lock poisoned".into()))?;
     fs::create_dir_all(output_dir)?;
     let mut file = fs::OpenOptions::new()
         .create(true)

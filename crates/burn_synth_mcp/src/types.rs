@@ -10,6 +10,7 @@ use burn_synth_grounding::{
     SegmentationPrecision, SegmentationQuantization,
 };
 use burn_synth_scene::SceneQualityProfile;
+pub use burn_synth_scene::SceneScalePolicy;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +18,7 @@ use serde_json::Value;
 pub(crate) const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const DEFAULT_SCENE_TRELLIS_TARGET_FACES: usize = 80_000;
 pub(crate) const DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE: usize = 512;
+pub(crate) const DEFAULT_SCENE_FEEDBACK_ITERS: usize = 8;
 pub(crate) const DEFAULT_SCENE_SEGMENTATION_CDN_BASE_URL: &str =
     "https://aberration.technology/model";
 pub(crate) const DEFAULT_LOCATE_ANYTHING_CDN_BASE_URL: &str = "https://aberration.technology/model";
@@ -357,11 +359,11 @@ pub struct ServerArgs {
     #[arg(long)]
     pub trellis_image_large_root: Option<PathBuf>,
 
-    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Low)]
     pub trellis_quality: TrellisQuality,
 
     /// Enable TRELLIS PBR UV/material texture baking through the Rust/Burn o_voxel export path.
-    #[arg(long)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub trellis_pbr: bool,
 
     /// TRELLIS PBR texture size for Rust/Burn o_voxel GLB export. Uses runtime default when omitted.
@@ -584,8 +586,12 @@ pub(crate) struct SceneBuildCliArgs {
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
-    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Auto)]
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::RenderSweep)]
     pub canonical_pose: SceneCanonicalPoseMode,
+
+    /// Generated asset scale policy used by layout and feedback.
+    #[arg(long, value_enum, default_value_t = SceneScalePolicy::AssetPreserving)]
+    pub scale_policy: SceneScalePolicy,
 
     /// Maximum pose candidates per object for deterministic cv-grounded fitting.
     #[arg(long, default_value_t = 32)]
@@ -636,7 +642,7 @@ pub(crate) struct SceneBuildCliArgs {
     pub feedback: bool,
 
     /// Maximum render-capture-feedback iterations.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = DEFAULT_SCENE_FEEDBACK_ITERS)]
     pub feedback_iters: usize,
 
     /// Leave a temporary feedback viewer running after scene-build completes.
@@ -687,8 +693,12 @@ pub(crate) struct SceneGroundCliArgs {
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
-    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Auto)]
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::RenderSweep)]
     pub canonical_pose: SceneCanonicalPoseMode,
+
+    /// Generated asset scale policy used by layout and feedback.
+    #[arg(long, value_enum, default_value_t = SceneScalePolicy::AssetPreserving)]
+    pub scale_policy: SceneScalePolicy,
 
     /// Maximum pose candidates per object for deterministic cv-grounded fitting.
     #[arg(long, default_value_t = 32)]
@@ -735,7 +745,7 @@ pub(crate) struct SceneGroundCliArgs {
     pub feedback: bool,
 
     /// Maximum render-capture-feedback iterations.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = DEFAULT_SCENE_FEEDBACK_ITERS)]
     pub feedback_iters: usize,
 
     /// Leave a temporary feedback viewer running after scene-ground completes.
@@ -845,7 +855,7 @@ pub(crate) struct SceneFeedbackReplayCliArgs {
     pub rebuild_commands_from_grounded_layout: bool,
 
     /// Maximum render-capture-feedback iterations.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = DEFAULT_SCENE_FEEDBACK_ITERS)]
     pub feedback_iters: usize,
 
     /// Leave the temporary feedback viewer running after replay.

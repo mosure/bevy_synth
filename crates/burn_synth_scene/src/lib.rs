@@ -24,7 +24,8 @@ pub use error::{SceneError, SceneResult};
 pub use layout::{
     GroundedSceneLayout, GroundedSceneLayoutConfig, GroundedScenePlacement, grounded_scene_bsn,
     grounded_scene_layout, grounded_scene_layout_for_manifest, grounded_scene_layout_with_evidence,
-    manifest_grounding_evidence, manifest_with_grounding_evidence,
+    grounded_scene_layout_with_evidence_config, manifest_grounding_evidence,
+    manifest_with_grounding_evidence,
 };
 pub use object_images::{
     object_image_prompt, object_image_prompt_template, object_manifest_prompt, scene_bsn_prompt,

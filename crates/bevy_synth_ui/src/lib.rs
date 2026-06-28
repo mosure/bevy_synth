@@ -1,4 +1,8 @@
 use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
@@ -142,6 +146,7 @@ const PROCESSING_EVENT_LIMIT: usize = 16;
 const PROCESSING_ARTIFACT_LIMIT: usize = 8;
 const DEVELOPER_EVENT_ROWS: usize = 12;
 const DEVELOPER_ARTIFACT_ROWS: usize = 10;
+const DEVELOPER_VISUAL_ROWS: usize = 8;
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -239,6 +244,15 @@ pub struct ScenePipelineUiSettings {
     pub pbr_texture_size: usize,
     pub target_faces: usize,
     pub allow_catalog_reuse: bool,
+    pub lift_assets: bool,
+    pub locate_anything_enabled: bool,
+    pub depth_enabled: bool,
+    pub segmentation_enabled: bool,
+    pub canonical_pose_enabled: bool,
+    pub pose_fit_enabled: bool,
+    pub feedback_enabled: bool,
+    pub write_artifacts: bool,
+    pub promote_to_catalog: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,6 +285,65 @@ pub struct SceneProcessingState {
     recent_artifacts: VecDeque<String>,
     token_usage_summary: Option<String>,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProcessingArtifactVisualKind {
+    Locate,
+    Segmentation,
+    Depth,
+    Crop,
+    Generated,
+    Canonical,
+    Projection,
+    Feedback,
+    Source,
+    Other,
+}
+
+impl ProcessingArtifactVisualKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Locate => "locate",
+            Self::Segmentation => "mask",
+            Self::Depth => "depth",
+            Self::Crop => "crop",
+            Self::Generated => "object",
+            Self::Canonical => "canonical",
+            Self::Projection => "projection",
+            Self::Feedback => "feedback",
+            Self::Source => "source",
+            Self::Other => "image",
+        }
+    }
+
+    fn priority(&self) -> usize {
+        match self {
+            Self::Locate => 0,
+            Self::Segmentation => 1,
+            Self::Depth => 2,
+            Self::Crop => 3,
+            Self::Generated => 4,
+            Self::Canonical => 5,
+            Self::Projection => 6,
+            Self::Feedback => 7,
+            Self::Source => 8,
+            Self::Other => 9,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProcessingArtifactPreview {
+    path: String,
+    kind: ProcessingArtifactVisualKind,
+    image: Handle<Image>,
+}
+
+#[derive(Resource, Default)]
+struct ProcessingArtifactPreviewCache {
+    signature: String,
+    previews: Vec<ProcessingArtifactPreview>,
 }
 
 impl Default for SceneProcessingState {
@@ -402,13 +475,22 @@ impl Default for ScenePipelineUiSettings {
         Self {
             pipeline: ScenePipelineKind::Explicit,
             image_to_3d_model: SynthesisModel::Trellis,
-            quality_profile: SceneQualityProfileSetting::Balanced,
+            quality_profile: SceneQualityProfileSetting::Fast,
             candidate_count: 2,
             feedback_iterations: 8,
             pbr_enabled: true,
             pbr_texture_size: DEFAULT_TRELLIS_PBR_TEXTURE_SIZE,
-            target_faces: 100_000,
+            target_faces: 80_000,
             allow_catalog_reuse: false,
+            lift_assets: true,
+            locate_anything_enabled: true,
+            depth_enabled: true,
+            segmentation_enabled: true,
+            canonical_pose_enabled: true,
+            pose_fit_enabled: true,
+            feedback_enabled: true,
+            write_artifacts: true,
+            promote_to_catalog: true,
         }
     }
 }
@@ -520,6 +602,8 @@ impl Plugin for BurnSynthUiPlugin {
             .init_resource::<ScenePipelineUiSettings>()
             .init_resource::<ViewerDebugSettings>()
             .init_resource::<SceneProcessingState>()
+            .init_resource::<ProcessingArtifactPreviewCache>()
+            .init_resource::<DeveloperPanelState>()
             .init_resource::<CatalogModeDropdownState>()
             .init_resource::<SettingsModalState>()
             .init_resource::<PipelineDropdownState>()
@@ -579,14 +663,18 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_scene_setting_step_button,
                     handle_scene_setting_toggle_button,
                     handle_settings_tab_button,
+                    handle_developer_panel_tab_button,
                     handle_viewer_aabb_mode_button,
                     handle_viewer_debug_toggle_button,
                     handle_viewer_debug_step_button,
                     (
                         tick_processing_elapsed,
+                        sync_processing_artifact_previews,
                         sync_settings_modal,
                         sync_settings_tab_visuals,
+                        sync_developer_panel_tab_visuals,
                         sync_settings_developer_panel,
+                        sync_settings_developer_visual_grid,
                         update_settings_labels,
                         update_viewer_debug_labels,
                     )
@@ -1132,6 +1220,24 @@ struct SettingsDeveloperEventsText;
 #[derive(Component, Default)]
 struct SettingsDeveloperArtifactText;
 
+#[derive(Component, Default)]
+struct SettingsDeveloperVisualText;
+
+#[derive(Component)]
+struct SettingsDeveloperTabButton {
+    tab: DeveloperPanelTab,
+}
+
+#[derive(Component)]
+struct SettingsDeveloperTabPanel {
+    tab: DeveloperPanelTab,
+}
+
+#[derive(Component, Default)]
+struct SettingsDeveloperVisualGrid {
+    signature: String,
+}
+
 #[derive(Component)]
 struct CatalogList;
 
@@ -1384,6 +1490,15 @@ enum SceneSettingDelta {
 enum SceneToggleSetting {
     Pbr,
     CatalogReuse,
+    LiftAssets,
+    LocateAnything,
+    Depth,
+    Segmentation,
+    CanonicalPose,
+    PoseFit,
+    Feedback,
+    WriteArtifacts,
+    PromoteToCatalog,
 }
 
 #[derive(Component)]
@@ -1484,6 +1599,31 @@ struct SettingsModalState {
     entity: Option<Entity>,
     pipeline: Option<CatalogPipelineChoice>,
     tab: SettingsModalTab,
+}
+
+#[derive(Resource, Default)]
+struct DeveloperPanelState {
+    tab: DeveloperPanelTab,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DeveloperPanelTab {
+    #[default]
+    Status,
+    Events,
+    Artifacts,
+    Visuals,
+}
+
+impl DeveloperPanelTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Events => "events",
+            Self::Artifacts => "artifacts",
+            Self::Visuals => "visuals",
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -2260,11 +2400,13 @@ fn sync_processing_panel(
 #[allow(clippy::type_complexity)]
 fn sync_settings_developer_panel(
     state: Res<SceneProcessingState>,
+    artifact_previews: Res<ProcessingArtifactPreviewCache>,
     mut text_queries: ParamSet<(
         Query<&mut Text, With<SettingsDeveloperCurrentText>>,
         Query<&mut Text, With<SettingsDeveloperTokenText>>,
         Query<&mut Text, With<SettingsDeveloperEventsText>>,
         Query<&mut Text, With<SettingsDeveloperArtifactText>>,
+        Query<&mut Text, With<SettingsDeveloperVisualText>>,
     )>,
 ) {
     let current_text = format_developer_current_block(&state);
@@ -2285,6 +2427,11 @@ fn sync_settings_developer_panel(
     let artifact_text = format_developer_artifact_block(&state);
     for mut text in &mut text_queries.p3() {
         text.0 = artifact_text.clone();
+    }
+
+    let visual_text = format_developer_visual_block(&state, &artifact_previews);
+    for mut text in &mut text_queries.p4() {
+        text.0 = visual_text.clone();
     }
 }
 
@@ -2360,6 +2507,215 @@ fn format_developer_artifact_block(state: &SceneProcessingState) -> String {
         };
     }
     rows.join("\n")
+}
+
+fn format_developer_visual_block(
+    state: &SceneProcessingState,
+    artifact_previews: &ProcessingArtifactPreviewCache,
+) -> String {
+    let visual_count = artifact_previews.previews.len();
+    if visual_count == 0 {
+        if state.active {
+            "waiting for locate/depth/crop/canonical/feedback images".to_string()
+        } else {
+            "no visual artifacts yet".to_string()
+        }
+    } else {
+        format!("{visual_count} visual artifact(s) discovered")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_processing_artifact_previews(
+    state: Res<SceneProcessingState>,
+    mut cache: ResMut<ProcessingArtifactPreviewCache>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let discovered = discover_processing_visual_artifacts(&state);
+    let signature = discovered
+        .iter()
+        .map(|(path, kind)| format!("{}:{}", kind.label(), path.display()))
+        .collect::<Vec<_>>()
+        .join("|");
+    if cache.signature == signature {
+        return;
+    }
+
+    cache.signature = signature;
+    cache.previews.clear();
+    for (path, kind) in discovered.into_iter().take(DEVELOPER_VISUAL_ROWS) {
+        if let Some(image) = load_processing_artifact_preview(&path, &mut images) {
+            cache.previews.push(ProcessingArtifactPreview {
+                path: path.display().to_string(),
+                kind,
+                image,
+            });
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sync_processing_artifact_previews(mut cache: ResMut<ProcessingArtifactPreviewCache>) {
+    if !cache.signature.is_empty() || !cache.previews.is_empty() {
+        cache.signature.clear();
+        cache.previews.clear();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn discover_processing_visual_artifacts(
+    state: &SceneProcessingState,
+) -> Vec<(PathBuf, ProcessingArtifactVisualKind)> {
+    let mut roots = Vec::new();
+    if let Some(run_id) = state.run_id.as_deref()
+        && !run_id.trim().is_empty()
+    {
+        roots.push(PathBuf::from("tmp").join("runs").join(run_id));
+    }
+    for path in &state.recent_artifacts {
+        roots.push(PathBuf::from(path));
+    }
+
+    let mut discovered = Vec::new();
+    for root in roots {
+        collect_visual_artifacts(&root, 0, &mut discovered);
+        if discovered.len() >= 96 {
+            break;
+        }
+    }
+
+    discovered.sort_by(|(left_path, left_kind), (right_path, right_kind)| {
+        let left_score = visual_artifact_score(left_path, left_kind);
+        let right_score = visual_artifact_score(right_path, right_kind);
+        left_kind
+            .priority()
+            .cmp(&right_kind.priority())
+            .then(left_score.cmp(&right_score))
+            .then_with(|| left_path.cmp(right_path))
+    });
+    discovered.dedup_by(|(left_path, _), (right_path, _)| left_path == right_path);
+    discovered
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_visual_artifacts(
+    path: &Path,
+    depth: usize,
+    out: &mut Vec<(PathBuf, ProcessingArtifactVisualKind)>,
+) {
+    if out.len() >= 128 || depth > 6 {
+        return;
+    }
+    if path.is_file() {
+        if let Some(kind) = visual_artifact_kind(path) {
+            out.push((path.to_path_buf(), kind));
+        }
+        return;
+    }
+    if !path.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        collect_visual_artifacts(&entry.path(), depth + 1, out);
+        if out.len() >= 128 {
+            break;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn visual_artifact_kind(path: &Path) -> Option<ProcessingArtifactVisualKind> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return None;
+    }
+
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if lower.contains("detections_overlay") || lower.contains("locate") {
+        Some(ProcessingArtifactVisualKind::Locate)
+    } else if lower.contains("masks_overlay")
+        || lower.contains("segmentation")
+        || lower.contains("/mask")
+        || lower.contains("\\mask")
+    {
+        Some(ProcessingArtifactVisualKind::Segmentation)
+    } else if lower.contains("depth") || lower.contains("floor") {
+        Some(ProcessingArtifactVisualKind::Depth)
+    } else if lower.contains("/crops/") || lower.contains("\\crops\\") || lower.contains("_crop") {
+        Some(ProcessingArtifactVisualKind::Crop)
+    } else if lower.contains("/generated/")
+        || lower.contains("\\generated\\")
+        || lower.contains("candidate")
+    {
+        Some(ProcessingArtifactVisualKind::Generated)
+    } else if lower.contains("canonical") || lower.contains("yaw") {
+        Some(ProcessingArtifactVisualKind::Canonical)
+    } else if lower.contains("projection_fit")
+        || lower.contains("visible_surface")
+        || lower.contains("silhouette")
+    {
+        Some(ProcessingArtifactVisualKind::Projection)
+    } else if lower.contains("/iterations")
+        || lower.contains("\\iterations")
+        || lower.contains("feedback")
+        || lower.ends_with("screenshot.png")
+    {
+        Some(ProcessingArtifactVisualKind::Feedback)
+    } else if lower.contains("source") || lower.contains("input") {
+        Some(ProcessingArtifactVisualKind::Source)
+    } else {
+        Some(ProcessingArtifactVisualKind::Other)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn visual_artifact_score(path: &Path, kind: &ProcessingArtifactVisualKind) -> usize {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    match kind {
+        ProcessingArtifactVisualKind::Locate if lower.contains("detections_overlay") => 0,
+        ProcessingArtifactVisualKind::Segmentation if lower.contains("masks_overlay") => 0,
+        ProcessingArtifactVisualKind::Depth if lower.contains("depth_overlay") => 0,
+        ProcessingArtifactVisualKind::Projection if lower.contains("projection_fit_overlay") => 0,
+        ProcessingArtifactVisualKind::Feedback if lower.ends_with("screenshot.png") => 0,
+        ProcessingArtifactVisualKind::Canonical if lower.contains("selection") => 0,
+        ProcessingArtifactVisualKind::Crop => 1,
+        ProcessingArtifactVisualKind::Generated => 1,
+        _ => 2,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_processing_artifact_preview(
+    path: &Path,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    let bytes = fs::read(path).ok()?;
+    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (width, height) = decoded.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let image = Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        decoded.into_raw(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    Some(images.add(image))
 }
 
 fn format_processing_event(event: &SceneProcessingEvent) -> String {
@@ -4221,6 +4577,33 @@ fn handle_scene_setting_toggle_button(
             SceneToggleSetting::CatalogReuse => {
                 scene_settings.allow_catalog_reuse = !scene_settings.allow_catalog_reuse
             }
+            SceneToggleSetting::LiftAssets => {
+                scene_settings.lift_assets = !scene_settings.lift_assets
+            }
+            SceneToggleSetting::LocateAnything => {
+                scene_settings.locate_anything_enabled = !scene_settings.locate_anything_enabled
+            }
+            SceneToggleSetting::Depth => {
+                scene_settings.depth_enabled = !scene_settings.depth_enabled
+            }
+            SceneToggleSetting::Segmentation => {
+                scene_settings.segmentation_enabled = !scene_settings.segmentation_enabled
+            }
+            SceneToggleSetting::CanonicalPose => {
+                scene_settings.canonical_pose_enabled = !scene_settings.canonical_pose_enabled
+            }
+            SceneToggleSetting::PoseFit => {
+                scene_settings.pose_fit_enabled = !scene_settings.pose_fit_enabled
+            }
+            SceneToggleSetting::Feedback => {
+                scene_settings.feedback_enabled = !scene_settings.feedback_enabled
+            }
+            SceneToggleSetting::WriteArtifacts => {
+                scene_settings.write_artifacts = !scene_settings.write_artifacts
+            }
+            SceneToggleSetting::PromoteToCatalog => {
+                scene_settings.promote_to_catalog = !scene_settings.promote_to_catalog
+            }
         }
     }
 }
@@ -4232,6 +4615,17 @@ fn handle_settings_tab_button(
     for (interaction, button) in interactions.iter_mut() {
         if *interaction == Interaction::Pressed && modal.tab != button.tab {
             modal.tab = button.tab;
+        }
+    }
+}
+
+fn handle_developer_panel_tab_button(
+    mut state: ResMut<DeveloperPanelState>,
+    mut interactions: Query<(&Interaction, &SettingsDeveloperTabButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction == Interaction::Pressed && state.tab != button.tab {
+            state.tab = button.tab;
         }
     }
 }
@@ -4372,6 +4766,84 @@ fn sync_settings_tab_visuals(
                 label.0 = text_color;
             }
         }
+    }
+}
+
+fn sync_developer_panel_tab_visuals(
+    state: Res<DeveloperPanelState>,
+    mut panels: Query<(&SettingsDeveloperTabPanel, &mut Node, &mut Visibility)>,
+    mut tabs: Query<
+        (
+            &SettingsDeveloperTabButton,
+            &Interaction,
+            &Children,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
+        With<Button>,
+    >,
+    mut labels: Query<&mut TextColor, With<ButtonLabel>>,
+) {
+    for (panel, mut node, mut visibility) in panels.iter_mut() {
+        let (next_visibility, next_display) = if panel.tab == state.tab {
+            (Visibility::Visible, Display::Flex)
+        } else {
+            (Visibility::Hidden, Display::None)
+        };
+        if *visibility != next_visibility {
+            *visibility = next_visibility;
+        }
+        if node.display != next_display {
+            node.display = next_display;
+        }
+    }
+    for (tab, interaction, children, mut bg, mut border) in tabs.iter_mut() {
+        let active = tab.tab == state.tab;
+        let (button_bg, button_border, text_color) =
+            control_button_palette(ControlButtonKind::Secondary, *interaction, false, active);
+        if bg.0 != button_bg {
+            bg.0 = button_bg;
+        }
+        *border = BorderColor::all(button_border);
+        for child in children.iter() {
+            if let Ok(mut label) = labels.get_mut(child)
+                && label.0 != text_color
+            {
+                label.0 = text_color;
+            }
+        }
+    }
+}
+
+fn sync_settings_developer_visual_grid(
+    mut commands: Commands,
+    children: Query<&Children>,
+    artifact_previews: Res<ProcessingArtifactPreviewCache>,
+    mut grids: Query<(Entity, &mut SettingsDeveloperVisualGrid)>,
+) {
+    for (entity, mut grid) in &mut grids {
+        if grid.signature == artifact_previews.signature {
+            continue;
+        }
+        despawn_children_recursive(entity, &mut commands, &children);
+        grid.signature = artifact_previews.signature.clone();
+        commands.entity(entity).with_children(|parent| {
+            if artifact_previews.previews.is_empty() {
+                parent.spawn((
+                    Text::new("no image artifacts discovered for the active run"),
+                    TextFont::from_font_size(11.0),
+                    TextColor(Color::srgb(0.62, 0.66, 0.74)),
+                ));
+                return;
+            }
+            for preview in artifact_previews
+                .previews
+                .iter()
+                .take(DEVELOPER_VISUAL_ROWS)
+            {
+                spawn_developer_visual_preview_row(parent, preview);
+            }
+        });
     }
 }
 
@@ -5499,7 +5971,7 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
                         });
                     }
                     row.spawn((
-                        Text::new(SceneQualityProfileSetting::Balanced.label()),
+                        Text::new(SceneQualityProfileSetting::Fast.label()),
                         TextFont::from_font_size(12.0),
                         TextColor(Color::srgb(0.72, 0.76, 0.84)),
                         SceneQualityValueLabel,
@@ -5523,6 +5995,20 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
         TRELLIS_FACE_STEP as isize,
     );
     spawn_scene_toggle_row(panel, "catalog reuse", SceneToggleSetting::CatalogReuse);
+    spawn_scene_settings_section_label(panel, "optional stages");
+    spawn_scene_toggle_row(panel, "lift assets", SceneToggleSetting::LiftAssets);
+    spawn_scene_toggle_row(panel, "locate bboxes", SceneToggleSetting::LocateAnything);
+    spawn_scene_toggle_row(panel, "depth/floor", SceneToggleSetting::Depth);
+    spawn_scene_toggle_row(panel, "sam masks", SceneToggleSetting::Segmentation);
+    spawn_scene_toggle_row(panel, "canonical yaw", SceneToggleSetting::CanonicalPose);
+    spawn_scene_toggle_row(panel, "projected fit", SceneToggleSetting::PoseFit);
+    spawn_scene_toggle_row(panel, "render feedback", SceneToggleSetting::Feedback);
+    spawn_scene_toggle_row(panel, "write artifacts", SceneToggleSetting::WriteArtifacts);
+    spawn_scene_toggle_row(
+        panel,
+        "promote catalog",
+        SceneToggleSetting::PromoteToCatalog,
+    );
 }
 
 fn spawn_general_settings(panel: &mut ChildSpawnerCommands) {
@@ -5550,18 +6036,110 @@ fn spawn_physics_settings(panel: &mut ChildSpawnerCommands) {
 }
 
 fn spawn_developer_settings(panel: &mut ChildSpawnerCommands) {
-    spawn_developer_text_block::<SettingsDeveloperCurrentText>(panel, "current", "idle");
-    spawn_developer_text_block::<SettingsDeveloperTokenText>(panel, "tokens", "no token usage");
-    spawn_developer_text_block::<SettingsDeveloperEventsText>(
-        panel,
-        "events",
-        "no scene build events yet",
-    );
-    spawn_developer_text_block::<SettingsDeveloperArtifactText>(
-        panel,
-        "artifacts",
-        "no artifacts yet",
-    );
+    spawn_developer_tabs(panel);
+    spawn_developer_tab_panel(panel, DeveloperPanelTab::Status, true, |panel| {
+        spawn_developer_text_block::<SettingsDeveloperCurrentText>(panel, "current", "idle");
+        spawn_developer_text_block::<SettingsDeveloperTokenText>(panel, "tokens", "no token usage");
+    });
+    spawn_developer_tab_panel(panel, DeveloperPanelTab::Events, false, |panel| {
+        spawn_developer_text_block::<SettingsDeveloperEventsText>(
+            panel,
+            "events",
+            "no scene build events yet",
+        );
+    });
+    spawn_developer_tab_panel(panel, DeveloperPanelTab::Artifacts, false, |panel| {
+        spawn_developer_text_block::<SettingsDeveloperArtifactText>(
+            panel,
+            "artifacts",
+            "no artifacts yet",
+        );
+    });
+    spawn_developer_tab_panel(panel, DeveloperPanelTab::Visuals, false, |panel| {
+        spawn_developer_text_block::<SettingsDeveloperVisualText>(
+            panel,
+            "visual artifacts",
+            "no visual artifacts yet",
+        );
+        panel.spawn((
+            SettingsDeveloperVisualGrid::default(),
+            Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
+                ..default()
+            },
+        ));
+    });
+}
+
+fn spawn_developer_tabs(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|row| {
+            for tab in [
+                DeveloperPanelTab::Status,
+                DeveloperPanelTab::Events,
+                DeveloperPanelTab::Artifacts,
+                DeveloperPanelTab::Visuals,
+            ] {
+                row.spawn((
+                    Button,
+                    SettingsDeveloperTabButton { tab },
+                    Node {
+                        height: Val::Px(26.0),
+                        padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        ..default()
+                    },
+                    BorderColor::all(BUTTON_BORDER),
+                    BackgroundColor(BUTTON_BG),
+                ))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new(tab.label()),
+                        TextFont::from_font_size(11.0),
+                        TextColor(BUTTON_TEXT),
+                        ButtonLabel,
+                    ));
+                });
+            }
+        });
+}
+
+fn spawn_developer_tab_panel(
+    parent: &mut ChildSpawnerCommands,
+    tab: DeveloperPanelTab,
+    visible: bool,
+    spawn_content: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    parent
+        .spawn((
+            SettingsDeveloperTabPanel { tab },
+            Node {
+                width: Val::Percent(100.0),
+                display: if visible {
+                    Display::Flex
+                } else {
+                    Display::None
+                },
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(10.0),
+                ..default()
+            },
+            if visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            },
+        ))
+        .with_children(spawn_content);
 }
 
 fn spawn_developer_text_block<T: Component + Default>(
@@ -5588,6 +6166,57 @@ fn spawn_developer_text_block<T: Component + Default>(
                 TextColor(Color::srgb(0.76, 0.81, 0.9)),
                 T::default(),
             ));
+        });
+}
+
+fn spawn_developer_visual_preview_row(
+    parent: &mut ChildSpawnerCommands,
+    preview: &ProcessingArtifactPreview,
+) {
+    let filename = preview
+        .path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(preview.path.as_str());
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(8.0),
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Node {
+                    width: Val::Px(168.0),
+                    height: Val::Px(96.0),
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.04, 0.045, 0.055)),
+                BorderColor::all(Color::srgb(0.22, 0.26, 0.34)),
+                ImageNode::new(preview.image.clone()),
+            ));
+            row.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(3.0),
+                flex_grow: 1.0,
+                ..default()
+            })
+            .with_children(|labels| {
+                labels.spawn((
+                    Text::new(preview.kind.label()),
+                    TextFont::from_font_size(11.0),
+                    TextColor(Color::srgb(0.62, 0.7, 0.86)),
+                ));
+                labels.spawn((
+                    Text::new(ellipsize_text(filename, 42)),
+                    TextFont::from_font_size(10.5),
+                    TextColor(Color::srgb(0.78, 0.82, 0.9)),
+                ));
+            });
         });
 }
 
@@ -5963,6 +6592,14 @@ fn spawn_scene_setting_row(
                 spawn_scene_setting_step_button(control, setting, step);
             });
         });
+}
+
+fn spawn_scene_settings_section_label(parent: &mut ChildSpawnerCommands, label: &'static str) {
+    parent.spawn((
+        Text::new(label),
+        TextFont::from_font_size(11.0),
+        TextColor(Color::srgb(0.58, 0.64, 0.74)),
+    ));
 }
 
 fn spawn_scene_toggle_row(
@@ -6375,7 +7012,7 @@ fn adjust_scene_setting(
         }
     }
     info!(
-        "explicit scene settings: image_to_3d={} quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={}",
+        "explicit scene settings: image_to_3d={} quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={} lift_assets={} locate={} depth={} segmentation={} canonical_pose={} pose_fit={} feedback={} artifacts={} promote={}",
         pipeline_label(settings.image_to_3d_model),
         settings.quality_profile.label(),
         settings.candidate_count,
@@ -6387,7 +7024,44 @@ fn adjust_scene_setting(
             "on"
         } else {
             "off"
-        }
+        },
+        if settings.lift_assets { "on" } else { "off" },
+        if settings.locate_anything_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        if settings.depth_enabled { "on" } else { "off" },
+        if settings.segmentation_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        if settings.canonical_pose_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        if settings.pose_fit_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        if settings.feedback_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        if settings.write_artifacts {
+            "on"
+        } else {
+            "off"
+        },
+        if settings.promote_to_catalog {
+            "on"
+        } else {
+            "off"
+        },
     );
 }
 
@@ -6499,6 +7173,15 @@ fn scene_toggle_value_text(
     let enabled = match setting {
         SceneToggleSetting::Pbr => settings.pbr_enabled,
         SceneToggleSetting::CatalogReuse => settings.allow_catalog_reuse,
+        SceneToggleSetting::LiftAssets => settings.lift_assets,
+        SceneToggleSetting::LocateAnything => settings.locate_anything_enabled,
+        SceneToggleSetting::Depth => settings.depth_enabled,
+        SceneToggleSetting::Segmentation => settings.segmentation_enabled,
+        SceneToggleSetting::CanonicalPose => settings.canonical_pose_enabled,
+        SceneToggleSetting::PoseFit => settings.pose_fit_enabled,
+        SceneToggleSetting::Feedback => settings.feedback_enabled,
+        SceneToggleSetting::WriteArtifacts => settings.write_artifacts,
+        SceneToggleSetting::PromoteToCatalog => settings.promote_to_catalog,
     };
     if enabled {
         "on".to_string()
@@ -7080,6 +7763,7 @@ mod tests {
             .entity_mut(stats_button)
             .insert(Interaction::Pressed);
         app.update();
+        app.update();
 
         let world = app.world_mut();
         let mut panels = world.query::<(&CatalogSourceImageTabPanel, &Node)>();
@@ -7174,6 +7858,143 @@ mod tests {
             vec![SynthesisModel::Triposg],
             "scene image-to-3d selection must not mutate the object catalog pipeline"
         );
+    }
+
+    #[test]
+    fn scene_optional_stage_toggle_labels_track_settings() {
+        let mut settings = ScenePipelineUiSettings::default();
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::LocateAnything),
+            "on"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::Depth),
+            "on"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::Segmentation),
+            "on"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::CanonicalPose),
+            "on"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::PoseFit),
+            "on"
+        );
+
+        settings.locate_anything_enabled = false;
+        settings.depth_enabled = false;
+        settings.segmentation_enabled = false;
+        settings.canonical_pose_enabled = false;
+        settings.pose_fit_enabled = false;
+
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::LocateAnything),
+            "off"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::Depth),
+            "off"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::Segmentation),
+            "off"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::CanonicalPose),
+            "off"
+        );
+        assert_eq!(
+            scene_toggle_value_text(&settings, SceneToggleSetting::PoseFit),
+            "off"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn processing_artifact_classifier_prioritizes_scene_intermediates() {
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new("tmp/runs/demo/detections_overlay.png")),
+            Some(ProcessingArtifactVisualKind::Locate)
+        );
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new("tmp/runs/demo/depth_map.png")),
+            Some(ProcessingArtifactVisualKind::Depth)
+        );
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new(
+                "tmp/runs/demo/objects/crops/chair_0.jpg"
+            )),
+            Some(ProcessingArtifactVisualKind::Crop)
+        );
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new(
+                "tmp/runs/demo/canonical_pose/chair_selection.png"
+            )),
+            Some(ProcessingArtifactVisualKind::Canonical)
+        );
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new(
+                "tmp/runs/demo/iterations/iter_03/screenshot.png"
+            )),
+            Some(ProcessingArtifactVisualKind::Feedback)
+        );
+    }
+
+    #[test]
+    fn developer_visual_tab_renders_artifact_previews() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Triposg];
+        let mut app = ui_test_app(Some(args));
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.world_mut().resource_mut::<SettingsModalState>().tab = SettingsModalTab::Developer;
+        app.world_mut().resource_mut::<DeveloperPanelState>().tab = DeveloperPanelTab::Visuals;
+        let artifact_path = std::env::temp_dir().join(format!(
+            "bevy_synth_ui_{}_detections_overlay.png",
+            std::process::id()
+        ));
+        image::save_buffer_with_format(
+            &artifact_path,
+            &[
+                255, 255, 255, 255, 64, 64, 64, 255, 64, 64, 64, 255, 255, 255, 255, 255,
+            ],
+            2,
+            2,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("write preview artifact");
+        {
+            let mut state = app.world_mut().resource_mut::<SceneProcessingState>();
+            state
+                .recent_artifacts
+                .push_front(artifact_path.display().to_string());
+        }
+
+        app.update();
+        app.update();
+
+        let world = app.world_mut();
+        let mut grids = world.query::<(&SettingsDeveloperVisualGrid, &Children)>();
+        let child_counts = grids
+            .iter(world)
+            .map(|(_, children)| children.len())
+            .collect::<Vec<_>>();
+        assert_eq!(child_counts, vec![1]);
+        let mut texts = world.query::<&Text>();
+        let values = texts
+            .iter(world)
+            .map(|text| text.0.clone())
+            .collect::<Vec<_>>();
+        assert!(values.iter().any(|text| text == "locate"));
+        assert!(
+            values
+                .iter()
+                .any(|text| text.contains("detections_overlay.png"))
+        );
+        std::fs::remove_file(artifact_path).expect("remove preview artifact");
     }
 
     #[test]

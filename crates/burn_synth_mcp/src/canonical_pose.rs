@@ -129,14 +129,15 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
     for (report_index, report) in run.reports.iter_mut().enumerate() {
+        let prior_selection = report.selected.clone();
         let source_metrics = report
             .source_crop_path
             .as_deref()
-            .and_then(|path| rendered_pose_image_metrics(path).ok());
+            .and_then(|path| reference_pose_image_metrics(path).ok().flatten());
         let generated_metrics = report
             .generated_image_path
             .as_deref()
-            .and_then(|path| rendered_pose_image_metrics(path).ok());
+            .and_then(|path| reference_pose_image_metrics(path).ok().flatten());
         if source_metrics.is_none() && generated_metrics.is_none() {
             skipped.push(json!({
                 "index": report_index,
@@ -151,9 +152,17 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
             let Some(render_path) = candidate.rendered_image_path.as_deref() else {
                 continue;
             };
-            let Ok(rendered_metrics) = rendered_pose_image_metrics(render_path) else {
+            let Ok(pixel_metrics) = rendered_pose_image_metrics(render_path) else {
                 continue;
             };
+            if let Err(err) = validate_canonical_pose_thumbnail_metrics(&pixel_metrics) {
+                candidate.metrics["render_similarity_error"] = json!(err);
+                continue;
+            }
+            let projected_bbox = projected_bbox_for_pose_candidate(candidate);
+            let rendered_metrics = projected_bbox
+                .map(|bbox| pixel_metrics.clone().with_foreground_bbox(bbox))
+                .unwrap_or_else(|| pixel_metrics.clone());
             let generated_score = generated_metrics
                 .as_ref()
                 .map(|metrics| rendered_pose_similarity(&rendered_metrics, metrics))
@@ -183,6 +192,8 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
                 "generated_score": generated_score,
                 "source_score": source_score,
                 "rendered": rendered_metrics,
+                "pixel_rendered": pixel_metrics,
+                "projected_bbox_used": projected_bbox,
                 "generated_available": generated_metrics.is_some(),
                 "source_available": source_metrics.is_some(),
             });
@@ -212,26 +223,36 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
             continue;
         };
         let candidate = report.candidates[candidate_vec_index].clone();
-        report.selected = CanonicalPoseSelection {
-            candidate_index: candidate.candidate_index,
-            yaw_offset_degrees: candidate.yaw_offset_degrees,
-            confidence: measured_score.clamp(0.0, 1.0),
-            source: SceneAssetFrameSource::VisualRenderSweep,
-            rationale: "selected from rendered asset thumbnail similarity against source/generated object evidence".to_string(),
-        };
-        report.fallback_used = measured_score < 0.38;
-        if report.fallback_used {
+        let fallback_used = measured_score < 0.38;
+        if fallback_used {
             report
                 .warnings
                 .push("rendered thumbnail similarity below confidence threshold".to_string());
-            report.selected.source = SceneAssetFrameSource::AmbiguousFallback;
+            report.selected = CanonicalPoseSelection {
+                candidate_index: prior_selection.candidate_index,
+                yaw_offset_degrees: prior_selection.yaw_offset_degrees,
+                confidence: measured_score.clamp(0.0, 1.0),
+                source: SceneAssetFrameSource::AmbiguousFallback,
+                rationale: "rendered thumbnail evidence was below confidence threshold; retained the prior deterministic canonical frame".to_string(),
+            };
+        } else {
+            report.selected = CanonicalPoseSelection {
+                candidate_index: candidate.candidate_index,
+                yaw_offset_degrees: candidate.yaw_offset_degrees,
+                confidence: measured_score.clamp(0.0, 1.0),
+                source: SceneAssetFrameSource::VisualRenderSweep,
+                rationale: "selected from rendered asset thumbnail similarity against source/generated object evidence".to_string(),
+            };
         }
+        report.fallback_used = fallback_used;
         applied.push(json!({
             "index": report_index,
             "asset_id": report.asset_id,
             "candidate_index": report.selected.candidate_index,
             "yaw_offset_degrees": report.selected.yaw_offset_degrees,
             "confidence": report.selected.confidence,
+            "best_measured_candidate_index": candidate.candidate_index,
+            "best_measured_yaw_offset_degrees": candidate.yaw_offset_degrees,
             "generated_score": generated_score,
             "source_score": source_score,
             "rendered_metrics": metrics,
@@ -248,6 +269,151 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
         "skipped": skipped,
     });
     run.selection_report.clone()
+}
+
+pub(crate) fn canonical_pose_verification_report(
+    mode: SceneCanonicalPoseMode,
+    run: &CanonicalPoseCalibrationRun,
+) -> Value {
+    let visual_evidence_required = matches!(
+        mode,
+        SceneCanonicalPoseMode::Auto
+            | SceneCanonicalPoseMode::RenderSweep
+            | SceneCanonicalPoseMode::Openai
+    );
+    let mut candidate_count = 0usize;
+    let mut rendered_candidate_count = 0usize;
+    let mut visual_selected_count = 0usize;
+    let mut fallback_assets = Vec::new();
+    let mut low_confidence_assets = Vec::new();
+    let mut missing_rendered_assets = Vec::new();
+    let mut source_evidence_missing_assets = Vec::new();
+    let mut generated_evidence_missing_assets = Vec::new();
+
+    for report in &run.reports {
+        candidate_count += report.candidates.len();
+        let rendered_count = report
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .rendered_image_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+            })
+            .count();
+        rendered_candidate_count += rendered_count;
+        if visual_evidence_required && rendered_count == 0 {
+            missing_rendered_assets.push(json!({
+                "asset_id": report.asset_id,
+                "object_id": report.object_id,
+                "label": report.label,
+                "reason": "no rendered canonical pose candidate thumbnails were available",
+            }));
+        }
+        if report.source_crop_path.is_none() {
+            source_evidence_missing_assets.push(json!({
+                "asset_id": report.asset_id,
+                "object_id": report.object_id,
+                "label": report.label,
+                "reason": "missing source crop evidence",
+            }));
+        }
+        if report.generated_image_path.is_none() {
+            generated_evidence_missing_assets.push(json!({
+                "asset_id": report.asset_id,
+                "object_id": report.object_id,
+                "label": report.label,
+                "reason": "missing generated object image evidence",
+            }));
+        }
+        if matches!(
+            report.selected.source,
+            SceneAssetFrameSource::VisualRenderSweep | SceneAssetFrameSource::GptVisualSelection
+        ) && !report.fallback_used
+        {
+            visual_selected_count += 1;
+        }
+        if report.fallback_used
+            || matches!(
+                report.selected.source,
+                SceneAssetFrameSource::AmbiguousFallback
+            )
+        {
+            fallback_assets.push(json!({
+                "asset_id": report.asset_id,
+                "object_id": report.object_id,
+                "label": report.label,
+                "selected_source": report.selected.source,
+                "confidence": report.selected.confidence,
+                "warnings": report.warnings,
+            }));
+        } else if report.selected.confidence < 0.55 {
+            low_confidence_assets.push(json!({
+                "asset_id": report.asset_id,
+                "object_id": report.object_id,
+                "label": report.label,
+                "selected_source": report.selected.source,
+                "confidence": report.selected.confidence,
+            }));
+        }
+    }
+
+    let status = if mode == SceneCanonicalPoseMode::Off {
+        "disabled"
+    } else if mode == SceneCanonicalPoseMode::Heuristic {
+        "heuristic"
+    } else if run.reports.is_empty() {
+        "no_assets"
+    } else if !missing_rendered_assets.is_empty() {
+        "invalid"
+    } else if !fallback_assets.is_empty() {
+        "fallback"
+    } else if !low_confidence_assets.is_empty() {
+        "low_confidence"
+    } else if visual_selected_count == run.reports.len() {
+        "verified"
+    } else {
+        "partial"
+    };
+    let requires_attention = visual_evidence_required
+        && matches!(
+            status,
+            "invalid" | "fallback" | "low_confidence" | "partial"
+        )
+        && !run.reports.is_empty();
+
+    json!({
+        "status": status,
+        "visual_verified": status == "verified",
+        "requires_attention": requires_attention,
+        "mode": canonical_pose_mode_label(mode),
+        "visual_evidence_required": visual_evidence_required,
+        "asset_count": run.reports.len(),
+        "candidate_count": candidate_count,
+        "rendered_candidate_count": rendered_candidate_count,
+        "visual_selected_count": visual_selected_count,
+        "fallback_count": fallback_assets.len(),
+        "missing_rendered_asset_count": missing_rendered_assets.len(),
+        "source_evidence_missing_count": source_evidence_missing_assets.len(),
+        "generated_evidence_missing_count": generated_evidence_missing_assets.len(),
+        "low_confidence_count": low_confidence_assets.len(),
+        "selector": run
+            .selection_report
+            .get("selector")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "render_report": run
+            .selection_report
+            .get("render_report")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "missing_rendered_assets": missing_rendered_assets,
+        "fallback_assets": fallback_assets,
+        "low_confidence_assets": low_confidence_assets,
+        "source_evidence_missing_assets": source_evidence_missing_assets,
+        "generated_evidence_missing_assets": generated_evidence_missing_assets,
+    })
 }
 
 pub(crate) fn canonical_pose_selection_prompt(task: &Value) -> String {
@@ -271,6 +437,80 @@ struct RenderedPoseImageMetrics {
     foreground_center: [f32; 2],
     foreground_aspect: f32,
     mean_luma: f32,
+}
+
+impl RenderedPoseImageMetrics {
+    fn with_foreground_bbox(mut self, bbox: [f32; 4]) -> Self {
+        let bbox = [
+            bbox[0].clamp(0.0, 1.0),
+            bbox[1].clamp(0.0, 1.0),
+            bbox[2].clamp(0.0, 1.0),
+            bbox[3].clamp(0.0, 1.0),
+        ];
+        let width = (bbox[2] - bbox[0]).max(1.0 / self.width.max(1) as f32);
+        let height = (bbox[3] - bbox[1]).max(1.0 / self.height.max(1) as f32);
+        self.foreground_bbox = bbox;
+        self.foreground_center = [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5];
+        self.foreground_aspect = width / height;
+        self.foreground_area_ratio = width * height;
+        self
+    }
+
+    fn foreground_bbox_area_ratio(&self) -> f32 {
+        (self.foreground_bbox[2] - self.foreground_bbox[0]).max(0.0)
+            * (self.foreground_bbox[3] - self.foreground_bbox[1]).max(0.0)
+    }
+
+    fn is_informative_reference(&self) -> bool {
+        if self.foreground_area_ratio <= 0.002 {
+            return false;
+        }
+        let bbox_area = self.foreground_bbox_area_ratio();
+        if self.foreground_area_ratio >= 0.92 && bbox_area >= 0.92 {
+            return false;
+        }
+        true
+    }
+}
+
+fn reference_pose_image_metrics(path: &str) -> Result<Option<RenderedPoseImageMetrics>, String> {
+    if is_mask_artifact_path(path) {
+        return Ok(None);
+    }
+    let metrics = rendered_pose_image_metrics(path)?;
+    Ok(metrics.is_informative_reference().then_some(metrics))
+}
+
+fn is_mask_artifact_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/masks/") || normalized.ends_with("_mask.png")
+}
+
+fn validate_canonical_pose_thumbnail_metrics(
+    metrics: &RenderedPoseImageMetrics,
+) -> Result<(), String> {
+    const MIN_FOREGROUND_AREA_RATIO: f32 = 0.008;
+    let bbox_area = metrics.foreground_bbox_area_ratio();
+    if metrics.foreground_area_ratio < MIN_FOREGROUND_AREA_RATIO {
+        return Err(format!(
+            "canonical pose thumbnail foreground area {:.5} below {:.5}; capture is likely blank or background-only",
+            metrics.foreground_area_ratio, MIN_FOREGROUND_AREA_RATIO
+        ));
+    }
+    if metrics.foreground_area_ratio >= 0.92 && bbox_area >= 0.92 {
+        return Err(
+            "canonical pose thumbnail foreground covers the full frame; capture is likely blank or a non-isolated mask"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_pose_thumbnail_pixel_metrics(path: &Path) -> Result<Value, String> {
+    let path = path.display().to_string();
+    let metrics = rendered_pose_image_metrics(&path)?;
+    validate_canonical_pose_thumbnail_metrics(&metrics)?;
+    serde_json::to_value(metrics).map_err(|err| err.to_string())
 }
 
 fn rendered_pose_image_metrics(path: &str) -> Result<RenderedPoseImageMetrics, String> {
@@ -362,6 +602,24 @@ fn rendered_pose_image_metrics(path: &str) -> Result<RenderedPoseImageMetrics, S
         foreground_aspect: bbox_width as f32 / bbox_height as f32,
         mean_luma: (luma_sum / foreground.max(1) as f32) / 255.0,
     })
+}
+
+fn projected_bbox_for_pose_candidate(candidate: &CanonicalPoseCandidate) -> Option<[f32; 4]> {
+    let bbox = candidate
+        .metrics
+        .pointer("/render/status/projected_items/0/screen_bbox")?
+        .as_array()?;
+    if bbox.len() != 4 {
+        return None;
+    }
+    let mut output = [0.0f32; 4];
+    for (index, value) in bbox.iter().enumerate() {
+        output[index] = value.as_f64()? as f32;
+    }
+    if output[2] <= output[0] || output[3] <= output[1] {
+        return None;
+    }
+    Some(output)
 }
 
 fn rendered_pose_similarity(

@@ -51,7 +51,7 @@ impl Default for WasmInferencePreset {
             resolution: 31,
             faces: DEFAULT_TRIPOSG_TARGET_FACES,
             trellis_max_sparse_coords: 2_048,
-            trellis_pbr_enabled: false,
+            trellis_pbr_enabled: true,
             trellis_pbr_texture_size: 1024,
             flash_octree_depth: 8,
             // Keep wasm flash chunking conservative for broader WebGPU portability
@@ -197,7 +197,7 @@ mod tests {
                 "--rmbg-weights-precision",
                 "auto",
                 "--trellis-pbr",
-                "false",
+                "true",
             ]
         );
 
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(preset.triposplat_num_gaussians, 262_144);
         assert_eq!(preset.triposplat_erode_radius, 1);
         assert_eq!(preset.resolution, 31);
-        assert!(!preset.trellis_pbr_enabled);
+        assert!(preset.trellis_pbr_enabled);
         assert_eq!(preset.trellis_max_sparse_coords, 2048);
         assert_eq!(preset.trellis_pbr_texture_size, 1024);
         assert_eq!(preset.flash_octree_depth, 8);

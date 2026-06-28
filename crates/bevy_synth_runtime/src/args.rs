@@ -53,7 +53,7 @@ pub struct Args {
     pub trellis_quality: TrellisQuality,
 
     /// Enable Trellis PBR texture baking through the Rust/Burn o_voxel export path.
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub trellis_pbr: bool,
 
     /// Trellis PBR texture size for Rust/Burn o_voxel GLB export. Use 0 for the runtime default.
@@ -713,7 +713,7 @@ mod tests {
     fn trellis_settings_have_pipeline_specific_defaults_and_overrides() {
         let defaults = build_app_args(Args::parse_from(["bevy_synth"]));
         assert_eq!(defaults.trellis_quality, TrellisQuality::Low);
-        assert!(!defaults.trellis_pbr_enabled);
+        assert!(defaults.trellis_pbr_enabled);
         assert_eq!(
             defaults.trellis_pbr_texture_size,
             Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE)

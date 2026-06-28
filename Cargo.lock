@@ -1920,6 +1920,7 @@ dependencies = [
  "bevy_window",
  "bevy_winit",
  "crossbeam-channel",
+ "image",
  "js-sys",
  "log",
  "rfd",

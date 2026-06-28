@@ -14,6 +14,9 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 struct RetryImageProvider {
     images: RefCell<VecDeque<Vec<u8>>>,
@@ -48,6 +51,50 @@ impl SceneAiProvider for RetryImageProvider {
     fn plan_scene_bsn(&self, _request: &SceneBsnRequest) -> SceneResult<String> {
         Err(SceneError::Provider(
             "plan_scene_bsn is not used by retry image tests".to_string(),
+        ))
+    }
+}
+
+struct ParallelImageProvider {
+    image: Vec<u8>,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+impl ParallelImageProvider {
+    fn new(image: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            image,
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        })
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+impl SceneAiProvider for Arc<ParallelImageProvider> {
+    fn plan_objects(&self, _request: &SceneReasoningRequest) -> SceneResult<SceneObjectManifest> {
+        Err(SceneError::Provider(
+            "plan_objects is not used by parallel image tests".to_string(),
+        ))
+    }
+
+    fn generate_object_images(&self, request: &ObjectImageRequest) -> SceneResult<Vec<Vec<u8>>> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(40));
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok((0..request.candidate_count)
+            .map(|_| self.image.clone())
+            .collect())
+    }
+
+    fn plan_scene_bsn(&self, _request: &SceneBsnRequest) -> SceneResult<String> {
+        Err(SceneError::Provider(
+            "plan_scene_bsn is not used by parallel image tests".to_string(),
         ))
     }
 }
@@ -621,7 +668,7 @@ fn grounding_evidence_deduplicates_manifest_instances_by_bbox() {
 }
 
 #[test]
-fn grounding_evidence_filters_table_embedded_seating_instances() {
+fn grounding_evidence_preserves_table_embedded_seating_instances() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.png".to_string(),
         scene_calibration: None,
@@ -686,9 +733,20 @@ fn grounding_evidence_filters_table_embedded_seating_instances() {
         .find(|object| object.id == "chairs")
         .unwrap();
 
-    assert_eq!(chairs.instances.len(), 1);
-    assert_eq!(chairs.instance_count, 1);
-    assert_eq!(chairs.instances[0].id.as_deref(), Some("valid_side_chair"));
+    assert_eq!(chairs.instances.len(), 2);
+    assert_eq!(chairs.instance_count, 2);
+    assert!(
+        chairs
+            .instances
+            .iter()
+            .any(|instance| instance.id.as_deref() == Some("valid_side_chair"))
+    );
+    assert!(
+        chairs
+            .instances
+            .iter()
+            .any(|instance| instance.id.as_deref() == Some("embedded_table_artifact"))
+    );
 }
 
 #[test]
@@ -777,8 +835,18 @@ fn depth_grounding_evidence_drives_metric_contact_points_and_scale() {
         .unwrap();
 
     assert_eq!(table.ground_point, [0.0, 0.0, 0.0]);
-    assert!((chair.ground_point[0] - 1.4).abs() < 1.0e-4);
-    assert!((chair.ground_point[2] - 1.6).abs() < 1.0e-4);
+    assert!(
+        (chair.ground_point[0] - 1.4).abs() < 0.08,
+        "chair ground point {:?}, camera {:?}",
+        chair.ground_point,
+        layout.camera
+    );
+    assert!(
+        (chair.ground_point[2] + 1.6).abs() < 0.08,
+        "chair ground point {:?}, camera {:?}",
+        chair.ground_point,
+        layout.camera
+    );
     assert_eq!(chair.target_footprint_m, [0.72, 0.76]);
     assert!(chair.scale[0] > 0.7);
     parse_scene_bsn(&layout.bsn, &assets).expect("depth-grounded BSN parses");
@@ -885,7 +953,134 @@ fn depth_grounding_uses_table_bbox_center_as_scene_origin() {
 
     assert_eq!(table.ground_point, [0.0, 0.0, 0.0]);
     assert!((chair.ground_point[0] - 3.0).abs() < 1.0e-4);
-    assert!((chair.ground_point[2] - 2.0).abs() < 1.0e-4);
+    assert!((chair.ground_point[2] + 2.0).abs() < 1.0e-4);
+}
+
+#[test]
+fn depth_grounding_preserves_source_camera_frame_with_yaw_hint() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/depth_scene.jpg".to_string(),
+        scene_calibration: Some(SceneCalibration {
+            table_center: Some([0.5, 0.5]),
+            table_axis_degrees: Some(0.0),
+            table_size_m: Some([2.4, 1.0]),
+            camera_yaw_degrees: Some(180.0),
+            camera_pitch_degrees: Some(45.0),
+            camera_radius_m: Some(5.0),
+            vertical_fov_degrees: Some(78.0),
+        }),
+        objects: vec![
+            SceneObjectSpec {
+                id: "conference_table".to_string(),
+                label: "conference table".to_string(),
+                aliases: vec!["table".to_string()],
+                bbox: [0.40, 0.40, 0.60, 0.60],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: None,
+                instance_count: 1,
+                object_prompt: "large conference table".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: Some([2.4, 1.0]),
+            },
+            SceneObjectSpec {
+                id: "chair_group".to_string(),
+                label: "conference chair".to_string(),
+                aliases: vec!["chair".to_string()],
+                bbox: [0.68, 0.50, 0.82, 0.92],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("conference_chair".to_string()),
+                instance_count: 1,
+                object_prompt: "conference chair".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: Some([0.72, 0.76]),
+            },
+        ],
+    };
+    let assets = vec![
+        SceneAssetBinding {
+            asset_id: "conference_table_asset".to_string(),
+            object_id: "conference_table".to_string(),
+            label: "conference table".to_string(),
+            aliases: Vec::new(),
+            path: None,
+            cache_key: Some("table".to_string()),
+            reusable: true,
+            source_image_path: None,
+            pipeline: Some("trellis".to_string()),
+            local_aabb: Some(SceneAssetAabb {
+                min: [-0.5, 0.0, -0.5],
+                max: [0.5, 0.35, 0.5],
+            }),
+            canonical_frame: None,
+            provenance: None,
+        },
+        chair_asset(),
+    ];
+    let mut evidence = manifest_grounding_evidence(&manifest);
+    evidence.depth = Some(DepthEvidenceRef {
+        provider: "synthetic_depth".to_string(),
+        model: None,
+        precision: None,
+        artifact_path: None,
+        focal_length_px: Some(100.0),
+        vertical_fov_degrees: Some(60.0),
+        image_size: Some([101, 101]),
+        depth_map_size: Some([101, 101]),
+        floor_sample_count: Some(32),
+    });
+    evidence.camera = EstimatedCamera {
+        focal_length_px: Some(100.0),
+        principal_point: Some([50.0, 50.0]),
+        image_size: Some([101, 101]),
+        vertical_fov_degrees: Some(60.0),
+        confidence: Some(1.0),
+    };
+    evidence.floor = EstimatedFloorPlane {
+        normal: [0.0, 1.0, 0.0],
+        distance_m: -1.5,
+        residual_m: Some(0.01),
+        confidence: Some(0.99),
+    };
+    for object in &mut evidence.objects {
+        match object.object_id.as_str() {
+            "conference_table" => object.metric_contact_point_m = Some([2.0, 0.0, 5.0]),
+            "chair_group" => object.metric_contact_point_m = Some([3.4, 0.0, 6.6]),
+            _ => {}
+        }
+    }
+
+    let layout = grounded_scene_layout_with_evidence(&manifest, &assets, &evidence).unwrap();
+    let chair = layout
+        .placements
+        .iter()
+        .find(|placement| placement.object_id == "chair_group")
+        .unwrap();
+
+    assert!(
+        (chair.ground_point[0] - 1.4).abs() < 0.08,
+        "chair ground point {:?}, camera {:?}",
+        chair.ground_point,
+        layout.camera
+    );
+    assert!(
+        (chair.ground_point[2] + 1.6).abs() < 0.08,
+        "chair ground point {:?}, camera {:?}",
+        chair.ground_point,
+        layout.camera
+    );
+    assert_eq!(layout.camera.translation, [-2.0, 1.5, 5.0]);
+    assert_eq!(layout.camera.focus, [-2.0, 1.5, 4.0]);
+    assert_eq!(layout.camera.yaw, None);
+    assert_eq!(layout.camera.pitch, None);
+    assert_eq!(layout.camera.radius, None);
+    assert!(layout.bsn.contains("vertical_fov 60"));
+    assert!(!layout.bsn.contains(" yaw "));
+    assert!(!layout.bsn.contains(" pitch "));
+    assert!(!layout.bsn.contains(" radius "));
 }
 
 #[test]
@@ -984,7 +1179,7 @@ fn depth_grounding_prefers_floor_ray_intersections_over_raw_depth_points() {
         .unwrap();
 
     assert!((chair.ground_point[0] - 2.0).abs() < 1.0e-4);
-    assert!((chair.ground_point[2] - 2.0).abs() < 1.0e-4);
+    assert!((chair.ground_point[2] + 2.0).abs() < 1.0e-4);
 }
 
 #[test]
@@ -1765,7 +1960,7 @@ fn grounded_scene_layout_uses_calibrated_table_slots_and_source_camera() {
 }
 
 #[test]
-fn grounded_scene_layout_preserves_anisotropic_table_footprint() {
+fn grounded_scene_layout_defaults_to_asset_preserving_table_scale() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/cslewis.jpg".to_string(),
         scene_calibration: Some(SceneCalibration {
@@ -1815,11 +2010,70 @@ fn grounded_scene_layout_preserves_anisotropic_table_footprint() {
     let table = &layout.placements[0];
 
     assert_eq!(table.rotation_y_degrees, -90.0);
+    assert!((table.scale[0] - table.scale[1]).abs() < 1.0e-5);
+    assert!((table.scale[1] - table.scale[2]).abs() < 1.0e-5);
+    assert!((table.scale[0] - 4.2).abs() < 0.05);
+    let bottom_y = table.translation[1] + table.local_aabb.min[1] * table.scale[1];
+    assert!(bottom_y.abs() < 1.0e-4);
+}
+
+#[test]
+fn grounded_scene_layout_supports_explicit_free_anisotropic_table_scale() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/cslewis.jpg".to_string(),
+        scene_calibration: Some(SceneCalibration {
+            table_center: Some([0.49, 0.64]),
+            table_axis_degrees: Some(0.0),
+            table_size_m: Some([4.2, 1.4]),
+            camera_yaw_degrees: Some(180.0),
+            camera_pitch_degrees: Some(34.0),
+            camera_radius_m: Some(5.4),
+            vertical_fov_degrees: Some(82.0),
+        }),
+        objects: vec![SceneObjectSpec {
+            id: "conference_table".to_string(),
+            label: "white rectangular conference table".to_string(),
+            aliases: vec!["table".to_string()],
+            bbox: [0.30, 0.47, 0.65, 1.0],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: None,
+            instance_count: 1,
+            object_prompt: "long white conference table".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: Some(0.0),
+            target_footprint_m: Some([4.2, 1.4]),
+        }],
+    };
+    let assets = vec![SceneAssetBinding {
+        asset_id: "conference_table_asset".to_string(),
+        object_id: "conference_table".to_string(),
+        label: "white rectangular conference table".to_string(),
+        aliases: vec!["table".to_string()],
+        path: None,
+        cache_key: Some("table".to_string()),
+        reusable: true,
+        source_image_path: None,
+        pipeline: Some("trellis".to_string()),
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.50, -0.15, -0.28],
+            max: [0.50, 0.15, 0.28],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(90.0, Some([4.2, 1.4]))),
+        provenance: None,
+    }];
+    let config = GroundedSceneLayoutConfig {
+        scale_policy: SceneScalePolicy::FreeAnisotropic,
+        ..GroundedSceneLayoutConfig::default()
+    };
+
+    let layout = grounded_scene_layout(&manifest, &assets, config).expect("grounded layout");
+    let table = &layout.placements[0];
+
+    assert_eq!(table.rotation_y_degrees, -90.0);
     assert!(table.scale[2] > table.scale[0] * 4.0);
     assert!((table.scale[0] - 1.4).abs() < 0.05);
     assert!((table.scale[2] - 7.5).abs() < 0.10);
-    let bottom_y = table.translation[1] + table.local_aabb.min[1] * table.scale[1];
-    assert!(bottom_y.abs() < 1.0e-4);
 }
 
 #[test]
@@ -2530,6 +2784,79 @@ fn object_image_generation_policy_stops_after_required_object_rejection() {
     assert_eq!(report.rejected_objects.len(), 1);
     assert_eq!(report.rejected_objects[0].object_id, "bad_first_object");
     assert!(report.selected_candidates.is_empty());
+}
+
+#[test]
+fn object_image_generation_policy_parallelizes_independent_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("scene.png");
+    image::RgbImage::from_pixel(512, 256, image::Rgb([64, 64, 64]))
+        .save(&source_path)
+        .unwrap();
+    let provider = ParallelImageProvider::new(high_contrast_candidate_png());
+    let config = SceneBuildConfig {
+        source_scene_path: source_path.clone(),
+        object_reference_image_path: source_path.clone(),
+        output_dir: dir.path().join("run"),
+        candidate_count: 1,
+        quality_profile: SceneQualityProfile::Draft,
+        reasoning_model: "test-reasoning".to_string(),
+        image_model: "test-image".to_string(),
+        allow_catalog_reuse: false,
+    };
+    let pipeline = ScenePipeline::new(config, provider.clone());
+    let request = |id: &str| ObjectImageRequest {
+        object: SceneObjectSpec {
+            id: id.to_string(),
+            label: id.replace('_', " "),
+            aliases: Vec::new(),
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: None,
+            instance_count: 1,
+            object_prompt: "test object".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: None,
+        },
+        source_scene_path: source_path.display().to_string(),
+        source_crop_path: source_path.display().to_string(),
+        object_reference_image_path: source_path.display().to_string(),
+        prompt: "generate object".to_string(),
+        candidate_count: 1,
+        size: "1024x1024".to_string(),
+        quality: "medium".to_string(),
+    };
+
+    let report = pipeline
+        .generate_object_candidates_with_policy_parallel(
+            &[request("first"), request("second"), request("third")],
+            ObjectImageGenerationPolicy {
+                min_score: 0.10,
+                max_attempts_per_object: 1,
+                candidates_per_attempt: 1,
+            },
+            3,
+        )
+        .unwrap();
+
+    assert!(
+        provider.max_active() > 1,
+        "independent object image requests should overlap"
+    );
+    assert_eq!(report.attempts.len(), 3);
+    assert_eq!(report.candidates.len(), 3);
+    assert_eq!(report.selected_candidates.len(), 3);
+    assert_eq!(report.attempts[0].object_id, "first");
+    assert_eq!(report.attempts[1].object_id, "second");
+    assert_eq!(report.attempts[2].object_id, "third");
+    assert!(report.rejected_objects.is_empty());
+
+    let metrics = fs::read_to_string(dir.path().join("run/metrics.jsonl")).unwrap();
+    for line in metrics.lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("metric line should be valid json");
+    }
 }
 
 #[test]

@@ -13,10 +13,17 @@ use bevy_gaussian_splatting::{CloudSettings, PlanarGaussian3d, PlanarGaussian3dH
 use bevy_mesh::Mesh as BevyMesh;
 use bevy_synth_ui::{
     BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogState, CatalogStatus,
-    SceneProcessingState, ViewerAabbOverlayMode,
+    ScenePipelineUiSettings, SceneProcessingState, SceneQualityProfileSetting,
+    ViewerAabbOverlayMode,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use burn_synth_mcp::{SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase};
+use burn_synth_mcp::{
+    SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
+    SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
+    SceneScalePolicy, SceneSegmentationProvider, SynthesisModel as McpSynthesisModel,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use burn_synth_scene::SceneQualityProfile;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::prepare_startup_bsn_scene;
@@ -31,8 +38,8 @@ use crate::app::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
-    InferenceDispatchGate, load_generated_glb_mesh_asset, should_pause_render_during_inference,
-    should_wait_before_inference_dispatch,
+    InferenceDispatchGate, load_generated_glb_mesh_asset, scene_build_args_from_ui_settings,
+    should_pause_render_during_inference, should_wait_before_inference_dispatch,
 };
 use bevy_synth_runtime::args::{
     AppArgs, BackendKind, DEFAULT_TRELLIS_PBR_TEXTURE_SIZE, DinoBackend, MeshMode, QualityPreset,
@@ -60,7 +67,7 @@ fn test_args() -> AppArgs {
         triposplat_weights_root: None,
         trellis_image_large_root: None,
         trellis_quality: TrellisQuality::Low,
-        trellis_pbr_enabled: false,
+        trellis_pbr_enabled: true,
         trellis_pbr_texture_size: Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE),
         trellis_target_faces: None,
         trellis_max_sparse_coords: None,
@@ -114,6 +121,61 @@ fn dummy_mesh() -> SynthMesh {
         vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         faces: vec![[0, 1, 2]],
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scene_ui_stage_toggles_map_to_scene_build_args() {
+    let mut settings = ScenePipelineUiSettings::default();
+    assert_eq!(settings.quality_profile, SceneQualityProfileSetting::Fast);
+    assert_eq!(settings.candidate_count, 2);
+    assert_eq!(settings.feedback_iterations, 8);
+    assert!(settings.pbr_enabled);
+    assert_eq!(settings.target_faces, 80_000);
+    assert!(settings.canonical_pose_enabled);
+
+    settings.lift_assets = false;
+    settings.locate_anything_enabled = false;
+    settings.depth_enabled = false;
+    settings.segmentation_enabled = true;
+    settings.canonical_pose_enabled = false;
+    settings.pose_fit_enabled = false;
+    settings.feedback_enabled = true;
+    settings.feedback_iterations = 4;
+    settings.write_artifacts = false;
+    settings.promote_to_catalog = false;
+
+    let args = scene_build_args_from_ui_settings(
+        PathBuf::from("scene.jpg"),
+        Some(PathBuf::from("tmp/runs/test_scene")),
+        0,
+        vec![McpSynthesisModel::Trellis],
+        &settings,
+    );
+
+    assert!(!args.lift_assets);
+    assert!(!args.promote_to_catalog);
+    assert_eq!(args.composition_mode, SceneCompositionMode::Heuristic);
+    assert_eq!(args.canonical_pose, SceneCanonicalPoseMode::Off);
+    assert_eq!(args.scale_policy, SceneScalePolicy::AssetPreserving);
+    assert_eq!(args.depth_provider, SceneDepthProvider::None);
+    assert_eq!(args.locator, SceneLocatorProvider::Manifest);
+    assert!(args.locate_anything_backend.is_none());
+    assert_eq!(
+        args.segmentation_provider,
+        Some(SceneSegmentationProvider::Sam2)
+    );
+    assert!(!args.write_artifacts);
+    assert!(!args.save_pose_debug);
+    assert!(
+        !args.feedback,
+        "feedback must stay disabled when asset lifting is disabled"
+    );
+    assert_eq!(args.feedback_iters, 0);
+    assert_eq!(args.batch_size, Some(1));
+    assert_eq!(args.quality_profile, Some(SceneQualityProfile::Draft));
+    assert_eq!(args.trellis_pbr, Some(true));
+    assert_eq!(args.target_faces, Some(80_000));
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -74,6 +74,7 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         composition_mode: args.composition_mode,
         pose_fit: args.pose_fit,
         canonical_pose: args.canonical_pose,
+        scale_policy: args.scale_policy,
         max_pose_candidates: args.max_pose_candidates,
         save_pose_debug: args.save_pose_debug,
         depth_provider: args.depth_provider,
@@ -115,6 +116,7 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         composition_mode: args.composition_mode,
         pose_fit: args.pose_fit,
         canonical_pose: args.canonical_pose,
+        scale_policy: args.scale_policy,
         max_pose_candidates: args.max_pose_candidates,
         save_pose_debug: args.save_pose_debug,
         depth_provider: args.depth_provider,
@@ -199,6 +201,7 @@ fn run_scene_feedback_replay_command(
             capture_dir: Some(capture_dir),
             threshold_profile: args.feedback_threshold_profile,
             rotation_selector: args.feedback_rotation_selector,
+            scale_policy: SceneScalePolicy::AssetPreserving,
         },
     )?;
     println!(

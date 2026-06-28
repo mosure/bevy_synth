@@ -11,6 +11,34 @@ pub enum SceneQualityProfile {
     Quality,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneScalePolicy {
+    AssetPreserving,
+    BoundedAnisotropic,
+    FreeAnisotropic,
+}
+
+impl Default for SceneScalePolicy {
+    fn default() -> Self {
+        Self::AssetPreserving
+    }
+}
+
+impl SceneScalePolicy {
+    pub fn max_xz_anisotropy(self) -> Option<f32> {
+        match self {
+            Self::AssetPreserving => Some(1.0),
+            Self::BoundedAnisotropic => Some(1.25),
+            Self::FreeAnisotropic => None,
+        }
+    }
+
+    pub fn allows_axis_feedback(self) -> bool {
+        matches!(self, Self::FreeAnisotropic)
+    }
+}
+
 pub const DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE: f32 = 0.45;
 
 fn default_instance_count() -> usize {

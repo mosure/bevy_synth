@@ -21,7 +21,7 @@ pub use types::{
     LocateAnythingBackend, MeshOutputFormat, QualityPreset, SceneBuildExecutionKind,
     SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
     SceneDepthPrecision, SceneDepthProvider, SceneLocateAnythingPrecision, SceneLocatorProvider,
-    ScenePoseFitMode, SceneSegmentationPrecision, SceneSegmentationProvider,
+    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationPrecision, SceneSegmentationProvider,
     SceneSegmentationQuantization, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 

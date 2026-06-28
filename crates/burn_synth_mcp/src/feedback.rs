@@ -105,18 +105,22 @@ pub(crate) fn scene_composition_candidates(
     asset_bindings: &[SceneAssetBinding],
     grounding_evidence: &SceneGroundingEvidence,
     clear_existing: bool,
+    scale_policy: SceneScalePolicy,
 ) -> Result<Vec<SceneCompositionCandidate>, String> {
     scene_composition_candidate_modes(requested_mode, compare_feedback_candidates)
         .into_iter()
         .map(|mode| {
+            let mut config = GroundedSceneLayoutConfig::default();
+            config.scale_policy = scale_policy;
             let layout = match mode {
                 SceneCompositionMode::Heuristic => {
-                    grounded_scene_layout_for_manifest(manifest, asset_bindings)
+                    grounded_scene_layout(manifest, asset_bindings, config)
                 }
-                SceneCompositionMode::CvGrounded => grounded_scene_layout_with_evidence(
+                SceneCompositionMode::CvGrounded => grounded_scene_layout_with_evidence_config(
                     manifest,
                     asset_bindings,
                     grounding_evidence,
+                    config,
                 ),
             }
             .map_err(|err| err.to_string())?;
@@ -292,82 +296,102 @@ pub(crate) fn scene_feedback_metrics(
             .unwrap_or(yaw_correction.delta_degrees);
         let yaw_delta_abs = selected_yaw_delta.abs();
         let max_yaw_delta = feedback_max_yaw_delta_for_pass(profile, placement);
-        let (center_error, area_log2_error, aspect_log2_error, contact_error, score, passed) =
-            if let Some(observed_bbox) = observed_bbox {
-                let edge_crop_relax = source_edge_cropped
-                    && (feedback_edge_crop_can_relax_projection(placement) || uses_center_anchor);
-                let visible_bbox_scoring =
-                    source_edge_cropped || feedback_bbox_outside_frame(observed_bbox);
-                let expected_score_bbox = if visible_bbox_scoring {
-                    feedback_visible_bbox(expected_bbox).unwrap_or(expected_bbox)
-                } else {
-                    expected_bbox
-                };
-                let observed_score_bbox = if visible_bbox_scoring {
-                    feedback_visible_bbox(observed_bbox).unwrap_or(observed_bbox)
-                } else {
-                    observed_bbox
-                };
-                let expected_center = bbox_center(expected_score_bbox);
-                let observed_center = bbox_center(observed_score_bbox);
-                let center_error = distance2(expected_center, observed_center);
-                let expected_area = bbox_area(expected_score_bbox);
-                let observed_area = bbox_area(observed_score_bbox);
-                let area_log2_error = safe_log2_ratio(observed_area, expected_area).abs();
-                let aspect_log2_error = safe_log2_ratio(
-                    bbox_aspect(observed_score_bbox),
-                    bbox_aspect(expected_score_bbox),
-                )
-                .abs();
-                let observed_anchor =
-                    feedback_observed_anchor_pixel(placement, observed_bbox, observed_contact);
-                let contact_error = distance2(expected_anchor, observed_anchor);
-                let mut center_limit = feedback_center_error_limit(
-                    uses_center_anchor,
-                    contact_error,
-                    thresholds.max_center_error,
-                    thresholds.max_contact_error,
-                );
-                if edge_crop_relax
-                    && !uses_center_anchor
-                    && contact_error <= thresholds.max_contact_error
-                {
-                    center_limit = center_limit.max(1.0);
-                }
-                let area_limit = feedback_area_log2_error_limit(
-                    uses_center_anchor,
-                    feedback_repeated_object_like(placement),
-                    edge_crop_relax,
-                    center_error,
-                    contact_error,
-                    thresholds.max_area_log2_error,
-                    thresholds.max_center_error,
-                    thresholds.max_contact_error,
-                );
-                let center_score = (1.0 - center_error / center_limit.max(1.0e-5)).clamp(0.0, 1.0);
-                let contact_score = (1.0
-                    - contact_error / thresholds.max_contact_error.max(1.0e-5))
-                .clamp(0.0, 1.0);
-                let area_score = (1.0 - area_log2_error / area_limit.max(1.0e-5)).clamp(0.0, 1.0);
-                let score = if uses_center_anchor {
-                    center_score * 0.45 + contact_score * 0.25 + area_score * 0.30
-                } else {
-                    center_score * 0.20 + contact_score * 0.45 + area_score * 0.35
-                };
-                let passed = center_error <= center_limit
-                    && contact_error <= thresholds.max_contact_error
-                    && area_log2_error <= area_limit;
-                (
-                    center_error,
-                    area_log2_error,
-                    aspect_log2_error,
-                    contact_error,
-                    score,
-                    passed,
-                )
+        let (
+            center_error,
+            area_log2_error,
+            aspect_log2_error,
+            contact_error,
+            score,
+            passed,
+            bbox_overscan,
+            max_bbox_overscan,
+        ) = if let Some(observed_bbox) = observed_bbox {
+            let edge_crop_relax = source_edge_cropped
+                && (feedback_edge_crop_can_relax_projection(placement) || uses_center_anchor);
+            let visible_bbox_scoring =
+                source_edge_cropped || feedback_bbox_outside_frame(observed_bbox);
+            let bbox_overscan = feedback_bbox_overscan(observed_bbox);
+            let max_bbox_overscan = feedback_max_bbox_overscan(placement);
+            let use_full_bbox_for_area = bbox_overscan > max_bbox_overscan;
+            let expected_score_bbox = if visible_bbox_scoring {
+                feedback_visible_bbox(expected_bbox).unwrap_or(expected_bbox)
             } else {
-                (1.0, 8.0, 8.0, 1.0, 0.0, false)
+                expected_bbox
             };
+            let observed_score_bbox = if visible_bbox_scoring && !use_full_bbox_for_area {
+                feedback_visible_bbox(observed_bbox).unwrap_or(observed_bbox)
+            } else {
+                observed_bbox
+            };
+            let expected_center = bbox_center(expected_score_bbox);
+            let observed_center = bbox_center(observed_score_bbox);
+            let center_error = distance2(expected_center, observed_center);
+            let expected_area = bbox_area(expected_score_bbox);
+            let observed_area = bbox_area(observed_score_bbox);
+            let area_log2_error = safe_log2_ratio(observed_area, expected_area).abs();
+            let aspect_log2_error = safe_log2_ratio(
+                bbox_aspect(observed_score_bbox),
+                bbox_aspect(expected_score_bbox),
+            )
+            .abs();
+            let observed_anchor = if uses_center_anchor {
+                observed_center
+            } else {
+                feedback_observed_anchor_pixel(placement, observed_bbox, observed_contact)
+            };
+            let contact_error = distance2(expected_anchor, observed_anchor);
+            let mut center_limit = feedback_center_error_limit(
+                uses_center_anchor,
+                contact_error,
+                thresholds.max_center_error,
+                thresholds.max_contact_error,
+            );
+            if edge_crop_relax
+                && !uses_center_anchor
+                && contact_error <= thresholds.max_contact_error
+            {
+                center_limit = center_limit.max(1.0);
+            }
+            let area_limit = feedback_area_log2_error_limit(
+                uses_center_anchor,
+                feedback_repeated_object_like(placement),
+                edge_crop_relax,
+                center_error,
+                contact_error,
+                thresholds.max_area_log2_error,
+                thresholds.max_center_error,
+                thresholds.max_contact_error,
+            );
+            let center_score = (1.0 - center_error / center_limit.max(1.0e-5)).clamp(0.0, 1.0);
+            let contact_score =
+                (1.0 - contact_error / thresholds.max_contact_error.max(1.0e-5)).clamp(0.0, 1.0);
+            let area_score = (1.0 - area_log2_error / area_limit.max(1.0e-5)).clamp(0.0, 1.0);
+            let score = if uses_center_anchor {
+                center_score * 0.45 + contact_score * 0.25 + area_score * 0.30
+            } else {
+                center_score * 0.20 + contact_score * 0.45 + area_score * 0.35
+            };
+            let overscan_passed = bbox_overscan <= max_bbox_overscan;
+            let overscan_score =
+                (1.0 - bbox_overscan / (max_bbox_overscan * 1.75).max(1.0e-5)).clamp(0.0, 1.0);
+            let score = score * (0.65 + 0.35 * overscan_score);
+            let passed = center_error <= center_limit
+                && contact_error <= thresholds.max_contact_error
+                && area_log2_error <= area_limit
+                && overscan_passed;
+            (
+                center_error,
+                area_log2_error,
+                aspect_log2_error,
+                contact_error,
+                score,
+                passed,
+                bbox_overscan,
+                max_bbox_overscan,
+            )
+        } else {
+            (1.0, 8.0, 8.0, 1.0, 0.0, false, 1.0, 0.0)
+        };
         if passed {
             passed_count += 1;
         }
@@ -377,8 +401,6 @@ pub(crate) fn scene_feedback_metrics(
         score_total += score;
         let observed_bbox = observed_bbox.unwrap_or([0.0, 0.0, 0.0, 0.0]);
         let observed_contact = observed_contact.unwrap_or(bbox_center(observed_bbox));
-        let observed_anchor =
-            feedback_observed_anchor_pixel(placement, observed_bbox, Some(observed_contact));
         let visible_bbox_scoring =
             source_edge_cropped || feedback_bbox_outside_frame(observed_bbox);
         let expected_delta_bbox = if visible_bbox_scoring {
@@ -391,8 +413,18 @@ pub(crate) fn scene_feedback_metrics(
         } else {
             observed_bbox
         };
+        let observed_anchor = if feedback_uses_bbox_center_anchor(placement) {
+            bbox_center(observed_delta_bbox)
+        } else {
+            feedback_observed_anchor_pixel(placement, observed_bbox, Some(observed_contact))
+        };
         let expected_area = bbox_area(expected_delta_bbox);
-        let observed_area = bbox_area(observed_delta_bbox);
+        let scale_observed_bbox = if bbox_overscan > max_bbox_overscan {
+            observed_bbox
+        } else {
+            observed_delta_bbox
+        };
+        let observed_area = bbox_area(scale_observed_bbox);
         let scale_multiplier = if observed_area > 1.0e-5 {
             (expected_area / observed_area).sqrt().clamp(0.82, 1.22)
         } else {
@@ -506,6 +538,8 @@ pub(crate) fn scene_feedback_metrics(
             "contact_error": contact_error,
             "area_log2_error": area_log2_error,
             "aspect_log2_error": aspect_log2_error,
+            "bbox_overscan": bbox_overscan,
+            "max_bbox_overscan": max_bbox_overscan,
             "score": score,
             "passed": passed,
             "translation_delta": translation_delta,
@@ -660,6 +694,12 @@ pub(crate) fn feedback_uses_bbox_center_anchor(placement: &GroundedScenePlacemen
         || descriptor.contains("desk")
         || descriptor.contains("counter")
         || descriptor.contains("bench")
+        || (feedback_source_bbox_edge_cropped(placement)
+            && (descriptor.contains("sofa")
+                || descriptor.contains("couch")
+                || descriptor.contains("sectional")
+                || descriptor.contains("loveseat")
+                || descriptor.contains("banquette")))
 }
 
 pub(crate) fn feedback_source_bbox_edge_cropped(placement: &GroundedScenePlacement) -> bool {
@@ -701,6 +741,38 @@ pub(crate) fn feedback_bbox_outside_frame(bbox: [f32; 4]) -> bool {
     bbox[0] < -1.0e-3 || bbox[1] < -1.0e-3 || bbox[2] > 1.0 + 1.0e-3 || bbox[3] > 1.0 + 1.0e-3
 }
 
+pub(crate) fn feedback_bbox_overscan(bbox: [f32; 4]) -> f32 {
+    [
+        (-bbox[0]).max(0.0),
+        (-bbox[1]).max(0.0),
+        (bbox[2] - 1.0).max(0.0),
+        (bbox[3] - 1.0).max(0.0),
+    ]
+    .into_iter()
+    .fold(0.0f32, f32::max)
+}
+
+pub(crate) fn feedback_max_bbox_overscan(placement: &GroundedScenePlacement) -> f32 {
+    let descriptor = format!("{} {}", placement.object_id, placement.label).to_ascii_lowercase();
+    if !feedback_source_bbox_edge_cropped(placement) {
+        return 0.08;
+    }
+    if feedback_repeated_object_like(placement)
+        || descriptor.contains("chair")
+        || descriptor.contains("stool")
+    {
+        0.85
+    } else if descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+    {
+        0.38
+    } else {
+        0.25
+    }
+}
+
 pub(crate) fn feedback_visible_bbox(bbox: [f32; 4]) -> Option<[f32; 4]> {
     let clipped = [
         bbox[0].clamp(0.0, 1.0),
@@ -711,7 +783,15 @@ pub(crate) fn feedback_visible_bbox(bbox: [f32; 4]) -> Option<[f32; 4]> {
     (bbox_area(clipped) > 1.0e-5).then_some(clipped)
 }
 
+#[cfg(test)]
 pub(crate) fn feedback_layout_deltas(metrics: &Value) -> Value {
+    feedback_layout_deltas_with_policy(metrics, SceneScalePolicy::AssetPreserving)
+}
+
+pub(crate) fn feedback_layout_deltas_with_policy(
+    metrics: &Value,
+    scale_policy: SceneScalePolicy,
+) -> Value {
     let objects = metrics
         .get("objects")
         .and_then(Value::as_array)
@@ -802,7 +882,7 @@ pub(crate) fn feedback_layout_deltas(metrics: &Value) -> Value {
                 .unwrap_or(1.0)
                 .clamp(0.82, 1.22);
             let object_scale = damped_feedback_scale_multiplier(object, object_scale);
-            let axis_scale = feedback_axis_scale_multiplier(object);
+            let axis_scale = feedback_axis_scale_multiplier(object, scale_policy);
             FeedbackDeltaDraft {
                 index: object.get("index").cloned().unwrap_or(Value::Null),
                 translation_delta: object
@@ -874,7 +954,13 @@ pub(crate) struct FeedbackDeltaDraft {
     pub(crate) ground_anchor_max_drift_m: Option<f32>,
 }
 
-pub(crate) fn feedback_axis_scale_multiplier(object: &Value) -> Option<[f64; 3]> {
+pub(crate) fn feedback_axis_scale_multiplier(
+    object: &Value,
+    scale_policy: SceneScalePolicy,
+) -> Option<[f64; 3]> {
+    if !scale_policy.allows_axis_feedback() {
+        return None;
+    }
     if !feedback_json_object_is_table_like(object) {
         return None;
     }
@@ -1132,7 +1218,14 @@ pub(crate) fn json_footprint_rect(value: &Value) -> Option<FootprintRect> {
 
 pub(crate) fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -> f64 {
     if feedback_json_object_is_table_like(object) {
-        return 1.0;
+        if object
+            .get("source_edge_cropped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return 1.0;
+        }
+        return raw_scale.clamp(0.88, 1.18);
     }
     let raw_scale = raw_scale.clamp(0.82, 1.22);
     if !object
@@ -1245,9 +1338,22 @@ pub(crate) fn feedback_scale_group_key(object: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_feedback_deltas_to_commands(
     commands: &[Value],
     deltas: &Value,
+) -> Result<Vec<Value>, String> {
+    apply_feedback_deltas_to_commands_with_policy(
+        commands,
+        deltas,
+        SceneScalePolicy::AssetPreserving,
+    )
+}
+
+pub(crate) fn apply_feedback_deltas_to_commands_with_policy(
+    commands: &[Value],
+    deltas: &Value,
+    scale_policy: SceneScalePolicy,
 ) -> Result<Vec<Value>, String> {
     let object_deltas = deltas
         .get("objects")
@@ -1260,7 +1366,7 @@ pub(crate) fn apply_feedback_deltas_to_commands(
         let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
         if command_type == "spawn_cached" || command_type == "spawn_path" {
             if let Some(delta) = object_deltas.get(spawn_index) {
-                apply_object_delta_to_command(command, delta)?;
+                apply_object_delta_to_command(command, delta, scale_policy)?;
             }
             spawn_index += 1;
         } else if command_type == "set_camera" {
@@ -1340,6 +1446,7 @@ pub(crate) fn normalize_reused_command_scales(commands: &mut [Value]) {
 pub(crate) fn apply_object_delta_to_command(
     command: &mut Value,
     delta: &Value,
+    scale_policy: SceneScalePolicy,
 ) -> Result<(), String> {
     let mut translation = command
         .get("translation")
@@ -1382,6 +1489,7 @@ pub(crate) fn apply_object_delta_to_command(
             *value = (*value * multiplier).clamp(0.05, 20.0);
         }
     }
+    scale = apply_feedback_scale_policy(scale, scale_policy);
     command["scale"] = json!(scale);
 
     let yaw_delta = delta
@@ -1398,6 +1506,34 @@ pub(crate) fn apply_object_delta_to_command(
         command["rotation"] = json!(quat_from_y_degrees(target_yaw));
     }
     Ok(())
+}
+
+fn apply_feedback_scale_policy(scale: [f32; 3], scale_policy: SceneScalePolicy) -> [f32; 3] {
+    let Some(max_ratio) = scale_policy.max_xz_anisotropy() else {
+        return scale;
+    };
+    if max_ratio <= 1.0 + f32::EPSILON {
+        let uniform = ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0);
+        return [uniform, uniform, uniform];
+    }
+    let x = scale[0].abs().clamp(0.05, 20.0);
+    let z = scale[2].abs().clamp(0.05, 20.0);
+    let ratio = (x.max(z) / x.min(z).max(1.0e-5)).max(1.0);
+    if ratio <= max_ratio {
+        return scale;
+    }
+    let area_scale = (x * z).sqrt().clamp(0.05, 20.0);
+    let root_ratio = max_ratio.sqrt();
+    let (next_x, next_z) = if x >= z {
+        (area_scale * root_ratio, area_scale / root_ratio)
+    } else {
+        (area_scale / root_ratio, area_scale * root_ratio)
+    };
+    [
+        next_x.clamp(0.05, 20.0).copysign(scale[0]),
+        area_scale.clamp(0.05, 20.0).copysign(scale[1]),
+        next_z.clamp(0.05, 20.0).copysign(scale[2]),
+    ]
 }
 
 pub(crate) fn clamp_translation_to_ground_anchor(
@@ -1479,20 +1615,17 @@ pub(crate) fn feedback_bsn_from_commands(
                 .get("yaw")
                 .and_then(Value::as_f64)
                 .map(|value| value as f32)
-                .or(grounded_layout.camera.yaw)
-                .unwrap_or(0.0);
+                .or(grounded_layout.camera.yaw);
             let pitch = command
                 .get("pitch")
                 .and_then(Value::as_f64)
                 .map(|value| value as f32)
-                .or(grounded_layout.camera.pitch)
-                .unwrap_or(30.0);
+                .or(grounded_layout.camera.pitch);
             let radius = command
                 .get("radius")
                 .and_then(Value::as_f64)
                 .map(|value| value as f32)
-                .or(grounded_layout.camera.radius)
-                .unwrap_or(5.0);
+                .or(grounded_layout.camera.radius);
             let vertical_fov = command
                 .get("vertical_fov")
                 .and_then(Value::as_f64)
@@ -1500,12 +1633,21 @@ pub(crate) fn feedback_bsn_from_commands(
                 .or(grounded_layout.camera.vertical_fov_degrees)
                 .unwrap_or(72.0);
             out.push_str(&format!(
-                "camera translation [{}] focus [{}] yaw {} pitch {} radius {} vertical_fov {};\n",
+                "camera translation [{}] focus [{}]",
                 fmt_feedback_vec3(translation),
-                fmt_feedback_vec3(focus),
-                fmt_feedback_num(yaw),
-                fmt_feedback_num(pitch),
-                fmt_feedback_num(radius),
+                fmt_feedback_vec3(focus)
+            ));
+            if let Some(yaw) = yaw {
+                out.push_str(&format!(" yaw {}", fmt_feedback_num(yaw)));
+            }
+            if let Some(pitch) = pitch {
+                out.push_str(&format!(" pitch {}", fmt_feedback_num(pitch)));
+            }
+            if let Some(radius) = radius {
+                out.push_str(&format!(" radius {}", fmt_feedback_num(radius)));
+            }
+            out.push_str(&format!(
+                " vertical_fov {};\n",
                 fmt_feedback_num(vertical_fov)
             ));
         }
@@ -1710,12 +1852,12 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
     let projection_bonus = metrics
         .get("projection_passed")
         .and_then(Value::as_bool)
-        .map(|passed| if passed { 0.35 } else { 0.0 })
+        .map(|passed| if passed { 1.00 } else { 0.0 })
         .unwrap_or(0.0);
     let rotation_bonus = metrics
         .get("rotation_passed")
         .and_then(Value::as_bool)
-        .map(|passed| if passed { 0.35 } else { 0.0 })
+        .map(|passed| if passed { 0.15 } else { 0.0 })
         .unwrap_or(0.0);
     let physical = metrics.get("physical_layout").unwrap_or(&Value::Null);
     let hard_failures = physical
@@ -1727,12 +1869,12 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
     score
-        + object_pass_fraction * 0.75
-        + rotation_pass_fraction * 0.75
+        + object_pass_fraction * 1.60
+        + rotation_pass_fraction * 0.25
         + projection_bonus
         + rotation_bonus
-        - hard_failures * 2.0
-        - max_overlap
+        - hard_failures * 3.0
+        - max_overlap * 1.5
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -252,6 +252,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"], "description": "Scene composition path after lifting. Full scene-build defaults to cv-grounded." },
                     "pose_fit": { "type": "string", "enum": ["projected-aabb"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette is reserved but not implemented yet." },
                     "canonical_pose": { "type": "string", "enum": ["off", "heuristic", "render-sweep", "openai", "auto"], "description": "Canonical asset orientation strategy for cv-grounded composition." },
+                    "scale_policy": { "type": "string", "enum": ["asset-preserving", "bounded-anisotropic", "free-anisotropic"], "description": "Generated asset scale policy. Defaults to asset-preserving to avoid skinny/distorted lifted tables." },
                     "max_pose_candidates": { "type": "integer", "description": "Maximum deterministic pose candidates per object." },
                     "save_pose_debug": { "type": "boolean", "description": "Write canonical pose, pose-fit candidate, and camera grounding artifacts." },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"], "description": "Depth provider for CV-grounded scene composition." },
@@ -264,7 +265,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "clear_existing": { "type": "boolean" },
                     "apply": { "type": "boolean" },
                     "feedback": { "type": "boolean", "description": "Run bounded render-capture-feedback placement validation/refinement. Defaults to true for full scene builds." },
-                    "feedback_iters": { "type": "integer", "description": "Maximum feedback iterations. Defaults to 3." },
+                    "feedback_iters": { "type": "integer", "description": "Maximum feedback iterations. Defaults to 8." },
                     "feedback_keep_viewer": { "type": "boolean", "description": "Leave the temporary feedback viewer running after completion." },
                     "feedback_capture_dir": { "type": "string", "description": "Optional feedback artifact directory. Defaults to output_dir/iterations." },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
@@ -292,6 +293,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"] },
                     "pose_fit": { "type": "string", "enum": ["projected-aabb"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette is reserved but not implemented yet." },
                     "canonical_pose": { "type": "string", "enum": ["off", "heuristic", "render-sweep", "openai", "auto"] },
+                    "scale_policy": { "type": "string", "enum": ["asset-preserving", "bounded-anisotropic", "free-anisotropic"], "description": "Generated asset scale policy. Defaults to asset-preserving." },
                     "max_pose_candidates": { "type": "integer" },
                     "save_pose_debug": { "type": "boolean" },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"] },
@@ -794,6 +796,8 @@ pub struct SceneBuildFromImageArgs {
     pub pose_fit: ScenePoseFitMode,
     #[serde(default = "default_scene_canonical_pose_mode")]
     pub canonical_pose: SceneCanonicalPoseMode,
+    #[serde(default = "default_scene_scale_policy")]
+    pub scale_policy: SceneScalePolicy,
     #[serde(default = "default_scene_max_pose_candidates")]
     pub max_pose_candidates: usize,
     #[serde(default = "default_scene_write_artifacts")]
@@ -845,6 +849,8 @@ pub(crate) struct SceneGroundToolArgs {
     pub pose_fit: ScenePoseFitMode,
     #[serde(default = "default_scene_canonical_pose_mode")]
     pub canonical_pose: SceneCanonicalPoseMode,
+    #[serde(default = "default_scene_scale_policy")]
+    pub scale_policy: SceneScalePolicy,
     #[serde(default = "default_scene_max_pose_candidates")]
     pub max_pose_candidates: usize,
     #[serde(default = "default_scene_write_artifacts")]
@@ -886,6 +892,7 @@ pub(crate) struct SceneFeedbackOptions {
     pub(crate) capture_dir: Option<PathBuf>,
     pub(crate) threshold_profile: FeedbackThresholdProfile,
     pub(crate) rotation_selector: FeedbackRotationSelector,
+    pub(crate) scale_policy: SceneScalePolicy,
 }
 
 pub(crate) struct SceneFeedbackIterationContext<'a> {
@@ -897,6 +904,7 @@ pub(crate) struct SceneFeedbackIterationContext<'a> {
     pub(crate) max_iters: usize,
     pub(crate) threshold_profile: FeedbackThresholdProfile,
     pub(crate) rotation_selector: FeedbackRotationSelector,
+    pub(crate) scale_policy: SceneScalePolicy,
 }
 
 #[derive(Clone, Debug)]

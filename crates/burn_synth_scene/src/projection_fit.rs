@@ -236,8 +236,12 @@ pub(crate) fn fit_grounded_scene_projection(
     if targets.iter().all(Option::is_none) {
         return None;
     }
-    let camera = ProjectionCamera::from_evidence(evidence, &targets)
-        .or_else(|| ProjectionCamera::from_scene_camera(camera, aspect))?;
+    let layout_camera = ProjectionCamera::from_scene_camera(camera, aspect);
+    let camera = if scene_camera_is_source_depth_frame(camera) {
+        ProjectionCamera::from_evidence(evidence, &targets).or(layout_camera)
+    } else {
+        layout_camera
+    }?;
 
     let initial_eval = evaluate_scene(placements, &targets, camera, floor_y);
     let mut best_loss = initial_eval.total_loss;
@@ -310,6 +314,10 @@ pub(crate) fn fit_grounded_scene_projection(
         objects: final_eval.reports,
         candidates,
     })
+}
+
+fn scene_camera_is_source_depth_frame(camera: &SceneCamera) -> bool {
+    camera.yaw.is_none() && camera.pitch.is_none() && camera.radius.is_none()
 }
 
 impl ProjectionTarget {
@@ -651,7 +659,7 @@ impl SourceProjectionCamera {
         let anchor = target.source_camera_anchor?;
         let origin = target.source_camera_origin_xz?;
         let x = point[0] + origin[0];
-        let z = point[2] + origin[1];
+        let z = origin[1] - point[2];
         let height_above_floor = point[1] - floor_y;
         let floor_y_camera =
             if target.ground_anchor_basis == GroundAnchorBasis::CameraRayGroundPlane {
@@ -1414,6 +1422,17 @@ mod tests {
         }
     }
 
+    fn source_frame_test_camera() -> SceneCamera {
+        SceneCamera {
+            translation: [0.0, 2.0, 2.0],
+            focus: [0.0, 2.0, 1.0],
+            yaw: None,
+            pitch: None,
+            radius: None,
+            vertical_fov_degrees: Some(70.0),
+        }
+    }
+
     fn test_placement(entity_id: &str, x: f32) -> GroundedScenePlacement {
         GroundedScenePlacement {
             entity_id: entity_id.to_string(),
@@ -1452,6 +1471,80 @@ mod tests {
             ground_anchor_max_drift_m: placement.ground_anchor_max_drift_m(),
             ground_anchor_weight: GroundAnchorBasis::LayoutContactPixel.loss_weight(),
             kind: placement_kind(placement),
+        }
+    }
+
+    #[test]
+    fn source_depth_projection_matches_serialized_bevy_camera_frame() {
+        let origin = [2.0, 5.0];
+        let camera_height = 1.5;
+        let vertical_fov_degrees: f32 = 60.0;
+        let width = 101;
+        let height = 101;
+        let focal_length_px =
+            ((height - 1) as f32 * 0.5) / (vertical_fov_degrees.to_radians() * 0.5).tan();
+        let evidence = SceneGroundingEvidence {
+            source_image_path: "synthetic.png".to_string(),
+            depth: Some(DepthEvidenceRef {
+                provider: "synthetic".to_string(),
+                model: None,
+                precision: None,
+                artifact_path: None,
+                focal_length_px: Some(focal_length_px),
+                vertical_fov_degrees: Some(vertical_fov_degrees),
+                image_size: Some([width, height]),
+                depth_map_size: Some([width, height]),
+                floor_sample_count: Some(64),
+            }),
+            segmentation: None,
+            detections: Vec::new(),
+            camera: EstimatedCamera {
+                focal_length_px: Some(focal_length_px),
+                principal_point: Some([50.0, 50.0]),
+                image_size: Some([width, height]),
+                vertical_fov_degrees: Some(vertical_fov_degrees),
+                ..EstimatedCamera::default()
+            },
+            floor: EstimatedFloorPlane::default(),
+            objects: Vec::new(),
+        };
+        let placement = test_placement("chair_001", 0.0);
+        let mut target = test_target(&placement);
+        target.ground_anchor_basis = GroundAnchorBasis::MetricDepthContact;
+        target.source_camera_anchor = Some([origin[0], camera_height, origin[1]]);
+        target.source_camera_origin_xz = Some(origin);
+        let source_camera =
+            ProjectionCamera::from_evidence(&evidence, &[Some(target.clone())]).unwrap();
+        let bevy_camera = ProjectionCamera::from_scene_camera(
+            &SceneCamera {
+                translation: [-origin[0], camera_height, origin[1]],
+                focus: [-origin[0], camera_height, origin[1] - 1.0],
+                yaw: None,
+                pitch: None,
+                radius: None,
+                vertical_fov_degrees: Some(vertical_fov_degrees),
+            },
+            1.0,
+        )
+        .unwrap();
+
+        for point in [[0.0, 0.0, 0.0], [0.6, 0.0, -1.0], [-0.4, 0.7, 0.75]] {
+            let (source_projected, source_depth) =
+                source_camera.project_point(point, &target, 0.0).unwrap();
+            let (bevy_projected, bevy_depth) =
+                bevy_camera.project_point(point, &target, 0.0).unwrap();
+            assert!(
+                (source_projected[0] - bevy_projected[0]).abs() < 1.0e-5,
+                "x mismatch for point {point:?}: source {source_projected:?}, bevy {bevy_projected:?}"
+            );
+            assert!(
+                (source_projected[1] - bevy_projected[1]).abs() < 1.0e-5,
+                "y mismatch for point {point:?}: source {source_projected:?}, bevy {bevy_projected:?}"
+            );
+            assert!(
+                (source_depth - bevy_depth).abs() < 1.0e-5,
+                "depth mismatch for point {point:?}: source {source_depth}, bevy {bevy_depth}"
+            );
         }
     }
 
@@ -1498,8 +1591,13 @@ mod tests {
             floor: EstimatedFloorPlane::default(),
             objects: Vec::new(),
         };
-        let report =
-            fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
+        let report = fit_grounded_scene_projection(
+            &mut placements,
+            &source_frame_test_camera(),
+            &evidence,
+            0.0,
+        )
+        .unwrap();
         assert!(report.final_loss <= report.initial_loss);
         assert_eq!(report.fit_mode, "projected_aabb_canonical_pose");
         assert_eq!(report.candidate_count, report.candidates.len());
@@ -1585,8 +1683,13 @@ mod tests {
             }],
         };
 
-        let report =
-            fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
+        let report = fit_grounded_scene_projection(
+            &mut placements,
+            &source_frame_test_camera(),
+            &evidence,
+            0.0,
+        )
+        .unwrap();
         let object = &report.objects[0];
 
         assert_eq!(report.camera.basis, "source-depth-intrinsics");
@@ -1685,8 +1788,13 @@ mod tests {
             }],
         };
 
-        let report =
-            fit_grounded_scene_projection(&mut placements, &test_camera(), &evidence, 0.0).unwrap();
+        let report = fit_grounded_scene_projection(
+            &mut placements,
+            &source_frame_test_camera(),
+            &evidence,
+            0.0,
+        )
+        .unwrap();
 
         assert_eq!(report.camera.basis, "source-depth-intrinsics");
         assert_eq!(

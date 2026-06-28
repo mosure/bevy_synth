@@ -1,5 +1,7 @@
 use crate::prelude::*;
 
+const FEEDBACK_RENDER_SETTLE_MS: u64 = 750;
+
 pub fn run_stdio_server(config: ServerConfig) -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -62,6 +64,43 @@ impl<'a> CanonicalPoseThumbnailSpawnBasis<'a> {
             Self::Path(_) => "path",
         }
     }
+}
+
+fn mark_canonical_pose_verification_failure(response: &mut Value, verification: &Value) {
+    let requires_attention = verification
+        .get("requires_attention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !requires_attention {
+        return;
+    }
+    if !response
+        .get("failed_stage")
+        .map(Value::is_null)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    response["failed_stage"] = json!("canonical_pose_calibration.visual_verification");
+    response["next_action"] = json!({
+        "reason": "Canonical pose render-sweep was requested but visual thumbnail evidence was missing, partial, or selected through fallback.",
+        "status": verification.get("status").cloned().unwrap_or(Value::Null),
+        "inspect": {
+            "verification": "canonical_pose_verification.json",
+            "selection": "canonical_pose_selection.json",
+            "calibration": "canonical_pose_calibration_report.json",
+            "render_root": verification
+                .get("render_report")
+                .and_then(|report| report.get("root"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "viewer_log": verification
+                .get("render_report")
+                .and_then(|report| report.get("viewer_log"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+    });
 }
 
 fn canonical_pose_thumbnail_spawn_command(
@@ -189,16 +228,33 @@ pub(crate) fn scene_object_image_generation_policy(
         .candidate_count
         .unwrap_or(default_candidate_count)
         .max(1);
+    let quality_profile = args.quality_profile.unwrap_or(SceneQualityProfile::Quality);
+    let default_candidates_per_attempt =
+        if quality_profile == SceneQualityProfile::Quality && requested_candidate_count > 1 {
+            requested_candidate_count.min(2)
+        } else {
+            1
+        };
+    let candidates_per_attempt = args
+        .candidate_batch_size
+        .unwrap_or(default_candidates_per_attempt)
+        .max(1);
+    let default_max_attempts = requested_candidate_count.saturating_add(candidates_per_attempt - 1)
+        / candidates_per_attempt;
     ObjectImageGenerationPolicy {
         min_score: args
             .min_reconstruction_score
             .unwrap_or(DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE),
         max_attempts_per_object: args
             .candidate_retry_attempts
-            .unwrap_or(requested_candidate_count)
+            .unwrap_or(default_max_attempts)
             .max(1),
-        candidates_per_attempt: args.candidate_batch_size.unwrap_or(1).max(1),
+        candidates_per_attempt,
     }
+}
+
+fn scene_object_image_request_parallelism(request_count: usize) -> usize {
+    request_count.clamp(1, 3)
 }
 
 struct SceneBuildProgressReporter<'a, F>
@@ -1426,12 +1482,17 @@ impl McpServer {
                 "requests": requests.len(),
                 "max_attempts_per_object": candidate_policy.max_attempts_per_object,
                 "candidates_per_attempt": candidate_policy.candidates_per_attempt,
+                "parallel_requests": scene_object_image_request_parallelism(requests.len()),
                 "min_score": candidate_policy.min_score,
                 "execution": "network"
             }),
         );
         let candidate_report = pipeline
-            .generate_object_candidates_with_policy(&requests, candidate_policy)
+            .generate_object_candidates_with_policy_parallel(
+                &requests,
+                candidate_policy,
+                scene_object_image_request_parallelism(requests.len()),
+            )
             .map_err(|err| err.to_string())?;
         record_stage(
             &mut stage_report,
@@ -1717,8 +1778,8 @@ impl McpServer {
                 .collect::<Vec<_>>();
         response["selected_candidates"] = json!(selected_values.clone());
         response["asset_lift_attempts"] = json!(asset_attempts);
+        response["asset_outputs"] = asset_outputs.clone();
         if !mesh_quality_failures.is_empty() {
-            response["asset_outputs"] = asset_outputs;
             response["mesh_quality_failures"] = json!(mesh_quality_failures);
             response["failed_stage"] = json!("images_to_assets.mesh_quality_gate");
             response["next_action"] = json!({
@@ -1741,6 +1802,15 @@ impl McpServer {
         }
         let mut asset_bindings =
             scene_asset_bindings_from_outputs(&manifest, &selected_values, &asset_outputs)?;
+        response["asset_bindings_initial"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["asset_bindings"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["asset_bindings_calibrated"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        if args.write_artifacts {
+            write_scene_build_artifacts(&output_dir, &response)?;
+        }
         let stage_started = Instant::now();
         progress.emit(
             "load_grounding_evidence",
@@ -1956,6 +2026,25 @@ impl McpServer {
                 evidence: &grounding_evidence,
             })?;
         asset_bindings = canonical_pose_calibration.asset_bindings.clone();
+        response["asset_bindings_initial"] =
+            serde_json::to_value(&initial_asset_bindings).map_err(|err| err.to_string())?;
+        response["asset_bindings"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["asset_bindings_calibrated"] =
+            serde_json::to_value(&asset_bindings).map_err(|err| err.to_string())?;
+        response["canonical_pose_calibration"] =
+            serde_json::to_value(&canonical_pose_calibration.reports)
+                .map_err(|err| err.to_string())?;
+        response["canonical_pose_selection"] = canonical_pose_calibration.selection_report.clone();
+        response["canonical_pose_selection_task"] =
+            canonical_pose_calibration.selection_task.clone();
+        let canonical_pose_verification =
+            canonical_pose_verification_report(args.canonical_pose, &canonical_pose_calibration);
+        response["canonical_pose_verification"] = canonical_pose_verification.clone();
+        mark_canonical_pose_verification_failure(&mut response, &canonical_pose_verification);
+        if args.write_artifacts {
+            write_scene_build_artifacts(&output_dir, &response)?;
+        }
         record_stage(
             &mut stage_report,
             "canonical_pose_calibration",
@@ -1984,6 +2073,14 @@ impl McpServer {
                     .iter()
                     .filter(|report| report.fallback_used)
                     .count(),
+                "verification_status": canonical_pose_verification
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "visual_verified": canonical_pose_verification
+                    .get("visual_verified")
+                    .cloned()
+                    .unwrap_or(Value::Null),
             }),
         );
         let stage_started = Instant::now();
@@ -2007,6 +2104,7 @@ impl McpServer {
             &asset_bindings,
             &grounding_evidence,
             args.clear_existing,
+            args.scale_policy,
         )?;
         let mut selected_composition = composition_candidates
             .first()
@@ -2062,6 +2160,7 @@ impl McpServer {
                     capture_dir: args.feedback_capture_dir.clone(),
                     threshold_profile: args.feedback_threshold_profile,
                     rotation_selector: args.feedback_rotation_selector,
+                    scale_policy: args.scale_policy,
                 },
             )?;
             selected_composition = selection.candidate;
@@ -2118,12 +2217,14 @@ impl McpServer {
                 .map_err(|err| err.to_string())?;
         response["canonical_pose_selection"] = canonical_pose_calibration.selection_report;
         response["canonical_pose_selection_task"] = canonical_pose_calibration.selection_task;
+        response["canonical_pose_verification"] = canonical_pose_verification;
         response["requested_composition_mode"] = json!(args.composition_mode);
         response["composition_mode"] = json!(selected_composition.mode);
         response["requested_pose_fit"] = json!(args.pose_fit);
         response["pose_fit"] = json!(args.pose_fit);
         response["pose_fit_note"] = json!(scene_pose_fit_note(args.pose_fit));
         response["canonical_pose"] = json!(args.canonical_pose);
+        response["scale_policy"] = json!(args.scale_policy);
         response["max_pose_candidates"] = json!(args.max_pose_candidates);
         response["save_pose_debug"] = json!(args.save_pose_debug);
         if !feedback_candidate_reports.is_empty() {
@@ -2405,6 +2506,8 @@ impl McpServer {
             "canonical_pose_calibration",
             stage_started,
         );
+        let canonical_pose_verification =
+            canonical_pose_verification_report(args.canonical_pose, &canonical_pose_calibration);
 
         let stage_started = Instant::now();
         let composition_candidates = scene_composition_candidates(
@@ -2414,6 +2517,7 @@ impl McpServer {
             &asset_bindings,
             &evidence,
             args.clear_existing,
+            args.scale_policy,
         )?;
         let mut selected_composition = composition_candidates
             .first()
@@ -2431,6 +2535,7 @@ impl McpServer {
             "pose_fit": args.pose_fit,
             "pose_fit_note": scene_pose_fit_note(args.pose_fit),
             "canonical_pose": args.canonical_pose,
+            "scale_policy": args.scale_policy,
             "max_pose_candidates": args.max_pose_candidates,
             "save_pose_debug": args.save_pose_debug,
             "depth_provider": args.depth_provider,
@@ -2446,10 +2551,12 @@ impl McpServer {
             "canonical_pose_calibration": canonical_pose_calibration.reports,
             "canonical_pose_selection": canonical_pose_calibration.selection_report,
             "canonical_pose_selection_task": canonical_pose_calibration.selection_task,
+            "canonical_pose_verification": canonical_pose_verification.clone(),
             "grounding_evidence": evidence.clone(),
             "clear_existing": args.clear_existing,
             "apply": args.apply,
         });
+        mark_canonical_pose_verification_failure(&mut response, &canonical_pose_verification);
         if let Some(report) = segmentation_report {
             response["segmentation_grounding"] = json!(report);
         }
@@ -2467,6 +2574,7 @@ impl McpServer {
                     capture_dir: args.feedback_capture_dir.clone(),
                     threshold_profile: args.feedback_threshold_profile,
                     rotation_selector: args.feedback_rotation_selector,
+                    scale_policy: args.scale_policy,
                 },
             )?;
             selected_composition = selection.candidate;
@@ -2939,22 +3047,50 @@ impl McpServer {
         ];
         commands = scene_commands_with_cache_reload(commands);
         let apply_ack = self.send_scene_commands(commands)?;
-        let (capture_ack, status) =
-            self.capture_feedback_when_projected_ready(&apply_ack, output_path, 1)?;
-        let file_size = output_path
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if file_size == 0 {
-            return Err(format!(
-                "thumbnail file was not written: {}",
-                output_path.display()
-            ));
+        let mut last_error = None::<String>;
+        let mut capture_ack = Value::Null;
+        let mut status = Value::Null;
+        let mut thumbnail_metrics = Value::Null;
+        let mut file_size = 0u64;
+        for attempt in 0..3 {
+            let (attempt_capture_ack, attempt_status) =
+                self.capture_feedback_when_projected_ready(&apply_ack, output_path, 1)?;
+            capture_ack = attempt_capture_ack;
+            status = attempt_status;
+            file_size = output_path
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if file_size == 0 {
+                last_error = Some(format!(
+                    "thumbnail file was not written: {}",
+                    output_path.display()
+                ));
+            } else {
+                match canonical_pose_thumbnail_pixel_metrics(output_path) {
+                    Ok(metrics) => {
+                        thumbnail_metrics = metrics;
+                        last_error = None;
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(format!(
+                            "thumbnail validation failed on attempt {}: {err}",
+                            attempt + 1
+                        ));
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(FEEDBACK_RENDER_SETTLE_MS));
+        }
+        if let Some(err) = last_error {
+            return Err(err);
         }
         Ok(json!({
             "output_path": output_path.display().to_string(),
             "yaw_degrees": yaw_degrees,
             "file_size": file_size,
+            "thumbnail_metrics": thumbnail_metrics,
             "spawn_basis": spawn_basis.label(),
             "local_aabb": local_aabb,
             "camera": {
@@ -3062,6 +3198,17 @@ impl McpServer {
 
     fn call_scene_capture(&self, args: SceneCaptureArgs) -> Result<Value, String> {
         let path = args.output_path;
+        if path
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+            && let Err(err) = fs::remove_file(&path)
+        {
+            return Err(format!(
+                "failed to remove stale screenshot {} before capture: {err}",
+                path.display()
+            ));
+        }
         let response = self.send_scene_commands(vec![json!({
             "type": "capture_screenshot",
             "path": path.display().to_string(),
@@ -3142,6 +3289,7 @@ impl McpServer {
                     capture_dir,
                     threshold_profile: options.threshold_profile,
                     rotation_selector: options.rotation_selector,
+                    scale_policy: options.scale_policy,
                 },
             );
             match feedback {
@@ -3259,6 +3407,7 @@ impl McpServer {
                         max_iters: options.max_iters.max(1),
                         threshold_profile: options.threshold_profile,
                         rotation_selector: options.rotation_selector,
+                        scale_policy: options.scale_policy,
                     });
                 if let Ok(value) = &mut result {
                     value["interaction_lock_ack"] = lock_ack;
@@ -3319,6 +3468,7 @@ impl McpServer {
             max_iters,
             threshold_profile,
             rotation_selector,
+            scale_policy,
         } = context;
         let mut commands = scene_commands_with_asset_local_aabbs(initial_commands, asset_bindings);
         let thresholds = threshold_profile.thresholds();
@@ -3414,7 +3564,7 @@ impl McpServer {
                 best_iteration = Some(iteration_index);
                 best_commands = commands.clone();
             }
-            let deltas = feedback_layout_deltas(&metrics);
+            let deltas = feedback_layout_deltas_with_policy(&metrics, scale_policy);
             write_json_file(&iteration_dir.join("layout_delta.json"), &deltas)
                 .map_err(|err| err.to_string())?;
             let iteration_context = feedback_iteration_context(
@@ -3449,24 +3599,11 @@ impl McpServer {
             }
             previous_commands = Some(commands.clone());
             previous_iteration_snapshot = iterations.last().cloned();
-            commands = apply_feedback_deltas_to_commands(&commands, &deltas)?;
+            commands =
+                apply_feedback_deltas_to_commands_with_policy(&commands, &deltas, scale_policy)?;
         }
-        if accepted_iteration.is_none() && best_iteration.is_some() {
-            commands = best_commands;
-        }
-        let final_bsn = feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
-        fs::write(capture_root.join("scene.feedback.bsn"), &final_bsn).map_err(|err| {
-            format!(
-                "failed to write final feedback BSN {}: {err}",
-                capture_root.join("scene.feedback.bsn").display()
-            )
-        })?;
-        write_json_file(
-            &capture_root.join("commands.feedback.json"),
-            &json!(commands),
-        )
-        .map_err(|err| err.to_string())?;
         let mut final_evidence = Value::Null;
+        let mut final_accepted = false;
         if accepted_iteration.is_none() && max_iters > 0 {
             let final_dir = capture_root.join("final");
             fs::create_dir_all(&final_dir).map_err(|err| {
@@ -3477,6 +3614,7 @@ impl McpServer {
             })?;
             write_json_file(&final_dir.join("commands.json"), &json!(commands))
                 .map_err(|err| err.to_string())?;
+            let final_bsn = feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
             fs::write(final_dir.join("scene.bsn"), &final_bsn).map_err(|err| {
                 format!(
                     "failed to write final feedback BSN {}: {err}",
@@ -3486,7 +3624,7 @@ impl McpServer {
             let apply_ack = self.send_scene_commands(commands.clone())?;
             write_json_file(&final_dir.join("apply_ack.json"), &apply_ack)
                 .map_err(|err| err.to_string())?;
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(FEEDBACK_RENDER_SETTLE_MS));
             let screenshot_path = final_dir.join("screenshot.png");
             let capture = self.call_scene_capture(SceneCaptureArgs {
                 output_path: screenshot_path.clone(),
@@ -3510,13 +3648,39 @@ impl McpServer {
                 .get("passed")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let selection_score = feedback_selection_score(&metrics);
+            let selected = passed || selection_score >= best_score;
             final_evidence = json!({
                 "dir": final_dir.display().to_string(),
                 "screenshot": screenshot_path.display().to_string(),
                 "metrics": metrics,
                 "passed": passed,
+                "selection_score": selection_score,
+                "selected": selected,
             });
+            if selected {
+                final_accepted = passed;
+                if selection_score > best_score {
+                    best_score = selection_score;
+                }
+            } else if best_iteration.is_some() {
+                commands = best_commands;
+            }
+        } else if accepted_iteration.is_none() && best_iteration.is_some() {
+            commands = best_commands;
         }
+        let final_bsn = feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
+        fs::write(capture_root.join("scene.feedback.bsn"), &final_bsn).map_err(|err| {
+            format!(
+                "failed to write final feedback BSN {}: {err}",
+                capture_root.join("scene.feedback.bsn").display()
+            )
+        })?;
+        write_json_file(
+            &capture_root.join("commands.feedback.json"),
+            &json!(commands),
+        )
+        .map_err(|err| err.to_string())?;
         let report = feedback_markdown_report(
             capture_root,
             threshold_profile,
@@ -3535,8 +3699,9 @@ impl McpServer {
             "threshold_profile": threshold_profile,
             "rotation_selector": rotation_selector,
             "max_iters": max_iters,
-            "accepted": accepted_iteration.is_some(),
+            "accepted": accepted_iteration.is_some() || final_accepted,
             "accepted_iteration": accepted_iteration,
+            "accepted_final": final_accepted,
             "best_iteration": best_iteration,
             "best_score": if best_score.is_finite() { Value::from(best_score) } else { Value::Null },
             "capture_dir": capture_root.display().to_string(),
@@ -3557,6 +3722,7 @@ impl McpServer {
         let timeout = self.config.scene_timeout.max(Duration::from_secs(10));
         let started = Instant::now();
         let mut attempt = 0usize;
+        thread::sleep(Duration::from_millis(FEEDBACK_RENDER_SETTLE_MS));
         loop {
             let capture = self.call_scene_capture(SceneCaptureArgs {
                 output_path: screenshot_path.to_path_buf(),

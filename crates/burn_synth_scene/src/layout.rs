@@ -16,6 +16,7 @@ pub struct GroundedSceneLayoutConfig {
     pub image_aspect: f32,
     pub floor_y: f32,
     pub seating_clearance_m: f32,
+    pub scale_policy: SceneScalePolicy,
 }
 
 impl Default for GroundedSceneLayoutConfig {
@@ -27,6 +28,7 @@ impl Default for GroundedSceneLayoutConfig {
             image_aspect: 2.0,
             floor_y: 0.0,
             seating_clearance_m: 0.18,
+            scale_policy: SceneScalePolicy::default(),
         }
     }
 }
@@ -119,8 +121,21 @@ pub fn grounded_scene_layout_with_evidence(
     assets: &[SceneAssetBinding],
     evidence: &SceneGroundingEvidence,
 ) -> SceneResult<GroundedSceneLayout> {
+    grounded_scene_layout_with_evidence_config(
+        manifest,
+        assets,
+        evidence,
+        GroundedSceneLayoutConfig::default(),
+    )
+}
+
+pub fn grounded_scene_layout_with_evidence_config(
+    manifest: &SceneObjectManifest,
+    assets: &[SceneAssetBinding],
+    evidence: &SceneGroundingEvidence,
+    mut config: GroundedSceneLayoutConfig,
+) -> SceneResult<GroundedSceneLayout> {
     let manifest = manifest_with_grounding_evidence(manifest, evidence);
-    let mut config = GroundedSceneLayoutConfig::default();
     if let Some([width, height]) = evidence
         .camera
         .image_size
@@ -226,56 +241,7 @@ pub fn manifest_with_grounding_evidence(
             object.instance_count = object.instances.len();
         }
     }
-    filter_table_embedded_seating_instances(&mut out.objects);
     out
-}
-
-fn filter_table_embedded_seating_instances(objects: &mut [SceneObjectSpec]) {
-    let table_bboxes = objects
-        .iter()
-        .filter(|object| is_table_like(object))
-        .map(|object| normalize_bbox(object.bbox))
-        .collect::<Vec<_>>();
-    if table_bboxes.is_empty() {
-        return;
-    }
-    for object in objects {
-        if !is_seating_like(object) || object.instances.is_empty() {
-            continue;
-        }
-        object.instances.retain(|instance| {
-            let bbox = normalize_bbox(instance.bbox);
-            !table_bboxes
-                .iter()
-                .any(|table_bbox| bbox_embedded_in_table(bbox, *table_bbox))
-        });
-        if object.instances.is_empty() {
-            object.instance_count = 1;
-        } else {
-            object.instance_count = object.instances.len();
-        }
-    }
-}
-
-fn bbox_embedded_in_table(bbox: [f32; 4], table_bbox: [f32; 4]) -> bool {
-    let center = bbox_center(bbox);
-    if center[0] < table_bbox[0]
-        || center[0] > table_bbox[2]
-        || center[1] < table_bbox[1]
-        || center[1] > table_bbox[3]
-    {
-        return false;
-    }
-    let embedded_fraction = bbox_intersection_area(bbox, table_bbox) / bbox_area(bbox).max(1.0e-6);
-    embedded_fraction >= 0.82
-}
-
-fn bbox_intersection_area(left: [f32; 4], right: [f32; 4]) -> f32 {
-    let ix0 = left[0].max(right[0]);
-    let iy0 = left[1].max(right[1]);
-    let ix1 = left[2].min(right[2]);
-    let iy1 = left[3].min(right[3]);
-    (ix1 - ix0).max(0.0) * (iy1 - iy0).max(0.0)
 }
 
 fn dedupe_object_instances_by_bbox(instances: &mut Vec<SceneObjectInstanceSpec>) {
@@ -427,6 +393,9 @@ fn distance2(left: [f32; 2], right: [f32; 2]) -> f32 {
 #[derive(Clone, Debug, Default)]
 struct GroundingGeometry {
     contact_points_by_instance: HashMap<(String, Option<String>), [f32; 3]>,
+    source_origin_xz: Option<[f32; 2]>,
+    source_camera_height_m: Option<f32>,
+    source_vertical_fov_degrees: Option<f32>,
 }
 
 impl GroundingGeometry {
@@ -447,6 +416,18 @@ impl GroundingGeometry {
                 [point[0], floor_y, point[2]],
             );
         }
+        out.source_origin_xz = source_origin_xz_from_evidence(evidence, &out);
+        out.source_camera_height_m = source_camera_height_from_floor(&evidence.floor);
+        out.source_vertical_fov_degrees = evidence
+            .camera
+            .vertical_fov_degrees
+            .or_else(|| {
+                evidence
+                    .depth
+                    .as_ref()
+                    .and_then(|depth| depth.vertical_fov_degrees)
+            })
+            .filter(|value| value.is_finite() && *value > 1.0);
         out
     }
 
@@ -465,6 +446,72 @@ impl GroundingGeometry {
                     .copied()
             })
     }
+}
+
+fn source_origin_xz_from_evidence(
+    evidence: &SceneGroundingEvidence,
+    geometry: &GroundingGeometry,
+) -> Option<[f32; 2]> {
+    evidence
+        .objects
+        .iter()
+        .filter(|object| object_grounding_is_table_like(object))
+        .find_map(|object| {
+            table_center_point_from_evidence(object, evidence)
+                .or_else(|| floor_contact_point_from_evidence(object, &evidence.floor))
+                .or(object.metric_contact_point_m)
+        })
+        .map(|point| [point[0], point[2]])
+        .or_else(|| {
+            let mut sum = [0.0f32; 2];
+            let mut count = 0usize;
+            for point in geometry.contact_points_by_instance.values() {
+                if point[0].is_finite() && point[2].is_finite() {
+                    sum[0] += point[0];
+                    sum[1] += point[2];
+                    count += 1;
+                }
+            }
+            (count > 0).then_some([sum[0] / count as f32, sum[1] / count as f32])
+        })
+}
+
+fn source_camera_height_from_floor(floor: &EstimatedFloorPlane) -> Option<f32> {
+    if !estimated_floor_plane_is_valid(floor) || floor.normal[1].abs() <= 1.0e-5 {
+        return None;
+    }
+    let residual_ok = floor
+        .residual_m
+        .filter(|value| value.is_finite())
+        .is_some_and(|value| value <= 0.10);
+    let confidence_ok = floor
+        .confidence
+        .filter(|value| value.is_finite())
+        .is_none_or(|value| value >= 0.72);
+    if !residual_ok || !confidence_ok {
+        return None;
+    }
+    let y_down_at_camera_origin = -floor.distance_m / floor.normal[1];
+    (y_down_at_camera_origin.is_finite() && (1.10..=3.80).contains(&y_down_at_camera_origin))
+        .then_some(y_down_at_camera_origin)
+}
+
+fn source_camera_from_grounding_geometry(
+    geometry: &GroundingGeometry,
+    floor_y: f32,
+) -> Option<SceneCamera> {
+    let origin = geometry.source_origin_xz?;
+    let camera_height = geometry.source_camera_height_m?;
+    let y = floor_y + camera_height;
+    let translation = [-origin[0], y, origin[1]];
+    Some(SceneCamera {
+        translation,
+        focus: [translation[0], y, translation[2] - 1.0],
+        yaw: None,
+        pitch: None,
+        radius: None,
+        vertical_fov_degrees: geometry.source_vertical_fov_degrees,
+    })
 }
 
 fn table_center_point_from_evidence(
@@ -504,14 +551,6 @@ fn object_grounding_is_table_like(object: &ObjectGroundingEvidence) -> bool {
     )
     .to_ascii_lowercase();
     descriptor.contains("table") || descriptor.contains("desk") || descriptor.contains("counter")
-}
-
-fn is_seating_like(object: &SceneObjectSpec) -> bool {
-    let descriptor = object_descriptor(object);
-    descriptor.contains("chair")
-        || descriptor.contains("seat")
-        || descriptor.contains("sofa")
-        || descriptor.contains("couch")
 }
 
 fn source_intrinsics_from_evidence(
@@ -776,13 +815,18 @@ fn grounded_scene_layout_internal(
         });
         let asset_frame = scene_asset_frame(asset, object, local_aabb);
         let target_footprint = target_footprint_m(object, &instance, asset_frame, metric_frame);
-        let scale = asset_scale_for_footprint(object, local_aabb, target_footprint, asset_frame);
+        let scale = asset_scale_for_footprint(
+            object,
+            local_aabb,
+            target_footprint,
+            asset_frame,
+            config.scale_policy,
+        );
         let depth_ground_point = grounding_geometry
             .and_then(|(geometry, _)| geometry.contact_point(object, &instance))
             .map(|point| {
                 source_metric_delta_to_layout(
                     [point[0] - center_x, point[2] - center_z],
-                    metric_frame,
                     config.floor_y,
                 )
             });
@@ -838,12 +882,16 @@ fn grounded_scene_layout_internal(
             target_footprint_m: target_footprint,
         });
     }
+    enforce_scale_policy(&mut placements, config.floor_y, config.scale_policy);
     normalize_repeated_asset_scales(&mut placements, config.floor_y);
 
-    let camera = grounded_camera_from_placements(&placements, config, metric_frame);
+    let camera = grounding_geometry
+        .and_then(|(geometry, _)| source_camera_from_grounding_geometry(geometry, config.floor_y))
+        .unwrap_or_else(|| grounded_camera_from_placements(&placements, config, metric_frame));
     let projection_fit = grounding_geometry.and_then(|(_, evidence)| {
         fit_grounded_scene_projection(&mut placements, &camera, evidence, config.floor_y)
     });
+    enforce_scale_policy(&mut placements, config.floor_y, config.scale_policy);
     normalize_repeated_asset_scales(&mut placements, config.floor_y);
     let (rug_center, rug_scale) = rug_from_placements(&placements, config.floor_y);
     let bsn = grounded_bsn_text(assets, &placements, rug_center, rug_scale, &camera);
@@ -863,24 +911,8 @@ fn grounded_scene_layout_internal(
     })
 }
 
-fn source_metric_delta_to_layout(
-    delta_xz: [f32; 2],
-    metric_frame: Option<MetricSceneFrame>,
-    floor_y: f32,
-) -> [f32; 3] {
-    let Some(camera_yaw_degrees) = metric_frame.and_then(|frame| frame.camera_yaw_degrees) else {
-        return [delta_xz[0], floor_y, delta_xz[1]];
-    };
-    let image_side_sign = if camera_yaw_degrees.to_radians().cos() >= 0.0 {
-        1.0
-    } else {
-        -1.0
-    };
-    [
-        delta_xz[0] * image_side_sign,
-        floor_y,
-        delta_xz[1] * -image_side_sign,
-    ]
+fn source_metric_delta_to_layout(delta_xz: [f32; 2], floor_y: f32) -> [f32; 3] {
+    [delta_xz[0], floor_y, -delta_xz[1]]
 }
 
 fn object_contact_point_with_geometry(
@@ -1071,9 +1103,10 @@ fn asset_scale_for_footprint(
     local_aabb: SceneAssetAabb,
     target_footprint: [f32; 2],
     asset_frame: SceneAssetFrame,
+    scale_policy: SceneScalePolicy,
 ) -> [f32; 3] {
     let uniform = uniform_asset_scale(local_aabb, target_footprint);
-    if !is_table_like(object) {
+    if !is_table_like(object) || scale_policy == SceneScalePolicy::AssetPreserving {
         return [uniform, uniform, uniform];
     }
 
@@ -1091,7 +1124,49 @@ fn asset_scale_for_footprint(
     let scale_x = (local_targets[0].max(0.1) / size[0]).clamp(0.05, 20.0);
     let scale_z = (local_targets[1].max(0.1) / size[2]).clamp(0.05, 20.0);
     let scale_y = (scale_x * scale_z).sqrt().clamp(0.05, 20.0);
-    [scale_x, scale_y, scale_z]
+    apply_scale_policy_to_scale([scale_x, scale_y, scale_z], scale_policy)
+}
+
+fn enforce_scale_policy(
+    placements: &mut [GroundedScenePlacement],
+    floor_y: f32,
+    scale_policy: SceneScalePolicy,
+) {
+    for placement in placements {
+        let next = apply_scale_policy_to_scale(placement.scale, scale_policy);
+        if next != placement.scale {
+            placement.scale = next;
+            placement.translation[1] = floor_y - placement.local_aabb.min[1] * next[1];
+        }
+    }
+}
+
+fn apply_scale_policy_to_scale(scale: [f32; 3], scale_policy: SceneScalePolicy) -> [f32; 3] {
+    let Some(max_ratio) = scale_policy.max_xz_anisotropy() else {
+        return scale;
+    };
+    if max_ratio <= 1.0 + f32::EPSILON {
+        let uniform = ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0);
+        return [uniform, uniform, uniform];
+    }
+    let x = scale[0].abs().clamp(0.05, 20.0);
+    let z = scale[2].abs().clamp(0.05, 20.0);
+    let ratio = (x.max(z) / x.min(z).max(1.0e-5)).max(1.0);
+    if ratio <= max_ratio {
+        return scale;
+    }
+    let area_scale = (x * z).sqrt().clamp(0.05, 20.0);
+    let root_ratio = max_ratio.sqrt();
+    let (next_x, next_z) = if x >= z {
+        (area_scale * root_ratio, area_scale / root_ratio)
+    } else {
+        (area_scale / root_ratio, area_scale * root_ratio)
+    };
+    [
+        next_x.clamp(0.05, 20.0).copysign(scale[0]),
+        area_scale.clamp(0.05, 20.0).copysign(scale[1]),
+        next_z.clamp(0.05, 20.0).copysign(scale[2]),
+    ]
 }
 
 fn normalize_repeated_asset_scales(placements: &mut [GroundedScenePlacement], floor_y: f32) {
@@ -1472,14 +1547,23 @@ fn grounded_bsn_text(
         ));
     }
     out.push_str(&format!(
-        "camera translation [{}] focus [{}] yaw {} pitch {} radius {} vertical_fov {};\n",
+        "camera translation [{}] focus [{}]",
         fmt_vec3(camera.translation),
         fmt_vec3(camera.focus),
-        fmt_num(camera.yaw.unwrap_or(0.0)),
-        fmt_num(camera.pitch.unwrap_or(30.0)),
-        fmt_num(camera.radius.unwrap_or(5.0)),
-        fmt_num(camera.vertical_fov_degrees.unwrap_or(72.0))
     ));
+    if let Some(yaw) = camera.yaw {
+        out.push_str(&format!(" yaw {}", fmt_num(yaw)));
+    }
+    if let Some(pitch) = camera.pitch {
+        out.push_str(&format!(" pitch {}", fmt_num(pitch)));
+    }
+    if let Some(radius) = camera.radius {
+        out.push_str(&format!(" radius {}", fmt_num(radius)));
+    }
+    if let Some(vertical_fov) = camera.vertical_fov_degrees {
+        out.push_str(&format!(" vertical_fov {}", fmt_num(vertical_fov)));
+    }
+    out.push_str(";\n");
     out.push_str("}\n");
     out
 }
