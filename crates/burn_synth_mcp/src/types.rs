@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use burn_synth::{ModelSelection, RuntimeConfig, TrellisComputeProfile};
 use burn_synth_grounding::{
-    GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, SegmentationPrecision,
-    SegmentationQuantization,
+    GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, LocateAnythingPrecision,
+    SegmentationPrecision, SegmentationQuantization,
 };
 use burn_synth_scene::SceneQualityProfile;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -17,6 +17,9 @@ use serde_json::Value;
 pub(crate) const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const DEFAULT_SCENE_TRELLIS_TARGET_FACES: usize = 80_000;
 pub(crate) const DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE: usize = 512;
+pub(crate) const DEFAULT_SCENE_SEGMENTATION_CDN_BASE_URL: &str =
+    "https://aberration.technology/model";
+pub(crate) const DEFAULT_LOCATE_ANYTHING_CDN_BASE_URL: &str = "https://aberration.technology/model";
 pub(crate) static NEXT_SCENE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -279,6 +282,24 @@ pub enum LocateAnythingBackend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SceneLocateAnythingPrecision {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl From<SceneLocateAnythingPrecision> for LocateAnythingPrecision {
+    fn from(value: SceneLocateAnythingPrecision) -> Self {
+        match value {
+            SceneLocateAnythingPrecision::F32 => LocateAnythingPrecision::F32,
+            SceneLocateAnythingPrecision::F16 => LocateAnythingPrecision::F16,
+            SceneLocateAnythingPrecision::Bf16 => LocateAnythingPrecision::Bf16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CubeClAutotuneLevelSetting {
     Default,
@@ -421,6 +442,22 @@ pub struct ServerArgs {
     #[arg(long, default_value = "assets/models/LocateAnything-3B")]
     pub locate_anything_model_root: PathBuf,
 
+    /// Local cache directory for LocateAnything CDN model shards and materialized safetensors.
+    #[arg(long)]
+    pub locate_anything_cache_dir: Option<PathBuf>,
+
+    /// CDN base URL for LocateAnything model metadata and bpk shard manifests.
+    #[arg(long, default_value = DEFAULT_LOCATE_ANYTHING_CDN_BASE_URL)]
+    pub locate_anything_cdn_base_url: Option<String>,
+
+    /// Allow LocateAnything runtime to download missing CDN artifacts.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub locate_anything_allow_download: bool,
+
+    /// Precision/artifact variant used for LocateAnything CDN bpk shards.
+    #[arg(long, value_enum, default_value_t = SceneLocateAnythingPrecision::Bf16)]
+    pub locate_anything_precision: SceneLocateAnythingPrecision,
+
     /// Image token limit for the LocateAnything locator. Defaults to the WGPU-safe limit.
     #[arg(long, default_value_t = LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT as usize)]
     pub locate_anything_in_token_limit: usize,
@@ -430,7 +467,7 @@ pub struct ServerArgs {
     pub locate_anything_backend: LocateAnythingBackend,
 
     /// Optional segmentation/mask provider used by CV-grounded scene composition.
-    #[arg(long, value_enum, default_value_t = SceneSegmentationProvider::None)]
+    #[arg(long, value_enum, default_value_t = SceneSegmentationProvider::Sam2)]
     pub scene_segmentation_provider: SceneSegmentationProvider,
 
     /// Segmentation checkpoint precision/artifact variant.
@@ -450,11 +487,11 @@ pub struct ServerArgs {
     pub scene_segmentation_cache_dir: Option<PathBuf>,
 
     /// CDN base URL for segmentation model manifests/shards.
-    #[arg(long)]
+    #[arg(long, default_value = DEFAULT_SCENE_SEGMENTATION_CDN_BASE_URL)]
     pub scene_segmentation_cdn_base_url: Option<String>,
 
     /// Allow segmentation runtime to fetch missing CDN artifacts when a loader is available.
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub scene_segmentation_allow_download: bool,
 
     #[command(subcommand)]
@@ -807,6 +844,10 @@ pub struct ServerConfig {
     pub depth_precision: SceneDepthPrecision,
     pub depth_allow_download: bool,
     pub locate_anything_model_root: PathBuf,
+    pub locate_anything_cache_dir: Option<PathBuf>,
+    pub locate_anything_cdn_base_url: Option<String>,
+    pub locate_anything_allow_download: bool,
+    pub locate_anything_precision: SceneLocateAnythingPrecision,
     pub locate_anything_in_token_limit: usize,
     pub locate_anything_backend: LocateAnythingBackend,
     pub scene_segmentation_provider: SceneSegmentationProvider,
@@ -865,6 +906,10 @@ impl ServerConfig {
             depth_precision: args.depth_precision,
             depth_allow_download: args.depth_allow_download,
             locate_anything_model_root: args.locate_anything_model_root,
+            locate_anything_cache_dir: args.locate_anything_cache_dir,
+            locate_anything_cdn_base_url: args.locate_anything_cdn_base_url,
+            locate_anything_allow_download: args.locate_anything_allow_download,
+            locate_anything_precision: args.locate_anything_precision,
             locate_anything_in_token_limit: args.locate_anything_in_token_limit.max(1),
             locate_anything_backend: args.locate_anything_backend,
             scene_segmentation_provider: args.scene_segmentation_provider,

@@ -123,6 +123,133 @@ pub(crate) fn apply_canonical_pose_openai_selection(
     run.selection_report.clone()
 }
 
+pub(crate) fn apply_canonical_pose_rendered_selection(
+    run: &mut CanonicalPoseCalibrationRun,
+) -> Value {
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+    for (report_index, report) in run.reports.iter_mut().enumerate() {
+        let source_metrics = report
+            .source_crop_path
+            .as_deref()
+            .and_then(|path| rendered_pose_image_metrics(path).ok());
+        let generated_metrics = report
+            .generated_image_path
+            .as_deref()
+            .and_then(|path| rendered_pose_image_metrics(path).ok());
+        if source_metrics.is_none() && generated_metrics.is_none() {
+            skipped.push(json!({
+                "index": report_index,
+                "asset_id": report.asset_id,
+                "reason": "missing source crop and generated object image metrics",
+            }));
+            continue;
+        }
+
+        let mut best = None::<(usize, f32, f32, f32, RenderedPoseImageMetrics)>;
+        for (candidate_index, candidate) in report.candidates.iter_mut().enumerate() {
+            let Some(render_path) = candidate.rendered_image_path.as_deref() else {
+                continue;
+            };
+            let Ok(rendered_metrics) = rendered_pose_image_metrics(render_path) else {
+                continue;
+            };
+            let generated_score = generated_metrics
+                .as_ref()
+                .map(|metrics| rendered_pose_similarity(&rendered_metrics, metrics))
+                .unwrap_or(0.0);
+            let source_score = source_metrics
+                .as_ref()
+                .map(|metrics| rendered_pose_similarity(&rendered_metrics, metrics))
+                .unwrap_or(0.0);
+            let evidence_weight = if generated_metrics.is_some() && source_metrics.is_some() {
+                0.82
+            } else {
+                0.70
+            };
+            let evidence_score = if generated_metrics.is_some() && source_metrics.is_some() {
+                generated_score * 0.64 + source_score * 0.36
+            } else if generated_metrics.is_some() {
+                generated_score
+            } else {
+                source_score
+            };
+            let measured_score = (evidence_score * evidence_weight
+                + candidate.score * (1.0 - evidence_weight))
+                .clamp(0.0, 1.0);
+            candidate.score = measured_score;
+            candidate.metrics["render_similarity"] = json!({
+                "measured_score": measured_score,
+                "generated_score": generated_score,
+                "source_score": source_score,
+                "rendered": rendered_metrics,
+                "generated_available": generated_metrics.is_some(),
+                "source_available": source_metrics.is_some(),
+            });
+            if best
+                .as_ref()
+                .map(|(_, score, _, _, _)| measured_score > *score)
+                .unwrap_or(true)
+            {
+                best = Some((
+                    candidate_index,
+                    measured_score,
+                    generated_score,
+                    source_score,
+                    rendered_metrics,
+                ));
+            }
+        }
+
+        let Some((candidate_vec_index, measured_score, generated_score, source_score, metrics)) =
+            best
+        else {
+            skipped.push(json!({
+                "index": report_index,
+                "asset_id": report.asset_id,
+                "reason": "no rendered candidate thumbnails were available",
+            }));
+            continue;
+        };
+        let candidate = report.candidates[candidate_vec_index].clone();
+        report.selected = CanonicalPoseSelection {
+            candidate_index: candidate.candidate_index,
+            yaw_offset_degrees: candidate.yaw_offset_degrees,
+            confidence: measured_score.clamp(0.0, 1.0),
+            source: SceneAssetFrameSource::VisualRenderSweep,
+            rationale: "selected from rendered asset thumbnail similarity against source/generated object evidence".to_string(),
+        };
+        report.fallback_used = measured_score < 0.38;
+        if report.fallback_used {
+            report
+                .warnings
+                .push("rendered thumbnail similarity below confidence threshold".to_string());
+            report.selected.source = SceneAssetFrameSource::AmbiguousFallback;
+        }
+        applied.push(json!({
+            "index": report_index,
+            "asset_id": report.asset_id,
+            "candidate_index": report.selected.candidate_index,
+            "yaw_offset_degrees": report.selected.yaw_offset_degrees,
+            "confidence": report.selected.confidence,
+            "generated_score": generated_score,
+            "source_score": source_score,
+            "rendered_metrics": metrics,
+            "fallback": report.fallback_used,
+        }));
+    }
+    run.asset_bindings = asset_bindings_with_calibrated_frames(&run.asset_bindings, &run.reports);
+    refresh_canonical_pose_selection_inputs(run);
+    run.selection_report = json!({
+        "selector": "rendered-thumbnail-sweep",
+        "applied_count": applied.len(),
+        "skipped_count": skipped.len(),
+        "applied": applied,
+        "skipped": skipped,
+    });
+    run.selection_report.clone()
+}
+
 pub(crate) fn canonical_pose_selection_prompt(task: &Value) -> String {
     let task_json = serde_json::to_string_pretty(task)
         .unwrap_or_else(|_| serde_json::to_string(task).unwrap_or_default());
@@ -133,6 +260,154 @@ pub(crate) fn canonical_pose_selection_prompt(task: &Value) -> String {
          transforms, or new candidate values. If evidence is ambiguous, choose the closest deterministic \
          candidate and lower confidence.\n\nJSON task:\n{task_json}"
     )
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RenderedPoseImageMetrics {
+    width: u32,
+    height: u32,
+    foreground_bbox: [f32; 4],
+    foreground_area_ratio: f32,
+    foreground_center: [f32; 2],
+    foreground_aspect: f32,
+    mean_luma: f32,
+}
+
+fn rendered_pose_image_metrics(path: &str) -> Result<RenderedPoseImageMetrics, String> {
+    let image = image::open(path)
+        .map_err(|err| format!("open canonical pose image {path}: {err}"))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err(format!("canonical pose image {path} is empty"));
+    }
+
+    let mut border = [0.0f32; 4];
+    let mut border_count = 0.0f32;
+    for y in 0..height {
+        for x in 0..width {
+            if x != 0 && y != 0 && x + 1 != width && y + 1 != height {
+                continue;
+            }
+            let pixel = image.get_pixel(x, y).0;
+            border[0] += pixel[0] as f32;
+            border[1] += pixel[1] as f32;
+            border[2] += pixel[2] as f32;
+            border[3] += pixel[3] as f32;
+            border_count += 1.0;
+        }
+    }
+    if border_count > 0.0 {
+        border[0] /= border_count;
+        border[1] /= border_count;
+        border[2] /= border_count;
+        border[3] /= border_count;
+    }
+
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut foreground = 0u32;
+    let mut luma_sum = 0.0f32;
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = image.get_pixel(x, y).0;
+            let alpha_foreground = (pixel[3] as f32 - border[3]).abs() > 32.0;
+            let diff = ((pixel[0] as f32 - border[0]).abs()
+                + (pixel[1] as f32 - border[1]).abs()
+                + (pixel[2] as f32 - border[2]).abs())
+                / 3.0;
+            if alpha_foreground || diff > 22.0 {
+                foreground += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                luma_sum +=
+                    pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722;
+            }
+        }
+    }
+
+    if foreground < (width * height / 250).max(8) {
+        min_x = 0;
+        min_y = 0;
+        max_x = width.saturating_sub(1);
+        max_y = height.saturating_sub(1);
+        foreground = width * height;
+        luma_sum = image
+            .pixels()
+            .map(|pixel| {
+                let pixel = pixel.0;
+                pixel[0] as f32 * 0.2126 + pixel[1] as f32 * 0.7152 + pixel[2] as f32 * 0.0722
+            })
+            .sum();
+    }
+
+    let bbox_width = (max_x + 1).saturating_sub(min_x).max(1);
+    let bbox_height = (max_y + 1).saturating_sub(min_y).max(1);
+    let bbox = [
+        min_x as f32 / width as f32,
+        min_y as f32 / height as f32,
+        (max_x + 1) as f32 / width as f32,
+        (max_y + 1) as f32 / height as f32,
+    ];
+    Ok(RenderedPoseImageMetrics {
+        width,
+        height,
+        foreground_bbox: bbox,
+        foreground_area_ratio: foreground as f32 / (width * height) as f32,
+        foreground_center: [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5],
+        foreground_aspect: bbox_width as f32 / bbox_height as f32,
+        mean_luma: (luma_sum / foreground.max(1) as f32) / 255.0,
+    })
+}
+
+fn rendered_pose_similarity(
+    rendered: &RenderedPoseImageMetrics,
+    reference: &RenderedPoseImageMetrics,
+) -> f32 {
+    let aspect_error =
+        safe_log_ratio(rendered.foreground_aspect, reference.foreground_aspect).abs();
+    let area_error = safe_log_ratio(
+        rendered.foreground_area_ratio,
+        reference.foreground_area_ratio,
+    )
+    .abs();
+    let center_error = ((rendered.foreground_center[0] - reference.foreground_center[0]).powi(2)
+        + (rendered.foreground_center[1] - reference.foreground_center[1]).powi(2))
+    .sqrt();
+    let bbox_iou = bbox_iou_2d(rendered.foreground_bbox, reference.foreground_bbox);
+    let luma_error = (rendered.mean_luma - reference.mean_luma).abs();
+    (1.0 - (aspect_error * 0.22
+        + area_error * 0.18
+        + center_error * 0.28
+        + (1.0 - bbox_iou) * 0.24
+        + luma_error * 0.08))
+        .clamp(0.0, 1.0)
+}
+
+fn safe_log_ratio(left: f32, right: f32) -> f32 {
+    (left.max(1.0e-4) / right.max(1.0e-4)).log2()
+}
+
+fn bbox_iou_2d(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let ix0 = left[0].max(right[0]);
+    let iy0 = left[1].max(right[1]);
+    let ix1 = left[2].min(right[2]);
+    let iy1 = left[3].min(right[3]);
+    let iw = (ix1 - ix0).max(0.0);
+    let ih = (iy1 - iy0).max(0.0);
+    let intersection = iw * ih;
+    let left_area = (left[2] - left[0]).max(0.0) * (left[3] - left[1]).max(0.0);
+    let right_area = (right[2] - right[0]).max(0.0) * (right[3] - right[1]).max(0.0);
+    let union = left_area + right_area - intersection;
+    if union <= f32::EPSILON {
+        0.0
+    } else {
+        intersection / union
+    }
 }
 
 pub(crate) fn refresh_canonical_pose_selection_inputs(run: &mut CanonicalPoseCalibrationRun) {

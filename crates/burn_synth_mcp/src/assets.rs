@@ -1593,6 +1593,17 @@ pub(crate) fn scene_selected_candidate_key(selected: &Value) -> Option<(String, 
     Some((object_id.to_string(), candidate_index))
 }
 
+pub(crate) fn scene_asset_lift_chunk_size(
+    batch_size: Option<usize>,
+    selected_count: usize,
+) -> usize {
+    let selected_count = selected_count.max(1);
+    match batch_size.filter(|size| *size > 0) {
+        Some(size) => size.min(selected_count),
+        None => 1,
+    }
+}
+
 pub(crate) fn cache_scene_asset_outputs(
     cache: &mut HashMap<(String, usize), Value>,
     selected_candidates: &[Value],
@@ -1950,6 +1961,10 @@ impl McpServer {
     ) -> Result<(SceneGroundingEvidence, LocateAnythingGroundingReport), String> {
         let config = LocateAnythingGroundingConfig {
             model_root: self.config.locate_anything_model_root.clone(),
+            cache_dir: self.config.locate_anything_cache_dir.clone(),
+            cdn_base_url: self.config.locate_anything_cdn_base_url.clone(),
+            allow_download: self.config.locate_anything_allow_download,
+            precision: self.config.locate_anything_precision.into(),
             in_token_limit: self.config.locate_anything_in_token_limit,
             ..LocateAnythingGroundingConfig::default()
         };

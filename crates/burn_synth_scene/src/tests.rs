@@ -428,6 +428,10 @@ fn grounding_evidence_prefers_mask_bbox_when_available() {
         score: 1.0,
         area_px: 100,
         image_size: [100, 100],
+        mask_rle: Vec::new(),
+        center_pixel: Some([0.30, 0.55]),
+        contact_pixel: Some([0.30, 0.80]),
+        coverage: Some(0.01),
         artifact_path: None,
         mask_png_path: None,
     });

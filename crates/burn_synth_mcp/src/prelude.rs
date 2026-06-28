@@ -5,6 +5,7 @@ pub(crate) use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::process::{Child, Command, Stdio};
 pub(crate) use std::sync::atomic::Ordering;
+pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,8 +19,9 @@ pub(crate) use bevy_synth_runtime::{
     TripoMesh as CachedTripoMesh,
 };
 pub(crate) use burn_synth::{
-    AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, RuntimeBatchPolicy,
-    SynthRuntime, SynthesisAsset, mesh_quality_failures, mesh_quality_metrics, write_glb_mesh,
+    AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, ProgressVerbosity,
+    RuntimeBatchPolicy, RuntimeProgressEvent, RuntimeProgressObserver, SynthRuntime,
+    SynthesisAsset, mesh_quality_failures, mesh_quality_metrics, write_glb_mesh,
 };
 pub(crate) use burn_synth_grounding::{
     DepthProGroundingConfig, DepthProGroundingReport, LocateAnythingGroundingConfig,

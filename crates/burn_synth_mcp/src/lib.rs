@@ -18,9 +18,9 @@ pub use types::{
     FeedbackRotationSelector, FeedbackThresholdProfile, ForegroundModel, InferenceBackend,
     LocateAnythingBackend, MeshOutputFormat, QualityPreset, SceneBuildExecutionKind,
     SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
-    SceneDepthPrecision, SceneDepthProvider, SceneLocatorProvider, ScenePoseFitMode,
-    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
-    ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
+    SceneDepthPrecision, SceneDepthProvider, SceneLocateAnythingPrecision, SceneLocatorProvider,
+    ScenePoseFitMode, SceneSegmentationPrecision, SceneSegmentationProvider,
+    SceneSegmentationQuantization, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(

@@ -166,10 +166,18 @@ impl SceneAiProvider for NoopSceneProvider {
 fn validate_scene_pose_fit_mode(mode: ScenePoseFitMode) -> Result<(), String> {
     match mode {
         ScenePoseFitMode::ProjectedAabb => Ok(()),
-        ScenePoseFitMode::RenderedSilhouette => Err(
-            "scene pose_fit=rendered-silhouette is not implemented yet; use pose_fit=projected-aabb until rendered mask/depth candidate scoring is wired"
-                .to_string(),
-        ),
+        ScenePoseFitMode::RenderedSilhouette => Ok(()),
+    }
+}
+
+fn scene_pose_fit_note(mode: ScenePoseFitMode) -> &'static str {
+    match mode {
+        ScenePoseFitMode::ProjectedAabb => {
+            "projected AABB/contact/depth fitting; segmentation masks refine source bboxes when available"
+        }
+        ScenePoseFitMode::RenderedSilhouette => {
+            "mask-aware projected silhouette/depth fitting; SAM masks provide visible-surface evidence and AABB projection remains the geometric proxy"
+        }
     }
 }
 
@@ -275,6 +283,185 @@ where
             eprintln!("burn_synth_mcp: failed to write scene progress event: {err}");
         }
         (self.emit)(event);
+    }
+}
+
+fn runtime_progress_event_json(event: &RuntimeProgressEvent) -> Value {
+    match event {
+        RuntimeProgressEvent::RunStarted { run, detail } => json!({
+            "kind": "run_started",
+            "run": run,
+            "detail": detail,
+            "message": runtime_progress_event_message(event),
+        }),
+        RuntimeProgressEvent::StageStarted {
+            run,
+            stage,
+            total_steps,
+            detail,
+        } => json!({
+            "kind": "stage_started",
+            "run": run,
+            "stage": stage,
+            "total_steps": total_steps,
+            "detail": detail,
+            "message": runtime_progress_event_message(event),
+        }),
+        RuntimeProgressEvent::Step {
+            run,
+            stage,
+            step,
+            total_steps,
+            step_ms,
+            elapsed_ms,
+            eta_ms,
+            detail,
+        } => json!({
+            "kind": "step",
+            "run": run,
+            "stage": stage,
+            "step": step,
+            "total_steps": total_steps,
+            "step_ms": step_ms,
+            "elapsed_ms": elapsed_ms,
+            "eta_ms": eta_ms,
+            "detail": detail,
+            "message": runtime_progress_event_message(event),
+        }),
+        RuntimeProgressEvent::StageCompleted {
+            run,
+            stage,
+            total_steps,
+            elapsed_ms,
+            detail,
+        } => json!({
+            "kind": "stage_completed",
+            "run": run,
+            "stage": stage,
+            "total_steps": total_steps,
+            "elapsed_ms": elapsed_ms,
+            "detail": detail,
+            "message": runtime_progress_event_message(event),
+        }),
+        RuntimeProgressEvent::Warning { run, message } => json!({
+            "kind": "warning",
+            "run": run,
+            "message": message,
+        }),
+        RuntimeProgressEvent::RunCompleted {
+            run,
+            elapsed_ms,
+            detail,
+        } => json!({
+            "kind": "run_completed",
+            "run": run,
+            "elapsed_ms": elapsed_ms,
+            "detail": detail,
+            "message": runtime_progress_event_message(event),
+        }),
+    }
+}
+
+fn runtime_progress_event_message(event: &RuntimeProgressEvent) -> String {
+    match event {
+        RuntimeProgressEvent::RunStarted { run, detail } => match detail {
+            Some(detail) => format!("{run} started: {detail}"),
+            None => format!("{run} started"),
+        },
+        RuntimeProgressEvent::StageStarted { stage, detail, .. } => match detail {
+            Some(detail) => format!("{stage} started: {detail}"),
+            None => format!("{stage} started"),
+        },
+        RuntimeProgressEvent::Step {
+            stage,
+            step,
+            total_steps,
+            eta_ms,
+            ..
+        } => {
+            let eta = eta_ms
+                .map(|value| format!(", eta_ms={value:.1}"))
+                .unwrap_or_default();
+            format!("{stage} step {step}/{total_steps}{eta}")
+        }
+        RuntimeProgressEvent::StageCompleted {
+            stage, elapsed_ms, ..
+        } => format!("{stage} complete ({elapsed_ms:.1} ms)"),
+        RuntimeProgressEvent::Warning { message, .. } => format!("warning: {message}"),
+        RuntimeProgressEvent::RunCompleted {
+            run, elapsed_ms, ..
+        } => format!("{run} complete ({elapsed_ms:.1} ms)"),
+    }
+}
+
+fn runtime_progress_scene_phase(kind: &str) -> SceneBuildProgressPhase {
+    match kind {
+        "run_started" | "stage_started" => SceneBuildProgressPhase::Started,
+        "run_completed" | "stage_completed" => SceneBuildProgressPhase::Completed,
+        "warning" => SceneBuildProgressPhase::Failed,
+        _ => SceneBuildProgressPhase::Progress,
+    }
+}
+
+fn runtime_progress_scene_execution(event: &Value) -> SceneBuildExecutionKind {
+    let stage_or_run = event
+        .get("stage")
+        .or_else(|| event.get("run"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if stage_or_run.contains("load") || stage_or_run.contains("download") {
+        SceneBuildExecutionKind::FileIo
+    } else if stage_or_run.contains("rmbg")
+        || stage_or_run.contains("foreground")
+        || stage_or_run.contains("tripo")
+        || stage_or_run.contains("trellis")
+        || stage_or_run.contains("dino")
+        || stage_or_run.contains("vae")
+    {
+        SceneBuildExecutionKind::Gpu
+    } else {
+        SceneBuildExecutionKind::Mixed
+    }
+}
+
+fn emit_asset_runtime_progress_events<F>(
+    progress: &mut SceneBuildProgressReporter<'_, F>,
+    events: &[Value],
+    chunk_index: usize,
+    item_index: Option<usize>,
+    item_count: Option<usize>,
+    artifact_path: PathBuf,
+) where
+    F: FnMut(SceneBuildProgressEvent),
+{
+    for event in events {
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("progress");
+        let stage = event
+            .get("stage")
+            .or_else(|| event.get("run"))
+            .and_then(Value::as_str)
+            .unwrap_or("runtime");
+        let message = event
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(stage)
+            .to_string();
+        progress.emit_with_items(
+            format!("images_to_assets.{stage}"),
+            runtime_progress_scene_phase(kind),
+            runtime_progress_scene_execution(event),
+            message,
+            item_index,
+            item_count,
+            Some(artifact_path.clone()),
+            json!({
+                "chunk_index": chunk_index,
+                "runtime_progress": event,
+            }),
+        );
     }
 }
 
@@ -751,7 +938,10 @@ impl McpServer {
         }))
     }
 
-    fn call_images_to_assets(&mut self, args: ImagesToAssetsToolArgs) -> Result<Value, String> {
+    pub(crate) fn call_images_to_assets(
+        &mut self,
+        args: ImagesToAssetsToolArgs,
+    ) -> Result<Value, String> {
         if args.input_image_paths.is_empty() {
             return Err("input_image_paths must not be empty".to_string());
         }
@@ -784,6 +974,10 @@ impl McpServer {
         let previous_trellis_pbr_enabled = self.runtime.config().trellis_pbr_enabled;
         let previous_trellis_pbr_texture_size = self.runtime.config().trellis_pbr_texture_size;
         let previous_target_faces = self.runtime.config().target_faces;
+        let previous_progress = self.runtime.config().progress.clone();
+        let previous_progress_callback = previous_progress.callback().cloned();
+        let runtime_progress_events = Arc::new(Mutex::new(Vec::<RuntimeProgressEvent>::new()));
+        let runtime_progress_events_for_callback = Arc::clone(&runtime_progress_events);
         let effective_trellis_pbr_enabled =
             args.trellis_pbr.unwrap_or(previous_trellis_pbr_enabled);
         let effective_trellis_pbr_texture_size = args
@@ -799,6 +993,21 @@ impl McpServer {
             config.trellis_pbr_enabled = effective_trellis_pbr_enabled;
             config.trellis_pbr_texture_size = effective_trellis_pbr_texture_size;
             config.target_faces = effective_target_faces;
+            config.progress = RuntimeProgressObserver::with_callback(
+                match previous_progress.verbosity {
+                    ProgressVerbosity::Steps => ProgressVerbosity::Steps,
+                    ProgressVerbosity::Stages | ProgressVerbosity::Off => ProgressVerbosity::Stages,
+                },
+                previous_progress.step_interval,
+                Arc::new(move |event| {
+                    if let Some(callback) = previous_progress_callback.as_ref() {
+                        callback(event);
+                    }
+                    if let Ok(mut events) = runtime_progress_events_for_callback.lock() {
+                        events.push(event.clone());
+                    }
+                }),
+            );
         }
 
         let batch_result = self.runtime.synthesize_assets_batch(AssetBatchRequest {
@@ -825,13 +1034,22 @@ impl McpServer {
             dry_run: args.dry_run,
             policy,
         });
+        let captured_runtime_progress_events = runtime_progress_events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default();
         {
             let config = self.runtime.config_mut();
             config.trellis_pbr_enabled = previous_trellis_pbr_enabled;
             config.trellis_pbr_texture_size = previous_trellis_pbr_texture_size;
             config.target_faces = previous_target_faces;
+            config.progress = previous_progress;
         }
         let batch = batch_result.map_err(|err| err.to_string())?;
+        let runtime_progress_events_json = captured_runtime_progress_events
+            .iter()
+            .map(runtime_progress_event_json)
+            .collect::<Vec<_>>();
 
         let mut items = Vec::with_capacity(batch.items.len());
         let mut catalog_cache = if args.promote_to_catalog {
@@ -906,6 +1124,7 @@ impl McpServer {
             "trellis_pbr_backend": if effective_trellis_pbr_enabled { Some("rust-ovoxel") } else { None },
             "trellis_pbr_texture_size": effective_trellis_pbr_texture_size,
             "target_faces": effective_target_faces,
+            "runtime_progress_events": runtime_progress_events_json,
             "promote_to_catalog": args.promote_to_catalog,
             "dry_run": args.dry_run,
         }))
@@ -1337,7 +1556,7 @@ impl McpServer {
                 .cloned()
                 .collect::<Vec<_>>();
             if !missing_selected.is_empty() {
-                let input_image_paths = missing_selected
+                let missing_input_image_paths = missing_selected
                     .iter()
                     .map(|candidate| {
                         candidate
@@ -1347,65 +1566,102 @@ impl McpServer {
                             .ok_or_else(|| "selected candidate missing image_path".to_string())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                progress.emit_with_items(
-                    "images_to_assets",
-                    SceneBuildProgressPhase::Progress,
-                    SceneBuildExecutionKind::Gpu,
-                    format!(
-                        "running {} batch for {} image(s)",
-                        selected_asset_model.as_str(),
-                        input_image_paths.len()
-                    ),
-                    Some(cached_asset_outputs.len()),
-                    Some(selected_values.len()),
-                    Some(output_dir.join("assets")),
-                    json!({
-                        "attempt_index": asset_attempts.len(),
-                        "synthesis_models": selected_synthesis_models.iter().map(|model| model.as_str()).collect::<Vec<_>>(),
-                        "inputs": input_image_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-                    }),
-                );
-                let new_outputs = self.call_images_to_assets(ImagesToAssetsToolArgs {
-                    input_image_paths,
-                    output_dir: Some(output_dir.join("assets")),
-                    output_paths: None,
-                    output_format: Some(AssetOutputFormat::Auto),
-                    rmbg_model: Some(ForegroundModel::Rmbg2),
-                    synthesis_models: Some(selected_synthesis_models.clone()),
-                    backend: Some(self.config.default_backend),
-                    target_faces: args
-                        .target_faces
-                        .or(Some(DEFAULT_SCENE_TRELLIS_TARGET_FACES)),
-                    batch_size: args.batch_size,
-                    batch_vram_mb: args.batch_vram_mb,
-                    trellis_pbr: Some(args.trellis_pbr.unwrap_or(true)),
-                    trellis_pbr_texture_size: args
-                        .trellis_pbr_texture_size
-                        .or(Some(DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE)),
-                    promote_to_catalog: args.promote_to_catalog,
-                    dry_run: false,
-                })?;
-                cache_scene_asset_outputs(
-                    &mut cached_asset_outputs,
-                    &missing_selected,
-                    &new_outputs,
-                )?;
-                progress.emit_with_items(
-                    "images_to_assets",
-                    SceneBuildProgressPhase::Progress,
-                    SceneBuildExecutionKind::Gpu,
-                    format!(
-                        "{} batch complete; checking asset quality",
-                        selected_asset_model.as_str()
-                    ),
-                    Some(cached_asset_outputs.len()),
-                    Some(selected_values.len()),
-                    Some(output_dir.join("assets")),
-                    json!({
-                        "stats": new_outputs.get("stats").cloned().unwrap_or(Value::Null),
-                        "items": new_outputs.get("items").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
-                    }),
-                );
+                let chunk_size =
+                    scene_asset_lift_chunk_size(args.batch_size, missing_selected.len());
+                for (chunk_index, (candidate_chunk, input_chunk)) in missing_selected
+                    .chunks(chunk_size)
+                    .zip(missing_input_image_paths.chunks(chunk_size))
+                    .enumerate()
+                {
+                    progress.emit_with_items(
+                        "images_to_assets",
+                        SceneBuildProgressPhase::Progress,
+                        SceneBuildExecutionKind::Gpu,
+                        format!(
+                            "running {} asset lift chunk {}/{} for {} image(s)",
+                            selected_asset_model.as_str(),
+                            chunk_index + 1,
+                            missing_selected.len().div_ceil(chunk_size),
+                            input_chunk.len()
+                        ),
+                        Some(cached_asset_outputs.len()),
+                        Some(selected_values.len()),
+                        Some(output_dir.join("assets")),
+                        json!({
+                            "attempt_index": asset_attempts.len(),
+                            "chunk_index": chunk_index,
+                            "chunk_count": missing_selected.len().div_ceil(chunk_size),
+                            "chunk_size": chunk_size,
+                            "batch_size_source": if args.batch_size.unwrap_or(0) > 0 { "explicit" } else { "scene_build_review_default" },
+                            "synthesis_models": selected_synthesis_models.iter().map(|model| model.as_str()).collect::<Vec<_>>(),
+                            "inputs": input_chunk.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                            "objects": candidate_chunk.iter().map(|candidate| {
+                                json!({
+                                    "object_id": candidate.get("object_id").and_then(Value::as_str),
+                                    "candidate_index": candidate.get("candidate_index").and_then(Value::as_u64),
+                                })
+                            }).collect::<Vec<_>>(),
+                        }),
+                    );
+                    let new_outputs = self.call_images_to_assets(ImagesToAssetsToolArgs {
+                        input_image_paths: input_chunk.to_vec(),
+                        output_dir: Some(output_dir.join("assets")),
+                        output_paths: None,
+                        output_format: Some(AssetOutputFormat::Auto),
+                        rmbg_model: Some(ForegroundModel::Rmbg2),
+                        synthesis_models: Some(selected_synthesis_models.clone()),
+                        backend: Some(self.config.default_backend),
+                        target_faces: args
+                            .target_faces
+                            .or(Some(DEFAULT_SCENE_TRELLIS_TARGET_FACES)),
+                        batch_size: Some(input_chunk.len()),
+                        batch_vram_mb: args.batch_vram_mb,
+                        trellis_pbr: Some(args.trellis_pbr.unwrap_or(true)),
+                        trellis_pbr_texture_size: args
+                            .trellis_pbr_texture_size
+                            .or(Some(DEFAULT_SCENE_TRELLIS_PBR_TEXTURE_SIZE)),
+                        promote_to_catalog: args.promote_to_catalog,
+                        dry_run: false,
+                    })?;
+                    let runtime_progress_events = new_outputs
+                        .get("runtime_progress_events")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    emit_asset_runtime_progress_events(
+                        progress,
+                        &runtime_progress_events,
+                        chunk_index,
+                        Some(cached_asset_outputs.len()),
+                        Some(selected_values.len()),
+                        output_dir.join("assets"),
+                    );
+                    cache_scene_asset_outputs(
+                        &mut cached_asset_outputs,
+                        candidate_chunk,
+                        &new_outputs,
+                    )?;
+                    progress.emit_with_items(
+                        "images_to_assets",
+                        SceneBuildProgressPhase::Progress,
+                        SceneBuildExecutionKind::Gpu,
+                        format!(
+                            "{} asset lift chunk {}/{} complete; checking asset quality",
+                            selected_asset_model.as_str(),
+                            chunk_index + 1,
+                            missing_selected.len().div_ceil(chunk_size)
+                        ),
+                        Some(cached_asset_outputs.len()),
+                        Some(selected_values.len()),
+                        Some(output_dir.join("assets")),
+                        json!({
+                            "chunk_index": chunk_index,
+                            "stats": new_outputs.get("stats").cloned().unwrap_or(Value::Null),
+                            "items": new_outputs.get("items").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+                            "runtime_progress_events": runtime_progress_events,
+                        }),
+                    );
+                }
             }
             let outputs =
                 scene_cached_asset_outputs_for_selected(&selected_values, &cached_asset_outputs)?;
@@ -1564,52 +1820,6 @@ impl McpServer {
             }),
         );
         if args.composition_mode == SceneCompositionMode::CvGrounded
-            && args.depth_provider == SceneDepthProvider::DepthPro
-            && grounding_evidence.depth.is_none()
-        {
-            let stage_started = Instant::now();
-            progress.emit(
-                "depth_pro_grounding_evidence",
-                SceneBuildProgressPhase::Started,
-                SceneBuildExecutionKind::Gpu,
-                "running DepthPro camera/depth/floor grounding",
-                json!({
-                    "depth_provider": args.depth_provider,
-                    "cache_dir": self.config.depth_cache_dir.clone(),
-                    "precision": self.config.depth_precision,
-                }),
-            );
-            let depth_report = self.depth_pro_grounding_evidence(
-                &mut grounding_evidence,
-                &args.source_scene_path,
-                &output_dir,
-            )?;
-            record_stage(
-                &mut stage_report,
-                "depth_pro_grounding_evidence",
-                stage_started,
-            );
-            progress.emit_with_items(
-                "depth_pro_grounding_evidence",
-                SceneBuildProgressPhase::Completed,
-                SceneBuildExecutionKind::Gpu,
-                "DepthPro grounding complete",
-                None,
-                Some(grounding_evidence.objects.len()),
-                Some(output_dir.join("depth_pro").join("depth_evidence.json")),
-                json!({
-                    "has_depth": grounding_evidence.depth.is_some(),
-                    "runtime_cache_hit": depth_report.runtime_cache_hit,
-                    "load_ms": depth_report.load_ms,
-                    "infer_ms": depth_report.infer_ms,
-                    "floor_sample_count": grounding_evidence
-                        .depth
-                        .as_ref()
-                        .and_then(|depth| depth.floor_sample_count),
-                }),
-            );
-        }
-        if args.composition_mode == SceneCompositionMode::CvGrounded
             && segmentation_provider != SceneSegmentationProvider::None
             && grounding_evidence.segmentation.is_none()
         {
@@ -1663,6 +1873,56 @@ impl McpServer {
                     "segmentation_quantization": segmentation_quantization,
                     "mask_count": segmentation_report.as_ref().map(|report| report.mask_count),
                     "runtime_cache_hit": segmentation_report.as_ref().map(|report| report.runtime_cache_hit),
+                }),
+            );
+        }
+        if args.composition_mode == SceneCompositionMode::CvGrounded
+            && args.depth_provider == SceneDepthProvider::DepthPro
+            && grounding_evidence.depth.is_none()
+        {
+            let stage_started = Instant::now();
+            progress.emit(
+                "depth_pro_grounding_evidence",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Gpu,
+                "running DepthPro camera/depth/floor grounding",
+                json!({
+                    "depth_provider": args.depth_provider,
+                    "cache_dir": self.config.depth_cache_dir.clone(),
+                    "precision": self.config.depth_precision,
+                    "mask_count": grounding_evidence
+                        .segmentation
+                        .as_ref()
+                        .and_then(|segmentation| segmentation.mask_count),
+                }),
+            );
+            let depth_report = self.depth_pro_grounding_evidence(
+                &mut grounding_evidence,
+                &args.source_scene_path,
+                &output_dir,
+            )?;
+            record_stage(
+                &mut stage_report,
+                "depth_pro_grounding_evidence",
+                stage_started,
+            );
+            progress.emit_with_items(
+                "depth_pro_grounding_evidence",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Gpu,
+                "DepthPro grounding complete",
+                None,
+                Some(grounding_evidence.objects.len()),
+                Some(output_dir.join("depth_pro").join("depth_evidence.json")),
+                json!({
+                    "has_depth": grounding_evidence.depth.is_some(),
+                    "runtime_cache_hit": depth_report.runtime_cache_hit,
+                    "load_ms": depth_report.load_ms,
+                    "infer_ms": depth_report.infer_ms,
+                    "floor_sample_count": grounding_evidence
+                        .depth
+                        .as_ref()
+                        .and_then(|depth| depth.floor_sample_count),
                 }),
             );
         }
@@ -1737,7 +1997,7 @@ impl McpServer {
                 "objects": grounding_evidence.objects.len(),
                 "composition_mode": args.composition_mode,
                 "requested_pose_fit": args.pose_fit,
-                "pose_fit": ScenePoseFitMode::ProjectedAabb,
+                "pose_fit": args.pose_fit,
             }),
         );
         let composition_candidates = scene_composition_candidates(
@@ -1861,10 +2121,8 @@ impl McpServer {
         response["requested_composition_mode"] = json!(args.composition_mode);
         response["composition_mode"] = json!(selected_composition.mode);
         response["requested_pose_fit"] = json!(args.pose_fit);
-        response["pose_fit"] = json!(ScenePoseFitMode::ProjectedAabb);
-        response["pose_fit_note"] = json!(
-            "projected-aabb/contact/depth feedback is the currently implemented deterministic pose fit path"
-        );
+        response["pose_fit"] = json!(args.pose_fit);
+        response["pose_fit_note"] = json!(scene_pose_fit_note(args.pose_fit));
         response["canonical_pose"] = json!(args.canonical_pose);
         response["max_pose_candidates"] = json!(args.max_pose_candidates);
         response["save_pose_debug"] = json!(args.save_pose_debug);
@@ -2094,19 +2352,6 @@ impl McpServer {
             .unwrap_or(self.config.scene_segmentation_quantization);
         let mut segmentation_report = None;
 
-        if args.depth_provider == SceneDepthProvider::DepthPro && evidence.depth.is_none() {
-            let stage_started = Instant::now();
-            let _depth_report = self.depth_pro_grounding_evidence(
-                &mut evidence,
-                &args.source_scene_path,
-                &output_dir,
-            )?;
-            record_stage(
-                &mut stage_report,
-                "depth_pro_grounding_evidence",
-                stage_started,
-            );
-        }
         if args.composition_mode == SceneCompositionMode::CvGrounded
             && segmentation_provider != SceneSegmentationProvider::None
             && evidence.segmentation.is_none()
@@ -2123,6 +2368,19 @@ impl McpServer {
             record_stage(
                 &mut stage_report,
                 "segmentation_grounding_evidence",
+                stage_started,
+            );
+        }
+        if args.depth_provider == SceneDepthProvider::DepthPro && evidence.depth.is_none() {
+            let stage_started = Instant::now();
+            let _depth_report = self.depth_pro_grounding_evidence(
+                &mut evidence,
+                &args.source_scene_path,
+                &output_dir,
+            )?;
+            record_stage(
+                &mut stage_report,
+                "depth_pro_grounding_evidence",
                 stage_started,
             );
         }
@@ -2170,8 +2428,8 @@ impl McpServer {
             "source_scene_path": args.source_scene_path,
             "requested_composition_mode": args.composition_mode,
             "requested_pose_fit": args.pose_fit,
-            "pose_fit": ScenePoseFitMode::ProjectedAabb,
-            "pose_fit_note": "projected-aabb/contact/depth feedback is the currently implemented deterministic pose fit path",
+            "pose_fit": args.pose_fit,
+            "pose_fit_note": scene_pose_fit_note(args.pose_fit),
             "canonical_pose": args.canonical_pose,
             "max_pose_candidates": args.max_pose_candidates,
             "save_pose_debug": args.save_pose_debug,
@@ -2236,7 +2494,7 @@ impl McpServer {
         let bsn = feedback_bsn_from_commands(&asset_bindings, &grounded_layout, &commands)?;
         response["composition_mode"] = json!(selected_composition.mode);
         response["requested_pose_fit"] = json!(args.pose_fit);
-        response["pose_fit"] = json!(ScenePoseFitMode::ProjectedAabb);
+        response["pose_fit"] = json!(args.pose_fit);
         if !feedback_candidate_reports.is_empty() {
             response["composition_candidate_reports"] = json!(feedback_candidate_reports);
         }
@@ -2330,6 +2588,18 @@ impl McpServer {
             request.evidence,
         );
         let render_report = self.render_canonical_pose_candidate_thumbnails(&request, &mut run);
+        let rendered_selection_report = if matches!(
+            request.mode,
+            SceneCanonicalPoseMode::Auto
+                | SceneCanonicalPoseMode::RenderSweep
+                | SceneCanonicalPoseMode::Openai
+        ) {
+            let mut report = apply_canonical_pose_rendered_selection(&mut run);
+            report["render_report"] = render_report.clone();
+            report
+        } else {
+            Value::Null
+        };
         run.selection_report = match request.mode {
             SceneCanonicalPoseMode::Off => json!({
                 "selector": "disabled",
@@ -2339,13 +2609,21 @@ impl McpServer {
             }),
             SceneCanonicalPoseMode::Openai => {
                 if run.reports.is_empty() || run.image_paths.is_empty() {
-                    json!({
-                        "selector": "openai",
-                        "fallback": true,
-                        "applied_count": 0,
-                        "reason": "missing canonical pose image evidence; kept deterministic candidates",
-                        "render_report": render_report,
-                    })
+                    let mut report = if rendered_selection_report.is_null() {
+                        json!({
+                            "selector": "openai",
+                            "fallback": true,
+                            "applied_count": 0,
+                        })
+                    } else {
+                        rendered_selection_report.clone()
+                    };
+                    report["openai_fallback"] = json!(true);
+                    report["reason"] = json!(
+                        "missing canonical pose image evidence; kept rendered/deterministic candidates"
+                    );
+                    report["render_report"] = render_report;
+                    report
                 } else {
                     let prompt = canonical_pose_selection_prompt(&run.selection_task);
                     if request.write_artifacts {
@@ -2390,20 +2668,48 @@ impl McpServer {
                             report["render_report"] = render_report;
                             report
                         }
-                        Err(err) => json!({
-                            "selector": "openai",
-                            "fallback": true,
-                            "applied_count": 0,
-                            "error": err,
-                            "reason": "kept deterministic canonical pose candidates",
-                            "render_report": render_report,
-                        }),
+                        Err(err) => {
+                            let mut report = if rendered_selection_report.is_null() {
+                                json!({
+                                    "selector": "openai",
+                                    "fallback": true,
+                                    "applied_count": 0,
+                                })
+                            } else {
+                                rendered_selection_report.clone()
+                            };
+                            report["openai_fallback"] = json!(true);
+                            report["openai_error"] = json!(err);
+                            report["reason"] =
+                                json!("kept rendered/deterministic canonical pose candidates");
+                            report["render_report"] = render_report;
+                            report
+                        }
                     }
                 }
             }
-            SceneCanonicalPoseMode::Heuristic
-            | SceneCanonicalPoseMode::RenderSweep
-            | SceneCanonicalPoseMode::Auto => json!({
+            SceneCanonicalPoseMode::RenderSweep | SceneCanonicalPoseMode::Auto => {
+                if rendered_selection_report.is_null() {
+                    json!({
+                        "selector": canonical_pose_mode_label(request.mode),
+                        "applied_count": run
+                            .reports
+                            .iter()
+                            .filter(|report| !report.fallback_used)
+                            .count(),
+                        "fallback_count": run
+                            .reports
+                            .iter()
+                            .filter(|report| report.fallback_used)
+                            .count(),
+                        "reason": "deterministic canonical pose candidate selection",
+                        "render_report": render_report,
+                    })
+                } else {
+                    rendered_selection_report
+                }
+            }
+            SceneCanonicalPoseMode::Heuristic => json!({
                 "selector": canonical_pose_mode_label(request.mode),
                 "applied_count": run
                     .reports
@@ -2429,11 +2735,13 @@ impl McpServer {
     ) -> Value {
         if !matches!(
             request.mode,
-            SceneCanonicalPoseMode::RenderSweep | SceneCanonicalPoseMode::Openai
+            SceneCanonicalPoseMode::Auto
+                | SceneCanonicalPoseMode::RenderSweep
+                | SceneCanonicalPoseMode::Openai
         ) {
             return json!({
                 "enabled": false,
-                "reason": "thumbnail rendering is only enabled for canonical_pose=render-sweep or canonical_pose=openai",
+                "reason": "thumbnail rendering is only enabled for canonical_pose=auto, render-sweep, or openai",
             });
         }
         if run.reports.is_empty() {

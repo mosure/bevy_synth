@@ -9,6 +9,7 @@ use burn_depth::{
     backproject_depth, depth_at_bbox_contact_region, estimate_floor_plane, pixel_to_ray,
 };
 use burn_locate_anything::LocateAnythingDetector;
+pub use burn_locate_anything::import::LocateAnythingPrecision;
 pub use burn_locate_anything::{
     DecodeMode, Detection as LocateAnythingDetection, DetectionQuery,
     LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, LocateAnythingRuntime, LocateAnythingRuntimeBackend,
@@ -78,6 +79,10 @@ impl Default for DepthProGroundingConfig {
 #[derive(Clone, Debug)]
 pub struct LocateAnythingGroundingConfig {
     pub model_root: PathBuf,
+    pub cache_dir: Option<PathBuf>,
+    pub cdn_base_url: Option<String>,
+    pub allow_download: bool,
+    pub precision: LocateAnythingPrecision,
     pub in_token_limit: usize,
     pub decode_mode: DecodeMode,
     pub max_new_tokens: usize,
@@ -91,6 +96,10 @@ impl Default for LocateAnythingGroundingConfig {
         let runtime = LocateAnythingRuntimeConfig::default();
         Self {
             model_root: PathBuf::from("assets/models/LocateAnything-3B"),
+            cache_dir: None,
+            cdn_base_url: None,
+            allow_download: false,
+            precision: LocateAnythingPrecision::default(),
             in_token_limit: LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT as usize,
             decode_mode: DecodeMode::Hybrid,
             max_new_tokens: runtime.max_new_tokens,
@@ -142,7 +151,7 @@ impl SegmentationGroundingConfig {
             quantization: self.quantization,
             allow_download: self.allow_download,
             require_gpu: self.require_gpu,
-            profile_stages: false,
+            profile_stages: true,
         }
     }
 }
@@ -151,6 +160,10 @@ impl LocateAnythingGroundingConfig {
     fn runtime_config(&self) -> LocateAnythingRuntimeConfig {
         LocateAnythingRuntimeConfig {
             model_root: self.model_root.clone(),
+            cache_dir: self.cache_dir.clone(),
+            cdn_base_url: self.cdn_base_url.clone(),
+            allow_download: self.allow_download,
+            precision: self.precision,
             backend: LocateAnythingRuntimeBackend::BurnNative,
             allow_experimental_native_detect: true,
             decode_mode: self.decode_mode,
@@ -167,6 +180,10 @@ impl LocateAnythingGroundingConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocateAnythingBurnNativeCacheKey {
     model_root: PathBuf,
+    cache_dir: Option<PathBuf>,
+    cdn_base_url: Option<String>,
+    allow_download: bool,
+    precision: LocateAnythingPrecision,
     decode_mode: DecodeMode,
     max_new_tokens: usize,
     in_token_limit: u32,
@@ -179,6 +196,10 @@ impl LocateAnythingBurnNativeCacheKey {
     pub fn from_config(config: &LocateAnythingRuntimeConfig) -> Self {
         Self {
             model_root: config.model_root.clone(),
+            cache_dir: config.cache_dir.clone(),
+            cdn_base_url: config.cdn_base_url.clone(),
+            allow_download: config.allow_download,
+            precision: config.precision,
             decode_mode: config.decode_mode,
             max_new_tokens: config.max_new_tokens,
             in_token_limit: config.in_token_limit,
@@ -279,6 +300,7 @@ pub struct SegmentationGroundingReport {
     pub elapsed_ms: f64,
     pub runtime_cache_hit: bool,
     pub mask_count: usize,
+    pub stage_timings: Option<burn_segmentation::SegmentationStageTimings>,
 }
 
 #[derive(Clone, Debug)]
@@ -654,9 +676,16 @@ impl SceneGroundingRuntime {
                     score: mask.score,
                     area_px: mask.area_px,
                     image_size: [mask.width, mask.height],
+                    mask_rle: mask.mask_rle.clone(),
+                    center_pixel: mask_center_pixel(mask),
+                    contact_pixel: mask_contact_pixel(mask),
+                    coverage: mask_coverage(mask),
                     artifact_path: Some(masks_path.display().to_string()),
                     mask_png_path: mask.mask_png_path.clone(),
                 });
+                if let Some(contact) = object.mask.as_ref().and_then(|mask| mask.contact_pixel) {
+                    object.contact_pixel = Some(contact);
+                }
                 let provenance = format!("segmentation_{}", config.model.label());
                 if !object.provenance.iter().any(|entry| entry == &provenance) {
                     object.provenance.push(provenance);
@@ -671,8 +700,69 @@ impl SceneGroundingRuntime {
             elapsed_ms,
             runtime_cache_hit: cache_hit,
             mask_count: masks.len(),
+            stage_timings: runtime.last_stage_timings(),
         })
     }
+}
+
+fn mask_center_pixel(mask: &burn_segmentation::SegmentationMask) -> Option<[f32; 2]> {
+    let binary = BinaryMask::decode_rle(mask.width, mask.height, &mask.mask_rle).ok()?;
+    normalized_mask_center(&binary)
+}
+
+fn mask_contact_pixel(mask: &burn_segmentation::SegmentationMask) -> Option<[f32; 2]> {
+    let binary = BinaryMask::decode_rle(mask.width, mask.height, &mask.mask_rle).ok()?;
+    normalized_mask_bottom_center(&binary)
+        .or_else(|| binary.bbox_normalized().map(bbox_bottom_center))
+}
+
+fn mask_coverage(mask: &burn_segmentation::SegmentationMask) -> Option<f32> {
+    let total = mask.width.checked_mul(mask.height)?;
+    (total > 0).then_some(mask.area_px as f32 / total as f32)
+}
+
+fn normalized_mask_center(mask: &BinaryMask) -> Option<[f32; 2]> {
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    let mut count = 0.0f64;
+    for y in 0..mask.height() {
+        for x in 0..mask.width() {
+            if mask.data()[y as usize * mask.width() as usize + x as usize] == 0 {
+                continue;
+            }
+            sum_x += x as f64 + 0.5;
+            sum_y += y as f64 + 0.5;
+            count += 1.0;
+        }
+    }
+    (count > 0.0).then_some([
+        (sum_x / count / mask.width().max(1) as f64) as f32,
+        (sum_y / count / mask.height().max(1) as f64) as f32,
+    ])
+}
+
+fn normalized_mask_bottom_center(mask: &BinaryMask) -> Option<[f32; 2]> {
+    let mut bottom_y = None::<u32>;
+    for y in 0..mask.height() {
+        let row = y as usize * mask.width() as usize;
+        if (0..mask.width()).any(|x| mask.data()[row + x as usize] != 0) {
+            bottom_y = Some(y);
+        }
+    }
+    let y = bottom_y?;
+    let row = y as usize * mask.width() as usize;
+    let mut sum_x = 0.0f64;
+    let mut count = 0.0f64;
+    for x in 0..mask.width() {
+        if mask.data()[row + x as usize] != 0 {
+            sum_x += x as f64 + 0.5;
+            count += 1.0;
+        }
+    }
+    (count > 0.0).then_some([
+        (sum_x / count / mask.width().max(1) as f64) as f32,
+        ((y as f64 + 0.5) / mask.height().max(1) as f64) as f32,
+    ])
 }
 
 fn segmentation_prompts_from_evidence(
@@ -852,23 +942,48 @@ pub fn annotate_grounding_evidence_with_depth_map(
     evidence.floor = floor.unwrap_or_default();
     let mut annotated_objects = 0usize;
     for object in &mut evidence.objects {
-        let Some(detection) = object.detection.as_ref() else {
+        let Some(detection) = object.detection.clone() else {
             continue;
         };
-        let bbox = normalized_bbox_to_image_bbox(detection.bbox, depth_map.width, depth_map.height);
-        let bbox_stats =
-            depth_stats_for_bbox(&depth_map.depth_m, depth_map.width, depth_map.height, bbox);
+        let source_bbox = object
+            .mask
+            .as_ref()
+            .map(|mask| mask.bbox)
+            .unwrap_or(detection.bbox);
+        let bbox = normalized_bbox_to_image_bbox(source_bbox, depth_map.width, depth_map.height);
+        let mask_binary = object.mask.as_ref().and_then(|mask| {
+            (!mask.mask_rle.is_empty())
+                .then(|| {
+                    BinaryMask::decode_rle(mask.image_size[0], mask.image_size[1], &mask.mask_rle)
+                        .ok()
+                })
+                .flatten()
+        });
+        let bbox_stats = mask_binary
+            .as_ref()
+            .and_then(|mask| depth_stats_for_mask(depth_map, mask))
+            .or_else(|| {
+                depth_stats_for_bbox(&depth_map.depth_m, depth_map.width, depth_map.height, bbox)
+            });
         let contact_pixel = object
-            .contact_pixel
+            .mask
+            .as_ref()
+            .and_then(|mask| mask.contact_pixel)
+            .or(object.contact_pixel)
             .or(detection.point)
-            .unwrap_or_else(|| bbox_bottom_center(detection.bbox));
-        let contact_depth = depth_at_bbox_contact_region(
-            &depth_map.depth_m,
-            depth_map.width,
-            depth_map.height,
-            bbox,
-        )
-        .or_else(|| sample_depth_at_normalized_pixel(depth_map, contact_pixel));
+            .unwrap_or_else(|| bbox_bottom_center(source_bbox));
+        let contact_depth = mask_binary
+            .as_ref()
+            .and_then(|mask| depth_at_mask_contact_region(depth_map, mask))
+            .or_else(|| {
+                depth_at_bbox_contact_region(
+                    &depth_map.depth_m,
+                    depth_map.width,
+                    depth_map.height,
+                    bbox,
+                )
+            })
+            .or_else(|| sample_depth_at_normalized_pixel(depth_map, contact_pixel));
         let Some(contact_depth) = contact_depth.filter(|value| value.is_finite() && *value > 0.0)
         else {
             continue;
@@ -878,7 +993,7 @@ pub fn annotate_grounding_evidence_with_depth_map(
         let ray = pixel_to_ray(pixel[0], pixel[1], depth_map.intrinsics);
         let point = backproject_depth(pixel[0], pixel[1], contact_depth, depth_map.intrinsics);
         let target_footprint =
-            estimate_depth_target_footprint(detection, bbox, contact_depth, depth_map.intrinsics);
+            estimate_depth_target_footprint(&detection, bbox, contact_depth, depth_map.intrinsics);
         object.depth_stats =
             bbox_stats.map(|(min_m, median_m, max_m, sample_count)| ObjectDepthStats {
                 median_m,
@@ -1135,6 +1250,11 @@ fn floor_sample_exclusion_bboxes(evidence: &SceneGroundingEvidence) -> Vec<[f32;
         .map(|detection| detection.bbox)
         .collect::<Vec<_>>();
     for object in &evidence.objects {
+        if let Some(mask) = object.mask.as_ref()
+            && !bboxes.iter().any(|bbox| bbox == &mask.bbox)
+        {
+            bboxes.push(mask.bbox);
+        }
         if let Some(detection) = object.detection.as_ref()
             && !bboxes.iter().any(|bbox| bbox == &detection.bbox)
         {
@@ -1499,6 +1619,107 @@ fn depth_stats_for_bbox(
     ))
 }
 
+fn depth_stats_for_mask(
+    depth_map: &SceneDepthMapEvidence,
+    mask: &BinaryMask,
+) -> Option<(f32, f32, f32, usize)> {
+    if depth_map.depth_m.len() != depth_map.width as usize * depth_map.height as usize {
+        return None;
+    }
+    let stride = mask_sampling_stride(mask.area_px() as usize, 65_536);
+    let mut values = Vec::new();
+    for y in (0..mask.height()).step_by(stride) {
+        let row = y as usize * mask.width() as usize;
+        for x in (0..mask.width()).step_by(stride) {
+            if mask.data()[row + x as usize] == 0 {
+                continue;
+            }
+            if let Some(value) = sample_depth_at_mask_pixel(depth_map, mask, x, y) {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() && stride > 1 {
+        for y in 0..mask.height() {
+            let row = y as usize * mask.width() as usize;
+            for x in 0..mask.width() {
+                if mask.data()[row + x as usize] == 0 {
+                    continue;
+                }
+                if let Some(value) = sample_depth_at_mask_pixel(depth_map, mask, x, y) {
+                    values.push(value);
+                }
+            }
+        }
+    }
+    depth_value_stats(values)
+}
+
+fn depth_at_mask_contact_region(
+    depth_map: &SceneDepthMapEvidence,
+    mask: &BinaryMask,
+) -> Option<f32> {
+    let mut bottom_y = None::<u32>;
+    for y in 0..mask.height() {
+        let row = y as usize * mask.width() as usize;
+        if (0..mask.width()).any(|x| mask.data()[row + x as usize] != 0) {
+            bottom_y = Some(y);
+        }
+    }
+    let bottom_y = bottom_y?;
+    let band = ((mask.height() as f32) * 0.08).ceil().max(3.0) as u32;
+    let y0 = bottom_y.saturating_sub(band);
+    let stride = mask_sampling_stride(mask.area_px() as usize, 16_384);
+    let mut values = Vec::new();
+    for y in (y0..=bottom_y).step_by(stride) {
+        let row = y as usize * mask.width() as usize;
+        for x in (0..mask.width()).step_by(stride) {
+            if mask.data()[row + x as usize] == 0 {
+                continue;
+            }
+            if let Some(value) = sample_depth_at_mask_pixel(depth_map, mask, x, y) {
+                values.push(value);
+            }
+        }
+    }
+    depth_value_stats(values).map(|(_, median, _, _)| median)
+}
+
+fn sample_depth_at_mask_pixel(
+    depth_map: &SceneDepthMapEvidence,
+    mask: &BinaryMask,
+    x: u32,
+    y: u32,
+) -> Option<f32> {
+    let u = (x as f32 + 0.5) / mask.width().max(1) as f32;
+    let v = (y as f32 + 0.5) / mask.height().max(1) as f32;
+    sample_depth_at_normalized_pixel(depth_map, [u, v])
+}
+
+fn depth_value_stats(mut values: Vec<f32>) -> Option<(f32, f32, f32, usize)> {
+    values.retain(|value| value.is_finite() && *value > 0.0);
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    Some((
+        values[0],
+        values[values.len() / 2],
+        values[values.len() - 1],
+        values.len(),
+    ))
+}
+
+fn mask_sampling_stride(area_px: usize, target_samples: usize) -> usize {
+    if area_px <= target_samples.max(1) {
+        return 1;
+    }
+    ((area_px as f64 / target_samples.max(1) as f64)
+        .sqrt()
+        .ceil() as usize)
+        .max(1)
+}
+
 fn sample_depth_at_normalized_pixel(
     depth_map: &SceneDepthMapEvidence,
     pixel: [f32; 2],
@@ -1556,12 +1777,7 @@ fn estimate_depth_target_footprint(
 }
 
 pub fn locate_anything_queries(manifest: &SceneObjectManifest) -> Vec<String> {
-    let categories = locate_anything_categories(manifest);
-    if categories.is_empty() {
-        Vec::new()
-    } else {
-        vec![categories.join("</c>")]
-    }
+    locate_anything_categories(manifest)
 }
 
 pub fn locate_anything_categories(manifest: &SceneObjectManifest) -> Vec<String> {
@@ -1661,32 +1877,76 @@ fn locate_anything_instance_evidence(
 ) -> Vec<ObjectGroundingEvidence> {
     let mut out = Vec::new();
     let instances = manifest_instances_for_matching(object);
-    let mut used = vec![false; detections.len()];
     let mut used_instance_ids = object
         .instances
         .iter()
         .filter_map(|instance| instance.id.clone())
         .collect::<Vec<_>>();
+
+    if !detections.is_empty() && (object.instance_count > 1 || !object.instances.is_empty()) {
+        let mut sorted_detections = detections.iter().collect::<Vec<_>>();
+        sorted_detections.sort_by(|left, right| {
+            bbox_center(left.bbox)[0]
+                .total_cmp(&bbox_center(right.bbox)[0])
+                .then_with(|| bbox_center(left.bbox)[1].total_cmp(&bbox_center(right.bbox)[1]))
+        });
+        let mut sorted_instances = instances;
+        sorted_instances.sort_by(|left, right| {
+            let left_slot = object
+                .instances
+                .iter()
+                .find(|instance| instance.id == left.0)
+                .and_then(|instance| instance.slot_index)
+                .unwrap_or(usize::MAX);
+            let right_slot = object
+                .instances
+                .iter()
+                .find(|instance| instance.id == right.0)
+                .and_then(|instance| instance.slot_index)
+                .unwrap_or(usize::MAX);
+            left_slot
+                .cmp(&right_slot)
+                .then_with(|| bbox_center(left.1)[0].total_cmp(&bbox_center(right.1)[0]))
+        });
+        for (index, detection) in sorted_detections.into_iter().enumerate() {
+            let instance = sorted_instances.get(index);
+            let instance_id = instance
+                .and_then(|(id, _, _, _)| id.clone())
+                .unwrap_or_else(|| generated_locate_instance_id(&mut used_instance_ids, index + 1));
+            let target_footprint_m = instance
+                .and_then(|(_, _, _, footprint)| *footprint)
+                .or(object.target_footprint_m);
+            out.push(ObjectGroundingEvidence {
+                object_id: object.id.clone(),
+                instance_id: Some(instance_id),
+                reuse_group: object.reuse_group.clone(),
+                detection: Some(detection.clone()),
+                mask: None,
+                asset_id: None,
+                contact_pixel: detection
+                    .point
+                    .or_else(|| Some(bbox_bottom_center(detection.bbox))),
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m,
+                provenance: vec![format!("{provenance_label}_instance_detection")],
+            });
+        }
+        return out;
+    }
+
     for (instance_id, bbox, contact, target_footprint_m) in instances {
-        let detection_index = best_detection_match(&bbox, detections, &used);
-        let (detection, provenance) = if let Some(index) = detection_index {
-            used[index] = true;
-            (
-                Some(detections[index].clone()),
-                vec![provenance_label.to_string()],
-            )
-        } else {
-            (
-                Some(Detection {
-                    label: object.label.clone(),
-                    bbox,
-                    point: contact,
-                    confidence: None,
-                    source_query: object.label.clone(),
-                }),
-                vec!["manifest_fallback_missing_detection".to_string()],
-            )
-        };
+        let (detection, provenance) = (
+            Some(Detection {
+                label: object.label.clone(),
+                bbox,
+                point: contact,
+                confidence: None,
+                source_query: object.label.clone(),
+            }),
+            vec!["manifest_fallback_missing_detection".to_string()],
+        );
         let contact_pixel = detection
             .as_ref()
             .and_then(|detection| detection.point)
@@ -1710,34 +1970,6 @@ fn locate_anything_instance_evidence(
             target_footprint_m,
             provenance,
         });
-    }
-    if detections.len() > used.iter().filter(|used| **used).count()
-        && (object.instance_count > 1 || !object.instances.is_empty())
-    {
-        let mut extra_index = 0usize;
-        for (detection_index, detection) in detections.iter().enumerate() {
-            if used.get(detection_index).copied().unwrap_or(false) {
-                continue;
-            }
-            extra_index += 1;
-            let instance_id = generated_locate_instance_id(&mut used_instance_ids, extra_index);
-            out.push(ObjectGroundingEvidence {
-                object_id: object.id.clone(),
-                instance_id: Some(instance_id),
-                reuse_group: object.reuse_group.clone(),
-                detection: Some(detection.clone()),
-                mask: None,
-                asset_id: None,
-                contact_pixel: detection
-                    .point
-                    .or_else(|| Some(bbox_bottom_center(detection.bbox))),
-                depth_stats: None,
-                candidate_floor_contact_rays: Vec::new(),
-                metric_contact_point_m: None,
-                target_footprint_m: object.target_footprint_m,
-                provenance: vec![format!("{provenance_label}_extra_instance")],
-            });
-        }
     }
     out
 }
@@ -1854,11 +2086,11 @@ fn best_singleton_detection_for_object(
     detections
         .iter()
         .max_by(|left, right| {
-            let left_score = bbox_iou(object.bbox, left.bbox);
-            let right_score = bbox_iou(object.bbox, right.bbox);
-            left_score.total_cmp(&right_score).then_with(|| {
-                bbox_area_normalized(left.bbox).total_cmp(&bbox_area_normalized(right.bbox))
-            })
+            detection_preference_score(object, left)
+                .total_cmp(&detection_preference_score(object, right))
+                .then_with(|| {
+                    bbox_area_normalized(left.bbox).total_cmp(&bbox_area_normalized(right.bbox))
+                })
         })
         .cloned()
         .unwrap_or_else(|| {
@@ -1866,18 +2098,17 @@ fn best_singleton_detection_for_object(
         })
 }
 
-fn best_detection_match(bbox: &[f32; 4], detections: &[Detection], used: &[bool]) -> Option<usize> {
-    detections
+fn detection_preference_score(object: &SceneObjectSpec, detection: &Detection) -> f32 {
+    let confidence = detection.confidence.unwrap_or(0.50).clamp(0.0, 1.0);
+    let source_key = normalized_query_key(&detection.source_query);
+    let label_key = normalized_query_key(&detection.label);
+    let label_bonus = object_label_keys(object)
         .iter()
-        .enumerate()
-        .filter(|(index, _)| !used.get(*index).copied().unwrap_or(false))
-        .map(|(index, detection)| (index, bbox_iou(*bbox, detection.bbox)))
-        .max_by(|left, right| {
-            left.1
-                .partial_cmp(&right.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index)
+        .any(|key| source_key == *key || label_key == *key)
+        .then_some(0.10)
+        .unwrap_or(0.0);
+    let area = bbox_area_normalized(detection.bbox).clamp(0.0, 1.0);
+    confidence + label_bonus + area.min(0.30) * 0.20
 }
 
 fn normalized_query_key(value: &str) -> String {
@@ -1886,6 +2117,10 @@ fn normalized_query_key(value: &str) -> String {
 
 pub fn bbox_bottom_center(bbox: [f32; 4]) -> [f32; 2] {
     [(bbox[0] + bbox[2]) * 0.5, bbox[3]]
+}
+
+fn bbox_center(bbox: [f32; 4]) -> [f32; 2] {
+    [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5]
 }
 
 fn union_bbox(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
@@ -2167,7 +2402,7 @@ mod tests {
     }
 
     #[test]
-    fn locate_anything_queries_use_hf_style_combined_categories() {
+    fn locate_anything_queries_use_per_category_prompts() {
         let manifest = SceneObjectManifest {
             source_scene_path: "/tmp/source.jpg".to_string(),
             scene_calibration: None,
@@ -2204,7 +2439,163 @@ mod tests {
         };
         assert_eq!(
             locate_anything_queries(&manifest),
-            vec!["table</c>chair".to_string()]
+            vec!["table".to_string(), "chair".to_string()]
+        );
+    }
+
+    #[test]
+    fn locate_anything_repeated_instances_ignore_manifest_bbox_matching() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: vec![SceneObjectSpec {
+                id: "chairs".to_string(),
+                label: "chair".to_string(),
+                aliases: vec!["chair".to_string()],
+                bbox: [0.0, 0.0, 1.0, 1.0],
+                instances: vec![
+                    SceneObjectInstanceSpec {
+                        id: Some("chair_left".to_string()),
+                        bbox: [0.70, 0.30, 0.90, 0.90],
+                        contact: None,
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: Some(SceneInstanceSide::Left),
+                        slot_index: Some(0),
+                        target_footprint_m: None,
+                    },
+                    SceneObjectInstanceSpec {
+                        id: Some("chair_right".to_string()),
+                        bbox: [0.10, 0.30, 0.30, 0.90],
+                        contact: None,
+                        rotation_hint_degrees: None,
+                        facing_yaw_degrees: None,
+                        side: Some(SceneInstanceSide::Right),
+                        slot_index: Some(1),
+                        target_footprint_m: None,
+                    },
+                ],
+                representative_instance_id: None,
+                reuse_group: Some("chair".to_string()),
+                instance_count: 2,
+                object_prompt: "chair".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: Some([0.6, 0.7]),
+            }],
+        };
+        let detections = vec![
+            Detection {
+                label: "chair".to_string(),
+                bbox: [0.12, 0.32, 0.30, 0.90],
+                point: None,
+                confidence: Some(0.83),
+                source_query: "chair".to_string(),
+            },
+            Detection {
+                label: "chair".to_string(),
+                bbox: [0.68, 0.34, 0.86, 0.91],
+                point: None,
+                confidence: Some(0.86),
+                source_query: "chair".to_string(),
+            },
+        ];
+        let root = std::env::temp_dir().join(format!(
+            "locate_anything_detection_order_{}",
+            std::process::id()
+        ));
+        let source_path = root.join("source.png");
+        fs::create_dir_all(&root).unwrap();
+        RgbaImage::from_pixel(20, 10, Rgba([0, 0, 0, 255]))
+            .save(&source_path)
+            .unwrap();
+        let evidence = locate_anything_evidence_from_detections(
+            &manifest,
+            &source_path,
+            detections,
+            "locate_anything",
+        )
+        .unwrap();
+        let left = evidence
+            .objects
+            .iter()
+            .find(|object| object.instance_id.as_deref() == Some("chair_left"))
+            .unwrap();
+        let right = evidence
+            .objects
+            .iter()
+            .find(|object| object.instance_id.as_deref() == Some("chair_right"))
+            .unwrap();
+        assert_eq!(
+            left.detection.as_ref().unwrap().bbox,
+            [0.12, 0.32, 0.30, 0.90]
+        );
+        assert_eq!(
+            right.detection.as_ref().unwrap().bbox,
+            [0.68, 0.34, 0.86, 0.91]
+        );
+    }
+
+    #[test]
+    fn locate_anything_singleton_prefers_detector_confidence_over_manifest_iou() {
+        let manifest = SceneObjectManifest {
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            scene_calibration: None,
+            objects: vec![SceneObjectSpec {
+                id: "table".to_string(),
+                label: "table".to_string(),
+                aliases: vec!["table".to_string()],
+                bbox: [0.45, 0.45, 0.55, 0.55],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("table".to_string()),
+                instance_count: 1,
+                object_prompt: "table".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: Some([2.0, 1.0]),
+            }],
+        };
+        let detections = vec![
+            Detection {
+                label: "table".to_string(),
+                bbox: [0.44, 0.44, 0.56, 0.56],
+                point: None,
+                confidence: Some(0.20),
+                source_query: "table".to_string(),
+            },
+            Detection {
+                label: "table".to_string(),
+                bbox: [0.20, 0.35, 0.80, 0.80],
+                point: None,
+                confidence: Some(0.91),
+                source_query: "table".to_string(),
+            },
+        ];
+        let root = std::env::temp_dir().join(format!(
+            "locate_anything_detector_confidence_{}",
+            std::process::id()
+        ));
+        let source_path = root.join("source.png");
+        fs::create_dir_all(&root).unwrap();
+        RgbaImage::from_pixel(20, 10, Rgba([0, 0, 0, 255]))
+            .save(&source_path)
+            .unwrap();
+        let evidence = locate_anything_evidence_from_detections(
+            &manifest,
+            &source_path,
+            detections,
+            "locate_anything",
+        )
+        .unwrap();
+        let table = evidence
+            .objects
+            .iter()
+            .find(|object| object.object_id == "table" && object.instance_id.is_none())
+            .unwrap();
+        assert_eq!(
+            table.detection.as_ref().unwrap().bbox,
+            [0.20, 0.35, 0.80, 0.80]
         );
     }
 

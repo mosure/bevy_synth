@@ -10,6 +10,8 @@ use crate::{
 pub struct ProjectionFitReport {
     pub applied: bool,
     pub fit_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_target_count: Option<usize>,
     pub iteration_count: usize,
     pub candidate_count: usize,
     pub initial_loss: f32,
@@ -226,10 +228,21 @@ pub(crate) fn fit_grounded_scene_projection(
     let final_eval = evaluate_scene(placements, &targets, camera, floor_y);
     let (max_ground_anchor_error_m, mean_ground_anchor_error_m) =
         anchor_error_summary(&final_eval.reports);
+    let mask_target_count = evidence
+        .objects
+        .iter()
+        .filter(|object| object.mask.is_some())
+        .count();
+    let fit_mode = if mask_target_count > 0 {
+        "mask_aware_projected_silhouette_depth"
+    } else {
+        "projected_aabb_canonical_pose"
+    };
 
     Some(ProjectionFitReport {
         applied: final_eval.total_loss + 1.0e-5 < initial_eval.total_loss,
-        fit_mode: "projected_aabb_canonical_pose".to_string(),
+        fit_mode: fit_mode.to_string(),
+        mask_target_count: (mask_target_count > 0).then_some(mask_target_count),
         iteration_count,
         candidate_count: candidates.len(),
         initial_loss: initial_eval.total_loss,

@@ -232,6 +232,14 @@ pub struct ObjectMaskEvidence {
     pub score: f32,
     pub area_px: u32,
     pub image_size: [u32; 2],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_rle: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_pixel: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_pixel: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

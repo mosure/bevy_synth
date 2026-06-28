@@ -58,6 +58,15 @@ fn server_args_default_to_balanced_quality_defaults() {
     assert_eq!(config.num_steps, 20);
     assert_eq!(config.num_tokens, 1024);
     assert_eq!(config.guidance_scale, 7.0);
+    assert_eq!(
+        config.scene_segmentation_provider,
+        SceneSegmentationProvider::Sam2
+    );
+    assert_eq!(
+        config.scene_segmentation_cdn_base_url.as_deref(),
+        Some(DEFAULT_SCENE_SEGMENTATION_CDN_BASE_URL)
+    );
+    assert!(config.scene_segmentation_allow_download);
     assert_eq!(config.flash_octree_depth, 8);
     assert_eq!(config.flash_min_resolution, 31);
     assert_eq!(config.flash_mini_grid_num, 4);
@@ -275,6 +284,165 @@ fn canonical_pose_calibration_applies_bounded_openai_selection() {
 }
 
 #[test]
+fn canonical_pose_calibration_applies_rendered_thumbnail_selection() {
+    let root = unique_test_dir("canonical_pose_rendered_selection");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source_path = root.join("source.png");
+    let generated_path = root.join("generated.png");
+    let wide_render_path = root.join("candidate_wide.png");
+    let tall_render_path = root.join("candidate_tall.png");
+    write_pose_test_image(&source_path, [22, 5, 42, 59]);
+    write_pose_test_image(&generated_path, [21, 5, 43, 59]);
+    write_pose_test_image(&wide_render_path, [5, 22, 59, 42]);
+    write_pose_test_image(&tall_render_path, [22, 5, 42, 59]);
+
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_1".to_string(),
+            label: "chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 1,
+            object_prompt: "chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([0.6, 0.7]),
+        }],
+    };
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair_1".to_string(),
+        label: "chair".to_string(),
+        aliases: vec!["chair".to_string()],
+        path: None,
+        cache_key: Some("test/chair".to_string()),
+        reusable: true,
+        source_image_path: Some(generated_path.display().to_string()),
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.3, 0.0, -0.35],
+            max: [0.3, 1.0, 0.35],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, Some([0.6, 0.7]))),
+        provenance: None,
+    };
+    let request = ObjectImageRequest {
+        object: manifest.objects[0].clone(),
+        source_scene_path: "/tmp/source_1024.jpg".to_string(),
+        source_crop_path: source_path.display().to_string(),
+        object_reference_image_path: "/tmp/reference.jpg".to_string(),
+        prompt: "chair".to_string(),
+        candidate_count: 1,
+        size: "1024x1024".to_string(),
+        quality: "medium".to_string(),
+    };
+    let selected = vec![json!({
+        "object_id": "chair_1",
+        "candidate_index": 0,
+        "image_path": generated_path,
+    })];
+    let evidence = manifest_grounding_evidence(&manifest);
+    let mut run = build_canonical_pose_calibration(
+        SceneCanonicalPoseMode::RenderSweep,
+        4,
+        &manifest,
+        std::slice::from_ref(&asset),
+        &selected,
+        &[request],
+        &evidence,
+    );
+    run.reports[0].candidates[0].rendered_image_path = Some(wide_render_path.display().to_string());
+    let tall_candidate_index = run.reports[0]
+        .candidates
+        .iter()
+        .position(|candidate| (candidate.yaw_offset_degrees - 180.0).abs() <= 1.0e-5)
+        .expect("180 candidate");
+    run.reports[0].candidates[tall_candidate_index].rendered_image_path =
+        Some(tall_render_path.display().to_string());
+
+    let report = apply_canonical_pose_rendered_selection(&mut run);
+
+    assert_eq!(report["applied_count"], json!(1));
+    assert_eq!(
+        run.asset_bindings[0].canonical_frame.unwrap().source,
+        Some(SceneAssetFrameSource::VisualRenderSweep)
+    );
+    assert!(
+        (run.asset_bindings[0]
+            .canonical_frame
+            .unwrap()
+            .yaw_offset_degrees
+            - 180.0)
+            .abs()
+            <= 1.0e-5
+    );
+}
+
+fn write_pose_test_image(path: &Path, rect: [u32; 4]) {
+    let mut image = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 255, 255, 255]));
+    for y in rect[1]..rect[3] {
+        for x in rect[0]..rect[2] {
+            image.put_pixel(x, y, image::Rgba([30, 30, 30, 255]));
+        }
+    }
+    image.save(path).unwrap();
+}
+
+#[test]
+fn images_to_assets_captures_runtime_progress_events() {
+    let root = unique_test_dir("asset_runtime_progress");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let input = root.join("input.png");
+    write_pose_test_image(&input, [16, 16, 48, 48]);
+
+    let mut server = McpServer::new(ServerConfig::from_args(ServerArgs::parse_from([
+        "burn_synth_mcp",
+    ])));
+    let result = server
+        .call_images_to_assets(ImagesToAssetsToolArgs {
+            input_image_paths: vec![input],
+            output_dir: Some(root.join("assets")),
+            output_paths: None,
+            output_format: Some(AssetOutputFormat::Glb),
+            rmbg_model: Some(ForegroundModel::Rmbg14),
+            synthesis_models: Some(vec![SynthesisModel::Triposg]),
+            backend: Some(InferenceBackend::Cpu),
+            target_faces: Some(0),
+            batch_size: Some(1),
+            batch_vram_mb: None,
+            trellis_pbr: Some(false),
+            trellis_pbr_texture_size: None,
+            promote_to_catalog: false,
+            dry_run: true,
+        })
+        .expect("dry-run images_to_assets");
+
+    let events = result["runtime_progress_events"]
+        .as_array()
+        .expect("runtime progress events array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "run_started" && event["run"] == "mesh"),
+        "expected mesh run start in {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "stage_completed" && event["stage"] == "mesh.dry_run"),
+        "expected mesh dry-run stage completion in {events:#?}"
+    );
+
+    fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+#[test]
 fn canonical_pose_calibration_rejects_untrusted_openai_candidate() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.jpg".to_string(),
@@ -356,7 +524,7 @@ fn canonical_pose_calibration_rejects_untrusted_openai_candidate() {
 }
 
 #[test]
-fn scene_ground_rejects_unimplemented_rendered_silhouette_pose_fit() {
+fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
     let args = ServerArgs::parse_from(["burn_synth_mcp"]);
     let config = ServerConfig::from_args(args);
     let mut server = McpServer::new(config);
@@ -393,7 +561,7 @@ fn scene_ground_rejects_unimplemented_rendered_silhouette_pose_fit() {
         })
         .unwrap_err();
 
-    assert!(err.contains("pose_fit=rendered-silhouette is not implemented yet"));
+    assert!(!err.contains("pose_fit=rendered-silhouette is not implemented yet"));
 }
 
 #[test]
@@ -404,16 +572,49 @@ fn server_args_default_to_safe_locate_anything_token_limit() {
         config.locate_anything_in_token_limit,
         LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT as usize
     );
+    assert_eq!(
+        config.locate_anything_cdn_base_url.as_deref(),
+        Some(DEFAULT_LOCATE_ANYTHING_CDN_BASE_URL)
+    );
+    assert!(config.locate_anything_allow_download);
+    assert_eq!(
+        config.locate_anything_precision,
+        SceneLocateAnythingPrecision::Bf16
+    );
 }
 
 #[test]
 fn server_args_accept_global_locate_anything_backend() {
-    let args =
-        ServerArgs::parse_from(["burn_synth_mcp", "--locate-anything-backend", "burn-native"]);
+    let args = ServerArgs::parse_from([
+        "burn_synth_mcp",
+        "--locate-anything-backend",
+        "burn-native",
+        "--locate-anything-cache-dir",
+        "/tmp/locateanything-cache",
+        "--locate-anything-cdn-base-url",
+        "https://cdn.example.invalid/model",
+        "--locate-anything-allow-download",
+        "false",
+        "--locate-anything-precision",
+        "f16",
+    ]);
     let config = ServerConfig::from_args(args);
     assert_eq!(
         config.locate_anything_backend,
         LocateAnythingBackend::BurnNative
+    );
+    assert_eq!(
+        config.locate_anything_cache_dir.as_deref(),
+        Some(Path::new("/tmp/locateanything-cache"))
+    );
+    assert_eq!(
+        config.locate_anything_cdn_base_url.as_deref(),
+        Some("https://cdn.example.invalid/model")
+    );
+    assert!(!config.locate_anything_allow_download);
+    assert_eq!(
+        config.locate_anything_precision,
+        SceneLocateAnythingPrecision::F16
     );
 }
 
@@ -3857,6 +4058,14 @@ fn scene_build_candidate_policy_defaults_to_guarded_sequential_retries() {
         explicit.segmentation_quantization,
         Some(SceneSegmentationQuantization::Q8)
     );
+}
+
+#[test]
+fn scene_asset_lift_chunk_size_defaults_to_per_object_for_review_runs() {
+    assert_eq!(scene_asset_lift_chunk_size(None, 4), 1);
+    assert_eq!(scene_asset_lift_chunk_size(Some(0), 4), 1);
+    assert_eq!(scene_asset_lift_chunk_size(Some(2), 4), 2);
+    assert_eq!(scene_asset_lift_chunk_size(Some(8), 4), 4);
 }
 
 #[test]
