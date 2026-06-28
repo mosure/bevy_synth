@@ -2123,6 +2123,7 @@ fn write_projection_fit_artifacts(output_dir: &Path, response: &Value) -> Result
             .map_err(|err| err.to_string())?;
         }
     }
+    write_visible_surface_fit_artifacts(output_dir, response, report)?;
     Ok(())
 }
 

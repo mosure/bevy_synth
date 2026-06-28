@@ -10,6 +10,9 @@ use crate::{
 pub struct ProjectionFitReport {
     pub applied: bool,
     pub fit_mode: String,
+    pub surface_target: String,
+    pub surface_prediction: String,
+    pub full_mesh_visible_surface: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask_target_count: Option<usize>,
     pub iteration_count: usize,
@@ -63,6 +66,10 @@ pub struct ProjectionFitObjectReport {
     pub ground_anchor_basis: String,
     pub target_ground_point: [f32; 3],
     pub observed_ground_point: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_camera_anchor: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_camera_origin_xz: Option<[f32; 2]>,
     pub ground_anchor_error_m: f32,
     pub ground_anchor_max_drift_m: f32,
     pub ground_anchor_loss: f32,
@@ -72,6 +79,32 @@ pub struct ProjectionFitObjectReport {
     pub translation: [f32; 3],
     pub rotation_y_degrees: f32,
     pub scale: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_surface: Option<ProjectionFitVisibleSurfaceReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ProjectionFitVisibleSurfaceReport {
+    pub target: String,
+    pub predicted_proxy: String,
+    pub full_mesh_visible_surface: bool,
+    pub geometry_match_ready: bool,
+    pub mask_available: bool,
+    pub depth_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mask_bbox: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mask_coverage: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mask_area_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_depth_median_m: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_bbox: Option<[f32; 4]>,
+    pub bbox_iou: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_log2_error: Option<f32>,
+    pub limitation: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -93,6 +126,9 @@ struct ProjectionTarget {
     source_bbox: [f32; 4],
     contact_pixel: [f32; 2],
     depth_stats: Option<ObjectDepthStats>,
+    mask_bbox: Option<[f32; 4]>,
+    mask_coverage: Option<f32>,
+    mask_area_px: Option<u32>,
     yaw_prior_degrees: f32,
     initial_scale: f32,
     ground_anchor: [f32; 3],
@@ -242,6 +278,14 @@ pub(crate) fn fit_grounded_scene_projection(
     Some(ProjectionFitReport {
         applied: final_eval.total_loss + 1.0e-5 < initial_eval.total_loss,
         fit_mode: fit_mode.to_string(),
+        surface_target: if mask_target_count > 0 {
+            "source_sam_mask_depth_visible_surface".to_string()
+        } else {
+            "source_detection_bbox_depth_proxy".to_string()
+        },
+        surface_prediction: "projected_asset_aabb_after_canonical_pose_visible_surface_proxy"
+            .to_string(),
+        full_mesh_visible_surface: false,
         mask_target_count: (mask_target_count > 0).then_some(mask_target_count),
         iteration_count,
         candidate_count: candidates.len(),
@@ -274,6 +318,7 @@ impl ProjectionTarget {
         evidence: &SceneGroundingEvidence,
     ) -> Option<Self> {
         let object_evidence = best_evidence_for_placement(placement, evidence);
+        let mask = object_evidence.and_then(|evidence| evidence.mask.as_ref());
         let source_bbox = object_evidence
             .and_then(|evidence| {
                 evidence
@@ -303,6 +348,9 @@ impl ProjectionTarget {
             source_bbox: normalize_bbox(source_bbox),
             contact_pixel: normalize_point(contact_pixel),
             depth_stats: object_evidence.and_then(|evidence| evidence.depth_stats),
+            mask_bbox: mask.map(|mask| normalize_bbox(mask.bbox)),
+            mask_coverage: mask.and_then(|mask| mask.coverage),
+            mask_area_px: mask.map(|mask| mask.area_px),
             yaw_prior_degrees: placement.rotation_y_degrees,
             initial_scale: representative_scale(placement.scale).max(1.0e-5),
             ground_anchor: placement.ground_point,
@@ -1008,6 +1056,7 @@ fn evaluate_object(
     }
     let yaw_prior_error_degrees =
         angular_error_degrees(placement.rotation_y_degrees, target.yaw_prior_degrees);
+    let visible_surface = visible_surface_report(target, projected_bbox, iou, depth_log2_error);
     ProjectionFitObjectReport {
         index,
         object_id: placement.object_id.clone(),
@@ -1026,6 +1075,8 @@ fn evaluate_object(
         ground_anchor_basis: target.ground_anchor_basis.as_str().to_string(),
         target_ground_point: target.ground_anchor,
         observed_ground_point: placement.ground_point,
+        source_camera_anchor: target.source_camera_anchor,
+        source_camera_origin_xz: target.source_camera_origin_xz,
         ground_anchor_error_m,
         ground_anchor_max_drift_m: target.ground_anchor_max_drift_m,
         ground_anchor_loss,
@@ -1035,7 +1086,45 @@ fn evaluate_object(
         translation: placement.translation,
         rotation_y_degrees: placement.rotation_y_degrees,
         scale: placement.scale,
+        visible_surface,
     }
+}
+
+fn visible_surface_report(
+    target: &ProjectionTarget,
+    projected_bbox: Option<[f32; 4]>,
+    bbox_iou: f32,
+    depth_log2_error: Option<f32>,
+) -> Option<ProjectionFitVisibleSurfaceReport> {
+    if target.mask_bbox.is_none() && target.depth_stats.is_none() {
+        return None;
+    }
+    let mask_available = target.mask_bbox.is_some();
+    let depth_available = target.depth_stats.is_some();
+    Some(ProjectionFitVisibleSurfaceReport {
+        target: if mask_available {
+            "source_sam_mask_depth_visible_surface".to_string()
+        } else {
+            "source_detection_bbox_depth_proxy".to_string()
+        },
+        predicted_proxy:
+            "projected_asset_aabb_after_canonical_pose_visible_surface_proxy".to_string(),
+        full_mesh_visible_surface: false,
+        geometry_match_ready: mask_available
+            && depth_available
+            && projected_bbox.is_some()
+            && target.source_camera_anchor.is_some(),
+        mask_available,
+        depth_available,
+        source_mask_bbox: target.mask_bbox,
+        source_mask_coverage: target.mask_coverage,
+        source_mask_area_px: target.mask_area_px,
+        source_depth_median_m: target.depth_stats.map(|stats| stats.median_m),
+        projected_bbox,
+        bbox_iou,
+        depth_log2_error,
+        limitation: "The deterministic optimizer currently fits the canonicalized asset AABB against source mask/depth evidence. Full generated-mesh visible-surface rasterization is reported separately when GLB assets are available and is not yet used as the optimization loss.".to_string(),
+    })
 }
 
 fn anchor_error_summary(reports: &[ProjectionFitObjectReport]) -> (f32, f32) {
@@ -1351,6 +1440,9 @@ mod tests {
             source_bbox: placement.source_bbox,
             contact_pixel: placement.contact_pixel,
             depth_stats: None,
+            mask_bbox: None,
+            mask_coverage: None,
+            mask_area_px: None,
             yaw_prior_degrees: placement.rotation_y_degrees,
             initial_scale: placement.scale[0],
             ground_anchor: placement.ground_point,
@@ -1463,10 +1555,29 @@ mod tests {
                     confidence: Some(0.95),
                     source_query: "chair".to_string(),
                 }),
-                mask: None,
+                mask: Some(crate::ObjectMaskEvidence {
+                    provider: "synthetic".to_string(),
+                    model: "synthetic-mask".to_string(),
+                    bbox: placement.source_bbox,
+                    score: 0.98,
+                    area_px: 20_000,
+                    image_size: [1600, 900],
+                    mask_rle: Vec::new(),
+                    center_pixel: Some([0.85, 0.66]),
+                    contact_pixel: Some(placement.contact_pixel),
+                    coverage: Some(0.74),
+                    artifact_path: None,
+                    mask_png_path: None,
+                }),
                 asset_id: None,
                 contact_pixel: Some(placement.contact_pixel),
-                depth_stats: None,
+                depth_stats: Some(ObjectDepthStats {
+                    median_m: 2.0,
+                    min_m: 1.8,
+                    max_m: 2.4,
+                    contact_m: Some(2.05),
+                    sample_count: Some(128),
+                }),
                 candidate_floor_contact_rays: vec![[0.0, -1.0, 1.0]],
                 metric_contact_point_m: Some([0.0, -2.0, 2.0]),
                 target_footprint_m: Some(placement.target_footprint_m),
@@ -1479,7 +1590,34 @@ mod tests {
         let object = &report.objects[0];
 
         assert_eq!(report.camera.basis, "source-depth-intrinsics");
+        assert_eq!(report.fit_mode, "mask_aware_projected_silhouette_depth");
+        assert_eq!(
+            report.surface_target,
+            "source_sam_mask_depth_visible_surface"
+        );
+        assert!(!report.full_mesh_visible_surface);
         assert_eq!(object.ground_anchor_basis, "camera-ray-ground-plane");
+        assert!(object.source_camera_anchor.is_some());
+        assert!(object.source_camera_origin_xz.is_some());
+        let visible_surface = object
+            .visible_surface
+            .as_ref()
+            .expect("mask+depth evidence should produce visible-surface report");
+        assert_eq!(
+            visible_surface.target,
+            "source_sam_mask_depth_visible_surface"
+        );
+        assert_eq!(
+            visible_surface.predicted_proxy,
+            "projected_asset_aabb_after_canonical_pose_visible_surface_proxy"
+        );
+        assert!(!visible_surface.full_mesh_visible_surface);
+        assert!(visible_surface.geometry_match_ready);
+        assert_eq!(
+            visible_surface.source_mask_bbox,
+            Some(placement.source_bbox)
+        );
+        assert_eq!(visible_surface.source_mask_area_px, Some(20_000));
         assert_eq!(object.target_ground_point, initial_anchor);
         assert!(
             object.ground_anchor_error_m <= max_drift + 1.0e-4,

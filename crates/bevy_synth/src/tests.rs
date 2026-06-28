@@ -59,8 +59,6 @@ fn test_args() -> AppArgs {
         trellis_weights_root: None,
         triposplat_weights_root: None,
         trellis_image_large_root: None,
-        trellis_python_bin: None,
-        trellis_bridge_script: None,
         trellis_quality: TrellisQuality::Low,
         trellis_pbr_enabled: false,
         trellis_pbr_texture_size: Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE),

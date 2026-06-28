@@ -385,8 +385,6 @@ fn runtime_config_from_args(
         trellis_weights_root: args.trellis_weights_root.clone(),
         triposplat_weights_root: args.triposplat_weights_root.clone(),
         trellis_image_large_root: args.trellis_image_large_root.clone(),
-        trellis_python_bin: args.trellis_python_bin.clone(),
-        trellis_bridge_script: args.trellis_bridge_script.clone(),
         triposplat_weights_precision: if args
             .synthesis_models
             .iter()

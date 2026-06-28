@@ -357,12 +357,6 @@ pub struct ServerArgs {
     #[arg(long)]
     pub trellis_image_large_root: Option<PathBuf>,
 
-    #[arg(long)]
-    pub trellis_python_bin: Option<PathBuf>,
-
-    #[arg(long)]
-    pub trellis_bridge_script: Option<PathBuf>,
-
     #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     pub trellis_quality: TrellisQuality,
 
@@ -505,6 +499,8 @@ pub(crate) enum ServerCommand {
     SceneBuild(SceneBuildCliArgs),
     /// Recompute scene composition from saved assets and grounding evidence without regenerating assets.
     SceneGround(SceneGroundCliArgs),
+    /// Run visual grounding providers and write an inspection report without scene composition.
+    SceneGroundingReport(SceneGroundingReportCliArgs),
     /// Replay render-capture-feedback using existing scene-build artifacts.
     SceneFeedbackReplay(SceneFeedbackReplayCliArgs),
 }
@@ -760,6 +756,69 @@ pub(crate) struct SceneGroundCliArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub(crate) struct SceneGroundingReportCliArgs {
+    /// Source scene image path.
+    #[arg(long, visible_alias = "scene")]
+    pub source_scene_path: PathBuf,
+
+    /// Object query prompt for LocateAnything. Repeat for multiple categories.
+    #[arg(long = "query", value_delimiter = ',')]
+    pub queries: Vec<String>,
+
+    /// Expected repeated instance count, formatted as query=count. Used only for report grouping.
+    #[arg(long = "expected-count")]
+    pub expected_counts: Vec<String>,
+
+    /// Output directory for overlays, evidence JSON, quality metrics, and HTML review.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Force model loading through the configured CDN/cache rather than any usable local model root.
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
+    pub cdn_only: bool,
+
+    /// Number of additional warm passes to run in-process after the first pass.
+    #[arg(long, default_value_t = 0)]
+    pub warm_runs: usize,
+
+    /// Locator provider used for bbox grounding.
+    #[arg(long, value_enum, default_value_t = SceneLocatorProvider::LocateAnything)]
+    pub locator: SceneLocatorProvider,
+
+    /// Override the server LocateAnything backend.
+    #[arg(long, value_enum)]
+    pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Segmentation provider to run after bbox grounding.
+    #[arg(long, value_enum, default_value_t = SceneSegmentationProvider::Sam2)]
+    pub segmentation_provider: SceneSegmentationProvider,
+
+    /// Also write bbox-prompt masks as a cheap rectangular baseline.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub bbox_prompt_baseline: bool,
+
+    /// Override the server scene segmentation precision.
+    #[arg(long, value_enum)]
+    pub segmentation_precision: Option<SceneSegmentationPrecision>,
+
+    /// Override the server scene segmentation quantization.
+    #[arg(long, value_enum)]
+    pub segmentation_quantization: Option<SceneSegmentationQuantization>,
+
+    /// Optional depth provider for report-side depth/floor annotation.
+    #[arg(long, value_enum, default_value_t = SceneDepthProvider::None)]
+    pub depth_provider: SceneDepthProvider,
+
+    /// Warn when a detection bbox covers more than this fraction of the image.
+    #[arg(long, default_value_t = 0.50)]
+    pub max_bbox_area: f32,
+
+    /// Warn when a segmentation mask covers more than this fraction of the image.
+    #[arg(long, default_value_t = 0.50)]
+    pub max_mask_coverage: f32,
+}
+
+#[derive(Args, Debug, Clone)]
 pub(crate) struct SceneFeedbackReplayCliArgs {
     /// Existing scene-build output directory with manifest/assets/layout/commands artifacts.
     #[arg(long)]
@@ -814,8 +873,6 @@ pub struct ServerConfig {
     pub weights_root: Option<PathBuf>,
     pub trellis_weights_root: Option<PathBuf>,
     pub trellis_image_large_root: Option<PathBuf>,
-    pub trellis_python_bin: Option<PathBuf>,
-    pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
     pub trellis_pbr_enabled: bool,
     pub trellis_pbr_texture_size: Option<usize>,
@@ -872,8 +929,6 @@ impl ServerConfig {
             weights_root: args.weights_root,
             trellis_weights_root: args.trellis_weights_root,
             trellis_image_large_root: args.trellis_image_large_root,
-            trellis_python_bin: args.trellis_python_bin,
-            trellis_bridge_script: args.trellis_bridge_script,
             trellis_quality: args.trellis_quality,
             trellis_pbr_enabled: args.trellis_pbr,
             trellis_pbr_texture_size: args.trellis_pbr_texture_size,
@@ -937,8 +992,6 @@ impl ServerConfig {
             weights_root: self.weights_root.clone(),
             trellis_weights_root: self.trellis_weights_root.clone(),
             trellis_image_large_root: self.trellis_image_large_root.clone(),
-            trellis_python_bin: self.trellis_python_bin.clone(),
-            trellis_bridge_script: self.trellis_bridge_script.clone(),
             trellis_quality: self.trellis_quality.into(),
             trellis_compute_profile: self.trellis_compute_profile(),
             trellis_pbr_enabled: self.trellis_pbr_enabled,

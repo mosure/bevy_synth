@@ -64,6 +64,7 @@ impl SegmentationModelKind {
 pub enum SegmentationRuntimeBackend {
     BboxPrompt,
     BurnNative,
+    #[cfg(feature = "python-reference")]
     PythonReference,
 }
 
@@ -72,6 +73,7 @@ impl SegmentationRuntimeBackend {
         match self {
             Self::BboxPrompt => "bbox-prompt",
             Self::BurnNative => "burn-native",
+            #[cfg(feature = "python-reference")]
             Self::PythonReference => "python-reference",
         }
     }
@@ -231,6 +233,7 @@ impl SegmentationRuntime {
             (_, SegmentationRuntimeBackend::BurnNative) => Err(SegmentationError::Unsupported(
                 "Burn-native segmentation is not implemented for this model".to_string(),
             )),
+            #[cfg(feature = "python-reference")]
             (_, SegmentationRuntimeBackend::PythonReference) => Err(SegmentationError::Unsupported(
                 "python-reference segmentation is reserved for fixture capture and not wired yet"
                     .to_string(),

@@ -48,14 +48,6 @@ pub struct Args {
     #[arg(long)]
     pub trellis_image_large_root: Option<PathBuf>,
 
-    /// Legacy option kept for backward CLI compatibility; ignored by Trellis2 Rust runtime.
-    #[arg(long)]
-    pub trellis_python_bin: Option<PathBuf>,
-
-    /// Legacy option kept for backward CLI compatibility; ignored by Trellis2 Rust runtime.
-    #[arg(long)]
-    pub trellis_bridge_script: Option<PathBuf>,
-
     /// Trellis quality preset (low, medium, high).
     #[arg(long, value_enum, default_value_t = TrellisQuality::Low)]
     pub trellis_quality: TrellisQuality,
@@ -386,8 +378,6 @@ pub struct AppArgs {
     pub trellis_weights_root: Option<PathBuf>,
     pub triposplat_weights_root: Option<PathBuf>,
     pub trellis_image_large_root: Option<PathBuf>,
-    pub trellis_python_bin: Option<PathBuf>,
-    pub trellis_bridge_script: Option<PathBuf>,
     pub trellis_quality: TrellisQuality,
     pub trellis_pbr_enabled: bool,
     pub trellis_pbr_texture_size: Option<usize>,
@@ -476,8 +466,6 @@ pub fn build_app_args(args: Args) -> AppArgs {
         trellis_weights_root: args.trellis_weights_root,
         triposplat_weights_root: args.triposplat_weights_root,
         trellis_image_large_root: args.trellis_image_large_root,
-        trellis_python_bin: args.trellis_python_bin,
-        trellis_bridge_script: args.trellis_bridge_script,
         trellis_quality: args.trellis_quality,
         trellis_pbr_enabled: args.trellis_pbr,
         trellis_pbr_texture_size: (args.trellis_pbr_texture_size > 0)

@@ -6,9 +6,11 @@ mod cli;
 mod feedback;
 mod prelude;
 mod protocol;
+mod scene_grounding_report;
 mod scene_layout;
 mod server;
 mod types;
+mod visible_surface_report;
 
 pub use cli::run_from_args;
 pub use protocol::SceneBuildFromImageArgs;
@@ -50,6 +52,8 @@ pub(crate) use canonical_pose::*;
 pub(crate) use feedback::*;
 #[cfg(test)]
 pub(crate) use protocol::*;
+#[cfg(test)]
+pub(crate) use scene_grounding_report::*;
 #[cfg(test)]
 pub(crate) use server::McpServer;
 

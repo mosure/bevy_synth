@@ -38,6 +38,7 @@ pub use pipeline::{
 };
 pub use projection_fit::{
     ProjectionFitCandidateReport, ProjectionFitObjectReport, ProjectionFitReport,
+    ProjectionFitVisibleSurfaceReport,
 };
 pub use types::*;
 

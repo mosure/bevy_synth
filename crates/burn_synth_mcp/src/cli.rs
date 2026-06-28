@@ -9,6 +9,9 @@ pub fn run_from_args(args: ServerArgs) -> Result<(), String> {
     match command {
         Some(ServerCommand::SceneBuild(args)) => run_scene_build_command(config, args),
         Some(ServerCommand::SceneGround(args)) => run_scene_ground_command(config, args),
+        Some(ServerCommand::SceneGroundingReport(args)) => {
+            run_scene_grounding_report_command(config, args)
+        }
         Some(ServerCommand::SceneFeedbackReplay(args)) => {
             run_scene_feedback_replay_command(config, args)
         }
@@ -133,6 +136,20 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         "{}",
         serde_json::to_string_pretty(&response)
             .map_err(|err| format!("serialize scene-ground response: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_scene_grounding_report_command(
+    config: ServerConfig,
+    args: SceneGroundingReportCliArgs,
+) -> Result<(), String> {
+    let mut server = McpServer::new(config);
+    let response = server.call_scene_grounding_report(args)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response)
+            .map_err(|err| format!("serialize scene-grounding-report response: {err}"))?
     );
     Ok(())
 }

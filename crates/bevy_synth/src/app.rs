@@ -3567,8 +3567,6 @@ fn run_scene_build_for_ui(
     server_args.weights_root = app_args.weights_root.clone();
     server_args.trellis_weights_root = app_args.trellis_weights_root.clone();
     server_args.trellis_image_large_root = app_args.trellis_image_large_root.clone();
-    server_args.trellis_python_bin = app_args.trellis_python_bin.clone();
-    server_args.trellis_bridge_script = app_args.trellis_bridge_script.clone();
     server_args.trellis_pbr = settings.pbr_enabled;
     server_args.trellis_pbr_texture_size = Some(settings.pbr_texture_size);
     let scene_synthesis_models = vec![mcp_synthesis_model(settings.image_to_3d_model)];

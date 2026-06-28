@@ -50,8 +50,10 @@ pub(crate) use crate::assets::*;
 pub(crate) use crate::canonical_pose::*;
 pub(crate) use crate::feedback::*;
 pub(crate) use crate::protocol::*;
+pub(crate) use crate::scene_grounding_report::*;
 pub(crate) use crate::scene_layout::{
     SceneComposeArgs, SceneComposePlan, SceneValidateArgs, compose_scene_layout,
     validate_scene_layout,
 };
 pub(crate) use crate::types::*;
+pub(crate) use crate::visible_surface_report::*;

@@ -48,12 +48,6 @@ struct Cli {
     trellis_image_large_root: Option<PathBuf>,
 
     #[arg(long)]
-    trellis_python_bin: Option<PathBuf>,
-
-    #[arg(long)]
-    trellis_bridge_script: Option<PathBuf>,
-
-    #[arg(long)]
     trellis_noise_overrides_hook: Option<PathBuf>,
 
     #[arg(long)]
@@ -363,8 +357,6 @@ fn run(cli: Cli) -> Result<(), String> {
         triposplat_weights_root: cli.triposplat_weights_root,
         triposplat_weights_precision: cli.triposplat_weights_precision.into(),
         trellis_image_large_root: cli.trellis_image_large_root,
-        trellis_python_bin: cli.trellis_python_bin,
-        trellis_bridge_script: cli.trellis_bridge_script,
         trellis_noise_overrides_hook: cli.trellis_noise_overrides_hook,
         trellis_max_sparse_coords: cli.trellis_max_sparse_coords,
         trellis_pbr_texture_size: cli

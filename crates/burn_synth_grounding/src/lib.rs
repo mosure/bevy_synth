@@ -299,6 +299,8 @@ pub struct SegmentationGroundingReport {
     pub overlay_path: PathBuf,
     pub elapsed_ms: f64,
     pub runtime_cache_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_variant: Option<String>,
     pub mask_count: usize,
     pub stage_timings: Option<burn_segmentation::SegmentationStageTimings>,
 }
@@ -699,6 +701,9 @@ impl SceneGroundingRuntime {
             overlay_path,
             elapsed_ms,
             runtime_cache_hit: cache_hit,
+            model_variant: runtime
+                .sam_image_encoder_variant()
+                .map(|variant| variant.label().to_string()),
             mask_count: masks.len(),
             stage_timings: runtime.last_stage_timings(),
         })

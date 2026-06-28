@@ -168,10 +168,6 @@ pub struct RuntimeConfig {
     pub triposplat_weights_precision: Option<TripoSplatBurnpackPrecision>,
     /// Optional local root for TRELLIS-image-large assets.
     pub trellis_image_large_root: Option<PathBuf>,
-    /// Legacy field retained for CLI compatibility; ignored by Trellis2 Rust runtime.
-    pub trellis_python_bin: Option<PathBuf>,
-    /// Legacy field retained for CLI compatibility; ignored by Trellis2 Rust runtime.
-    pub trellis_bridge_script: Option<PathBuf>,
     /// Optional hook with stage-noise/coord overrides for Trellis runtime parity/debug.
     pub trellis_noise_overrides_hook: Option<PathBuf>,
     /// Optional explicit sparse-coordinate cap for Trellis decode.
@@ -214,8 +210,6 @@ impl Default for RuntimeConfig {
             triposplat_weights_root: None,
             triposplat_weights_precision: Some(TripoSplatBurnpackPrecision::F32),
             trellis_image_large_root: None,
-            trellis_python_bin: None,
-            trellis_bridge_script: None,
             trellis_noise_overrides_hook: None,
             trellis_max_sparse_coords: None,
             trellis_pbr_texture_size: Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE),

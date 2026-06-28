@@ -4179,6 +4179,120 @@ fn scene_command_waits_for_matching_status_sequence() {
     fs::remove_dir_all(root).expect("remove temp dir");
 }
 
+#[test]
+fn scene_grounding_report_manifest_uses_expected_counts() {
+    let manifest = scene_grounding_report_manifest(
+        Path::new("/tmp/source.jpg"),
+        &["chair".to_string(), "table".to_string()],
+        &["chair=6".to_string()],
+    )
+    .expect("manifest");
+
+    let chair = manifest
+        .objects
+        .iter()
+        .find(|object| object.id == "chair")
+        .expect("chair object");
+    let table = manifest
+        .objects
+        .iter()
+        .find(|object| object.id == "table")
+        .expect("table object");
+    assert_eq!(chair.instance_count, 6);
+    assert_eq!(table.instance_count, 1);
+}
+
+#[test]
+fn scene_grounding_report_quality_flags_count_edge_and_tiny_boxes() {
+    let manifest = scene_grounding_report_manifest(
+        Path::new("/tmp/source.jpg"),
+        &["chair".to_string(), "plant".to_string()],
+        &["chair=2".to_string()],
+    )
+    .expect("manifest");
+    let evidence = SceneGroundingEvidence {
+        source_image_path: "/tmp/source.jpg".to_string(),
+        depth: None,
+        segmentation: None,
+        detections: Vec::new(),
+        camera: burn_synth_scene::EstimatedCamera::default(),
+        floor: burn_synth_scene::EstimatedFloorPlane::default(),
+        objects: vec![
+            report_test_object("chair", Some("one"), [0.10, 0.10, 0.20, 0.20]),
+            report_test_object("chair", Some("two"), [0.21, 0.10, 0.23, 0.20]),
+            report_test_object("chair", Some("three"), [0.24, 0.10, 0.26, 0.20]),
+            report_test_object("plant", None, [0.00, 0.20, 0.10, 0.80]),
+        ],
+    };
+
+    let quality = scene_grounding_quality_report(&manifest, &evidence, 0.5, 0.5);
+    assert_eq!(quality["status"], "warn");
+    assert_eq!(quality["warning_count"].as_u64().unwrap(), 4);
+    assert!(
+        quality["group_warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["kind"] == "expected_instance_count_mismatch")
+    );
+    let object_warnings = quality["objects"].as_array().unwrap();
+    assert!(object_warnings.iter().any(|object| {
+        object["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().starts_with("bbox_area_tiny"))
+    }));
+    assert!(object_warnings.iter().any(|object| {
+        object["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning == "bbox_touches_horizontal_image_edge")
+    }));
+}
+
+fn report_test_object(
+    object_id: &str,
+    instance_id: Option<&str>,
+    bbox: [f32; 4],
+) -> burn_synth_scene::ObjectGroundingEvidence {
+    let bbox_area = (bbox[2] - bbox[0]).max(0.0) * (bbox[3] - bbox[1]).max(0.0);
+    burn_synth_scene::ObjectGroundingEvidence {
+        object_id: object_id.to_string(),
+        instance_id: instance_id.map(ToOwned::to_owned),
+        reuse_group: Some(object_id.to_string()),
+        detection: Some(burn_synth_scene::Detection {
+            label: object_id.to_string(),
+            bbox,
+            point: None,
+            confidence: None,
+            source_query: object_id.to_string(),
+        }),
+        mask: Some(burn_synth_scene::ObjectMaskEvidence {
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            bbox,
+            score: 1.0,
+            area_px: 1,
+            image_size: [100, 100],
+            mask_rle: Vec::new(),
+            center_pixel: None,
+            contact_pixel: None,
+            coverage: Some(bbox_area * 0.5),
+            artifact_path: None,
+            mask_png_path: None,
+        }),
+        asset_id: None,
+        contact_pixel: None,
+        depth_stats: None,
+        candidate_floor_contact_rays: Vec::new(),
+        metric_contact_point_m: None,
+        target_footprint_m: None,
+        provenance: Vec::new(),
+    }
+}
+
 fn unique_test_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
