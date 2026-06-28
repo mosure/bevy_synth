@@ -7,6 +7,10 @@ use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 use image::DynamicImage;
 use image::imageops::FilterType;
 
+use crate::config::{
+    SegmentationModelComponent, SegmentationPrecision, SegmentationQuantization,
+    component_burnpack_file_name,
+};
 use crate::image_encoder::burn_image_encoder::BurnSamImageEncoder;
 use crate::mask_decoder::burn_mask_decoder::BurnSamMaskDecoder;
 use crate::prompt_encoder::burn_prompt::BurnSamPromptEncoder;
@@ -42,32 +46,31 @@ impl Sam2WgpuRuntime {
                 config.model.label()
             )));
         }
-        if config.allow_download && config.cdn_base_url.is_some() {
-            return Err(SegmentationError::Unsupported(
-                "SAM2 WGPU runtime does not yet implement CDN download/bootstrap".to_string(),
-            ));
-        }
-        let model_root = config.model_root.as_ref().ok_or_else(|| {
-            SegmentationError::Unsupported(
-                "SAM2 WGPU runtime requires model_root containing component safetensors"
-                    .to_string(),
-            )
-        })?;
-        let image_encoder_path = component_path(model_root, "image_encoder.safetensors")?;
-        let prompt_encoder_path = component_path(model_root, "prompt_encoder.safetensors")?;
-        let mask_decoder_path = component_path(model_root, "mask_decoder.safetensors")?;
+        let model_root = crate::cdn::resolve_or_download_model_root(config)?;
+        let image_encoder_path = component_path(
+            &model_root,
+            SegmentationModelComponent::ImageEncoder,
+            config,
+        )?;
+        let prompt_encoder_path = component_path(
+            &model_root,
+            SegmentationModelComponent::PromptEncoder,
+            config,
+        )?;
+        let mask_decoder_path =
+            component_path(&model_root, SegmentationModelComponent::MaskDecoder, config)?;
 
         let device = burn_wgpu::WgpuDevice::default();
         let image_encoder = BurnSamImageEncoder::<WgpuBackend>::from_weights(
-            SamImageEncoderWeights::from_safetensors_file(&image_encoder_path)?,
+            load_image_encoder_weights(&image_encoder_path)?,
             &device,
         );
         let prompt_encoder = BurnSamPromptEncoder::<WgpuBackend>::from_weights(
-            SamPromptEncoderWeights::from_safetensors_file(&prompt_encoder_path)?,
+            load_prompt_encoder_weights(&prompt_encoder_path)?,
             &device,
         );
         let mask_decoder = BurnSamMaskDecoder::<WgpuBackend>::from_weights(
-            SamMaskDecoderWeights::from_safetensors_file(&mask_decoder_path)?,
+            load_mask_decoder_weights(&mask_decoder_path)?,
             &device,
         );
         Ok(Self {
@@ -203,19 +206,65 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-fn component_path(model_root: &Path, file_name: &str) -> SegmentationResult<PathBuf> {
-    for candidate in [
-        model_root.join(file_name),
-        model_root.join("components").join(file_name),
-    ] {
+fn component_path(
+    model_root: &Path,
+    component: SegmentationModelComponent,
+    config: &SegmentationRuntimeConfig,
+) -> SegmentationResult<PathBuf> {
+    let requested = component_burnpack_file_name(component, config.precision, config.quantization);
+    let default = component_burnpack_file_name(
+        component,
+        SegmentationPrecision::default(),
+        SegmentationQuantization::default(),
+    );
+    let safetensors_name = format!("{}.safetensors", component.label());
+    let mut candidates = vec![model_root.join(&requested)];
+    if requested != default {
+        candidates.push(model_root.join(default));
+    }
+    candidates.extend([
+        model_root.join(&safetensors_name),
+        model_root.join("components").join(&safetensors_name),
+    ]);
+    for candidate in candidates {
         if candidate.exists() {
             return Ok(candidate);
         }
     }
     Err(SegmentationError::Unsupported(format!(
-        "missing SAM2 component safetensors `{file_name}` under {}",
+        "missing SAM2 component BurnPack `{requested}` or local safetensors `{safetensors_name}` under {}",
         model_root.display()
     )))
+}
+
+fn is_burnpack(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bpk"))
+}
+
+fn load_image_encoder_weights(path: &Path) -> SegmentationResult<SamImageEncoderWeights> {
+    if is_burnpack(path) {
+        SamImageEncoderWeights::from_burnpack_file(path)
+    } else {
+        SamImageEncoderWeights::from_safetensors_file(path)
+    }
+}
+
+fn load_prompt_encoder_weights(path: &Path) -> SegmentationResult<SamPromptEncoderWeights> {
+    if is_burnpack(path) {
+        SamPromptEncoderWeights::from_burnpack_file(path)
+    } else {
+        SamPromptEncoderWeights::from_safetensors_file(path)
+    }
+}
+
+fn load_mask_decoder_weights(path: &Path) -> SegmentationResult<SamMaskDecoderWeights> {
+    if is_burnpack(path) {
+        SamMaskDecoderWeights::from_burnpack_file(path)
+    } else {
+        SamMaskDecoderWeights::from_safetensors_file(path)
+    }
 }
 
 pub fn preprocess_image_to_sam_input(image: &DynamicImage) -> Vec<f32> {
@@ -241,10 +290,27 @@ pub fn preprocess_image_to_sam_input(image: &DynamicImage) -> Vec<f32> {
 }
 
 fn prompt_input_from_prompts(prompts: &[SegmentationPrompt]) -> SegmentationResult<SamPromptInput> {
-    let mut coords = Vec::with_capacity(prompts.len() * 3 * 2);
-    let mut labels = Vec::with_capacity(prompts.len() * 3);
+    let points = if prompts.iter().any(|prompt| prompt.point.is_some()) {
+        4
+    } else {
+        3
+    };
+    let mut coords = Vec::with_capacity(prompts.len() * points * 2);
+    let mut labels = Vec::with_capacity(prompts.len() * points);
     for prompt in prompts {
         validate_bbox(prompt.bbox)?;
+        if points == 4 {
+            if let Some(point) = prompt.point {
+                coords.extend_from_slice(&[
+                    point[0].clamp(0.0, 1.0) * SAM_INPUT_SIZE as f32,
+                    point[1].clamp(0.0, 1.0) * SAM_INPUT_SIZE as f32,
+                ]);
+                labels.push(1);
+            } else {
+                coords.extend_from_slice(&[0.0, 0.0]);
+                labels.push(-1);
+            }
+        }
         coords.extend_from_slice(&[
             prompt.bbox[0] * SAM_INPUT_SIZE as f32,
             prompt.bbox[1] * SAM_INPUT_SIZE as f32,
@@ -259,7 +325,7 @@ fn prompt_input_from_prompts(prompts: &[SegmentationPrompt]) -> SegmentationResu
         coords,
         labels,
         batch: prompts.len(),
-        points: 3,
+        points,
     };
     input.validate()?;
     Ok(input)
@@ -319,6 +385,32 @@ mod tests {
         assert_eq!(input.points, 3);
         assert_eq!(input.coords, vec![256.0, 512.0, 768.0, 1024.0, 0.0, 0.0]);
         assert_eq!(input.labels, vec![2, 3, -1]);
+    }
+
+    #[test]
+    fn sam2_prompt_batch_uses_positive_points_when_available() {
+        let prompts = vec![
+            SegmentationPrompt {
+                object_id: "chair_1".to_string(),
+                label: "chair".to_string(),
+                bbox: [0.25, 0.5, 0.75, 1.0],
+                point: Some([0.5, 0.75]),
+                source_query: Some("chair".to_string()),
+            },
+            SegmentationPrompt {
+                object_id: "table_1".to_string(),
+                label: "table".to_string(),
+                bbox: [0.0, 0.0, 0.5, 0.5],
+                point: None,
+                source_query: Some("table".to_string()),
+            },
+        ];
+        let input = prompt_input_from_prompts(&prompts).unwrap();
+        assert_eq!(input.batch, 2);
+        assert_eq!(input.points, 4);
+        assert_eq!(input.labels, vec![1, 2, 3, -1, -1, 2, 3, -1]);
+        assert_eq!(&input.coords[0..2], &[512.0, 768.0]);
+        assert_eq!(&input.coords[8..10], &[0.0, 0.0]);
     }
 
     #[test]

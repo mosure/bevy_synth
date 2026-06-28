@@ -6,6 +6,7 @@ use image::{DynamicImage, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 
 pub mod assets;
+pub mod cdn;
 pub mod config;
 pub mod image_encoder;
 #[cfg(feature = "import")]
@@ -20,6 +21,12 @@ pub mod tensor_io;
 pub use assets::{
     SegmentationAssetReport, SegmentationBurnpackStatus, SegmentationWeightFileStatus,
     burnpack_parts_manifest_path, inspect_model_assets,
+};
+pub use cdn::{
+    SegmentationFilePartEntry, SegmentationFilePartsManifest, SegmentationFilePartsReport,
+    assemble_file_parts, component_safetensors_file_name, component_safetensors_rel_path,
+    file_parts_manifest_path, read_file_parts_manifest, resolve_file_part_entry_path,
+    segmentation_cdn_root_prefix, segmentation_cdn_root_url, write_file_parts_for_cdn,
 };
 pub use config::{
     SegmentationModelComponent, SegmentationPrecision, SegmentationQuantization,
@@ -194,12 +201,6 @@ impl SegmentationRuntime {
             }
             #[cfg(feature = "backend_wgpu")]
             (SegmentationModelKind::Sam2, SegmentationRuntimeBackend::BurnNative) => {
-                if config.allow_download && config.cdn_base_url.is_some() {
-                    return Err(SegmentationError::Unsupported(
-                        "segmentation CDN download is configured but the SAM artifact downloader is not implemented yet"
-                            .to_string(),
-                    ));
-                }
                 let runtime = sam2_wgpu::Sam2WgpuRuntime::new(&config)?;
                 Ok(Self {
                     config,
@@ -207,12 +208,6 @@ impl SegmentationRuntime {
                 })
             }
             (SegmentationModelKind::Sam2 | SegmentationModelKind::Sam3, _) => {
-                if config.allow_download && config.cdn_base_url.is_some() {
-                    return Err(SegmentationError::Unsupported(
-                        "segmentation CDN download is configured but the SAM artifact downloader is not implemented yet"
-                            .to_string(),
-                    ));
-                }
                 let asset_status = config
                     .model_root
                     .as_ref()

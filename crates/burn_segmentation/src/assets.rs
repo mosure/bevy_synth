@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cdn::{component_safetensors_file_name, component_safetensors_rel_path};
 use crate::config::{
     SegmentationModelComponent, SegmentationPrecision, SegmentationQuantization,
     component_burnpack_file_name, optional_components, required_components,
@@ -19,6 +20,8 @@ pub struct SegmentationAssetReport {
     pub processor_present: bool,
     pub index_present: bool,
     pub single_safetensors_present: bool,
+    #[serde(default)]
+    pub component_safetensors_present: bool,
     pub weight_files: Vec<SegmentationWeightFileStatus>,
     pub burnpacks: Vec<SegmentationBurnpackStatus>,
     pub missing_files: Vec<String>,
@@ -49,16 +52,16 @@ impl SegmentationAssetReport {
         if self.model == SegmentationModelKind::BboxPrompt {
             return true;
         }
-        self.config_present
-            && self.processor_present
-            && self.burnpacks.iter().all(|artifact| {
-                !artifact.required || artifact.present || artifact.parts_manifest_present
-            })
+        let required_burnpacks_present = self.burnpacks.iter().all(|artifact| {
+            !artifact.required || artifact.present || artifact.parts_manifest_present
+        });
+        self.component_safetensors_present || required_burnpacks_present
     }
 
     pub fn has_source_weights(&self) -> bool {
         self.single_safetensors_present
             || self.index_present
+            || self.component_safetensors_present
             || self.weight_files.iter().any(|file| file.present)
     }
 }
@@ -78,6 +81,7 @@ pub fn inspect_model_assets(
             processor_present: true,
             index_present: false,
             single_safetensors_present: false,
+            component_safetensors_present: true,
             weight_files: Vec::new(),
             burnpacks: Vec::new(),
             missing_files: Vec::new(),
@@ -96,24 +100,47 @@ pub fn inspect_model_assets(
     let index_path = model_root.join("model.safetensors.index.json");
     let index_present = index_path.exists();
     let single_safetensors_present = model_root.join("model.safetensors").exists();
-    let weight_file_names = if index_present {
+    let component_file_names = collect_component_file_names(model_root, model);
+    let component_safetensors_present = !required_components(model).is_empty()
+        && required_components(model).iter().all(|component| {
+            component_file_path(model_root, *component)
+                .map(|path| path.exists())
+                .unwrap_or(false)
+        });
+    let mut weight_file_names = if index_present {
         collect_weight_file_names(&index_path)?
     } else if single_safetensors_present {
         BTreeSet::from(["model.safetensors".to_string()])
     } else {
         BTreeSet::new()
     };
+    weight_file_names.extend(component_file_names);
+    let burnpacks = required_components(model)
+        .iter()
+        .copied()
+        .map(|component| burnpack_status(model_root, component, precision, quantization, true))
+        .chain(optional_components(model).iter().copied().map(|component| {
+            burnpack_status(model_root, component, precision, quantization, false)
+        }))
+        .collect::<Vec<_>>();
     let mut missing_files = Vec::new();
-    if !config_present {
+    let required_burnpacks_present = burnpacks
+        .iter()
+        .all(|artifact| !artifact.required || artifact.present || artifact.parts_manifest_present);
+    if !config_present && !component_safetensors_present && !required_burnpacks_present {
         missing_files.push("config.json".to_string());
     }
-    if !processor_present {
+    if !processor_present && !component_safetensors_present && !required_burnpacks_present {
         missing_files.push(
             "preprocessor_config.json|processor_config.json|image_processor_config.json"
                 .to_string(),
         );
     }
-    if !index_present && !single_safetensors_present {
+    if !index_present
+        && !single_safetensors_present
+        && !component_safetensors_present
+        && !required_burnpacks_present
+    {
         missing_files.push("model.safetensors or model.safetensors.index.json".to_string());
     }
 
@@ -137,16 +164,12 @@ pub fn inspect_model_assets(
         })
         .collect::<Vec<_>>();
 
-    let burnpacks = required_components(model)
-        .iter()
-        .copied()
-        .map(|component| burnpack_status(model_root, component, precision, quantization, true))
-        .chain(optional_components(model).iter().copied().map(|component| {
-            burnpack_status(model_root, component, precision, quantization, false)
-        }))
-        .collect::<Vec<_>>();
     for artifact in &burnpacks {
-        if artifact.required && !artifact.present && !artifact.parts_manifest_present {
+        if artifact.required
+            && !artifact.present
+            && !artifact.parts_manifest_present
+            && !component_safetensors_present
+        {
             missing_files.push(format!(
                 "{} or {}",
                 artifact.path,
@@ -165,11 +188,43 @@ pub fn inspect_model_assets(
         processor_present,
         index_present,
         single_safetensors_present,
+        component_safetensors_present,
         weight_files,
         burnpacks,
         missing_files,
         total_weight_bytes,
     })
+}
+
+fn collect_component_file_names(
+    model_root: &Path,
+    model: SegmentationModelKind,
+) -> BTreeSet<String> {
+    required_components(model)
+        .iter()
+        .chain(optional_components(model).iter())
+        .filter_map(|component| {
+            component_file_path(model_root, *component).and_then(|path| {
+                path.exists().then(|| {
+                    path.strip_prefix(model_root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string()
+                })
+            })
+        })
+        .collect()
+}
+
+fn component_file_path(
+    model_root: &Path,
+    component: SegmentationModelComponent,
+) -> Option<PathBuf> {
+    let component_rel = component_safetensors_rel_path(component);
+    let direct = component_safetensors_file_name(component);
+    [model_root.join(component_rel), model_root.join(direct)]
+        .into_iter()
+        .find(|path| path.exists())
 }
 
 pub fn burnpack_status(
@@ -291,6 +346,44 @@ mod tests {
                 .any(|file| file.contains("prompt_encoder_f16.bpk"))
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn component_safetensors_are_complete_native_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "burn_segmentation_component_assets_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("components")).unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        fs::write(root.join("preprocessor_config.json"), "{}").unwrap();
+        fs::write(root.join("components/image_encoder.safetensors"), b"image").unwrap();
+        fs::write(
+            root.join("components/prompt_encoder.safetensors"),
+            b"prompt",
+        )
+        .unwrap();
+        fs::write(root.join("components/mask_decoder.safetensors"), b"mask").unwrap();
+
+        let report = inspect_model_assets(
+            SegmentationModelKind::Sam2,
+            &root,
+            SegmentationPrecision::F16,
+            SegmentationQuantization::None,
+        )
+        .unwrap();
+
+        assert!(report.component_safetensors_present);
+        assert!(report.has_source_weights());
+        assert!(report.is_complete_for_native_burn());
+        assert!(
+            !report
+                .missing_files
+                .iter()
+                .any(|path| path.contains(".bpk"))
+        );
         fs::remove_dir_all(root).ok();
     }
 }

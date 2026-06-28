@@ -1,5 +1,7 @@
 use std::path::Path;
 
+#[cfg(feature = "bpk")]
+use crate::tensor_io::load_all_tensors_from_burnpack_file;
 use crate::tensor_io::{LoadedTensorF32, load_all_tensors_from_safetensors_file};
 use crate::{SegmentationError, SegmentationResult};
 
@@ -43,6 +45,17 @@ pub struct SamMaskDecoderWeights {
 impl SamMaskDecoderWeights {
     pub fn from_safetensors_file(path: impl AsRef<Path>) -> SegmentationResult<Self> {
         let tensors = load_all_tensors_from_safetensors_file(path.as_ref())?;
+        let weights = Self {
+            config: SamMaskDecoderConfig::sam2_1024(),
+            tensors,
+        };
+        weights.validate()?;
+        Ok(weights)
+    }
+
+    #[cfg(feature = "bpk")]
+    pub fn from_burnpack_file(path: impl AsRef<Path>) -> SegmentationResult<Self> {
+        let tensors = load_all_tensors_from_burnpack_file(path.as_ref())?;
         let weights = Self {
             config: SamMaskDecoderConfig::sam2_1024(),
             tensors,

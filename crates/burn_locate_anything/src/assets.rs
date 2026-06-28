@@ -6,6 +6,7 @@ use std::sync::{LazyLock, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::blob_burnpack::burnpack_parts_manifest_path;
 use crate::{LocateAnythingError, LocateAnythingResult};
 
 static WEIGHT_MAP_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, BTreeMap<String, String>>>> =
@@ -70,8 +71,8 @@ pub fn inspect_model_assets(
     let mut weight_files = Vec::new();
     let mut total_weight_bytes = 0u64;
     for name in weight_file_names {
-        let path = model_root.join(&name);
-        let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let path = resolve_existing_weight_artifact(model_root, &name);
+        let bytes = weight_artifact_bytes(&path)?;
         if bytes == 0 {
             missing_files.push(name.clone());
         }
@@ -114,7 +115,59 @@ pub fn weight_file_for_tensor(
                 index_path.display()
             ))
         })?;
-    Ok(model_root.join(file))
+    Ok(resolve_existing_weight_artifact(model_root, file))
+}
+
+fn resolve_existing_weight_artifact(model_root: &Path, file: &str) -> PathBuf {
+    let direct = model_root.join(file);
+    if direct.exists() {
+        return direct;
+    }
+    for candidate in burnpack_candidates_for_weight_file(model_root, file) {
+        if candidate.exists() || burnpack_parts_manifest_path(&candidate).exists() {
+            return candidate;
+        }
+    }
+    direct
+}
+
+fn weight_artifact_bytes(path: &Path) -> LocateAnythingResult<u64> {
+    if let Ok(metadata) = fs::metadata(path) {
+        return Ok(metadata.len());
+    }
+    let manifest_path = burnpack_parts_manifest_path(path);
+    if !manifest_path.exists() {
+        return Ok(0);
+    }
+    let bytes = fs::read(&manifest_path).map_err(|err| {
+        LocateAnythingError::Io(format!("read {}: {err}", manifest_path.display()))
+    })?;
+    let value = serde_json::from_slice::<Value>(&bytes).map_err(|err| {
+        LocateAnythingError::Config(format!("parse {}: {err}", manifest_path.display()))
+    })?;
+    Ok(value
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value.get("parts").and_then(Value::as_array).map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("bytes").and_then(Value::as_u64))
+                    .sum()
+            })
+        })
+        .unwrap_or(0))
+}
+
+fn burnpack_candidates_for_weight_file(model_root: &Path, file: &str) -> Vec<PathBuf> {
+    let Some(stem) = file.strip_suffix(".safetensors") else {
+        return vec![model_root.join(file)];
+    };
+    ["bf16", "f16", "f32"]
+        .into_iter()
+        .map(|precision| model_root.join(format!("{stem}_{precision}.bpk")))
+        .chain(std::iter::once(model_root.join(format!("{stem}.bpk"))))
+        .collect()
 }
 
 fn collect_weight_file_names(index_path: &Path) -> LocateAnythingResult<BTreeSet<String>> {
@@ -208,5 +261,72 @@ mod tests {
                 .to_string_lossy(),
             "model-00002-of-00002.safetensors"
         );
+    }
+
+    #[test]
+    fn index_uses_bpk_bundle_when_safetensors_are_not_materialized() {
+        let root =
+            std::env::temp_dir().join(format!("locateanything_asset_bpk_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"vision_model.patch_embed.proj.weight":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("model-00001-of-00002_bf16.bpk.parts.json"), "{}").unwrap();
+        let resolved =
+            weight_file_for_tensor(&root, "vision_model.patch_embed.proj.weight").unwrap();
+        assert_eq!(
+            resolved.file_name().unwrap().to_string_lossy(),
+            "model-00001-of-00002_bf16.bpk"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asset_report_accepts_bpk_parts_without_materialized_safetensors() {
+        let root = std::env::temp_dir().join(format!(
+            "locateanything_asset_report_bpk_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for file in [
+            "config.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "preprocessor_config.json",
+            "processor_config.json",
+        ] {
+            fs::write(root.join(file), "{}").unwrap();
+        }
+        fs::write(
+            root.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"vision_model.patch_embed.proj.weight":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("model-00001-of-00002_bf16.bpk.parts.json"),
+            r#"{"total_bytes":1234,"parts":[{"path":"model-00001-of-00002_bf16.bpk.part-00000.bpk","bytes":1234}]}"#,
+        )
+        .unwrap();
+        let report = inspect_model_assets(&root).unwrap();
+        assert!(report.is_complete(), "{report:#?}");
+        assert_eq!(report.total_weight_bytes, 1234);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asset_report_accepts_env_bpk_bundle_root() {
+        let Some(root) = std::env::var_os("LOCATE_ANYTHING_BPK_BUNDLE_ROOT").map(PathBuf::from)
+        else {
+            eprintln!("skipping: set LOCATE_ANYTHING_BPK_BUNDLE_ROOT to a bpk bundle root");
+            return;
+        };
+        let report = inspect_model_assets(&root).unwrap();
+        assert!(report.is_complete(), "{report:#?}");
+        assert_eq!(report.weight_files.len(), 2);
     }
 }

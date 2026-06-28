@@ -8,7 +8,7 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "locate_anything_import",
-    about = "Prepare a LocateAnything import manifest and burnpack artifact plan"
+    about = "Prepare a LocateAnything CDN-ready metadata + sharded blob-burnpack bundle"
 )]
 struct Args {
     #[arg(long)]
@@ -17,7 +17,7 @@ struct Args {
     output_dir: PathBuf,
     #[arg(long, default_value = "nvidia/LocateAnything-3B")]
     model_id: String,
-    #[arg(long, value_enum, default_value_t = PrecisionArg::F16)]
+    #[arg(long, value_enum, default_value_t = PrecisionArg::Bf16)]
     precision: PrecisionArg,
     #[arg(long)]
     shard_size_mib: Option<usize>,

@@ -1,11 +1,12 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use half::{bf16, f16};
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use safetensors::tensor::{Dtype, TensorView};
 
+use crate::blob_burnpack::extract_blob_burnpack_or_parts_to_file;
 use crate::{LocateAnythingError, LocateAnythingResult};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,7 +38,8 @@ pub fn load_required_tensors_from_safetensors_file(
     path: &Path,
     keys: &[&str],
 ) -> LocateAnythingResult<Vec<(String, LoadedTensorF32)>> {
-    let file = fs::File::open(path).map_err(|err| {
+    let path = materialize_blob_burnpack_if_needed(path)?;
+    let file = fs::File::open(&path).map_err(|err| {
         LocateAnythingError::Io(format!("failed to open {}: {err}", path.display()))
     })?;
     // Safetensors files can be multi-GB checkpoints; mmap keeps fixture and
@@ -73,7 +75,8 @@ pub fn load_required_tensor_data_from_safetensors_file(
     path: &Path,
     keys: &[&str],
 ) -> LocateAnythingResult<Vec<(String, LoadedTensorData)>> {
-    let file = fs::File::open(path).map_err(|err| {
+    let path = materialize_blob_burnpack_if_needed(path)?;
+    let file = fs::File::open(&path).map_err(|err| {
         LocateAnythingError::Io(format!("failed to open {}: {err}", path.display()))
     })?;
     let mmap = unsafe { MmapOptions::new().map(&file) }.map_err(|err| {
@@ -96,6 +99,21 @@ pub fn load_required_tensor_data_from_safetensors_file(
             Ok(((*key).to_string(), tensor_view_to_tensor_data(&view)?))
         })
         .collect()
+}
+
+fn materialize_blob_burnpack_if_needed(path: &Path) -> LocateAnythingResult<PathBuf> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bpk"))
+    {
+        return Ok(path.to_path_buf());
+    }
+    let destination = path.with_extension("safetensors");
+    if !destination.exists() {
+        extract_blob_burnpack_or_parts_to_file(path, &destination)?;
+    }
+    Ok(destination)
 }
 
 fn tensor_view_to_f32(view: &TensorView<'_>) -> LocateAnythingResult<LoadedTensorF32> {

@@ -10,7 +10,14 @@ use burn_synth_import::parts::{
 };
 
 use crate::assets::{SegmentationAssetReport, burnpack_parts_manifest_path, inspect_model_assets};
-use crate::config::{SegmentationPrecision, SegmentationQuantization};
+use crate::cdn::{component_safetensors_file_name, segmentation_cdn_root_prefix};
+use crate::config::{
+    SegmentationModelComponent, SegmentationPrecision, SegmentationQuantization,
+    component_burnpack_file_name, optional_components, required_components,
+};
+use crate::tensor_io::{
+    load_all_tensors_from_safetensors_file, write_all_tensors_to_burnpack_file,
+};
 use crate::{SegmentationError, SegmentationModelKind, SegmentationResult};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -34,6 +41,8 @@ pub struct SegmentationImportManifest {
     pub source_root: String,
     pub asset_report: SegmentationAssetReport,
     pub files: Vec<SegmentationSourceFile>,
+    #[serde(default)]
+    pub component_safetensors: Vec<SegmentationComponentArtifact>,
     pub required_burnpacks: Vec<SegmentationBurnpackArtifact>,
     pub cdn_layout: SegmentationCdnLayout,
 }
@@ -47,6 +56,14 @@ pub struct SegmentationSourceFile {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SegmentationBurnpackArtifact {
+    pub component: String,
+    pub path: String,
+    pub required: bool,
+    pub parts_manifest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SegmentationComponentArtifact {
     pub component: String,
     pub path: String,
     pub required: bool,
@@ -92,6 +109,7 @@ pub fn write_import_manifest(
     fs::create_dir_all(&config.output_dir).map_err(|err| {
         SegmentationError::Io(format!("create {}: {err}", config.output_dir.display()))
     })?;
+    let component_safetensors = convert_component_safetensors_to_burnpacks(config)?;
     let files = collect_source_files(&config.hf_root)?;
     let initial_asset_report = inspect_model_assets(
         config.model,
@@ -134,12 +152,8 @@ pub fn write_import_manifest(
             }
         })
         .collect::<Vec<_>>();
-    let root_prefix = format!(
-        "models/segmentation/{}/{}/{}",
-        config.model.label(),
-        config.precision,
-        config.quantization
-    );
+    let root_prefix =
+        segmentation_cdn_root_prefix(config.model, config.precision, config.quantization);
     let component_paths = required_burnpacks
         .iter()
         .map(|artifact| format!("{root_prefix}/{}", artifact.path))
@@ -166,6 +180,7 @@ pub fn write_import_manifest(
         source_root: source_root_label(&config.hf_root),
         asset_report,
         files,
+        component_safetensors,
         required_burnpacks,
         cdn_layout,
     };
@@ -234,6 +249,70 @@ fn collect_cdn_files(
     files.sort_by(|left, right| left.cdn_path.cmp(&right.cdn_path));
     files.dedup_by(|left, right| left.cdn_path == right.cdn_path);
     Ok(files)
+}
+
+fn convert_component_safetensors_to_burnpacks(
+    config: &SegmentationImportConfig,
+) -> SegmentationResult<Vec<SegmentationComponentArtifact>> {
+    let mut artifacts = Vec::new();
+    let required = required_components(config.model)
+        .iter()
+        .copied()
+        .map(|component| (component, true));
+    let optional = optional_components(config.model)
+        .iter()
+        .copied()
+        .map(|component| (component, false));
+    for (component, required) in required.chain(optional) {
+        let Some(source) = find_component_safetensors(&config.hf_root, component) else {
+            if required {
+                artifacts.push(SegmentationComponentArtifact {
+                    component: component.label().to_string(),
+                    path: component_safetensors_file_name(component),
+                    required,
+                    parts_manifest: None,
+                });
+            }
+            continue;
+        };
+        if config.quantization != SegmentationQuantization::None {
+            return Err(SegmentationError::Unsupported(format!(
+                "segmentation quantized BurnPack import is not implemented yet for {}; use --quantization none until quantized SAM parity is validated",
+                config.quantization
+            )));
+        }
+        let tensors = load_all_tensors_from_safetensors_file(&source)?;
+        let burnpack_name =
+            component_burnpack_file_name(component, config.precision, config.quantization);
+        let burnpack_path = config.output_dir.join(&burnpack_name);
+        write_all_tensors_to_burnpack_file(&burnpack_path, &tensors, config.precision, false)?;
+        let source_rel = source
+            .strip_prefix(&config.hf_root)
+            .unwrap_or(&source)
+            .display()
+            .to_string();
+        artifacts.push(SegmentationComponentArtifact {
+            component: component.label().to_string(),
+            path: source_rel,
+            required,
+            parts_manifest: None,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn find_component_safetensors(
+    root: &Path,
+    component: SegmentationModelComponent,
+) -> Option<PathBuf> {
+    let file_name = component_safetensors_file_name(component);
+    [
+        root.join(&file_name),
+        root.join("components").join(&file_name),
+        root.join(component.label()).join(&file_name),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
 }
 
 fn cdn_file_entry(
@@ -346,28 +425,19 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&out).unwrap();
         fs::write(root.join("config.json"), "{}").unwrap();
-        fs::write(root.join("model.safetensors"), b"weights").unwrap();
-        fs::write(out.join("image_encoder_f16.bpk"), b"burnpack").unwrap();
-        fs::write(out.join("image_encoder_f16.bpk.part-00000.bpk"), b"part").unwrap();
-        fs::write(
-            out.join("image_encoder_f16.bpk.parts.json"),
-            r#"{
-              "version": 1,
-              "source_file": "image_encoder_f16.bpk",
-              "source_modified_unix_ms": 1,
-              "total_bytes": 8,
-              "max_part_bytes": 4,
-              "parts": [
-                {
-                  "path": "image_encoder_f16.bpk.part-00000.bpk",
-                  "bytes": 4,
-                  "sha256": "",
-                  "tensors": 1
-                }
-              ]
-            }"#,
-        )
-        .unwrap();
+        write_tiny_safetensors(&root.join("model.safetensors"), "model.weight");
+        write_tiny_safetensors(
+            &root.join("image_encoder.safetensors"),
+            "image_encoder.test.weight",
+        );
+        write_tiny_safetensors(
+            &root.join("prompt_encoder.safetensors"),
+            "sam_prompt_encoder.test.weight",
+        );
+        write_tiny_safetensors(
+            &root.join("mask_decoder.safetensors"),
+            "sam_mask_decoder.test.weight",
+        );
 
         let manifest = write_import_manifest(&SegmentationImportConfig {
             hf_root: root.clone(),
@@ -376,14 +446,29 @@ mod tests {
             model: SegmentationModelKind::Sam2,
             precision: SegmentationPrecision::F16,
             quantization: SegmentationQuantization::None,
-            shard_size_mib: None,
+            shard_size_mib: Some(1),
         })
         .unwrap();
 
         assert_eq!(manifest.model, SegmentationModelKind::Sam2);
         assert!(!Path::new(&manifest.source_root).is_absolute());
         assert!(manifest.files.iter().any(|file| file.path == "config.json"));
-        assert!(manifest.cdn_layout.root_prefix.ends_with("sam2/f16/none"));
+        assert_eq!(manifest.component_safetensors.len(), 3);
+        assert!(
+            manifest
+                .component_safetensors
+                .iter()
+                .all(|artifact| artifact.parts_manifest.is_none())
+        );
+        assert_eq!(manifest.cdn_layout.root_prefix, "model/SAM2.1");
+        assert!(manifest.cdn_layout.files.iter().all(|file| {
+            matches!(
+                file.kind,
+                SegmentationCdnFileKind::Burnpack
+                    | SegmentationCdnFileKind::PartsManifest
+                    | SegmentationCdnFileKind::BurnpackPart
+            ) && !file.cdn_path.ends_with(".safetensors")
+        }));
         assert!(
             manifest
                 .cdn_layout
@@ -404,5 +489,13 @@ mod tests {
 
         fs::remove_dir_all(root).ok();
         fs::remove_dir_all(out).ok();
+    }
+
+    fn write_tiny_safetensors(path: &Path, key: &str) {
+        use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+
+        let data = 1.0f32.to_le_bytes().to_vec();
+        let view = TensorView::new(Dtype::F32, vec![1], &data).unwrap();
+        serialize_to_file([(key.to_string(), view)], None, path).unwrap();
     }
 }

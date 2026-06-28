@@ -2915,6 +2915,7 @@ dependencies = [
  "burn-cuda",
  "burn-wgpu",
  "burn_synth_import",
+ "ciborium",
  "clap",
  "half",
  "image",
@@ -2924,6 +2925,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokenizers",
+ "ureq 2.12.1",
 ]
 
 [[package]]
@@ -2931,7 +2933,10 @@ name = "burn_segmentation"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-core",
  "burn-cuda",
+ "burn-store",
+ "burn-tensor",
  "burn-wgpu",
  "burn_synth_import",
  "clap",
@@ -2942,6 +2947,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "ureq 2.12.1",
 ]
 
 [[package]]

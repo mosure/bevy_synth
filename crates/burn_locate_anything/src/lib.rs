@@ -1,4 +1,6 @@
 pub mod assets;
+pub mod blob_burnpack;
+pub mod cdn;
 pub mod config;
 pub mod decode;
 pub mod import;
@@ -18,6 +20,7 @@ pub use assets::{
     LocateAnythingAssetReport, LocateAnythingWeightFileStatus, inspect_model_assets,
     weight_file_for_tensor,
 };
+pub use cdn::{locate_anything_cdn_root_prefix, locate_anything_cdn_root_url};
 pub use config::{
     LocateAnythingModelConfig, LocateAnythingTextConfig, LocateAnythingVisionBackboneConfig,
 };

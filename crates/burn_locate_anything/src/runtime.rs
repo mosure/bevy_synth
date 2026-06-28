@@ -4,8 +4,10 @@ use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 
 use crate::assets::{LocateAnythingAssetReport, inspect_model_assets};
+use crate::cdn::resolve_or_download_model_root;
 use crate::config::LocateAnythingModelConfig;
 use crate::decode::{DecodeMode, decode_detections_from_text};
+use crate::import::LocateAnythingPrecision;
 use crate::native::{LocateAnythingNativeBatchInputs, prepare_native_batch_inputs};
 use crate::tokenizer::grounding_prompt;
 use crate::vision::LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT;
@@ -42,6 +44,14 @@ pub enum LocateAnythingRuntimeBackend {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LocateAnythingRuntimeConfig {
     pub model_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_base_url: Option<String>,
+    #[serde(default)]
+    pub allow_download: bool,
+    #[serde(default)]
+    pub precision: LocateAnythingPrecision,
     pub backend: LocateAnythingRuntimeBackend,
     #[serde(default)]
     pub allow_experimental_native_detect: bool,
@@ -70,6 +80,10 @@ impl Default for LocateAnythingRuntimeConfig {
     fn default() -> Self {
         Self {
             model_root: PathBuf::from("assets/models/LocateAnything-3B"),
+            cache_dir: None,
+            cdn_base_url: None,
+            allow_download: false,
+            precision: LocateAnythingPrecision::default(),
             backend: LocateAnythingRuntimeBackend::BurnNative,
             allow_experimental_native_detect: false,
             decode_mode: DecodeMode::Hybrid,
@@ -146,6 +160,8 @@ impl LocateAnythingRuntime {
                 "max_new_tokens must be greater than zero".to_string(),
             ));
         }
+        let mut config = config;
+        config.model_root = resolve_or_download_model_root(&config)?;
         let asset_report = inspect_model_assets(&config.model_root)?;
         let model_config = if asset_report.config_present {
             Some(LocateAnythingModelConfig::from_model_root(

@@ -49,7 +49,7 @@ let detections = runtime.detect_batch(
 - [x] parallel box decoding and text-output box parsing
 - [x] WGPU-native runtime path
 - [x] wasm-compatible crate check without native tokenizer execution
-- [ ] CDN `.bpk.parts.json` loader as a public runtime default
+- [x] CDN/cache loader for sharded `.bpk.parts.json` weight artifacts
 - [ ] broad multi-scene checkpoint parity gates
 
 ## setup
@@ -57,15 +57,19 @@ let detections = runtime.detect_batch(
 Download the upstream `nvidia/LocateAnything-3B` Hugging Face snapshot and place it under a model
 root such as `assets/models/LocateAnything-3B`.
 
-Prepare an import manifest and BurnPack artifact plan:
+Prepare a CDN-ready metadata + sharded blob-burnpack bundle:
 
 ```bash
 cargo run -p burn_locate_anything --features import --bin locate_anything_import -- \
   --hf-root assets/models/LocateAnything-3B \
-  --output-dir assets/models/LocateAnything-3B-bpk \
-  --precision f16 \
+  --output-dir tmp/runs/<run_id>/model/LocateAnything-3B \
+  --precision bf16 \
   --shard-size-mib 64
 ```
+
+The generated upload layout is rooted at `model/LocateAnything-3B`. Runtime CDN loading is opt-in
+through `LocateAnythingRuntimeConfig { cdn_base_url, cache_dir, allow_download: true, .. }`; local
+`model_root` snapshots are still preferred when present.
 
 > Pre-trained model weights have separate licenses. Keep converted checkpoints and generated
 > `.bpk` artifacts out of source control unless a release process explicitly includes them.

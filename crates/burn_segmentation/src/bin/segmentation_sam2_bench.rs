@@ -14,6 +14,8 @@ struct BenchReport {
     variant: Option<String>,
     backend: String,
     model_root: String,
+    cdn_base_url: Option<String>,
+    allow_download: bool,
     image: String,
     image_size: [u32; 2],
     prompt_count: usize,
@@ -63,6 +65,9 @@ fn run() -> Result<(), String> {
         model: SegmentationModelKind::Sam2,
         backend: SegmentationRuntimeBackend::BurnNative,
         model_root: Some(args.model_root.clone()),
+        cache_dir: args.cache_dir.clone(),
+        cdn_base_url: args.cdn_base_url.clone(),
+        allow_download: args.allow_download,
         profile_stages: true,
         ..SegmentationRuntimeConfig::default()
     })
@@ -103,6 +108,8 @@ fn run() -> Result<(), String> {
             .map(|variant| variant.label().to_string()),
         backend: SegmentationRuntimeBackend::BurnNative.label().to_string(),
         model_root: args.model_root.display().to_string(),
+        cdn_base_url: args.cdn_base_url,
+        allow_download: args.allow_download,
         image: args.image.display().to_string(),
         image_size: [image.width(), image.height()],
         prompt_count: 1,
@@ -124,6 +131,9 @@ fn run() -> Result<(), String> {
 #[derive(Debug)]
 struct Args {
     model_root: PathBuf,
+    cache_dir: Option<PathBuf>,
+    cdn_base_url: Option<String>,
+    allow_download: bool,
     image: PathBuf,
     bbox: [f32; 4],
     warmup_runs: usize,
@@ -134,6 +144,9 @@ impl Args {
     fn parse() -> Result<Self, String> {
         let mut args = env::args().skip(1);
         let mut model_root = None;
+        let mut cache_dir = None;
+        let mut cdn_base_url = None;
+        let mut allow_download = false;
         let mut image = None;
         let mut bbox = None;
         let mut warmup_runs = 1usize;
@@ -141,6 +154,9 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--model-root" => model_root = args.next().map(PathBuf::from),
+                "--cache-dir" => cache_dir = args.next().map(PathBuf::from),
+                "--cdn-base-url" => cdn_base_url = args.next(),
+                "--allow-download" => allow_download = true,
                 "--image" => image = args.next().map(PathBuf::from),
                 "--bbox" => bbox = args.next().map(parse_bbox).transpose()?,
                 "--warmup-runs" => {
@@ -163,6 +179,9 @@ impl Args {
         }
         Ok(Self {
             model_root: model_root.ok_or_else(|| "--model-root is required".to_string())?,
+            cache_dir,
+            cdn_base_url,
+            allow_download,
             image: image.ok_or_else(|| "--image is required".to_string())?,
             bbox: bbox.unwrap_or([0.15, 0.10, 0.85, 0.90]),
             warmup_runs,
@@ -189,7 +208,7 @@ fn parse_bbox(value: String) -> Result<[f32; 4], String> {
 }
 
 fn usage() -> String {
-    "usage: segmentation_sam2_bench --model-root DIR --image IMAGE [--bbox x0,y0,x1,y1] [--warmup-runs N] [--runs N]".to_string()
+    "usage: segmentation_sam2_bench --model-root DIR --image IMAGE [--allow-download --cdn-base-url URL] [--cache-dir DIR] [--bbox x0,y0,x1,y1] [--warmup-runs N] [--runs N]".to_string()
 }
 
 fn elapsed_ms(start: Instant) -> f64 {

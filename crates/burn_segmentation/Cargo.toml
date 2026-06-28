@@ -14,14 +14,18 @@ readme = "README.md"
 
 [features]
 default = []
-import = ["dep:clap", "dep:burn_synth_import"]
-backend_wgpu = ["dep:burn", "dep:burn-wgpu"]
-backend_cuda = ["dep:burn", "dep:burn-cuda"]
+bpk = ["dep:burn-core", "dep:burn-store", "dep:burn-tensor"]
+import = ["dep:clap", "dep:burn_synth_import", "bpk"]
+backend_wgpu = ["dep:burn", "dep:burn-wgpu", "bpk"]
+backend_cuda = ["dep:burn", "dep:burn-cuda", "bpk"]
 python-reference = []
 
 [dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn-core = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn-store = { version = "=0.21.0", default-features = false, features = ["std", "burnpack"], optional = true }
 burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
+burn-tensor = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 half = "2.4"
@@ -30,6 +34,10 @@ safetensors = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.ureq]
+version = "2.12"
+default-features = true
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
 version = "=0.21.0"

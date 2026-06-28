@@ -1,11 +1,19 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(feature = "bpk")]
+use burn_core::module::ParamId;
+#[cfg(feature = "bpk")]
+use burn_store::{BurnpackStore, BurnpackWriter, ModuleStore, TensorSnapshot};
+#[cfg(feature = "bpk")]
+use burn_tensor::{DType, TensorData, bf16 as BurnBf16, f16 as BurnF16};
 use half::{bf16, f16};
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use safetensors::tensor::{Dtype, TensorView};
 
+#[cfg(feature = "bpk")]
+use crate::config::SegmentationPrecision;
 use crate::{SegmentationError, SegmentationResult};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +99,66 @@ pub fn load_all_tensors_from_safetensors_file(
                 ))
             })?;
             Ok((key.to_string(), tensor_view_to_f32(&view)?))
+        })
+        .collect()
+}
+
+#[cfg(feature = "bpk")]
+pub fn write_all_tensors_to_burnpack_file(
+    path: &Path,
+    tensors: &[(String, LoadedTensorF32)],
+    precision: SegmentationPrecision,
+    overwrite: bool,
+) -> SegmentationResult<()> {
+    if path.exists() && !overwrite {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| SegmentationError::Io(format!("create {}: {err}", parent.display())))?;
+    }
+    let snapshots = tensors
+        .iter()
+        .map(|(name, tensor)| {
+            let data = tensor_data_for_precision(tensor, precision)?;
+            Ok(TensorSnapshot::from_data(
+                data,
+                vec![name.clone()],
+                vec!["Struct:SegmentationComponent".to_string()],
+                ParamId::new(),
+            ))
+        })
+        .collect::<SegmentationResult<Vec<_>>>()?;
+    let writer = BurnpackWriter::new(snapshots)
+        .with_metadata("format", "burnpack")
+        .with_metadata("producer", "burn_segmentation")
+        .with_metadata("precision", precision.label());
+    writer
+        .write_to_file(path)
+        .map_err(|err| SegmentationError::Io(format!("write burnpack {}: {err}", path.display())))
+}
+
+#[cfg(feature = "bpk")]
+pub fn load_all_tensors_from_burnpack_file(
+    path: &Path,
+) -> SegmentationResult<Vec<(String, LoadedTensorF32)>> {
+    let mut store = BurnpackStore::from_file(path).auto_extension(false);
+    let snapshots = store
+        .get_all_snapshots()
+        .map_err(|err| {
+            SegmentationError::Image(format!("read burnpack {}: {err}", path.display()))
+        })?
+        .clone();
+    snapshots
+        .into_iter()
+        .map(|(name, snapshot)| {
+            let data = snapshot.to_data().map_err(|err| {
+                SegmentationError::Image(format!(
+                    "read tensor `{name}` from burnpack {}: {err}",
+                    path.display()
+                ))
+            })?;
+            Ok((name, tensor_data_to_f32(data)?))
         })
         .collect()
 }
@@ -244,4 +312,131 @@ fn bytes_to_chunks(
         )));
     }
     Ok(bytes.chunks_exact(chunk_size).map(convert).collect())
+}
+
+#[cfg(feature = "bpk")]
+fn tensor_data_for_precision(
+    tensor: &LoadedTensorF32,
+    precision: SegmentationPrecision,
+) -> SegmentationResult<TensorData> {
+    let expected = tensor.shape.iter().try_fold(1usize, |acc, value| {
+        acc.checked_mul(*value).ok_or_else(|| {
+            SegmentationError::Image(format!(
+                "burnpack tensor shape product overflow: {:?}",
+                tensor.shape
+            ))
+        })
+    })?;
+    if expected != tensor.data.len() {
+        return Err(SegmentationError::Image(format!(
+            "burnpack tensor element count mismatch: shape {:?} implies {}, got {}",
+            tensor.shape,
+            expected,
+            tensor.data.len()
+        )));
+    }
+    Ok(match precision {
+        SegmentationPrecision::F32 => TensorData::new(tensor.data.clone(), tensor.shape.clone()),
+        SegmentationPrecision::F16 => TensorData::new(
+            tensor
+                .data
+                .iter()
+                .map(|value| BurnF16::from_f32(*value))
+                .collect::<Vec<_>>(),
+            tensor.shape.clone(),
+        ),
+        SegmentationPrecision::Bf16 => TensorData::new(
+            tensor
+                .data
+                .iter()
+                .map(|value| BurnBf16::from_f32(*value))
+                .collect::<Vec<_>>(),
+            tensor.shape.clone(),
+        ),
+    })
+}
+
+#[cfg(feature = "bpk")]
+fn tensor_data_to_f32(data: TensorData) -> SegmentationResult<LoadedTensorF32> {
+    let shape = data.shape.as_slice().to_vec();
+    let values = match data.dtype {
+        DType::F32 | DType::Flex32 => data
+            .into_vec::<f32>()
+            .map_err(|err| SegmentationError::Image(format!("read f32 burnpack tensor: {err}")))?,
+        DType::F16 => data
+            .into_vec::<BurnF16>()
+            .map_err(|err| SegmentationError::Image(format!("read f16 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect(),
+        DType::BF16 => data
+            .into_vec::<BurnBf16>()
+            .map_err(|err| SegmentationError::Image(format!("read bf16 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect(),
+        DType::F64 => data
+            .into_vec::<f64>()
+            .map_err(|err| SegmentationError::Image(format!("read f64 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::I64 => data
+            .into_vec::<i64>()
+            .map_err(|err| SegmentationError::Image(format!("read i64 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::U64 => data
+            .into_vec::<u64>()
+            .map_err(|err| SegmentationError::Image(format!("read u64 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::I32 => data
+            .into_vec::<i32>()
+            .map_err(|err| SegmentationError::Image(format!("read i32 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::U32 => data
+            .into_vec::<u32>()
+            .map_err(|err| SegmentationError::Image(format!("read u32 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::I16 => data
+            .into_vec::<i16>()
+            .map_err(|err| SegmentationError::Image(format!("read i16 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::U16 => data
+            .into_vec::<u16>()
+            .map_err(|err| SegmentationError::Image(format!("read u16 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::I8 => data
+            .into_vec::<i8>()
+            .map_err(|err| SegmentationError::Image(format!("read i8 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        DType::U8 => data
+            .into_vec::<u8>()
+            .map_err(|err| SegmentationError::Image(format!("read u8 burnpack tensor: {err}")))?
+            .into_iter()
+            .map(|value| value as f32)
+            .collect(),
+        other => {
+            return Err(SegmentationError::Image(format!(
+                "unsupported burnpack tensor dtype {other:?}"
+            )));
+        }
+    };
+    Ok(LoadedTensorF32 {
+        shape,
+        data: values,
+    })
 }

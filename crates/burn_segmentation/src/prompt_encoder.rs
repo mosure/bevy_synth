@@ -1,5 +1,7 @@
 use std::path::Path;
 
+#[cfg(feature = "bpk")]
+use crate::tensor_io::load_all_tensors_from_burnpack_file;
 use crate::tensor_io::{
     LoadedTensorF32, expect_2d, find_tensor, load_required_tensors_from_safetensors_file,
 };
@@ -47,6 +49,12 @@ impl SamPromptEncoderWeights {
                 "sam_prompt_encoder.no_mask_embed.weight",
             ],
         )?;
+        Self::from_loaded_tensors(&tensors)
+    }
+
+    #[cfg(feature = "bpk")]
+    pub fn from_burnpack_file(path: impl AsRef<Path>) -> SegmentationResult<Self> {
+        let tensors = load_all_tensors_from_burnpack_file(path.as_ref())?;
         Self::from_loaded_tensors(&tensors)
     }
 
