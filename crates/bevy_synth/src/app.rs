@@ -87,13 +87,13 @@ use std::sync::{
 
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_mcp::{
-    FeedbackRotationSelector, FeedbackThresholdProfile, InferenceBackend as McpInferenceBackend,
-    LocateAnythingBackend, QualityPreset as McpQualityPreset, SceneBuildExecutionKind,
-    SceneBuildFromImageArgs, SceneBuildProgressEvent, SceneBuildProgressPhase,
-    SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
-    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider, ServerArgs, ServerConfig,
-    SynthesisModel as McpSynthesisModel, TrellisQuality as McpTrellisQuality,
-    run_scene_build_from_image_with_progress,
+    FeedbackRotationSelector, FeedbackRubricScorer, FeedbackThresholdProfile,
+    InferenceBackend as McpInferenceBackend, LocateAnythingBackend,
+    QualityPreset as McpQualityPreset, SceneBuildExecutionKind, SceneBuildFromImageArgs,
+    SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
+    SceneDepthProvider, SceneLocatorProvider, ScenePoseFitMode, SceneScalePolicy,
+    SceneSegmentationProvider, ServerArgs, ServerConfig, SynthesisModel as McpSynthesisModel,
+    TrellisQuality as McpTrellisQuality, run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
@@ -3687,6 +3687,7 @@ pub(crate) fn scene_build_args_from_ui_settings(
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        feedback_rubric_scorer: FeedbackRubricScorer::Off,
     }
 }
 

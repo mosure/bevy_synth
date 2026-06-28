@@ -110,6 +110,8 @@ fn server_args_accept_scene_ground_command() {
         "5",
         "--feedback-rotation-selector",
         "openai",
+        "--feedback-rubric-scorer",
+        "openai",
     ]);
     let Some(ServerCommand::SceneGround(command)) = args.command else {
         panic!("expected scene-ground subcommand");
@@ -142,6 +144,7 @@ fn server_args_accept_scene_ground_command() {
         command.feedback_rotation_selector,
         FeedbackRotationSelector::Openai
     );
+    assert_eq!(command.feedback_rubric_scorer, FeedbackRubricScorer::Openai);
 }
 
 #[test]
@@ -167,6 +170,7 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
         command.feedback_rotation_selector,
         FeedbackRotationSelector::Deterministic
     );
+    assert_eq!(command.feedback_rubric_scorer, FeedbackRubricScorer::Off);
 }
 
 #[test]
@@ -746,6 +750,7 @@ fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
             feedback_capture_dir: None,
             feedback_threshold_profile: FeedbackThresholdProfile::Standard,
             feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+            feedback_rubric_scorer: FeedbackRubricScorer::Off,
         })
         .unwrap_err();
 
@@ -1035,6 +1040,7 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
 
     server
@@ -1147,6 +1153,7 @@ fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
     let first_dir = root.join("first");
     let second_dir = root.join("second");
@@ -1461,6 +1468,8 @@ fn scene_build_tool_schema_exposes_retry_and_artifact_controls() {
         "feedback_keep_viewer",
         "feedback_capture_dir",
         "feedback_threshold_profile",
+        "feedback_rotation_selector",
+        "feedback_rubric_scorer",
     ] {
         assert!(
             properties.get(key).is_some(),
@@ -2646,6 +2655,34 @@ fn feedback_deltas_default_to_asset_preserving_table_scale() {
 }
 
 #[test]
+fn feedback_deltas_shrink_pathological_edge_cropped_table_projection() {
+    let metrics = json!({
+        "objects": [{
+            "index": 0,
+            "object_id": "conference_table",
+            "label": "white rectangular conference table",
+            "cache_key": "table-cache",
+            "expected_bbox": [0.38, 0.52, 0.66, 1.0],
+            "observed_bbox": [-0.02, 0.37, 1.22, 1.70],
+            "source_edge_cropped": true,
+            "bbox_overscan": 0.92,
+            "max_bbox_overscan": 0.02,
+            "area_log2_error": 3.6,
+            "translation_delta": [0.0, 0.0, 0.0],
+            "scale_multiplier": 0.82,
+            "yaw_delta_degrees": 0.0
+        }]
+    });
+
+    let deltas = feedback_layout_deltas(&metrics);
+    let object = &deltas["objects"][0];
+
+    assert!(object["scale_multiplier_xyz"].is_null());
+    assert_eq!(object["scale_multiplier"], json!(0.82));
+    assert_eq!(object["scale_source"], json!("object_projection"));
+}
+
+#[test]
 fn feedback_deltas_normalize_existing_reused_command_scales() {
     let commands = vec![
         json!({
@@ -3031,6 +3068,60 @@ fn feedback_selection_score_prefers_projection_over_rotation_only_candidate() {
 }
 
 #[test]
+fn feedback_selection_score_uses_valid_scene_quality_rubric() {
+    let low_rubric = json!({
+        "score": 0.70,
+        "object_count": 2,
+        "object_pass_count": 2,
+        "rotation_pass_count": 2,
+        "projection_passed": true,
+        "rotation_passed": true,
+        "physical_layout": {
+            "hard_failure_count": 0,
+            "max_overlap_fraction_smaller": 0.0
+        },
+        "scene_quality_rubric": {
+            "overall_score": 0.30,
+            "blocking_issue_count": 1
+        }
+    });
+    let high_rubric = json!({
+        "score": 0.70,
+        "object_count": 2,
+        "object_pass_count": 2,
+        "rotation_pass_count": 2,
+        "projection_passed": true,
+        "rotation_passed": true,
+        "physical_layout": {
+            "hard_failure_count": 0,
+            "max_overlap_fraction_smaller": 0.0
+        },
+        "scene_quality_rubric": {
+            "overall_score": 0.85,
+            "blocking_issue_count": 0
+        }
+    });
+
+    assert!(feedback_selection_score(&high_rubric) > feedback_selection_score(&low_rubric));
+}
+
+#[test]
+fn rubric_gate_rejects_blocking_scene_quality_issue() {
+    let mut metrics = json!({
+        "passed": true,
+        "scene_quality_rubric": {
+            "overall_score": 0.82,
+            "blocking_issue_count": 1
+        }
+    });
+
+    apply_feedback_scene_quality_rubric_gate(&mut metrics);
+
+    assert_eq!(metrics["passed"], json!(false));
+    assert_eq!(metrics["rubric_passed"], json!(false));
+}
+
+#[test]
 fn feedback_predictive_delta_prevents_move_into_table() {
     let placement = test_feedback_placement(
         "conference_chair",
@@ -3265,12 +3356,16 @@ fn status_world_item_yaw_matches_cache_key_when_order_differs() {
 }
 
 #[test]
-fn feedback_status_prefers_capture_acknowledgement_for_screenshot_metrics() {
+fn feedback_status_prefers_apply_projection_order_when_ready() {
     let apply_ack = json!({
         "status": {
             "sequence": 1,
             "projected_items": [{
-                "screen_bbox": [0.1, 0.1, 0.2, 0.2]
+                "screen_bbox": [0.1, 0.1, 0.2, 0.2],
+                "world_aabb": {
+                    "min": [0.0, 0.0, 0.0],
+                    "max": [1.0, 1.0, 1.0]
+                }
             }]
         }
     });
@@ -3287,10 +3382,10 @@ fn feedback_status_prefers_capture_acknowledgement_for_screenshot_metrics() {
 
     let status = McpServer::feedback_capture_status(&apply_ack, &capture_ack);
 
-    assert_eq!(status["sequence"], json!(2));
+    assert_eq!(status["sequence"], json!(1));
     assert_eq!(
         status["projected_items"][0]["screen_bbox"],
-        json!([0.3, 0.3, 0.4, 0.4])
+        json!([0.1, 0.1, 0.2, 0.2])
     );
 }
 

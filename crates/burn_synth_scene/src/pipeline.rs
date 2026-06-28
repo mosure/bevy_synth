@@ -28,6 +28,14 @@ pub trait SceneAiProvider {
             "rotation candidate selection is not supported by this provider".to_string(),
         ))
     }
+    fn score_scene_quality(
+        &self,
+        _request: &SceneQualityRubricRequest,
+    ) -> SceneResult<SceneQualityRubricResponse> {
+        Err(SceneError::Provider(
+            "scene quality rubric scoring is not supported by this provider".to_string(),
+        ))
+    }
     fn provider_metadata(&self) -> Value {
         Value::Null
     }
@@ -55,6 +63,14 @@ pub struct SceneRotationSelectionRequest {
     pub image_paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SceneQualityRubricRequest {
+    pub prompt: String,
+    pub source_scene_path: PathBuf,
+    pub rendered_scene_path: PathBuf,
+    pub context: Value,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SceneRotationSelectionResponse {
     pub objects: Vec<SceneRotationSelection>,
@@ -66,6 +82,30 @@ pub struct SceneRotationSelection {
     pub candidate_index: usize,
     pub confidence: f32,
     pub rationale: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneQualityRubricResponse {
+    pub overall_score: f32,
+    pub object_count_score: f32,
+    pub placement_score: f32,
+    pub scale_score: f32,
+    pub rotation_score: f32,
+    pub camera_score: f32,
+    pub physical_plausibility_score: f32,
+    pub summary: String,
+    pub blocking_issue_count: usize,
+    pub issues: Vec<SceneQualityRubricIssue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneQualityRubricIssue {
+    pub category: String,
+    pub severity: String,
+    pub object_id: Option<String>,
+    pub description: String,
+    pub evidence: String,
+    pub suggested_fix: String,
 }
 
 pub struct ScenePipeline<P> {

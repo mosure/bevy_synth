@@ -20,6 +20,7 @@ pub struct OpenAiProviderConfig {
     pub reasoning_model: String,
     pub image_model: String,
     pub timeout: Duration,
+    pub rubric_timeout: Duration,
 }
 
 impl Default for OpenAiProviderConfig {
@@ -31,6 +32,7 @@ impl Default for OpenAiProviderConfig {
             reasoning_model: "gpt-5.5".to_string(),
             image_model: "gpt-image-2".to_string(),
             timeout: Duration::from_secs(180),
+            rubric_timeout: Duration::from_secs(75),
         }
     }
 }
@@ -53,6 +55,12 @@ impl OpenAiSceneProvider {
             })?;
         if let Ok(base_url) = env::var("OPENAI_BASE_URL") {
             config.base_url = base_url;
+        }
+        if let Some(timeout) = env_duration_ms("OPENAI_TIMEOUT_MS") {
+            config.timeout = timeout;
+        }
+        if let Some(timeout) = env_duration_ms("OPENAI_RUBRIC_TIMEOUT_MS") {
+            config.rubric_timeout = timeout;
         }
         config.project_id = env::var("OPENAI_PROJECT_ID")
             .ok()
@@ -119,16 +127,31 @@ impl OpenAiSceneProvider {
         schema: Value,
         image_paths: &[PathBuf],
     ) -> SceneResult<Value> {
+        self.post_responses_schema_with_timeout(operation, prompt, schema, image_paths, None)
+    }
+
+    fn post_responses_schema_with_timeout(
+        &self,
+        operation: &'static str,
+        prompt: &str,
+        schema: Value,
+        image_paths: &[PathBuf],
+        timeout: Option<Duration>,
+    ) -> SceneResult<Value> {
         let url = format!(
             "{}/v1/responses",
             self.config.base_url.trim_end_matches('/')
         );
+        let mut request = self.client.post(url).json(&self.responses_schema_request(
+            prompt,
+            schema,
+            image_paths,
+        )?);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         let response = self
-            .auth(self.client.post(url).json(&self.responses_schema_request(
-                prompt,
-                schema,
-                image_paths,
-            )?))
+            .auth(request)
             .send()
             .map_err(|err| SceneError::Http(err.to_string()))?;
         let status = response.status();
@@ -334,6 +357,28 @@ impl SceneAiProvider for OpenAiSceneProvider {
         serde_json::from_value(value).map_err(|err| SceneError::Provider(err.to_string()))
     }
 
+    fn score_scene_quality(
+        &self,
+        request: &SceneQualityRubricRequest,
+    ) -> SceneResult<SceneQualityRubricResponse> {
+        let prompt = format!(
+            "{}\n\nContext JSON:\n{}",
+            request.prompt,
+            serde_json::to_string_pretty(&request.context).unwrap_or_else(|_| "{}".to_string())
+        );
+        let value = self.post_responses_schema_with_timeout(
+            "score_scene_quality",
+            &prompt,
+            scene_quality_rubric_schema(),
+            &[
+                request.source_scene_path.clone(),
+                request.rendered_scene_path.clone(),
+            ],
+            Some(self.config.rubric_timeout),
+        )?;
+        serde_json::from_value(value).map_err(|err| SceneError::Provider(err.to_string()))
+    }
+
     fn provider_metadata(&self) -> Value {
         let requests = self
             .request_log
@@ -346,9 +391,17 @@ impl SceneAiProvider for OpenAiSceneProvider {
             "project_id_set": self.config.project_id.is_some(),
             "requested_reasoning_model": self.config.reasoning_model,
             "requested_image_model": self.config.image_model,
+            "timeout_ms": self.config.timeout.as_millis(),
+            "rubric_timeout_ms": self.config.rubric_timeout.as_millis(),
             "requests": requests,
         })
     }
+}
+
+fn env_duration_ms(name: &str) -> Option<Duration> {
+    let value = env::var(name).ok()?;
+    let millis = value.trim().parse::<u64>().ok()?;
+    (millis > 0).then(|| Duration::from_millis(millis))
 }
 
 pub(crate) fn image_error_is_retryable(err: &SceneError) -> bool {

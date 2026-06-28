@@ -2147,6 +2147,7 @@ impl McpServer {
                     "feedback_iters": args.feedback_iters,
                     "threshold_profile": args.feedback_threshold_profile,
                     "rotation_selector": args.feedback_rotation_selector,
+                    "rubric_scorer": args.feedback_rubric_scorer,
                 }),
             );
             let selection = self.run_scene_composition_feedback_selection(
@@ -2160,6 +2161,7 @@ impl McpServer {
                     capture_dir: args.feedback_capture_dir.clone(),
                     threshold_profile: args.feedback_threshold_profile,
                     rotation_selector: args.feedback_rotation_selector,
+                    rubric_scorer: args.feedback_rubric_scorer,
                     scale_policy: args.scale_policy,
                 },
             )?;
@@ -2574,6 +2576,7 @@ impl McpServer {
                     capture_dir: args.feedback_capture_dir.clone(),
                     threshold_profile: args.feedback_threshold_profile,
                     rotation_selector: args.feedback_rotation_selector,
+                    rubric_scorer: args.feedback_rubric_scorer,
                     scale_policy: args.scale_policy,
                 },
             )?;
@@ -3289,6 +3292,7 @@ impl McpServer {
                     capture_dir,
                     threshold_profile: options.threshold_profile,
                     rotation_selector: options.rotation_selector,
+                    rubric_scorer: options.rubric_scorer,
                     scale_policy: options.scale_policy,
                 },
             );
@@ -3407,6 +3411,7 @@ impl McpServer {
                         max_iters: options.max_iters.max(1),
                         threshold_profile: options.threshold_profile,
                         rotation_selector: options.rotation_selector,
+                        rubric_scorer: options.rubric_scorer,
                         scale_policy: options.scale_policy,
                     });
                 if let Ok(value) = &mut result {
@@ -3468,6 +3473,7 @@ impl McpServer {
             max_iters,
             threshold_profile,
             rotation_selector,
+            rubric_scorer,
             scale_policy,
         } = context;
         let mut commands = scene_commands_with_asset_local_aabbs(initial_commands, asset_bindings);
@@ -3549,6 +3555,25 @@ impl McpServer {
                 write_json_file(
                     &iteration_dir.join("rotation_selection_report.json"),
                     &rotation_selection_report,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            let rubric_report = self.apply_feedback_rubric_scorer(
+                rubric_scorer,
+                &iteration_dir,
+                Path::new(&manifest.source_scene_path),
+                &screenshot_path,
+                manifest,
+                grounded_layout,
+                &metrics,
+                Some(iteration_index),
+            )?;
+            if !rubric_report.is_null() {
+                metrics["scene_quality_rubric"] = rubric_report.clone();
+                apply_feedback_scene_quality_rubric_gate(&mut metrics);
+                write_json_file(
+                    &iteration_dir.join("scene_quality_rubric.json"),
+                    &rubric_report,
                 )
                 .map_err(|err| err.to_string())?;
             }
@@ -3634,7 +3659,7 @@ impl McpServer {
             let status = Self::feedback_capture_status(&apply_ack, &capture);
             write_json_file(&final_dir.join("status.json"), &status)
                 .map_err(|err| err.to_string())?;
-            let metrics = scene_feedback_metrics(
+            let mut metrics = scene_feedback_metrics(
                 manifest,
                 grounded_layout,
                 &status,
@@ -3642,6 +3667,22 @@ impl McpServer {
                 thresholds,
                 threshold_profile,
             )?;
+            let rubric_report = self.apply_feedback_rubric_scorer(
+                rubric_scorer,
+                &final_dir,
+                Path::new(&manifest.source_scene_path),
+                &screenshot_path,
+                manifest,
+                grounded_layout,
+                &metrics,
+                None,
+            )?;
+            if !rubric_report.is_null() {
+                metrics["scene_quality_rubric"] = rubric_report.clone();
+                apply_feedback_scene_quality_rubric_gate(&mut metrics);
+                write_json_file(&final_dir.join("scene_quality_rubric.json"), &rubric_report)
+                    .map_err(|err| err.to_string())?;
+            }
             write_json_file(&final_dir.join("metrics.json"), &metrics)
                 .map_err(|err| err.to_string())?;
             let passed = metrics
@@ -3698,6 +3739,7 @@ impl McpServer {
             "enabled": true,
             "threshold_profile": threshold_profile,
             "rotation_selector": rotation_selector,
+            "rubric_scorer": rubric_scorer,
             "max_iters": max_iters,
             "accepted": accepted_iteration.is_some() || final_accepted,
             "accepted_iteration": accepted_iteration,
@@ -3805,13 +3847,100 @@ impl McpServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_feedback_rubric_scorer(
+        &self,
+        scorer: FeedbackRubricScorer,
+        iteration_dir: &Path,
+        source_scene_path: &Path,
+        screenshot_path: &Path,
+        manifest: &SceneObjectManifest,
+        grounded_layout: &GroundedSceneLayout,
+        metrics: &Value,
+        iteration_index: Option<usize>,
+    ) -> Result<Value, String> {
+        match scorer {
+            FeedbackRubricScorer::Off => Ok(Value::Null),
+            FeedbackRubricScorer::Openai => {
+                let prompt = feedback_scene_quality_rubric_prompt();
+                let context = feedback_scene_quality_context(
+                    manifest,
+                    grounded_layout,
+                    metrics,
+                    iteration_index,
+                );
+                write_json_file(
+                    &iteration_dir.join("scene_quality_rubric_request.json"),
+                    &json!({
+                        "scorer": scorer,
+                        "prompt": prompt,
+                        "source_scene_path": source_scene_path.display().to_string(),
+                        "rendered_scene_path": screenshot_path.display().to_string(),
+                        "context": context,
+                    }),
+                )
+                .map_err(|err| err.to_string())?;
+                match self.openai_provider().and_then(|provider| {
+                    provider
+                        .score_scene_quality(&SceneQualityRubricRequest {
+                            prompt,
+                            source_scene_path: source_scene_path.to_path_buf(),
+                            rendered_scene_path: screenshot_path.to_path_buf(),
+                            context,
+                        })
+                        .map_err(|err| err.to_string())
+                }) {
+                    Ok(response) => serde_json::to_value(SceneQualityRubricResponse {
+                        overall_score: response.overall_score.clamp(0.0, 1.0),
+                        object_count_score: response.object_count_score.clamp(0.0, 1.0),
+                        placement_score: response.placement_score.clamp(0.0, 1.0),
+                        scale_score: response.scale_score.clamp(0.0, 1.0),
+                        rotation_score: response.rotation_score.clamp(0.0, 1.0),
+                        camera_score: response.camera_score.clamp(0.0, 1.0),
+                        physical_plausibility_score: response
+                            .physical_plausibility_score
+                            .clamp(0.0, 1.0),
+                        summary: response.summary,
+                        blocking_issue_count: response.blocking_issue_count,
+                        issues: response.issues,
+                    })
+                    .map_err(|err| err.to_string()),
+                    Err(err) => Ok(json!({
+                        "scorer": "openai",
+                        "fallback": true,
+                        "error": err,
+                        "reason": "scene quality rubric scoring failed; deterministic geometry metrics remain authoritative",
+                    })),
+                }
+            }
+        }
+    }
+
     pub(crate) fn feedback_capture_status(apply_ack: &Value, capture_ack: &Value) -> Value {
+        let apply_status = apply_ack.get("status").cloned().unwrap_or(Value::Null);
+        if Self::feedback_status_has_projected_aabbs(&apply_status) {
+            return apply_status;
+        }
         capture_ack
             .get("acknowledgement")
             .and_then(|ack| ack.get("status"))
             .cloned()
-            .or_else(|| apply_ack.get("status").cloned())
+            .or_else(|| (!apply_status.is_null()).then_some(apply_status))
             .unwrap_or(Value::Null)
+    }
+
+    fn feedback_status_has_projected_aabbs(status: &Value) -> bool {
+        status
+            .get("projected_items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                !items.is_empty()
+                    && items.iter().all(|item| {
+                        item.get("screen_bbox")
+                            .is_some_and(|value| !value.is_null())
+                            && item.get("world_aabb").is_some_and(|value| !value.is_null())
+                    })
+            })
     }
 
     pub(crate) fn feedback_status_projected_items_ready(

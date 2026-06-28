@@ -269,7 +269,8 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "feedback_keep_viewer": { "type": "boolean", "description": "Leave the temporary feedback viewer running after completion." },
                     "feedback_capture_dir": { "type": "string", "description": "Optional feedback artifact directory. Defaults to output_dir/iterations." },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
-                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; openai asks the reasoning model to pick candidate_index values from source/render crops." }
+                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; openai asks the reasoning model to pick candidate_index values from source/render crops." },
+                    "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path"],
                 "additionalProperties": false
@@ -309,7 +310,8 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "feedback_keep_viewer": { "type": "boolean" },
                     "feedback_capture_dir": { "type": "string" },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
-                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; openai asks the reasoning model to pick candidate_index values from source/render crops." }
+                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; openai asks the reasoning model to pick candidate_index values from source/render crops." },
+                    "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path", "manifest", "asset_bindings"],
                 "additionalProperties": false
@@ -832,6 +834,8 @@ pub struct SceneBuildFromImageArgs {
     pub feedback_threshold_profile: FeedbackThresholdProfile,
     #[serde(default = "default_feedback_rotation_selector")]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+    #[serde(default = "default_feedback_rubric_scorer")]
+    pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -883,6 +887,8 @@ pub(crate) struct SceneGroundToolArgs {
     pub feedback_threshold_profile: FeedbackThresholdProfile,
     #[serde(default = "default_feedback_rotation_selector")]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+    #[serde(default = "default_feedback_rubric_scorer")]
+    pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
 
 #[derive(Clone, Debug)]
@@ -892,6 +898,7 @@ pub(crate) struct SceneFeedbackOptions {
     pub(crate) capture_dir: Option<PathBuf>,
     pub(crate) threshold_profile: FeedbackThresholdProfile,
     pub(crate) rotation_selector: FeedbackRotationSelector,
+    pub(crate) rubric_scorer: FeedbackRubricScorer,
     pub(crate) scale_policy: SceneScalePolicy,
 }
 
@@ -904,6 +911,7 @@ pub(crate) struct SceneFeedbackIterationContext<'a> {
     pub(crate) max_iters: usize,
     pub(crate) threshold_profile: FeedbackThresholdProfile,
     pub(crate) rotation_selector: FeedbackRotationSelector,
+    pub(crate) rubric_scorer: FeedbackRubricScorer,
     pub(crate) scale_policy: SceneScalePolicy,
 }
 

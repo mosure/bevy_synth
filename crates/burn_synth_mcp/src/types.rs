@@ -116,6 +116,13 @@ pub enum FeedbackRotationSelector {
     Openai,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeedbackRubricScorer {
+    Off,
+    Openai,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QualityDefaults {
     num_steps: usize,
@@ -660,6 +667,10 @@ pub(crate) struct SceneBuildCliArgs {
     /// Rotation candidate selector used during render-capture feedback.
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+
+    /// Optional source-vs-render scene quality rubric scorer.
+    #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
+    pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -763,6 +774,10 @@ pub(crate) struct SceneGroundCliArgs {
     /// Rotation candidate selector used during render-capture feedback.
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+
+    /// Optional source-vs-render scene quality rubric scorer.
+    #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
+    pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -873,6 +888,10 @@ pub(crate) struct SceneFeedbackReplayCliArgs {
     /// Rotation candidate selector used during render-capture feedback.
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+
+    /// Optional source-vs-render scene quality rubric scorer.
+    #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
+    pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
 
 #[derive(Clone, Debug)]

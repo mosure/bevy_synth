@@ -17,12 +17,13 @@ pub use protocol::SceneBuildFromImageArgs;
 pub use server::run_stdio_server;
 pub use types::{
     AssetOutputFormat, CubeClAutotuneCacheSetting, CubeClAutotuneLevelSetting,
-    FeedbackRotationSelector, FeedbackThresholdProfile, ForegroundModel, InferenceBackend,
-    LocateAnythingBackend, MeshOutputFormat, QualityPreset, SceneBuildExecutionKind,
-    SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
-    SceneDepthPrecision, SceneDepthProvider, SceneLocateAnythingPrecision, SceneLocatorProvider,
-    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationPrecision, SceneSegmentationProvider,
-    SceneSegmentationQuantization, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
+    FeedbackRotationSelector, FeedbackRubricScorer, FeedbackThresholdProfile, ForegroundModel,
+    InferenceBackend, LocateAnythingBackend, MeshOutputFormat, QualityPreset,
+    SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
+    SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthPrecision, SceneDepthProvider,
+    SceneLocateAnythingPrecision, SceneLocatorProvider, ScenePoseFitMode, SceneScalePolicy,
+    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
+    ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(

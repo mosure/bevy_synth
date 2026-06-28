@@ -92,6 +92,7 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         feedback_capture_dir: args.feedback_capture_dir,
         feedback_threshold_profile: args.feedback_threshold_profile,
         feedback_rotation_selector: args.feedback_rotation_selector,
+        feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
         "{}",
@@ -133,6 +134,7 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         feedback_capture_dir: args.feedback_capture_dir,
         feedback_threshold_profile: args.feedback_threshold_profile,
         feedback_rotation_selector: args.feedback_rotation_selector,
+        feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
         "{}",
@@ -201,6 +203,7 @@ fn run_scene_feedback_replay_command(
             capture_dir: Some(capture_dir),
             threshold_profile: args.feedback_threshold_profile,
             rotation_selector: args.feedback_rotation_selector,
+            rubric_scorer: args.feedback_rubric_scorer,
             scale_policy: SceneScalePolicy::AssetPreserving,
         },
     )?;

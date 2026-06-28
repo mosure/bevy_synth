@@ -434,6 +434,10 @@ pub(crate) fn default_feedback_rotation_selector() -> FeedbackRotationSelector {
     FeedbackRotationSelector::Deterministic
 }
 
+pub(crate) fn default_feedback_rubric_scorer() -> FeedbackRubricScorer {
+    FeedbackRubricScorer::Off
+}
+
 pub(crate) fn default_scene_composition_mode() -> SceneCompositionMode {
     SceneCompositionMode::CvGrounded
 }
@@ -1094,6 +1098,8 @@ fn scene_grounding_contract_report(
                 },
                 if args.feedback_rotation_selector == FeedbackRotationSelector::Openai {
                     GptDelegationRole::BoundedCandidateSelection
+                } else if args.feedback_rubric_scorer == FeedbackRubricScorer::Openai {
+                    GptDelegationRole::DeveloperDiagnosis
                 } else {
                     GptDelegationRole::None
                 },
@@ -1103,6 +1109,7 @@ fn scene_grounding_contract_report(
                     "accepted": feedback_accepted,
                     "accepted_iteration": response.pointer("/feedback/accepted_iteration").cloned().unwrap_or(Value::Null),
                     "rotation_selector": args.feedback_rotation_selector,
+                    "rubric_scorer": args.feedback_rubric_scorer,
                     "threshold_profile": args.feedback_threshold_profile,
                 }),
                 ["screenshots", "screen_bboxes", "physical_overlap_metrics"],
@@ -1241,6 +1248,8 @@ fn scene_decision_log(
                 },
                 if args.feedback_rotation_selector == FeedbackRotationSelector::Openai {
                     GptDelegationRole::BoundedCandidateSelection
+                } else if args.feedback_rubric_scorer == FeedbackRubricScorer::Openai {
+                    GptDelegationRole::DeveloperDiagnosis
                 } else {
                     GptDelegationRole::None
                 },
@@ -1250,6 +1259,7 @@ fn scene_decision_log(
                     "accepted_iteration": response.pointer("/feedback/accepted_iteration").cloned().unwrap_or(Value::Null),
                     "threshold_profile": args.feedback_threshold_profile,
                     "rotation_selector": args.feedback_rotation_selector,
+                    "rubric_scorer": args.feedback_rubric_scorer,
                 }),
                 ["deterministic_best_candidate"],
                 None,

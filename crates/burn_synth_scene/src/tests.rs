@@ -2885,6 +2885,10 @@ fn schemas_are_strict_objects() {
         json!(false)
     );
     assert_eq!(scene_bsn_schema()["additionalProperties"], json!(false));
+    assert_eq!(
+        scene_quality_rubric_schema()["additionalProperties"],
+        json!(false)
+    );
 }
 
 #[test]

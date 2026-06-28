@@ -121,6 +121,74 @@ pub fn rotation_selection_schema() -> Value {
     })
 }
 
+pub fn scene_quality_rubric_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "overall_score",
+            "object_count_score",
+            "placement_score",
+            "scale_score",
+            "rotation_score",
+            "camera_score",
+            "physical_plausibility_score",
+            "summary",
+            "blocking_issue_count",
+            "issues"
+        ],
+        "properties": {
+            "overall_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "object_count_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "placement_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "scale_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "rotation_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "camera_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "physical_plausibility_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+            "summary": { "type": "string" },
+            "blocking_issue_count": { "type": "integer", "minimum": 0 },
+            "issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "category",
+                        "severity",
+                        "object_id",
+                        "description",
+                        "evidence",
+                        "suggested_fix"
+                    ],
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": [
+                                "object_count",
+                                "placement",
+                                "scale",
+                                "rotation",
+                                "camera",
+                                "physical_plausibility",
+                                "appearance",
+                                "other"
+                            ]
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["none", "minor", "major", "blocking"]
+                        },
+                        "object_id": { "type": ["string", "null"] },
+                        "description": { "type": "string" },
+                        "evidence": { "type": "string" },
+                        "suggested_fix": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn parse_scene_bsn(bsn: &str, assets: &[SceneAssetBinding]) -> SceneResult<ScenePlan> {
     let known_assets = assets
         .iter()

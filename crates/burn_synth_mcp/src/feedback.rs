@@ -186,6 +186,112 @@ pub(crate) fn feedback_result_selection_score(feedback: &Value) -> f64 {
     score + accepted_bonus
 }
 
+pub(crate) fn feedback_scene_quality_rubric_prompt() -> String {
+    [
+        "You are grading a 3D scene composition render against a source scene photograph.",
+        "The first image is the source scene. The second image is the rendered reconstruction.",
+        "Score only scene composition: object count/cardinality, placement, scale, yaw/rotation, camera framing/perspective, and physical plausibility.",
+        "Do not reward photorealistic material differences unless they obscure geometry or object identity.",
+        "Use the provided context JSON object ids, source bboxes, rendered bboxes, and deterministic geometry metrics as evidence.",
+        "Return strict JSON. Scores are 0.0 to 1.0 where 1.0 is a close match.",
+        "Mark blocking issues for failures that would make the scene unusable for review, such as missing major objects, object inside another object, severe 180 degree rotation errors, or clearly wrong camera viewpoint.",
+    ]
+    .join("\n")
+}
+
+pub(crate) fn feedback_scene_quality_context(
+    manifest: &SceneObjectManifest,
+    grounded_layout: &GroundedSceneLayout,
+    metrics: &Value,
+    iteration_index: Option<usize>,
+) -> Value {
+    let metric_objects = metrics
+        .get("objects")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let objects = grounded_layout
+        .placements
+        .iter()
+        .enumerate()
+        .map(|(index, placement)| {
+            let observed = metric_objects.get(index).cloned().unwrap_or(Value::Null);
+            json!({
+                "index": index,
+                "object_id": placement.object_id,
+                "instance_id": placement.instance_id,
+                "label": placement.label,
+                "source_bbox": placement.source_bbox,
+                "source_contact_pixel": placement.contact_pixel,
+                "expected_rotation_y_degrees": placement.rotation_y_degrees,
+                "expected_scale": placement.scale,
+                "observed_bbox": observed.get("observed_bbox").cloned().unwrap_or(Value::Null),
+                "observed_contact": observed.get("observed_contact").cloned().unwrap_or(Value::Null),
+                "center_error": observed.get("center_error").cloned().unwrap_or(Value::Null),
+                "contact_error": observed.get("contact_error").cloned().unwrap_or(Value::Null),
+                "area_log2_error": observed.get("area_log2_error").cloned().unwrap_or(Value::Null),
+                "bbox_overscan": observed.get("bbox_overscan").cloned().unwrap_or(Value::Null),
+                "current_yaw_degrees": observed.get("current_yaw_degrees").cloned().unwrap_or(Value::Null),
+                "target_yaw_degrees": observed.get("target_yaw_degrees").cloned().unwrap_or(Value::Null),
+                "yaw_delta_degrees": observed.get("yaw_delta_degrees").cloned().unwrap_or(Value::Null),
+                "physical_failures": observed.get("physical_failures").cloned().unwrap_or(Value::Null),
+                "passed": observed.get("passed").cloned().unwrap_or(Value::Null),
+                "yaw_passed": observed.get("yaw_passed").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "iteration": iteration_index,
+        "source_scene_path": manifest.source_scene_path,
+        "manifest_object_count": manifest.objects.len(),
+        "placement_count": grounded_layout.placements.len(),
+        "source_objects": manifest.objects.iter().map(|object| {
+            json!({
+                "id": object.id,
+                "label": object.label,
+                "bbox": object.bbox,
+                "instance_count": object.instance_count,
+                "instance_bboxes": object.instances.iter().map(|instance| instance.bbox).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "render_metrics": {
+            "passed": metrics.get("passed").cloned().unwrap_or(Value::Null),
+            "score": metrics.get("score").cloned().unwrap_or(Value::Null),
+            "projection_passed": metrics.get("projection_passed").cloned().unwrap_or(Value::Null),
+            "physical_passed": metrics.get("physical_passed").cloned().unwrap_or(Value::Null),
+            "rotation_passed": metrics.get("rotation_passed").cloned().unwrap_or(Value::Null),
+            "object_count": metrics.get("object_count").cloned().unwrap_or(Value::Null),
+            "object_pass_count": metrics.get("object_pass_count").cloned().unwrap_or(Value::Null),
+            "rotation_pass_count": metrics.get("rotation_pass_count").cloned().unwrap_or(Value::Null),
+            "physical_layout": metrics.get("physical_layout").cloned().unwrap_or(Value::Null),
+            "camera": metrics.get("camera").cloned().unwrap_or(Value::Null),
+        },
+        "objects": objects,
+    })
+}
+
+pub(crate) fn apply_feedback_scene_quality_rubric_gate(metrics: &mut Value) {
+    let rubric = metrics.get("scene_quality_rubric").unwrap_or(&Value::Null);
+    let Some(overall_score) = rubric
+        .get("overall_score")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+    else {
+        return;
+    };
+    let blocking_issue_count = rubric
+        .get("blocking_issue_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let rubric_passed = overall_score >= 0.70 && blocking_issue_count == 0;
+    metrics["rubric_passed"] = json!(rubric_passed);
+    metrics["rubric_min_overall_score"] = json!(0.70);
+    metrics["rubric_blocking_issue_count"] = json!(blocking_issue_count);
+    if !rubric_passed {
+        metrics["passed"] = json!(false);
+    }
+}
+
 pub(crate) fn feedback_report_path_from_result(feedback: &Value) -> Option<String> {
     let capture_dir = feedback.get("capture_dir").and_then(Value::as_str)?;
     Some(
@@ -479,7 +585,7 @@ pub(crate) fn scene_feedback_metrics(
             translation_delta = clamp_xz_delta(add3(translation_delta, residual), 0.95);
         }
         if feedback_physical_kind(placement) == FeedbackPhysicalKind::Table {
-            translation_delta = clamp_xz_delta(translation_delta, 0.15);
+            translation_delta = clamp_xz_delta(translation_delta, 0.06);
         }
         let physical_delta = physical
             .corrections
@@ -1218,12 +1324,32 @@ pub(crate) fn json_footprint_rect(value: &Value) -> Option<FootprintRect> {
 
 pub(crate) fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -> f64 {
     if feedback_json_object_is_table_like(object) {
-        if object
+        let source_edge_cropped = object
             .get("source_edge_cropped")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let area_error = object
+            .get("area_log2_error")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
+        let bbox_overscan = object
+            .get("bbox_overscan")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
+        let max_bbox_overscan = object
+            .get("max_bbox_overscan")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
+        let rendered_table_is_pathologically_large =
+            raw_scale < 0.98 && (area_error > 1.0 || bbox_overscan > max_bbox_overscan.max(0.02));
+        if source_edge_cropped && !rendered_table_is_pathologically_large {
             return 1.0;
+        }
+        if rendered_table_is_pathologically_large {
+            return raw_scale.clamp(0.82, 1.0);
         }
         return raw_scale.clamp(0.88, 1.18);
     }
@@ -1762,10 +1888,45 @@ pub(crate) fn feedback_markdown_report(
             .get("min_signed_clearance_m")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        let rubric = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("scene_quality_rubric"))
+            .unwrap_or(&Value::Null);
+        let rubric_score = rubric
+            .get("overall_score")
+            .and_then(Value::as_f64)
+            .unwrap_or(f64::NAN);
+        let rubric_summary = rubric.get("summary").and_then(Value::as_str).unwrap_or("");
+        let rubric_passed = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("rubric_passed"))
+            .and_then(Value::as_bool);
         out.push_str(&format!(
-            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nprojection_passed: {projection_passed} ({object_pass_count}/{object_count})\nrotation_passed: {rotation_passed} ({rotation_pass_count}/{object_count})\nphysical_passed: {physical_passed}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\n\n![iteration {index}]({})\n\n",
+            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nrubric_score: {rubric_score:.4}\nrubric_passed: {rubric_passed:?}\nprojection_passed: {projection_passed} ({object_pass_count}/{object_count})\nrotation_passed: {rotation_passed} ({rotation_pass_count}/{object_count})\nphysical_passed: {physical_passed}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\nrubric_summary: {rubric_summary}\n\n![iteration {index}]({})\n\n",
             path_relative_to(capture_root, Path::new(screenshot))
         ));
+        if let Some(issues) = rubric.get("issues").and_then(Value::as_array)
+            && !issues.is_empty()
+        {
+            out.push_str("| Rubric Issue | Severity | Object | Suggested Fix |\n");
+            out.push_str("| --- | --- | --- | --- |\n");
+            for issue in issues.iter().take(8) {
+                let description = issue
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let severity = issue.get("severity").and_then(Value::as_str).unwrap_or("");
+                let object = issue.get("object_id").and_then(Value::as_str).unwrap_or("");
+                let suggested_fix = issue
+                    .get("suggested_fix")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                out.push_str(&format!(
+                    "| {description} | {severity} | {object} | {suggested_fix} |\n"
+                ));
+            }
+            out.push('\n');
+        }
         if let Some(pairs) = physical.get("pairs").and_then(Value::as_array) {
             let failing_pairs = pairs
                 .iter()
@@ -1868,6 +2029,19 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         .get("max_overlap_fraction_smaller")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let rubric = metrics.get("scene_quality_rubric").unwrap_or(&Value::Null);
+    let rubric_score = rubric
+        .get("overall_score")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite());
+    let blocking_issues = rubric
+        .get("blocking_issue_count")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let rubric_adjustment = rubric_score
+        .map(|score| (score - 0.50) * 2.50 - blocking_issues * 0.45)
+        .unwrap_or(0.0);
     score
         + object_pass_fraction * 1.60
         + rotation_pass_fraction * 0.25
@@ -1875,6 +2049,7 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         + rotation_bonus
         - hard_failures * 3.0
         - max_overlap * 1.5
+        + rubric_adjustment
 }
 
 #[allow(clippy::too_many_arguments)]
