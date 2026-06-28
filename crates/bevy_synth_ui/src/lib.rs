@@ -292,6 +292,7 @@ enum ProcessingArtifactVisualKind {
     Locate,
     Segmentation,
     Depth,
+    IsolatedRender,
     Crop,
     Generated,
     Canonical,
@@ -307,6 +308,7 @@ impl ProcessingArtifactVisualKind {
             Self::Locate => "locate",
             Self::Segmentation => "mask",
             Self::Depth => "depth",
+            Self::IsolatedRender => "isolated",
             Self::Crop => "crop",
             Self::Generated => "object",
             Self::Canonical => "canonical",
@@ -322,13 +324,14 @@ impl ProcessingArtifactVisualKind {
             Self::Locate => 0,
             Self::Segmentation => 1,
             Self::Depth => 2,
-            Self::Crop => 3,
-            Self::Generated => 4,
-            Self::Canonical => 5,
-            Self::Projection => 6,
-            Self::Feedback => 7,
-            Self::Source => 8,
-            Self::Other => 9,
+            Self::IsolatedRender => 3,
+            Self::Crop => 4,
+            Self::Generated => 5,
+            Self::Canonical => 6,
+            Self::Projection => 7,
+            Self::Feedback => 8,
+            Self::Source => 9,
+            Self::Other => 10,
         }
     }
 }
@@ -2650,6 +2653,11 @@ fn visual_artifact_kind(path: &Path) -> Option<ProcessingArtifactVisualKind> {
         Some(ProcessingArtifactVisualKind::Segmentation)
     } else if lower.contains("depth") || lower.contains("floor") {
         Some(ProcessingArtifactVisualKind::Depth)
+    } else if lower.contains("current_isolated_full_frame")
+        || lower.contains("isolated_render_full_frame")
+        || (lower.contains("rotation_candidates") && lower.ends_with("_screenshot.png"))
+    {
+        Some(ProcessingArtifactVisualKind::IsolatedRender)
     } else if lower.contains("/crops/") || lower.contains("\\crops\\") || lower.contains("_crop") {
         Some(ProcessingArtifactVisualKind::Crop)
     } else if lower.contains("/generated/")
@@ -2684,6 +2692,12 @@ fn visual_artifact_score(path: &Path, kind: &ProcessingArtifactVisualKind) -> us
         ProcessingArtifactVisualKind::Locate if lower.contains("detections_overlay") => 0,
         ProcessingArtifactVisualKind::Segmentation if lower.contains("masks_overlay") => 0,
         ProcessingArtifactVisualKind::Depth if lower.contains("depth_overlay") => 0,
+        ProcessingArtifactVisualKind::IsolatedRender
+            if lower.contains("current_isolated_full_frame") =>
+        {
+            0
+        }
+        ProcessingArtifactVisualKind::IsolatedRender => 1,
         ProcessingArtifactVisualKind::Projection if lower.contains("projection_fit_overlay") => 0,
         ProcessingArtifactVisualKind::Feedback if lower.ends_with("screenshot.png") => 0,
         ProcessingArtifactVisualKind::Canonical if lower.contains("selection") => 0,
@@ -2775,6 +2789,8 @@ fn artifact_kind_label(path: &str) -> &'static str {
         || lower.ends_with(".webp")
     {
         "image"
+    } else if lower.ends_with(".bsn") {
+        "bsn  "
     } else if lower.ends_with(".json") || lower.ends_with(".jsonl") {
         "json "
     } else if lower.contains("/assets") || lower.ends_with("assets") {
@@ -4678,6 +4694,7 @@ fn handle_viewer_debug_step_button(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_settings_modal(
     mut commands: Commands,
     catalog: Res<CatalogState>,
@@ -7940,6 +7957,22 @@ mod tests {
                 "tmp/runs/demo/iterations/iter_03/screenshot.png"
             )),
             Some(ProcessingArtifactVisualKind::Feedback)
+        );
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new(
+                "tmp/runs/demo/iterations/iter_03/rotation_candidates/chair/current_isolated_full_frame.png"
+            )),
+            Some(ProcessingArtifactVisualKind::IsolatedRender)
+        );
+        assert_eq!(
+            visual_artifact_kind(std::path::Path::new(
+                "tmp/runs/demo/iterations/iter_03/rotation_candidates/chair/candidate_00_yaw_pos0_screenshot.png"
+            )),
+            Some(ProcessingArtifactVisualKind::IsolatedRender)
+        );
+        assert_eq!(
+            artifact_kind_label("tmp/runs/demo/iterations/iter_03/scene.bsn"),
+            "bsn  "
         );
     }
 

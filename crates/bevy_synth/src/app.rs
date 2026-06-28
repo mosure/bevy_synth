@@ -390,10 +390,6 @@ pub(crate) fn prepare_startup_bsn_scene(args: &mut AppArgs) -> Result<(), String
         }
         return Ok(());
     };
-    let assets_path = args
-        .scene_assets_json
-        .as_ref()
-        .ok_or_else(|| "--scene-bsn requires --scene-assets-json".to_string())?;
     let command_path = args.mcp_scene_control_path.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!(
             "bevy_synth_bsn_scene_{}_commands.json",
@@ -402,7 +398,7 @@ pub(crate) fn prepare_startup_bsn_scene(args: &mut AppArgs) -> Result<(), String
     });
     let envelope = scene_bsn_file_to_mcp_command_envelope(
         bsn_path,
-        assets_path,
+        args.scene_assets_json.as_deref(),
         args.scene_bsn_clear_existing,
         Some("bevy_synth-startup-bsn"),
         Some(1),
@@ -3687,6 +3683,11 @@ pub(crate) fn scene_build_args_from_ui_settings(
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        rotation_fit: burn_synth_mcp::SceneRotationFitMode::DepthMaskRansac,
+        rotation_fit_max_gpt_rounds: 2,
+        rotation_fit_min_mask_iou: 0.45,
+        rotation_fit_max_depth_error_m: 0.35,
+        rotation_fit_write_artifacts: true,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     }
 }

@@ -467,10 +467,10 @@ fn ensure_component_burnpack(
     let local_manifest = file_parts_manifest_path(&destination);
     let manifest_rel = format!("{rel_path}.parts.json");
     let manifest_url = join_url(remote_root, &manifest_rel);
-    if !local_manifest.exists() {
-        if let Some(bytes) = download_optional_bytes(&manifest_url)? {
-            write_file_atomically(&local_manifest, &bytes)?;
-        }
+    if !local_manifest.exists()
+        && let Some(bytes) = download_optional_bytes(&manifest_url)?
+    {
+        write_file_atomically(&local_manifest, &bytes)?;
     }
     if local_manifest.exists() {
         let manifest = read_file_parts_manifest(&local_manifest)?;
@@ -566,16 +566,15 @@ fn download_file(
 ) -> SegmentationResult<()> {
     ensure_parent_dir(destination)?;
     if destination.exists() {
-        if let Some(bytes) = expected_bytes {
-            if fs::metadata(destination)
+        if let Some(bytes) = expected_bytes
+            && fs::metadata(destination)
                 .map_err(|err| {
                     SegmentationError::Io(format!("metadata {}: {err}", destination.display()))
                 })?
                 .len()
                 != bytes
-            {
-                fs::remove_file(destination).ok();
-            }
+        {
+            fs::remove_file(destination).ok();
         }
         if destination.exists()
             && expected_sha256

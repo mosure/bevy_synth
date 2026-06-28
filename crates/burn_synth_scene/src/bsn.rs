@@ -18,6 +18,19 @@ use crate::*;
 
 static METRIC_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SceneAssetDeclaration {
+    asset_id: String,
+    resolver: SceneAssetResolver,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SceneAssetResolver {
+    Generated,
+    Cache(String),
+    Path(String),
+}
+
 pub fn object_manifest_schema() -> Value {
     json!({
         "type": "object",
@@ -209,13 +222,22 @@ pub fn parse_scene_bsn(bsn: &str, assets: &[SceneAssetBinding]) -> SceneResult<S
             saw_header = true;
             continue;
         }
-        if let Some(asset_id) = parse_asset_line(line)? {
-            if !known_assets.contains(asset_id.as_str()) {
+        if let Some(declaration) = parse_asset_line(line)? {
+            if declared_assets.contains(&declaration.asset_id) {
                 return Err(SceneError::Validation(format!(
-                    "BSN declares unknown asset id `{asset_id}`"
+                    "duplicate asset id `{}`",
+                    declaration.asset_id
                 )));
             }
-            declared_assets.insert(asset_id);
+            if declaration.resolver.requires_binding()
+                && !known_assets.contains(declaration.asset_id.as_str())
+            {
+                return Err(SceneError::Validation(format!(
+                    "BSN declares generated asset `{}` without a matching asset binding",
+                    declaration.asset_id
+                )));
+            }
+            declared_assets.insert(declaration.asset_id);
             continue;
         }
         if line.starts_with("spawn ") {
@@ -333,6 +355,22 @@ pub fn load_scene_asset_bindings(path: &Path) -> SceneResult<Vec<SceneAssetBindi
         .map_err(|err| SceneError::Parse(format!("asset binding JSON: {err}")))
 }
 
+pub fn scene_asset_source_for_bsn(asset: &SceneAssetBinding) -> String {
+    if let Some(cache_key) = asset.cache_key.as_ref() {
+        format!("cache:{cache_key}")
+    } else if let Some(path) = asset.path.as_ref() {
+        format!("path:{path}")
+    } else {
+        format!("generated:{}", asset.asset_id)
+    }
+}
+
+pub fn scene_asset_declaration_for_bsn(asset: &SceneAssetBinding) -> String {
+    let source = serde_json::to_string(&scene_asset_source_for_bsn(asset))
+        .unwrap_or_else(|_| format!("\"generated:{}\"", asset.asset_id));
+    format!("asset {} = {};", asset.asset_id, source)
+}
+
 pub fn scene_bsn_to_mcp_command_envelope(
     bsn: &str,
     assets: &[SceneAssetBinding],
@@ -340,8 +378,9 @@ pub fn scene_bsn_to_mcp_command_envelope(
     session_id: Option<&str>,
     sequence: Option<u64>,
 ) -> SceneResult<Value> {
-    let plan = parse_scene_bsn(bsn, assets)?;
-    let commands = scene_plan_to_mcp_commands(&plan, assets, clear_existing)?;
+    let resolved_assets = resolve_scene_bsn_asset_bindings(bsn, assets)?;
+    let plan = parse_scene_bsn(bsn, &resolved_assets)?;
+    let commands = scene_plan_to_mcp_commands(&plan, &resolved_assets, clear_existing)?;
     Ok(json!({
         "session_id": session_id,
         "sequence": sequence,
@@ -351,13 +390,16 @@ pub fn scene_bsn_to_mcp_command_envelope(
 
 pub fn scene_bsn_file_to_mcp_command_envelope(
     bsn_path: &Path,
-    assets_json_path: &Path,
+    assets_json_path: Option<&Path>,
     clear_existing: bool,
     session_id: Option<&str>,
     sequence: Option<u64>,
 ) -> SceneResult<Value> {
     let bsn = fs::read_to_string(bsn_path)?;
-    let assets = load_scene_asset_bindings(assets_json_path)?;
+    let assets = match assets_json_path {
+        Some(path) => load_scene_asset_bindings(path)?,
+        None => Vec::new(),
+    };
     scene_bsn_to_mcp_command_envelope(&bsn, &assets, clear_existing, session_id, sequence)
 }
 
@@ -496,7 +538,7 @@ pub(crate) fn validate_build_config(config: &SceneBuildConfig) -> SceneResult<()
     Ok(())
 }
 
-fn parse_asset_line(line: &str) -> SceneResult<Option<String>> {
+fn parse_asset_line(line: &str) -> SceneResult<Option<SceneAssetDeclaration>> {
     if !line.starts_with("asset ") {
         return Ok(None);
     }
@@ -505,7 +547,7 @@ fn parse_asset_line(line: &str) -> SceneResult<Option<String>> {
         .unwrap()
         .trim_end_matches(';')
         .trim();
-    let (asset_id, _) = without_prefix
+    let (asset_id, source) = without_prefix
         .split_once('=')
         .ok_or_else(|| SceneError::Parse(format!("invalid asset line: {line}")))?;
     let asset_id = asset_id.trim();
@@ -514,7 +556,153 @@ fn parse_asset_line(line: &str) -> SceneResult<Option<String>> {
             "invalid asset id in line: {line}"
         )));
     }
-    Ok(Some(asset_id.to_string()))
+    let source = parse_asset_source_literal(source.trim(), line)?;
+    Ok(Some(SceneAssetDeclaration {
+        asset_id: asset_id.to_string(),
+        resolver: parse_asset_resolver(&source, line)?,
+    }))
+}
+
+fn parse_asset_source_literal(raw: &str, line: &str) -> SceneResult<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(SceneError::Parse(format!(
+            "empty asset source in line: {line}"
+        )));
+    }
+    if raw.starts_with('"') {
+        serde_json::from_str::<String>(raw)
+            .map_err(|err| SceneError::Parse(format!("invalid asset source literal: {err}")))
+    } else {
+        Ok(raw.trim_matches('\'').to_string())
+    }
+}
+
+fn parse_asset_resolver(source: &str, line: &str) -> SceneResult<SceneAssetResolver> {
+    if let Some(asset_id) = source.strip_prefix("generated:") {
+        if asset_id.trim().is_empty() {
+            return Err(SceneError::Parse(format!(
+                "empty generated asset source in line: {line}"
+            )));
+        }
+        return Ok(SceneAssetResolver::Generated);
+    }
+    if let Some(cache_key) = source.strip_prefix("cache:") {
+        if cache_key.trim().is_empty() {
+            return Err(SceneError::Parse(format!(
+                "empty cache asset source in line: {line}"
+            )));
+        }
+        return Ok(SceneAssetResolver::Cache(cache_key.to_string()));
+    }
+    if let Some(path) = source.strip_prefix("path:") {
+        if path.trim().is_empty() {
+            return Err(SceneError::Parse(format!(
+                "empty path asset source in line: {line}"
+            )));
+        }
+        return Ok(SceneAssetResolver::Path(path.to_string()));
+    }
+    Err(SceneError::Parse(format!(
+        "unsupported asset source `{source}` in line: {line}; use generated:, cache:, or path:"
+    )))
+}
+
+impl SceneAssetResolver {
+    fn requires_binding(&self) -> bool {
+        matches!(self, Self::Generated)
+    }
+}
+
+fn resolve_scene_bsn_asset_bindings(
+    bsn: &str,
+    assets: &[SceneAssetBinding],
+) -> SceneResult<Vec<SceneAssetBinding>> {
+    let declarations = scene_asset_declarations(bsn)?;
+    let mut resolved = assets.to_vec();
+    let mut indices = resolved
+        .iter()
+        .enumerate()
+        .map(|(index, asset)| (asset.asset_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    for declaration in declarations {
+        match indices.get(declaration.asset_id.as_str()).copied() {
+            Some(index) => apply_asset_resolver(&mut resolved[index], &declaration.resolver),
+            None => {
+                if declaration.resolver.requires_binding() {
+                    return Err(SceneError::Validation(format!(
+                        "BSN declares generated asset `{}` without a matching asset binding",
+                        declaration.asset_id
+                    )));
+                }
+                let binding = scene_asset_binding_from_declaration(&declaration);
+                indices.insert(binding.asset_id.clone(), resolved.len());
+                resolved.push(binding);
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn scene_asset_declarations(bsn: &str) -> SceneResult<Vec<SceneAssetDeclaration>> {
+    let mut declarations = Vec::new();
+    let mut asset_ids = HashSet::new();
+    for raw_line in bsn.lines() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line == "}"
+            || line.starts_with("synth_scene_v1")
+        {
+            continue;
+        }
+        if let Some(declaration) = parse_asset_line(line)? {
+            if !asset_ids.insert(declaration.asset_id.clone()) {
+                return Err(SceneError::Validation(format!(
+                    "duplicate asset id `{}`",
+                    declaration.asset_id
+                )));
+            }
+            declarations.push(declaration);
+        }
+    }
+    Ok(declarations)
+}
+
+fn scene_asset_binding_from_declaration(declaration: &SceneAssetDeclaration) -> SceneAssetBinding {
+    let mut binding = SceneAssetBinding {
+        asset_id: declaration.asset_id.clone(),
+        object_id: declaration.asset_id.clone(),
+        label: declaration.asset_id.clone(),
+        aliases: Vec::new(),
+        path: None,
+        cache_key: None,
+        reusable: true,
+        source_image_path: None,
+        pipeline: None,
+        local_aabb: None,
+        canonical_frame: None,
+        provenance: None,
+    };
+    apply_asset_resolver(&mut binding, &declaration.resolver);
+    binding
+}
+
+fn apply_asset_resolver(binding: &mut SceneAssetBinding, resolver: &SceneAssetResolver) {
+    match resolver {
+        SceneAssetResolver::Generated => {}
+        SceneAssetResolver::Cache(cache_key) => {
+            binding.cache_key = Some(cache_key.clone());
+            binding.path = None;
+            binding.reusable = true;
+        }
+        SceneAssetResolver::Path(path) => {
+            binding.path = Some(path.clone());
+            binding.cache_key = None;
+        }
+    }
 }
 
 fn parse_spawn_line(line: &str) -> SceneResult<ScenePlacement> {

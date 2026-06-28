@@ -362,10 +362,10 @@ pub(crate) fn scene_grounding_quality_report(
                 warnings.push("invalid_bbox_area".to_string());
             }
         }
-        if let Some(bbox) = detection_bbox {
-            if bbox[0] <= 0.005 || bbox[2] >= 0.995 {
-                warnings.push("bbox_touches_horizontal_image_edge".to_string());
-            }
+        if let Some(bbox) = detection_bbox
+            && (bbox[0] <= 0.005 || bbox[2] >= 0.995)
+        {
+            warnings.push("bbox_touches_horizontal_image_edge".to_string());
         }
 
         let mask_coverage = object.mask.as_ref().and_then(|mask| mask.coverage);

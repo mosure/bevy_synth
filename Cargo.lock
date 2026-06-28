@@ -3018,6 +3018,7 @@ name = "burn_synth_mcp"
 version = "0.2.0"
 dependencies = [
  "bevy_synth_runtime",
+ "burn_segmentation",
  "burn_synth",
  "burn_synth_grounding",
  "burn_synth_scene",

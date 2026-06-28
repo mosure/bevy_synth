@@ -6,6 +6,7 @@ mod cli;
 mod feedback;
 mod prelude;
 mod protocol;
+mod rotation_fit;
 mod scene_grounding_report;
 mod scene_layout;
 mod server;
@@ -21,9 +22,9 @@ pub use types::{
     InferenceBackend, LocateAnythingBackend, MeshOutputFormat, QualityPreset,
     SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthPrecision, SceneDepthProvider,
-    SceneLocateAnythingPrecision, SceneLocatorProvider, ScenePoseFitMode, SceneScalePolicy,
-    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
-    ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
+    SceneLocateAnythingPrecision, SceneLocatorProvider, ScenePoseFitMode, SceneRotationFitMode,
+    SceneScalePolicy, SceneSegmentationPrecision, SceneSegmentationProvider,
+    SceneSegmentationQuantization, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(

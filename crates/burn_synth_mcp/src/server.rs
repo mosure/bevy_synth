@@ -1,6 +1,9 @@
 use crate::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const FEEDBACK_RENDER_SETTLE_MS: u64 = 750;
+const FEEDBACK_ROTATION_RENDER_MAX_CANDIDATES: usize = 18;
 
 pub fn run_stdio_server(config: ServerConfig) -> Result<(), String> {
     let stdin = io::stdin();
@@ -64,6 +67,49 @@ impl<'a> CanonicalPoseThumbnailSpawnBasis<'a> {
             Self::Path(_) => "path",
         }
     }
+}
+
+fn feedback_selector_uses_rendered_candidates(selector: FeedbackRotationSelector) -> bool {
+    matches!(
+        selector,
+        FeedbackRotationSelector::RenderedSweep | FeedbackRotationSelector::Openai
+    )
+}
+
+fn feedback_rotation_spawn_commands(commands: &[Value]) -> Vec<(usize, Value)> {
+    commands
+        .iter()
+        .enumerate()
+        .filter_map(|(command_index, command)| {
+            let command_type = command.get("type").and_then(Value::as_str)?;
+            matches!(command_type, "spawn_cached" | "spawn_path")
+                .then(|| (command_index, command.clone()))
+        })
+        .collect()
+}
+
+fn feedback_rotation_camera_command(commands: &[Value]) -> Option<Value> {
+    commands
+        .iter()
+        .rev()
+        .find(|command| command.get("type").and_then(Value::as_str) == Some("set_camera"))
+        .cloned()
+}
+
+fn feedback_rotation_candidate_commands(
+    base_spawn: &Value,
+    candidate_yaw_degrees: f32,
+    camera_command: &Value,
+) -> Vec<Value> {
+    let mut spawn = base_spawn.clone();
+    spawn["rotation"] = json!(quat_from_y_degrees(candidate_yaw_degrees));
+    spawn["select"] = json!(false);
+    vec![
+        json!({ "type": "clear_scene" }),
+        json!({ "type": "reload_cache" }),
+        spawn,
+        camera_command.clone(),
+    ]
 }
 
 fn mark_canonical_pose_verification_failure(response: &mut Value, verification: &Value) {
@@ -339,6 +385,46 @@ where
             eprintln!("burn_synth_mcp: failed to write scene progress event: {err}");
         }
         (self.emit)(event);
+    }
+}
+
+pub(crate) struct SceneFeedbackProgressEmission {
+    stage: &'static str,
+    phase: SceneBuildProgressPhase,
+    execution: SceneBuildExecutionKind,
+    message: String,
+    item_index: Option<usize>,
+    item_count: Option<usize>,
+    artifact_path: Option<PathBuf>,
+    detail: Value,
+}
+
+pub(crate) type SceneFeedbackProgressSink<'a> =
+    Rc<RefCell<Box<dyn FnMut(SceneFeedbackProgressEmission) + 'a>>>;
+
+#[allow(clippy::too_many_arguments)]
+fn emit_scene_feedback_progress(
+    progress: &Option<SceneFeedbackProgressSink<'_>>,
+    stage: &'static str,
+    phase: SceneBuildProgressPhase,
+    execution: SceneBuildExecutionKind,
+    message: impl Into<String>,
+    item_index: Option<usize>,
+    item_count: Option<usize>,
+    artifact_path: Option<PathBuf>,
+    detail: Value,
+) {
+    if let Some(progress) = progress {
+        (progress.borrow_mut())(SceneFeedbackProgressEmission {
+            stage,
+            phase,
+            execution,
+            message: message.into(),
+            item_index,
+            item_count,
+            artifact_path,
+            detail,
+        });
     }
 }
 
@@ -2147,9 +2233,24 @@ impl McpServer {
                     "feedback_iters": args.feedback_iters,
                     "threshold_profile": args.feedback_threshold_profile,
                     "rotation_selector": args.feedback_rotation_selector,
+                    "rotation_fit": args.rotation_fit,
                     "rubric_scorer": args.feedback_rubric_scorer,
                 }),
             );
+            let feedback_progress: SceneFeedbackProgressSink<'_> = Rc::new(RefCell::new(Box::new(
+                |emission: SceneFeedbackProgressEmission| {
+                    progress.emit_with_items(
+                        emission.stage,
+                        emission.phase,
+                        emission.execution,
+                        emission.message,
+                        emission.item_index,
+                        emission.item_count,
+                        emission.artifact_path,
+                        emission.detail,
+                    );
+                },
+            )));
             let selection = self.run_scene_composition_feedback_selection(
                 &output_dir,
                 &manifest,
@@ -2161,10 +2262,18 @@ impl McpServer {
                     capture_dir: args.feedback_capture_dir.clone(),
                     threshold_profile: args.feedback_threshold_profile,
                     rotation_selector: args.feedback_rotation_selector,
+                    rotation_fit: args.rotation_fit,
+                    rotation_fit_max_gpt_rounds: args.rotation_fit_max_gpt_rounds,
+                    rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
+                    rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                    rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
                     rubric_scorer: args.feedback_rubric_scorer,
                     scale_policy: args.scale_policy,
+                    grounding_evidence: Some(grounding_evidence.clone()),
                 },
+                Some(Rc::clone(&feedback_progress)),
             )?;
+            drop(feedback_progress);
             selected_composition = selection.candidate;
             commands = selection.commands;
             feedback_candidate_reports = selection.candidate_reports;
@@ -2576,9 +2685,16 @@ impl McpServer {
                     capture_dir: args.feedback_capture_dir.clone(),
                     threshold_profile: args.feedback_threshold_profile,
                     rotation_selector: args.feedback_rotation_selector,
+                    rotation_fit: args.rotation_fit,
+                    rotation_fit_max_gpt_rounds: args.rotation_fit_max_gpt_rounds,
+                    rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
+                    rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                    rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
                     rubric_scorer: args.feedback_rubric_scorer,
                     scale_policy: args.scale_policy,
+                    grounding_evidence: Some(evidence.clone()),
                 },
+                None,
             )?;
             selected_composition = selection.candidate;
             commands = selection.commands;
@@ -3263,6 +3379,7 @@ impl McpServer {
         asset_bindings: &[SceneAssetBinding],
         candidates: Vec<SceneCompositionCandidate>,
         options: SceneFeedbackOptions,
+        progress: Option<SceneFeedbackProgressSink<'_>>,
     ) -> Result<SceneCompositionFeedbackSelection, String> {
         if candidates.is_empty() {
             return Err("composition feedback selection requires candidates".to_string());
@@ -3292,9 +3409,16 @@ impl McpServer {
                     capture_dir,
                     threshold_profile: options.threshold_profile,
                     rotation_selector: options.rotation_selector,
+                    rotation_fit: options.rotation_fit,
+                    rotation_fit_max_gpt_rounds: options.rotation_fit_max_gpt_rounds,
+                    rotation_fit_min_mask_iou: options.rotation_fit_min_mask_iou,
+                    rotation_fit_max_depth_error_m: options.rotation_fit_max_depth_error_m,
+                    rotation_fit_write_artifacts: options.rotation_fit_write_artifacts,
                     rubric_scorer: options.rubric_scorer,
                     scale_policy: options.scale_policy,
+                    grounding_evidence: options.grounding_evidence.clone(),
                 },
+                progress.clone(),
             );
             match feedback {
                 Ok(mut feedback) => {
@@ -3353,6 +3477,7 @@ impl McpServer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_scene_feedback(
         &mut self,
         output_dir: &Path,
@@ -3361,6 +3486,7 @@ impl McpServer {
         grounded_layout: &GroundedSceneLayout,
         initial_commands: Vec<Value>,
         options: SceneFeedbackOptions,
+        progress: Option<SceneFeedbackProgressSink<'_>>,
     ) -> Result<Value, String> {
         let original_control_path = self.config.scene_control_path.clone();
         let original_status_path = self.config.scene_status_path.clone();
@@ -3401,8 +3527,8 @@ impl McpServer {
         let feedback_result = match lock_result {
             Ok(lock_ack) => {
                 let _ = write_json_file(&capture_root.join("interaction_lock_ack.json"), &lock_ack);
-                let mut result =
-                    self.run_scene_feedback_iterations(SceneFeedbackIterationContext {
+                let mut result = self.run_scene_feedback_iterations(
+                    SceneFeedbackIterationContext {
                         capture_root: &capture_root,
                         manifest,
                         asset_bindings,
@@ -3411,9 +3537,17 @@ impl McpServer {
                         max_iters: options.max_iters.max(1),
                         threshold_profile: options.threshold_profile,
                         rotation_selector: options.rotation_selector,
+                        rotation_fit: options.rotation_fit,
+                        rotation_fit_max_gpt_rounds: options.rotation_fit_max_gpt_rounds,
+                        rotation_fit_min_mask_iou: options.rotation_fit_min_mask_iou,
+                        rotation_fit_max_depth_error_m: options.rotation_fit_max_depth_error_m,
+                        rotation_fit_write_artifacts: options.rotation_fit_write_artifacts,
                         rubric_scorer: options.rubric_scorer,
                         scale_policy: options.scale_policy,
-                    });
+                        grounding_evidence: options.grounding_evidence.as_ref(),
+                    },
+                    progress.clone(),
+                );
                 if let Ok(value) = &mut result {
                     value["interaction_lock_ack"] = lock_ack;
                 }
@@ -3463,6 +3597,7 @@ impl McpServer {
     fn run_scene_feedback_iterations(
         &self,
         context: SceneFeedbackIterationContext<'_>,
+        progress: Option<SceneFeedbackProgressSink<'_>>,
     ) -> Result<Value, String> {
         let SceneFeedbackIterationContext {
             capture_root,
@@ -3473,10 +3608,50 @@ impl McpServer {
             max_iters,
             threshold_profile,
             rotation_selector,
+            rotation_fit,
+            rotation_fit_max_gpt_rounds,
+            rotation_fit_min_mask_iou,
+            rotation_fit_max_depth_error_m,
+            rotation_fit_write_artifacts,
             rubric_scorer,
             scale_policy,
+            grounding_evidence,
         } = context;
         let mut commands = scene_commands_with_asset_local_aabbs(initial_commands, asset_bindings);
+        let mut feedback_layout = grounded_layout.clone();
+        let mut rotation_fit_report = Value::Null;
+        if rotation_fit != SceneRotationFitMode::Off {
+            let rotation_fit_dir = capture_root.join("rotation_fit");
+            let fit = apply_scene_rotation_fit(
+                SceneRotationFitConfig {
+                    mode: rotation_fit,
+                    max_gpt_rounds: rotation_fit_max_gpt_rounds,
+                    min_mask_iou: rotation_fit_min_mask_iou,
+                    max_depth_error_m: rotation_fit_max_depth_error_m,
+                    write_artifacts: rotation_fit_write_artifacts,
+                    output_dir: &rotation_fit_dir,
+                },
+                manifest,
+                asset_bindings,
+                grounding_evidence,
+                &feedback_layout,
+                &commands,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, asset_bindings);
+            feedback_layout = fit.grounded_layout;
+            rotation_fit_report = fit.report;
+            write_json_file(
+                &capture_root.join("commands.rotation_fit.json"),
+                &json!(commands),
+            )
+            .map_err(|err| err.to_string())?;
+            write_json_file(
+                &capture_root.join("grounded_layout.rotation_fit.json"),
+                &json!(feedback_layout),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        let grounded_layout = &feedback_layout;
         let thresholds = threshold_profile.thresholds();
         let mut iterations = Vec::new();
         let mut accepted_iteration = None;
@@ -3486,6 +3661,13 @@ impl McpServer {
         let mut previous_iteration_snapshot: Option<Value> = None;
         let mut previous_commands: Option<Vec<Value>> = None;
         for iteration_index in 0..max_iters {
+            let iteration_rotation_selector = if rotation_fit == SceneRotationFitMode::GptRefine
+                && iteration_index < rotation_fit_max_gpt_rounds
+            {
+                FeedbackRotationSelector::Openai
+            } else {
+                rotation_selector
+            };
             let iteration_dir = capture_root.join(format!("iter_{iteration_index:02}"));
             fs::create_dir_all(&iteration_dir).map_err(|err| {
                 format!(
@@ -3497,12 +3679,27 @@ impl McpServer {
                 .map_err(|err| err.to_string())?;
             let iteration_bsn =
                 feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
-            fs::write(iteration_dir.join("scene.bsn"), iteration_bsn).map_err(|err| {
+            let iteration_bsn_path = iteration_dir.join("scene.bsn");
+            fs::write(&iteration_bsn_path, iteration_bsn).map_err(|err| {
                 format!(
                     "failed to write feedback BSN {}: {err}",
-                    iteration_dir.join("scene.bsn").display()
+                    iteration_bsn_path.display()
                 )
             })?;
+            emit_scene_feedback_progress(
+                &progress,
+                "render_capture_feedback.bsn",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::FileIo,
+                format!("wrote iteration {iteration_index} BSN"),
+                Some(iteration_index + 1),
+                Some(max_iters),
+                Some(iteration_bsn_path.clone()),
+                json!({
+                    "iteration": iteration_index,
+                    "scene_bsn": iteration_bsn_path,
+                }),
+            );
 
             let apply_ack = self.send_scene_commands(commands.clone())?;
             write_json_file(&iteration_dir.join("apply_ack.json"), &apply_ack)
@@ -3517,6 +3714,25 @@ impl McpServer {
                 .map_err(|err| err.to_string())?;
             write_json_file(&iteration_dir.join("status.json"), &status)
                 .map_err(|err| err.to_string())?;
+            emit_scene_feedback_progress(
+                &progress,
+                "render_capture_feedback.screenshot",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Viewer,
+                format!("captured iteration {iteration_index} full-scene render"),
+                Some(iteration_index + 1),
+                Some(max_iters),
+                Some(screenshot_path.clone()),
+                json!({
+                    "iteration": iteration_index,
+                    "screenshot": screenshot_path,
+                    "projected_items": status
+                        .get("projected_items")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                }),
+            );
             let mut metrics = scene_feedback_metrics(
                 manifest,
                 grounded_layout,
@@ -3525,16 +3741,59 @@ impl McpServer {
                 thresholds,
                 threshold_profile,
             )?;
-            let object_crops = feedback_object_crops(
+            let mut object_crops = feedback_object_crops(
                 &iteration_dir,
                 Path::new(&manifest.source_scene_path),
                 &screenshot_path,
                 &metrics,
             );
+            let rotation_render_report =
+                if feedback_selector_uses_rendered_candidates(iteration_rotation_selector) {
+                    self.render_feedback_rotation_candidate_crops(
+                        &iteration_dir,
+                        &commands,
+                        &mut metrics,
+                        &mut object_crops,
+                        &progress,
+                    )?
+                } else {
+                    Value::Null
+                };
+            if !rotation_render_report.is_null() {
+                metrics["rotation_candidate_render"] = rotation_render_report.clone();
+                write_json_file(
+                    &iteration_dir.join("rotation_candidate_render.json"),
+                    &rotation_render_report,
+                )
+                .map_err(|err| err.to_string())?;
+            }
             if !object_crops.is_null() {
                 metrics["object_crops"] = object_crops.clone();
                 write_json_file(&iteration_dir.join("object_crops.json"), &object_crops)
                     .map_err(|err| err.to_string())?;
+                let crop_artifact = object_crops
+                    .get("dir")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| iteration_dir.join("object_crops.json"));
+                emit_scene_feedback_progress(
+                    &progress,
+                    "render_capture_feedback.object_crops",
+                    SceneBuildProgressPhase::Completed,
+                    SceneBuildExecutionKind::FileIo,
+                    format!("wrote iteration {iteration_index} per-object crops"),
+                    Some(iteration_index + 1),
+                    Some(max_iters),
+                    Some(crop_artifact),
+                    json!({
+                        "iteration": iteration_index,
+                        "object_count": object_crops
+                            .get("objects")
+                            .and_then(Value::as_array)
+                            .map(Vec::len)
+                            .unwrap_or(0),
+                    }),
+                );
             }
             let rotation_selection_task = feedback_rotation_selection_task(&metrics, &object_crops);
             if !rotation_selection_task.is_null() {
@@ -3545,7 +3804,7 @@ impl McpServer {
                 .map_err(|err| err.to_string())?;
             }
             let rotation_selection_report = self.apply_feedback_rotation_selector(
-                rotation_selector,
+                iteration_rotation_selector,
                 &iteration_dir,
                 &rotation_selection_task,
                 &mut metrics,
@@ -3711,12 +3970,28 @@ impl McpServer {
             commands = best_commands;
         }
         let final_bsn = feedback_bsn_from_commands(asset_bindings, grounded_layout, &commands)?;
-        fs::write(capture_root.join("scene.feedback.bsn"), &final_bsn).map_err(|err| {
+        let final_bsn_path = capture_root.join("scene.feedback.bsn");
+        fs::write(&final_bsn_path, &final_bsn).map_err(|err| {
             format!(
                 "failed to write final feedback BSN {}: {err}",
-                capture_root.join("scene.feedback.bsn").display()
+                final_bsn_path.display()
             )
         })?;
+        emit_scene_feedback_progress(
+            &progress,
+            "render_capture_feedback.final_bsn",
+            SceneBuildProgressPhase::Completed,
+            SceneBuildExecutionKind::FileIo,
+            "wrote selected feedback BSN",
+            None,
+            Some(max_iters),
+            Some(final_bsn_path.clone()),
+            json!({
+                "accepted_iteration": accepted_iteration,
+                "best_iteration": best_iteration,
+                "final_bsn": final_bsn_path,
+            }),
+        );
         write_json_file(
             &capture_root.join("commands.feedback.json"),
             &json!(commands),
@@ -3734,11 +4009,29 @@ impl McpServer {
                 capture_root.join("feedback_report.md").display()
             )
         })?;
+        let rotation_report = feedback_rotation_html_report(
+            capture_root,
+            threshold_profile,
+            accepted_iteration,
+            &iterations,
+        );
+        fs::write(
+            capture_root.join("feedback_rotation_report.html"),
+            rotation_report,
+        )
+        .map_err(|err| {
+            format!(
+                "failed to write feedback rotation html report {}: {err}",
+                capture_root.join("feedback_rotation_report.html").display()
+            )
+        })?;
         Ok(json!({
             "tool": "scene_render_capture_feedback",
             "enabled": true,
             "threshold_profile": threshold_profile,
             "rotation_selector": rotation_selector,
+            "rotation_fit": rotation_fit,
+            "rotation_fit_report": rotation_fit_report,
             "rubric_scorer": rubric_scorer,
             "max_iters": max_iters,
             "accepted": accepted_iteration.is_some() || final_accepted,
@@ -3747,6 +4040,7 @@ impl McpServer {
             "best_iteration": best_iteration,
             "best_score": if best_score.is_finite() { Value::from(best_score) } else { Value::Null },
             "capture_dir": capture_root.display().to_string(),
+            "rotation_report_path": capture_root.join("feedback_rotation_report.html").display().to_string(),
             "iterations": iterations,
             "final_evidence": final_evidence,
             "final_bsn_path": capture_root.join("scene.feedback.bsn").display().to_string(),
@@ -3782,6 +4076,368 @@ impl McpServer {
         }
     }
 
+    fn render_feedback_rotation_candidate_crops(
+        &self,
+        iteration_dir: &Path,
+        commands: &[Value],
+        metrics: &mut Value,
+        object_crops: &mut Value,
+        progress: &Option<SceneFeedbackProgressSink<'_>>,
+    ) -> Result<Value, String> {
+        let object_count = metrics
+            .get("objects")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if object_count == 0 || object_crops.is_null() {
+            return Ok(json!({
+                "enabled": true,
+                "rendered": 0,
+                "attempted": 0,
+                "reason": "no feedback objects with crops",
+            }));
+        }
+        let spawn_commands = feedback_rotation_spawn_commands(commands);
+        let Some(camera_command) = feedback_rotation_camera_command(commands) else {
+            return Ok(json!({
+                "enabled": true,
+                "rendered": 0,
+                "attempted": 0,
+                "error": "feedback commands did not include a set_camera command",
+            }));
+        };
+        let candidate_root = iteration_dir.join("rotation_candidates");
+        fs::create_dir_all(&candidate_root).map_err(|err| {
+            format!(
+                "failed to create rotation candidate directory {}: {err}",
+                candidate_root.display()
+            )
+        })?;
+
+        let mut crop_objects = object_crops
+            .get_mut("objects")
+            .and_then(Value::as_array_mut);
+        let Some(metrics_objects) = metrics.get_mut("objects").and_then(Value::as_array_mut) else {
+            return Ok(json!({
+                "enabled": true,
+                "rendered": 0,
+                "attempted": 0,
+                "error": "metrics missing object array",
+            }));
+        };
+
+        let mut attempted = 0usize;
+        let mut rendered = 0usize;
+        let mut scored = 0usize;
+        let mut errors = Vec::new();
+        for object in metrics_objects {
+            let index = object
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(usize::MAX);
+            if index == usize::MAX {
+                errors.push(json!({
+                    "reason": "object_missing_index",
+                }));
+                continue;
+            }
+            let Some((_, base_spawn)) = spawn_commands.get(index) else {
+                errors.push(json!({
+                    "index": index,
+                    "reason": "spawn_command_missing_for_object_index",
+                }));
+                continue;
+            };
+            let object_id = object
+                .get("object_id")
+                .and_then(Value::as_str)
+                .unwrap_or("object")
+                .to_string();
+            let name = sanitize_feedback_crop_name(index, &object_id);
+            let source_crop = crop_objects
+                .as_deref()
+                .and_then(|objects| {
+                    objects.iter().find(|crop| {
+                        crop.get("index").and_then(Value::as_u64) == Some(index as u64)
+                    })
+                })
+                .and_then(|crop| crop.get("source_crop").and_then(Value::as_str))
+                .map(PathBuf::from);
+            if object.get("rotation_selection").is_none() {
+                continue;
+            }
+            let object_dir = candidate_root.join(&name);
+            fs::create_dir_all(&object_dir).map_err(|err| {
+                format!(
+                    "failed to create rotation candidate object directory {}: {err}",
+                    object_dir.display()
+                )
+            })?;
+
+            let current_yaw = base_spawn
+                .get("rotation")
+                .and_then(json_array4)
+                .map(quat_y_degrees)
+                .or_else(|| {
+                    object
+                        .get("current_yaw_degrees")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                })
+                .unwrap_or(0.0);
+            let current_screenshot_path = object_dir.join("current_isolated_full_frame.png");
+            let current_commands =
+                feedback_rotation_candidate_commands(base_spawn, current_yaw, &camera_command);
+            match self
+                .send_scene_commands(current_commands)
+                .and_then(|apply_ack| {
+                    self.capture_feedback_when_projected_ready(
+                        &apply_ack,
+                        &current_screenshot_path,
+                        1,
+                    )
+                }) {
+                Ok((capture, status)) => {
+                    let projected_bbox = status
+                        .get("projected_items")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("screen_bbox"))
+                        .and_then(json_array4)
+                        .and_then(feedback_visible_bbox);
+                    let isolated_report = json!({
+                        "yaw_degrees": current_yaw,
+                        "full_frame": current_screenshot_path.display().to_string(),
+                        "projected_bbox": projected_bbox,
+                        "capture": {
+                            "ok": capture.get("ok").cloned().unwrap_or(Value::Null),
+                            "output_path": current_screenshot_path.display().to_string(),
+                            "projected_item_count": status
+                                .get("projected_items")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(0),
+                        },
+                    });
+                    object["isolated_render_full_frame"] =
+                        json!(current_screenshot_path.display().to_string());
+                    object["isolated_render_bbox"] = projected_bbox
+                        .map(|bbox| json!(bbox))
+                        .unwrap_or(Value::Null);
+                    emit_scene_feedback_progress(
+                        progress,
+                        "render_capture_feedback.object_isolated",
+                        SceneBuildProgressPhase::Completed,
+                        SceneBuildExecutionKind::Viewer,
+                        format!("captured isolated full-frame render for {object_id}"),
+                        Some(index.saturating_add(1)),
+                        Some(object_count),
+                        Some(current_screenshot_path.clone()),
+                        json!({
+                            "index": index,
+                            "object_id": object_id.clone(),
+                            "path": current_screenshot_path.display().to_string(),
+                            "projected_bbox": projected_bbox,
+                        }),
+                    );
+                    if let Some(crop_objects) = crop_objects.as_deref_mut()
+                        && let Some(crop_object) = crop_objects.iter_mut().find(|crop| {
+                            crop.get("index").and_then(Value::as_u64) == Some(index as u64)
+                        })
+                    {
+                        crop_object["isolated_render_full_frame"] =
+                            json!(current_screenshot_path.display().to_string());
+                        crop_object["isolated_render_bbox"] = projected_bbox
+                            .map(|bbox| json!(bbox))
+                            .unwrap_or(Value::Null);
+                        crop_object["isolated_render"] = isolated_report;
+                    }
+                }
+                Err(err) => {
+                    errors.push(json!({
+                        "index": index,
+                        "reason": "current_isolated_full_frame_failed",
+                        "error": err,
+                    }));
+                }
+            }
+
+            let Some(rotation_selection) = object.get_mut("rotation_selection") else {
+                continue;
+            };
+            let Some(candidates) = rotation_selection
+                .get_mut("candidates")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let mut rendered_candidates = Vec::new();
+            for candidate in candidates
+                .iter_mut()
+                .take(FEEDBACK_ROTATION_RENDER_MAX_CANDIDATES)
+            {
+                let candidate_index = candidate
+                    .get("candidate_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(rendered_candidates.len() as u64)
+                    as usize;
+                let Some(candidate_yaw) = candidate
+                    .get("candidate_yaw_degrees")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite())
+                    .map(|value| value as f32)
+                else {
+                    errors.push(json!({
+                        "index": index,
+                        "candidate_index": candidate_index,
+                        "reason": "candidate_missing_yaw",
+                    }));
+                    continue;
+                };
+                attempted += 1;
+                let yaw_label = canonical_pose_yaw_file_component(candidate_yaw);
+                let screenshot_path = object_dir.join(format!(
+                    "candidate_{candidate_index:02}_yaw_{yaw_label}_screenshot.png"
+                ));
+                let crop_path = object_dir.join(format!(
+                    "candidate_{candidate_index:02}_yaw_{yaw_label}_crop.png"
+                ));
+                let candidate_commands = feedback_rotation_candidate_commands(
+                    base_spawn,
+                    candidate_yaw,
+                    &camera_command,
+                );
+                let apply_ack = match self.send_scene_commands(candidate_commands) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(json!({
+                            "index": index,
+                            "candidate_index": candidate_index,
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                };
+                let (capture, status) = match self.capture_feedback_when_projected_ready(
+                    &apply_ack,
+                    &screenshot_path,
+                    1,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(json!({
+                            "index": index,
+                            "candidate_index": candidate_index,
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                };
+                candidate["rendered_candidate_screenshot"] =
+                    json!(screenshot_path.display().to_string());
+                candidate["rendered_candidate_full_frame"] =
+                    json!(screenshot_path.display().to_string());
+                candidate["rendered_candidate_capture"] = json!({
+                    "ok": capture.get("ok").cloned().unwrap_or(Value::Null),
+                    "output_path": screenshot_path.display().to_string(),
+                    "projected_item_count": status
+                        .get("projected_items")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                });
+                if let Some(bbox) = status
+                    .get("projected_items")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("screen_bbox"))
+                    .and_then(json_array4)
+                    .and_then(feedback_visible_bbox)
+                    && let Ok(image) = image::open(&screenshot_path)
+                {
+                    match write_feedback_crop(&image, bbox, &crop_path) {
+                        Ok(()) => {
+                            candidate["rendered_candidate_crop"] =
+                                json!(crop_path.display().to_string());
+                            candidate["rendered_candidate_bbox"] = json!(bbox);
+                            if let Some(source_crop) = &source_crop {
+                                match feedback_crop_visual_similarity(source_crop, &crop_path) {
+                                    Ok(similarity) => {
+                                        let score = similarity
+                                            .get("score")
+                                            .and_then(Value::as_f64)
+                                            .unwrap_or(0.0);
+                                        candidate["visual_similarity"] = similarity;
+                                        candidate["visual_score"] = json!(score);
+                                        scored += 1;
+                                    }
+                                    Err(err) => {
+                                        candidate["visual_similarity_error"] = json!(err);
+                                    }
+                                }
+                            }
+                            rendered += 1;
+                            rendered_candidates.push(json!({
+                                "candidate_index": candidate_index,
+                                "yaw_degrees": candidate_yaw,
+                                "full_frame": screenshot_path.display().to_string(),
+                                "crop": crop_path.display().to_string(),
+                                "screenshot": screenshot_path.display().to_string(),
+                                "visual_score": candidate.get("visual_score").cloned().unwrap_or(Value::Null),
+                            }));
+                        }
+                        Err(err) => {
+                            candidate["rendered_candidate_crop_error"] = json!(err);
+                            errors.push(json!({
+                                "index": index,
+                                "candidate_index": candidate_index,
+                                "error": err,
+                            }));
+                        }
+                    }
+                }
+            }
+            let rendered_candidate_count = rendered_candidates.len();
+            if let Some(crop_objects) = crop_objects.as_deref_mut()
+                && let Some(crop_object) = crop_objects
+                    .iter_mut()
+                    .find(|crop| crop.get("index").and_then(Value::as_u64) == Some(index as u64))
+            {
+                crop_object["rotation_candidates"] = json!(rendered_candidates);
+            }
+            emit_scene_feedback_progress(
+                progress,
+                "render_capture_feedback.rotation_candidates",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Viewer,
+                format!("captured isolated yaw candidates for {object_id}"),
+                Some(index.saturating_add(1)),
+                Some(object_count),
+                Some(object_dir.clone()),
+                json!({
+                    "index": index,
+                    "object_id": object_id.clone(),
+                    "candidate_dir": object_dir.display().to_string(),
+                    "candidate_count": candidates.len().min(FEEDBACK_ROTATION_RENDER_MAX_CANDIDATES),
+                    "rendered_count": rendered_candidate_count,
+                }),
+            );
+        }
+        let _ = self.send_scene_commands(commands.to_vec());
+        Ok(json!({
+            "enabled": true,
+            "selector_support": "isolated_per_object_scene_camera_yaw_candidates",
+            "root": candidate_root.display().to_string(),
+            "max_candidates_per_object": FEEDBACK_ROTATION_RENDER_MAX_CANDIDATES,
+            "attempted": attempted,
+            "rendered": rendered,
+            "scored": scored,
+            "error_count": errors.len(),
+            "errors": errors,
+        }))
+    }
+
     fn apply_feedback_rotation_selector(
         &self,
         selector: FeedbackRotationSelector,
@@ -3798,6 +4454,13 @@ impl McpServer {
                 "applied_count": 0,
                 "reason": "using deterministic geometry-selected rotation candidates",
             })),
+            FeedbackRotationSelector::RenderedSweep => {
+                let applied = apply_feedback_rendered_rotation_selection(metrics);
+                Ok(json!({
+                    "selector": "rendered-sweep",
+                    "applied": applied,
+                }))
+            }
             FeedbackRotationSelector::Openai => {
                 let image_paths = feedback_rotation_selection_image_paths(task);
                 let prompt = feedback_rotation_selection_prompt(task);

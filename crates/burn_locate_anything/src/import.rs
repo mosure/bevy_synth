@@ -40,18 +40,13 @@ pub struct LocateAnythingImportConfig {
     pub shard_size_mib: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LocateAnythingPrecision {
     F32,
     F16,
+    #[default]
     Bf16,
-}
-
-impl Default for LocateAnythingPrecision {
-    fn default() -> Self {
-        Self::Bf16
-    }
 }
 
 impl std::fmt::Display for LocateAnythingPrecision {

@@ -11,18 +11,13 @@ pub enum SceneQualityProfile {
     Quality,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum SceneScalePolicy {
+    #[default]
     AssetPreserving,
     BoundedAnisotropic,
     FreeAnisotropic,
-}
-
-impl Default for SceneScalePolicy {
-    fn default() -> Self {
-        Self::AssetPreserving
-    }
 }
 
 impl SceneScalePolicy {

@@ -51,6 +51,64 @@ use burn_synth_scene::SceneCamera;
 use clap::Parser;
 
 #[test]
+fn feedback_bsn_serializes_concrete_cache_assets() {
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair".to_string(),
+        label: "chair".to_string(),
+        aliases: Vec::new(),
+        path: None,
+        cache_key: Some("chair-cache-key".to_string()),
+        reusable: true,
+        source_image_path: None,
+        pipeline: Some("trellis".to_string()),
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.5, 0.0, -0.5],
+            max: [0.5, 1.0, 0.5],
+        }),
+        canonical_frame: None,
+        provenance: None,
+    };
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![test_feedback_placement(
+            "chair_asset",
+            "chair",
+            [0.0, 0.0, 0.0],
+            [0.1, 0.2, 0.3, 0.4],
+        )],
+        camera: SceneCamera {
+            translation: [0.0, 1.5, -3.0],
+            focus: [0.0, 0.5, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(20.0),
+            radius: Some(3.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let commands = vec![json!({
+        "type": "spawn_cached",
+        "cache_key": "chair-cache-key",
+        "translation": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0, 1.0],
+        "scale": [1.0, 1.0, 1.0]
+    })];
+
+    let bsn = feedback_bsn_from_commands(&[asset], &layout, &commands).unwrap();
+    assert!(bsn.contains("asset chair_asset = \"cache:chair-cache-key\";"));
+    let envelope =
+        burn_synth_scene::scene_bsn_to_mcp_command_envelope(&bsn, &[], true, None, None).unwrap();
+    assert_eq!(envelope["commands"][1]["type"], json!("spawn_cached"));
+    assert_eq!(
+        envelope["commands"][1]["cache_key"],
+        json!("chair-cache-key")
+    );
+}
+
+#[test]
 fn server_args_default_to_balanced_quality_defaults() {
     let args = ServerArgs::parse_from(["burn_synth_mcp"]);
     let config = ServerConfig::from_args(args);
@@ -170,6 +228,11 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
         command.feedback_rotation_selector,
         FeedbackRotationSelector::Deterministic
     );
+    assert_eq!(command.rotation_fit, SceneRotationFitMode::DepthMaskRansac);
+    assert_eq!(command.rotation_fit_max_gpt_rounds, 2);
+    assert!((command.rotation_fit_min_mask_iou - 0.45).abs() < 1.0e-6);
+    assert!((command.rotation_fit_max_depth_error_m - 0.35).abs() < 1.0e-6);
+    assert!(command.rotation_fit_write_artifacts);
     assert_eq!(command.feedback_rubric_scorer, FeedbackRubricScorer::Off);
 }
 
@@ -750,6 +813,11 @@ fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
             feedback_capture_dir: None,
             feedback_threshold_profile: FeedbackThresholdProfile::Standard,
             feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+            rotation_fit: SceneRotationFitMode::DepthMaskRansac,
+            rotation_fit_max_gpt_rounds: 2,
+            rotation_fit_min_mask_iou: 0.45,
+            rotation_fit_max_depth_error_m: 0.35,
+            rotation_fit_write_artifacts: true,
             feedback_rubric_scorer: FeedbackRubricScorer::Off,
         })
         .unwrap_err();
@@ -1040,6 +1108,11 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        rotation_fit: SceneRotationFitMode::DepthMaskRansac,
+        rotation_fit_max_gpt_rounds: 2,
+        rotation_fit_min_mask_iou: 0.45,
+        rotation_fit_max_depth_error_m: 0.35,
+        rotation_fit_write_artifacts: true,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
 
@@ -1153,6 +1226,11 @@ fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        rotation_fit: SceneRotationFitMode::DepthMaskRansac,
+        rotation_fit_max_gpt_rounds: 2,
+        rotation_fit_min_mask_iou: 0.45,
+        rotation_fit_max_depth_error_m: 0.35,
+        rotation_fit_write_artifacts: true,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
     let first_dir = root.join("first");
@@ -2549,6 +2627,7 @@ fn projected_collision_correction_clears_anchor_clamp() {
         scale_group_key: None,
         scale_source: "object_projection",
         yaw_delta_degrees: json!(0.0),
+        max_yaw_delta_degrees: 30.0,
         ground_anchor_point: Some([0.0, 0.0, 0.0]),
         ground_anchor_max_drift_m: Some(0.25),
     }];
@@ -2928,6 +3007,103 @@ fn feedback_metrics_fail_chair_contained_inside_table_footprint() {
 }
 
 #[test]
+fn feedback_metrics_fail_reused_asset_instances_with_different_scales() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let mut left = test_feedback_placement(
+        "chair_group",
+        "conference chair",
+        [-1.0, 0.0, 0.0],
+        [0.20, 0.50, 0.35, 0.80],
+    );
+    left.asset_id = "chair_asset".to_string();
+    left.instance_id = Some("left_chair".to_string());
+    let mut right = test_feedback_placement(
+        "chair_group",
+        "conference chair",
+        [1.0, 0.0, 0.0],
+        [0.65, 0.50, 0.80, 0.80],
+    );
+    right.asset_id = "chair_asset".to_string();
+    right.instance_id = Some("right_chair".to_string());
+    let layout = GroundedSceneLayout {
+        bsn: "scene {}".to_string(),
+        placements: vec![left, right],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, 5.0],
+            focus: [0.0, 0.0, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(5.0),
+            vertical_fov_degrees: Some(72.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "world_items": [
+            {
+                "cache_key": "chair-cache",
+                "scale": [1.00, 1.00, 1.00],
+                "translation": [-1.0, 0.0, 0.0]
+            },
+            {
+                "cache_key": "chair-cache",
+                "scale": [1.20, 1.20, 1.20],
+                "translation": [1.0, 0.0, 0.0]
+            }
+        ],
+        "projected_items": [
+            {
+                "cache_key": "chair-cache",
+                "screen_bbox": [0.20, 0.50, 0.35, 0.80],
+                "screen_contact": [0.275, 0.80],
+                "world_aabb": {
+                    "min": [-1.35, 0.0, -0.35],
+                    "max": [-0.65, 1.0, 0.35]
+                }
+            },
+            {
+                "cache_key": "chair-cache",
+                "screen_bbox": [0.65, 0.50, 0.80, 0.80],
+                "screen_contact": [0.725, 0.80],
+                "world_aabb": {
+                    "min": [0.65, 0.0, -0.35],
+                    "max": [1.35, 1.0, 0.35]
+                }
+            }
+        ],
+        "camera": { "radius": 5.0 }
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/iter.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["projection_passed"], json!(true));
+    assert_eq!(metrics["physical_passed"], json!(true));
+    assert_eq!(metrics["scale_consistency_passed"], json!(false));
+    assert_eq!(metrics["scale_consistency"]["hard_failure_count"], json!(1));
+    assert!(!metrics["passed"].as_bool().unwrap());
+    assert!(
+        metrics["objects"][0]["physical_failures"][0]
+            .as_str()
+            .unwrap()
+            .contains("reused asset scale mismatch")
+    );
+}
+
+#[test]
 fn feedback_metrics_allow_open_sectional_table_rect_overlap_as_warning() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.jpg".to_string(),
@@ -3241,7 +3417,7 @@ fn feedback_rotation_selection_exposes_relative_candidate_choices() {
 
     assert_eq!(
         selection["search_strategy"],
-        json!("bounded-coarse-to-fine-relative-yaw")
+        json!("bounded-coarse-to-fine-plus-cardinal-yaw")
     );
     assert!(
         selection["instruction"]
@@ -3251,6 +3427,16 @@ fn feedback_rotation_selection_exposes_relative_candidate_choices() {
     );
     let candidates = selection["candidates"].as_array().unwrap();
     assert!(candidates.len() >= 7);
+    assert!(candidates.iter().any(|candidate| {
+        candidate["yaw_delta_degrees"]
+            .as_f64()
+            .is_some_and(|delta| (delta - 180.0).abs() <= 1.0e-5)
+    }));
+    assert!(candidates.iter().any(|candidate| {
+        candidate["yaw_delta_degrees"]
+            .as_f64()
+            .is_some_and(|delta| (delta + 180.0).abs() <= 1.0e-5)
+    }));
     let selected_index = selection["selected_candidate_index"].as_u64().unwrap() as usize;
     assert_eq!(candidates[selected_index]["selected"], json!(true));
     let selected_delta = selection["selected_yaw_delta_degrees"].as_f64().unwrap();
@@ -3332,6 +3518,138 @@ fn feedback_rotation_selector_response_ignores_invalid_candidate_indices() {
     assert_eq!(
         report["ignored"][0]["reason"],
         json!("candidate_index_not_available")
+    );
+}
+
+#[test]
+fn feedback_rendered_rotation_selector_uses_best_visual_candidate() {
+    let mut rotation_selection = feedback_rotation_selection(15.0, 0.0, "canonical-bsn-yaw");
+    let candidates = rotation_selection["candidates"].as_array_mut().unwrap();
+    for candidate in candidates.iter_mut() {
+        candidate["visual_score"] = json!(0.20);
+        candidate["rendered_candidate_crop"] = json!("/tmp/candidate.png");
+    }
+    let flip_index = candidates
+        .iter()
+        .position(|candidate| {
+            candidate["yaw_delta_degrees"]
+                .as_f64()
+                .is_some_and(|delta| (delta - 180.0).abs() <= 1.0e-5)
+        })
+        .unwrap();
+    candidates[flip_index]["visual_score"] = json!(0.94);
+    let mut metrics = json!({
+        "objects": [{
+            "index": 0,
+            "object_id": "chair",
+            "label": "swivel chair",
+            "current_yaw_degrees": 15.0,
+            "yaw_delta_degrees": 0.0,
+            "rotation_selection": rotation_selection
+        }]
+    });
+
+    let report = apply_feedback_rendered_rotation_selection(&mut metrics);
+
+    assert_eq!(report["applied_count"], json!(1));
+    assert_eq!(
+        metrics["objects"][0]["rotation_selection"]["selection_source"],
+        json!("rendered_candidate_sweep")
+    );
+    assert_eq!(
+        metrics["objects"][0]["rotation_selection"]["selected_candidate_index"],
+        json!(flip_index)
+    );
+    assert!((metrics["objects"][0]["yaw_delta_degrees"].as_f64().unwrap() - 180.0).abs() <= 1.0e-5);
+    assert_eq!(metrics["objects"][0]["max_yaw_delta_degrees"], json!(180.0));
+}
+
+#[test]
+fn feedback_visual_rotation_deltas_can_apply_cardinal_flips() {
+    let commands = vec![json!({
+        "type": "spawn_cached",
+        "cache_key": "chair-cache",
+        "translation": [0.0, 0.0, 0.0],
+        "rotation": quat_from_y_degrees(10.0),
+        "scale": [1.0, 1.0, 1.0],
+    })];
+    let deltas = json!({
+        "objects": [{
+            "translation_delta": [0.0, 0.0, 0.0],
+            "scale_multiplier": 1.0,
+            "yaw_delta_degrees": 180.0,
+            "max_yaw_delta_degrees": 180.0
+        }]
+    });
+
+    let adjusted = apply_feedback_deltas_to_commands(&commands, &deltas).unwrap();
+
+    let yaw = adjusted[0]["rotation"]
+        .as_array()
+        .and_then(|_| adjusted[0]["rotation"].clone().as_array().cloned())
+        .and_then(|values| {
+            let mut out = [0.0; 4];
+            for (slot, value) in out.iter_mut().zip(values) {
+                *slot = value.as_f64()? as f32;
+            }
+            Some(out)
+        })
+        .map(quat_y_degrees)
+        .unwrap();
+    assert!((normalize_degrees(yaw - -170.0)).abs() <= 1.0e-3);
+}
+
+#[test]
+fn feedback_rotation_selection_task_includes_candidate_images() {
+    let mut rotation_selection = feedback_rotation_selection(0.0, 0.0, "canonical-bsn-yaw");
+    rotation_selection["candidates"][0]["rendered_candidate_crop"] =
+        json!("/tmp/iter/objects/candidate_00.png");
+    rotation_selection["candidates"][0]["rendered_candidate_full_frame"] =
+        json!("/tmp/iter/objects/candidate_00_full.png");
+    rotation_selection["candidates"][0]["rendered_candidate_screenshot"] =
+        json!("/tmp/iter/objects/candidate_00_full.png");
+    let metrics = json!({
+        "objects": [{
+            "index": 0,
+            "object_id": "chair",
+            "label": "chair",
+            "expected_bbox": [0.1, 0.2, 0.3, 0.7],
+            "observed_bbox": [0.11, 0.22, 0.31, 0.72],
+            "current_yaw_degrees": 0.0,
+            "canonical_yaw_degrees": 0.0,
+            "rotation_selection": rotation_selection
+        }]
+    });
+    let object_crops = json!({
+        "objects": [{
+            "index": 0,
+            "source_crop": "/tmp/iter/objects/chair_source.png",
+            "isolated_render_full_frame": "/tmp/iter/objects/chair_isolated_full.png",
+            "isolated_render_bbox": [0.12, 0.21, 0.32, 0.74],
+            "rendered_crop": "/tmp/iter/objects/chair_render.png"
+        }]
+    });
+
+    let task = feedback_rotation_selection_task(&metrics, &object_crops);
+    let paths = feedback_rotation_selection_image_paths(&task);
+
+    assert_eq!(task["objects"][0]["purpose"], Value::Null);
+    assert_eq!(
+        task["objects"][0]["isolated_render_full_frame"],
+        json!("/tmp/iter/objects/chair_isolated_full.png")
+    );
+    assert!(paths.iter().any(|path| path.ends_with("chair_source.png")));
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("chair_isolated_full.png"))
+    );
+    assert!(paths.iter().any(|path| path.ends_with("chair_render.png")));
+    assert!(paths.iter().any(|path| path.ends_with("candidate_00.png")));
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with("candidate_00_full.png"))
     );
 }
 

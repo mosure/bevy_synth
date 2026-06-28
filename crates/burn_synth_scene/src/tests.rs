@@ -849,6 +849,16 @@ fn depth_grounding_evidence_drives_metric_contact_points_and_scale() {
     );
     assert_eq!(chair.target_footprint_m, [0.72, 0.76]);
     assert!(chair.scale[0] > 0.7);
+    assert!(
+        layout
+            .bsn
+            .contains("asset conference_table_asset = \"cache:table\";")
+    );
+    assert!(
+        layout
+            .bsn
+            .contains("asset chair_asset = \"path:/tmp/chair.glb\";")
+    );
     parse_scene_bsn(&layout.bsn, &assets).expect("depth-grounded BSN parses");
 }
 
@@ -1434,6 +1444,51 @@ spawn chair_left uses chair_asset translation [-1.0,0.0,2.0] rotation_y 25.0 sca
     let commands = envelope["commands"].as_array().unwrap();
     assert_eq!(commands[0]["type"], "clear_scene");
     assert_eq!(commands[1]["type"], "spawn_path");
+}
+
+#[test]
+fn bsn_to_mcp_envelope_resolves_cache_asset_without_sidecar() {
+    let bsn = r#"
+synth_scene_v1 {
+asset chair_asset = "cache:central-chair-cache-key";
+spawn chair_left uses chair_asset translation [-1.0,0.0,2.0] rotation_y 25.0 scale [1.0,1.0,1.0];
+}
+"#;
+    let envelope = scene_bsn_to_mcp_command_envelope(bsn, &[], true, Some("viewer"), Some(7))
+        .expect("self-contained cache BSN");
+    let commands = envelope["commands"].as_array().unwrap();
+    assert_eq!(commands[0]["type"], "clear_scene");
+    assert_eq!(commands[1]["type"], "spawn_cached");
+    assert_eq!(commands[1]["cache_key"], "central-chair-cache-key");
+}
+
+#[test]
+fn bsn_to_mcp_envelope_resolves_path_asset_without_sidecar() {
+    let bsn = r#"
+synth_scene_v1 {
+asset chair_asset = "path:/tmp/chair.glb";
+spawn chair_left uses chair_asset translation [-1.0,0.0,2.0] rotation_y 25.0 scale [1.0,1.0,1.0];
+}
+"#;
+    let envelope = scene_bsn_to_mcp_command_envelope(bsn, &[], false, None, None)
+        .expect("self-contained path BSN");
+    let commands = envelope["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["type"], "spawn_path");
+    assert_eq!(commands[0]["path"], "/tmp/chair.glb");
+    assert_eq!(commands[0]["cache_key"], "chair_asset");
+}
+
+#[test]
+fn generated_bsn_asset_requires_sidecar_binding() {
+    let bsn = r#"
+synth_scene_v1 {
+asset chair_asset = "generated:chair_asset";
+spawn chair_left uses chair_asset translation [-1.0,0.0,2.0] rotation_y 25.0 scale [1.0,1.0,1.0];
+}
+"#;
+    let err = scene_bsn_to_mcp_command_envelope(bsn, &[], true, None, None).unwrap_err();
+    assert!(err.to_string().contains("without a matching asset binding"));
 }
 
 #[test]

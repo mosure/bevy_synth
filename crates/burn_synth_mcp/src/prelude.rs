@@ -18,6 +18,7 @@ pub(crate) use bevy_synth_runtime::{
     SynthMeshPbrTextures as CachedSynthMeshPbrTextures, SynthMeshTexture as CachedSynthMeshTexture,
     TripoMesh as CachedTripoMesh,
 };
+pub(crate) use burn_segmentation::BinaryMask;
 pub(crate) use burn_synth::{
     AssetBatchItem, AssetBatchRequest, ForegroundRequest, ImageSource, Mesh, ProgressVerbosity,
     RuntimeBatchPolicy, RuntimeProgressEvent, RuntimeProgressObserver, SynthRuntime,
@@ -41,8 +42,9 @@ pub(crate) use burn_synth_scene::{
     SceneRotationSelectionResponse, SceneScalePolicy, canonical_pose_evidence_for_assets,
     grounded_scene_layout, grounded_scene_layout_for_manifest,
     grounded_scene_layout_with_evidence_config, manifest_grounding_evidence,
-    manifest_with_grounding_evidence, parse_scene_bsn, scene_plan_to_mcp_commands,
-    select_object_image_candidates_with_exclusions, symmetry_for_descriptor, write_json_file,
+    manifest_with_grounding_evidence, parse_scene_bsn, scene_asset_declaration_for_bsn,
+    scene_plan_to_mcp_commands, select_object_image_candidates_with_exclusions,
+    symmetry_for_descriptor, write_json_file,
 };
 pub(crate) use serde::{Deserialize, de::DeserializeOwned};
 pub(crate) use serde_json::{Value, json};
@@ -51,6 +53,7 @@ pub(crate) use crate::assets::*;
 pub(crate) use crate::canonical_pose::*;
 pub(crate) use crate::feedback::*;
 pub(crate) use crate::protocol::*;
+pub(crate) use crate::rotation_fit::*;
 pub(crate) use crate::scene_grounding_report::*;
 pub(crate) use crate::scene_layout::{
     SceneComposeArgs, SceneComposePlan, SceneValidateArgs, compose_scene_layout,

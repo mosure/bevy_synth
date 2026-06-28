@@ -51,7 +51,7 @@ struct ValidateBsnArgs {
     #[arg(long)]
     bsn: PathBuf,
     #[arg(long)]
-    assets_json: PathBuf,
+    assets_json: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -59,7 +59,7 @@ struct WriteCommandsArgs {
     #[arg(long)]
     bsn: PathBuf,
     #[arg(long)]
-    assets_json: PathBuf,
+    assets_json: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -116,7 +116,10 @@ pub fn run_cli(cli: Cli) -> SceneResult<()> {
         }
         Command::ValidateBsn(args) => {
             let bsn = fs::read_to_string(args.bsn)?;
-            let assets = load_scene_asset_bindings(&args.assets_json)?;
+            let assets = match args.assets_json.as_deref() {
+                Some(path) => load_scene_asset_bindings(path)?,
+                None => Vec::new(),
+            };
             let parsed = parse_scene_bsn(&bsn, &assets)?;
             println!("{}", serde_json::to_string_pretty(&parsed).unwrap());
             Ok(())
@@ -124,7 +127,7 @@ pub fn run_cli(cli: Cli) -> SceneResult<()> {
         Command::WriteCommands(args) => {
             let envelope = scene_bsn_file_to_mcp_command_envelope(
                 &args.bsn,
-                &args.assets_json,
+                args.assets_json.as_deref(),
                 args.clear_existing,
                 args.session_id.as_deref(),
                 args.sequence,

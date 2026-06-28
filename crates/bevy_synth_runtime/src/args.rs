@@ -234,7 +234,7 @@ pub struct Args {
     #[arg(long)]
     pub scene_bsn: Option<PathBuf>,
 
-    /// Asset binding JSON for --scene-bsn.
+    /// Optional asset binding JSON for symbolic generated: assets in --scene-bsn.
     #[arg(long)]
     pub scene_assets_json: Option<PathBuf>,
 

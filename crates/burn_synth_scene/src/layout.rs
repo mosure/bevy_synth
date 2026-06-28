@@ -1521,14 +1521,12 @@ fn grounded_bsn_text(
     let mut declared = HashSet::new();
     for placement in placements {
         if declared.insert(placement.asset_id.as_str())
-            && assets
+            && let Some(asset) = assets
                 .iter()
-                .any(|asset| asset.asset_id == placement.asset_id)
+                .find(|asset| asset.asset_id == placement.asset_id)
         {
-            out.push_str(&format!(
-                "asset {} = \"generated:{}\";\n",
-                placement.asset_id, placement.asset_id
-            ));
+            out.push_str(&scene_asset_declaration_for_bsn(asset));
+            out.push('\n');
         }
     }
     out.push_str(&format!(

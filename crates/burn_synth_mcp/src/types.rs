@@ -113,7 +113,16 @@ pub enum FeedbackThresholdProfile {
 #[serde(rename_all = "kebab-case")]
 pub enum FeedbackRotationSelector {
     Deterministic,
+    RenderedSweep,
     Openai,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneRotationFitMode {
+    Off,
+    DepthMaskRansac,
+    GptRefine,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -668,6 +677,26 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
 
+    /// Pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth, and projected GLB visible surface.
+    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::DepthMaskRansac)]
+    pub rotation_fit: SceneRotationFitMode,
+
+    /// Maximum GPT refinement rounds when --rotation-fit=gpt-refine.
+    #[arg(long, default_value_t = 2)]
+    pub rotation_fit_max_gpt_rounds: usize,
+
+    /// Minimum visible-surface mask IoU required before applying an objective rotation candidate.
+    #[arg(long, default_value_t = 0.45)]
+    pub rotation_fit_min_mask_iou: f32,
+
+    /// Maximum accepted visible-surface median-depth error in meters.
+    #[arg(long, default_value_t = 0.35)]
+    pub rotation_fit_max_depth_error_m: f32,
+
+    /// Write rotation-fit candidate overlays, report JSON, and HTML review artifacts.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub rotation_fit_write_artifacts: bool,
+
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
@@ -774,6 +803,26 @@ pub(crate) struct SceneGroundCliArgs {
     /// Rotation candidate selector used during render-capture feedback.
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+
+    /// Pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth, and projected GLB visible surface.
+    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::DepthMaskRansac)]
+    pub rotation_fit: SceneRotationFitMode,
+
+    /// Maximum GPT refinement rounds when --rotation-fit=gpt-refine.
+    #[arg(long, default_value_t = 2)]
+    pub rotation_fit_max_gpt_rounds: usize,
+
+    /// Minimum visible-surface mask IoU required before applying an objective rotation candidate.
+    #[arg(long, default_value_t = 0.45)]
+    pub rotation_fit_min_mask_iou: f32,
+
+    /// Maximum accepted visible-surface median-depth error in meters.
+    #[arg(long, default_value_t = 0.35)]
+    pub rotation_fit_max_depth_error_m: f32,
+
+    /// Write rotation-fit candidate overlays, report JSON, and HTML review artifacts.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub rotation_fit_write_artifacts: bool,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
@@ -888,6 +937,26 @@ pub(crate) struct SceneFeedbackReplayCliArgs {
     /// Rotation candidate selector used during render-capture feedback.
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+
+    /// Pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth, and projected GLB visible surface.
+    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::DepthMaskRansac)]
+    pub rotation_fit: SceneRotationFitMode,
+
+    /// Maximum GPT refinement rounds when --rotation-fit=gpt-refine.
+    #[arg(long, default_value_t = 2)]
+    pub rotation_fit_max_gpt_rounds: usize,
+
+    /// Minimum visible-surface mask IoU required before applying an objective rotation candidate.
+    #[arg(long, default_value_t = 0.45)]
+    pub rotation_fit_min_mask_iou: f32,
+
+    /// Maximum accepted visible-surface median-depth error in meters.
+    #[arg(long, default_value_t = 0.35)]
+    pub rotation_fit_max_depth_error_m: f32,
+
+    /// Write rotation-fit candidate overlays, report JSON, and HTML review artifacts.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub rotation_fit_write_artifacts: bool,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]

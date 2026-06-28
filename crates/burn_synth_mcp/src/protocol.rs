@@ -269,7 +269,12 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "feedback_keep_viewer": { "type": "boolean", "description": "Leave the temporary feedback viewer running after completion." },
                     "feedback_capture_dir": { "type": "string", "description": "Optional feedback artifact directory. Defaults to output_dir/iterations." },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
-                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; openai asks the reasoning model to pick candidate_index values from source/render crops." },
+                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "rendered-sweep", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; rendered-sweep renders per-object yaw candidates; openai asks the reasoning model to pick candidate_index values from source/render/candidate crops." },
+                    "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Pre-feedback object yaw fitting strategy. depth-mask-ransac uses LocateAnything/SAM masks, DepthPro depth, and projected GLB visible surface; gpt-refine enables bounded GPT candidate selection after objective fitting." },
+                    "rotation_fit_max_gpt_rounds": { "type": "integer", "description": "Maximum GPT refinement rounds when rotation_fit is gpt-refine." },
+                    "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask rotation candidate." },
+                    "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters." },
+                    "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path"],
@@ -310,7 +315,12 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "feedback_keep_viewer": { "type": "boolean" },
                     "feedback_capture_dir": { "type": "string" },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
-                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; openai asks the reasoning model to pick candidate_index values from source/render crops." },
+                    "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "rendered-sweep", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; rendered-sweep renders per-object yaw candidates; openai asks the reasoning model to pick candidate_index values from source/render/candidate crops." },
+                    "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Pre-feedback object yaw fitting strategy. depth-mask-ransac uses LocateAnything/SAM masks, DepthPro depth, and projected GLB visible surface; gpt-refine enables bounded GPT candidate selection after objective fitting." },
+                    "rotation_fit_max_gpt_rounds": { "type": "integer", "description": "Maximum GPT refinement rounds when rotation_fit is gpt-refine." },
+                    "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask rotation candidate." },
+                    "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters." },
+                    "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path", "manifest", "asset_bindings"],
@@ -834,6 +844,16 @@ pub struct SceneBuildFromImageArgs {
     pub feedback_threshold_profile: FeedbackThresholdProfile,
     #[serde(default = "default_feedback_rotation_selector")]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+    #[serde(default = "default_scene_rotation_fit_mode")]
+    pub rotation_fit: SceneRotationFitMode,
+    #[serde(default = "default_scene_rotation_fit_max_gpt_rounds")]
+    pub rotation_fit_max_gpt_rounds: usize,
+    #[serde(default = "default_scene_rotation_fit_min_mask_iou")]
+    pub rotation_fit_min_mask_iou: f32,
+    #[serde(default = "default_scene_rotation_fit_max_depth_error_m")]
+    pub rotation_fit_max_depth_error_m: f32,
+    #[serde(default = "default_scene_rotation_fit_write_artifacts")]
+    pub rotation_fit_write_artifacts: bool,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
@@ -887,6 +907,16 @@ pub(crate) struct SceneGroundToolArgs {
     pub feedback_threshold_profile: FeedbackThresholdProfile,
     #[serde(default = "default_feedback_rotation_selector")]
     pub feedback_rotation_selector: FeedbackRotationSelector,
+    #[serde(default = "default_scene_rotation_fit_mode")]
+    pub rotation_fit: SceneRotationFitMode,
+    #[serde(default = "default_scene_rotation_fit_max_gpt_rounds")]
+    pub rotation_fit_max_gpt_rounds: usize,
+    #[serde(default = "default_scene_rotation_fit_min_mask_iou")]
+    pub rotation_fit_min_mask_iou: f32,
+    #[serde(default = "default_scene_rotation_fit_max_depth_error_m")]
+    pub rotation_fit_max_depth_error_m: f32,
+    #[serde(default = "default_scene_rotation_fit_write_artifacts")]
+    pub rotation_fit_write_artifacts: bool,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
@@ -898,8 +928,14 @@ pub(crate) struct SceneFeedbackOptions {
     pub(crate) capture_dir: Option<PathBuf>,
     pub(crate) threshold_profile: FeedbackThresholdProfile,
     pub(crate) rotation_selector: FeedbackRotationSelector,
+    pub(crate) rotation_fit: SceneRotationFitMode,
+    pub(crate) rotation_fit_max_gpt_rounds: usize,
+    pub(crate) rotation_fit_min_mask_iou: f32,
+    pub(crate) rotation_fit_max_depth_error_m: f32,
+    pub(crate) rotation_fit_write_artifacts: bool,
     pub(crate) rubric_scorer: FeedbackRubricScorer,
     pub(crate) scale_policy: SceneScalePolicy,
+    pub(crate) grounding_evidence: Option<SceneGroundingEvidence>,
 }
 
 pub(crate) struct SceneFeedbackIterationContext<'a> {
@@ -911,8 +947,14 @@ pub(crate) struct SceneFeedbackIterationContext<'a> {
     pub(crate) max_iters: usize,
     pub(crate) threshold_profile: FeedbackThresholdProfile,
     pub(crate) rotation_selector: FeedbackRotationSelector,
+    pub(crate) rotation_fit: SceneRotationFitMode,
+    pub(crate) rotation_fit_max_gpt_rounds: usize,
+    pub(crate) rotation_fit_min_mask_iou: f32,
+    pub(crate) rotation_fit_max_depth_error_m: f32,
+    pub(crate) rotation_fit_write_artifacts: bool,
     pub(crate) rubric_scorer: FeedbackRubricScorer,
     pub(crate) scale_policy: SceneScalePolicy,
+    pub(crate) grounding_evidence: Option<&'a SceneGroundingEvidence>,
 }
 
 #[derive(Clone, Debug)]

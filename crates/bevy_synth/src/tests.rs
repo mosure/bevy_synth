@@ -263,6 +263,41 @@ fn startup_bsn_scene_writes_mcp_command_envelope() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn startup_bsn_scene_accepts_self_contained_path_asset() {
+    let dir = isolated_cache_root();
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let bsn_path = dir.join("scene.bsn");
+    let command_path = dir.join("scene_commands.json");
+    let mesh_path = dir.join("chair.glb");
+    write_glb(&mesh_path, &dummy_mesh()).expect("write generated glb");
+    std::fs::write(
+        &bsn_path,
+        format!(
+            "synth_scene_v1 {{\nasset chair_asset = \"path:{}\";\nspawn chair_left uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0 scale [1.0,1.0,1.0];\n}}\n",
+            mesh_path.display()
+        ),
+    )
+    .expect("write bsn");
+    let mut args = test_args();
+    args.scene_bsn = Some(bsn_path);
+    args.scene_assets_json = None;
+    args.mcp_scene_control_path = Some(command_path.clone());
+    prepare_startup_bsn_scene(&mut args).expect("prepare startup bsn");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&command_path).expect("read envelope")).unwrap();
+    assert_eq!(
+        envelope["commands"][1]["type"],
+        serde_json::json!("spawn_path")
+    );
+    assert_eq!(
+        envelope["commands"][1]["path"],
+        serde_json::json!(mesh_path.to_string_lossy())
+    );
+    std::fs::remove_dir_all(dir).expect("remove temp dir");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn scene_bsn_export_serializes_only_placed_cached_assets() {
     let dir = isolated_cache_root();
     let mut cache = MeshCache::load_from_root(dir.clone()).expect("create isolated cache");

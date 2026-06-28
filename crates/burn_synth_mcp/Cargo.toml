@@ -16,6 +16,7 @@ readme = "README.md"
 burn_synth = { version = "0.2.0", path = "../burn_synth", features = ["import", "trellis-native-pbr", "trellis-wgpu", "wgpu"] }
 burn_synth_grounding = { version = "0.2.0", path = "../burn_synth_grounding", features = ["locate-anything-wgpu"] }
 burn_synth_scene = { version = "0.2.0", path = "../burn_synth_scene" }
+burn_segmentation = { version = "0.1.0", path = "../burn_segmentation" }
 bevy_synth_runtime = { version = "0.2.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 clap = { version = "4.5", features = ["derive"] }
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"] }

@@ -28,7 +28,7 @@ pub(crate) fn write_visible_surface_fit_artifacts(
         response
             .get("grounding_evidence")
             .cloned()
-            .unwrap_or_else(|| Value::Null),
+            .unwrap_or(Value::Null),
     ) else {
         return Ok(());
     };

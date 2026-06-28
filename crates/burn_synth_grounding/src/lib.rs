@@ -2107,11 +2107,14 @@ fn detection_preference_score(object: &SceneObjectSpec, detection: &Detection) -
     let confidence = detection.confidence.unwrap_or(0.50).clamp(0.0, 1.0);
     let source_key = normalized_query_key(&detection.source_query);
     let label_key = normalized_query_key(&detection.label);
-    let label_bonus = object_label_keys(object)
+    let label_bonus = if object_label_keys(object)
         .iter()
         .any(|key| source_key == *key || label_key == *key)
-        .then_some(0.10)
-        .unwrap_or(0.0);
+    {
+        0.10
+    } else {
+        0.0
+    };
     let area = bbox_area_normalized(detection.bbox).clamp(0.0, 1.0);
     confidence + label_bonus + area.min(0.30) * 0.20
 }

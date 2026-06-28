@@ -110,8 +110,10 @@ pub(crate) fn scene_composition_candidates(
     scene_composition_candidate_modes(requested_mode, compare_feedback_candidates)
         .into_iter()
         .map(|mode| {
-            let mut config = GroundedSceneLayoutConfig::default();
-            config.scale_policy = scale_policy;
+            let config = GroundedSceneLayoutConfig {
+                scale_policy,
+                ..Default::default()
+            };
             let layout = match mode {
                 SceneCompositionMode::Heuristic => {
                     grounded_scene_layout(manifest, asset_bindings, config)
@@ -260,10 +262,12 @@ pub(crate) fn feedback_scene_quality_context(
             "projection_passed": metrics.get("projection_passed").cloned().unwrap_or(Value::Null),
             "physical_passed": metrics.get("physical_passed").cloned().unwrap_or(Value::Null),
             "rotation_passed": metrics.get("rotation_passed").cloned().unwrap_or(Value::Null),
+            "scale_consistency_passed": metrics.get("scale_consistency_passed").cloned().unwrap_or(Value::Null),
             "object_count": metrics.get("object_count").cloned().unwrap_or(Value::Null),
             "object_pass_count": metrics.get("object_pass_count").cloned().unwrap_or(Value::Null),
             "rotation_pass_count": metrics.get("rotation_pass_count").cloned().unwrap_or(Value::Null),
             "physical_layout": metrics.get("physical_layout").cloned().unwrap_or(Value::Null),
+            "scale_consistency": metrics.get("scale_consistency").cloned().unwrap_or(Value::Null),
             "camera": metrics.get("camera").cloned().unwrap_or(Value::Null),
         },
         "objects": objects,
@@ -374,9 +378,14 @@ pub(crate) fn scene_feedback_metrics(
     let floor_y = grounded_layout.rug_center[1];
     let footprints = feedback_projected_footprints(&grounded_layout.placements, projected);
     let physical = feedback_physical_layout(&grounded_layout.placements, &footprints, thresholds);
+    let scale_consistency = feedback_reused_scale_consistency(status);
     let mut yaw_passed_count = 0usize;
     for (index, placement) in grounded_layout.placements.iter().enumerate() {
         let projected_item = projected.get(index).unwrap_or(&Value::Null);
+        let world_item = status
+            .get("world_items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.get(index));
         let observed_bbox = projected_item.get("screen_bbox").and_then(json_array4);
         let observed_contact = projected_item.get("screen_contact").and_then(json_array2);
         let expected_bbox = placement.source_bbox;
@@ -617,11 +626,17 @@ pub(crate) fn scene_feedback_metrics(
         });
         let canonical_yaw_error =
             normalize_degrees(placement.rotation_y_degrees - current_yaw_degrees);
-        let physical_failures = physical
+        let mut physical_failures = physical
             .object_failures
             .get(&index)
             .cloned()
             .unwrap_or_default();
+        let scale_consistency_failures = scale_consistency
+            .object_failures
+            .get(&index)
+            .cloned()
+            .unwrap_or_default();
+        physical_failures.extend(scale_consistency_failures.iter().cloned());
         let physical_passed = physical_failures.is_empty();
         object_metrics.push(json!({
             "index": index,
@@ -658,6 +673,10 @@ pub(crate) fn scene_feedback_metrics(
             "world_footprint": world_footprint,
             "physical_passed": physical_passed,
             "physical_failures": physical_failures,
+            "scale_consistency_failures": scale_consistency_failures,
+            "world_scale": world_item
+                .and_then(|item| item.get("scale"))
+                .and_then(json_array3),
             "target_ground_point": target_ground_point,
             "observed_ground_point": observed_ground_point,
             "ground_anchor_point": placement.ground_point,
@@ -682,7 +701,9 @@ pub(crate) fn scene_feedback_metrics(
         && mean_score >= thresholds.min_overall_score;
     let physical_passed = physical.hard_failure_count == 0;
     let rotation_passed = yaw_passed_count == grounded_layout.placements.len();
-    let passed = projection_passed && physical_passed && rotation_passed;
+    let scale_consistency_passed = scale_consistency.passed;
+    let passed =
+        projection_passed && physical_passed && rotation_passed && scale_consistency_passed;
     Ok(json!({
         "profile": profile,
         "passed": passed,
@@ -690,6 +711,8 @@ pub(crate) fn scene_feedback_metrics(
         "projection_passed": projection_passed,
         "physical_passed": physical_passed,
         "rotation_passed": rotation_passed,
+        "scale_consistency_passed": scale_consistency_passed,
+        "constraint_passed": scale_consistency_passed,
         "object_count": grounded_layout.placements.len(),
         "object_pass_count": passed_count,
         "rotation_pass_count": yaw_passed_count,
@@ -714,6 +737,13 @@ pub(crate) fn scene_feedback_metrics(
             "max_overlap_fraction_smaller": physical.max_overlap_fraction_smaller,
             "min_signed_clearance_m": physical.min_signed_clearance_m,
             "pairs": physical.pairs,
+        },
+        "scale_consistency": {
+            "passed": scale_consistency.passed,
+            "hard_failure_count": scale_consistency.hard_failure_count,
+            "max_relative_delta": scale_consistency.max_relative_delta,
+            "relative_tolerance": REUSED_SCALE_RELATIVE_TOLERANCE,
+            "groups": scale_consistency.groups,
         },
         "objects": object_metrics,
         "camera": status.get("camera").cloned().unwrap_or(Value::Null),
@@ -1013,6 +1043,7 @@ pub(crate) fn feedback_layout_deltas_with_policy(
                     .get("yaw_delta_degrees")
                     .cloned()
                     .unwrap_or(json!(0.0)),
+                max_yaw_delta_degrees: feedback_yaw_delta_limit_for_object(object),
                 ground_anchor_point: object
                     .get("target_ground_point")
                     .and_then(json_array3)
@@ -1037,6 +1068,7 @@ pub(crate) fn feedback_layout_deltas_with_policy(
                 "scale_group_key": delta.scale_group_key,
                 "scale_source": delta.scale_source,
                 "yaw_delta_degrees": delta.yaw_delta_degrees,
+                "max_yaw_delta_degrees": delta.max_yaw_delta_degrees,
                 "ground_anchor_point": delta.ground_anchor_point,
                 "ground_anchor_max_drift_m": delta.ground_anchor_max_drift_m,
             })
@@ -1056,8 +1088,25 @@ pub(crate) struct FeedbackDeltaDraft {
     pub(crate) scale_group_key: Option<String>,
     pub(crate) scale_source: &'static str,
     pub(crate) yaw_delta_degrees: Value,
+    pub(crate) max_yaw_delta_degrees: f64,
     pub(crate) ground_anchor_point: Option<[f32; 3]>,
     pub(crate) ground_anchor_max_drift_m: Option<f32>,
+}
+
+fn feedback_yaw_delta_limit_for_object(object: &Value) -> f64 {
+    let selection_source = object
+        .get("rotation_selection")
+        .and_then(|selection| selection.get("selection_source"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(
+        selection_source,
+        "rendered_candidate_sweep" | "openai_candidate_selector"
+    ) {
+        180.0
+    } else {
+        30.0
+    }
 }
 
 pub(crate) fn feedback_axis_scale_multiplier(
@@ -1623,12 +1672,19 @@ pub(crate) fn apply_object_delta_to_command(
         .and_then(Value::as_f64)
         .unwrap_or(0.0) as f32;
     if yaw_delta.abs() > 1.0e-4 {
+        let max_yaw_delta = delta
+            .get("max_yaw_delta_degrees")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(30.0)
+            .clamp(0.0, 180.0) as f32;
         let current_yaw = command
             .get("rotation")
             .and_then(json_array4)
             .map(quat_y_degrees)
             .unwrap_or(0.0);
-        let target_yaw = normalize_degrees(current_yaw + yaw_delta.clamp(-30.0, 30.0));
+        let target_yaw =
+            normalize_degrees(current_yaw + yaw_delta.clamp(-max_yaw_delta, max_yaw_delta));
         command["rotation"] = json!(quat_from_y_degrees(target_yaw));
     }
     Ok(())
@@ -1686,10 +1742,8 @@ pub(crate) fn feedback_bsn_from_commands(
 ) -> Result<String, String> {
     let mut out = String::from("synth_scene_v1 {\n");
     for asset in asset_bindings {
-        out.push_str(&format!(
-            "asset {} = \"generated:{}\";\n",
-            asset.asset_id, asset.asset_id
-        ));
+        out.push_str(&scene_asset_declaration_for_bsn(asset));
+        out.push('\n');
     }
     out.push_str(&format!(
         "environment rug translation [{}] scale [{}] color [0.62,0.02,0.26];\n",
@@ -1888,6 +1942,23 @@ pub(crate) fn feedback_markdown_report(
             .get("min_signed_clearance_m")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        let scale_consistency = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("scale_consistency"))
+            .unwrap_or(&Value::Null);
+        let scale_consistency_passed = iteration
+            .get("metrics")
+            .and_then(|metrics| metrics.get("scale_consistency_passed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let scale_hard_failures = scale_consistency
+            .get("hard_failure_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let scale_max_relative_delta = scale_consistency
+            .get("max_relative_delta")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         let rubric = iteration
             .get("metrics")
             .and_then(|metrics| metrics.get("scene_quality_rubric"))
@@ -1902,9 +1973,43 @@ pub(crate) fn feedback_markdown_report(
             .and_then(|metrics| metrics.get("rubric_passed"))
             .and_then(Value::as_bool);
         out.push_str(&format!(
-            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nrubric_score: {rubric_score:.4}\nrubric_passed: {rubric_passed:?}\nprojection_passed: {projection_passed} ({object_pass_count}/{object_count})\nrotation_passed: {rotation_passed} ({rotation_pass_count}/{object_count})\nphysical_passed: {physical_passed}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\nrubric_summary: {rubric_summary}\n\n![iteration {index}]({})\n\n",
+            "## Iteration {index}\n\npassed: {passed}\nscore: {score:.4}\nselection_score: {selection_score:.4}\nrubric_score: {rubric_score:.4}\nrubric_passed: {rubric_passed:?}\nprojection_passed: {projection_passed} ({object_pass_count}/{object_count})\nrotation_passed: {rotation_passed} ({rotation_pass_count}/{object_count})\nphysical_passed: {physical_passed}\nscale_consistency_passed: {scale_consistency_passed}\nscale_consistency_failures: {scale_hard_failures}\nscale_max_relative_delta: {scale_max_relative_delta:.4}\nhard_overlap_failures: {hard_failures}\nmax_overlap_fraction_smaller: {max_overlap:.4}\nmin_signed_clearance_m: {min_clearance:.4}\nrubric_summary: {rubric_summary}\n\n![iteration {index}]({})\n\n",
             path_relative_to(capture_root, Path::new(screenshot))
         ));
+        if let Some(groups) = scale_consistency.get("groups").and_then(Value::as_array) {
+            let failing_groups = groups
+                .iter()
+                .filter(|group| !group.get("passed").and_then(Value::as_bool).unwrap_or(true))
+                .take(6)
+                .collect::<Vec<_>>();
+            if !failing_groups.is_empty() {
+                out.push_str("| Scale Group | Indices | Max Relative Delta |\n");
+                out.push_str("| --- | --- | ---: |\n");
+                for group in failing_groups {
+                    let cache_key = group
+                        .get("cache_key")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cache");
+                    let indices = group
+                        .get("indices")
+                        .and_then(Value::as_array)
+                        .map(|indices| {
+                            indices
+                                .iter()
+                                .map(Value::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    let max_delta = group
+                        .get("max_relative_delta")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    out.push_str(&format!("| {cache_key} | {indices} | {max_delta:.4} |\n"));
+                }
+                out.push('\n');
+            }
+        }
         if let Some(issues) = rubric.get("issues").and_then(Value::as_array)
             && !issues.is_empty()
         {
@@ -1987,6 +2092,247 @@ pub(crate) fn feedback_markdown_report(
     out
 }
 
+pub(crate) fn feedback_rotation_html_report(
+    capture_root: &Path,
+    profile: FeedbackThresholdProfile,
+    accepted_iteration: Option<usize>,
+    iterations: &[Value],
+) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Scene Rotation Feedback</title>",
+    );
+    out.push_str(
+        "<style>body{margin:0;background:#101114;color:#e8e8ea;font:14px/1.45 system-ui,sans-serif}main{padding:24px;max-width:1500px;margin:auto}h1,h2,h3{margin:0 0 12px}section{border:1px solid #30323a;background:#17191f;border-radius:8px;padding:16px;margin:18px 0}.meta{color:#aeb4c0}.scene{width:min(100%,920px);border:1px solid #333;border-radius:6px}.objects{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}.object{background:#20232b;border:1px solid #363a45;border-radius:8px;padding:12px}.crop-row,.candidate-grid{display:flex;gap:10px;flex-wrap:wrap}.thumb{background:#0b0c0f;border:1px solid #3a3f4a;border-radius:6px;padding:6px;max-width:190px}.thumb.wide{max-width:290px}.thumb.selected{border-color:#63e6be;box-shadow:0 0 0 1px #63e6be55}.thumb img{display:block;max-width:176px;max-height:176px;object-fit:contain}.thumb.wide img{max-width:276px}.label{font-size:12px;color:#b8beca;margin-top:4px;word-break:break-word}.score{color:#96f2d7}.warn{color:#ffd43b}.pill{display:inline-block;border:1px solid #4a5060;border-radius:999px;padding:2px 8px;margin:2px 4px 8px 0;color:#cbd3df}</style>",
+    );
+    out.push_str("</head><body><main>");
+    out.push_str(&format!(
+        "<h1>Scene Rotation Feedback</h1><p class=\"meta\">profile: {} · accepted iteration: {}</p>",
+        html_escape(&format!("{profile:?}")),
+        accepted_iteration
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    ));
+    out.push_str("<p class=\"meta\">This report ablates deterministic feedback against per-object isolated rendered yaw candidates. Source crops are compared against full-frame isolated renders from the scene camera, so translation and scale mistakes stay visible instead of disappearing into empty tight crops. Mask/depth visible-surface fitting is still reported separately.</p>");
+    for iteration in iterations {
+        let index = iteration
+            .get("iteration")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let screenshot = iteration
+            .get("screenshot")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let score = iteration
+            .get("selection_score")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                iteration
+                    .pointer("/metrics/score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+            });
+        let selector = iteration
+            .pointer("/metrics/rotation_selector/selector")
+            .and_then(Value::as_str)
+            .unwrap_or("deterministic");
+        out.push_str(&format!(
+            "<section><h2>Iteration {index}</h2><span class=\"pill\">score {:.4}</span><span class=\"pill\">selector {}</span>",
+            score,
+            html_escape(selector)
+        ));
+        if !screenshot.is_empty() {
+            out.push_str(&format!(
+                "<div><img class=\"scene\" src=\"{}\" alt=\"iteration {index} screenshot\"></div>",
+                html_escape(&path_relative_to(capture_root, Path::new(screenshot)))
+            ));
+        }
+        let objects = iteration
+            .pointer("/metrics/objects")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let crop_objects = iteration
+            .get("object_crops")
+            .and_then(|crops| crops.get("objects"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        out.push_str("<div class=\"objects\">");
+        for object in objects {
+            let Some(rotation_selection) = object.get("rotation_selection") else {
+                continue;
+            };
+            let object_index = object.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let label = object
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("object");
+            let object_id = object
+                .get("object_id")
+                .and_then(Value::as_str)
+                .unwrap_or("object");
+            let crop = crop_objects
+                .iter()
+                .find(|crop| crop.get("index").and_then(Value::as_u64) == Some(object_index))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let source_crop = crop
+                .get("source_crop")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let rendered_crop = crop
+                .get("rendered_crop")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let isolated_full_frame = crop
+                .get("isolated_render_full_frame")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    object
+                        .get("isolated_render_full_frame")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("");
+            let selected_candidate = rotation_selection
+                .get("selected_candidate_index")
+                .and_then(Value::as_u64);
+            out.push_str(&format!(
+                "<div class=\"object\"><h3>{}: {}</h3><div class=\"meta\">current yaw {} · target yaw {} · selected candidate {}</div>",
+                object_index,
+                html_escape(&format!("{label} / {object_id}")),
+                html_escape(&json_number_label(object.get("current_yaw_degrees"))),
+                html_escape(&json_number_label(object.get("target_yaw_degrees"))),
+                selected_candidate
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ));
+            out.push_str("<div class=\"crop-row\">");
+            push_feedback_report_thumb(
+                capture_root,
+                &mut out,
+                "source crop",
+                source_crop,
+                false,
+                "",
+            );
+            push_feedback_report_thumb(
+                capture_root,
+                &mut out,
+                "isolated full-frame",
+                isolated_full_frame,
+                false,
+                "wide",
+            );
+            push_feedback_report_thumb(
+                capture_root,
+                &mut out,
+                "current render crop",
+                rendered_crop,
+                false,
+                "",
+            );
+            out.push_str("</div><h4>Yaw Candidates</h4><div class=\"candidate-grid\">");
+            for candidate in rotation_selection
+                .get("candidates")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let candidate_index = candidate
+                    .get("candidate_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let selected = selected_candidate == Some(candidate_index);
+                let full_frame_path = candidate
+                    .get("rendered_candidate_full_frame")
+                    .or_else(|| candidate.get("rendered_candidate_screenshot"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let crop_path = candidate
+                    .get("rendered_candidate_crop")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let score = candidate
+                    .get("visual_score")
+                    .and_then(Value::as_f64)
+                    .map(|value| format!(" · score {value:.4}"))
+                    .unwrap_or_default();
+                let label = format!(
+                    "#{candidate_index} Δ{} yaw {}{}",
+                    json_number_label(candidate.get("yaw_delta_degrees")),
+                    json_number_label(candidate.get("candidate_yaw_degrees")),
+                    score
+                );
+                push_feedback_report_thumb(
+                    capture_root,
+                    &mut out,
+                    &format!("{label} full-frame"),
+                    full_frame_path,
+                    selected,
+                    "wide",
+                );
+                push_feedback_report_thumb(
+                    capture_root,
+                    &mut out,
+                    &format!("{label} crop"),
+                    crop_path,
+                    selected,
+                    "",
+                );
+            }
+            out.push_str("</div></div>");
+        }
+        out.push_str("</div></section>");
+    }
+    out.push_str("</main></body></html>");
+    out
+}
+
+fn push_feedback_report_thumb(
+    capture_root: &Path,
+    out: &mut String,
+    label: &str,
+    path: &str,
+    selected: bool,
+    extra_class: &str,
+) {
+    let selected_class = if selected { " selected" } else { "" };
+    out.push_str(&format!(
+        "<div class=\"thumb{selected_class} {}\">",
+        html_escape(extra_class)
+    ));
+    if path.is_empty() {
+        out.push_str("<div class=\"warn\">missing image</div>");
+    } else {
+        out.push_str(&format!(
+            "<img src=\"{}\" alt=\"{}\">",
+            html_escape(&path_relative_to(capture_root, Path::new(path))),
+            html_escape(label)
+        ));
+    }
+    out.push_str(&format!(
+        "<div class=\"label\">{}</div></div>",
+        html_escape(label)
+    ));
+}
+
+fn json_number_label(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
     let score = metrics
         .get("score")
@@ -2029,6 +2375,17 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         .get("max_overlap_fraction_smaller")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let scale_consistency = metrics.get("scale_consistency").unwrap_or(&Value::Null);
+    let scale_hard_failures = scale_consistency
+        .get("hard_failure_count")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let scale_max_relative_delta = scale_consistency
+        .get("max_relative_delta")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
     let rubric = metrics.get("scene_quality_rubric").unwrap_or(&Value::Null);
     let rubric_score = rubric
         .get("overall_score")
@@ -2049,6 +2406,8 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         + rotation_bonus
         - hard_failures * 3.0
         - max_overlap * 1.5
+        - scale_hard_failures * 3.0
+        - scale_max_relative_delta * 2.0
         + rubric_adjustment
 }
 
@@ -2129,6 +2488,16 @@ pub(crate) fn feedback_rotation_selection_task(metrics: &Value, object_crops: &V
             "instance_id": object.get("instance_id").cloned().unwrap_or(Value::Null),
             "label": object.get("label").cloned().unwrap_or(Value::Null),
             "source_crop": crop.get("source_crop").cloned().unwrap_or(Value::Null),
+            "isolated_render_full_frame": crop
+                .get("isolated_render_full_frame")
+                .cloned()
+                .or_else(|| object.get("isolated_render_full_frame").cloned())
+                .unwrap_or(Value::Null),
+            "isolated_render_bbox": crop
+                .get("isolated_render_bbox")
+                .cloned()
+                .or_else(|| object.get("isolated_render_bbox").cloned())
+                .unwrap_or(Value::Null),
             "rendered_crop": crop.get("rendered_crop").cloned().unwrap_or(Value::Null),
             "source_bbox": object.get("expected_bbox").cloned().unwrap_or(Value::Null),
             "rendered_bbox": object.get("observed_bbox").cloned().unwrap_or(Value::Null),
@@ -2142,7 +2511,7 @@ pub(crate) fn feedback_rotation_selection_task(metrics: &Value, object_crops: &V
     }
     json!({
         "purpose": "bounded-object-rotation-selection",
-        "instruction": "Choose one candidate per object by comparing the source crop to the rendered crop. Return candidate_index values only; do not invent absolute yaw or transform values.",
+        "instruction": "Choose one candidate per object by comparing the per-object source crop to full-frame isolated renders captured from the scene camera. The isolated render keeps the full source frame and shows only that object, so use object position within the frame as evidence. Rendered tight crops are secondary diagnostics only and may be empty if placement is wrong. Return candidate_index values only; do not invent absolute yaw or transform values.",
         "schema": {
             "type": "object",
             "properties": {
@@ -2173,12 +2542,17 @@ pub(crate) fn feedback_rotation_selection_prompt(task: &Value) -> String {
         .unwrap_or_else(|_| serde_json::to_string(task).unwrap_or_default());
     format!(
         "You are selecting bounded object yaw corrections for a 3D scene composition feedback loop.\n\
-         Compare each source crop with its rendered crop. For each object, choose exactly one \
+         Compare each per-object source crop with the full-frame isolated render for that object. \
+         The isolated render uses the same scene camera and contains only the selected object, while \
+         preserving its position in the full frame. This is the primary rendered evidence because \
+         tight rendered crops may be empty when placement is wrong. Also compare any full-frame \
+         isolated rendered yaw-candidate screenshots embedded in rotation_selection.candidates. \
+         For each object, choose exactly one \
          candidate_index from the provided candidates. Do not invent absolute yaw, transforms, \
          positions, scales, or new candidate values. If the crop evidence is ambiguous, choose \
          the candidate closest to the rendered object's apparent orientation and lower confidence.\n\
-         Source/render crop images are attached in source, rendered pairs in the same object order \
-         as the JSON task.\n\nJSON task:\n{task_json}"
+         Images are attached in source-crop, current isolated full-frame, rendered crop diagnostics, \
+         then full-frame yaw candidates order for each object when available.\n\nJSON task:\n{task_json}"
     )
 }
 
@@ -2191,7 +2565,7 @@ pub(crate) fn feedback_rotation_selection_image_paths(task: &Value) -> Vec<PathB
         .into_iter()
         .flatten()
     {
-        for key in ["source_crop", "rendered_crop"] {
+        for key in ["source_crop", "isolated_render_full_frame", "rendered_crop"] {
             let Some(path) = object.get(key).and_then(Value::as_str) else {
                 continue;
             };
@@ -2199,6 +2573,26 @@ pub(crate) fn feedback_rotation_selection_image_paths(task: &Value) -> Vec<PathB
                 continue;
             }
             paths.push(PathBuf::from(path));
+        }
+        for candidate in object
+            .pointer("/rotation_selection/candidates")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for key in [
+                "rendered_candidate_full_frame",
+                "rendered_candidate_screenshot",
+                "rendered_candidate_crop",
+            ] {
+                let Some(path) = candidate.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if path.trim().is_empty() || !seen.insert(path.to_string()) {
+                    continue;
+                }
+                paths.push(PathBuf::from(path));
+            }
         }
     }
     paths
@@ -2260,6 +2654,7 @@ pub(crate) fn apply_feedback_rotation_selection_response(
                 normalize_degrees(current_yaw + yaw_delta as f32) as f64
             });
         object["yaw_delta_degrees"] = json!(yaw_delta);
+        object["max_yaw_delta_degrees"] = json!(180.0);
         object["target_yaw_degrees"] = json!(target_yaw);
         if let Some(rotation_selection) = object.get_mut("rotation_selection") {
             rotation_selection["selection_source"] = json!("openai_candidate_selector");
@@ -2297,6 +2692,130 @@ pub(crate) fn apply_feedback_rotation_selection_response(
         "ignored": ignored,
         "objects": applied,
     })
+}
+
+pub(crate) fn apply_feedback_rendered_rotation_selection(metrics: &mut Value) -> Value {
+    let Some(objects) = metrics.get_mut("objects").and_then(Value::as_array_mut) else {
+        return json!({
+            "selector": "rendered-sweep",
+            "applied_count": 0,
+            "ignored": ["metrics_missing_objects"],
+            "objects": [],
+        });
+    };
+    let mut applied = Vec::new();
+    let mut ignored = Vec::new();
+    for object in objects {
+        let index = object
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let current_yaw_degrees = object
+            .get("current_yaw_degrees")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        let selected = {
+            let Some(rotation_selection) = object.get_mut("rotation_selection") else {
+                continue;
+            };
+            let (candidate_index, yaw_delta, target_yaw, score) = {
+                let Some(candidates) = rotation_selection
+                    .get_mut("candidates")
+                    .and_then(Value::as_array_mut)
+                else {
+                    ignored.push(json!({
+                        "index": index,
+                        "reason": "object_missing_candidates",
+                    }));
+                    continue;
+                };
+                let Some((candidate_position, score)) = candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, candidate)| {
+                        feedback_rotation_candidate_visual_score(candidate)
+                            .map(|score| (position, score))
+                    })
+                    .max_by(|(_, left), (_, right)| {
+                        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                else {
+                    ignored.push(json!({
+                        "index": index,
+                        "reason": "object_missing_rendered_candidate_scores",
+                    }));
+                    continue;
+                };
+                let candidate = candidates[candidate_position].clone();
+                let candidate_index = candidate
+                    .get("candidate_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(candidate_position as u64)
+                    as usize;
+                let yaw_delta = candidate
+                    .get("yaw_delta_degrees")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let target_yaw = candidate
+                    .get("candidate_yaw_degrees")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_else(|| {
+                        normalize_degrees(current_yaw_degrees + yaw_delta as f32) as f64
+                    });
+                for candidate in candidates {
+                    let item_index = candidate
+                        .get("candidate_index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize);
+                    candidate["selected"] = json!(item_index == Some(candidate_index));
+                }
+                (candidate_index, yaw_delta, target_yaw, score)
+            };
+            rotation_selection["selection_source"] = json!("rendered_candidate_sweep");
+            rotation_selection["selected_candidate_index"] = json!(candidate_index);
+            rotation_selection["selected_yaw_delta_degrees"] = json!(yaw_delta);
+            rotation_selection["selected_yaw_degrees"] = json!(target_yaw);
+            rotation_selection["selector_result"] = json!({
+                "visual_score": score,
+                "rationale": "selected highest-scoring isolated rendered yaw candidate against the source crop",
+            });
+            (candidate_index, yaw_delta, target_yaw, score)
+        };
+        let (candidate_index, yaw_delta, target_yaw, score) = selected;
+        object["yaw_delta_degrees"] = json!(yaw_delta);
+        object["max_yaw_delta_degrees"] = json!(180.0);
+        object["target_yaw_degrees"] = json!(target_yaw);
+        applied.push(json!({
+            "index": index,
+            "candidate_index": candidate_index,
+            "yaw_delta_degrees": yaw_delta,
+            "target_yaw_degrees": target_yaw,
+            "visual_score": score,
+        }));
+    }
+    json!({
+        "selector": "rendered-sweep",
+        "applied_count": applied.len(),
+        "ignored": ignored,
+        "objects": applied,
+    })
+}
+
+fn feedback_rotation_candidate_visual_score(candidate: &Value) -> Option<f64> {
+    candidate
+        .get("visual_score")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            candidate
+                .pointer("/visual_similarity/score")
+                .and_then(Value::as_f64)
+        })
+        .or_else(|| {
+            candidate
+                .pointer("/rendered_candidate_metrics/visual_similarity/score")
+                .and_then(Value::as_f64)
+        })
+        .filter(|value| value.is_finite())
 }
 
 fn feedback_rotation_candidate_for_object(object: &Value, candidate_index: usize) -> Option<Value> {
@@ -2355,8 +2874,8 @@ pub(crate) fn feedback_rotation_selection(
     json!({
         "selection_source": "deterministic_closest_to_feedback_target",
         "selection_basis": basis,
-        "search_strategy": "bounded-coarse-to-fine-relative-yaw",
-        "instruction": "Compare source/rendered crops and choose candidate_index only; do not provide absolute yaw or transform values.",
+        "search_strategy": "bounded-coarse-to-fine-plus-cardinal-yaw",
+        "instruction": "Compare the source crop against full-frame isolated scene-camera renders and choose candidate_index only; do not provide absolute yaw or transform values.",
         "current_yaw_degrees": current_yaw_degrees,
         "target_delta_degrees": target_delta_degrees,
         "selected_candidate_index": selected_index,
@@ -2394,6 +2913,18 @@ fn feedback_rotation_candidate_deltas(target_delta_degrees: f32) -> Vec<(f32, &'
         "fine-mid-right",
     );
     push_unique_rotation_delta(&mut deltas, target_delta_degrees + fine_span, "fine-right");
+    for (delta, level) in [
+        (-180.0, "visual-cardinal"),
+        (-135.0, "visual-cardinal"),
+        (-90.0, "visual-cardinal"),
+        (-60.0, "visual-wide"),
+        (60.0, "visual-wide"),
+        (90.0, "visual-cardinal"),
+        (135.0, "visual-cardinal"),
+        (180.0, "visual-cardinal"),
+    ] {
+        push_unique_rotation_delta(&mut deltas, delta, level);
+    }
     deltas.sort_by(|left, right| {
         left.0
             .partial_cmp(&right.0)
@@ -2410,7 +2941,7 @@ fn push_unique_rotation_delta(
     if !delta_degrees.is_finite() {
         return;
     }
-    let delta_degrees = delta_degrees.clamp(-30.0, 30.0);
+    let delta_degrees = delta_degrees.clamp(-180.0, 180.0);
     if deltas
         .iter()
         .any(|(existing, _)| (*existing - delta_degrees).abs() <= 1.0)
@@ -2499,7 +3030,7 @@ pub(crate) fn feedback_object_crops(
     })
 }
 
-fn write_feedback_crop(
+pub(crate) fn write_feedback_crop(
     image: &image::DynamicImage,
     bbox: [f32; 4],
     output_path: &Path,
@@ -2525,7 +3056,7 @@ fn write_feedback_crop(
         .map_err(|err| format!("write feedback crop {}: {err}", output_path.display()))
 }
 
-fn sanitize_feedback_crop_name(index: usize, value: &str) -> String {
+pub(crate) fn sanitize_feedback_crop_name(index: usize, value: &str) -> String {
     let mut out = format!("{index:02}_");
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
@@ -2537,6 +3068,144 @@ fn sanitize_feedback_crop_name(index: usize, value: &str) -> String {
     out
 }
 
+pub(crate) fn feedback_crop_visual_similarity(
+    source_crop: &Path,
+    rendered_candidate_crop: &Path,
+) -> Result<Value, String> {
+    let source = feedback_crop_descriptor(source_crop)?;
+    let candidate = feedback_crop_descriptor(rendered_candidate_crop)?;
+    let gray_mse = mean_square_error(&source.gray_norm, &candidate.gray_norm);
+    let edge_mse = mean_square_error(&source.edge_norm, &candidate.edge_norm);
+    let color_mse = mean_square_error(&source.rgb_norm, &candidate.rgb_norm);
+    let contrast_error = (source.gray_std - candidate.gray_std).abs();
+    let score = (0.40 * (-edge_mse * 0.55).exp()
+        + 0.30 * (-gray_mse * 0.35).exp()
+        + 0.20 * (-color_mse * 0.25).exp()
+        + 0.10 * (-contrast_error * 2.0).exp())
+    .clamp(0.0, 1.0);
+    Ok(json!({
+        "score": score,
+        "edge_mse": edge_mse,
+        "gray_mse": gray_mse,
+        "color_mse": color_mse,
+        "source_gray_mean": source.gray_mean,
+        "candidate_gray_mean": candidate.gray_mean,
+        "source_gray_std": source.gray_std,
+        "candidate_gray_std": candidate.gray_std,
+        "descriptor": "resized_64_rgb_luma_sobel_normalized",
+    }))
+}
+
+struct FeedbackCropDescriptor {
+    rgb_norm: Vec<f64>,
+    gray_norm: Vec<f64>,
+    edge_norm: Vec<f64>,
+    gray_mean: f64,
+    gray_std: f64,
+}
+
+fn feedback_crop_descriptor(path: &Path) -> Result<FeedbackCropDescriptor, String> {
+    let image = image::open(path)
+        .map_err(|err| format!("failed to open feedback crop {}: {err}", path.display()))?
+        .resize_exact(64, 64, image::imageops::FilterType::Triangle)
+        .to_rgb8();
+    let mut rgb = Vec::with_capacity((image.width() * image.height() * 3) as usize);
+    let mut gray = Vec::with_capacity((image.width() * image.height()) as usize);
+    for pixel in image.pixels() {
+        let r = pixel[0] as f64 / 255.0;
+        let g = pixel[1] as f64 / 255.0;
+        let b = pixel[2] as f64 / 255.0;
+        rgb.extend([r, g, b]);
+        gray.push(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    }
+    let (gray_mean, gray_std) = mean_std(&gray);
+    let gray_norm = normalize_vec(&gray, gray_mean, gray_std);
+    let rgb_mean = if rgb.is_empty() {
+        0.0
+    } else {
+        rgb.iter().sum::<f64>() / rgb.len() as f64
+    };
+    let rgb_std = variance_std(&rgb, rgb_mean);
+    let rgb_norm = normalize_vec(&rgb, rgb_mean, rgb_std);
+    let edge = feedback_edge_descriptor(&gray, 64, 64);
+    let edge_mean = if edge.is_empty() {
+        0.0
+    } else {
+        edge.iter().sum::<f64>() / edge.len() as f64
+    };
+    let edge_std = variance_std(&edge, edge_mean);
+    let edge_norm = normalize_vec(&edge, edge_mean, edge_std);
+    Ok(FeedbackCropDescriptor {
+        rgb_norm,
+        gray_norm,
+        edge_norm,
+        gray_mean,
+        gray_std,
+    })
+}
+
+fn feedback_edge_descriptor(gray: &[f64], width: usize, height: usize) -> Vec<f64> {
+    let mut edges = vec![0.0; width.saturating_mul(height)];
+    if width < 3 || height < 3 || gray.len() < width.saturating_mul(height) {
+        return edges;
+    }
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            let idx = y * width + x;
+            let gx = gray[idx + 1] - gray[idx - 1];
+            let gy = gray[idx + width] - gray[idx - width];
+            edges[idx] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+    edges
+}
+
+fn mean_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 1.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    (mean, variance_std(values, mean))
+}
+
+fn variance_std(values: &[f64], mean: f64) -> f64 {
+    if values.is_empty() {
+        return 1.0;
+    }
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt().max(1.0e-6)
+}
+
+fn normalize_vec(values: &[f64], mean: f64, std: f64) -> Vec<f64> {
+    values
+        .iter()
+        .map(|value| ((value - mean) / std).clamp(-3.0, 3.0))
+        .collect()
+}
+
+fn mean_square_error(left: &[f64], right: &[f64]) -> f64 {
+    let len = left.len().min(right.len());
+    if len == 0 {
+        return f64::INFINITY;
+    }
+    left.iter()
+        .zip(right.iter())
+        .take(len)
+        .map(|(left, right)| {
+            let delta = left - right;
+            delta * delta
+        })
+        .sum::<f64>()
+        / len as f64
+}
+
 pub(crate) fn feedback_metrics_summary(metrics: &Value) -> Value {
     json!({
         "passed": metrics.get("passed").cloned().unwrap_or(Value::Null),
@@ -2544,10 +3213,12 @@ pub(crate) fn feedback_metrics_summary(metrics: &Value) -> Value {
         "projection_passed": metrics.get("projection_passed").cloned().unwrap_or(Value::Null),
         "physical_passed": metrics.get("physical_passed").cloned().unwrap_or(Value::Null),
         "rotation_passed": metrics.get("rotation_passed").cloned().unwrap_or(Value::Null),
+        "scale_consistency_passed": metrics.get("scale_consistency_passed").cloned().unwrap_or(Value::Null),
         "object_count": metrics.get("object_count").cloned().unwrap_or(Value::Null),
         "object_pass_count": metrics.get("object_pass_count").cloned().unwrap_or(Value::Null),
         "rotation_pass_count": metrics.get("rotation_pass_count").cloned().unwrap_or(Value::Null),
         "physical_layout": metrics.get("physical_layout").cloned().unwrap_or(Value::Null),
+        "scale_consistency": metrics.get("scale_consistency").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -2814,6 +3485,96 @@ pub(crate) struct FeedbackPhysicalLayout {
     pub(crate) object_failure_count: usize,
     pub(crate) max_overlap_fraction_smaller: f32,
     pub(crate) min_signed_clearance_m: f32,
+}
+
+const REUSED_SCALE_RELATIVE_TOLERANCE: f32 = 0.015;
+
+#[derive(Debug)]
+pub(crate) struct FeedbackScaleConsistency {
+    pub(crate) groups: Vec<Value>,
+    pub(crate) object_failures: HashMap<usize, Vec<String>>,
+    pub(crate) hard_failure_count: usize,
+    pub(crate) max_relative_delta: f32,
+    pub(crate) passed: bool,
+}
+
+pub(crate) fn feedback_reused_scale_consistency(status: &Value) -> FeedbackScaleConsistency {
+    let mut grouped = HashMap::<String, Vec<(usize, [f32; 3])>>::new();
+    if let Some(world_items) = status.get("world_items").and_then(Value::as_array) {
+        for (index, item) in world_items.iter().enumerate() {
+            let Some(cache_key) = item
+                .get("cache_key")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(scale) = item.get("scale").and_then(json_array3) else {
+                continue;
+            };
+            grouped
+                .entry(cache_key.to_string())
+                .or_default()
+                .push((index, scale));
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut object_failures = HashMap::<usize, Vec<String>>::new();
+    let mut hard_failure_count = 0usize;
+    let mut max_relative_delta = 0.0f32;
+    for (cache_key, items) in grouped {
+        if items.len() < 2 {
+            continue;
+        }
+        let mut mean = [0.0f32; 3];
+        for (_, scale) in &items {
+            for axis in 0..3 {
+                mean[axis] += scale[axis].abs();
+            }
+        }
+        for value in &mut mean {
+            *value = (*value / items.len() as f32).max(1.0e-5);
+        }
+        let mut group_max_relative_delta = 0.0f32;
+        for (_, scale) in &items {
+            for axis in 0..3 {
+                let delta = (scale[axis].abs() - mean[axis]).abs() / mean[axis];
+                group_max_relative_delta = group_max_relative_delta.max(delta);
+            }
+        }
+        max_relative_delta = max_relative_delta.max(group_max_relative_delta);
+        let passed = group_max_relative_delta <= REUSED_SCALE_RELATIVE_TOLERANCE;
+        if !passed {
+            hard_failure_count += 1;
+            let message = format!(
+                "reused asset scale mismatch for cache_key `{cache_key}`: max_relative_delta={group_max_relative_delta:.4} exceeds tolerance={REUSED_SCALE_RELATIVE_TOLERANCE:.4}"
+            );
+            for (index, _) in &items {
+                object_failures
+                    .entry(*index)
+                    .or_default()
+                    .push(message.clone());
+            }
+        }
+        groups.push(json!({
+            "cache_key": cache_key,
+            "indices": items.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            "scales": items.iter().map(|(_, scale)| *scale).collect::<Vec<_>>(),
+            "mean_scale": mean,
+            "max_relative_delta": group_max_relative_delta,
+            "relative_tolerance": REUSED_SCALE_RELATIVE_TOLERANCE,
+            "passed": passed,
+        }));
+    }
+
+    FeedbackScaleConsistency {
+        groups,
+        object_failures,
+        hard_failure_count,
+        max_relative_delta,
+        passed: hard_failure_count == 0,
+    }
 }
 
 pub(crate) fn feedback_projected_footprints(

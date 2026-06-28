@@ -11,9 +11,10 @@ mod types;
 
 pub use bsn::{
     crop_scene_object, load_scene_asset_bindings, object_manifest_schema, parse_scene_bsn,
-    resize_image_for_api, rotation_selection_schema, scene_bsn_file_to_mcp_command_envelope,
-    scene_bsn_schema, scene_bsn_to_mcp_command_envelope, scene_plan_to_mcp_commands,
-    scene_quality_rubric_schema, write_json_file, write_metric,
+    resize_image_for_api, rotation_selection_schema, scene_asset_declaration_for_bsn,
+    scene_asset_source_for_bsn, scene_bsn_file_to_mcp_command_envelope, scene_bsn_schema,
+    scene_bsn_to_mcp_command_envelope, scene_plan_to_mcp_commands, scene_quality_rubric_schema,
+    write_json_file, write_metric,
 };
 pub use canonical_pose::{
     canonical_frame_for_asset, canonical_pose_evidence_for_asset,

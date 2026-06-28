@@ -92,6 +92,11 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         feedback_capture_dir: args.feedback_capture_dir,
         feedback_threshold_profile: args.feedback_threshold_profile,
         feedback_rotation_selector: args.feedback_rotation_selector,
+        rotation_fit: args.rotation_fit,
+        rotation_fit_max_gpt_rounds: args.rotation_fit_max_gpt_rounds,
+        rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
+        rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
+        rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
@@ -134,6 +139,11 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         feedback_capture_dir: args.feedback_capture_dir,
         feedback_threshold_profile: args.feedback_threshold_profile,
         feedback_rotation_selector: args.feedback_rotation_selector,
+        rotation_fit: args.rotation_fit,
+        rotation_fit_max_gpt_rounds: args.rotation_fit_max_gpt_rounds,
+        rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
+        rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
+        rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
@@ -181,6 +191,11 @@ fn run_scene_feedback_replay_command(
     let manifest = read_json_path::<SceneObjectManifest>(&manifest_path)?;
     let asset_bindings = read_json_path::<Vec<SceneAssetBinding>>(&asset_bindings_path)?;
     let grounded_layout = read_json_path::<GroundedSceneLayout>(&grounded_layout_path)?;
+    let grounding_evidence_path = args.output_dir.join("grounding_evidence.json");
+    let grounding_evidence = grounding_evidence_path
+        .exists()
+        .then(|| read_json_path::<SceneGroundingEvidence>(&grounding_evidence_path))
+        .transpose()?;
     let commands = if args.rebuild_commands_from_grounded_layout {
         let plan = parse_scene_bsn(&grounded_layout.bsn, &asset_bindings)
             .map_err(|err| err.to_string())?;
@@ -203,9 +218,16 @@ fn run_scene_feedback_replay_command(
             capture_dir: Some(capture_dir),
             threshold_profile: args.feedback_threshold_profile,
             rotation_selector: args.feedback_rotation_selector,
+            rotation_fit: args.rotation_fit,
+            rotation_fit_max_gpt_rounds: args.rotation_fit_max_gpt_rounds,
+            rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
+            rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
+            rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
             rubric_scorer: args.feedback_rubric_scorer,
             scale_policy: SceneScalePolicy::AssetPreserving,
+            grounding_evidence,
         },
+        None,
     )?;
     println!(
         "{}",

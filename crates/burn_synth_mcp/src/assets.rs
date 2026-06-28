@@ -438,6 +438,26 @@ pub(crate) fn default_feedback_rubric_scorer() -> FeedbackRubricScorer {
     FeedbackRubricScorer::Off
 }
 
+pub(crate) fn default_scene_rotation_fit_mode() -> SceneRotationFitMode {
+    SceneRotationFitMode::DepthMaskRansac
+}
+
+pub(crate) fn default_scene_rotation_fit_max_gpt_rounds() -> usize {
+    2
+}
+
+pub(crate) fn default_scene_rotation_fit_min_mask_iou() -> f32 {
+    0.45
+}
+
+pub(crate) fn default_scene_rotation_fit_max_depth_error_m() -> f32 {
+    0.35
+}
+
+pub(crate) fn default_scene_rotation_fit_write_artifacts() -> bool {
+    true
+}
+
 pub(crate) fn default_scene_composition_mode() -> SceneCompositionMode {
     SceneCompositionMode::CvGrounded
 }
