@@ -277,7 +277,8 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask/surface rotation candidate." },
                     "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters; depth-distribution loss is also reported." },
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
-                    "table_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Table-only pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting only on table-like objects; gated-gpt additionally marks failed or ambiguous table fits for bounded GPT candidate selection; always-gpt marks all tables." },
+                    "object_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Object-set pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting on the selected object set; gated-gpt additionally marks failed or ambiguous fits for bounded GPT candidate selection; always-gpt marks every selected object." },
+                    "object_pose_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by object_pose_refinement. Defaults to tables-and-large-seating." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path"],
@@ -325,7 +326,8 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask/surface rotation candidate." },
                     "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters; depth-distribution loss is also reported." },
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
-                    "table_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Table-only pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting only on table-like objects; gated-gpt additionally marks failed or ambiguous table fits for bounded GPT candidate selection; always-gpt marks all tables." },
+                    "object_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Object-set pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting on the selected object set; gated-gpt additionally marks failed or ambiguous fits for bounded GPT candidate selection; always-gpt marks every selected object." },
+                    "object_pose_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by object_pose_refinement. Defaults to tables-and-large-seating." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path", "manifest", "asset_bindings"],
@@ -863,8 +865,10 @@ pub struct SceneBuildFromImageArgs {
     pub rotation_fit_max_depth_error_m: f32,
     #[serde(default = "default_scene_rotation_fit_write_artifacts")]
     pub rotation_fit_write_artifacts: bool,
-    #[serde(default = "default_scene_table_pose_refinement")]
-    pub table_pose_refinement: SceneTablePoseRefinementMode,
+    #[serde(default = "default_scene_object_pose_refinement")]
+    pub object_pose_refinement: SceneObjectPoseRefinementMode,
+    #[serde(default = "default_scene_object_pose_refinement_set")]
+    pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
@@ -930,8 +934,10 @@ pub(crate) struct SceneGroundToolArgs {
     pub rotation_fit_max_depth_error_m: f32,
     #[serde(default = "default_scene_rotation_fit_write_artifacts")]
     pub rotation_fit_write_artifacts: bool,
-    #[serde(default = "default_scene_table_pose_refinement")]
-    pub table_pose_refinement: SceneTablePoseRefinementMode,
+    #[serde(default = "default_scene_object_pose_refinement")]
+    pub object_pose_refinement: SceneObjectPoseRefinementMode,
+    #[serde(default = "default_scene_object_pose_refinement_set")]
+    pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }

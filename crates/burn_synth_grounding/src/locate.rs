@@ -293,7 +293,7 @@ fn locate_anything_detection_allowed(detection: &Detection, allowed: &[&'static 
     let Some(source_category) = canonical_locate_anything_category(&detection.source_query) else {
         return false;
     };
-    if !allowed.iter().any(|category| *category == source_category) {
+    if !allowed.contains(&source_category) {
         return false;
     }
     let label_key = normalized_query_key(&detection.label);

@@ -1168,7 +1168,8 @@ fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
             rotation_fit_min_mask_iou: 0.45,
             rotation_fit_max_depth_error_m: 0.35,
             rotation_fit_write_artifacts: true,
-            table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
+            object_pose_refinement: SceneObjectPoseRefinementMode::GatedGpt,
+            object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
             feedback_rubric_scorer: FeedbackRubricScorer::Off,
         })
         .unwrap_err();
@@ -1465,7 +1466,8 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         rotation_fit_min_mask_iou: 0.45,
         rotation_fit_max_depth_error_m: 0.35,
         rotation_fit_write_artifacts: true,
-        table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
+        object_pose_refinement: SceneObjectPoseRefinementMode::GatedGpt,
+        object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
 
@@ -1585,7 +1587,8 @@ fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
         rotation_fit_min_mask_iou: 0.45,
         rotation_fit_max_depth_error_m: 0.35,
         rotation_fit_write_artifacts: true,
-        table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
+        object_pose_refinement: SceneObjectPoseRefinementMode::GatedGpt,
+        object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
     let first_dir = root.join("first");
@@ -5226,7 +5229,8 @@ fn scene_build_defaults_select_bare_bones_geometric_placement_pipeline() {
         feedback_rotation_selector: args.feedback_rotation_selector,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
         rotation_fit: args.rotation_fit,
-        table_pose_refinement: args.table_pose_refinement,
+        object_pose_refinement: args.object_pose_refinement,
+        object_pose_refinement_set: args.object_pose_refinement_set,
         max_pose_candidates: args.max_pose_candidates,
     });
 
@@ -5234,7 +5238,7 @@ fn scene_build_defaults_select_bare_bones_geometric_placement_pipeline() {
     assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
     assert_eq!(
         plan.active_pose_optimizer,
-        "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_table_refinement"
+        "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_object_refinement"
     );
     assert!(plan.stages.iter().any(|stage| {
         stage.stage == "object_discretization"
@@ -5258,8 +5262,12 @@ fn scene_build_defaults_select_bare_bones_geometric_placement_pipeline() {
     assert!(!args.feedback);
     assert_eq!(args.rotation_fit, SceneRotationFitMode::Off);
     assert_eq!(
-        args.table_pose_refinement,
-        SceneTablePoseRefinementMode::GatedGpt
+        args.object_pose_refinement,
+        SceneObjectPoseRefinementMode::GatedGpt
+    );
+    assert_eq!(
+        args.object_pose_refinement_set,
+        SceneObjectPoseRefinementSet::TablesAndLargeSeating
     );
 }
 
@@ -5270,7 +5278,8 @@ fn scene_asset_lift_policy_rejects_triposplat_for_mesh_pose_fit() {
         "synthesis_models": ["triposplat"],
         "composition_mode": "cv-grounded",
         "pose_fit": "rendered-silhouette",
-        "table_pose_refinement": "gated-gpt"
+        "object_pose_refinement": "gated-gpt",
+        "object_pose_refinement_set": "tables-and-large-seating"
     }))
     .expect("scene build args deserialize");
 
@@ -5285,7 +5294,7 @@ fn scene_asset_lift_policy_rejects_triposplat_for_mesh_pose_fit() {
         "synthesis_models": ["triposplat"],
         "composition_mode": "cv-grounded",
         "pose_fit": "projected-aabb",
-        "table_pose_refinement": "off"
+        "object_pose_refinement": "off"
     }))
     .expect("scene build args deserialize");
     projected_only.rotation_fit = SceneRotationFitMode::Off;

@@ -43,46 +43,58 @@ pub(crate) struct SceneRotationFitOutcome {
     pub(crate) report: Value,
 }
 
+pub(crate) struct SceneObjectPoseRefinementConfig<'a> {
+    pub(crate) mode: SceneObjectPoseRefinementMode,
+    pub(crate) object_set: SceneObjectPoseRefinementSet,
+    pub(crate) pose_fit: SceneVisibleSurfacePoseFitConfig<'a>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScenePoseFitObjectFilter {
     All,
-    TablesOnly,
+    RefinementSet(SceneObjectPoseRefinementSet),
 }
 
 impl ScenePoseFitObjectFilter {
     fn includes(self, placement: &GroundedScenePlacement) -> bool {
         match self {
             Self::All => true,
-            Self::TablesOnly => placement_is_table_like(placement),
+            Self::RefinementSet(object_set) => {
+                object_pose_refinement_set_includes(object_set, placement)
+            }
         }
     }
 
     fn stage_name(self) -> &'static str {
         match self {
             Self::All => "visible_surface_pose_fit",
-            Self::TablesOnly => "table_pose_refinement",
+            Self::RefinementSet(_) => "object_pose_refinement",
         }
     }
 
     fn report_file_stem(self) -> &'static str {
         match self {
             Self::All => "visible_surface_pose_fit",
-            Self::TablesOnly => "table_pose_refinement",
+            Self::RefinementSet(_) => "object_pose_refinement",
         }
     }
 
     fn output_dir_name(self) -> &'static str {
         match self {
             Self::All => "visible_surface_pose_candidates",
-            Self::TablesOnly => "table_pose_candidates",
+            Self::RefinementSet(_) => "object_pose_candidates",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::TablesOnly => "tables-only",
+            Self::RefinementSet(object_set) => object_set.label(),
         }
+    }
+
+    fn is_refinement(self) -> bool {
+        matches!(self, Self::RefinementSet(_))
     }
 }
 
@@ -588,6 +600,7 @@ pub(crate) fn apply_scene_visible_surface_pose_fit(
             &mesh,
             &baseline_placement,
             fit_object,
+            out_layout.projection_fit.as_ref().map(|fit| &fit.camera),
             evidence,
             intrinsics,
             &target,
@@ -698,19 +711,24 @@ pub(crate) fn apply_scene_visible_surface_pose_fit(
     })
 }
 
-pub(crate) fn apply_scene_table_pose_refinement(
-    mode: SceneTablePoseRefinementMode,
-    mut config: SceneVisibleSurfacePoseFitConfig<'_>,
+pub(crate) fn apply_scene_object_pose_refinement(
+    config: SceneObjectPoseRefinementConfig<'_>,
     manifest: &SceneObjectManifest,
     asset_bindings: &[SceneAssetBinding],
     evidence: Option<&SceneGroundingEvidence>,
     grounded_layout: &GroundedSceneLayout,
     commands: &[Value],
 ) -> Result<SceneRotationFitOutcome, String> {
-    config.object_filter = ScenePoseFitObjectFilter::TablesOnly;
-    if mode == SceneTablePoseRefinementMode::Off {
-        let report =
-            visible_surface_pose_fit_report(config, manifest, 0, 0, 0, Vec::new(), "disabled");
+    let mode = config.mode;
+    let object_set = config.object_set;
+    let mut pose_config = config.pose_fit;
+    pose_config.object_filter = ScenePoseFitObjectFilter::RefinementSet(object_set);
+    if mode == SceneObjectPoseRefinementMode::Off {
+        let mut report =
+            visible_surface_pose_fit_report(pose_config, manifest, 0, 0, 0, Vec::new(), "disabled");
+        report["object_pose_refinement_mode"] = json!(mode);
+        report["object_pose_refinement_set"] = json!(object_set);
+        report["gpt_gate"] = pose_refinement_gpt_gate(mode, &report, pose_config.object_filter);
         return Ok(SceneRotationFitOutcome {
             commands: commands.to_vec(),
             grounded_layout: grounded_layout.clone(),
@@ -718,17 +736,23 @@ pub(crate) fn apply_scene_table_pose_refinement(
         });
     }
     let mut outcome = apply_scene_visible_surface_pose_fit(
-        config,
+        pose_config,
         manifest,
         asset_bindings,
         evidence,
         grounded_layout,
         commands,
     )?;
-    outcome.report["table_pose_refinement_mode"] = json!(mode);
-    outcome.report["gpt_gate"] = table_pose_refinement_gpt_gate(mode, &outcome.report);
-    if config.write_artifacts {
-        write_visible_surface_pose_fit_artifacts_if_requested(config, manifest, &outcome.report)?;
+    outcome.report["object_pose_refinement_mode"] = json!(mode);
+    outcome.report["object_pose_refinement_set"] = json!(object_set);
+    outcome.report["gpt_gate"] =
+        pose_refinement_gpt_gate(mode, &outcome.report, pose_config.object_filter);
+    if pose_config.write_artifacts {
+        write_visible_surface_pose_fit_artifacts_if_requested(
+            pose_config,
+            manifest,
+            &outcome.report,
+        )?;
     }
     Ok(outcome)
 }
@@ -914,9 +938,70 @@ pub(super) fn placement_is_table_like(placement: &GroundedScenePlacement) -> boo
         || descriptor.contains("counter")
 }
 
-pub(crate) fn table_pose_refinement_gpt_gate(
-    mode: SceneTablePoseRefinementMode,
+pub(super) fn placement_is_sofa_like(placement: &GroundedScenePlacement) -> bool {
+    let descriptor = format!(
+        "{} {} {}",
+        placement.object_id, placement.label, placement.entity_id
+    )
+    .to_ascii_lowercase();
+    descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+        || descriptor.contains("settee")
+}
+
+pub(super) fn placement_is_large_seating_like(placement: &GroundedScenePlacement) -> bool {
+    placement_is_sofa_like(placement)
+}
+
+pub(super) fn placement_is_furniture_like(placement: &GroundedScenePlacement) -> bool {
+    placement_is_table_like(placement)
+        || placement_is_large_seating_like(placement)
+        || placement_descriptor(placement).contains("chair")
+        || placement_descriptor(placement).contains("seat")
+        || placement_descriptor(placement).contains("bench")
+}
+
+pub(super) fn object_pose_refinement_set_includes(
+    object_set: SceneObjectPoseRefinementSet,
+    placement: &GroundedScenePlacement,
+) -> bool {
+    match object_set {
+        SceneObjectPoseRefinementSet::Tables => placement_is_table_like(placement),
+        SceneObjectPoseRefinementSet::LargeSeating => placement_is_large_seating_like(placement),
+        SceneObjectPoseRefinementSet::TablesAndLargeSeating => {
+            placement_is_table_like(placement) || placement_is_large_seating_like(placement)
+        }
+        SceneObjectPoseRefinementSet::AllFurniture => placement_is_furniture_like(placement),
+    }
+}
+
+fn placement_descriptor(placement: &GroundedScenePlacement) -> String {
+    format!(
+        "{} {} {}",
+        placement.object_id, placement.label, placement.entity_id
+    )
+    .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+pub(crate) fn object_pose_refinement_gpt_gate(
+    mode: SceneObjectPoseRefinementMode,
     report: &Value,
+    object_set: SceneObjectPoseRefinementSet,
+) -> Value {
+    pose_refinement_gpt_gate(
+        mode,
+        report,
+        ScenePoseFitObjectFilter::RefinementSet(object_set),
+    )
+}
+
+fn pose_refinement_gpt_gate(
+    mode: SceneObjectPoseRefinementMode,
+    report: &Value,
+    object_filter: ScenePoseFitObjectFilter,
 ) -> Value {
     let mut required_objects = Vec::new();
     if !mode.gpt_allowed() {
@@ -933,17 +1018,19 @@ pub(crate) fn table_pose_refinement_gpt_gate(
         .into_iter()
         .flatten()
     {
-        if mode == SceneTablePoseRefinementMode::AlwaysGpt {
-            required_objects.push(table_gpt_gate_object_report(object, "mode_always_gpt"));
+        if mode == SceneObjectPoseRefinementMode::AlwaysGpt {
+            required_objects.push(pose_refinement_gpt_gate_object_report(
+                object,
+                "mode_always_gpt",
+            ));
             continue;
         }
-        if object
+        if !object
             .get("applied")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            == false
         {
-            required_objects.push(table_gpt_gate_object_report(
+            required_objects.push(pose_refinement_gpt_gate_object_report(
                 object,
                 "no_geometry_candidate_applied",
             ));
@@ -983,17 +1070,17 @@ pub(crate) fn table_pose_refinement_gpt_gate(
             && baseline_loss - selected_loss < 0.075
             && yaw_delta > 20.0;
         if low_overlap {
-            required_objects.push(table_gpt_gate_object_report(
+            required_objects.push(pose_refinement_gpt_gate_object_report(
                 object,
                 "low_mask_and_bbox_overlap",
             ));
         } else if off_center {
-            required_objects.push(table_gpt_gate_object_report(
+            required_objects.push(pose_refinement_gpt_gate_object_report(
                 object,
                 "projected_center_error",
             ));
         } else if ambiguous_loss {
-            required_objects.push(table_gpt_gate_object_report(
+            required_objects.push(pose_refinement_gpt_gate_object_report(
                 object,
                 "ambiguous_geometry_margin",
             ));
@@ -1003,12 +1090,16 @@ pub(crate) fn table_pose_refinement_gpt_gate(
         "enabled": true,
         "required": !required_objects.is_empty(),
         "mode": mode,
+        "object_filter": object_filter.label(),
         "objects": required_objects,
-        "note": "GPT is only a bounded candidate selector for table fits flagged by objective geometry. It is not a source of absolute transform truth.",
+        "note": format!(
+            "GPT is only a bounded candidate selector for {} fits flagged by objective geometry. It is not a source of absolute transform truth.",
+            object_filter.label()
+        ),
     })
 }
 
-fn table_gpt_gate_object_report(object: &Value, reason: &'static str) -> Value {
+fn pose_refinement_gpt_gate_object_report(object: &Value, reason: &'static str) -> Value {
     json!({
         "object_id": object.get("object_id").cloned().unwrap_or(Value::Null),
         "instance_id": object.get("instance_id").cloned().unwrap_or(Value::Null),
@@ -1547,10 +1638,11 @@ mod tests {
             "generic fit should still reject a depth-failing candidate"
         );
 
-        config.object_filter = ScenePoseFitObjectFilter::TablesOnly;
+        config.object_filter =
+            ScenePoseFitObjectFilter::RefinementSet(SceneObjectPoseRefinementSet::Tables);
         assert!(
             visible_surface_pose_candidate_passes_target(&best, &baseline, &target, config),
-            "table refinement should accept the strong projected table improvement"
+            "object pose refinement should accept the strong projected table improvement"
         );
     }
 
@@ -1773,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn table_pose_refinement_gated_gpt_flags_ambiguous_or_bad_table_fit() {
+    fn object_pose_refinement_gated_gpt_flags_ambiguous_table_fit() {
         let report = json!({
             "objects": [
                 {
@@ -1793,11 +1885,18 @@ mod tests {
                 }
             ]
         });
-        let geometry_gate =
-            table_pose_refinement_gpt_gate(SceneTablePoseRefinementMode::Geometry, &report);
+        let geometry_gate = object_pose_refinement_gpt_gate(
+            SceneObjectPoseRefinementMode::Geometry,
+            &report,
+            SceneObjectPoseRefinementSet::Tables,
+        );
         assert_eq!(geometry_gate["required"], json!(false));
 
-        let gated = table_pose_refinement_gpt_gate(SceneTablePoseRefinementMode::GatedGpt, &report);
+        let gated = object_pose_refinement_gpt_gate(
+            SceneObjectPoseRefinementMode::GatedGpt,
+            &report,
+            SceneObjectPoseRefinementSet::Tables,
+        );
         assert_eq!(gated["required"], json!(true));
         assert_eq!(
             gated["objects"][0]["reason"],
@@ -1806,7 +1905,40 @@ mod tests {
     }
 
     #[test]
-    fn table_pose_refinement_clamps_table_scale_more_tightly_than_chair_scale() {
+    fn object_pose_refinement_gated_gpt_flags_large_seating_fit_failures() {
+        let report = json!({
+            "objects": [
+                {
+                    "object_id": "tan_open_crescent_sectional_sofa",
+                    "instance_id": null,
+                    "label": "tan open sectional sofa",
+                    "applied": false,
+                    "baseline": { "loss": 1.00 },
+                    "best": { "loss": 0.99 },
+                    "selected": {
+                        "loss": 0.99,
+                        "mask_iou": 0.22,
+                        "bbox_iou": 0.40,
+                        "center_error": 0.12
+                    }
+                }
+            ]
+        });
+        let gate = object_pose_refinement_gpt_gate(
+            SceneObjectPoseRefinementMode::GatedGpt,
+            &report,
+            SceneObjectPoseRefinementSet::LargeSeating,
+        );
+        assert_eq!(gate["required"], json!(true));
+        assert_eq!(gate["object_filter"], json!("large-seating"));
+        assert_eq!(
+            gate["objects"][0]["reason"],
+            json!("no_geometry_candidate_applied")
+        );
+    }
+
+    #[test]
+    fn object_pose_refinement_clamps_table_scale_more_tightly_than_chair_scale() {
         let mut table = test_pose_fit_placement(0.0);
         table.entity_id = "table_0".to_string();
         table.object_id = "conference_table".to_string();
@@ -1839,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn table_pose_refinement_filter_does_not_match_conference_chairs() {
+    fn object_pose_refinement_table_set_does_not_match_conference_chairs() {
         let mut chair = test_pose_fit_placement(0.0);
         chair.entity_id = "chair_group_01".to_string();
         chair.object_id = "chair_group_01".to_string();
@@ -1851,6 +1983,41 @@ mod tests {
         table.object_id = "conference_table_01".to_string();
         table.label = "white rounded rectangular conference table".to_string();
         assert!(placement_is_table_like(&table));
+        assert!(object_pose_refinement_set_includes(
+            SceneObjectPoseRefinementSet::Tables,
+            &table
+        ));
+        assert!(!object_pose_refinement_set_includes(
+            SceneObjectPoseRefinementSet::Tables,
+            &chair
+        ));
+    }
+
+    #[test]
+    fn object_pose_refinement_large_seating_set_matches_couches_without_matching_chairs() {
+        let mut chair = test_pose_fit_placement(0.0);
+        chair.entity_id = "chair_group_01".to_string();
+        chair.object_id = "chair_group_01".to_string();
+        chair.label = "reusable tufted swivel conference chair group".to_string();
+        assert!(!placement_is_sofa_like(&chair));
+
+        let mut sofa = test_pose_fit_placement(0.0);
+        sofa.entity_id = "sectional_sofa_01".to_string();
+        sofa.object_id = "tan_open_crescent_sectional_sofa".to_string();
+        sofa.label = "tan open crescent sectional couch".to_string();
+        assert!(placement_is_sofa_like(&sofa));
+        assert!(object_pose_refinement_set_includes(
+            SceneObjectPoseRefinementSet::LargeSeating,
+            &sofa
+        ));
+        assert!(!object_pose_refinement_set_includes(
+            SceneObjectPoseRefinementSet::LargeSeating,
+            &chair
+        ));
+        assert!(object_pose_refinement_set_includes(
+            SceneObjectPoseRefinementSet::TablesAndLargeSeating,
+            &sofa
+        ));
     }
 
     fn test_pose_fit_placement(yaw: f32) -> GroundedScenePlacement {

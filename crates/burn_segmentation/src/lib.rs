@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn sam_models_fail_fast_until_wired() {
+    fn sam2_burn_native_requires_component_assets() {
         let err = SegmentationRuntime::new(SegmentationRuntimeConfig {
             model: SegmentationModelKind::Sam2,
             backend: SegmentationRuntimeBackend::BurnNative,
@@ -595,12 +595,14 @@ mod tests {
             ..SegmentationRuntimeConfig::default()
         })
         .unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("sam2 with BurnNative is not implemented")
-                || err
-                    .to_string()
-                    .contains("missing SAM2 component safetensors")
+            (message.contains("missing native artifacts")
+                && message.contains("image_encoder_f16.bpk")
+                && message.contains("prompt_encoder_f16.bpk")
+                && message.contains("mask_decoder_f16.bpk"))
+                || message.contains("missing SAM2 component BurnPack"),
+            "unexpected error: {message}"
         );
     }
 }

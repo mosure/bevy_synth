@@ -35,13 +35,13 @@ pub(super) fn project_mesh_visible_surface_mask(
     mesh: &CachedSynthMesh,
     placement: &GroundedScenePlacement,
     fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     crop_bbox: [f32; 4],
 ) -> Option<ProjectedCandidateSurface> {
-    let origin = fit_object.source_camera_origin_xz?;
-    let anchor = fit_object.source_camera_anchor?;
-    let ground_anchor_basis = fit_object.ground_anchor_basis.as_str();
+    let projection =
+        RotationFitProjection::from_fit_object(fit_object, projection_camera, intrinsics)?;
     let res = ROTATION_FIT_CROP_RESOLUTION as usize;
     let mut mask = vec![0_u8; res * res];
     let mut depth_buffer = vec![f32::INFINITY; res * res];
@@ -62,19 +62,7 @@ pub(super) fn project_mesh_visible_surface_mask(
         let mut valid = true;
         for (slot, index) in indices.iter().copied().enumerate() {
             let world = rotation_fit_transform_local_point(placement, mesh.mesh.vertices[index]);
-            let Some(camera_point) = rotation_fit_source_camera_point(
-                world,
-                origin,
-                anchor,
-                ground_anchor_basis,
-                evidence,
-            ) else {
-                valid = false;
-                break;
-            };
-            let Some(projected_point) =
-                rotation_fit_project_source_camera_point(camera_point, intrinsics)
-            else {
+            let Some((camera_point, projected_point)) = projection.project(world, evidence) else {
                 valid = false;
                 break;
             };
@@ -119,18 +107,7 @@ pub(super) fn project_mesh_visible_surface_mask(
         fallback_points = true;
         for vertex in &mesh.mesh.vertices {
             let world = rotation_fit_transform_local_point(placement, *vertex);
-            let Some(camera_point) = rotation_fit_source_camera_point(
-                world,
-                origin,
-                anchor,
-                ground_anchor_basis,
-                evidence,
-            ) else {
-                continue;
-            };
-            let Some(projected_point) =
-                rotation_fit_project_source_camera_point(camera_point, intrinsics)
-            else {
+            let Some((camera_point, projected_point)) = projection.project(world, evidence) else {
                 continue;
             };
             projected_points.push(projected_point);
@@ -172,6 +149,115 @@ pub(super) fn project_mesh_visible_surface_mask(
         covered_px,
         fallback_points,
     })
+}
+
+#[derive(Clone, Copy)]
+enum RotationFitProjection {
+    Source {
+        origin: [f32; 2],
+        anchor: [f32; 3],
+        ground_anchor_basis: &'static str,
+        intrinsics: RotationFitIntrinsics,
+    },
+    Layout {
+        translation: [f32; 3],
+        forward: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        vertical_fov_degrees: f32,
+        aspect: f32,
+    },
+}
+
+impl RotationFitProjection {
+    fn from_fit_object(
+        fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+        projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
+        intrinsics: RotationFitIntrinsics,
+    ) -> Option<Self> {
+        if let (Some(origin), Some(anchor)) = (
+            fit_object.source_camera_origin_xz,
+            fit_object.source_camera_anchor,
+        ) {
+            let ground_anchor_basis = if fit_object.ground_anchor_basis == "camera-ray-ground-plane"
+            {
+                "camera-ray-ground-plane"
+            } else {
+                "layout-contact-pixel"
+            };
+            return Some(Self::Source {
+                origin,
+                anchor,
+                ground_anchor_basis,
+                intrinsics,
+            });
+        }
+        let camera = projection_camera?;
+        if camera.basis != "layout-camera" {
+            return None;
+        }
+        let forward = normalize3(sub3(camera.focus, camera.translation))?;
+        let right = normalize3(cross3(forward, [0.0, 1.0, 0.0]))
+            .or_else(|| normalize3(cross3(forward, [0.0, 0.0, 1.0])))?;
+        let up = normalize3(cross3(right, forward))?;
+        Some(Self::Layout {
+            translation: camera.translation,
+            forward,
+            right,
+            up,
+            vertical_fov_degrees: camera.vertical_fov_degrees,
+            aspect: camera.aspect.max(0.1),
+        })
+    }
+
+    fn project(
+        self,
+        world: [f32; 3],
+        evidence: &SceneGroundingEvidence,
+    ) -> Option<([f32; 3], [f32; 2])> {
+        match self {
+            Self::Source {
+                origin,
+                anchor,
+                ground_anchor_basis,
+                intrinsics,
+            } => {
+                let camera_point = rotation_fit_source_camera_point(
+                    world,
+                    origin,
+                    anchor,
+                    ground_anchor_basis,
+                    evidence,
+                )?;
+                let projected_point =
+                    rotation_fit_project_source_camera_point(camera_point, intrinsics)?;
+                Some((camera_point, projected_point))
+            }
+            Self::Layout {
+                translation,
+                forward,
+                right,
+                up,
+                vertical_fov_degrees,
+                aspect,
+            } => {
+                let rel = sub3(world, translation);
+                let z = dot3(rel, forward);
+                if !z.is_finite() || z <= 1.0e-4 {
+                    return None;
+                }
+                let x = dot3(rel, right);
+                let y = dot3(rel, up);
+                let tan_half = (vertical_fov_degrees.to_radians() * 0.5).tan();
+                if !tan_half.is_finite() || tan_half <= 1.0e-5 {
+                    return None;
+                }
+                let u = (x / (z * tan_half * aspect) + 1.0) * 0.5;
+                let v = (1.0 - y / (z * tan_half)) * 0.5;
+                (u.is_finite() && v.is_finite()).then_some(([x, y, z], [u, v]))
+            }
+        }
+    }
 }
 
 fn rotation_fit_transform_local_point(

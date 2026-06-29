@@ -366,7 +366,7 @@ pub(crate) fn scene_build_requires_mesh_assets(args: &SceneBuildFromImageArgs) -
         && args.composition_mode == SceneCompositionMode::CvGrounded
         && (args.pose_fit == ScenePoseFitMode::RenderedSilhouette
             || args.rotation_fit != SceneRotationFitMode::Off
-            || args.table_pose_refinement.geometry_enabled())
+            || args.object_pose_refinement.geometry_enabled())
 }
 
 fn scene_synthesis_model_outputs_mesh(model: SynthesisModel) -> bool {
@@ -2267,7 +2267,8 @@ impl McpServer {
                 feedback_rotation_selector: args.feedback_rotation_selector,
                 feedback_rubric_scorer: args.feedback_rubric_scorer,
                 rotation_fit: args.rotation_fit,
-                table_pose_refinement: args.table_pose_refinement,
+                object_pose_refinement: args.object_pose_refinement,
+                object_pose_refinement_set: args.object_pose_refinement_set,
                 max_pose_candidates: args.max_pose_candidates,
             });
 
@@ -2967,29 +2968,35 @@ impl McpServer {
         }
         if args.pose_fit == ScenePoseFitMode::RenderedSilhouette
             && args.lift_assets
-            && args.table_pose_refinement.geometry_enabled()
+            && args.object_pose_refinement.geometry_enabled()
         {
             let stage_started = Instant::now();
             progress.emit(
-                "table_pose_refinement",
+                "object_pose_refinement",
                 SceneBuildProgressPhase::Started,
                 SceneBuildExecutionKind::Cpu,
-                "refining table placement/rotation with stricter table-only mask/depth constraints",
+                "refining selected object placement, rotation, and uniform scale with mask/depth constraints",
                 json!({
-                    "mode": args.table_pose_refinement,
+                    "mode": args.object_pose_refinement,
+                    "object_set": args.object_pose_refinement_set,
                     "scale_policy": args.scale_policy,
                 }),
             );
-            let fit = apply_scene_table_pose_refinement(
-                args.table_pose_refinement,
-                SceneVisibleSurfacePoseFitConfig {
-                    mode: args.pose_fit,
-                    min_mask_iou: args.rotation_fit_min_mask_iou,
-                    max_depth_error_m: args.rotation_fit_max_depth_error_m,
-                    write_artifacts: args.write_artifacts,
-                    output_dir: &output_dir.join("table_pose_refinement"),
-                    scale_policy: args.scale_policy,
-                    object_filter: ScenePoseFitObjectFilter::TablesOnly,
+            let fit = apply_scene_object_pose_refinement(
+                SceneObjectPoseRefinementConfig {
+                    mode: args.object_pose_refinement,
+                    object_set: args.object_pose_refinement_set,
+                    pose_fit: SceneVisibleSurfacePoseFitConfig {
+                        mode: args.pose_fit,
+                        min_mask_iou: args.rotation_fit_min_mask_iou,
+                        max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                        write_artifacts: args.write_artifacts,
+                        output_dir: &output_dir.join("object_pose_refinement"),
+                        scale_policy: args.scale_policy,
+                        object_filter: ScenePoseFitObjectFilter::RefinementSet(
+                            args.object_pose_refinement_set,
+                        ),
+                    },
                 },
                 &manifest,
                 &asset_bindings,
@@ -3008,27 +3015,27 @@ impl McpServer {
                 parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
             selected_composition.layout.bsn = pose_bsn;
             selected_composition.commands = commands.clone();
-            response["table_pose_refinement"] = fit.report;
-            record_stage(&mut stage_report, "table_pose_refinement", stage_started);
+            response["object_pose_refinement"] = fit.report;
+            record_stage(&mut stage_report, "object_pose_refinement", stage_started);
             progress.emit_with_items(
-                "table_pose_refinement",
+                "object_pose_refinement",
                 SceneBuildProgressPhase::Completed,
                 SceneBuildExecutionKind::Cpu,
-                "table pose refinement complete",
+                "object pose refinement complete",
                 None,
                 Some(selected_composition.layout.placements.len()),
                 Some(
                     output_dir
-                        .join("table_pose_refinement")
-                        .join("table_pose_refinement_report.json"),
+                        .join("object_pose_refinement")
+                        .join("object_pose_refinement_report.json"),
                 ),
                 json!({
                     "applied_count": response
-                        .pointer("/table_pose_refinement/applied_count")
+                        .pointer("/object_pose_refinement/applied_count")
                         .cloned()
                         .unwrap_or(Value::Null),
                     "gpt_required": response
-                        .pointer("/table_pose_refinement/gpt_gate/required")
+                        .pointer("/object_pose_refinement/gpt_gate/required")
                         .cloned()
                         .unwrap_or(Value::Null),
                 }),
@@ -3501,7 +3508,8 @@ impl McpServer {
                 feedback_rotation_selector: args.feedback_rotation_selector,
                 feedback_rubric_scorer: args.feedback_rubric_scorer,
                 rotation_fit: args.rotation_fit,
-                table_pose_refinement: args.table_pose_refinement,
+                object_pose_refinement: args.object_pose_refinement,
+                object_pose_refinement_set: args.object_pose_refinement_set,
                 max_pose_candidates: args.max_pose_candidates,
             });
 
@@ -3580,19 +3588,24 @@ impl McpServer {
             record_stage(&mut stage_report, "visible_surface_pose_fit", stage_started);
         }
         if args.pose_fit == ScenePoseFitMode::RenderedSilhouette
-            && args.table_pose_refinement.geometry_enabled()
+            && args.object_pose_refinement.geometry_enabled()
         {
             let stage_started = Instant::now();
-            let fit = apply_scene_table_pose_refinement(
-                args.table_pose_refinement,
-                SceneVisibleSurfacePoseFitConfig {
-                    mode: args.pose_fit,
-                    min_mask_iou: args.rotation_fit_min_mask_iou,
-                    max_depth_error_m: args.rotation_fit_max_depth_error_m,
-                    write_artifacts: true,
-                    output_dir: &output_dir.join("table_pose_refinement"),
-                    scale_policy: args.scale_policy,
-                    object_filter: ScenePoseFitObjectFilter::TablesOnly,
+            let fit = apply_scene_object_pose_refinement(
+                SceneObjectPoseRefinementConfig {
+                    mode: args.object_pose_refinement,
+                    object_set: args.object_pose_refinement_set,
+                    pose_fit: SceneVisibleSurfacePoseFitConfig {
+                        mode: args.pose_fit,
+                        min_mask_iou: args.rotation_fit_min_mask_iou,
+                        max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                        write_artifacts: true,
+                        output_dir: &output_dir.join("object_pose_refinement"),
+                        scale_policy: args.scale_policy,
+                        object_filter: ScenePoseFitObjectFilter::RefinementSet(
+                            args.object_pose_refinement_set,
+                        ),
+                    },
                 },
                 &manifest,
                 &asset_bindings,
@@ -3611,8 +3624,8 @@ impl McpServer {
                 parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
             selected_composition.layout.bsn = pose_bsn;
             selected_composition.commands = commands.clone();
-            response["table_pose_refinement"] = fit.report;
-            record_stage(&mut stage_report, "table_pose_refinement", stage_started);
+            response["object_pose_refinement"] = fit.report;
+            record_stage(&mut stage_report, "object_pose_refinement", stage_started);
         }
 
         if args.feedback {

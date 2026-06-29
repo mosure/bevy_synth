@@ -63,6 +63,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
     mesh: &CachedSynthMesh,
     baseline: &GroundedScenePlacement,
     fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -78,6 +79,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
         baseline,
         baseline,
         fit_object,
+        projection_camera,
         evidence,
         intrinsics,
         target,
@@ -106,6 +108,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
             mesh,
             &trial,
             fit_object,
+            projection_camera,
             evidence,
             intrinsics,
             target,
@@ -138,6 +141,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
                 mesh,
                 &trial,
                 fit_object,
+                projection_camera,
                 evidence,
                 intrinsics,
                 target,
@@ -170,6 +174,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
                 mesh,
                 &trial,
                 fit_object,
+                projection_camera,
                 evidence,
                 intrinsics,
                 target,
@@ -219,6 +224,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
                     mesh,
                     &trial,
                     fit_object,
+                    projection_camera,
                     evidence,
                     intrinsics,
                     target,
@@ -258,6 +264,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
             mesh,
             &trial,
             fit_object,
+            projection_camera,
             evidence,
             intrinsics,
             target,
@@ -282,6 +289,7 @@ fn push_visible_surface_pose_candidate(
     baseline: &GroundedScenePlacement,
     placement: &GroundedScenePlacement,
     fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -297,6 +305,7 @@ fn push_visible_surface_pose_candidate(
         mesh,
         &trial,
         fit_object,
+        projection_camera,
         evidence,
         intrinsics,
         target,
@@ -316,6 +325,7 @@ fn visible_surface_pose_candidate(
     mesh: &CachedSynthMesh,
     placement: &GroundedScenePlacement,
     fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -330,6 +340,7 @@ fn visible_surface_pose_candidate(
         mesh,
         placement,
         fit_object,
+        projection_camera,
         evidence,
         intrinsics,
         target.crop_bbox,
@@ -460,7 +471,8 @@ pub(super) fn visible_surface_pose_candidate_passes_target(
     if best.loss + VISIBLE_SURFACE_POSE_FIT_MIN_APPLY_IMPROVEMENT >= baseline.loss {
         return false;
     }
-    if config.object_filter == ScenePoseFitObjectFilter::TablesOnly
+    if config.object_filter.is_refinement()
+        && placement_is_table_like(&best.placement)
         && best.bbox_iou >= 0.72
         && best.bbox_iou > baseline.bbox_iou + 0.18
         && best.center_error <= 0.055
@@ -1170,6 +1182,7 @@ fn evaluate_rotation_fit_candidate(
         mesh,
         &candidate_placement,
         fit_object,
+        None,
         evidence,
         intrinsics,
         target.crop_bbox,

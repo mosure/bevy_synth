@@ -247,7 +247,7 @@ impl ScenePipelineKind {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SceneTablePoseRefinementSetting {
+pub enum SceneObjectPoseRefinementSetting {
     Off,
     Geometry,
     #[default]
@@ -255,7 +255,7 @@ pub enum SceneTablePoseRefinementSetting {
     AlwaysGpt,
 }
 
-impl SceneTablePoseRefinementSetting {
+impl SceneObjectPoseRefinementSetting {
     fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -266,11 +266,11 @@ impl SceneTablePoseRefinementSetting {
     }
 
     fn cycle(self, delta: isize) -> Self {
-        const OPTIONS: [SceneTablePoseRefinementSetting; 4] = [
-            SceneTablePoseRefinementSetting::Off,
-            SceneTablePoseRefinementSetting::Geometry,
-            SceneTablePoseRefinementSetting::GatedGpt,
-            SceneTablePoseRefinementSetting::AlwaysGpt,
+        const OPTIONS: [SceneObjectPoseRefinementSetting; 4] = [
+            SceneObjectPoseRefinementSetting::Off,
+            SceneObjectPoseRefinementSetting::Geometry,
+            SceneObjectPoseRefinementSetting::GatedGpt,
+            SceneObjectPoseRefinementSetting::AlwaysGpt,
         ];
         let index = OPTIONS
             .iter()
@@ -303,7 +303,7 @@ pub struct ScenePipelineUiSettings {
     pub quality_profile: SceneQualityProfileSetting,
     pub ground_calibration: SceneGroundCalibrationSetting,
     pub instance_generation: SceneInstanceGenerationSetting,
-    pub table_pose_refinement: SceneTablePoseRefinementSetting,
+    pub object_pose_refinement: SceneObjectPoseRefinementSetting,
     pub candidate_count: usize,
     pub feedback_iterations: usize,
     pub pbr_enabled: bool,
@@ -574,7 +574,7 @@ impl Default for ScenePipelineUiSettings {
             quality_profile: SceneQualityProfileSetting::Fast,
             ground_calibration: SceneGroundCalibrationSetting::Gpt,
             instance_generation: SceneInstanceGenerationSetting::CategoryRepresentative,
-            table_pose_refinement: SceneTablePoseRefinementSetting::GatedGpt,
+            object_pose_refinement: SceneObjectPoseRefinementSetting::GatedGpt,
             candidate_count: 1,
             feedback_iterations: 0,
             pbr_enabled: true,
@@ -1651,7 +1651,7 @@ struct SceneSettingToggleButton {
 enum SceneSetting {
     GroundCalibration,
     InstanceGeneration,
-    TablePoseRefinement,
+    ObjectPoseRefinement,
     CandidateCount,
     FeedbackIterations,
     PbrTextureSize,
@@ -6446,7 +6446,7 @@ fn spawn_scene_grounding_settings(panel: &mut ChildSpawnerCommands) {
     spawn_scene_settings_section_label(panel, "layout search");
     spawn_scene_setting_row(panel, "candidates", SceneSetting::CandidateCount, 1);
     spawn_scene_setting_row(panel, "ground cal", SceneSetting::GroundCalibration, 1);
-    spawn_scene_setting_row(panel, "table refine", SceneSetting::TablePoseRefinement, 1);
+    spawn_scene_setting_row(panel, "pose refine", SceneSetting::ObjectPoseRefinement, 1);
     spawn_scene_settings_section_label(panel, "evidence");
     spawn_scene_toggle_row(panel, "locate bboxes", SceneToggleSetting::LocateAnything);
     spawn_scene_toggle_row(panel, "depth/floor", SceneToggleSetting::Depth);
@@ -7528,8 +7528,8 @@ fn adjust_scene_setting(
         (SceneSetting::InstanceGeneration, SceneSettingDelta::Integer(delta)) => {
             settings.instance_generation = settings.instance_generation.cycle(delta);
         }
-        (SceneSetting::TablePoseRefinement, SceneSettingDelta::Integer(delta)) => {
-            settings.table_pose_refinement = settings.table_pose_refinement.cycle(delta);
+        (SceneSetting::ObjectPoseRefinement, SceneSettingDelta::Integer(delta)) => {
+            settings.object_pose_refinement = settings.object_pose_refinement.cycle(delta);
         }
         (SceneSetting::CandidateCount, SceneSettingDelta::Integer(delta)) => {
             settings.candidate_count = apply_integer_delta(settings.candidate_count, delta, 1, 6);
@@ -7556,12 +7556,12 @@ fn adjust_scene_setting(
         }
     }
     info!(
-        "explicit scene settings: image_to_3d={} quality={} ground_calibration={} instances={} table_refine={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={} lift_assets={} locate={} depth={} segmentation={} pose_fit={} feedback={} artifacts={} promote={}",
+        "explicit scene settings: image_to_3d={} quality={} ground_calibration={} instances={} object_refine={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={} lift_assets={} locate={} depth={} segmentation={} pose_fit={} feedback={} artifacts={} promote={}",
         pipeline_label(settings.image_to_3d_model),
         settings.quality_profile.label(),
         settings.ground_calibration.label(),
         settings.instance_generation.label(),
-        settings.table_pose_refinement.label(),
+        settings.object_pose_refinement.label(),
         settings.candidate_count,
         settings.feedback_iterations,
         if settings.pbr_enabled { "on" } else { "off" },
@@ -7697,7 +7697,7 @@ fn scene_setting_value_text(settings: &ScenePipelineUiSettings, setting: SceneSe
     match setting {
         SceneSetting::GroundCalibration => settings.ground_calibration.label().to_string(),
         SceneSetting::InstanceGeneration => settings.instance_generation.label().to_string(),
-        SceneSetting::TablePoseRefinement => settings.table_pose_refinement.label().to_string(),
+        SceneSetting::ObjectPoseRefinement => settings.object_pose_refinement.label().to_string(),
         SceneSetting::CandidateCount => settings.candidate_count.to_string(),
         SceneSetting::FeedbackIterations => settings.feedback_iterations.to_string(),
         SceneSetting::PbrTextureSize => {

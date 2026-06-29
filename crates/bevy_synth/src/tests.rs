@@ -20,8 +20,8 @@ use bevy_synth_ui::{
 use burn_synth_mcp::{
     SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
-    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider, SceneTablePoseRefinementMode,
-    SynthesisModel as McpSynthesisModel,
+    SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet, ScenePoseFitMode,
+    SceneScalePolicy, SceneSegmentationProvider, SynthesisModel as McpSynthesisModel,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::SceneQualityProfile;
@@ -191,8 +191,12 @@ fn scene_ui_stage_toggles_map_to_scene_build_args() {
     );
     assert_eq!(default_args.rotation_fit_max_gpt_rounds, 0);
     assert_eq!(
-        default_args.table_pose_refinement,
-        SceneTablePoseRefinementMode::GatedGpt
+        default_args.object_pose_refinement,
+        SceneObjectPoseRefinementMode::GatedGpt
+    );
+    assert_eq!(
+        default_args.object_pose_refinement_set,
+        SceneObjectPoseRefinementSet::TablesAndLargeSeating
     );
 
     settings.lift_assets = false;

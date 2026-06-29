@@ -52,8 +52,8 @@ pub use pipeline::{
     select_object_image_candidates, select_object_image_candidates_with_exclusions,
 };
 pub use projection_fit::{
-    ProjectionFitCandidateReport, ProjectionFitObjectReport, ProjectionFitReport,
-    ProjectionFitVisibleSurfaceReport,
+    ProjectionFitCameraReport, ProjectionFitCandidateReport, ProjectionFitObjectReport,
+    ProjectionFitReport, ProjectionFitVisibleSurfaceReport,
 };
 pub use types::*;
 

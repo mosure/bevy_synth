@@ -25,9 +25,10 @@ pub use types::{
     SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthPrecision, SceneDepthProvider,
     SceneGroundCalibrationMode, SceneInstanceGenerationMode, SceneLocateAnythingPrecision,
-    SceneLocatorProvider, ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy,
-    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
-    SceneTablePoseRefinementMode, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
+    SceneLocatorProvider, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
+    ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy, SceneSegmentationPrecision,
+    SceneSegmentationProvider, SceneSegmentationQuantization, ServerArgs, ServerConfig,
+    SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(

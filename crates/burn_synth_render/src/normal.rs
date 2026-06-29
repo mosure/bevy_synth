@@ -352,11 +352,13 @@ fn render_candidate_mesh_normals(
             ],
             world_normals,
             camera,
-            &mut normals,
-            &mut out_mask,
-            &mut depth,
-            width,
-            height,
+            NormalRasterTarget {
+                normal_buffer: &mut normals,
+                mask: &mut out_mask,
+                depth_buffer: &mut depth,
+                width,
+                height,
+            },
         );
     }
     for (normal, valid) in normals.iter().copied().zip(&out_mask) {
@@ -383,16 +385,20 @@ fn render_candidate_mesh_normals(
     }
 }
 
+struct NormalRasterTarget<'a> {
+    normal_buffer: &'a mut [[f32; 3]],
+    mask: &'a mut [u8],
+    depth_buffer: &'a mut [f32],
+    width: u32,
+    height: u32,
+}
+
 fn rasterize_normal_triangle(
     pixels: [[f32; 2]; 3],
     depths: [f32; 3],
     normals_world: [[f32; 3]; 3],
     camera: CanonicalPoseCamera,
-    normal_buffer: &mut [[f32; 3]],
-    mask: &mut [u8],
-    depth_buffer: &mut [f32],
-    width: u32,
-    height: u32,
+    target: NormalRasterTarget<'_>,
 ) {
     let min_x = pixels
         .iter()
@@ -405,7 +411,7 @@ fn rasterize_normal_triangle(
         .map(|point| point[0])
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil()
-        .min(width.saturating_sub(1) as f32) as u32;
+        .min(target.width.saturating_sub(1) as f32) as u32;
     let min_y = pixels
         .iter()
         .map(|point| point[1])
@@ -417,7 +423,7 @@ fn rasterize_normal_triangle(
         .map(|point| point[1])
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil()
-        .min(height.saturating_sub(1) as f32) as u32;
+        .min(target.height.saturating_sub(1) as f32) as u32;
     if max_x < min_x || max_y < min_y {
         return;
     }
@@ -438,8 +444,8 @@ fn rasterize_normal_triangle(
             if !z.is_finite() || z <= 0.0 {
                 continue;
             }
-            let index = (y * width + x) as usize;
-            if z >= depth_buffer[index] {
+            let index = (y * target.width + x) as usize;
+            if z >= target.depth_buffer[index] {
                 continue;
             }
             let normal_world = normalize3(add3(
@@ -450,9 +456,9 @@ fn rasterize_normal_triangle(
             let Some(encoded) = camera.world_normal_to_encoded_camera(normal_world) else {
                 continue;
             };
-            depth_buffer[index] = z;
-            normal_buffer[index] = encoded;
-            mask[index] = 255;
+            target.depth_buffer[index] = z;
+            target.normal_buffer[index] = encoded;
+            target.mask[index] = 255;
         }
     }
 }

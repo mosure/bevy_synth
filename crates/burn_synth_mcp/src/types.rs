@@ -127,20 +127,40 @@ pub enum SceneRotationFitMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SceneTablePoseRefinementMode {
+pub enum SceneObjectPoseRefinementMode {
     Off,
     Geometry,
     GatedGpt,
     AlwaysGpt,
 }
 
-impl SceneTablePoseRefinementMode {
+impl SceneObjectPoseRefinementMode {
     pub(crate) fn geometry_enabled(self) -> bool {
         !matches!(self, Self::Off)
     }
 
     pub(crate) fn gpt_allowed(self) -> bool {
         matches!(self, Self::GatedGpt | Self::AlwaysGpt)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneObjectPoseRefinementSet {
+    Tables,
+    LargeSeating,
+    TablesAndLargeSeating,
+    AllFurniture,
+}
+
+impl SceneObjectPoseRefinementSet {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Tables => "tables",
+            Self::LargeSeating => "large-seating",
+            Self::TablesAndLargeSeating => "tables-and-large-seating",
+            Self::AllFurniture => "all-furniture",
+        }
     }
 }
 
@@ -746,13 +766,17 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub rotation_fit_write_artifacts: bool,
 
-    /// Table-specific pose refinement after the generic visible-surface fit.
+    /// Object-set-specific pose refinement after the generic visible-surface fit.
     ///
-    /// Defaults to gated-gpt: deterministic mask/depth/table candidate fitting
-    /// runs first, and the report marks only ambiguous/failed table fits for
+    /// Defaults to gated-gpt: deterministic mask/depth candidate fitting runs
+    /// first, and the report marks only ambiguous/failed object fits for
     /// bounded GPT candidate selection.
-    #[arg(long, value_enum, default_value_t = SceneTablePoseRefinementMode::GatedGpt)]
-    pub table_pose_refinement: SceneTablePoseRefinementMode,
+    #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementMode::GatedGpt)]
+    pub object_pose_refinement: SceneObjectPoseRefinementMode,
+
+    /// Object set targeted by --object-pose-refinement.
+    #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementSet::TablesAndLargeSeating)]
+    pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
@@ -885,9 +909,13 @@ pub(crate) struct SceneGroundCliArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub rotation_fit_write_artifacts: bool,
 
-    /// Table-specific pose refinement after the generic visible-surface fit.
-    #[arg(long, value_enum, default_value_t = SceneTablePoseRefinementMode::GatedGpt)]
-    pub table_pose_refinement: SceneTablePoseRefinementMode,
+    /// Object-set-specific pose refinement after the generic visible-surface fit.
+    #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementMode::GatedGpt)]
+    pub object_pose_refinement: SceneObjectPoseRefinementMode,
+
+    /// Object set targeted by --object-pose-refinement.
+    #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementSet::TablesAndLargeSeating)]
+    pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]

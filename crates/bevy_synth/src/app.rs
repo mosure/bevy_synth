@@ -90,9 +90,10 @@ use burn_synth_mcp::{
     QualityPreset as McpQualityPreset, SceneBuildExecutionKind, SceneBuildFromImageArgs,
     SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
     SceneDepthProvider, SceneGroundCalibrationMode, SceneInstanceGenerationMode,
-    SceneLocatorProvider, ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider,
-    SceneTablePoseRefinementMode, ServerArgs, ServerConfig, SynthesisModel as McpSynthesisModel,
-    TrellisQuality as McpTrellisQuality, run_scene_build_from_image_with_progress,
+    SceneLocatorProvider, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
+    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider, ServerArgs, ServerConfig,
+    SynthesisModel as McpSynthesisModel, TrellisQuality as McpTrellisQuality,
+    run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
@@ -3513,20 +3514,21 @@ pub(crate) fn scene_build_args_from_ui_settings(
         rotation_fit_min_mask_iou: 0.45,
         rotation_fit_max_depth_error_m: 0.35,
         rotation_fit_write_artifacts: true,
-        table_pose_refinement: match settings.table_pose_refinement {
-            bevy_synth_ui::SceneTablePoseRefinementSetting::Off => {
-                SceneTablePoseRefinementMode::Off
+        object_pose_refinement: match settings.object_pose_refinement {
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::Off => {
+                SceneObjectPoseRefinementMode::Off
             }
-            bevy_synth_ui::SceneTablePoseRefinementSetting::Geometry => {
-                SceneTablePoseRefinementMode::Geometry
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::Geometry => {
+                SceneObjectPoseRefinementMode::Geometry
             }
-            bevy_synth_ui::SceneTablePoseRefinementSetting::GatedGpt => {
-                SceneTablePoseRefinementMode::GatedGpt
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::GatedGpt => {
+                SceneObjectPoseRefinementMode::GatedGpt
             }
-            bevy_synth_ui::SceneTablePoseRefinementSetting::AlwaysGpt => {
-                SceneTablePoseRefinementMode::AlwaysGpt
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::AlwaysGpt => {
+                SceneObjectPoseRefinementMode::AlwaysGpt
             }
         },
+        object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     }
 }

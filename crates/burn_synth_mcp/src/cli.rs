@@ -99,7 +99,8 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
         rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
         rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
-        table_pose_refinement: args.table_pose_refinement,
+        object_pose_refinement: args.object_pose_refinement,
+        object_pose_refinement_set: args.object_pose_refinement_set,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
@@ -148,7 +149,8 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
         rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
         rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
-        table_pose_refinement: args.table_pose_refinement,
+        object_pose_refinement: args.object_pose_refinement,
+        object_pose_refinement_set: args.object_pose_refinement_set,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(

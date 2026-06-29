@@ -27,7 +27,8 @@ pub(crate) struct ScenePlacementPipelineSelection {
     pub(crate) feedback_rotation_selector: FeedbackRotationSelector,
     pub(crate) feedback_rubric_scorer: FeedbackRubricScorer,
     pub(crate) rotation_fit: SceneRotationFitMode,
-    pub(crate) table_pose_refinement: SceneTablePoseRefinementMode,
+    pub(crate) object_pose_refinement: SceneObjectPoseRefinementMode,
+    pub(crate) object_pose_refinement_set: SceneObjectPoseRefinementSet,
     pub(crate) max_pose_candidates: usize,
 }
 
@@ -107,8 +108,8 @@ pub(crate) fn scene_placement_pipeline_plan(
     let rendered_silhouette =
         asset_pose_enabled && selection.pose_fit == ScenePoseFitMode::RenderedSilhouette;
     let dense_pose_enabled = rendered_silhouette && has_depth && has_any_mask;
-    let table_refinement_enabled =
-        dense_pose_enabled && selection.table_pose_refinement.geometry_enabled();
+    let object_refinement_enabled =
+        dense_pose_enabled && selection.object_pose_refinement.geometry_enabled();
     let feedback_enabled =
         selection.lift_assets && selection.feedback && selection.feedback_iters > 0;
 
@@ -196,7 +197,9 @@ pub(crate) fn scene_placement_pipeline_plan(
         && selection.feedback_rotation_selector == FeedbackRotationSelector::Deterministic
         && selection.feedback_rubric_scorer == FeedbackRubricScorer::Off
         && selection.rotation_fit == SceneRotationFitMode::Off
-        && selection.table_pose_refinement == SceneTablePoseRefinementMode::GatedGpt
+        && selection.object_pose_refinement == SceneObjectPoseRefinementMode::GatedGpt
+        && selection.object_pose_refinement_set
+            == SceneObjectPoseRefinementSet::TablesAndLargeSeating
     {
         "bare_bones_geometric"
     } else if dense_pose_enabled {
@@ -453,23 +456,25 @@ pub(crate) fn scene_placement_pipeline_plan(
         gpt_role: "none",
     }));
     stages.push(stage(StageTemplate {
-        stage: "table_pose_refinement",
+        stage: "object_pose_refinement",
         role: "optimization_specialization",
-        method: match selection.table_pose_refinement {
-            SceneTablePoseRefinementMode::Off => "disabled",
-            SceneTablePoseRefinementMode::Geometry => "table_only_visible_surface_geometry",
-            SceneTablePoseRefinementMode::GatedGpt => "table_only_geometry_with_gpt_gate",
-            SceneTablePoseRefinementMode::AlwaysGpt => "table_only_geometry_with_required_gpt_gate",
+        method: match selection.object_pose_refinement {
+            SceneObjectPoseRefinementMode::Off => "disabled",
+            SceneObjectPoseRefinementMode::Geometry => "object_set_visible_surface_geometry",
+            SceneObjectPoseRefinementMode::GatedGpt => "object_set_geometry_with_gpt_gate",
+            SceneObjectPoseRefinementMode::AlwaysGpt => {
+                "object_set_geometry_with_required_gpt_gate"
+            }
         },
-        enabled: table_refinement_enabled,
-        status: if table_refinement_enabled {
+        enabled: object_refinement_enabled,
+        status: if object_refinement_enabled {
             "active"
-        } else if selection.table_pose_refinement == SceneTablePoseRefinementMode::Off {
+        } else if selection.object_pose_refinement == SceneObjectPoseRefinementMode::Off {
             "disabled"
         } else {
             "waiting_for_dense_pose_inputs"
         },
-        mutual_exclusion_group: "table_pose_refinement",
+        mutual_exclusion_group: "object_pose_refinement",
         evidence_inputs: vec![
             "pose_fit_candidates",
             "object_masks",
@@ -477,12 +482,12 @@ pub(crate) fn scene_placement_pipeline_plan(
             "asset_meshes",
         ],
         outputs: vec![
-            "table_pose_candidates",
-            "updated_table_scene_commands",
-            "gpt_required_table_fit_flags",
+            "object_pose_candidates",
+            "updated_object_scene_commands",
+            "gpt_required_object_fit_flags",
         ],
-        objective: "Apply a stricter table-only X/Z/yaw/uniform-scale refinement after the generic pose solve; large table distortions stay disallowed.",
-        gpt_role: if selection.table_pose_refinement.gpt_allowed() {
+        objective: "Apply a stricter object-set X/Z/yaw/uniform-scale refinement after the generic pose solve; selected objects stay isotropic under the scene scale policy.",
+        gpt_role: if selection.object_pose_refinement.gpt_allowed() {
             "bounded_candidate_selection_after_failed_or_ambiguous_geometry"
         } else {
             "none"
@@ -539,7 +544,7 @@ pub(crate) fn scene_placement_pipeline_plan(
                 "metric_depth",
                 "pose_optimizer",
                 "continuous_refinement",
-                "table_pose_refinement",
+                "object_pose_refinement",
             ],
             true,
             if has_sam {
@@ -557,7 +562,7 @@ pub(crate) fn scene_placement_pipeline_plan(
                 "initial_layout",
                 "pose_optimizer",
                 "continuous_refinement",
-                "table_pose_refinement",
+                "object_pose_refinement",
             ],
             true,
             if has_depth { "verified" } else { "absent" },
@@ -580,7 +585,7 @@ pub(crate) fn scene_placement_pipeline_plan(
             "canonical_asset_pose",
             vec![
                 "pose_optimizer",
-                "table_pose_refinement",
+                "object_pose_refinement",
                 "render_capture_feedback",
             ],
             false,
@@ -668,16 +673,33 @@ pub(crate) fn scene_placement_pipeline_plan(
             "High: this is the direct object transform solver.",
         ),
         ablation_axis(
-            "table_pose_refinement",
-            match selection.table_pose_refinement {
-                SceneTablePoseRefinementMode::Off => "off",
-                SceneTablePoseRefinementMode::Geometry => "geometry",
-                SceneTablePoseRefinementMode::GatedGpt => "gated_gpt",
-                SceneTablePoseRefinementMode::AlwaysGpt => "always_gpt",
+            "object_pose_refinement",
+            match selection.object_pose_refinement {
+                SceneObjectPoseRefinementMode::Off => "off",
+                SceneObjectPoseRefinementMode::Geometry => "geometry",
+                SceneObjectPoseRefinementMode::GatedGpt => "gated_gpt",
+                SceneObjectPoseRefinementMode::AlwaysGpt => "always_gpt",
             },
             vec!["off", "geometry", "gated_gpt", "always_gpt"],
-            "table_pose_refinement",
-            "Medium/high: table-only retry can fix elongated table rotation/position without re-running expensive all-object feedback.",
+            "object_pose_refinement",
+            "Medium/high: selected-object retry can fix difficult object rotation/position without re-running expensive all-object feedback.",
+        ),
+        ablation_axis(
+            "object_pose_refinement_set",
+            match selection.object_pose_refinement_set {
+                SceneObjectPoseRefinementSet::Tables => "tables",
+                SceneObjectPoseRefinementSet::LargeSeating => "large_seating",
+                SceneObjectPoseRefinementSet::TablesAndLargeSeating => "tables_and_large_seating",
+                SceneObjectPoseRefinementSet::AllFurniture => "all_furniture",
+            },
+            vec![
+                "tables",
+                "large_seating",
+                "tables_and_large_seating",
+                "all_furniture",
+            ],
+            "object_pose_refinement",
+            "Medium/high: widening the refinement set can improve more objects but increases runtime and ambiguity.",
         ),
         ablation_axis(
             "scale_policy",
@@ -707,12 +729,10 @@ pub(crate) fn scene_placement_pipeline_plan(
         stages,
         evidence_contracts,
         ablation_axes,
-        active_pose_optimizer: if dense_pose_enabled {
-            if table_refinement_enabled {
-                "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_table_refinement"
-            } else {
-                "visible_surface_dense_depth_search_plus_soft_point_refinement"
-            }
+        active_pose_optimizer: if dense_pose_enabled && object_refinement_enabled {
+            "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_object_refinement"
+        } else if dense_pose_enabled {
+            "visible_surface_dense_depth_search_plus_soft_point_refinement"
         } else if asset_pose_enabled && selection.pose_fit == ScenePoseFitMode::RenderedSilhouette {
             "visible_surface_summary_depth_search"
         } else if asset_pose_enabled {
@@ -806,7 +826,8 @@ mod tests {
             feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
             feedback_rubric_scorer: FeedbackRubricScorer::Off,
             rotation_fit: SceneRotationFitMode::Off,
-            table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
+            object_pose_refinement: SceneObjectPoseRefinementMode::GatedGpt,
+            object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
             max_pose_candidates: 32,
         }
     }
@@ -818,12 +839,12 @@ mod tests {
         assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
         assert_eq!(
             plan.active_pose_optimizer,
-            "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_table_refinement"
+            "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_object_refinement"
         );
         assert!(plan.stages.iter().any(|stage| {
-            stage.stage == "table_pose_refinement"
+            stage.stage == "object_pose_refinement"
                 && stage.enabled
-                && stage.method == "table_only_geometry_with_gpt_gate"
+                && stage.method == "object_set_geometry_with_gpt_gate"
         }));
         assert!(plan.stages.iter().any(|stage| {
             stage.stage == "metric_depth"

@@ -458,8 +458,12 @@ pub(crate) fn default_scene_rotation_fit_write_artifacts() -> bool {
     true
 }
 
-pub(crate) fn default_scene_table_pose_refinement() -> SceneTablePoseRefinementMode {
-    SceneTablePoseRefinementMode::GatedGpt
+pub(crate) fn default_scene_object_pose_refinement() -> SceneObjectPoseRefinementMode {
+    SceneObjectPoseRefinementMode::GatedGpt
+}
+
+pub(crate) fn default_scene_object_pose_refinement_set() -> SceneObjectPoseRefinementSet {
+    SceneObjectPoseRefinementSet::TablesAndLargeSeating
 }
 
 pub(crate) fn default_scene_composition_mode() -> SceneCompositionMode {
