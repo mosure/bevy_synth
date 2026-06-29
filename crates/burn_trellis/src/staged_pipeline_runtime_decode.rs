@@ -836,10 +836,7 @@ fn decimate_mesh_for_face_budget(
     if remapped_indices.len() < 3 {
         return Err("meshopt remap produced empty mesh".to_string());
     }
-    let remapped_faces = remapped_indices
-        .chunks_exact(3)
-        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
-        .collect::<Vec<[u32; 3]>>();
+    let remapped_faces = remapped_indices.as_chunks::<3>().0.to_vec();
 
     *vertices = remapped_vertices;
     *faces = remapped_faces;

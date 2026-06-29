@@ -533,8 +533,8 @@ fn f32_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     let mut out = Vec::with_capacity((bytes.len() / 4) * 2);
-    for chunk in bytes.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in bytes.as_chunks::<4>().0 {
+        let value = f32::from_le_bytes(*chunk);
         out.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
     }
     Ok(out)
@@ -548,10 +548,8 @@ fn f64_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     let mut out = Vec::with_capacity((bytes.len() / 8) * 2);
-    for chunk in bytes.chunks_exact(8) {
-        let value = f64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]) as f32;
+    for chunk in bytes.as_chunks::<8>().0 {
+        let value = f64::from_le_bytes(*chunk) as f32;
         out.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
     }
     Ok(out)
@@ -565,8 +563,8 @@ fn bf16_bytes_to_f16_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     let mut out = Vec::with_capacity(bytes.len());
-    for chunk in bytes.chunks_exact(2) {
-        let value = bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+    for chunk in bytes.as_chunks::<2>().0 {
+        let value = bf16::from_bits(u16::from_le_bytes(*chunk)).to_f32();
         out.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
     }
     Ok(out)
@@ -1494,8 +1492,10 @@ mod tests {
         assert_eq!(f32_tensor.dtype(), Dtype::F16);
         let f32_data = f32_tensor
             .data()
-            .chunks_exact(2)
-            .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| f16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect::<Vec<_>>();
         assert!((f32_data[0] - float_values[0]).abs() <= 1.0e-3);
         assert!((f32_data[1] - float_values[1]).abs() <= 1.0e-3);

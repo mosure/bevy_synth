@@ -2139,7 +2139,7 @@ fn decoder_wgpu_upsample_parity_check(
         ));
     }
     let mut subdivision_mask = vec![[false; 8]; parent_rows];
-    for pair in active_indices.chunks_exact(2) {
+    for pair in active_indices.as_chunks::<2>().0 {
         let parent_idx = usize::try_from(pair[0])
             .map_err(|_| format!("{context}: negative active parent index {}", pair[0]))?;
         let child_idx = usize::try_from(pair[1])
