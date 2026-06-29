@@ -2325,10 +2325,15 @@ fn torch_sobol_seed123_dim3_positions<B: Backend>(
         count <= TORCH_SOBOL_SEED123_DIM3_COUNT,
         "TripoSplat q_token_length {count} exceeds canonical PyTorch Sobol table length {TORCH_SOBOL_SEED123_DIM3_COUNT}"
     );
-    let values = TORCH_SOBOL_SEED123_DIM3_BYTES
-        .chunks_exact(4)
+    let (sobol_chunks, sobol_remainder) = TORCH_SOBOL_SEED123_DIM3_BYTES.as_chunks::<4>();
+    assert!(
+        sobol_remainder.is_empty(),
+        "canonical TripoSplat Sobol byte table must contain whole f32 values"
+    );
+    let values = sobol_chunks
+        .iter()
         .take(count * 3)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     Param::from_tensor(
         Tensor::<B, 1>::from_data(TensorData::new(values, [count * 3]), (device, DType::F32))
@@ -2347,10 +2352,16 @@ fn canonical_latent_position_embedding<B: Backend>(
             count <= TORCH_LATENT_POSITION_SEED123_COUNT,
             "TripoSplat q_token_length {count} exceeds canonical PyTorch latent position table length {TORCH_LATENT_POSITION_SEED123_COUNT}"
         );
-        let values = TORCH_LATENT_POSITION_SEED123_BYTES
-            .chunks_exact(4)
+        let (position_chunks, position_remainder) =
+            TORCH_LATENT_POSITION_SEED123_BYTES.as_chunks::<4>();
+        assert!(
+            position_remainder.is_empty(),
+            "canonical TripoSplat latent-position byte table must contain whole f32 values"
+        );
+        let values = position_chunks
+            .iter()
             .take(count * channels)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         Tensor::<B, 1>::from_data(
             TensorData::new(values, [count * channels]),
