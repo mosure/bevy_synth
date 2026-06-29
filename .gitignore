@@ -39,6 +39,8 @@ scripts/*
 !scripts/bundle_web_assets.ps1
 !scripts/check_trellis_strict_benchmark_invariants.py
 !scripts/guard_canonical_runtime.sh
+!scripts/trellis2_blender_render_compare.py
+!scripts/trellis2_render_psnr.py
 !scripts/trellis2_python_reference.py
 !scripts/trellis2_perf_matrix.sh
 !scripts/triposplat_bootstrap.sh

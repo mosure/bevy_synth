@@ -518,8 +518,14 @@ struct DecodeRuntimeTimings {
     stage_fenced: bool,
     shape_decoder_ms: f64,
     tex_decoder_ms: f64,
+    output_materialize_ms: f64,
     attr_merge_ms: f64,
     mesh_ms: f64,
+    remesh_bvh_ms: f64,
+    remesh_refine_ms: f64,
+    remesh_dc_ms: f64,
+    remesh_cleanup_ms: f64,
+    remesh_total_ms: f64,
     pre_pbr_decimate_ms: f64,
     pbr_ms: f64,
     shape_conv_calls: u64,
@@ -570,10 +576,17 @@ pub struct TrellisStageTimings {
     pub tex_slat_flow_ops: SparseFlowOpTimingSummary,
     pub decode_ms: f64,
     pub decode_stage_fenced: bool,
+    pub decode_model_load_ms: f64,
     pub decode_shape_decoder_ms: f64,
     pub decode_tex_decoder_ms: f64,
+    pub decode_output_materialize_ms: f64,
     pub decode_attr_merge_ms: f64,
     pub decode_mesh_ms: f64,
+    pub decode_remesh_bvh_ms: f64,
+    pub decode_remesh_refine_ms: f64,
+    pub decode_remesh_dc_ms: f64,
+    pub decode_remesh_cleanup_ms: f64,
+    pub decode_remesh_total_ms: f64,
     pub decode_pre_pbr_decimate_ms: f64,
     pub decode_pbr_ms: f64,
     pub decode_shape_conv_calls: u64,
@@ -2135,12 +2148,14 @@ impl TrellisStageRuntime {
         let decode_start = Instant::now();
         trellis_stage_log!("burn_trellis: stage decode begin");
         set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+        let decode_model_load_start = Instant::now();
         let shape_decoder_runtime = self.shape_decoder_runtime();
         let tex_decoder_runtime = if run_config.decode_output_mode.needs_texture_attrs() {
             self.tex_decoder_runtime()
         } else {
             None
         };
+        let decode_model_load_ms = decode_model_load_start.elapsed().as_secs_f64() * 1000.0;
         let decode_overrides = DecodeHookOverrides {
             decode_shape_subs: decode_shape_subs_override,
             decode_tex_voxels: decode_tex_voxels_override,
@@ -2203,10 +2218,17 @@ impl TrellisStageRuntime {
             tex_slat_flow_ops,
             decode_ms,
             decode_stage_fenced: decoded.timings.stage_fenced,
+            decode_model_load_ms,
             decode_shape_decoder_ms: decoded.timings.shape_decoder_ms,
             decode_tex_decoder_ms: decoded.timings.tex_decoder_ms,
+            decode_output_materialize_ms: decoded.timings.output_materialize_ms,
             decode_attr_merge_ms: decoded.timings.attr_merge_ms,
             decode_mesh_ms: decoded.timings.mesh_ms,
+            decode_remesh_bvh_ms: decoded.timings.remesh_bvh_ms,
+            decode_remesh_refine_ms: decoded.timings.remesh_refine_ms,
+            decode_remesh_dc_ms: decoded.timings.remesh_dc_ms,
+            decode_remesh_cleanup_ms: decoded.timings.remesh_cleanup_ms,
+            decode_remesh_total_ms: decoded.timings.remesh_total_ms,
             decode_pre_pbr_decimate_ms: decoded.timings.pre_pbr_decimate_ms,
             decode_pbr_ms: decoded.timings.pbr_ms,
             decode_shape_conv_calls: decoded.timings.shape_conv_calls,
@@ -2623,6 +2645,7 @@ impl TrellisStageRuntime {
         trellis_stage_log!("burn_trellis: stage decode begin");
         #[cfg(feature = "runtime-model")]
         set_runtime_model_debug_config_for_stage(run_config, RuntimeFlowStage::SLat);
+        let decode_model_load_start = Instant::now();
         #[cfg(feature = "runtime-model")]
         let shape_decoder_runtime = self.shape_decoder_runtime();
         #[cfg(feature = "runtime-model")]
@@ -2631,6 +2654,7 @@ impl TrellisStageRuntime {
         } else {
             None
         };
+        let decode_model_load_ms = decode_model_load_start.elapsed().as_secs_f64() * 1000.0;
         let decode_overrides = DecodeHookOverrides {
             decode_shape_subs: decode_shape_subs_override,
             decode_tex_voxels: decode_tex_voxels_override,
@@ -2700,10 +2724,17 @@ impl TrellisStageRuntime {
             tex_slat_flow_ops,
             decode_ms,
             decode_stage_fenced: decoded.timings.stage_fenced,
+            decode_model_load_ms,
             decode_shape_decoder_ms: decoded.timings.shape_decoder_ms,
             decode_tex_decoder_ms: decoded.timings.tex_decoder_ms,
+            decode_output_materialize_ms: decoded.timings.output_materialize_ms,
             decode_attr_merge_ms: decoded.timings.attr_merge_ms,
             decode_mesh_ms: decoded.timings.mesh_ms,
+            decode_remesh_bvh_ms: decoded.timings.remesh_bvh_ms,
+            decode_remesh_refine_ms: decoded.timings.remesh_refine_ms,
+            decode_remesh_dc_ms: decoded.timings.remesh_dc_ms,
+            decode_remesh_cleanup_ms: decoded.timings.remesh_cleanup_ms,
+            decode_remesh_total_ms: decoded.timings.remesh_total_ms,
             decode_pre_pbr_decimate_ms: decoded.timings.pre_pbr_decimate_ms,
             decode_pbr_ms: decoded.timings.pbr_ms,
             decode_shape_conv_calls: decoded.timings.shape_conv_calls,

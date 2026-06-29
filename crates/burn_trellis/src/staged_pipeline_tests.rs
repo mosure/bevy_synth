@@ -1300,9 +1300,10 @@ fn native_pbr_simple_dc_remesh_extracts_nonempty_surface() {
         faces: faces.as_slice(),
     })
     .expect("projection bvh should build");
-    let (remeshed_vertices, remeshed_faces) =
-        super::remesh_narrow_band_simple_dc_with_projection_bvh(&bvh, 32, 1.0)
-            .expect("simple dc remesh should extract a surface");
+    let remeshed = super::remesh_narrow_band_simple_dc_with_projection_bvh(&bvh, 32, 1.0, Some(1))
+        .expect("simple dc remesh should extract a surface");
+    let remeshed_vertices = remeshed.vertices;
+    let remeshed_faces = remeshed.faces;
 
     assert!(!remeshed_vertices.is_empty());
     assert!(!remeshed_faces.is_empty());
@@ -1315,6 +1316,49 @@ fn native_pbr_simple_dc_remesh_extracts_nonempty_surface() {
             .iter()
             .all(|component| component.is_finite() && component.abs() <= 0.6)
     }));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_pbr_simple_dc_remesh_parallel_matches_serial() {
+    let vertices = vec![
+        [-0.25, -0.25, -0.25],
+        [0.25, -0.25, -0.25],
+        [0.25, 0.25, -0.25],
+        [-0.25, 0.25, -0.25],
+        [-0.25, -0.25, 0.25],
+        [0.25, -0.25, 0.25],
+        [0.25, 0.25, 0.25],
+        [-0.25, 0.25, 0.25],
+    ];
+    let faces = vec![
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+    ];
+    let bvh = super::build_projection_bvh_for_pbr(super::PbrProjectionSource {
+        vertices: vertices.as_slice(),
+        faces: faces.as_slice(),
+    })
+    .expect("projection bvh should build");
+
+    let serial = super::remesh_narrow_band_simple_dc_with_projection_bvh(&bvh, 32, 1.0, Some(1))
+        .expect("serial simple dc remesh should extract a surface");
+    let parallel =
+        super::remesh_narrow_band_simple_dc_with_projection_bvh(&bvh, 32, 1.0, Some(4))
+            .expect("parallel simple dc remesh should extract a surface");
+
+    assert_eq!(parallel.vertices, serial.vertices);
+    assert_eq!(parallel.faces, serial.faces);
 }
 
 #[test]

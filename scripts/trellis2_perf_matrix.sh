@@ -25,6 +25,7 @@ render_psnr="${TRELLIS2_RENDER_PSNR:-0}"
 output_glb="${TRELLIS2_OUTPUT_GLB:-${render_psnr}}"
 burn_glb_export_mode="${TRELLIS2_GLB_EXPORT_MODE:-native}"
 render_burn_mode="${TRELLIS2_RENDER_BURN_MODE:-runtime}"
+render_engine="${TRELLIS2_RENDER_ENGINE:-blender}"
 render_psnr_resolution="${TRELLIS2_RENDER_PSNR_RESOLUTION:-512}"
 render_fail_min_psnr="${TRELLIS2_RENDER_FAIL_MIN_PSNR:-28}"
 render_fail_min_mask_iou="${TRELLIS2_RENDER_FAIL_MIN_MASK_IOU:-}"
@@ -82,6 +83,7 @@ cat > "${run_dir}/config.json" <<JSON
   "burn_glb_export_mode": "${burn_glb_export_mode}",
   "render_psnr": ${render_psnr},
   "render_burn_mode": "${render_burn_mode}",
+  "render_engine": "${render_engine}",
   "render_psnr_resolution": ${render_psnr_resolution},
   "render_fail_min_psnr": "${render_fail_min_psnr}",
   "render_fail_min_mask_iou": "${render_fail_min_mask_iou}",
@@ -274,24 +276,56 @@ fi
 
 if [[ "${render_psnr}" == "1" ]]; then
   mkdir -p "${run_dir}/render_psnr"
-  render_args=(
-    scripts/trellis2_render_psnr.py \
-    --reference "${python_glb}" \
-    --actual "${render_actual_glb}" \
-    --out-dir "${run_dir}/render_psnr" \
-    --resolution "${render_psnr_resolution}"
-  )
-  if [[ -n "${render_fail_min_psnr}" ]]; then
-    render_args+=(--fail-min-psnr "${render_fail_min_psnr}")
-  fi
-  if [[ -n "${render_fail_min_mask_iou}" ]]; then
-    render_args+=(--fail-min-mask-iou "${render_fail_min_mask_iou}")
-  fi
+  case "${render_engine}" in
+    blender)
+      if ! command -v blender >/dev/null 2>&1; then
+        echo "TRELLIS2_RENDER_ENGINE=blender requires blender on PATH" >&2
+        exit 2
+      fi
+      render_cmd=(blender --background --python scripts/trellis2_blender_render_compare.py --)
+      render_args=(
+        --reference "${python_glb}" \
+        --actual "${render_actual_glb}" \
+        --out-dir "${run_dir}/render_psnr" \
+        --resolution "${render_psnr_resolution}"
+      )
+      if [[ -n "${render_fail_min_psnr}" ]]; then
+        render_args+=(--fail-min-psnr "${render_fail_min_psnr}")
+      fi
+      ;;
+    splat)
+      render_cmd=("${python_bin}")
+      render_args=(
+        scripts/trellis2_render_psnr.py \
+        --reference "${python_glb}" \
+        --actual "${render_actual_glb}" \
+        --out-dir "${run_dir}/render_psnr" \
+        --resolution "${render_psnr_resolution}"
+      )
+      if [[ -n "${render_fail_min_psnr}" ]]; then
+        render_args+=(--fail-min-psnr "${render_fail_min_psnr}")
+      fi
+      if [[ -n "${render_fail_min_mask_iou}" ]]; then
+        render_args+=(--fail-min-mask-iou "${render_fail_min_mask_iou}")
+      fi
+      ;;
+    *)
+      echo "unsupported TRELLIS2_RENDER_ENGINE='${render_engine}'" >&2
+      exit 2
+      ;;
+  esac
   set +e
-  timeout "${timeout_s}s" "${python_bin}" "${render_args[@]}" \
-    > "${run_dir}/render_psnr/stdout.log" \
-    2> "${run_dir}/render_psnr/stderr.log"
-  status="$?"
+  if [[ "${render_engine}" == "blender" ]]; then
+    timeout "${timeout_s}s" "${render_cmd[@]}" "${render_args[@]}" \
+      2>&1 | tee "${run_dir}/render_psnr/stdout.log" >/dev/null
+    status="${PIPESTATUS[0]}"
+    : > "${run_dir}/render_psnr/stderr.log"
+  else
+    timeout "${timeout_s}s" "${render_cmd[@]}" "${render_args[@]}" \
+      > "${run_dir}/render_psnr/stdout.log" \
+      2> "${run_dir}/render_psnr/stderr.log"
+    status="$?"
+  fi
   set -e
   printf '%s\n' "${status}" > "${run_dir}/render_psnr/status.txt"
   if [[ "${status}" != "0" ]]; then
@@ -463,12 +497,14 @@ if py_summary is not None and burn_report is not None:
     if "last" in burn_report:
         burn_timings = get_path(burn_report, "last", "timings_ms") or burn_timings
     burn_decode_ms = ms(burn_timings.get("decode"))
+    burn_decode_model_load_ms = ms(burn_timings.get("decode_model_load")) or 0.0
     burn_decode_pbr_ms = ms(burn_timings.get("decode_pbr")) or 0.0
+    burn_decode_remesh_ms = ms(burn_timings.get("decode_remesh_total")) or 0.0
     burn_decode_pre_pbr_decimate_ms = ms(burn_timings.get("decode_pre_pbr_decimate")) or 0.0
     burn_decode_latent_ms = (
         None
         if burn_decode_ms is None
-        else max(0.0, burn_decode_ms - burn_decode_pbr_ms - burn_decode_pre_pbr_decimate_ms)
+        else max(0.0, burn_decode_ms - burn_decode_model_load_ms - burn_decode_pbr_ms - burn_decode_remesh_ms - burn_decode_pre_pbr_decimate_ms)
     )
     comparisons = {
         "preprocess": (ms(burn_timings.get("preprocess")), py_stage.get("preprocess")),
@@ -485,9 +521,16 @@ if py_summary is not None and burn_report is not None:
             or py_stage.get("shape_slat_1024"),
         ),
         "tex_slat": (ms(burn_timings.get("tex_slat")), py_stage.get("tex_slat")),
+        "decode_model_load": (ms(burn_timings.get("decode_model_load")), None),
         "decode_shape": (ms(burn_timings.get("decode_shape_decoder")), py_stage.get("decode_shape")),
         "decode_tex": (ms(burn_timings.get("decode_tex_decoder")), py_stage.get("decode_tex")),
+        "decode_output_materialize": (ms(burn_timings.get("decode_output_materialize")), None),
         "decode_latent_total": (burn_decode_latent_ms, py_stage.get("decode_latent_total")),
+        "decode_remesh_bvh": (ms(burn_timings.get("decode_remesh_bvh")), None),
+        "decode_remesh_refine": (ms(burn_timings.get("decode_remesh_refine")), None),
+        "decode_remesh_dc": (ms(burn_timings.get("decode_remesh_dc")), None),
+        "decode_remesh_cleanup": (ms(burn_timings.get("decode_remesh_cleanup")), None),
+        "decode_remesh_total": (ms(burn_timings.get("decode_remesh_total")), None),
         "decode_pre_pbr_decimate": (ms(burn_timings.get("decode_pre_pbr_decimate")), None),
         "decode_native_pbr": (ms(burn_timings.get("decode_pbr")), None),
         "decode_runtime_total": (burn_decode_ms, None),
@@ -548,7 +591,7 @@ lines.append("")
 lines.append("## GPU")
 lines.append(f"- {summary['gpu']}")
 if render_summary is not None:
-    render = render_summary.get("summary", {})
+    render = render_summary.get("summary") or render_summary
     lines.append("")
     lines.append("## Render PSNR")
     lines.append(

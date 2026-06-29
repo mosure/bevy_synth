@@ -1,7 +1,10 @@
 #![recursion_limit = "256"]
 
 mod app;
+#[cfg(not(target_arch = "wasm32"))]
+mod depth_debug;
 mod infinite_grid;
+mod panorbit;
 #[cfg(all(
     target_arch = "wasm32",
     target_os = "unknown",

@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{CameraOutputMode, RenderTarget};
+use bevy::input::mouse::MouseScrollUnit;
 use bevy::light::{DirectionalLight, PointLight};
 use bevy::pbr::MeshMaterial3d;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::ui::widget::Button;
+use bevy::ui::{ComputedNode, OverflowAxis, ScrollPosition};
 use bevy::window::PrimaryWindow;
 use bevy_gaussian_splatting::gaussian::settings::GaussianColorSpace;
 use bevy_gaussian_splatting::sort::SortMode;
@@ -25,6 +27,7 @@ use bevy_gaussian_splatting::{
 };
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
 use bevy_picking::Pickable;
+use bevy_picking::events::{Pointer, Scroll as PointerScroll};
 use log::info;
 
 /// Internalized editor-core module.
@@ -66,6 +69,9 @@ const CATALOG_TOGGLE_BUTTON_WIDTH: f32 = 44.0;
 const PIPELINE_SELECTOR_WIDTH: f32 = 176.0;
 const PIPELINE_SELECTOR_HEIGHT: f32 = 30.0;
 const STATUS_BADGE_WIDTH: f32 = 260.0;
+const SETTINGS_MODAL_WIDTH: f32 = 560.0;
+const SETTINGS_MODAL_MAX_HEIGHT_VH: f32 = 88.0;
+const SETTINGS_TAB_BODY_MAX_HEIGHT_VH: f32 = 64.0;
 const PREVIEW_SIZE: u32 = 128;
 const PREVIEW_MAX_LAYER: usize = 30;
 const GIZMO_LAYER: usize = 12;
@@ -150,11 +156,17 @@ const VIEWER_GROUND_Y_MIN: f32 = -2.0;
 const VIEWER_GROUND_Y_MAX: f32 = 2.0;
 const VIEWER_FRUSTUM_LENGTH_MIN: f32 = 0.05;
 const VIEWER_FRUSTUM_LENGTH_MAX: f32 = 3.0;
+const VIEWER_DEPTH_CLOUD_MIN_GAUSSIANS: usize = 8_192;
+const VIEWER_DEPTH_CLOUD_DEFAULT_GAUSSIANS: usize = 262_144;
+const VIEWER_DEPTH_CLOUD_MAX_GAUSSIANS: usize = 1280 * 720;
+const VIEWER_DEPTH_CLOUD_GAUSSIAN_STEP: usize = 32_768;
 const PROCESSING_EVENT_LIMIT: usize = 16;
 const PROCESSING_ARTIFACT_LIMIT: usize = 8;
 const DEVELOPER_EVENT_ROWS: usize = 12;
 const DEVELOPER_ARTIFACT_ROWS: usize = 10;
-const DEVELOPER_VISUAL_ROWS: usize = 8;
+const DEVELOPER_VISUAL_ROWS: usize = 3;
+const DEVELOPER_VISUAL_THUMB_WIDTH: f32 = 144.0;
+const DEVELOPER_VISUAL_THUMB_HEIGHT: f32 = 82.0;
 
 #[derive(Component)]
 pub struct MainCamera;
@@ -183,6 +195,7 @@ pub struct ViewerDebugSettings {
     pub draw_ground_contact: bool,
     pub draw_scene_camera_frustum: bool,
     pub depth_cloud_overlay: bool,
+    pub depth_cloud_max_gaussians: usize,
     pub ground_y: f32,
     pub contact_tolerance: f32,
     pub scene_camera_frustum_length: f32,
@@ -195,6 +208,7 @@ impl Default for ViewerDebugSettings {
             draw_ground_contact: true,
             draw_scene_camera_frustum: true,
             depth_cloud_overlay: false,
+            depth_cloud_max_gaussians: VIEWER_DEPTH_CLOUD_DEFAULT_GAUSSIANS,
             ground_y: 0.0,
             contact_tolerance: 0.02,
             scene_camera_frustum_length: DEFAULT_VIEWER_FRUSTUM_LENGTH,
@@ -751,6 +765,7 @@ impl Plugin for BurnSynthUiPlugin {
             .add_message::<SceneRenameRequest>()
             .add_message::<SceneBuildRequest>()
             .add_message::<SceneSaveRequest>()
+            .add_observer(handle_settings_scroll)
             .add_systems(Startup, setup_ui)
             .add_systems(
                 Update,
@@ -1502,10 +1517,16 @@ struct SettingsTabPanel {
     tab: SettingsModalTab,
 }
 
+#[derive(Component)]
+struct SettingsScrollArea;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsModalTab {
     #[default]
     Pipeline,
+    Generation,
+    Grounding,
+    Debug,
     General,
     Physics,
     Developer,
@@ -1515,6 +1536,9 @@ impl SettingsModalTab {
     fn label(self) -> &'static str {
         match self {
             Self::Pipeline => "pipeline",
+            Self::Generation => "generation",
+            Self::Grounding => "grounding",
+            Self::Debug => "debug",
             Self::General => "general",
             Self::Physics => "physics",
             Self::Developer => "developer",
@@ -1700,6 +1724,7 @@ enum ViewerDebugNumericSetting {
     GroundY,
     ContactTolerance,
     SceneCameraFrustumLength,
+    DepthCloudMaxGaussians,
 }
 
 #[derive(Component)]
@@ -4842,6 +4867,28 @@ fn handle_settings_tab_button(
     }
 }
 
+fn handle_settings_scroll(
+    mut scroll: On<Pointer<PointerScroll>>,
+    mut query: Query<(&Node, &ComputedNode, &mut ScrollPosition), With<SettingsScrollArea>>,
+) {
+    let Ok((node, computed, mut scroll_position)) = query.get_mut(scroll.entity) else {
+        return;
+    };
+    if node.overflow.y != OverflowAxis::Scroll || scroll.y == 0.0 {
+        return;
+    }
+
+    scroll.propagate(false);
+    let visible_size = computed.size() * computed.inverse_scale_factor();
+    let content_size = computed.content_size() * computed.inverse_scale_factor();
+    let max_offset = (content_size - visible_size).max(Vec2::ZERO);
+    let unit = match scroll.unit {
+        MouseScrollUnit::Line => MouseScrollUnit::SCROLL_UNIT_CONVERSION_FACTOR,
+        MouseScrollUnit::Pixel => 1.0,
+    };
+    scroll_position.y = (scroll_position.y - scroll.y * unit).clamp(0.0, max_offset.y);
+}
+
 fn handle_developer_panel_tab_button(
     mut state: ResMut<DeveloperPanelState>,
     mut interactions: Query<(&Interaction, &SettingsDeveloperTabButton), Changed<Interaction>>,
@@ -4931,6 +4978,17 @@ fn handle_viewer_debug_step_button(
                 settings.scene_camera_frustum_length = (settings.scene_camera_frustum_length
                     + button.delta)
                     .clamp(VIEWER_FRUSTUM_LENGTH_MIN, VIEWER_FRUSTUM_LENGTH_MAX);
+            }
+            ViewerDebugNumericSetting::DepthCloudMaxGaussians => {
+                let next = settings.depth_cloud_max_gaussians as f32 + button.delta;
+                let stepped = (next / VIEWER_DEPTH_CLOUD_GAUSSIAN_STEP as f32).round()
+                    * VIEWER_DEPTH_CLOUD_GAUSSIAN_STEP as f32;
+                settings.depth_cloud_max_gaussians = stepped
+                    .clamp(
+                        VIEWER_DEPTH_CLOUD_MIN_GAUSSIANS as f32,
+                        VIEWER_DEPTH_CLOUD_MAX_GAUSSIANS as f32,
+                    )
+                    .round() as usize;
             }
         }
     }
@@ -5394,6 +5452,9 @@ fn update_viewer_debug_labels(
             ViewerDebugNumericSetting::SceneCameraFrustumLength => {
                 format!("{:.2}", viewer_debug.scene_camera_frustum_length)
             }
+            ViewerDebugNumericSetting::DepthCloudMaxGaussians => {
+                format!("{}", viewer_debug.depth_cloud_max_gaussians)
+            }
         };
         if label.0 != next {
             label.0 = next;
@@ -5803,11 +5864,13 @@ fn spawn_settings_modal(
         .with_children(|root| {
             root.spawn((
                 Node {
-                    width: Val::Px(520.0),
+                    width: Val::Px(SETTINGS_MODAL_WIDTH),
+                    max_height: Val::Vh(SETTINGS_MODAL_MAX_HEIGHT_VH),
                     flex_direction: FlexDirection::Column,
                     row_gap: Val::Px(14.0),
                     padding: UiRect::all(Val::Px(16.0)),
                     border: UiRect::all(Val::Px(1.0)),
+                    overflow: Overflow::clip_y(),
                     ..default()
                 },
                 BackgroundColor(MODAL_BG),
@@ -5850,54 +5913,12 @@ fn spawn_settings_modal(
                             });
                     });
 
-                spawn_settings_tabs(panel);
-                spawn_settings_tab_panel(
-                    panel,
-                    SettingsModalTab::Pipeline,
-                    active_tab == SettingsModalTab::Pipeline,
-                    |panel| match pipeline {
-                        CatalogPipelineChoice::Object(SynthesisModel::Triposg) => {
-                            spawn_object_pipeline_selector(panel, available, pipeline);
-                            spawn_triposg_settings(panel)
-                        }
-                        CatalogPipelineChoice::Object(SynthesisModel::Triposplat) => {
-                            spawn_object_pipeline_selector(panel, available, pipeline);
-                            spawn_triposplat_settings(panel)
-                        }
-                        CatalogPipelineChoice::Object(SynthesisModel::Trellis) => {
-                            spawn_object_pipeline_selector(panel, available, pipeline);
-                            spawn_trellis_settings(panel)
-                        }
-                        CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => {
-                            spawn_scene_pipeline_selector(panel, available);
-                            spawn_scene_settings(panel)
-                        }
-                    },
-                );
-                spawn_settings_tab_panel(
-                    panel,
-                    SettingsModalTab::General,
-                    active_tab == SettingsModalTab::General,
-                    |panel| {
-                        spawn_general_settings(panel);
-                    },
-                );
-                spawn_settings_tab_panel(
-                    panel,
-                    SettingsModalTab::Physics,
-                    active_tab == SettingsModalTab::Physics,
-                    |panel| {
-                        spawn_physics_settings(panel);
-                    },
-                );
-                spawn_settings_tab_panel(
-                    panel,
-                    SettingsModalTab::Developer,
-                    active_tab == SettingsModalTab::Developer,
-                    |panel| {
-                        spawn_developer_settings(panel);
-                    },
-                );
+                spawn_settings_tabs(panel, pipeline);
+                for tab in settings_tabs_for_pipeline(pipeline) {
+                    spawn_settings_tab_panel(panel, tab, active_tab == tab, |panel| {
+                        spawn_settings_tab_content(panel, pipeline, tab, available);
+                    });
+                }
             });
         })
         .id()
@@ -5912,20 +5933,38 @@ fn settings_modal_title(pipeline: CatalogPipelineChoice) -> &'static str {
     }
 }
 
-fn spawn_settings_tabs(panel: &mut ChildSpawnerCommands) {
+fn settings_tabs_for_pipeline(pipeline: CatalogPipelineChoice) -> Vec<SettingsModalTab> {
+    match pipeline {
+        CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit) => vec![
+            SettingsModalTab::Pipeline,
+            SettingsModalTab::Generation,
+            SettingsModalTab::Grounding,
+            SettingsModalTab::Debug,
+            SettingsModalTab::General,
+            SettingsModalTab::Physics,
+            SettingsModalTab::Developer,
+        ],
+        CatalogPipelineChoice::Object(_) => vec![
+            SettingsModalTab::Pipeline,
+            SettingsModalTab::General,
+            SettingsModalTab::Physics,
+            SettingsModalTab::Developer,
+        ],
+    }
+}
+
+fn spawn_settings_tabs(panel: &mut ChildSpawnerCommands, pipeline: CatalogPipelineChoice) {
     panel
         .spawn(Node {
+            width: Val::Percent(100.0),
             flex_direction: FlexDirection::Row,
             column_gap: Val::Px(6.0),
+            row_gap: Val::Px(6.0),
+            flex_wrap: FlexWrap::Wrap,
             ..default()
         })
         .with_children(|row| {
-            for tab in [
-                SettingsModalTab::Pipeline,
-                SettingsModalTab::General,
-                SettingsModalTab::Physics,
-                SettingsModalTab::Developer,
-            ] {
+            for tab in settings_tabs_for_pipeline(pipeline) {
                 row.spawn((
                     Button,
                     SettingsTabButton { tab },
@@ -5952,6 +5991,50 @@ fn spawn_settings_tabs(panel: &mut ChildSpawnerCommands) {
         });
 }
 
+fn spawn_settings_tab_content(
+    panel: &mut ChildSpawnerCommands,
+    pipeline: CatalogPipelineChoice,
+    tab: SettingsModalTab,
+    available: Option<&AvailablePipelines>,
+) {
+    match (pipeline, tab) {
+        (CatalogPipelineChoice::Object(SynthesisModel::Triposg), SettingsModalTab::Pipeline) => {
+            spawn_object_pipeline_selector(panel, available, pipeline);
+            spawn_triposg_settings(panel);
+        }
+        (CatalogPipelineChoice::Object(SynthesisModel::Triposplat), SettingsModalTab::Pipeline) => {
+            spawn_object_pipeline_selector(panel, available, pipeline);
+            spawn_triposplat_settings(panel);
+        }
+        (CatalogPipelineChoice::Object(SynthesisModel::Trellis), SettingsModalTab::Pipeline) => {
+            spawn_object_pipeline_selector(panel, available, pipeline);
+            spawn_trellis_settings(panel);
+        }
+        (CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit), SettingsModalTab::Pipeline) => {
+            spawn_scene_pipeline_settings(panel, available);
+        }
+        (
+            CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit),
+            SettingsModalTab::Generation,
+        ) => {
+            spawn_scene_generation_settings(panel);
+        }
+        (
+            CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit),
+            SettingsModalTab::Grounding,
+        ) => {
+            spawn_scene_grounding_settings(panel);
+        }
+        (CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit), SettingsModalTab::Debug) => {
+            spawn_scene_debug_settings(panel);
+        }
+        (_, SettingsModalTab::General) => spawn_general_settings(panel),
+        (_, SettingsModalTab::Physics) => spawn_physics_settings(panel),
+        (_, SettingsModalTab::Developer) => spawn_developer_settings(panel),
+        _ => {}
+    }
+}
+
 fn spawn_settings_tab_panel(
     parent: &mut ChildSpawnerCommands,
     tab: SettingsModalTab,
@@ -5961,7 +6044,10 @@ fn spawn_settings_tab_panel(
     parent
         .spawn((
             SettingsTabPanel { tab },
+            SettingsScrollArea,
             Node {
+                width: Val::Percent(100.0),
+                max_height: Val::Vh(SETTINGS_TAB_BODY_MAX_HEIGHT_VH),
                 display: if visible {
                     Display::Flex
                 } else {
@@ -5969,8 +6055,11 @@ fn spawn_settings_tab_panel(
                 },
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(10.0),
+                overflow: Overflow::scroll_y(),
+                padding: UiRect::right(Val::Px(4.0)),
                 ..default()
             },
+            ScrollPosition::default(),
             if visible {
                 Visibility::Visible
             } else {
@@ -6262,7 +6351,15 @@ fn spawn_trellis_settings(panel: &mut ChildSpawnerCommands) {
     spawn_trellis_setting_row(panel, "sparse cap", TrellisSetting::MaxSparseCoords);
 }
 
-fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
+fn spawn_scene_pipeline_settings(
+    panel: &mut ChildSpawnerCommands,
+    available: Option<&AvailablePipelines>,
+) {
+    spawn_scene_pipeline_selector(panel, available);
+    spawn_scene_quality_settings(panel);
+}
+
+fn spawn_scene_quality_settings(panel: &mut ChildSpawnerCommands) {
     panel
         .spawn(Node {
             flex_direction: FlexDirection::Column,
@@ -6317,11 +6414,19 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
                     ));
                 });
         });
+}
 
-    spawn_scene_setting_row(panel, "candidates", SceneSetting::CandidateCount, 1);
-    spawn_scene_setting_row(panel, "ground cal", SceneSetting::GroundCalibration, 1);
+fn spawn_scene_generation_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_scene_settings_section_label(panel, "asset generation");
     spawn_scene_setting_row(panel, "instances", SceneSetting::InstanceGeneration, 1);
-    spawn_scene_setting_row(panel, "table refine", SceneSetting::TablePoseRefinement, 1);
+    spawn_scene_toggle_row(panel, "lift assets", SceneToggleSetting::LiftAssets);
+    spawn_scene_toggle_row(panel, "catalog reuse", SceneToggleSetting::CatalogReuse);
+    spawn_scene_toggle_row(
+        panel,
+        "promote catalog",
+        SceneToggleSetting::PromoteToCatalog,
+    );
+    spawn_scene_settings_section_label(panel, "mesh output");
     spawn_scene_toggle_row(panel, "pbr textures", SceneToggleSetting::Pbr);
     spawn_scene_setting_row(
         panel,
@@ -6335,21 +6440,26 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
         SceneSetting::TargetFaces,
         TRELLIS_FACE_STEP as isize,
     );
-    spawn_scene_toggle_row(panel, "catalog reuse", SceneToggleSetting::CatalogReuse);
-    spawn_scene_settings_section_label(panel, "debug ablations");
-    spawn_scene_setting_row(panel, "feedback iters", SceneSetting::FeedbackIterations, 1);
-    spawn_scene_toggle_row(panel, "lift assets", SceneToggleSetting::LiftAssets);
+}
+
+fn spawn_scene_grounding_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_scene_settings_section_label(panel, "layout search");
+    spawn_scene_setting_row(panel, "candidates", SceneSetting::CandidateCount, 1);
+    spawn_scene_setting_row(panel, "ground cal", SceneSetting::GroundCalibration, 1);
+    spawn_scene_setting_row(panel, "table refine", SceneSetting::TablePoseRefinement, 1);
+    spawn_scene_settings_section_label(panel, "evidence");
     spawn_scene_toggle_row(panel, "locate bboxes", SceneToggleSetting::LocateAnything);
     spawn_scene_toggle_row(panel, "depth/floor", SceneToggleSetting::Depth);
     spawn_scene_toggle_row(panel, "sam masks", SceneToggleSetting::Segmentation);
     spawn_scene_toggle_row(panel, "visible fit", SceneToggleSetting::PoseFit);
+}
+
+fn spawn_scene_debug_settings(panel: &mut ChildSpawnerCommands) {
+    spawn_scene_settings_section_label(panel, "feedback");
+    spawn_scene_setting_row(panel, "feedback iters", SceneSetting::FeedbackIterations, 1);
     spawn_scene_toggle_row(panel, "feedback loop", SceneToggleSetting::Feedback);
+    spawn_scene_settings_section_label(panel, "artifacts");
     spawn_scene_toggle_row(panel, "write artifacts", SceneToggleSetting::WriteArtifacts);
-    spawn_scene_toggle_row(
-        panel,
-        "promote catalog",
-        SceneToggleSetting::PromoteToCatalog,
-    );
 }
 
 fn spawn_general_settings(panel: &mut ChildSpawnerCommands) {
@@ -6397,6 +6507,12 @@ fn spawn_developer_settings(panel: &mut ChildSpawnerCommands) {
             panel,
             "depth rgb splats",
             ViewerDebugToggleSetting::DepthCloud,
+        );
+        spawn_viewer_debug_numeric_row(
+            panel,
+            "depth splat cap",
+            ViewerDebugNumericSetting::DepthCloudMaxGaussians,
+            VIEWER_DEPTH_CLOUD_GAUSSIAN_STEP as f32,
         );
     });
     spawn_developer_tab_panel(panel, DeveloperPanelTab::Events, false, |panel| {
@@ -6605,8 +6721,8 @@ fn spawn_developer_visual_preview_row(
         .with_children(|row| {
             row.spawn((
                 Node {
-                    width: Val::Px(168.0),
-                    height: Val::Px(96.0),
+                    width: Val::Px(DEVELOPER_VISUAL_THUMB_WIDTH),
+                    height: Val::Px(DEVELOPER_VISUAL_THUMB_HEIGHT),
                     border: UiRect::all(Val::Px(1.0)),
                     ..default()
                 },
@@ -8505,7 +8621,9 @@ mod tests {
             assert_eq!(cache.page_count, 2);
             assert_eq!(cache.previews.len(), DEVELOPER_VISUAL_ROWS);
             assert!(
-                cache.previews[0].path.contains("iter_08"),
+                cache.previews[0]
+                    .path
+                    .contains(&format!("iter_{:02}", DEVELOPER_VISUAL_ROWS)),
                 "first page should be latest-first"
             );
         }
@@ -8944,6 +9062,42 @@ mod tests {
     }
 
     #[test]
+    fn scene_settings_modal_splits_long_pipeline_controls() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Trellis, SynthesisModel::Triposg];
+        let mut app = ui_test_app(Some(args));
+        app.world_mut()
+            .resource_mut::<CatalogState>()
+            .set_active_mode(CatalogMode::Scene);
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.update();
+        app.update();
+
+        let world = app.world_mut();
+        assert_eq!(world.query::<&SettingsTabButton>().iter(world).count(), 7);
+        assert_eq!(world.query::<&SettingsTabPanel>().iter(world).count(), 7);
+        assert_eq!(world.query::<&SettingsScrollArea>().iter(world).count(), 7);
+        assert_eq!(
+            settings_tabs_for_pipeline(CatalogPipelineChoice::Scene(ScenePipelineKind::Explicit)),
+            vec![
+                SettingsModalTab::Pipeline,
+                SettingsModalTab::Generation,
+                SettingsModalTab::Grounding,
+                SettingsModalTab::Debug,
+                SettingsModalTab::General,
+                SettingsModalTab::Physics,
+                SettingsModalTab::Developer,
+            ]
+        );
+
+        let mut scroll_panels = world.query::<(&SettingsScrollArea, &Node)>();
+        for (_, node) in scroll_panels.iter(world) {
+            assert_eq!(node.max_height, Val::Vh(SETTINGS_TAB_BODY_MAX_HEIGHT_VH));
+            assert_eq!(node.overflow.y, OverflowAxis::Scroll);
+        }
+    }
+
+    #[test]
     fn worker_status_text_is_compacted_for_menu_bar() {
         let text = compact_worker_status_text(
             "scene progress: images_to_assets - running TRELLIS batch for 2 image(s)",
@@ -9087,6 +9241,29 @@ mod tests {
             app.world()
                 .resource::<ViewerDebugSettings>()
                 .depth_cloud_overlay
+        );
+
+        let depth_cap_step = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &ViewerDebugStepButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.setting == ViewerDebugNumericSetting::DepthCloudMaxGaussians
+                        && button.delta > 0.0)
+                        .then_some(entity)
+                })
+                .expect("depth cloud cap step button")
+        };
+        app.world_mut()
+            .entity_mut(depth_cap_step)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ViewerDebugSettings>()
+                .depth_cloud_max_gaussians,
+            VIEWER_DEPTH_CLOUD_DEFAULT_GAUSSIANS + VIEWER_DEPTH_CLOUD_GAUSSIAN_STEP
         );
     }
 

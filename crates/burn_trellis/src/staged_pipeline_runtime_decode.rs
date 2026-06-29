@@ -226,6 +226,29 @@ const NATIVE_PBR_SMALL_COMPONENT_AREA_FRACTION: f32 = 1.0e-4;
 const NATIVE_PBR_MAX_HOLE_PERIMETER: f32 = 3.0e-2;
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+type MeshCleanupFastHasher = std::hash::BuildHasherDefault<rustc_hash::FxHasher>;
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+type MeshCleanupHashMap<K, V> = std::collections::HashMap<K, V, MeshCleanupFastHasher>;
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+type MeshCleanupHashSet<K> = std::collections::HashSet<K, MeshCleanupFastHasher>;
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn mesh_cleanup_hash_map_with_capacity<K, V>(capacity: usize) -> MeshCleanupHashMap<K, V> {
+    MeshCleanupHashMap::with_capacity_and_hasher(
+        capacity,
+        std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default(),
+    )
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+fn mesh_cleanup_hash_set_with_capacity<K>(capacity: usize) -> MeshCleanupHashSet<K> {
+    MeshCleanupHashSet::with_capacity_and_hasher(
+        capacity,
+        std::hash::BuildHasherDefault::<rustc_hash::FxHasher>::default(),
+    )
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
 #[derive(Debug, Clone, Copy, Default)]
 struct MeshCleanupStats {
     duplicate_faces_removed: usize,
@@ -288,16 +311,38 @@ fn sanitize_mesh_geometry(vertices: MeshVertices, faces: MeshFaces) -> MeshSanit
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
 fn cleanup_mesh_topology(vertices: &mut MeshVertices, faces: &mut MeshFaces) -> MeshCleanupStats {
+    let cleanup_start = Instant::now();
+    let duplicate_start = Instant::now();
     let duplicate_faces_removed = remove_duplicate_mesh_faces(faces);
+    let duplicate_ms = duplicate_start.elapsed().as_secs_f64() * 1000.0;
+    let nonmanifold_start = Instant::now();
     let nonmanifold_faces_removed = remove_nonmanifold_mesh_faces(faces);
+    let nonmanifold_ms = nonmanifold_start.elapsed().as_secs_f64() * 1000.0;
+    let component_start = Instant::now();
     let small_component_faces_removed = remove_small_connected_components(
         vertices.as_slice(),
         faces,
         NATIVE_PBR_SMALL_COMPONENT_AREA,
     );
+    let component_ms = component_start.elapsed().as_secs_f64() * 1000.0;
+    let hole_start = Instant::now();
     let hole_faces_added =
         fill_small_boundary_holes(vertices, faces, NATIVE_PBR_MAX_HOLE_PERIMETER);
+    let hole_ms = hole_start.elapsed().as_secs_f64() * 1000.0;
+    let compact_start = Instant::now();
     remove_unreferenced_vertices(vertices, faces);
+    let compact_ms = compact_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: mesh topology cleanup passes complete ({:.2} ms, duplicate={:.2} ms nonmanifold={:.2} ms components={:.2} ms holes={:.2} ms compact={:.2} ms faces={} vertices={})",
+        cleanup_start.elapsed().as_secs_f64() * 1000.0,
+        duplicate_ms,
+        nonmanifold_ms,
+        component_ms,
+        hole_ms,
+        compact_ms,
+        faces.len(),
+        vertices.len()
+    );
     MeshCleanupStats {
         duplicate_faces_removed,
         nonmanifold_faces_removed,
@@ -309,7 +354,7 @@ fn cleanup_mesh_topology(vertices: &mut MeshVertices, faces: &mut MeshFaces) -> 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
 fn remove_duplicate_mesh_faces(faces: &mut MeshFaces) -> usize {
     let before = faces.len();
-    let mut seen = std::collections::HashSet::<[u32; 3]>::with_capacity(faces.len());
+    let mut seen = mesh_cleanup_hash_set_with_capacity::<[u32; 3]>(faces.len());
     faces.retain(|face| {
         let mut key = *face;
         key.sort_unstable();
@@ -322,27 +367,46 @@ fn remove_duplicate_mesh_faces(faces: &mut MeshFaces) -> usize {
 }
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy)]
+struct EdgeFaceOwners {
+    second: Option<usize>,
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy)]
+struct BoundaryEdgeOwner {
+    count: u8,
+    a: u32,
+    b: u32,
+}
+
+#[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
 fn remove_nonmanifold_mesh_faces(faces: &mut MeshFaces) -> usize {
     if faces.is_empty() {
         return 0;
     }
 
     let mut edge_faces =
-        std::collections::HashMap::<(u32, u32), Vec<usize>>::with_capacity(faces.len() * 3);
+        mesh_cleanup_hash_map_with_capacity::<(u32, u32), EdgeFaceOwners>(faces.len() * 3);
+    let mut drop_face = vec![false; faces.len()];
     for (face_idx, face) in faces.iter().copied().enumerate() {
         for edge in face_edges_u32(face) {
-            edge_faces.entry(edge).or_default().push(face_idx);
-        }
-    }
-
-    let mut drop_face = vec![false; faces.len()];
-    for mut owners in edge_faces.into_values() {
-        if owners.len() <= 2 {
-            continue;
-        }
-        owners.sort_unstable();
-        for face_idx in owners.into_iter().skip(2) {
-            drop_face[face_idx] = true;
+            match edge_faces.get_mut(&edge) {
+                Some(owners) if owners.second.is_none() => {
+                    owners.second = Some(face_idx);
+                }
+                Some(_owners) => {
+                    drop_face[face_idx] = true;
+                }
+                None => {
+                    edge_faces.insert(
+                        edge,
+                        EdgeFaceOwners {
+                            second: None,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -366,8 +430,7 @@ fn remove_small_connected_components(
     }
 
     let mut parent = (0..faces.len()).collect::<Vec<_>>();
-    let mut edge_owner =
-        std::collections::HashMap::<(u32, u32), usize>::with_capacity(faces.len() * 3);
+    let mut edge_owner = mesh_cleanup_hash_map_with_capacity::<(u32, u32), usize>(faces.len() * 3);
     for (face_idx, face) in faces.iter().copied().enumerate() {
         for edge in face_edges_u32(face) {
             if let Some(prev_idx) = edge_owner.insert(edge, face_idx) {
@@ -376,24 +439,24 @@ fn remove_small_connected_components(
         }
     }
 
-    let mut component_area = std::collections::HashMap::<usize, f32>::new();
+    let mut component_area = vec![0.0f32; faces.len()];
     for (face_idx, face) in faces.iter().copied().enumerate() {
         let root = mesh_find(parent.as_mut_slice(), face_idx);
         let area = triangle_area_by_indices(vertices, face).unwrap_or(0.0);
-        *component_area.entry(root).or_insert(0.0) += area;
+        component_area[root] += area;
     }
-    let total_area = component_area.values().copied().sum::<f32>();
+    let total_area = component_area.iter().copied().sum::<f32>();
     let min_area = min_area.max(total_area * NATIVE_PBR_SMALL_COMPONENT_AREA_FRACTION);
     let largest_component = component_area
         .iter()
+        .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(root, _)| *root);
+        .map(|(root, _area)| root);
 
     let before = faces.len();
     faces.retain_with_index(|face_idx, _face| {
         let root = mesh_find(parent.as_mut_slice(), face_idx);
-        Some(root) == largest_component
-            || component_area.get(&root).copied().unwrap_or(0.0) >= min_area
+        Some(root) == largest_component || component_area[root] >= min_area
     });
     before.saturating_sub(faces.len())
 }
@@ -409,33 +472,30 @@ fn fill_small_boundary_holes(
     }
 
     let mut edge_counts =
-        std::collections::HashMap::<(u32, u32), u8>::with_capacity(faces.len() * 3);
-    let mut directed_edges = Vec::<(u32, u32)>::with_capacity(faces.len() * 3);
+        mesh_cleanup_hash_map_with_capacity::<(u32, u32), BoundaryEdgeOwner>(faces.len() * 3);
     for face in faces.iter().copied() {
         for [a, b] in [[face[0], face[1]], [face[1], face[2]], [face[2], face[0]]] {
             let key = sorted_edge_u32(a, b);
-            let count = edge_counts.entry(key).or_insert(0);
-            *count = count.saturating_add(1);
-            directed_edges.push((a, b));
+            edge_counts
+                .entry(key)
+                .and_modify(|owner| {
+                    owner.count = owner.count.saturating_add(1);
+                })
+                .or_insert(BoundaryEdgeOwner { count: 1, a, b });
         }
     }
 
-    let mut outgoing = std::collections::HashMap::<u32, Vec<u32>>::new();
-    for (a, b) in directed_edges {
-        if edge_counts
-            .get(&sorted_edge_u32(a, b))
-            .copied()
-            .unwrap_or(0)
-            == 1
-        {
-            outgoing.entry(a).or_default().push(b);
+    let mut outgoing = mesh_cleanup_hash_map_with_capacity::<u32, Vec<u32>>(faces.len() / 8);
+    for owner in edge_counts.into_values() {
+        if owner.count == 1 {
+            outgoing.entry(owner.a).or_default().push(owner.b);
         }
     }
     for next in outgoing.values_mut() {
         next.sort_unstable();
     }
 
-    let mut used = std::collections::HashSet::<(u32, u32)>::new();
+    let mut used = mesh_cleanup_hash_set_with_capacity::<(u32, u32)>(outgoing.len());
     let mut loops = Vec::<Vec<u32>>::new();
     let mut starts = outgoing.keys().copied().collect::<Vec<_>>();
     starts.sort_unstable();
@@ -796,6 +856,7 @@ pub struct NativePbrPostprocessInput {
     pub final_resolution: u32,
     pub target_faces: Option<usize>,
     pub pbr_texture_size: Option<usize>,
+    pub remesh_threads: Option<usize>,
 }
 
 #[cfg(all(feature = "runtime-model", not(target_arch = "wasm32")))]
@@ -810,6 +871,7 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         final_resolution,
         target_faces,
         pbr_texture_size,
+        remesh_threads,
     } = input;
     if voxel_coords.len() != voxel_attrs.len() {
         return Err(format!(
@@ -861,18 +923,23 @@ pub fn native_pbr_mesh_from_decoded_tensors(
     let projection_faces = faces.clone();
     let remesh_start = Instant::now();
     let before_remesh_faces = faces.len();
+    let projection_bvh_start = Instant::now();
     let projection_bvh_for_pbr = build_projection_bvh_for_pbr(PbrProjectionSource {
         vertices: projection_vertices.as_slice(),
         faces: projection_faces.as_slice(),
     })?;
-    let (remeshed_vertices, remeshed_faces) = remesh_narrow_band_simple_dc_with_projection_bvh(
+    let remesh_bvh_ms = projection_bvh_start.elapsed().as_secs_f64() * 1000.0;
+    let remesh_output = remesh_narrow_band_simple_dc_with_projection_bvh(
         &projection_bvh_for_pbr,
         final_resolution.max(1),
         NATIVE_PBR_OVOXEL_REMESH_BAND,
+        remesh_threads,
     )?;
-    vertices = remeshed_vertices;
-    faces = remeshed_faces;
+    vertices = remesh_output.vertices;
+    faces = remesh_output.faces;
+    let remesh_cleanup_start = Instant::now();
     let remesh_cleanup_stats = cleanup_mesh_topology(&mut vertices, &mut faces);
+    let remesh_cleanup_ms = remesh_cleanup_start.elapsed().as_secs_f64() * 1000.0;
     if remesh_cleanup_stats.duplicate_faces_removed > 0
         || remesh_cleanup_stats.nonmanifold_faces_removed > 0
         || remesh_cleanup_stats.small_component_faces_removed > 0
@@ -889,8 +956,14 @@ pub fn native_pbr_mesh_from_decoded_tensors(
         );
     }
     trellis_stage_log!(
-        "burn_trellis: rust_ovoxel pbr postprocess remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
+        "burn_trellis: rust_ovoxel pbr postprocess remesh complete ({:.2} ms, bvh={:.2} ms refine={:.2} ms dc={:.2} ms cleanup={:.2} ms active_voxels={} grid_vertices={} from_faces={} to_faces={} vertices={})",
         remesh_start.elapsed().as_secs_f64() * 1000.0,
+        remesh_bvh_ms,
+        remesh_output.refine_ms,
+        remesh_output.dc_ms,
+        remesh_cleanup_ms,
+        remesh_output.active_voxels,
+        remesh_output.grid_vertices,
         before_remesh_faces,
         faces.len(),
         vertices.len()
@@ -1446,6 +1519,7 @@ async fn decode_latent_with_runtime_decoders(
             "runtime decode received invalid final resolution for pipeline '{pipeline_type}'"
         ));
     }
+    let output_materialize_start = Instant::now();
     #[cfg(feature = "runtime-model-wgpu")]
     let shape_decoded_coords_host = shape_decode_result
         .coords_host_async("runtime decode shape coord stage-boundary materialization")
@@ -1499,6 +1573,11 @@ async fn decode_latent_with_runtime_decoders(
     } else {
         Vec::new()
     };
+    let output_materialize_ms = output_materialize_start.elapsed().as_secs_f64() * 1000.0;
+    trellis_stage_log!(
+        "burn_trellis: stage decode.output_materialize complete ({output_materialize_ms:.2} ms, rows={})",
+        shape_decoded.coords.len()
+    );
     let shape_subdivisions = shape_decoded.subdivisions;
     let coords = shape_decoded.coords;
     let shape_vertices = shape_decoded.vertices;
@@ -1590,27 +1669,38 @@ async fn decode_latent_with_runtime_decoders(
     let mut use_projection_source = false;
     #[cfg(not(target_arch = "wasm32"))]
     let mut projection_bvh_for_pbr = None;
+    let mut remesh_bvh_ms = 0.0f64;
+    let mut remesh_refine_ms = 0.0f64;
+    let mut remesh_dc_ms = 0.0f64;
+    let mut remesh_cleanup_ms = 0.0f64;
+    let mut remesh_total_ms = 0.0f64;
     #[cfg(not(target_arch = "wasm32"))]
     {
         if decode_output_mode.needs_native_mesh_postprocess() {
             let remesh_start = Instant::now();
             let before_remesh_faces = faces.len();
+            let projection_bvh_start = Instant::now();
             let projection_bvh = build_projection_bvh_for_pbr(PbrProjectionSource {
                 vertices: projection_vertices.as_slice(),
                 faces: projection_faces.as_slice(),
             })
             .map_err(|err| format!("runtime decode rust o_voxel mesh remesh failed: {err}"))?;
-            let (remeshed_vertices, remeshed_faces) =
-                remesh_narrow_band_simple_dc_with_projection_bvh(
-                    &projection_bvh,
-                    final_resolution as u32,
-                    NATIVE_PBR_OVOXEL_REMESH_BAND,
-                )
-                .map_err(|err| format!("runtime decode rust o_voxel mesh remesh failed: {err}"))?;
+            remesh_bvh_ms = projection_bvh_start.elapsed().as_secs_f64() * 1000.0;
+            let remesh_output = remesh_narrow_band_simple_dc_with_projection_bvh(
+                &projection_bvh,
+                final_resolution as u32,
+                NATIVE_PBR_OVOXEL_REMESH_BAND,
+                None,
+            )
+            .map_err(|err| format!("runtime decode rust o_voxel mesh remesh failed: {err}"))?;
+            remesh_refine_ms = remesh_output.refine_ms;
+            remesh_dc_ms = remesh_output.dc_ms;
             projection_bvh_for_pbr = Some(projection_bvh);
-            vertices = remeshed_vertices;
-            faces = remeshed_faces;
+            vertices = remesh_output.vertices;
+            faces = remesh_output.faces;
+            let remesh_cleanup_start = Instant::now();
             let remesh_cleanup = cleanup_mesh_topology(&mut vertices, &mut faces);
+            remesh_cleanup_ms = remesh_cleanup_start.elapsed().as_secs_f64() * 1000.0;
             if remesh_cleanup.duplicate_faces_removed > 0
                 || remesh_cleanup.nonmanifold_faces_removed > 0
                 || remesh_cleanup.small_component_faces_removed > 0
@@ -1626,9 +1716,16 @@ async fn decode_latent_with_runtime_decoders(
                     faces.len()
                 );
             }
+            remesh_total_ms = remesh_start.elapsed().as_secs_f64() * 1000.0;
             trellis_stage_log!(
-                "burn_trellis: runtime decode rust_ovoxel mesh remesh complete ({:.2} ms, from_faces={} to_faces={} vertices={})",
-                remesh_start.elapsed().as_secs_f64() * 1000.0,
+                "burn_trellis: runtime decode rust_ovoxel mesh remesh complete ({:.2} ms, bvh={:.2} ms refine={:.2} ms dc={:.2} ms cleanup={:.2} ms active_voxels={} grid_vertices={} from_faces={} to_faces={} vertices={})",
+                remesh_total_ms,
+                remesh_bvh_ms,
+                remesh_refine_ms,
+                remesh_dc_ms,
+                remesh_cleanup_ms,
+                remesh_output.active_voxels,
+                remesh_output.grid_vertices,
                 before_remesh_faces,
                 faces.len(),
                 vertices.len()
@@ -1812,8 +1909,14 @@ async fn decode_latent_with_runtime_decoders(
             stage_fenced: decode_stage_fenced,
             shape_decoder_ms,
             tex_decoder_ms,
+            output_materialize_ms,
             attr_merge_ms,
             mesh_ms,
+            remesh_bvh_ms,
+            remesh_refine_ms,
+            remesh_dc_ms,
+            remesh_cleanup_ms,
+            remesh_total_ms,
             pre_pbr_decimate_ms,
             pbr_ms,
             shape_conv_calls: shape_conv_telemetry.conv_calls,

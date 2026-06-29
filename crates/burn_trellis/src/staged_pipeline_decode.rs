@@ -33,6 +33,16 @@ pub(super) struct PbrBakeMesh {
     pub normals: Vec<[f32; 3]>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) struct RemeshNarrowBandOutput {
+    pub vertices: Vec<[f32; 3]>,
+    pub faces: Vec<[u32; 3]>,
+    pub refine_ms: f64,
+    pub dc_ms: f64,
+    pub active_voxels: usize,
+    pub grid_vertices: usize,
+}
+
 type VoxelAttrFastHasher = BuildHasherDefault<FxHasher>;
 type VoxelAttrMap = HashMap<u64, [f32; 6], VoxelAttrFastHasher>;
 type FastHashMap<K, V> = HashMap<K, V, VoxelAttrFastHasher>;
@@ -213,8 +223,8 @@ impl<'a> ProjectionBvh<'a> {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn closest_distance2(&self, point: [f32; 3]) -> f32 {
-        self.closest_point_and_distance2(point).1
+    fn closest_distance2_with_stack(&self, point: [f32; 3], stack: &mut Vec<usize>) -> f32 {
+        self.closest_point_and_distance2_with_stack(point, stack).1
     }
 
     fn closest_point(&self, point: [f32; 3]) -> [f32; 3] {
@@ -222,9 +232,18 @@ impl<'a> ProjectionBvh<'a> {
     }
 
     fn closest_point_and_distance2(&self, point: [f32; 3]) -> ([f32; 3], f32) {
+        let mut stack = Vec::with_capacity(64);
+        self.closest_point_and_distance2_with_stack(point, &mut stack)
+    }
+
+    fn closest_point_and_distance2_with_stack(
+        &self,
+        point: [f32; 3],
+        stack: &mut Vec<usize>,
+    ) -> ([f32; 3], f32) {
         let mut best_dist2 = f32::INFINITY;
         let mut best_point = point;
-        let mut stack = Vec::with_capacity(64);
+        stack.clear();
         stack.push(self.root);
         while let Some(node_idx) = stack.pop() {
             let node = self.nodes[node_idx];
@@ -288,11 +307,103 @@ pub(super) fn build_projection_bvh_for_pbr(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn remesh_parallel_threads(items: usize, override_threads: Option<usize>) -> usize {
+    if let Some(threads) = override_threads {
+        return threads.clamp(1, 64);
+    }
+    if items < 131_072 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn remesh_keep_mask_parallel(
+    bvh: &ProjectionBvh<'_>,
+    coords: &[[i32; 3]],
+    current_resolution: u32,
+    domain_scale: f32,
+    eps: f32,
+    threshold: f32,
+    override_threads: Option<usize>,
+) -> Vec<bool> {
+    let threads = remesh_parallel_threads(coords.len(), override_threads);
+    let mut keep = vec![false; coords.len()];
+    if threads == 1 {
+        let mut stack = Vec::with_capacity(64);
+        for (idx, coord) in coords.iter().copied().enumerate() {
+            let point = remesh_cell_center(coord, current_resolution, domain_scale);
+            let distance = bvh.closest_distance2_with_stack(point, &mut stack).sqrt();
+            keep[idx] = (distance - eps).abs() < threshold;
+        }
+        return keep;
+    }
+
+    let chunk_size = coords.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (chunk_idx, keep_chunk) in keep.chunks_mut(chunk_size).enumerate() {
+            let start = chunk_idx * chunk_size;
+            let coord_chunk = &coords[start..start + keep_chunk.len()];
+            scope.spawn(move || {
+                let mut stack = Vec::with_capacity(64);
+                for (dst, coord) in keep_chunk.iter_mut().zip(coord_chunk.iter().copied()) {
+                    let point = remesh_cell_center(coord, current_resolution, domain_scale);
+                    let distance = bvh.closest_distance2_with_stack(point, &mut stack).sqrt();
+                    *dst = (distance - eps).abs() < threshold;
+                }
+            });
+        }
+    });
+    keep
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn remesh_grid_values_parallel(
+    bvh: &ProjectionBvh<'_>,
+    grid_vertices: &[[i32; 3]],
+    resolution: u32,
+    domain_scale: f32,
+    eps: f32,
+    override_threads: Option<usize>,
+) -> Vec<f32> {
+    let threads = remesh_parallel_threads(grid_vertices.len(), override_threads);
+    let mut values = vec![0.0f32; grid_vertices.len()];
+    if threads == 1 {
+        let mut stack = Vec::with_capacity(64);
+        for (dst, vertex) in values.iter_mut().zip(grid_vertices.iter().copied()) {
+            let point = remesh_grid_point(vertex, resolution, domain_scale);
+            *dst = bvh.closest_distance2_with_stack(point, &mut stack).sqrt() - eps;
+        }
+        return values;
+    }
+
+    let chunk_size = grid_vertices.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (chunk_idx, value_chunk) in values.chunks_mut(chunk_size).enumerate() {
+            let start = chunk_idx * chunk_size;
+            let vertex_chunk = &grid_vertices[start..start + value_chunk.len()];
+            scope.spawn(move || {
+                let mut stack = Vec::with_capacity(64);
+                for (dst, vertex) in value_chunk.iter_mut().zip(vertex_chunk.iter().copied()) {
+                    let point = remesh_grid_point(vertex, resolution, domain_scale);
+                    *dst = bvh.closest_distance2_with_stack(point, &mut stack).sqrt() - eps;
+                }
+            });
+        }
+    });
+    values
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
     bvh: &ProjectionBvh<'_>,
     final_resolution: u32,
     band: f32,
-) -> Result<(Vec<[f32; 3]>, Vec<[u32; 3]>), String> {
+    override_threads: Option<usize>,
+) -> Result<RemeshNarrowBandOutput, String> {
     let resolution = final_resolution.max(1);
     if resolution < 2 {
         return Err(format!(
@@ -330,11 +441,23 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
     loop {
         let cell_size = domain_scale / current_resolution as f32;
         let threshold = 0.87 * cell_size;
-        coords.retain(|coord| {
-            let point = remesh_cell_center(*coord, current_resolution, domain_scale);
-            let distance = bvh.closest_distance2(point).sqrt();
-            (distance - eps).abs() < threshold
-        });
+        let keep = remesh_keep_mask_parallel(
+            bvh,
+            coords.as_slice(),
+            current_resolution,
+            domain_scale,
+            eps,
+            threshold,
+            override_threads,
+        );
+        let mut write_idx = 0usize;
+        for read_idx in 0..coords.len() {
+            if keep[read_idx] {
+                coords[write_idx] = coords[read_idx];
+                write_idx += 1;
+            }
+        }
+        coords.truncate(write_idx);
         pbr_stage_log(format!(
             "burn_trellis: decode.pbr remesh refine level complete (resolution={} active_voxels={})",
             current_resolution,
@@ -360,10 +483,11 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
     if coords.is_empty() {
         return Err("rust o_voxel pbr remesh produced no active voxels".to_string());
     }
+    let refine_ms = refine_start.elapsed().as_secs_f64() * 1000.0;
+    let active_voxels = coords.len();
     pbr_stage_log(format!(
         "burn_trellis: decode.pbr remesh refine complete ({:.2} ms, active_voxels={})",
-        refine_start.elapsed().as_secs_f64() * 1000.0,
-        coords.len()
+        refine_ms, active_voxels
     ));
 
     let dc_start = Instant::now();
@@ -384,11 +508,14 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
             });
         }
     }
-    let mut grid_values = Vec::with_capacity(grid_vertices.len());
-    for vertex in &grid_vertices {
-        let point = remesh_grid_point(*vertex, resolution, domain_scale);
-        grid_values.push(bvh.closest_distance2(point).sqrt() - eps);
-    }
+    let grid_values = remesh_grid_values_parallel(
+        bvh,
+        grid_vertices.as_slice(),
+        resolution,
+        domain_scale,
+        eps,
+        override_threads,
+    );
 
     let mut voxel_map = fast_hash_map_with_capacity::<(i32, i32, i32), usize>(coords.len());
     for (idx, coord) in coords.iter().copied().enumerate() {
@@ -399,14 +526,14 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
     let mut intersected = Vec::<[i32; 3]>::with_capacity(coords.len());
     for coord in &coords {
         let (dual, edge_flags) =
-            simple_dual_contour_voxel(*coord, &grid_vertex_map, grid_values.as_slice())?;
+            simple_dual_contour_voxel_cached(*coord, &grid_vertex_map, grid_values.as_slice())?;
         dual_vertices_grid.push(dual);
         intersected.push(edge_flags);
     }
 
     let mut used = vec![false; coords.len()];
     let mut remap = vec![u32::MAX; coords.len()];
-    let mut faces_out = Vec::<[u32; 3]>::new();
+    let mut faces_out = Vec::<[u32; 3]>::with_capacity(coords.len().saturating_mul(2));
     for (voxel_idx, coord) in coords.iter().copied().enumerate() {
         for axis in 0..3 {
             let dir = intersected[voxel_idx][axis];
@@ -468,14 +595,23 @@ pub(super) fn remesh_narrow_band_simple_dc_with_projection_bvh(
         face[1] = remap[face[1] as usize];
         face[2] = remap[face[2] as usize];
     }
+    let dc_ms = dc_start.elapsed().as_secs_f64() * 1000.0;
+    let grid_vertex_count = grid_vertices.len();
     pbr_stage_log(format!(
         "burn_trellis: decode.pbr remesh dc complete ({:.2} ms, grid_vertices={} vertices={} faces={})",
-        dc_start.elapsed().as_secs_f64() * 1000.0,
-        grid_vertices.len(),
+        dc_ms,
+        grid_vertex_count,
         vertices_out.len(),
         faces_out.len()
     ));
-    Ok((vertices_out, faces_out))
+    Ok(RemeshNarrowBandOutput {
+        vertices: vertices_out,
+        faces: faces_out,
+        refine_ms,
+        dc_ms,
+        active_voxels,
+        grid_vertices: grid_vertex_count,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -525,30 +661,34 @@ fn remesh_grid_to_world(coord: [f32; 3], resolution: u32, domain_scale: f32) -> 
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn simple_dual_contour_voxel(
+fn simple_dual_contour_voxel_cached(
     coord: [i32; 3],
     grid_vertex_map: &FastHashMap<(i32, i32, i32), usize>,
     grid_values: &[f32],
 ) -> Result<([f32; 3], [i32; 3]), String> {
-    let value =
-        |x: i32, y: i32, z: i32| -> Result<f32, String> {
-            let idx = grid_vertex_map.get(&(x, y, z)).copied().ok_or_else(|| {
-                format!("rust o_voxel pbr remesh missing grid vertex ({x},{y},{z})")
-            })?;
-            grid_values.get(idx).copied().ok_or_else(|| {
-                format!("rust o_voxel pbr remesh grid value index out of range: {idx}")
-            })
-        };
-
     let [vx, vy, vz] = coord;
+    let mut values = [0.0f32; 8];
+    for (idx, corner) in REMESH_CORNERS.iter().copied().enumerate() {
+        let x = vx + corner[0];
+        let y = vy + corner[1];
+        let z = vz + corner[2];
+        let value_idx = grid_vertex_map
+            .get(&(x, y, z))
+            .copied()
+            .ok_or_else(|| format!("rust o_voxel pbr remesh missing grid vertex ({x},{y},{z})"))?;
+        values[idx] = grid_values.get(value_idx).copied().ok_or_else(|| {
+            format!("rust o_voxel pbr remesh grid value index out of range: {value_idx}")
+        })?;
+    }
+
     let mut intersection_sum = [0.0f32; 3];
     let mut intersection_count = 0usize;
     let mut intersected = [0i32; 3];
 
     for u in 0..=1 {
         for v in 0..=1 {
-            let val1 = value(vx, vy + u, vz + v)?;
-            let val2 = value(vx + 1, vy + u, vz + v)?;
+            let val1 = remesh_corner_value(&values, 0, u, v);
+            let val2 = remesh_corner_value(&values, 1, u, v);
             if remesh_edge_crosses(val1, val2) {
                 let t = remesh_interp_t(val1, val2);
                 intersection_sum[0] += vx as f32 + t;
@@ -563,8 +703,8 @@ fn simple_dual_contour_voxel(
     }
     for u in 0..=1 {
         for v in 0..=1 {
-            let val1 = value(vx + u, vy, vz + v)?;
-            let val2 = value(vx + u, vy + 1, vz + v)?;
+            let val1 = remesh_corner_value(&values, u, 0, v);
+            let val2 = remesh_corner_value(&values, u, 1, v);
             if remesh_edge_crosses(val1, val2) {
                 let t = remesh_interp_t(val1, val2);
                 intersection_sum[0] += (vx + u) as f32;
@@ -579,8 +719,8 @@ fn simple_dual_contour_voxel(
     }
     for u in 0..=1 {
         for v in 0..=1 {
-            let val1 = value(vx + u, vy + v, vz)?;
-            let val2 = value(vx + u, vy + v, vz + 1)?;
+            let val1 = remesh_corner_value(&values, u, v, 0);
+            let val2 = remesh_corner_value(&values, u, v, 1);
             if remesh_edge_crosses(val1, val2) {
                 let t = remesh_interp_t(val1, val2);
                 intersection_sum[0] += (vx + u) as f32;
@@ -604,6 +744,12 @@ fn simple_dual_contour_voxel(
         [vx as f32 + 0.5, vy as f32 + 0.5, vz as f32 + 0.5]
     };
     Ok((dual, intersected))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn remesh_corner_value(values: &[f32; 8], dx: i32, dy: i32, dz: i32) -> f32 {
+    let idx = (dx as usize) + (dy as usize) * 2 + (dz as usize) * 4;
+    values[idx]
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -748,7 +894,7 @@ fn build_projection_bvh_node(
     } else {
         2
     };
-    tri_indices[start..end].sort_unstable_by(|a, b| {
+    tri_indices[start..end].select_nth_unstable_by(len / 2, |a, b| {
         let ca = face_centroids[*a][split_axis];
         let cb = face_centroids[*b][split_axis];
         ca.total_cmp(&cb).then_with(|| a.cmp(b))

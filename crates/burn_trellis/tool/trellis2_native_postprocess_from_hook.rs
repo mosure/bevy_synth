@@ -31,6 +31,10 @@ struct Args {
     /// Optional native PBR texture size. Use 0 for the runtime default.
     #[arg(long, default_value_t = 1024)]
     texture_size: usize,
+
+    /// Override native remesh worker threads. Use 0 for the runtime auto setting.
+    #[arg(long, default_value_t = 0)]
+    remesh_threads: usize,
 }
 
 fn main() {
@@ -98,6 +102,7 @@ fn run() -> Result<(), String> {
         final_resolution,
         target_faces: (args.target_faces > 0).then_some(args.target_faces),
         pbr_texture_size: (args.texture_size > 0).then_some(args.texture_size),
+        remesh_threads: (args.remesh_threads > 0).then_some(args.remesh_threads),
     })?;
     let bake_ms = bake_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -114,6 +119,7 @@ fn run() -> Result<(), String> {
                 "output": args.output,
                 "target_faces": args.target_faces,
                 "texture_size": args.texture_size,
+                "remesh_threads": args.remesh_threads,
                 "final_resolution": final_resolution,
                 "mesh": {
                     "vertices": mesh.vertices.len(),
