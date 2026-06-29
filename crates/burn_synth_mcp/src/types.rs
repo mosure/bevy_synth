@@ -127,6 +127,25 @@ pub enum SceneRotationFitMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum SceneTablePoseRefinementMode {
+    Off,
+    Geometry,
+    GatedGpt,
+    AlwaysGpt,
+}
+
+impl SceneTablePoseRefinementMode {
+    pub(crate) fn geometry_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub(crate) fn gpt_allowed(self) -> bool {
+        matches!(self, Self::GatedGpt | Self::AlwaysGpt)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FeedbackRubricScorer {
     Off,
     Openai,
@@ -216,6 +235,20 @@ pub enum SceneCanonicalPoseMode {
     RenderSweep,
     Openai,
     Auto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneGroundCalibrationMode {
+    DepthHeuristic,
+    Gpt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneInstanceGenerationMode {
+    CategoryRepresentative,
+    FineGrainedTypes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -598,11 +631,11 @@ pub(crate) struct SceneBuildCliArgs {
     pub composition_mode: SceneCompositionMode,
 
     /// Pose fitting strategy used inside cv-grounded composition.
-    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::ProjectedAabb)]
+    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::RenderedSilhouette)]
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
-    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::RenderSweep)]
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Off)]
     pub canonical_pose: SceneCanonicalPoseMode,
 
     /// Generated asset scale policy used by layout and feedback.
@@ -616,6 +649,14 @@ pub(crate) struct SceneBuildCliArgs {
     /// Save pose fitting debug sidecars when artifacts are enabled.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub save_pose_debug: bool,
+
+    /// Camera/floor calibration source used after DepthPro evidence is available.
+    #[arg(long, value_enum, default_value_t = SceneGroundCalibrationMode::Gpt)]
+    pub ground_calibration: SceneGroundCalibrationMode,
+
+    /// Reusable-object instance generation mode. Default generates one asset per category/reuse group.
+    #[arg(long, value_enum, default_value_t = SceneInstanceGenerationMode::CategoryRepresentative)]
+    pub instance_generation: SceneInstanceGenerationMode,
 
     /// Depth provider used by CV-grounded scene composition.
     #[arg(long, value_enum, default_value_t = SceneDepthProvider::DepthPro)]
@@ -654,7 +695,11 @@ pub(crate) struct SceneBuildCliArgs {
     pub apply: bool,
 
     /// Run bounded render-capture-feedback layout validation/refinement.
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    ///
+    /// This is intentionally opt-in. The default scene flow should be a deterministic
+    /// geometric solve from LocateAnything boxes, SAM masks, DepthPro depth, and
+    /// projected lifted-asset visible surfaces.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub feedback: bool,
 
     /// Maximum render-capture-feedback iterations.
@@ -677,12 +722,16 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
 
-    /// Pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth, and projected GLB visible surface.
-    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::DepthMaskRansac)]
+    /// Extra pre-feedback Y-axis rotation fit.
+    ///
+    /// Keep this off by default: the canonical default pose solve is
+    /// --pose-fit=rendered-silhouette, which already scores X/Z/yaw/uniform-scale
+    /// candidates against source masks/depth and projected GLB visible surfaces.
+    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::Off)]
     pub rotation_fit: SceneRotationFitMode,
 
     /// Maximum GPT refinement rounds when --rotation-fit=gpt-refine.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 0)]
     pub rotation_fit_max_gpt_rounds: usize,
 
     /// Minimum visible-surface mask IoU required before applying an objective rotation candidate.
@@ -696,6 +745,14 @@ pub(crate) struct SceneBuildCliArgs {
     /// Write rotation-fit candidate overlays, report JSON, and HTML review artifacts.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub rotation_fit_write_artifacts: bool,
+
+    /// Table-specific pose refinement after the generic visible-surface fit.
+    ///
+    /// Defaults to gated-gpt: deterministic mask/depth/table candidate fitting
+    /// runs first, and the report marks only ambiguous/failed table fits for
+    /// bounded GPT candidate selection.
+    #[arg(long, value_enum, default_value_t = SceneTablePoseRefinementMode::GatedGpt)]
+    pub table_pose_refinement: SceneTablePoseRefinementMode,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
@@ -729,11 +786,11 @@ pub(crate) struct SceneGroundCliArgs {
     pub composition_mode: SceneCompositionMode,
 
     /// Pose fitting strategy used inside cv-grounded composition.
-    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::ProjectedAabb)]
+    #[arg(long, value_enum, default_value_t = ScenePoseFitMode::RenderedSilhouette)]
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
-    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::RenderSweep)]
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Off)]
     pub canonical_pose: SceneCanonicalPoseMode,
 
     /// Generated asset scale policy used by layout and feedback.
@@ -748,12 +805,16 @@ pub(crate) struct SceneGroundCliArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub save_pose_debug: bool,
 
+    /// Camera/floor calibration source used when grounding evidence is refreshed.
+    #[arg(long, value_enum, default_value_t = SceneGroundCalibrationMode::Gpt)]
+    pub ground_calibration: SceneGroundCalibrationMode,
+
     /// Depth provider identifier for run metadata.
     #[arg(long, value_enum, default_value_t = SceneDepthProvider::DepthPro)]
     pub depth_provider: SceneDepthProvider,
 
-    /// Locator provider identifier for run metadata.
-    #[arg(long, value_enum, default_value_t = SceneLocatorProvider::Manifest)]
+    /// Locator provider used to refresh source-image object boxes when evidence is omitted.
+    #[arg(long, value_enum, default_value_t = SceneLocatorProvider::LocateAnything)]
     pub locator: SceneLocatorProvider,
 
     /// Override the server LocateAnything backend for this scene-ground run.
@@ -804,12 +865,12 @@ pub(crate) struct SceneGroundCliArgs {
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
 
-    /// Pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth, and projected GLB visible surface.
-    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::DepthMaskRansac)]
+    /// Extra pre-feedback Y-axis rotation fit.
+    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::Off)]
     pub rotation_fit: SceneRotationFitMode,
 
     /// Maximum GPT refinement rounds when --rotation-fit=gpt-refine.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 0)]
     pub rotation_fit_max_gpt_rounds: usize,
 
     /// Minimum visible-surface mask IoU required before applying an objective rotation candidate.
@@ -823,6 +884,10 @@ pub(crate) struct SceneGroundCliArgs {
     /// Write rotation-fit candidate overlays, report JSON, and HTML review artifacts.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub rotation_fit_write_artifacts: bool,
+
+    /// Table-specific pose refinement after the generic visible-surface fit.
+    #[arg(long, value_enum, default_value_t = SceneTablePoseRefinementMode::GatedGpt)]
+    pub table_pose_refinement: SceneTablePoseRefinementMode,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
@@ -938,12 +1003,13 @@ pub(crate) struct SceneFeedbackReplayCliArgs {
     #[arg(long, value_enum, default_value_t = FeedbackRotationSelector::Deterministic)]
     pub feedback_rotation_selector: FeedbackRotationSelector,
 
-    /// Pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth, and projected GLB visible surface.
-    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::DepthMaskRansac)]
+    /// Extra pre-feedback Y-axis rotation fit from source SAM masks, DepthPro depth,
+    /// and projected GLB visible surface.
+    #[arg(long, value_enum, default_value_t = SceneRotationFitMode::Off)]
     pub rotation_fit: SceneRotationFitMode,
 
     /// Maximum GPT refinement rounds when --rotation-fit=gpt-refine.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 0)]
     pub rotation_fit_max_gpt_rounds: usize,
 
     /// Minimum visible-surface mask IoU required before applying an objective rotation candidate.

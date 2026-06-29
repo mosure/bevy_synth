@@ -1124,7 +1124,7 @@ fn asset_scale_for_footprint(
     let scale_x = (local_targets[0].max(0.1) / size[0]).clamp(0.05, 20.0);
     let scale_z = (local_targets[1].max(0.1) / size[2]).clamp(0.05, 20.0);
     let scale_y = (scale_x * scale_z).sqrt().clamp(0.05, 20.0);
-    apply_scale_policy_to_scale([scale_x, scale_y, scale_z], scale_policy)
+    scale_policy.apply_to_scale([scale_x, scale_y, scale_z])
 }
 
 fn enforce_scale_policy(
@@ -1133,40 +1133,12 @@ fn enforce_scale_policy(
     scale_policy: SceneScalePolicy,
 ) {
     for placement in placements {
-        let next = apply_scale_policy_to_scale(placement.scale, scale_policy);
+        let next = scale_policy.apply_to_scale(placement.scale);
         if next != placement.scale {
             placement.scale = next;
             placement.translation[1] = floor_y - placement.local_aabb.min[1] * next[1];
         }
     }
-}
-
-fn apply_scale_policy_to_scale(scale: [f32; 3], scale_policy: SceneScalePolicy) -> [f32; 3] {
-    let Some(max_ratio) = scale_policy.max_xz_anisotropy() else {
-        return scale;
-    };
-    if max_ratio <= 1.0 + f32::EPSILON {
-        let uniform = ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0);
-        return [uniform, uniform, uniform];
-    }
-    let x = scale[0].abs().clamp(0.05, 20.0);
-    let z = scale[2].abs().clamp(0.05, 20.0);
-    let ratio = (x.max(z) / x.min(z).max(1.0e-5)).max(1.0);
-    if ratio <= max_ratio {
-        return scale;
-    }
-    let area_scale = (x * z).sqrt().clamp(0.05, 20.0);
-    let root_ratio = max_ratio.sqrt();
-    let (next_x, next_z) = if x >= z {
-        (area_scale * root_ratio, area_scale / root_ratio)
-    } else {
-        (area_scale / root_ratio, area_scale * root_ratio)
-    };
-    [
-        next_x.clamp(0.05, 20.0).copysign(scale[0]),
-        area_scale.clamp(0.05, 20.0).copysign(scale[1]),
-        next_z.clamp(0.05, 20.0).copysign(scale[2]),
-    ]
 }
 
 fn normalize_repeated_asset_scales(placements: &mut [GroundedScenePlacement], floor_y: f32) {

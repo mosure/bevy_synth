@@ -20,7 +20,8 @@ use bevy_synth_ui::{
 use burn_synth_mcp::{
     SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthProvider, SceneLocatorProvider,
-    SceneScalePolicy, SceneSegmentationProvider, SynthesisModel as McpSynthesisModel,
+    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider, SceneTablePoseRefinementMode,
+    SynthesisModel as McpSynthesisModel,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use burn_synth_scene::SceneQualityProfile;
@@ -38,7 +39,8 @@ use crate::app::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
-    InferenceDispatchGate, load_generated_glb_mesh_asset, scene_build_args_from_ui_settings,
+    DepthDebugIntrinsics, InferenceDispatchGate, depth_debug_sample_stride,
+    depth_debug_world_point, load_generated_glb_mesh_asset, scene_build_args_from_ui_settings,
     should_pause_render_during_inference, should_wait_before_inference_dispatch,
 };
 use bevy_synth_runtime::args::{
@@ -125,20 +127,78 @@ fn dummy_mesh() -> SynthMesh {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn depth_debug_sample_stride_caps_to_720p_budget() {
+    let stride = depth_debug_sample_stride(3840, 2160, 1280 * 720);
+    let sampled = 3840usize.div_ceil(stride) * 2160usize.div_ceil(stride);
+    assert!(sampled <= 1280 * 720);
+    assert_eq!(depth_debug_sample_stride(640, 360, 1280 * 720), 1);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn depth_debug_unprojects_center_pixel_along_scene_camera_forward() {
+    let intrinsics = DepthDebugIntrinsics {
+        fx: 100.0,
+        fy: 100.0,
+        cx: 1.5,
+        cy: 1.5,
+        width: 4,
+        height: 4,
+    };
+    let transform = Transform::from_translation(Vec3::new(2.0, 1.0, -3.0))
+        .looking_at(Vec3::new(2.0, 1.0, -4.0), Vec3::Y);
+    let point = depth_debug_world_point(1, 1, 2.0, intrinsics, transform);
+    assert!((point.x - 2.0).abs() < 1.0e-5);
+    assert!((point.y - 1.0).abs() < 1.0e-5);
+    assert!((point.z + 5.0).abs() < 1.0e-5);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn scene_ui_stage_toggles_map_to_scene_build_args() {
     let mut settings = ScenePipelineUiSettings::default();
     assert_eq!(settings.quality_profile, SceneQualityProfileSetting::Fast);
-    assert_eq!(settings.candidate_count, 2);
-    assert_eq!(settings.feedback_iterations, 8);
+    assert_eq!(settings.candidate_count, 1);
+    assert_eq!(settings.feedback_iterations, 0);
     assert!(settings.pbr_enabled);
     assert_eq!(settings.target_faces, 80_000);
-    assert!(settings.canonical_pose_enabled);
+    assert!(!settings.feedback_enabled);
+    let default_args = scene_build_args_from_ui_settings(
+        PathBuf::from("scene.jpg"),
+        Some(PathBuf::from("tmp/runs/test_scene_default")),
+        1,
+        vec![McpSynthesisModel::Trellis],
+        &settings,
+    );
+    assert_eq!(
+        default_args.composition_mode,
+        SceneCompositionMode::CvGrounded
+    );
+    assert_eq!(default_args.pose_fit, ScenePoseFitMode::RenderedSilhouette);
+    assert_eq!(default_args.canonical_pose, SceneCanonicalPoseMode::Off);
+    assert_eq!(default_args.scale_policy, SceneScalePolicy::AssetPreserving);
+    assert_eq!(default_args.depth_provider, SceneDepthProvider::DepthPro);
+    assert_eq!(default_args.locator, SceneLocatorProvider::LocateAnything);
+    assert_eq!(
+        default_args.segmentation_provider,
+        Some(SceneSegmentationProvider::Sam2)
+    );
+    assert!(!default_args.feedback);
+    assert_eq!(default_args.feedback_iters, 0);
+    assert_eq!(
+        default_args.rotation_fit,
+        burn_synth_mcp::SceneRotationFitMode::Off
+    );
+    assert_eq!(default_args.rotation_fit_max_gpt_rounds, 0);
+    assert_eq!(
+        default_args.table_pose_refinement,
+        SceneTablePoseRefinementMode::GatedGpt
+    );
 
     settings.lift_assets = false;
     settings.locate_anything_enabled = false;
     settings.depth_enabled = false;
     settings.segmentation_enabled = true;
-    settings.canonical_pose_enabled = false;
     settings.pose_fit_enabled = false;
     settings.feedback_enabled = true;
     settings.feedback_iterations = 4;
@@ -880,6 +940,20 @@ fn viewer_ground_contact_state_classifies_gap_direction() {
     assert_eq!(
         crate::app::viewer_ground_contact_state(-0.05, 0.0, 0.02),
         crate::app::ViewerGroundContactState::BelowGround
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn scene_camera_frustum_debug_gizmo_is_bounded() {
+    assert_eq!(crate::app::scene_camera_frustum_length(0.001), 0.05);
+    assert_eq!(crate::app::scene_camera_frustum_length(100.0), 3.0);
+
+    let default_cross = crate::app::scene_camera_frustum_cross_size(0.75);
+    assert!((0.02..=0.08).contains(&default_cross));
+    assert!(
+        default_cross <= 0.03,
+        "default scene camera cross should stay visually small, got {default_cross}"
     );
 }
 

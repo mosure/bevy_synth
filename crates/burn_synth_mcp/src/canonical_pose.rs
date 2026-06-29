@@ -163,21 +163,72 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
             let rendered_metrics = projected_bbox
                 .map(|bbox| pixel_metrics.clone().with_foreground_bbox(bbox))
                 .unwrap_or_else(|| pixel_metrics.clone());
-            let generated_score = generated_metrics
+            let generated_shape_score = generated_metrics
                 .as_ref()
                 .map(|metrics| rendered_pose_similarity(&rendered_metrics, metrics))
                 .unwrap_or(0.0);
-            let source_score = source_metrics
+            let source_shape_score = source_metrics
                 .as_ref()
                 .map(|metrics| rendered_pose_similarity(&rendered_metrics, metrics))
                 .unwrap_or(0.0);
-            let evidence_weight = if generated_metrics.is_some() && source_metrics.is_some() {
-                0.82
+            let generated_descriptor = report.generated_image_path.as_deref().and_then(|path| {
+                rendered_pose_visual_descriptor_similarity(
+                    path,
+                    render_path,
+                    Some(rendered_metrics.foreground_bbox),
+                )
+            });
+            let source_descriptor = report.source_crop_path.as_deref().and_then(|path| {
+                rendered_pose_visual_descriptor_similarity(
+                    path,
+                    render_path,
+                    Some(rendered_metrics.foreground_bbox),
+                )
+            });
+            let generated_descriptor_similarity_score = generated_descriptor
+                .as_ref()
+                .and_then(visual_similarity_score);
+            let source_descriptor_similarity_score =
+                source_descriptor.as_ref().and_then(visual_similarity_score);
+            let generated_descriptor_orientation_score = generated_descriptor
+                .as_ref()
+                .and_then(visual_orientation_score);
+            let source_descriptor_orientation_score = source_descriptor
+                .as_ref()
+                .and_then(visual_orientation_score);
+            let generated_descriptor_score = visual_descriptor_score(
+                generated_descriptor_similarity_score,
+                generated_descriptor_orientation_score,
+            );
+            let source_descriptor_score = visual_descriptor_score(
+                source_descriptor_similarity_score,
+                source_descriptor_orientation_score,
+            );
+            let source_normal_score = candidate
+                .metrics
+                .pointer("/normal_evidence/similarity/score")
+                .and_then(Value::as_f64)
+                .filter(|score| score.is_finite())
+                .map(|score| (score as f32).clamp(0.0, 1.0));
+            let generated_score =
+                combine_rendered_pose_scores(generated_shape_score, generated_descriptor_score);
+            let source_score = combine_rendered_pose_scores_with_normal(
+                source_shape_score,
+                source_descriptor_score,
+                source_normal_score,
+            );
+            let descriptor_available = generated_descriptor_score.is_some()
+                || source_descriptor_score.is_some()
+                || source_normal_score.is_some();
+            let evidence_weight = if descriptor_available {
+                0.96
+            } else if generated_metrics.is_some() && source_metrics.is_some() {
+                0.88
             } else {
-                0.70
+                0.76
             };
             let evidence_score = if generated_metrics.is_some() && source_metrics.is_some() {
-                generated_score * 0.64 + source_score * 0.36
+                generated_score * 0.58 + source_score * 0.42
             } else if generated_metrics.is_some() {
                 generated_score
             } else {
@@ -191,11 +242,26 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
                 "measured_score": measured_score,
                 "generated_score": generated_score,
                 "source_score": source_score,
+                "generated_shape_score": generated_shape_score,
+                "source_shape_score": source_shape_score,
+                "generated_descriptor_score": generated_descriptor_score,
+                "source_descriptor_score": source_descriptor_score,
+                "source_normal_score": source_normal_score,
+                "generated_descriptor_similarity_score": generated_descriptor_similarity_score,
+                "source_descriptor_similarity_score": source_descriptor_similarity_score,
+                "generated_descriptor_orientation_score": generated_descriptor_orientation_score,
+                "source_descriptor_orientation_score": source_descriptor_orientation_score,
                 "rendered": rendered_metrics,
                 "pixel_rendered": pixel_metrics,
                 "projected_bbox_used": projected_bbox,
                 "generated_available": generated_metrics.is_some(),
                 "source_available": source_metrics.is_some(),
+                "visual_descriptor": {
+                    "descriptor": "rgb_luma_sobel_edge",
+                    "generated": generated_descriptor,
+                    "source": source_descriptor,
+                },
+                "normal_descriptor": candidate.metrics.get("normal_evidence").cloned().unwrap_or(Value::Null),
             });
             if best
                 .as_ref()
@@ -349,12 +415,35 @@ pub(crate) fn canonical_pose_verification_report(
                 "warnings": report.warnings,
             }));
         } else if report.selected.confidence < 0.55 {
+            let selected_candidate = report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.candidate_index == report.selected.candidate_index);
             low_confidence_assets.push(json!({
                 "asset_id": report.asset_id,
                 "object_id": report.object_id,
                 "label": report.label,
                 "selected_source": report.selected.source,
                 "confidence": report.selected.confidence,
+                "selected_candidate": selected_candidate.map(|candidate| json!({
+                    "candidate_index": candidate.candidate_index,
+                    "yaw_offset_degrees": candidate.yaw_offset_degrees,
+                    "source_normal_score": candidate
+                        .metrics
+                        .pointer("/render_similarity/source_normal_score")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "normal_descriptor": candidate
+                        .metrics
+                        .pointer("/render_similarity/normal_descriptor/descriptor")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "normal_similarity_descriptor": candidate
+                        .metrics
+                        .pointer("/render_similarity/normal_descriptor/similarity/descriptor")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                })),
             }));
         }
     }
@@ -517,7 +606,8 @@ fn rendered_pose_image_metrics(path: &str) -> Result<RenderedPoseImageMetrics, S
     let image = image::open(path)
         .map_err(|err| format!("open canonical pose image {path}: {err}"))?
         .to_rgba8();
-    let (width, height) = image.dimensions();
+    let width = image.width();
+    let height = image.height();
     if width == 0 || height == 0 {
         return Err(format!("canonical pose image {path} is empty"));
     }
@@ -644,6 +734,141 @@ fn rendered_pose_similarity(
         + (1.0 - bbox_iou) * 0.24
         + luma_error * 0.08))
         .clamp(0.0, 1.0)
+}
+
+fn rendered_pose_visual_descriptor_similarity(
+    reference_path: &str,
+    render_path: &str,
+    render_bbox: Option<[f32; 4]>,
+) -> Option<Value> {
+    if is_mask_artifact_path(reference_path) || is_mask_artifact_path(render_path) {
+        return None;
+    }
+    let reference = Path::new(reference_path);
+    let render = Path::new(render_path);
+    let (reference_crop, reference_bbox) = canonical_pose_foreground_crop(reference, None).ok()?;
+    let (render_crop, render_crop_bbox) =
+        canonical_pose_foreground_crop(render, render_bbox).ok()?;
+    feedback_crop_visual_similarity_images(&reference_crop, &render_crop)
+        .map(|mut value| {
+            value["foreground_cropped"] = json!(true);
+            value["reference_crop_bbox"] = json!(reference_bbox);
+            value["render_crop_bbox"] = json!(render_crop_bbox);
+            value
+        })
+        .ok()
+}
+
+fn canonical_pose_foreground_crop(
+    path: &Path,
+    bbox_override: Option<[f32; 4]>,
+) -> Result<(image::DynamicImage, [f32; 4]), String> {
+    let image = image::open(path).map_err(|err| {
+        format!(
+            "open canonical pose descriptor image {}: {err}",
+            path.display()
+        )
+    })?;
+    let bbox = bbox_override
+        .or_else(|| {
+            rendered_pose_image_metrics(&path.display().to_string())
+                .ok()
+                .map(|metrics| metrics.foreground_bbox)
+        })
+        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    let bbox = pad_normalized_bbox(bbox, 0.12);
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "canonical pose descriptor image {} is empty",
+            path.display()
+        ));
+    }
+    let max_x = width.saturating_sub(1);
+    let max_y = height.saturating_sub(1);
+    let x0 = (bbox[0].clamp(0.0, 1.0) * max_x as f32)
+        .floor()
+        .clamp(0.0, max_x as f32) as u32;
+    let y0 = (bbox[1].clamp(0.0, 1.0) * max_y as f32)
+        .floor()
+        .clamp(0.0, max_y as f32) as u32;
+    let x1 = (bbox[2].clamp(0.0, 1.0) * max_x as f32)
+        .ceil()
+        .clamp(x0 as f32, max_x as f32) as u32;
+    let y1 = (bbox[3].clamp(0.0, 1.0) * max_y as f32)
+        .ceil()
+        .clamp(y0 as f32, max_y as f32) as u32;
+    let crop_width = (x1 + 1).saturating_sub(x0).max(1);
+    let crop_height = (y1 + 1).saturating_sub(y0).max(1);
+    let crop = image.crop_imm(x0, y0, crop_width, crop_height);
+    Ok((crop, bbox))
+}
+
+fn pad_normalized_bbox(bbox: [f32; 4], padding: f32) -> [f32; 4] {
+    let width = (bbox[2] - bbox[0]).max(0.0);
+    let height = (bbox[3] - bbox[1]).max(0.0);
+    let pad_x = width * padding.max(0.0);
+    let pad_y = height * padding.max(0.0);
+    [
+        (bbox[0] - pad_x).clamp(0.0, 1.0),
+        (bbox[1] - pad_y).clamp(0.0, 1.0),
+        (bbox[2] + pad_x).clamp(0.0, 1.0),
+        (bbox[3] + pad_y).clamp(0.0, 1.0),
+    ]
+}
+
+fn visual_similarity_score(value: &Value) -> Option<f32> {
+    value
+        .get("score")
+        .and_then(Value::as_f64)
+        .filter(|score| score.is_finite())
+        .map(|score| (score as f32).clamp(0.0, 1.0))
+}
+
+fn visual_orientation_score(value: &Value) -> Option<f32> {
+    let edge_mse = value.get("edge_mse")?.as_f64()?.max(0.0);
+    let color_mse = value.get("color_mse")?.as_f64()?.max(0.0);
+    let gray_mse = value.get("gray_mse")?.as_f64()?.max(0.0);
+    let score = 0.45 * (-edge_mse * 8.0).exp()
+        + 0.35 * (-color_mse * 4.0).exp()
+        + 0.20 * (-gray_mse * 4.0).exp();
+    Some((score as f32).clamp(0.0, 1.0))
+}
+
+fn visual_descriptor_score(
+    similarity_score: Option<f32>,
+    orientation_score: Option<f32>,
+) -> Option<f32> {
+    match (similarity_score, orientation_score) {
+        (Some(similarity), Some(orientation)) => {
+            Some((similarity * 0.96 + orientation * 0.04).clamp(0.0, 1.0))
+        }
+        (Some(similarity), None) => Some(similarity.clamp(0.0, 1.0)),
+        (None, Some(orientation)) => Some(orientation.clamp(0.0, 1.0)),
+        (None, None) => None,
+    }
+}
+
+fn combine_rendered_pose_scores(shape_score: f32, descriptor_score: Option<f32>) -> f32 {
+    descriptor_score
+        .map(|descriptor_score| (descriptor_score * 0.86 + shape_score * 0.14).clamp(0.0, 1.0))
+        .unwrap_or(shape_score.clamp(0.0, 1.0))
+}
+
+fn combine_rendered_pose_scores_with_normal(
+    shape_score: f32,
+    color_descriptor_score: Option<f32>,
+    normal_score: Option<f32>,
+) -> f32 {
+    match (color_descriptor_score, normal_score) {
+        (Some(color), Some(normal)) => {
+            (color * 0.58 + normal * 0.34 + shape_score * 0.08).clamp(0.0, 1.0)
+        }
+        (Some(color), None) => (color * 0.86 + shape_score * 0.14).clamp(0.0, 1.0),
+        (None, Some(normal)) => (normal * 0.88 + shape_score * 0.12).clamp(0.0, 1.0),
+        (None, None) => shape_score.clamp(0.0, 1.0),
+    }
 }
 
 fn safe_log_ratio(left: f32, right: f32) -> f32 {
@@ -966,6 +1191,12 @@ fn source_crop_for_asset(
         .iter()
         .find(|request| request.object.id == asset.object_id)
         .map(|request| request.source_crop_path.clone())
+        .or_else(|| {
+            asset
+                .provenance
+                .as_ref()
+                .and_then(|provenance| provenance.source_crop_path.clone())
+        })
         .or_else(|| {
             evidence.objects.iter().find_map(|object| {
                 (object.object_id == asset.object_id).then(|| {

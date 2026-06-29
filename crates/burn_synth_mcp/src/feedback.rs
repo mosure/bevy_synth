@@ -959,7 +959,7 @@ pub(crate) fn feedback_layout_deltas_with_policy(
         else {
             continue;
         };
-        let scale = damped_feedback_scale_multiplier(object, scale);
+        let scale = feedback_scale_multiplier_for_policy(object, scale, scale_policy);
         let entry = scale_groups.entry(group_key).or_insert((0.0, 0));
         entry.0 += scale.clamp(0.82, 1.22);
         entry.1 += 1;
@@ -1017,7 +1017,8 @@ pub(crate) fn feedback_layout_deltas_with_policy(
                 .filter(|value| value.is_finite())
                 .unwrap_or(1.0)
                 .clamp(0.82, 1.22);
-            let object_scale = damped_feedback_scale_multiplier(object, object_scale);
+            let object_scale =
+                feedback_scale_multiplier_for_policy(object, object_scale, scale_policy);
             let axis_scale = feedback_axis_scale_multiplier(object, scale_policy);
             FeedbackDeltaDraft {
                 index: object.get("index").cloned().unwrap_or(Value::Null),
@@ -1377,23 +1378,8 @@ pub(crate) fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -
             .get("source_edge_cropped")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let area_error = object
-            .get("area_log2_error")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
-            .unwrap_or(0.0);
-        let bbox_overscan = object
-            .get("bbox_overscan")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
-            .unwrap_or(0.0);
-        let max_bbox_overscan = object
-            .get("max_bbox_overscan")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .unwrap_or(0.0);
         let rendered_table_is_pathologically_large =
-            raw_scale < 0.98 && (area_error > 1.0 || bbox_overscan > max_bbox_overscan.max(0.02));
+            feedback_table_is_pathologically_large(object, raw_scale);
         if source_edge_cropped && !rendered_table_is_pathologically_large {
             return 1.0;
         }
@@ -1439,6 +1425,41 @@ pub(crate) fn damped_feedback_scale_multiplier(object: &Value, raw_scale: f64) -
         0.25
     };
     (1.0 + (raw_scale - 1.0) * weight).clamp(0.88, 1.12)
+}
+
+pub(crate) fn feedback_scale_multiplier_for_policy(
+    object: &Value,
+    raw_scale: f64,
+    scale_policy: SceneScalePolicy,
+) -> f64 {
+    let scale = damped_feedback_scale_multiplier(object, raw_scale);
+    if feedback_json_object_is_table_like(object)
+        && scale_policy != SceneScalePolicy::FreeAnisotropic
+        && !feedback_table_is_pathologically_large(object, raw_scale)
+    {
+        1.0
+    } else {
+        scale
+    }
+}
+
+pub(crate) fn feedback_table_is_pathologically_large(object: &Value, raw_scale: f64) -> bool {
+    let area_error = object
+        .get("area_log2_error")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let bbox_overscan = object
+        .get("bbox_overscan")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let max_bbox_overscan = object
+        .get("max_bbox_overscan")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    raw_scale < 0.98 && (area_error > 1.0 || bbox_overscan > max_bbox_overscan.max(0.02))
 }
 
 pub(crate) fn feedback_json_object_is_table_like(object: &Value) -> bool {
@@ -1555,11 +1576,14 @@ pub(crate) fn apply_feedback_deltas_to_commands_with_policy(
             }
         }
     }
-    normalize_reused_command_scales(&mut out);
+    normalize_reused_command_scales(&mut out, scale_policy);
     Ok(out)
 }
 
-pub(crate) fn normalize_reused_command_scales(commands: &mut [Value]) {
+pub(crate) fn normalize_reused_command_scales(
+    commands: &mut [Value],
+    scale_policy: SceneScalePolicy,
+) {
     let mut groups: HashMap<String, ([f32; 3], usize)> = HashMap::new();
     for command in commands.iter() {
         let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1588,11 +1612,11 @@ pub(crate) fn normalize_reused_command_scales(commands: &mut [Value]) {
             if count > 1 {
                 Some((
                     key,
-                    [
+                    scale_policy.apply_to_scale([
                         (sum[0] / count as f32).clamp(0.05, 20.0),
                         (sum[1] / count as f32).clamp(0.05, 20.0),
                         (sum[2] / count as f32).clamp(0.05, 20.0),
-                    ],
+                    ]),
                 ))
             } else {
                 None
@@ -1664,7 +1688,7 @@ pub(crate) fn apply_object_delta_to_command(
             *value = (*value * multiplier).clamp(0.05, 20.0);
         }
     }
-    scale = apply_feedback_scale_policy(scale, scale_policy);
+    scale = scale_policy.apply_to_scale(scale);
     command["scale"] = json!(scale);
 
     let yaw_delta = delta
@@ -1688,34 +1712,6 @@ pub(crate) fn apply_object_delta_to_command(
         command["rotation"] = json!(quat_from_y_degrees(target_yaw));
     }
     Ok(())
-}
-
-fn apply_feedback_scale_policy(scale: [f32; 3], scale_policy: SceneScalePolicy) -> [f32; 3] {
-    let Some(max_ratio) = scale_policy.max_xz_anisotropy() else {
-        return scale;
-    };
-    if max_ratio <= 1.0 + f32::EPSILON {
-        let uniform = ((scale[0].abs() + scale[1].abs() + scale[2].abs()) / 3.0).clamp(0.05, 20.0);
-        return [uniform, uniform, uniform];
-    }
-    let x = scale[0].abs().clamp(0.05, 20.0);
-    let z = scale[2].abs().clamp(0.05, 20.0);
-    let ratio = (x.max(z) / x.min(z).max(1.0e-5)).max(1.0);
-    if ratio <= max_ratio {
-        return scale;
-    }
-    let area_scale = (x * z).sqrt().clamp(0.05, 20.0);
-    let root_ratio = max_ratio.sqrt();
-    let (next_x, next_z) = if x >= z {
-        (area_scale * root_ratio, area_scale / root_ratio)
-    } else {
-        (area_scale / root_ratio, area_scale * root_ratio)
-    };
-    [
-        next_x.clamp(0.05, 20.0).copysign(scale[0]),
-        area_scale.clamp(0.05, 20.0).copysign(scale[1]),
-        next_z.clamp(0.05, 20.0).copysign(scale[2]),
-    ]
 }
 
 pub(crate) fn clamp_translation_to_ground_anchor(
@@ -3072,8 +3068,27 @@ pub(crate) fn feedback_crop_visual_similarity(
     source_crop: &Path,
     rendered_candidate_crop: &Path,
 ) -> Result<Value, String> {
-    let source = feedback_crop_descriptor(source_crop)?;
-    let candidate = feedback_crop_descriptor(rendered_candidate_crop)?;
+    let source_image = image::open(source_crop).map_err(|err| {
+        format!(
+            "failed to open feedback crop {}: {err}",
+            source_crop.display()
+        )
+    })?;
+    let candidate_image = image::open(rendered_candidate_crop).map_err(|err| {
+        format!(
+            "failed to open feedback crop {}: {err}",
+            rendered_candidate_crop.display()
+        )
+    })?;
+    feedback_crop_visual_similarity_images(&source_image, &candidate_image)
+}
+
+pub(crate) fn feedback_crop_visual_similarity_images(
+    source_image: &image::DynamicImage,
+    candidate_image: &image::DynamicImage,
+) -> Result<Value, String> {
+    let source = feedback_crop_descriptor_from_image(source_image)?;
+    let candidate = feedback_crop_descriptor_from_image(candidate_image)?;
     let gray_mse = mean_square_error(&source.gray_norm, &candidate.gray_norm);
     let edge_mse = mean_square_error(&source.edge_norm, &candidate.edge_norm);
     let color_mse = mean_square_error(&source.rgb_norm, &candidate.rgb_norm);
@@ -3104,9 +3119,10 @@ struct FeedbackCropDescriptor {
     gray_std: f64,
 }
 
-fn feedback_crop_descriptor(path: &Path) -> Result<FeedbackCropDescriptor, String> {
-    let image = image::open(path)
-        .map_err(|err| format!("failed to open feedback crop {}: {err}", path.display()))?
+fn feedback_crop_descriptor_from_image(
+    image: &image::DynamicImage,
+) -> Result<FeedbackCropDescriptor, String> {
+    let image = image
         .resize_exact(64, 64, image::imageops::FilterType::Triangle)
         .to_rgb8();
     let mut rgb = Vec::with_capacity((image.width() * image.height() * 3) as usize);

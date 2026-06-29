@@ -236,12 +236,8 @@ pub(crate) fn fit_grounded_scene_projection(
     if targets.iter().all(Option::is_none) {
         return None;
     }
-    let layout_camera = ProjectionCamera::from_scene_camera(camera, aspect);
-    let camera = if scene_camera_is_source_depth_frame(camera) {
-        ProjectionCamera::from_evidence(evidence, &targets).or(layout_camera)
-    } else {
-        layout_camera
-    }?;
+    let camera = ProjectionCamera::from_evidence(evidence, &targets)
+        .or_else(|| ProjectionCamera::from_scene_camera(camera, aspect))?;
 
     let initial_eval = evaluate_scene(placements, &targets, camera, floor_y);
     let mut best_loss = initial_eval.total_loss;
@@ -316,10 +312,6 @@ pub(crate) fn fit_grounded_scene_projection(
     })
 }
 
-fn scene_camera_is_source_depth_frame(camera: &SceneCamera) -> bool {
-    camera.yaw.is_none() && camera.pitch.is_none() && camera.radius.is_none()
-}
-
 impl ProjectionTarget {
     fn from_placement(
         placement: &GroundedScenePlacement,
@@ -365,9 +357,12 @@ impl ProjectionTarget {
             ground_anchor_basis,
             source_camera_anchor,
             source_camera_origin_xz: source_camera_anchor.map(|point| {
+                // Layout Z is the inverse of source-camera Z:
+                // layout_z = source_origin_z - source_z. Reconstruct the
+                // shared source origin from the anchor and layout ground point.
                 [
                     point[0] - placement.ground_point[0],
-                    point[2] - placement.ground_point[2],
+                    point[2] + placement.ground_point[2],
                 ]
             }),
             ground_anchor_max_drift_m: placement.ground_anchor_max_drift_m(),
@@ -1879,6 +1874,91 @@ mod tests {
             target.ground_anchor_basis,
             GroundAnchorBasis::MetricDepthContact
         );
+        assert!((projected[0] - placement.contact_pixel[0]).abs() < 1.0e-5);
+        assert!((projected[1] - placement.contact_pixel[1]).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn source_origin_round_trip_preserves_nonzero_layout_z() {
+        let width = 1600.0f32;
+        let height = 900.0f32;
+        let fx = 800.0f32;
+        let fy = 800.0f32;
+        let cx = 799.5f32;
+        let cy = 449.5f32;
+        let source_origin = [2.0f32, 5.0f32];
+        let mut placement = test_placement("chair_001", 0.0);
+        placement.ground_point = [0.5, 0.0, -1.0];
+        placement.translation = placement.ground_point;
+        let source_anchor = [
+            source_origin[0] + placement.ground_point[0],
+            0.0,
+            source_origin[1] - placement.ground_point[2],
+        ];
+        placement.contact_pixel = [
+            (fx * source_anchor[0] / source_anchor[2] + cx) / (width - 1.0),
+            (fy * source_anchor[1] / source_anchor[2] + cy) / (height - 1.0),
+        ];
+        let evidence = SceneGroundingEvidence {
+            source_image_path: "synthetic.png".to_string(),
+            depth: Some(DepthEvidenceRef {
+                provider: "synthetic".to_string(),
+                model: None,
+                precision: None,
+                artifact_path: None,
+                focal_length_px: Some(fy),
+                vertical_fov_degrees: Some(60.0),
+                image_size: Some([width as u32, height as u32]),
+                depth_map_size: Some([width as u32, height as u32]),
+                floor_sample_count: Some(64),
+            }),
+            segmentation: None,
+            detections: Vec::new(),
+            camera: EstimatedCamera {
+                focal_length_px: Some(fy),
+                principal_point: Some([cx, cy]),
+                image_size: Some([width as u32, height as u32]),
+                vertical_fov_degrees: Some(60.0),
+                ..EstimatedCamera::default()
+            },
+            floor: EstimatedFloorPlane {
+                normal: [0.0, 1.0, 0.0],
+                distance_m: 0.0,
+                residual_m: Some(0.50),
+                confidence: Some(0.50),
+            },
+            objects: vec![ObjectGroundingEvidence {
+                object_id: placement.object_id.clone(),
+                instance_id: placement.instance_id.clone(),
+                reuse_group: None,
+                detection: Some(crate::Detection {
+                    label: placement.label.clone(),
+                    bbox: placement.source_bbox,
+                    point: Some(placement.contact_pixel),
+                    confidence: Some(0.95),
+                    source_query: "chair".to_string(),
+                }),
+                mask: None,
+                asset_id: None,
+                contact_pixel: Some(placement.contact_pixel),
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: Some(source_anchor),
+                target_footprint_m: Some(placement.target_footprint_m),
+                provenance: vec!["synthetic_metric_depth".to_string()],
+            }],
+        };
+        let target = ProjectionTarget::from_placement(&placement, &evidence).unwrap();
+        assert_eq!(
+            target.source_camera_origin_xz,
+            Some(source_origin),
+            "source origin must invert layout_z = source_origin_z - source_z"
+        );
+        let camera = ProjectionCamera::from_evidence(&evidence, &[Some(target.clone())]).unwrap();
+        let (projected, _) = camera
+            .project_point(placement.ground_point, &target, 0.0)
+            .unwrap();
+
         assert!((projected[0] - placement.contact_pixel[0]).abs() < 1.0e-5);
         assert!((projected[1] - placement.contact_pixel[1]).abs() < 1.0e-5);
     }

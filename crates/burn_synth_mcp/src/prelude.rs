@@ -29,18 +29,26 @@ pub(crate) use burn_synth_grounding::{
     LocateAnythingGroundingReport, SceneGroundingRuntime, SegmentationGroundingConfig,
     SegmentationGroundingReport, SegmentationModelKind, SegmentationRuntimeBackend,
 };
+pub(crate) use burn_synth_render::normal::{
+    BinaryMaskView, DepthMapView, DepthNormalIntrinsics, MeshNormalInput, RenderAabb,
+    SourceDepthNormalInput, normal_map_similarity,
+    write_candidate_mesh_normal_render as write_render_candidate_mesh_normal,
+    write_source_depth_normal_evidence as write_render_source_depth_normal_evidence,
+};
 pub(crate) use burn_synth_scene::{
     CanonicalPoseCalibrationReport, CanonicalPoseCandidate, CanonicalPoseSelection,
     DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE, GptDelegationRole, GroundedSceneLayout,
     GroundedSceneLayoutConfig, GroundedScenePlacement, GroundingContractEntry,
-    GroundingContractReport, GroundingVerificationStatus, ObjectImageGenerationPolicy,
-    ObjectImageRequest, OpenAiProviderConfig, OpenAiSceneProvider, SceneAiProvider, SceneAssetAabb,
-    SceneAssetBinding, SceneAssetFrame, SceneAssetFrameSource, SceneAssetSymmetry, SceneBsnRequest,
-    SceneBuildConfig, SceneDecisionLog, SceneDecisionLogEntry, SceneGroundingEvidence,
-    SceneObjectManifest, ScenePipeline, ScenePlan, SceneQualityProfile, SceneQualityRubricRequest,
-    SceneQualityRubricResponse, SceneReasoningRequest, SceneResult, SceneRotationSelectionRequest,
-    SceneRotationSelectionResponse, SceneScalePolicy, canonical_pose_evidence_for_assets,
-    grounded_scene_layout, grounded_scene_layout_for_manifest,
+    GroundingContractReport, GroundingVerificationStatus, ObjectGroundingEvidence,
+    ObjectImageGenerationPolicy, ObjectImageRequest, OpenAiProviderConfig, OpenAiSceneProvider,
+    SceneAiProvider, SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneAssetFrameSource,
+    SceneAssetSymmetry, SceneBsnRequest, SceneBuildConfig, SceneDecisionLog, SceneDecisionLogEntry,
+    SceneGroundCalibrationReport, SceneGroundingEvidence, SceneObjectManifest, ScenePipeline,
+    ScenePlan, SceneQualityProfile, SceneQualityRubricRequest, SceneQualityRubricResponse,
+    SceneReasoningRequest, SceneResult, SceneRotationSelectionRequest,
+    SceneRotationSelectionResponse, SceneScalePolicy, apply_chair_type_groups,
+    apply_ground_calibration_response, canonical_pose_evidence_for_assets,
+    chair_type_grouping_report, grounded_scene_layout, grounded_scene_layout_for_manifest,
     grounded_scene_layout_with_evidence_config, manifest_grounding_evidence,
     manifest_with_grounding_evidence, parse_scene_bsn, scene_asset_declaration_for_bsn,
     scene_plan_to_mcp_commands, select_object_image_candidates_with_exclusions,
@@ -54,10 +62,12 @@ pub(crate) use crate::canonical_pose::*;
 pub(crate) use crate::feedback::*;
 pub(crate) use crate::protocol::*;
 pub(crate) use crate::rotation_fit::*;
+pub(crate) use crate::scene_depth_sidecar::*;
 pub(crate) use crate::scene_grounding_report::*;
 pub(crate) use crate::scene_layout::{
     SceneComposeArgs, SceneComposePlan, SceneValidateArgs, compose_scene_layout,
     validate_scene_layout,
 };
+pub(crate) use crate::scene_pipeline_strategy::*;
 pub(crate) use crate::types::*;
 pub(crate) use crate::visible_surface_report::*;

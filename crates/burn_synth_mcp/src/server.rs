@@ -112,6 +112,44 @@ fn feedback_rotation_candidate_commands(
     ]
 }
 
+fn apply_gpt_ground_calibration<P: SceneAiProvider>(
+    pipeline: &ScenePipeline<P>,
+    manifest: &mut SceneObjectManifest,
+    evidence: &mut SceneGroundingEvidence,
+    output_dir: &Path,
+    write_artifacts: bool,
+    extra_image_paths: &[PathBuf],
+) -> Result<SceneGroundCalibrationReport, String> {
+    let request =
+        pipeline.prepare_ground_calibration_request(manifest, evidence, extra_image_paths);
+    let response = pipeline
+        .calibrate_ground(&request)
+        .map_err(|err| err.to_string())?;
+    let (next_manifest, next_evidence, report) =
+        apply_ground_calibration_response(manifest, evidence, &response)
+            .map_err(|err| err.to_string())?;
+    if write_artifacts {
+        write_json_file(
+            &output_dir.join("ground_calibration_gpt_request.json"),
+            &request,
+        )
+        .map_err(|err| err.to_string())?;
+        write_json_file(
+            &output_dir.join("ground_calibration_gpt_response.json"),
+            &response,
+        )
+        .map_err(|err| err.to_string())?;
+        write_json_file(
+            &output_dir.join("ground_calibration_gpt_report.json"),
+            &report,
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    *manifest = next_manifest;
+    *evidence = next_evidence;
+    Ok(report)
+}
+
 fn mark_canonical_pose_verification_failure(response: &mut Value, verification: &Value) {
     let requires_attention = verification
         .get("requires_attention")
@@ -255,13 +293,146 @@ fn validate_scene_pose_fit_mode(mode: ScenePoseFitMode) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SceneAssetLiftPolicy {
+    pub(crate) synthesis_models: Vec<SynthesisModel>,
+    pub(crate) output_format: AssetOutputFormat,
+    pub(crate) requires_mesh_assets: bool,
+    pub(crate) warnings: Vec<String>,
+}
+
+impl SceneAssetLiftPolicy {
+    fn to_json(&self) -> Value {
+        json!({
+            "synthesis_models": self
+                .synthesis_models
+                .iter()
+                .map(|model| model.as_str())
+                .collect::<Vec<_>>(),
+            "output_format": self.output_format.as_str(),
+            "requires_mesh_assets": self.requires_mesh_assets,
+            "warnings": self.warnings,
+        })
+    }
+}
+
+pub(crate) fn scene_asset_lift_policy(
+    args: &SceneBuildFromImageArgs,
+) -> Result<SceneAssetLiftPolicy, String> {
+    let requires_mesh_assets = scene_build_requires_mesh_assets(args);
+    let synthesis_models = args
+        .synthesis_models
+        .clone()
+        .map(sanitize_synthesis_models)
+        .unwrap_or_else(|| vec![SynthesisModel::Trellis]);
+    let mut warnings = Vec::new();
+
+    if requires_mesh_assets {
+        let invalid = synthesis_models
+            .iter()
+            .copied()
+            .filter(|model| !scene_synthesis_model_outputs_mesh(*model))
+            .map(|model| model.as_str())
+            .collect::<Vec<_>>();
+        if !invalid.is_empty() {
+            return Err(format!(
+                "explicit scene composition with {:?} pose fitting requires GLB mesh assets, but selected image-to-3d model(s) [{}] emit non-mesh outputs. Use trellis or triposg, or disable rendered-silhouette/table pose fitting for splat-only experiments.",
+                args.pose_fit,
+                invalid.join(", ")
+            ));
+        }
+        if !synthesis_models.contains(&SynthesisModel::Trellis) {
+            warnings.push(
+                "Trellis.2 is the preferred scene asset model for PBR/mesh quality; non-Trellis mesh models are treated as an explicit quality ablation."
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(SceneAssetLiftPolicy {
+        synthesis_models,
+        output_format: if requires_mesh_assets {
+            AssetOutputFormat::Glb
+        } else {
+            AssetOutputFormat::Auto
+        },
+        requires_mesh_assets,
+        warnings,
+    })
+}
+
+pub(crate) fn scene_build_requires_mesh_assets(args: &SceneBuildFromImageArgs) -> bool {
+    args.lift_assets
+        && args.composition_mode == SceneCompositionMode::CvGrounded
+        && (args.pose_fit == ScenePoseFitMode::RenderedSilhouette
+            || args.rotation_fit != SceneRotationFitMode::Off
+            || args.table_pose_refinement.geometry_enabled())
+}
+
+fn scene_synthesis_model_outputs_mesh(model: SynthesisModel) -> bool {
+    matches!(model, SynthesisModel::Triposg | SynthesisModel::Trellis)
+}
+
+pub(crate) fn validate_scene_asset_outputs_for_policy(
+    asset_outputs: &Value,
+    policy: &SceneAssetLiftPolicy,
+) -> Result<(), String> {
+    if !policy.requires_mesh_assets {
+        return Ok(());
+    }
+    let Some(items) = asset_outputs.get("items").and_then(Value::as_array) else {
+        return Err(
+            "scene asset contract failed: images_to_assets response missing items".to_string(),
+        );
+    };
+    let mut failures = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let object = item
+            .get("input_image_path")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .unwrap_or("<unknown>");
+        let asset_kind = item
+            .get("asset_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let output_format = item
+            .get("output_format")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if asset_kind != "mesh" {
+            failures.push(format!(
+                "item {index} ({object}) produced asset_kind={asset_kind}, expected mesh"
+            ));
+        }
+        if output_format != "glb" {
+            failures.push(format!(
+                "item {index} ({object}) produced output_format={output_format}, expected glb"
+            ));
+        }
+        if item.get("local_aabb").is_none_or(Value::is_null) {
+            failures.push(format!(
+                "item {index} ({object}) has no local_aabb for scene placement"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "scene asset contract failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
 fn scene_pose_fit_note(mode: ScenePoseFitMode) -> &'static str {
     match mode {
         ScenePoseFitMode::ProjectedAabb => {
             "projected AABB/contact/depth fitting; segmentation masks refine source bboxes when available"
         }
         ScenePoseFitMode::RenderedSilhouette => {
-            "mask-aware projected silhouette/depth fitting; SAM masks provide visible-surface evidence and AABB projection remains the geometric proxy"
+            "bounded source-camera visible-surface fitting; SAM/bbox masks, DepthPro dense depth sidecar crops, depth distributions, and mask point moments are matched against projected generated GLB surfaces before feedback"
         }
     }
 }
@@ -605,6 +776,136 @@ fn emit_asset_runtime_progress_events<F>(
             }),
         );
     }
+}
+
+fn write_source_depth_normal_evidence_for_asset(
+    asset: &SceneAssetBinding,
+    evidence: &SceneGroundingEvidence,
+    depth_map: Option<&LoadedSceneDepthMap>,
+    output_path: &Path,
+) -> Result<Option<Value>, String> {
+    let Some(depth_map) = depth_map else {
+        return Ok(None);
+    };
+    let Some(object) = evidence.objects.iter().find(|object| {
+        object.object_id == asset.object_id
+            || object.asset_id.as_deref() == Some(asset.asset_id.as_str())
+    }) else {
+        return Ok(None);
+    };
+    let Some(mask) = source_normal_mask(object, evidence) else {
+        return Ok(None);
+    };
+    let bbox = object
+        .mask
+        .as_ref()
+        .map(|mask| mask.bbox)
+        .or_else(|| object.detection.as_ref().map(|detection| detection.bbox))
+        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    let bbox = pad_normalized_bbox_for_render(bbox, 0.08);
+    let intrinsics = source_depth_intrinsics(evidence, depth_map);
+    let depth_sidecar_label = depth_map.raw_path.display().to_string();
+    let mask_kind = if object
+        .mask
+        .as_ref()
+        .is_some_and(|mask| !mask.mask_rle.is_empty())
+    {
+        "sam_rle"
+    } else {
+        "bbox"
+    };
+    let input = SourceDepthNormalInput {
+        depth_map: DepthMapView {
+            depth_m: &depth_map.depth_m,
+            width: depth_map.width,
+            height: depth_map.height,
+        },
+        mask: BinaryMaskView {
+            data: mask.data(),
+            width: mask.width(),
+            height: mask.height(),
+        },
+        bbox,
+        intrinsics,
+        depth_sidecar_label: Some(depth_sidecar_label.as_str()),
+        mask_kind,
+    };
+    write_render_source_depth_normal_evidence(input, output_path).map(Some)
+}
+
+fn source_normal_mask(
+    object: &ObjectGroundingEvidence,
+    evidence: &SceneGroundingEvidence,
+) -> Option<BinaryMask> {
+    if let Some(mask) = object.mask.as_ref() {
+        if !mask.mask_rle.is_empty() {
+            return BinaryMask::decode_rle(mask.image_size[0], mask.image_size[1], &mask.mask_rle)
+                .ok();
+        }
+        return BinaryMask::from_normalized_bbox(mask.image_size[0], mask.image_size[1], mask.bbox)
+            .ok();
+    }
+    let bbox = object
+        .detection
+        .as_ref()
+        .map(|detection| detection.bbox)
+        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    let size = evidence
+        .camera
+        .image_size
+        .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.image_size))
+        .unwrap_or([1024, 1024]);
+    BinaryMask::from_normalized_bbox(size[0], size[1], bbox).ok()
+}
+
+fn source_depth_intrinsics(
+    evidence: &SceneGroundingEvidence,
+    depth_map: &LoadedSceneDepthMap,
+) -> DepthNormalIntrinsics {
+    let focal = evidence
+        .depth
+        .as_ref()
+        .and_then(|depth| depth.focal_length_px)
+        .or(evidence.camera.focal_length_px)
+        .unwrap_or(depth_map.width.max(depth_map.height) as f32);
+    let principal = evidence.camera.principal_point.unwrap_or([
+        (depth_map.width.saturating_sub(1)) as f32 * 0.5,
+        (depth_map.height.saturating_sub(1)) as f32 * 0.5,
+    ]);
+    DepthNormalIntrinsics {
+        fx: focal.max(1.0e-5),
+        fy: focal.max(1.0e-5),
+        cx: principal[0],
+        cy: principal[1],
+        width: depth_map.width,
+        height: depth_map.height,
+    }
+}
+
+fn cached_mesh_normal_input(mesh: &CachedSynthMesh) -> MeshNormalInput<'_> {
+    MeshNormalInput {
+        vertices: &mesh.mesh.vertices,
+        faces: &mesh.mesh.faces,
+        normals: Some(&mesh.normals),
+    }
+}
+
+fn scene_aabb_to_render(aabb: SceneAssetAabb) -> RenderAabb {
+    RenderAabb {
+        min: aabb.min,
+        max: aabb.max,
+    }
+}
+
+fn pad_normalized_bbox_for_render(bbox: [f32; 4], padding: f32) -> [f32; 4] {
+    let width = (bbox[2] - bbox[0]).max(0.0);
+    let height = (bbox[3] - bbox[1]).max(0.0);
+    [
+        (bbox[0] - width * padding).clamp(0.0, 1.0),
+        (bbox[1] - height * padding).clamp(0.0, 1.0),
+        (bbox[2] + width * padding).clamp(0.0, 1.0),
+        (bbox[3] + height * padding).clamp(0.0, 1.0),
+    ]
 }
 
 impl McpServer {
@@ -1357,6 +1658,7 @@ impl McpServer {
         F: FnMut(SceneBuildProgressEvent),
     {
         validate_scene_pose_fit_mode(args.pose_fit)?;
+        let asset_lift_policy = scene_asset_lift_policy(&args)?;
         let e2e_started = Instant::now();
         let mut stage_report = Vec::new();
         let prepare_args = ScenePrepareBuildArgs {
@@ -1432,11 +1734,25 @@ impl McpServer {
             write_json_file(&output_dir.join("manifest.json"), &manifest)
                 .map_err(|err| err.to_string())?;
         }
+        let segmentation_provider = args
+            .segmentation_provider
+            .unwrap_or(self.config.scene_segmentation_provider);
+        let segmentation_precision = args
+            .segmentation_precision
+            .unwrap_or(self.config.scene_segmentation_precision);
+        let segmentation_quantization = args
+            .segmentation_quantization
+            .unwrap_or(self.config.scene_segmentation_quantization);
         let mut pre_generation_grounding_source = "not_requested".to_string();
         let mut pre_generation_grounding_evidence: Option<SceneGroundingEvidence> = None;
         let mut pre_generation_locate_anything_report: Option<LocateAnythingGroundingReport> = None;
+        let mut pre_generation_segmentation_report: Option<SegmentationGroundingReport> = None;
+        let mut pre_generation_depth_report: Option<DepthProGroundingReport> = None;
+        let mut pre_generation_ground_calibration_report: Option<SceneGroundCalibrationReport> =
+            None;
         if args.composition_mode == SceneCompositionMode::CvGrounded {
-            if args.locator == SceneLocatorProvider::LocateAnything {
+            let (mut evidence, mut source) = if args.locator == SceneLocatorProvider::LocateAnything
+            {
                 let stage_started = Instant::now();
                 let backend = args
                     .locate_anything_backend
@@ -1449,7 +1765,7 @@ impl McpServer {
                     json!({
                         "locator": args.locator,
                         "backend": backend,
-                        "purpose": "refine object-image source bboxes before gpt-image-2",
+                        "purpose": "object cardinality and crop bboxes before gpt-image-2",
                     }),
                 );
                 let (evidence, report) = self.locate_anything_grounding_evidence_with_report(
@@ -1458,11 +1774,7 @@ impl McpServer {
                     &args.source_scene_path,
                     &output_dir,
                 )?;
-                let grounded_manifest = manifest_with_grounding_evidence(&manifest, &evidence);
-                manifest = grounded_manifest;
-                pre_generation_grounding_source =
-                    "locate_anything_burn_native_pre_generation".to_string();
-                pre_generation_grounding_evidence = Some(evidence);
+                let source = "locate_anything_burn_native_pre_generation".to_string();
                 pre_generation_locate_anything_report = Some(report);
                 record_stage(
                     &mut stage_report,
@@ -1482,43 +1794,371 @@ impl McpServer {
                         .as_ref()
                         .map(|report| report.overlay_path.clone()),
                     json!({
-                        "grounding_source": pre_generation_grounding_source,
-                        "detections": pre_generation_grounding_evidence
-                            .as_ref()
-                            .map(|evidence| evidence.detections.len())
-                            .unwrap_or_default(),
-                        "objects": pre_generation_grounding_evidence
-                            .as_ref()
-                            .map(|evidence| evidence.objects.len())
-                            .unwrap_or_default(),
+                        "grounding_source": source,
+                        "detections": evidence.detections.len(),
+                        "objects": evidence.objects.len(),
                         "manifest_artifact": output_dir.join("manifest_grounded_for_crops.json"),
                     }),
                 );
-                if args.write_artifacts {
-                    write_json_file(&output_dir.join("manifest.json"), &manifest)
-                        .map_err(|err| err.to_string())?;
-                    write_json_file(
-                        &output_dir.join("manifest_grounded_for_crops.json"),
-                        &manifest,
-                    )
-                    .map_err(|err| err.to_string())?;
-                    if let Some(evidence) = pre_generation_grounding_evidence.as_ref() {
-                        write_json_file(
-                            &output_dir.join("pre_generation_grounding_evidence.json"),
-                            evidence,
-                        )
-                        .map_err(|err| err.to_string())?;
+                (evidence, source)
+            } else {
+                (
+                    manifest_grounding_evidence(&manifest),
+                    "manifest_fallback_pre_generation".to_string(),
+                )
+            };
+
+            if args.locator == SceneLocatorProvider::LocateAnything
+                && args.instance_generation == SceneInstanceGenerationMode::FineGrainedTypes
+            {
+                match pipeline.prepare_chair_type_grouping_request(&manifest, &evidence) {
+                    Ok(Some(request)) => {
+                        let stage_started = Instant::now();
+                        let request_path = output_dir.join("chair_type_grouping_request.json");
+                        let response_path = output_dir.join("chair_type_grouping_response.json");
+                        let report_path = output_dir.join("chair_type_grouping_report.json");
+                        if args.write_artifacts {
+                            write_json_file(&request_path, &request)
+                                .map_err(|err| err.to_string())?;
+                        }
+                        progress.emit_with_items(
+                            "chair_type_grouping",
+                            SceneBuildProgressPhase::Started,
+                            SceneBuildExecutionKind::Network,
+                            "classifying repeated chair detections into reusable asset types",
+                            None,
+                            Some(request.items.len()),
+                            Some(request_path.clone()),
+                            json!({
+                                "chair_detection_count": request.items.len(),
+                                "crop_count": request.crop_image_paths.len(),
+                                "purpose": "split visually distinct chair types before shared image generation and 3d lift",
+                            }),
+                        );
+                        match pipeline.classify_chair_types(&request) {
+                            Ok(response) => {
+                                let report = chair_type_grouping_report(&request, &response);
+                                let (next_manifest, next_evidence) = apply_chair_type_groups(
+                                    &manifest, &evidence, &request, &response,
+                                )
+                                .map_err(|err| err.to_string())?;
+                                manifest = next_manifest;
+                                evidence = next_evidence;
+                                source = format!("{source}+chair_type_grouping");
+                                record_stage(
+                                    &mut stage_report,
+                                    "chair_type_grouping",
+                                    stage_started,
+                                );
+                                if args.write_artifacts {
+                                    write_json_file(&response_path, &response)
+                                        .map_err(|err| err.to_string())?;
+                                    write_json_file(&report_path, &report)
+                                        .map_err(|err| err.to_string())?;
+                                    write_json_file(
+                                        &output_dir.join("manifest_after_chair_type_grouping.json"),
+                                        &manifest,
+                                    )
+                                    .map_err(|err| err.to_string())?;
+                                    write_json_file(
+                                        &output_dir
+                                            .join("grounding_after_chair_type_grouping.json"),
+                                        &evidence,
+                                    )
+                                    .map_err(|err| err.to_string())?;
+                                }
+                                progress.emit_with_items(
+                                    "chair_type_grouping",
+                                    SceneBuildProgressPhase::Completed,
+                                    SceneBuildExecutionKind::Network,
+                                    "chair type grouping complete",
+                                    None,
+                                    report
+                                        .get("group_count")
+                                        .and_then(Value::as_u64)
+                                        .map(|value| value as usize),
+                                    Some(report_path),
+                                    json!({
+                                        "group_count": report
+                                            .get("group_count")
+                                            .and_then(Value::as_u64),
+                                        "manifest_objects": manifest.objects.len(),
+                                        "source": source.clone(),
+                                    }),
+                                );
+                            }
+                            Err(err) => {
+                                record_stage(
+                                    &mut stage_report,
+                                    "chair_type_grouping",
+                                    stage_started,
+                                );
+                                let error_path = output_dir.join("chair_type_grouping_error.json");
+                                if args.write_artifacts {
+                                    write_json_file(
+                                        &error_path,
+                                        &json!({
+                                            "stage": "chair_type_grouping",
+                                            "error": err.to_string(),
+                                            "message": "fine-grained instance generation failed",
+                                        }),
+                                    )
+                                    .map_err(|write_err| write_err.to_string())?;
+                                }
+                                progress.emit_with_items(
+                                    "chair_type_grouping",
+                                    SceneBuildProgressPhase::Failed,
+                                    SceneBuildExecutionKind::Network,
+                                    "chair type grouping failed",
+                                    None,
+                                    Some(request.items.len()),
+                                    Some(error_path),
+                                    json!({
+                                        "error": err.to_string(),
+                                        "fallback": Value::Null,
+                                    }),
+                                );
+                                return Err(format!("chair type grouping failed: {err}"));
+                            }
+                        }
                     }
-                    if let Some(report) = pre_generation_locate_anything_report.as_ref() {
-                        write_json_file(
-                            &output_dir.join("pre_generation_locate_anything_report.json"),
-                            report,
-                        )
-                        .map_err(|err| err.to_string())?;
+                    Ok(None) => {
+                        progress.emit(
+                            "chair_type_grouping",
+                            SceneBuildProgressPhase::Completed,
+                            SceneBuildExecutionKind::Cpu,
+                            "chair type grouping not needed",
+                            json!({
+                                "reason": "zero_or_one_chair_detection",
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err.to_string());
                     }
                 }
+            } else if args.locator == SceneLocatorProvider::LocateAnything {
+                progress.emit(
+                    "chair_type_grouping",
+                    SceneBuildProgressPhase::Completed,
+                    SceneBuildExecutionKind::Cpu,
+                    "same-category instances will share category representative assets",
+                    json!({
+                        "instance_generation": args.instance_generation,
+                        "reason": "fine_grained_types_not_selected",
+                    }),
+                );
+            }
+
+            if segmentation_provider != SceneSegmentationProvider::None
+                && evidence.segmentation.is_none()
+            {
+                let stage_started = Instant::now();
+                progress.emit(
+                    "pre_generation_segmentation_grounding",
+                    SceneBuildProgressPhase::Started,
+                    if segmentation_provider == SceneSegmentationProvider::BboxPrompt {
+                        SceneBuildExecutionKind::Cpu
+                    } else {
+                        SceneBuildExecutionKind::Gpu
+                    },
+                    "running SAM/object-query masks before object crops",
+                    json!({
+                        "segmentation_provider": segmentation_provider,
+                        "segmentation_precision": segmentation_precision,
+                        "segmentation_quantization": segmentation_quantization,
+                        "objects": evidence.objects.len(),
+                        "purpose": "mask-refined crop boxes and visible-pixel depth selection",
+                    }),
+                );
+                pre_generation_segmentation_report = self.segmentation_grounding_evidence(
+                    segmentation_provider,
+                    Some(segmentation_precision),
+                    Some(segmentation_quantization),
+                    &mut evidence,
+                    &args.source_scene_path,
+                    &output_dir,
+                )?;
+                record_stage(
+                    &mut stage_report,
+                    "pre_generation_segmentation_grounding",
+                    stage_started,
+                );
+                progress.emit_with_items(
+                    "pre_generation_segmentation_grounding",
+                    SceneBuildProgressPhase::Completed,
+                    if segmentation_provider == SceneSegmentationProvider::BboxPrompt {
+                        SceneBuildExecutionKind::Cpu
+                    } else {
+                        SceneBuildExecutionKind::Gpu
+                    },
+                    "pre-generation mask grounding complete",
+                    None,
+                    pre_generation_segmentation_report
+                        .as_ref()
+                        .map(|report| report.mask_count),
+                    pre_generation_segmentation_report
+                        .as_ref()
+                        .map(|report| report.overlay_path.clone()),
+                    json!({
+                        "mask_count": pre_generation_segmentation_report
+                            .as_ref()
+                            .map(|report| report.mask_count),
+                        "runtime_cache_hit": pre_generation_segmentation_report
+                            .as_ref()
+                            .map(|report| report.runtime_cache_hit),
+                    }),
+                );
+            }
+
+            if args.depth_provider == SceneDepthProvider::DepthPro && evidence.depth.is_none() {
+                let stage_started = Instant::now();
+                progress.emit(
+                    "pre_generation_depth_pro_grounding",
+                    SceneBuildProgressPhase::Started,
+                    SceneBuildExecutionKind::Gpu,
+                    "running DepthPro before object crops",
+                    json!({
+                        "depth_provider": args.depth_provider,
+                        "cache_dir": self.config.depth_cache_dir.clone(),
+                        "precision": self.config.depth_precision,
+                        "mask_count": evidence
+                            .segmentation
+                            .as_ref()
+                            .and_then(|segmentation| segmentation.mask_count),
+                        "purpose": "camera/floor calibration and visible-surface depth stats before composition",
+                    }),
+                );
+                let depth_report = self.depth_pro_grounding_evidence(
+                    &mut evidence,
+                    &args.source_scene_path,
+                    &output_dir,
+                )?;
+                record_stage(
+                    &mut stage_report,
+                    "pre_generation_depth_pro_grounding",
+                    stage_started,
+                );
+                progress.emit_with_items(
+                    "pre_generation_depth_pro_grounding",
+                    SceneBuildProgressPhase::Completed,
+                    SceneBuildExecutionKind::Gpu,
+                    "pre-generation DepthPro grounding complete",
+                    None,
+                    Some(evidence.objects.len()),
+                    Some(output_dir.join("depth_pro").join("depth_evidence.json")),
+                    json!({
+                        "has_depth": evidence.depth.is_some(),
+                        "runtime_cache_hit": depth_report.runtime_cache_hit,
+                        "load_ms": depth_report.load_ms,
+                        "infer_ms": depth_report.infer_ms,
+                        "depth_map_path": depth_report.depth_map_path.display().to_string(),
+                        "depth_map_metadata_path": depth_report
+                            .depth_map_metadata_path
+                            .display()
+                            .to_string(),
+                        "floor_sample_count": evidence
+                            .depth
+                            .as_ref()
+                            .and_then(|depth| depth.floor_sample_count),
+                    }),
+                );
+                pre_generation_depth_report = Some(depth_report);
+            }
+
+            if args.ground_calibration == SceneGroundCalibrationMode::Gpt {
+                let stage_started = Instant::now();
+                progress.emit(
+                    "ground_calibration_gpt",
+                    SceneBuildProgressPhase::Started,
+                    SceneBuildExecutionKind::Network,
+                    "calibrating source camera/floor with GPT",
+                    json!({
+                        "ground_calibration": args.ground_calibration,
+                        "depth_provider": args.depth_provider,
+                        "has_depth": evidence.depth.is_some(),
+                        "purpose": "replace noisy depth-floor heuristic with typed camera/floor evidence before object crops and composition",
+                    }),
+                );
+                let report = apply_gpt_ground_calibration(
+                    &pipeline,
+                    &mut manifest,
+                    &mut evidence,
+                    &output_dir,
+                    args.write_artifacts,
+                    &[],
+                )?;
+                source = format!("{source}+gpt_ground_calibration");
+                record_stage(&mut stage_report, "ground_calibration_gpt", stage_started);
+                progress.emit(
+                    "ground_calibration_gpt",
+                    SceneBuildProgressPhase::Completed,
+                    SceneBuildExecutionKind::Network,
+                    "GPT camera/floor calibration complete",
+                    json!({
+                        "camera_height_m": -report.applied_floor.distance_m,
+                        "vertical_fov_degrees": report.applied_camera.vertical_fov_degrees,
+                        "floor_confidence": report.applied_floor.confidence,
+                        "floor_residual_m": report.applied_floor.residual_m,
+                    }),
+                );
+                pre_generation_ground_calibration_report = Some(report);
             } else {
-                pre_generation_grounding_source = "manifest_fallback".to_string();
+                progress.emit(
+                    "ground_calibration",
+                    SceneBuildProgressPhase::Completed,
+                    SceneBuildExecutionKind::Cpu,
+                    "using DepthPro floor/camera heuristic",
+                    json!({
+                        "ground_calibration": args.ground_calibration,
+                        "has_depth": evidence.depth.is_some(),
+                    }),
+                );
+            }
+
+            manifest = manifest_with_grounding_evidence(&manifest, &evidence);
+            pre_generation_grounding_source = source;
+            pre_generation_grounding_evidence = Some(evidence);
+            if args.write_artifacts {
+                write_json_file(&output_dir.join("manifest.json"), &manifest)
+                    .map_err(|err| err.to_string())?;
+                write_json_file(
+                    &output_dir.join("manifest_grounded_for_crops.json"),
+                    &manifest,
+                )
+                .map_err(|err| err.to_string())?;
+                if let Some(evidence) = pre_generation_grounding_evidence.as_ref() {
+                    write_json_file(
+                        &output_dir.join("pre_generation_grounding_evidence.json"),
+                        evidence,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+                if let Some(report) = pre_generation_locate_anything_report.as_ref() {
+                    write_json_file(
+                        &output_dir.join("pre_generation_locate_anything_report.json"),
+                        report,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+                if let Some(report) = pre_generation_segmentation_report.as_ref() {
+                    write_json_file(
+                        &output_dir.join("pre_generation_segmentation_report.json"),
+                        report,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+                if let Some(report) = pre_generation_depth_report.as_ref() {
+                    write_json_file(&output_dir.join("pre_generation_depth_report.json"), report)
+                        .map_err(|err| err.to_string())?;
+                }
+                if let Some(report) = pre_generation_ground_calibration_report.as_ref() {
+                    write_json_file(
+                        &output_dir.join("pre_generation_ground_calibration_report.json"),
+                        report,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
             }
         }
         let stage_started = Instant::now();
@@ -1608,7 +2248,28 @@ impl McpServer {
         } else {
             Vec::new()
         };
-        let mut selected_values = selected_candidates_to_values(&selected);
+        let mut selected_values = selected_candidates_to_values_with_requests(&selected, &requests);
+        let scene_placement_pipeline =
+            scene_placement_pipeline_plan(ScenePlacementPipelineSelection {
+                entry_point: ScenePlacementEntryPoint::SceneBuild,
+                lift_assets: args.lift_assets,
+                composition_mode: args.composition_mode,
+                pose_fit: args.pose_fit,
+                canonical_pose: args.canonical_pose,
+                scale_policy: args.scale_policy,
+                ground_calibration: args.ground_calibration,
+                instance_generation: args.instance_generation,
+                depth_provider: args.depth_provider,
+                locator: args.locator,
+                segmentation_provider,
+                feedback: args.feedback,
+                feedback_iters: args.feedback_iters,
+                feedback_rotation_selector: args.feedback_rotation_selector,
+                feedback_rubric_scorer: args.feedback_rubric_scorer,
+                rotation_fit: args.rotation_fit,
+                table_pose_refinement: args.table_pose_refinement,
+                max_pose_candidates: args.max_pose_candidates,
+            });
 
         let mut response = json!({
             "tool": "scene_build_from_image",
@@ -1619,12 +2280,19 @@ impl McpServer {
             "pre_generation_grounding_source": pre_generation_grounding_source.clone(),
             "pre_generation_grounding_evidence": pre_generation_grounding_evidence.clone(),
             "pre_generation_locate_anything_report": pre_generation_locate_anything_report.clone(),
+            "pre_generation_segmentation_report": pre_generation_segmentation_report.clone(),
+            "pre_generation_depth_report": pre_generation_depth_report.clone(),
+            "pre_generation_ground_calibration_report": pre_generation_ground_calibration_report.clone(),
             "manifest": manifest.clone(),
             "object_image_requests": requests,
             "candidate_generation": candidate_report.clone(),
             "candidates": candidate_report.candidates.clone(),
             "selected_candidates": selected_values.clone(),
             "lift_assets": args.lift_assets,
+            "scene_asset_lift_policy": asset_lift_policy.to_json(),
+            "ground_calibration": args.ground_calibration,
+            "instance_generation": args.instance_generation,
+            "scene_placement_pipeline": scene_placement_pipeline.to_json(),
         });
         if args.write_artifacts {
             write_scene_build_artifacts(&output_dir, &response)?;
@@ -1653,11 +2321,7 @@ impl McpServer {
             return Ok(response);
         }
 
-        let selected_synthesis_models = args
-            .synthesis_models
-            .clone()
-            .map(sanitize_synthesis_models)
-            .unwrap_or_else(|| vec![SynthesisModel::Trellis]);
+        let selected_synthesis_models = asset_lift_policy.synthesis_models.clone();
         let selected_asset_model = selected_synthesis_models
             .first()
             .copied()
@@ -1754,7 +2418,7 @@ impl McpServer {
                         input_image_paths: input_chunk.to_vec(),
                         output_dir: Some(output_dir.join("assets")),
                         output_paths: None,
-                        output_format: Some(AssetOutputFormat::Auto),
+                        output_format: Some(asset_lift_policy.output_format),
                         rmbg_model: Some(ForegroundModel::Rmbg2),
                         synthesis_models: Some(selected_synthesis_models.clone()),
                         backend: Some(self.config.default_backend),
@@ -1841,7 +2505,7 @@ impl McpServer {
                 break outputs;
             }
             selected = next_selected;
-            selected_values = selected_candidates_to_values(&selected);
+            selected_values = selected_candidates_to_values_with_requests(&selected, &requests);
         };
         record_stage(&mut stage_report, "images_to_assets", stage_started);
         progress.emit_with_items(
@@ -1865,6 +2529,27 @@ impl McpServer {
         response["selected_candidates"] = json!(selected_values.clone());
         response["asset_lift_attempts"] = json!(asset_attempts);
         response["asset_outputs"] = asset_outputs.clone();
+        if let Err(err) =
+            validate_scene_asset_outputs_for_policy(&asset_outputs, &asset_lift_policy)
+        {
+            response["failed_stage"] = json!("images_to_assets.asset_contract");
+            response["asset_contract_error"] = json!(err);
+            response["next_action"] = json!({
+                "kind": "rerun_scene_with_mesh_assets",
+                "recommendation": "Use Trellis.2 or another GLB mesh-producing model for explicit scene composition. TripoSplat Gaussian splats need a separate splat-aware placement solver.",
+                "reason": "The active scene pose optimizer requires mesh local AABBs and GLB visible-surface fitting.",
+            });
+            response["stage_report"] = json!(stage_report);
+            attach_scene_token_usage(&mut response);
+            response["e2e_summary"] = scene_build_summary(&response, e2e_started.elapsed());
+            if args.write_artifacts {
+                write_scene_build_artifacts(&output_dir, &response)?;
+            }
+            return Err(response["asset_contract_error"]
+                .as_str()
+                .unwrap_or("scene asset contract failed")
+                .to_string());
+        }
         if !mesh_quality_failures.is_empty() {
             response["mesh_quality_failures"] = json!(mesh_quality_failures);
             response["failed_stage"] = json!("images_to_assets.mesh_quality_gate");
@@ -1945,16 +2630,7 @@ impl McpServer {
                 )
             };
         record_stage(&mut stage_report, "load_grounding_evidence", stage_started);
-        let segmentation_provider = args
-            .segmentation_provider
-            .unwrap_or(self.config.scene_segmentation_provider);
-        let segmentation_precision = args
-            .segmentation_precision
-            .unwrap_or(self.config.scene_segmentation_precision);
-        let segmentation_quantization = args
-            .segmentation_quantization
-            .unwrap_or(self.config.scene_segmentation_quantization);
-        let mut segmentation_report = None;
+        let mut segmentation_report = pre_generation_segmentation_report.clone();
         progress.emit_with_items(
             "load_grounding_evidence",
             SceneBuildProgressPhase::Completed,
@@ -2075,6 +2751,11 @@ impl McpServer {
                     "runtime_cache_hit": depth_report.runtime_cache_hit,
                     "load_ms": depth_report.load_ms,
                     "infer_ms": depth_report.infer_ms,
+                    "depth_map_path": depth_report.depth_map_path.display().to_string(),
+                    "depth_map_metadata_path": depth_report
+                        .depth_map_metadata_path
+                        .display()
+                        .to_string(),
                     "floor_sample_count": grounding_evidence
                         .depth
                         .as_ref()
@@ -2216,6 +2897,143 @@ impl McpServer {
                 "commands": commands.len(),
             }),
         );
+        if args.pose_fit == ScenePoseFitMode::RenderedSilhouette && args.lift_assets {
+            let stage_started = Instant::now();
+            progress.emit(
+                "visible_surface_pose_fit",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Cpu,
+                "fitting object transforms from source masks/depth and projected GLB visible surfaces",
+                json!({
+                    "pose_fit": args.pose_fit,
+                    "objects": selected_composition.layout.placements.len(),
+                    "segmentation_provider": segmentation_provider,
+                    "depth_provider": args.depth_provider,
+                    "scale_policy": args.scale_policy,
+                }),
+            );
+            let fit = apply_scene_visible_surface_pose_fit(
+                SceneVisibleSurfacePoseFitConfig {
+                    mode: args.pose_fit,
+                    min_mask_iou: args.rotation_fit_min_mask_iou,
+                    max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                    write_artifacts: args.write_artifacts,
+                    output_dir: &output_dir.join("visible_surface_pose_fit"),
+                    scale_policy: args.scale_policy,
+                    object_filter: ScenePoseFitObjectFilter::All,
+                },
+                &manifest,
+                &asset_bindings,
+                Some(&grounding_evidence),
+                &selected_composition.layout,
+                &commands,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, &asset_bindings);
+            selected_composition.layout = fit.grounded_layout;
+            let pose_bsn = feedback_bsn_from_commands(
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+            )?;
+            selected_composition.plan =
+                parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
+            selected_composition.layout.bsn = pose_bsn;
+            selected_composition.commands = commands.clone();
+            response["visible_surface_pose_fit"] = fit.report;
+            record_stage(&mut stage_report, "visible_surface_pose_fit", stage_started);
+            progress.emit_with_items(
+                "visible_surface_pose_fit",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Cpu,
+                "visible-surface pose fit complete",
+                None,
+                Some(selected_composition.layout.placements.len()),
+                Some(
+                    output_dir
+                        .join("visible_surface_pose_fit")
+                        .join("visible_surface_pose_fit_report.json"),
+                ),
+                json!({
+                    "applied_count": response
+                        .pointer("/visible_surface_pose_fit/applied_count")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "skipped_count": response
+                        .pointer("/visible_surface_pose_fit/skipped_count")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }),
+            );
+        }
+        if args.pose_fit == ScenePoseFitMode::RenderedSilhouette
+            && args.lift_assets
+            && args.table_pose_refinement.geometry_enabled()
+        {
+            let stage_started = Instant::now();
+            progress.emit(
+                "table_pose_refinement",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Cpu,
+                "refining table placement/rotation with stricter table-only mask/depth constraints",
+                json!({
+                    "mode": args.table_pose_refinement,
+                    "scale_policy": args.scale_policy,
+                }),
+            );
+            let fit = apply_scene_table_pose_refinement(
+                args.table_pose_refinement,
+                SceneVisibleSurfacePoseFitConfig {
+                    mode: args.pose_fit,
+                    min_mask_iou: args.rotation_fit_min_mask_iou,
+                    max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                    write_artifacts: args.write_artifacts,
+                    output_dir: &output_dir.join("table_pose_refinement"),
+                    scale_policy: args.scale_policy,
+                    object_filter: ScenePoseFitObjectFilter::TablesOnly,
+                },
+                &manifest,
+                &asset_bindings,
+                Some(&grounding_evidence),
+                &selected_composition.layout,
+                &commands,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, &asset_bindings);
+            selected_composition.layout = fit.grounded_layout;
+            let pose_bsn = feedback_bsn_from_commands(
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+            )?;
+            selected_composition.plan =
+                parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
+            selected_composition.layout.bsn = pose_bsn;
+            selected_composition.commands = commands.clone();
+            response["table_pose_refinement"] = fit.report;
+            record_stage(&mut stage_report, "table_pose_refinement", stage_started);
+            progress.emit_with_items(
+                "table_pose_refinement",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Cpu,
+                "table pose refinement complete",
+                None,
+                Some(selected_composition.layout.placements.len()),
+                Some(
+                    output_dir
+                        .join("table_pose_refinement")
+                        .join("table_pose_refinement_report.json"),
+                ),
+                json!({
+                    "applied_count": response
+                        .pointer("/table_pose_refinement/applied_count")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "gpt_required": response
+                        .pointer("/table_pose_refinement/gpt_gate/required")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }),
+            );
+        }
         if args.feedback && args.lift_assets {
             let stage_started = Instant::now();
             progress.emit_with_items(
@@ -2563,6 +3381,8 @@ impl McpServer {
             .segmentation_quantization
             .unwrap_or(self.config.scene_segmentation_quantization);
         let mut segmentation_report = None;
+        let mut depth_report = None;
+        let mut ground_calibration_report = None;
 
         if args.composition_mode == SceneCompositionMode::CvGrounded
             && segmentation_provider != SceneSegmentationProvider::None
@@ -2585,16 +3405,42 @@ impl McpServer {
         }
         if args.depth_provider == SceneDepthProvider::DepthPro && evidence.depth.is_none() {
             let stage_started = Instant::now();
-            let _depth_report = self.depth_pro_grounding_evidence(
+            depth_report = Some(self.depth_pro_grounding_evidence(
                 &mut evidence,
                 &args.source_scene_path,
                 &output_dir,
-            )?;
+            )?);
             record_stage(
                 &mut stage_report,
                 "depth_pro_grounding_evidence",
                 stage_started,
             );
+        }
+        if args.composition_mode == SceneCompositionMode::CvGrounded
+            && args.ground_calibration == SceneGroundCalibrationMode::Gpt
+        {
+            let stage_started = Instant::now();
+            let config = SceneBuildConfig {
+                source_scene_path: args.source_scene_path.clone(),
+                object_reference_image_path: self.config.scene_object_reference_image.clone(),
+                output_dir: output_dir.clone(),
+                candidate_count: 1,
+                quality_profile: SceneQualityProfile::Draft,
+                reasoning_model: self.config.openai_reasoning_model.clone(),
+                image_model: self.config.openai_image_model.clone(),
+                allow_catalog_reuse: false,
+            };
+            let provider = self.openai_provider()?;
+            let pipeline = ScenePipeline::new(config, provider);
+            ground_calibration_report = Some(apply_gpt_ground_calibration(
+                &pipeline,
+                &mut manifest,
+                &mut evidence,
+                &output_dir,
+                true,
+                &[],
+            )?);
+            record_stage(&mut stage_report, "ground_calibration_gpt", stage_started);
         }
 
         let initial_asset_bindings = asset_bindings.clone();
@@ -2637,6 +3483,27 @@ impl McpServer {
         let mut commands = selected_composition.commands.clone();
         let mut feedback_candidate_reports = Vec::new();
         record_stage(&mut stage_report, "solve_grounded_scene", stage_started);
+        let scene_placement_pipeline =
+            scene_placement_pipeline_plan(ScenePlacementPipelineSelection {
+                entry_point: ScenePlacementEntryPoint::SceneGround,
+                lift_assets: true,
+                composition_mode: args.composition_mode,
+                pose_fit: args.pose_fit,
+                canonical_pose: args.canonical_pose,
+                scale_policy: args.scale_policy,
+                ground_calibration: args.ground_calibration,
+                instance_generation: SceneInstanceGenerationMode::CategoryRepresentative,
+                depth_provider: args.depth_provider,
+                locator: args.locator,
+                segmentation_provider,
+                feedback: args.feedback,
+                feedback_iters: args.feedback_iters,
+                feedback_rotation_selector: args.feedback_rotation_selector,
+                feedback_rubric_scorer: args.feedback_rubric_scorer,
+                rotation_fit: args.rotation_fit,
+                table_pose_refinement: args.table_pose_refinement,
+                max_pose_candidates: args.max_pose_candidates,
+            });
 
         let mut response = json!({
             "tool": "scene_ground",
@@ -2649,11 +3516,13 @@ impl McpServer {
             "scale_policy": args.scale_policy,
             "max_pose_candidates": args.max_pose_candidates,
             "save_pose_debug": args.save_pose_debug,
+            "ground_calibration": args.ground_calibration,
             "depth_provider": args.depth_provider,
             "locator": args.locator,
             "segmentation_provider": segmentation_provider,
             "segmentation_precision": segmentation_precision,
             "segmentation_quantization": segmentation_quantization,
+            "scene_placement_pipeline": scene_placement_pipeline.to_json(),
             "grounding_source": grounding_source,
             "manifest": manifest.clone(),
             "asset_bindings_initial": initial_asset_bindings,
@@ -2670,6 +3539,80 @@ impl McpServer {
         mark_canonical_pose_verification_failure(&mut response, &canonical_pose_verification);
         if let Some(report) = segmentation_report {
             response["segmentation_grounding"] = json!(report);
+        }
+        if let Some(report) = depth_report {
+            response["depth_grounding"] = json!(report);
+        }
+        if let Some(report) = ground_calibration_report {
+            response["ground_calibration_report"] = json!(report);
+        }
+
+        if args.pose_fit == ScenePoseFitMode::RenderedSilhouette {
+            let stage_started = Instant::now();
+            let fit = apply_scene_visible_surface_pose_fit(
+                SceneVisibleSurfacePoseFitConfig {
+                    mode: args.pose_fit,
+                    min_mask_iou: args.rotation_fit_min_mask_iou,
+                    max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                    write_artifacts: true,
+                    output_dir: &output_dir.join("visible_surface_pose_fit"),
+                    scale_policy: args.scale_policy,
+                    object_filter: ScenePoseFitObjectFilter::All,
+                },
+                &manifest,
+                &asset_bindings,
+                Some(&evidence),
+                &selected_composition.layout,
+                &commands,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, &asset_bindings);
+            selected_composition.layout = fit.grounded_layout;
+            let pose_bsn = feedback_bsn_from_commands(
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+            )?;
+            selected_composition.plan =
+                parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
+            selected_composition.layout.bsn = pose_bsn;
+            selected_composition.commands = commands.clone();
+            response["visible_surface_pose_fit"] = fit.report;
+            record_stage(&mut stage_report, "visible_surface_pose_fit", stage_started);
+        }
+        if args.pose_fit == ScenePoseFitMode::RenderedSilhouette
+            && args.table_pose_refinement.geometry_enabled()
+        {
+            let stage_started = Instant::now();
+            let fit = apply_scene_table_pose_refinement(
+                args.table_pose_refinement,
+                SceneVisibleSurfacePoseFitConfig {
+                    mode: args.pose_fit,
+                    min_mask_iou: args.rotation_fit_min_mask_iou,
+                    max_depth_error_m: args.rotation_fit_max_depth_error_m,
+                    write_artifacts: true,
+                    output_dir: &output_dir.join("table_pose_refinement"),
+                    scale_policy: args.scale_policy,
+                    object_filter: ScenePoseFitObjectFilter::TablesOnly,
+                },
+                &manifest,
+                &asset_bindings,
+                Some(&evidence),
+                &selected_composition.layout,
+                &commands,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, &asset_bindings);
+            selected_composition.layout = fit.grounded_layout;
+            let pose_bsn = feedback_bsn_from_commands(
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+            )?;
+            selected_composition.plan =
+                parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
+            selected_composition.layout.bsn = pose_bsn;
+            selected_composition.commands = commands.clone();
+            response["table_pose_refinement"] = fit.report;
+            record_stage(&mut stage_report, "table_pose_refinement", stage_started);
         }
 
         if args.feedback {
@@ -3021,8 +3964,20 @@ impl McpServer {
         self.config.scene_status_path = Some(status_path);
         self.config.scene_timeout = self.config.scene_timeout.max(Duration::from_secs(60));
 
+        let depth_map = match load_scene_depth_map_sidecar(request.evidence) {
+            Ok(depth_map) => depth_map,
+            Err(err) => {
+                append_canonical_pose_render_warning(
+                    run,
+                    &format!("failed to load source depth normal sidecar: {err}"),
+                );
+                None
+            }
+        };
         let mut attempted = 0usize;
         let mut rendered = 0usize;
+        let mut normal_rendered = 0usize;
+        let mut source_normals = 0usize;
         let mut errors = Vec::new();
         for report_index in 0..run.reports.len() {
             let asset_id = run.reports[report_index].asset_id.clone();
@@ -3064,6 +4019,49 @@ impl McpServer {
                 }));
                 continue;
             }
+            let source_normal_path = asset_dir.join("source_depth_normal.png");
+            let source_normal_evidence = match write_source_depth_normal_evidence_for_asset(
+                asset,
+                request.evidence,
+                depth_map.as_ref(),
+                &source_normal_path,
+            ) {
+                Ok(evidence) => {
+                    if evidence.is_some() {
+                        source_normals += 1;
+                    }
+                    evidence
+                }
+                Err(err) => {
+                    let message = format!(
+                        "failed to render source depth normal evidence for {}: {err}",
+                        asset.asset_id
+                    );
+                    run.reports[report_index].warnings.push(message.clone());
+                    errors.push(json!({
+                        "asset_id": asset.asset_id,
+                        "stage": "source_depth_normal",
+                        "error": message,
+                    }));
+                    None
+                }
+            };
+            let normal_mesh = match self.load_canonical_pose_normal_mesh(asset, spawn_basis) {
+                Ok(mesh) => mesh,
+                Err(err) => {
+                    let message = format!(
+                        "failed to load mesh for canonical pose normal pass for {}: {err}",
+                        asset.asset_id
+                    );
+                    run.reports[report_index].warnings.push(message.clone());
+                    errors.push(json!({
+                        "asset_id": asset.asset_id,
+                        "stage": "candidate_mesh_normal",
+                        "error": message,
+                    }));
+                    None
+                }
+            };
             for candidate_index in 0..run.reports[report_index].candidates.len() {
                 attempted += 1;
                 let candidate_id =
@@ -3072,6 +4070,11 @@ impl McpServer {
                     run.reports[report_index].candidates[candidate_index].yaw_offset_degrees;
                 let output_path = asset_dir.join(format!(
                     "candidate_{:02}_yaw_{}.png",
+                    candidate_id,
+                    canonical_pose_yaw_file_component(candidate_yaw)
+                ));
+                let normal_path = asset_dir.join(format!(
+                    "candidate_{:02}_yaw_{}_normal.png",
                     candidate_id,
                     canonical_pose_yaw_file_component(candidate_yaw)
                 ));
@@ -3088,6 +4091,41 @@ impl McpServer {
                         candidate.metrics["rendered_asset_thumbnail"] = json!(true);
                         candidate.metrics["renderer"] = json!("bevy_synth_private_viewer");
                         candidate.metrics["render"] = render_info;
+                        if let Some(mesh) = normal_mesh.as_ref() {
+                            match write_render_candidate_mesh_normal(
+                                cached_mesh_normal_input(mesh),
+                                scene_aabb_to_render(asset.local_aabb.unwrap_or(SceneAssetAabb {
+                                    min: [-0.5, 0.0, -0.5],
+                                    max: [0.5, 1.0, 0.5],
+                                })),
+                                candidate_yaw,
+                                &normal_path,
+                            ) {
+                                Ok(normal_render) => {
+                                    normal_rendered += 1;
+                                    let similarity = source_normal_evidence
+                                        .as_ref()
+                                        .and_then(|evidence| {
+                                            evidence
+                                                .get("path")
+                                                .and_then(Value::as_str)
+                                                .map(PathBuf::from)
+                                        })
+                                        .and_then(|source_path| {
+                                            normal_map_similarity(&source_path, &normal_path).ok()
+                                        });
+                                    candidate.metrics["normal_evidence"] = json!({
+                                        "source": source_normal_evidence,
+                                        "candidate": normal_render,
+                                        "similarity": similarity,
+                                        "descriptor": "source_depth_normal_vs_rendered_mesh_normal",
+                                    });
+                                }
+                                Err(err) => {
+                                    candidate.metrics["normal_evidence_error"] = json!(err);
+                                }
+                            }
+                        }
                     }
                     Err(err) => {
                         let message = format!(
@@ -3120,9 +4158,34 @@ impl McpServer {
             "viewer_log": log_path.display().to_string(),
             "attempted": attempted,
             "rendered": rendered,
+            "normal_rendered": normal_rendered,
+            "source_normals": source_normals,
             "error_count": errors.len(),
             "errors": errors,
         })
+    }
+
+    fn load_canonical_pose_normal_mesh(
+        &self,
+        asset: &SceneAssetBinding,
+        spawn_basis: CanonicalPoseThumbnailSpawnBasis<'_>,
+    ) -> Result<Option<CachedSynthMesh>, String> {
+        if let CanonicalPoseThumbnailSpawnBasis::Cache(cache_key) = spawn_basis {
+            let cache = self.open_catalog_cache()?;
+            if let Some(mesh) = cache
+                .load_mesh(cache_key)
+                .map_err(|err| format!("load cached mesh {cache_key}: {err}"))?
+            {
+                return Ok(Some(mesh));
+            }
+        }
+        if let Some(path) = asset.path.as_deref() {
+            let bytes = fs::read(path).map_err(|err| format!("read mesh glb {path}: {err}"))?;
+            let mesh = bevy_synth_runtime::io::mesh_from_glb_bytes(&bytes)
+                .map_err(|err| format!("parse mesh glb {path}: {err}"))?;
+            return Ok(Some(mesh));
+        }
+        Ok(None)
     }
 
     fn render_canonical_pose_candidate_thumbnail(

@@ -603,6 +603,7 @@ fn images_to_assets_applies_trellis_pbr_and_target_faces() {
         "--backend",
         "cpu",
         "--trellis-pbr",
+        "true",
         "--trellis-pbr-texture-size",
         "512",
     ]);

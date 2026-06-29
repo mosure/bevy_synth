@@ -1,8 +1,12 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
@@ -138,10 +142,14 @@ const DEFAULT_PIPELINE_OPTIONS: [SynthesisModel; 3] = [
 ];
 const VIEWER_GROUND_Y_STEP: f32 = 0.05;
 const VIEWER_CONTACT_TOLERANCE_STEP: f32 = 0.01;
+const DEFAULT_VIEWER_FRUSTUM_LENGTH: f32 = 0.75;
+const VIEWER_FRUSTUM_LENGTH_STEP: f32 = 0.05;
 const VIEWER_CONTACT_TOLERANCE_MIN: f32 = 0.0;
 const VIEWER_CONTACT_TOLERANCE_MAX: f32 = 0.25;
 const VIEWER_GROUND_Y_MIN: f32 = -2.0;
 const VIEWER_GROUND_Y_MAX: f32 = 2.0;
+const VIEWER_FRUSTUM_LENGTH_MIN: f32 = 0.05;
+const VIEWER_FRUSTUM_LENGTH_MAX: f32 = 3.0;
 const PROCESSING_EVENT_LIMIT: usize = 16;
 const PROCESSING_ARTIFACT_LIMIT: usize = 8;
 const DEVELOPER_EVENT_ROWS: usize = 12;
@@ -173,8 +181,11 @@ impl ViewerAabbOverlayMode {
 pub struct ViewerDebugSettings {
     pub aabb_overlay: ViewerAabbOverlayMode,
     pub draw_ground_contact: bool,
+    pub draw_scene_camera_frustum: bool,
+    pub depth_cloud_overlay: bool,
     pub ground_y: f32,
     pub contact_tolerance: f32,
+    pub scene_camera_frustum_length: f32,
 }
 
 impl Default for ViewerDebugSettings {
@@ -182,8 +193,11 @@ impl Default for ViewerDebugSettings {
         Self {
             aabb_overlay: ViewerAabbOverlayMode::Selected,
             draw_ground_contact: true,
+            draw_scene_camera_frustum: true,
+            depth_cloud_overlay: false,
             ground_y: 0.0,
             contact_tolerance: 0.02,
+            scene_camera_frustum_length: DEFAULT_VIEWER_FRUSTUM_LENGTH,
         }
     }
 }
@@ -218,6 +232,41 @@ impl ScenePipelineKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneTablePoseRefinementSetting {
+    Off,
+    Geometry,
+    #[default]
+    GatedGpt,
+    AlwaysGpt,
+}
+
+impl SceneTablePoseRefinementSetting {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Geometry => "geometry",
+            Self::GatedGpt => "gated-gpt",
+            Self::AlwaysGpt => "always-gpt",
+        }
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        const OPTIONS: [SceneTablePoseRefinementSetting; 4] = [
+            SceneTablePoseRefinementSetting::Off,
+            SceneTablePoseRefinementSetting::Geometry,
+            SceneTablePoseRefinementSetting::GatedGpt,
+            SceneTablePoseRefinementSetting::AlwaysGpt,
+        ];
+        let index = OPTIONS
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(2);
+        let next = (index as isize + delta).rem_euclid(OPTIONS.len() as isize) as usize;
+        OPTIONS[next]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogPipelineChoice {
     Object(SynthesisModel),
@@ -238,6 +287,9 @@ pub struct ScenePipelineUiSettings {
     pub pipeline: ScenePipelineKind,
     pub image_to_3d_model: SynthesisModel,
     pub quality_profile: SceneQualityProfileSetting,
+    pub ground_calibration: SceneGroundCalibrationSetting,
+    pub instance_generation: SceneInstanceGenerationSetting,
+    pub table_pose_refinement: SceneTablePoseRefinementSetting,
     pub candidate_count: usize,
     pub feedback_iterations: usize,
     pub pbr_enabled: bool,
@@ -248,7 +300,6 @@ pub struct ScenePipelineUiSettings {
     pub locate_anything_enabled: bool,
     pub depth_enabled: bool,
     pub segmentation_enabled: bool,
-    pub canonical_pose_enabled: bool,
     pub pose_fit_enabled: bool,
     pub feedback_enabled: bool,
     pub write_artifacts: bool,
@@ -347,6 +398,9 @@ struct ProcessingArtifactPreview {
 struct ProcessingArtifactPreviewCache {
     signature: String,
     previews: Vec<ProcessingArtifactPreview>,
+    total_count: usize,
+    page: usize,
+    page_count: usize,
 }
 
 impl Default for SceneProcessingState {
@@ -455,6 +509,31 @@ impl SceneProcessingState {
         self.token_usage_summary.as_deref()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn artifact_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(run_id) = self.run_id.as_deref()
+            && !run_id.trim().is_empty()
+        {
+            roots.push(PathBuf::from("tmp").join("runs").join(run_id));
+        }
+        for path in &self.recent_artifacts {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                roots.push(path.clone());
+                if let Some(parent) = path.parent() {
+                    roots.push(parent.to_path_buf());
+                    if let Some(run_root) = parent.parent() {
+                        roots.push(run_root.to_path_buf());
+                    }
+                }
+            } else {
+                roots.push(path);
+            }
+        }
+        roots
+    }
+
     pub fn tick(&mut self) {
         if !self.active {
             return;
@@ -479,8 +558,11 @@ impl Default for ScenePipelineUiSettings {
             pipeline: ScenePipelineKind::Explicit,
             image_to_3d_model: SynthesisModel::Trellis,
             quality_profile: SceneQualityProfileSetting::Fast,
-            candidate_count: 2,
-            feedback_iterations: 8,
+            ground_calibration: SceneGroundCalibrationSetting::Gpt,
+            instance_generation: SceneInstanceGenerationSetting::CategoryRepresentative,
+            table_pose_refinement: SceneTablePoseRefinementSetting::GatedGpt,
+            candidate_count: 1,
+            feedback_iterations: 0,
             pbr_enabled: true,
             pbr_texture_size: DEFAULT_TRELLIS_PBR_TEXTURE_SIZE,
             target_faces: 80_000,
@@ -489,9 +571,8 @@ impl Default for ScenePipelineUiSettings {
             locate_anything_enabled: true,
             depth_enabled: true,
             segmentation_enabled: true,
-            canonical_pose_enabled: true,
             pose_fit_enabled: true,
-            feedback_enabled: true,
+            feedback_enabled: false,
             write_artifacts: true,
             promote_to_catalog: true,
         }
@@ -512,6 +593,56 @@ impl SceneQualityProfileSetting {
             Self::Fast => "fast",
             Self::Balanced => "balanced",
             Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneGroundCalibrationSetting {
+    DepthHeuristic,
+    #[default]
+    Gpt,
+}
+
+impl SceneGroundCalibrationSetting {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DepthHeuristic => "depth heuristic",
+            Self::Gpt => "gpt",
+        }
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        match (self, delta >= 0) {
+            (Self::DepthHeuristic, true) | (Self::Gpt, false) => Self::Gpt,
+            (Self::Gpt, true) | (Self::DepthHeuristic, false) => Self::DepthHeuristic,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneInstanceGenerationSetting {
+    #[default]
+    CategoryRepresentative,
+    FineGrainedTypes,
+}
+
+impl SceneInstanceGenerationSetting {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CategoryRepresentative => "per category",
+            Self::FineGrainedTypes => "fine types",
+        }
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        match (self, delta >= 0) {
+            (Self::CategoryRepresentative, true) | (Self::FineGrainedTypes, false) => {
+                Self::FineGrainedTypes
+            }
+            (Self::FineGrainedTypes, true) | (Self::CategoryRepresentative, false) => {
+                Self::CategoryRepresentative
+            }
         }
     }
 }
@@ -672,10 +803,12 @@ impl Plugin for BurnSynthUiPlugin {
                     handle_viewer_debug_step_button,
                     (
                         tick_processing_elapsed,
+                        handle_developer_visual_page_button,
                         sync_processing_artifact_previews,
                         sync_settings_modal,
                         sync_settings_tab_visuals,
                         sync_developer_panel_tab_visuals,
+                        sync_developer_visual_page_controls,
                         sync_settings_developer_panel,
                         sync_settings_developer_visual_grid,
                         update_settings_labels,
@@ -1232,6 +1365,20 @@ struct SettingsDeveloperTabButton {
 }
 
 #[derive(Component)]
+struct SettingsDeveloperVisualPageButton {
+    direction: DeveloperVisualPageDirection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeveloperVisualPageDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Component, Default)]
+struct SettingsDeveloperVisualPagerText;
+
+#[derive(Component)]
 struct SettingsDeveloperTabPanel {
     tab: DeveloperPanelTab,
 }
@@ -1478,6 +1625,9 @@ struct SceneSettingToggleButton {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SceneSetting {
+    GroundCalibration,
+    InstanceGeneration,
+    TablePoseRefinement,
     CandidateCount,
     FeedbackIterations,
     PbrTextureSize,
@@ -1497,7 +1647,6 @@ enum SceneToggleSetting {
     LocateAnything,
     Depth,
     Segmentation,
-    CanonicalPose,
     PoseFit,
     Feedback,
     WriteArtifacts,
@@ -1542,12 +1691,15 @@ struct ViewerDebugStepButton {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewerDebugToggleSetting {
     GroundContact,
+    SceneCameraFrustum,
+    DepthCloud,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewerDebugNumericSetting {
     GroundY,
     ContactTolerance,
+    SceneCameraFrustumLength,
 }
 
 #[derive(Component)]
@@ -1607,6 +1759,7 @@ struct SettingsModalState {
 #[derive(Resource, Default)]
 struct DeveloperPanelState {
     tab: DeveloperPanelTab,
+    visual_page: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2516,37 +2669,58 @@ fn format_developer_visual_block(
     state: &SceneProcessingState,
     artifact_previews: &ProcessingArtifactPreviewCache,
 ) -> String {
-    let visual_count = artifact_previews.previews.len();
-    if visual_count == 0 {
+    if artifact_previews.total_count == 0 {
         if state.active {
             "waiting for locate/depth/crop/canonical/feedback images".to_string()
         } else {
             "no visual artifacts yet".to_string()
         }
     } else {
-        format!("{visual_count} visual artifact(s) discovered")
+        format!(
+            "{} visual artifact(s) | latest first | page {}/{}",
+            artifact_previews.total_count,
+            artifact_previews.page + 1,
+            artifact_previews.page_count.max(1)
+        )
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn sync_processing_artifact_previews(
     state: Res<SceneProcessingState>,
+    mut developer: ResMut<DeveloperPanelState>,
     mut cache: ResMut<ProcessingArtifactPreviewCache>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let discovered = discover_processing_visual_artifacts(&state);
+    let total_count = discovered.len();
+    let page_count = total_count.div_ceil(DEVELOPER_VISUAL_ROWS);
+    let max_page = page_count.saturating_sub(1);
+    if developer.visual_page > max_page {
+        developer.visual_page = max_page;
+    }
+    let page = developer.visual_page;
+    let page_start = page.saturating_mul(DEVELOPER_VISUAL_ROWS);
     let signature = discovered
         .iter()
         .map(|(path, kind)| format!("{}:{}", kind.label(), path.display()))
         .collect::<Vec<_>>()
         .join("|");
+    let signature = format!("page={page};total={total_count};{signature}");
     if cache.signature == signature {
         return;
     }
 
     cache.signature = signature;
+    cache.total_count = total_count;
+    cache.page = page;
+    cache.page_count = page_count;
     cache.previews.clear();
-    for (path, kind) in discovered.into_iter().take(DEVELOPER_VISUAL_ROWS) {
+    for (path, kind) in discovered
+        .into_iter()
+        .skip(page_start)
+        .take(DEVELOPER_VISUAL_ROWS)
+    {
         if let Some(image) = load_processing_artifact_preview(&path, &mut images) {
             cache.previews.push(ProcessingArtifactPreview {
                 path: path.display().to_string(),
@@ -2559,9 +2733,12 @@ fn sync_processing_artifact_previews(
 
 #[cfg(target_arch = "wasm32")]
 fn sync_processing_artifact_previews(mut cache: ResMut<ProcessingArtifactPreviewCache>) {
-    if !cache.signature.is_empty() || !cache.previews.is_empty() {
+    if !cache.signature.is_empty() || !cache.previews.is_empty() || cache.total_count != 0 {
         cache.signature.clear();
         cache.previews.clear();
+        cache.total_count = 0;
+        cache.page = 0;
+        cache.page_count = 0;
     }
 }
 
@@ -2587,17 +2764,50 @@ fn discover_processing_visual_artifacts(
         }
     }
 
-    discovered.sort_by(|(left_path, left_kind), (right_path, right_kind)| {
-        let left_score = visual_artifact_score(left_path, left_kind);
-        let right_score = visual_artifact_score(right_path, right_kind);
-        left_kind
-            .priority()
-            .cmp(&right_kind.priority())
-            .then(left_score.cmp(&right_score))
-            .then_with(|| left_path.cmp(right_path))
-    });
+    sort_visual_artifacts_for_display(&mut discovered);
     discovered.dedup_by(|(left_path, _), (right_path, _)| left_path == right_path);
     discovered
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn visual_artifact_modified_ms(path: &Path) -> u128 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn visual_artifact_generation_order(path: &Path) -> Vec<u64> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    for ch in path.to_string_lossy().chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            values.push(current.parse::<u64>().unwrap_or(u64::MAX));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        values.push(current.parse::<u64>().unwrap_or(u64::MAX));
+    }
+    values
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sort_visual_artifacts_for_display(discovered: &mut [(PathBuf, ProcessingArtifactVisualKind)]) {
+    discovered.sort_by_cached_key(|(path, kind)| {
+        (
+            Reverse(visual_artifact_modified_ms(path)),
+            Reverse(visual_artifact_generation_order(path)),
+            kind.priority(),
+            visual_artifact_score(path, kind),
+            Reverse(path.clone()),
+        )
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4605,9 +4815,6 @@ fn handle_scene_setting_toggle_button(
             SceneToggleSetting::Segmentation => {
                 scene_settings.segmentation_enabled = !scene_settings.segmentation_enabled
             }
-            SceneToggleSetting::CanonicalPose => {
-                scene_settings.canonical_pose_enabled = !scene_settings.canonical_pose_enabled
-            }
             SceneToggleSetting::PoseFit => {
                 scene_settings.pose_fit_enabled = !scene_settings.pose_fit_enabled
             }
@@ -4646,6 +4853,30 @@ fn handle_developer_panel_tab_button(
     }
 }
 
+fn handle_developer_visual_page_button(
+    mut state: ResMut<DeveloperPanelState>,
+    cache: Res<ProcessingArtifactPreviewCache>,
+    mut interactions: Query<
+        (&Interaction, &SettingsDeveloperVisualPageButton),
+        Changed<Interaction>,
+    >,
+) {
+    let max_page = cache.page_count.saturating_sub(1);
+    for (interaction, button) in interactions.iter_mut() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match button.direction {
+            DeveloperVisualPageDirection::Previous => {
+                state.visual_page = state.visual_page.saturating_sub(1);
+            }
+            DeveloperVisualPageDirection::Next => {
+                state.visual_page = state.visual_page.saturating_add(1).min(max_page);
+            }
+        }
+    }
+}
+
 fn handle_viewer_aabb_mode_button(
     mut settings: ResMut<ViewerDebugSettings>,
     mut interactions: Query<(&Interaction, &ViewerAabbModeButton), Changed<Interaction>>,
@@ -4669,6 +4900,12 @@ fn handle_viewer_debug_toggle_button(
             ViewerDebugToggleSetting::GroundContact => {
                 settings.draw_ground_contact = !settings.draw_ground_contact;
             }
+            ViewerDebugToggleSetting::SceneCameraFrustum => {
+                settings.draw_scene_camera_frustum = !settings.draw_scene_camera_frustum;
+            }
+            ViewerDebugToggleSetting::DepthCloud => {
+                settings.depth_cloud_overlay = !settings.depth_cloud_overlay;
+            }
         }
     }
 }
@@ -4689,6 +4926,11 @@ fn handle_viewer_debug_step_button(
             ViewerDebugNumericSetting::ContactTolerance => {
                 settings.contact_tolerance = (settings.contact_tolerance + button.delta)
                     .clamp(VIEWER_CONTACT_TOLERANCE_MIN, VIEWER_CONTACT_TOLERANCE_MAX);
+            }
+            ViewerDebugNumericSetting::SceneCameraFrustumLength => {
+                settings.scene_camera_frustum_length = (settings.scene_camera_frustum_length
+                    + button.delta)
+                    .clamp(VIEWER_FRUSTUM_LENGTH_MIN, VIEWER_FRUSTUM_LENGTH_MAX);
             }
         }
     }
@@ -4832,6 +5074,59 @@ fn sync_developer_panel_tab_visuals(
     }
 }
 
+fn sync_developer_visual_page_controls(
+    artifact_previews: Res<ProcessingArtifactPreviewCache>,
+    mut buttons: Query<
+        (
+            &SettingsDeveloperVisualPageButton,
+            &Interaction,
+            &Children,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
+        With<Button>,
+    >,
+    mut labels: Query<&mut TextColor, With<ButtonLabel>>,
+    mut pager_texts: Query<&mut Text, With<SettingsDeveloperVisualPagerText>>,
+) {
+    let page_text = if artifact_previews.total_count == 0 {
+        "page 0/0 | 0 images".to_string()
+    } else {
+        format!(
+            "page {}/{} | {} images | latest first",
+            artifact_previews.page + 1,
+            artifact_previews.page_count.max(1),
+            artifact_previews.total_count
+        )
+    };
+    for mut text in &mut pager_texts {
+        text.0 = page_text.clone();
+    }
+
+    for (button, interaction, children, mut bg, mut border) in &mut buttons {
+        let disabled = artifact_previews.total_count == 0
+            || match button.direction {
+                DeveloperVisualPageDirection::Previous => artifact_previews.page == 0,
+                DeveloperVisualPageDirection::Next => {
+                    artifact_previews.page + 1 >= artifact_previews.page_count.max(1)
+                }
+            };
+        let (button_bg, button_border, text_color) =
+            control_button_palette(ControlButtonKind::Nav, *interaction, disabled, false);
+        if bg.0 != button_bg {
+            bg.0 = button_bg;
+        }
+        *border = BorderColor::all(button_border);
+        for child in children.iter() {
+            if let Ok(mut label) = labels.get_mut(child)
+                && label.0 != text_color
+            {
+                label.0 = text_color;
+            }
+        }
+    }
+}
+
 fn sync_settings_developer_visual_grid(
     mut commands: Commands,
     children: Query<&Children>,
@@ -4853,11 +5148,7 @@ fn sync_settings_developer_visual_grid(
                 ));
                 return;
             }
-            for preview in artifact_previews
-                .previews
-                .iter()
-                .take(DEVELOPER_VISUAL_ROWS)
-            {
+            for preview in artifact_previews.previews.iter() {
                 spawn_developer_visual_preview_row(parent, preview);
             }
         });
@@ -5074,6 +5365,20 @@ fn update_viewer_debug_labels(
                     "off"
                 }
             }
+            ViewerDebugToggleSetting::SceneCameraFrustum => {
+                if viewer_debug.draw_scene_camera_frustum {
+                    "on"
+                } else {
+                    "off"
+                }
+            }
+            ViewerDebugToggleSetting::DepthCloud => {
+                if viewer_debug.depth_cloud_overlay {
+                    "on"
+                } else {
+                    "off"
+                }
+            }
         }
         .to_string();
         if label.0 != next {
@@ -5085,6 +5390,9 @@ fn update_viewer_debug_labels(
             ViewerDebugNumericSetting::GroundY => format!("{:.2}", viewer_debug.ground_y),
             ViewerDebugNumericSetting::ContactTolerance => {
                 format!("{:.2}", viewer_debug.contact_tolerance)
+            }
+            ViewerDebugNumericSetting::SceneCameraFrustumLength => {
+                format!("{:.2}", viewer_debug.scene_camera_frustum_length)
             }
         };
         if label.0 != next {
@@ -5735,7 +6043,7 @@ fn spawn_scene_pipeline_selector(
             ));
         });
 
-    let choices = active_pipeline_choices(CatalogMode::Object, available);
+    let choices = scene_image_to_3d_pipeline_choices(available);
     panel
         .spawn(Node {
             flex_direction: FlexDirection::Column,
@@ -5766,6 +6074,20 @@ fn spawn_scene_pipeline_selector(
                 });
             spawn_pipeline_button_row(column, choices);
         });
+}
+
+fn scene_image_to_3d_pipeline_choices(
+    available: Option<&AvailablePipelines>,
+) -> Vec<CatalogPipelineChoice> {
+    active_pipeline_choices(CatalogMode::Object, available)
+        .into_iter()
+        .filter(|choice| {
+            !matches!(
+                choice,
+                CatalogPipelineChoice::Object(SynthesisModel::Triposplat)
+            )
+        })
+        .collect()
 }
 
 fn spawn_pipeline_button_row(
@@ -5997,7 +6319,9 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
         });
 
     spawn_scene_setting_row(panel, "candidates", SceneSetting::CandidateCount, 1);
-    spawn_scene_setting_row(panel, "feedback iters", SceneSetting::FeedbackIterations, 1);
+    spawn_scene_setting_row(panel, "ground cal", SceneSetting::GroundCalibration, 1);
+    spawn_scene_setting_row(panel, "instances", SceneSetting::InstanceGeneration, 1);
+    spawn_scene_setting_row(panel, "table refine", SceneSetting::TablePoseRefinement, 1);
     spawn_scene_toggle_row(panel, "pbr textures", SceneToggleSetting::Pbr);
     spawn_scene_setting_row(
         panel,
@@ -6012,14 +6336,14 @@ fn spawn_scene_settings(panel: &mut ChildSpawnerCommands) {
         TRELLIS_FACE_STEP as isize,
     );
     spawn_scene_toggle_row(panel, "catalog reuse", SceneToggleSetting::CatalogReuse);
-    spawn_scene_settings_section_label(panel, "optional stages");
+    spawn_scene_settings_section_label(panel, "debug ablations");
+    spawn_scene_setting_row(panel, "feedback iters", SceneSetting::FeedbackIterations, 1);
     spawn_scene_toggle_row(panel, "lift assets", SceneToggleSetting::LiftAssets);
     spawn_scene_toggle_row(panel, "locate bboxes", SceneToggleSetting::LocateAnything);
     spawn_scene_toggle_row(panel, "depth/floor", SceneToggleSetting::Depth);
     spawn_scene_toggle_row(panel, "sam masks", SceneToggleSetting::Segmentation);
-    spawn_scene_toggle_row(panel, "canonical yaw", SceneToggleSetting::CanonicalPose);
-    spawn_scene_toggle_row(panel, "projected fit", SceneToggleSetting::PoseFit);
-    spawn_scene_toggle_row(panel, "render feedback", SceneToggleSetting::Feedback);
+    spawn_scene_toggle_row(panel, "visible fit", SceneToggleSetting::PoseFit);
+    spawn_scene_toggle_row(panel, "feedback loop", SceneToggleSetting::Feedback);
     spawn_scene_toggle_row(panel, "write artifacts", SceneToggleSetting::WriteArtifacts);
     spawn_scene_toggle_row(
         panel,
@@ -6057,6 +6381,23 @@ fn spawn_developer_settings(panel: &mut ChildSpawnerCommands) {
     spawn_developer_tab_panel(panel, DeveloperPanelTab::Status, true, |panel| {
         spawn_developer_text_block::<SettingsDeveloperCurrentText>(panel, "current", "idle");
         spawn_developer_text_block::<SettingsDeveloperTokenText>(panel, "tokens", "no token usage");
+        spawn_developer_section_label(panel, "debug overlays");
+        spawn_viewer_debug_toggle_row(
+            panel,
+            "scene camera frustum",
+            ViewerDebugToggleSetting::SceneCameraFrustum,
+        );
+        spawn_viewer_debug_numeric_row(
+            panel,
+            "frustum length",
+            ViewerDebugNumericSetting::SceneCameraFrustumLength,
+            VIEWER_FRUSTUM_LENGTH_STEP,
+        );
+        spawn_viewer_debug_toggle_row(
+            panel,
+            "depth rgb splats",
+            ViewerDebugToggleSetting::DepthCloud,
+        );
     });
     spawn_developer_tab_panel(panel, DeveloperPanelTab::Events, false, |panel| {
         spawn_developer_text_block::<SettingsDeveloperEventsText>(
@@ -6078,6 +6419,7 @@ fn spawn_developer_settings(panel: &mut ChildSpawnerCommands) {
             "visual artifacts",
             "no visual artifacts yet",
         );
+        spawn_developer_visual_pager(panel);
         panel.spawn((
             SettingsDeveloperVisualGrid::default(),
             Node {
@@ -6086,6 +6428,62 @@ fn spawn_developer_settings(panel: &mut ChildSpawnerCommands) {
                 row_gap: Val::Px(8.0),
                 ..default()
             },
+        ));
+    });
+}
+
+fn spawn_developer_visual_pager(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            height: Val::Px(28.0),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_developer_visual_page_button(row, DeveloperVisualPageDirection::Previous, "<");
+            row.spawn((
+                Text::new("page 0/0 | 0 images"),
+                TextFont::from_font_size(10.5),
+                TextColor(Color::srgb(0.72, 0.77, 0.86)),
+                SettingsDeveloperVisualPagerText,
+                Node {
+                    flex_grow: 1.0,
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                },
+            ));
+            spawn_developer_visual_page_button(row, DeveloperVisualPageDirection::Next, ">");
+        });
+}
+
+fn spawn_developer_visual_page_button(
+    row: &mut ChildSpawnerCommands,
+    direction: DeveloperVisualPageDirection,
+    label: &'static str,
+) {
+    row.spawn((
+        Button,
+        SettingsDeveloperVisualPageButton { direction },
+        Node {
+            width: Val::Px(30.0),
+            height: Val::Px(24.0),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BorderColor::all(BUTTON_BORDER_DISABLED),
+        BackgroundColor(BUTTON_BG_DISABLED),
+    ))
+    .with_children(|button| {
+        button.spawn((
+            Text::new(label),
+            TextFont::from_font_size(12.0),
+            TextColor(BUTTON_TEXT_DISABLED),
+            ButtonLabel,
         ));
     });
 }
@@ -6619,6 +7017,10 @@ fn spawn_scene_settings_section_label(parent: &mut ChildSpawnerCommands, label: 
     ));
 }
 
+fn spawn_developer_section_label(parent: &mut ChildSpawnerCommands, label: &'static str) {
+    spawn_scene_settings_section_label(parent, label);
+}
+
 fn spawn_scene_toggle_row(
     parent: &mut ChildSpawnerCommands,
     label: &'static str,
@@ -7004,6 +7406,15 @@ fn adjust_scene_setting(
     delta: SceneSettingDelta,
 ) {
     match (setting, delta) {
+        (SceneSetting::GroundCalibration, SceneSettingDelta::Integer(delta)) => {
+            settings.ground_calibration = settings.ground_calibration.cycle(delta);
+        }
+        (SceneSetting::InstanceGeneration, SceneSettingDelta::Integer(delta)) => {
+            settings.instance_generation = settings.instance_generation.cycle(delta);
+        }
+        (SceneSetting::TablePoseRefinement, SceneSettingDelta::Integer(delta)) => {
+            settings.table_pose_refinement = settings.table_pose_refinement.cycle(delta);
+        }
         (SceneSetting::CandidateCount, SceneSettingDelta::Integer(delta)) => {
             settings.candidate_count = apply_integer_delta(settings.candidate_count, delta, 1, 6);
         }
@@ -7029,9 +7440,12 @@ fn adjust_scene_setting(
         }
     }
     info!(
-        "explicit scene settings: image_to_3d={} quality={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={} lift_assets={} locate={} depth={} segmentation={} canonical_pose={} pose_fit={} feedback={} artifacts={} promote={}",
+        "explicit scene settings: image_to_3d={} quality={} ground_calibration={} instances={} table_refine={} candidates={} feedback_iters={} pbr={} texture_size={} target_faces={} catalog_reuse={} lift_assets={} locate={} depth={} segmentation={} pose_fit={} feedback={} artifacts={} promote={}",
         pipeline_label(settings.image_to_3d_model),
         settings.quality_profile.label(),
+        settings.ground_calibration.label(),
+        settings.instance_generation.label(),
+        settings.table_pose_refinement.label(),
         settings.candidate_count,
         settings.feedback_iterations,
         if settings.pbr_enabled { "on" } else { "off" },
@@ -7050,11 +7464,6 @@ fn adjust_scene_setting(
         },
         if settings.depth_enabled { "on" } else { "off" },
         if settings.segmentation_enabled {
-            "on"
-        } else {
-            "off"
-        },
-        if settings.canonical_pose_enabled {
             "on"
         } else {
             "off"
@@ -7170,6 +7579,9 @@ fn trellis_setting_value_text(args: &AppArgs, setting: TrellisSetting) -> String
 
 fn scene_setting_value_text(settings: &ScenePipelineUiSettings, setting: SceneSetting) -> String {
     match setting {
+        SceneSetting::GroundCalibration => settings.ground_calibration.label().to_string(),
+        SceneSetting::InstanceGeneration => settings.instance_generation.label().to_string(),
+        SceneSetting::TablePoseRefinement => settings.table_pose_refinement.label().to_string(),
         SceneSetting::CandidateCount => settings.candidate_count.to_string(),
         SceneSetting::FeedbackIterations => settings.feedback_iterations.to_string(),
         SceneSetting::PbrTextureSize => {
@@ -7194,7 +7606,6 @@ fn scene_toggle_value_text(
         SceneToggleSetting::LocateAnything => settings.locate_anything_enabled,
         SceneToggleSetting::Depth => settings.depth_enabled,
         SceneToggleSetting::Segmentation => settings.segmentation_enabled,
-        SceneToggleSetting::CanonicalPose => settings.canonical_pose_enabled,
         SceneToggleSetting::PoseFit => settings.pose_fit_enabled,
         SceneToggleSetting::Feedback => settings.feedback_enabled,
         SceneToggleSetting::WriteArtifacts => settings.write_artifacts,
@@ -7828,7 +8239,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_settings_model_buttons_update_scene_asset_model() {
+    fn scene_settings_model_buttons_update_scene_mesh_asset_model() {
         let mut args = AppArgs::default();
         args.backend = BackendKind::Wgpu;
         args.synthesis_models = vec![SynthesisModel::Triposg];
@@ -7845,7 +8256,23 @@ mod tests {
         app.update();
         app.update();
 
-        let triposplat_button = {
+        {
+            let world = app.world_mut();
+            let mut query = world.query::<&PipelineOptionButton>();
+            let models: Vec<_> = query
+                .iter(world)
+                .filter_map(|button| match button.choice {
+                    CatalogPipelineChoice::Object(model) => Some(model),
+                    CatalogPipelineChoice::Scene(_) => None,
+                })
+                .collect();
+            assert_eq!(
+                models,
+                vec![SynthesisModel::Triposg, SynthesisModel::Trellis]
+            );
+        }
+
+        let triposg_button = {
             let world = app.world_mut();
             let mut query = world.query::<(Entity, &PipelineOptionButton)>();
             query
@@ -7853,14 +8280,14 @@ mod tests {
                 .find_map(|(entity, button)| {
                     matches!(
                         button.choice,
-                        CatalogPipelineChoice::Object(SynthesisModel::Triposplat)
+                        CatalogPipelineChoice::Object(SynthesisModel::Triposg)
                     )
                     .then_some(entity)
                 })
-                .expect("TripoSplat scene image-to-3d button")
+                .expect("TripoSG scene image-to-3d button")
         };
         app.world_mut()
-            .entity_mut(triposplat_button)
+            .entity_mut(triposg_button)
             .insert(Interaction::Pressed);
         app.update();
 
@@ -7868,7 +8295,7 @@ mod tests {
             app.world()
                 .resource::<ScenePipelineUiSettings>()
                 .image_to_3d_model,
-            SynthesisModel::Triposplat
+            SynthesisModel::Triposg
         );
         assert_eq!(
             app.world().resource::<AppArgs>().synthesis_models,
@@ -7893,10 +8320,6 @@ mod tests {
             "on"
         );
         assert_eq!(
-            scene_toggle_value_text(&settings, SceneToggleSetting::CanonicalPose),
-            "on"
-        );
-        assert_eq!(
             scene_toggle_value_text(&settings, SceneToggleSetting::PoseFit),
             "on"
         );
@@ -7904,7 +8327,6 @@ mod tests {
         settings.locate_anything_enabled = false;
         settings.depth_enabled = false;
         settings.segmentation_enabled = false;
-        settings.canonical_pose_enabled = false;
         settings.pose_fit_enabled = false;
 
         assert_eq!(
@@ -7917,10 +8339,6 @@ mod tests {
         );
         assert_eq!(
             scene_toggle_value_text(&settings, SceneToggleSetting::Segmentation),
-            "off"
-        );
-        assert_eq!(
-            scene_toggle_value_text(&settings, SceneToggleSetting::CanonicalPose),
             "off"
         );
         assert_eq!(
@@ -7976,6 +8394,32 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn processing_artifacts_sort_latest_generation_first() {
+        let root = temp_visual_artifact_dir("latest_sort");
+        let older = root.join("iterations/iter_00/screenshot.png");
+        let newer = root.join("iterations/iter_03/screenshot.png");
+        std::fs::create_dir_all(older.parent().expect("older parent")).expect("older dir");
+        std::fs::create_dir_all(newer.parent().expect("newer parent")).expect("newer dir");
+        std::fs::write(&older, &[] as &[u8]).expect("older artifact");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&newer, &[] as &[u8]).expect("newer artifact");
+
+        let mut state = SceneProcessingState::default();
+        state
+            .recent_artifacts
+            .push_front(root.display().to_string());
+        let discovered = discover_processing_visual_artifacts(&state);
+
+        assert_eq!(
+            discovered.first().map(|(path, _)| path),
+            Some(&newer),
+            "latest pipeline artifact should be shown first"
+        );
+        std::fs::remove_dir_all(root).expect("remove temp artifacts");
+    }
+
     #[test]
     fn developer_visual_tab_renders_artifact_previews() {
         let mut args = AppArgs::default();
@@ -8028,6 +8472,115 @@ mod tests {
                 .any(|text| text.contains("detections_overlay.png"))
         );
         std::fs::remove_file(artifact_path).expect("remove preview artifact");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn developer_visual_tab_paginates_artifact_previews() {
+        let mut args = AppArgs::default();
+        args.synthesis_models = vec![SynthesisModel::Triposg];
+        let mut app = ui_test_app(Some(args));
+        app.world_mut().resource_mut::<SettingsModalState>().open = true;
+        app.world_mut().resource_mut::<SettingsModalState>().tab = SettingsModalTab::Developer;
+        app.world_mut().resource_mut::<DeveloperPanelState>().tab = DeveloperPanelTab::Visuals;
+        let root = temp_visual_artifact_dir("pagination");
+        std::fs::create_dir_all(&root).expect("preview dir");
+        for index in 0..(DEVELOPER_VISUAL_ROWS + 1) {
+            write_preview_png(&root.join(format!("iter_{index:02}_detections_overlay.png")));
+        }
+        {
+            let mut state = app.world_mut().resource_mut::<SceneProcessingState>();
+            state
+                .recent_artifacts
+                .push_front(root.display().to_string());
+        }
+
+        app.update();
+        app.update();
+
+        {
+            let cache = app.world().resource::<ProcessingArtifactPreviewCache>();
+            assert_eq!(cache.total_count, DEVELOPER_VISUAL_ROWS + 1);
+            assert_eq!(cache.page, 0);
+            assert_eq!(cache.page_count, 2);
+            assert_eq!(cache.previews.len(), DEVELOPER_VISUAL_ROWS);
+            assert!(
+                cache.previews[0].path.contains("iter_08"),
+                "first page should be latest-first"
+            );
+        }
+        assert_visual_grid_child_count(&mut app, DEVELOPER_VISUAL_ROWS);
+
+        let next_button = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &SettingsDeveloperVisualPageButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.direction == DeveloperVisualPageDirection::Next).then_some(entity)
+                })
+                .expect("next visual page button")
+        };
+        app.world_mut()
+            .entity_mut(next_button)
+            .insert(Interaction::Pressed);
+        app.update();
+        app.update();
+
+        {
+            let cache = app.world().resource::<ProcessingArtifactPreviewCache>();
+            assert_eq!(cache.page, 1);
+            assert_eq!(cache.previews.len(), 1);
+        }
+        assert_visual_grid_child_count(&mut app, 1);
+        let world = app.world_mut();
+        let mut pager_texts =
+            world.query_filtered::<&Text, With<SettingsDeveloperVisualPagerText>>();
+        assert!(
+            pager_texts
+                .iter(world)
+                .any(|text| text.0.contains("page 2/2")),
+            "pager text should report the active page"
+        );
+        std::fs::remove_dir_all(root).expect("remove preview artifacts");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn temp_visual_artifact_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bevy_synth_ui_{label}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_preview_png(path: &std::path::Path) {
+        image::save_buffer_with_format(
+            path,
+            &[
+                255, 255, 255, 255, 64, 64, 64, 255, 64, 64, 64, 255, 255, 255, 255, 255,
+            ],
+            2,
+            2,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("write preview artifact");
+    }
+
+    fn assert_visual_grid_child_count(app: &mut App, expected: usize) {
+        let world = app.world_mut();
+        let mut grids = world.query::<(&SettingsDeveloperVisualGrid, &Children)>();
+        let child_counts = grids
+            .iter(world)
+            .map(|(_, children)| children.len())
+            .collect::<Vec<_>>();
+        assert_eq!(child_counts, vec![expected]);
     }
 
     #[test]
@@ -8491,6 +9044,49 @@ mod tests {
                 .resource::<ViewerDebugSettings>()
                 .contact_tolerance
                 > 0.02
+        );
+
+        let frustum_length_step = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &ViewerDebugStepButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.setting == ViewerDebugNumericSetting::SceneCameraFrustumLength
+                        && button.delta > 0.0)
+                        .then_some(entity)
+                })
+                .expect("frustum length step button")
+        };
+        app.world_mut()
+            .entity_mut(frustum_length_step)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ViewerDebugSettings>()
+                .scene_camera_frustum_length,
+            DEFAULT_VIEWER_FRUSTUM_LENGTH + VIEWER_FRUSTUM_LENGTH_STEP
+        );
+
+        let depth_cloud_toggle = {
+            let world = app.world_mut();
+            let mut query = world.query::<(Entity, &ViewerDebugToggleButton)>();
+            query
+                .iter(world)
+                .find_map(|(entity, button)| {
+                    (button.setting == ViewerDebugToggleSetting::DepthCloud).then_some(entity)
+                })
+                .expect("depth cloud debug toggle")
+        };
+        app.world_mut()
+            .entity_mut(depth_cloud_toggle)
+            .insert(Interaction::Pressed);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ViewerDebugSettings>()
+                .depth_cloud_overlay
         );
     }
 

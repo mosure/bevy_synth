@@ -379,6 +379,40 @@ impl SceneAiProvider for OpenAiSceneProvider {
         serde_json::from_value(value).map_err(|err| SceneError::Provider(err.to_string()))
     }
 
+    fn classify_chair_types(
+        &self,
+        request: &SceneChairTypeGroupingRequest,
+    ) -> SceneResult<SceneChairTypeGroupingResponse> {
+        let mut image_paths = Vec::with_capacity(request.crop_image_paths.len() + 1);
+        image_paths.push(request.source_scene_path.clone());
+        image_paths.extend(request.crop_image_paths.iter().cloned());
+        let value = self.post_responses_schema(
+            "classify_chair_types",
+            &request.prompt,
+            chair_type_grouping_schema(),
+            &image_paths,
+        )?;
+        serde_json::from_value(value).map_err(|err| SceneError::Provider(err.to_string()))
+    }
+
+    fn calibrate_ground(
+        &self,
+        request: &SceneGroundCalibrationRequest,
+    ) -> SceneResult<SceneGroundCalibrationResponse> {
+        let prompt = format!(
+            "{}\n\nContext JSON:\n{}",
+            request.prompt,
+            serde_json::to_string_pretty(&request.context).unwrap_or_else(|_| "{}".to_string())
+        );
+        let value = self.post_responses_schema(
+            "calibrate_ground",
+            &prompt,
+            ground_calibration_schema(),
+            &request.image_paths,
+        )?;
+        serde_json::from_value(value).map_err(|err| SceneError::Provider(err.to_string()))
+    }
+
     fn provider_metadata(&self) -> Value {
         let requests = self
             .request_log

@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
 // Local adaptation of fslabs/bevy_infinite_grid for the pinned Bevy render API.
+// Bevy 0.19 has Plane3d/InfinitePlane3d primitives for finite meshes and math,
+// but not a camera-faded infinite-grid renderer, so this shader path remains.
 use bevy::{
     asset::{load_internal_asset, uuid_handle},
     camera::visibility::{self, NoFrustumCulling, VisibilityClass},

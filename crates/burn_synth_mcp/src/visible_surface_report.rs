@@ -420,7 +420,7 @@ fn report_source_camera_point(
     evidence: &SceneGroundingEvidence,
 ) -> Option<[f32; 3]> {
     let x = point[0] + origin[0];
-    let z = point[2] + origin[1];
+    let z = origin[1] - point[2];
     let height_above_floor = point[1];
     let floor_y_camera = if ground_anchor_basis == "camera-ray-ground-plane" {
         report_source_floor_y_at(evidence, x, z).unwrap_or(anchor[1])

@@ -2073,6 +2073,15 @@ fn grounded_scene_layout_defaults_to_asset_preserving_table_scale() {
 }
 
 #[test]
+fn asset_preserving_scale_policy_ignores_single_axis_outliers() {
+    let scale = SceneScalePolicy::AssetPreserving.apply_to_scale([5.00385, 0.9624, 1.03558]);
+
+    assert!((scale[0] - 1.03558).abs() < 1.0e-5);
+    assert_eq!(scale[0], scale[1]);
+    assert_eq!(scale[1], scale[2]);
+}
+
+#[test]
 fn grounded_scene_layout_supports_explicit_free_anisotropic_table_scale() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/cslewis.jpg".to_string(),
@@ -2944,6 +2953,228 @@ fn schemas_are_strict_objects() {
         scene_quality_rubric_schema()["additionalProperties"],
         json!(false)
     );
+}
+
+#[test]
+fn chair_type_grouping_splits_manifest_and_preserves_instance_cardinality() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![
+            SceneObjectSpec {
+                id: "table".to_string(),
+                label: "table".to_string(),
+                aliases: vec!["table".to_string()],
+                bbox: [0.30, 0.35, 0.70, 0.85],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("table".to_string()),
+                instance_count: 1,
+                object_prompt: "conference table".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            },
+            SceneObjectSpec {
+                id: "chairs".to_string(),
+                label: "chair".to_string(),
+                aliases: vec!["chair".to_string()],
+                bbox: [0.10, 0.30, 0.90, 0.92],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("chair".to_string()),
+                instance_count: 3,
+                object_prompt: "meeting chairs".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: Some([0.55, 0.55]),
+            },
+        ],
+    };
+    let detections = vec![
+        Detection {
+            label: "black lounge chair".to_string(),
+            bbox: [0.10, 0.35, 0.22, 0.88],
+            point: Some([0.16, 0.88]),
+            confidence: Some(0.9),
+            source_query: "chair".to_string(),
+        },
+        Detection {
+            label: "black lounge chair".to_string(),
+            bbox: [0.24, 0.34, 0.36, 0.88],
+            point: Some([0.30, 0.88]),
+            confidence: Some(0.85),
+            source_query: "chair".to_string(),
+        },
+        Detection {
+            label: "light mesh chair".to_string(),
+            bbox: [0.70, 0.36, 0.84, 0.90],
+            point: Some([0.77, 0.90]),
+            confidence: Some(0.8),
+            source_query: "chair".to_string(),
+        },
+    ];
+    let evidence = SceneGroundingEvidence {
+        source_image_path: "/tmp/source.jpg".to_string(),
+        depth: None,
+        segmentation: None,
+        detections: detections.clone(),
+        camera: EstimatedCamera::default(),
+        floor: EstimatedFloorPlane::default(),
+        objects: vec![ObjectGroundingEvidence {
+            object_id: "chairs".to_string(),
+            instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            detection: Some(detections[0].clone()),
+            mask: None,
+            asset_id: None,
+            contact_pixel: detections[0].point,
+            depth_stats: None,
+            candidate_floor_contact_rays: Vec::new(),
+            metric_contact_point_m: None,
+            target_footprint_m: Some([0.55, 0.55]),
+            provenance: vec!["locate_anything".to_string()],
+        }],
+    };
+    let request = SceneChairTypeGroupingRequest {
+        prompt: "group chairs".to_string(),
+        source_scene_path: "/tmp/source.jpg".into(),
+        crop_image_paths: vec![
+            "/tmp/chair_01.jpg".into(),
+            "/tmp/chair_02.jpg".into(),
+            "/tmp/chair_03.jpg".into(),
+        ],
+        items: detections
+            .iter()
+            .enumerate()
+            .map(|(index, detection)| SceneChairTypeCrop {
+                index,
+                instance_id: format!("chair_{:02}", index + 1),
+                bbox: detection.bbox,
+                point: detection.point,
+                confidence: detection.confidence,
+                crop_path: format!("/tmp/chair_{:02}.jpg", index + 1),
+                label: detection.label.clone(),
+                source_query: detection.source_query.clone(),
+            })
+            .collect(),
+    };
+    let response = SceneChairTypeGroupingResponse {
+        groups: vec![
+            SceneChairTypeGroup {
+                group_id: "black_lounge".to_string(),
+                label: "black lounge chair".to_string(),
+                description: "black padded lounge chair with low frame".to_string(),
+                member_indices: vec![0, 1],
+                confidence: 0.92,
+            },
+            SceneChairTypeGroup {
+                group_id: "light_mesh".to_string(),
+                label: "light mesh chair".to_string(),
+                description: "light fabric mesh meeting chair".to_string(),
+                member_indices: vec![2],
+                confidence: 0.88,
+            },
+        ],
+    };
+
+    let (manifest, evidence) =
+        apply_chair_type_groups(&manifest, &evidence, &request, &response).unwrap();
+    let chair_objects = manifest
+        .objects
+        .iter()
+        .filter(|object| object.id.starts_with("chair_"))
+        .collect::<Vec<_>>();
+    assert_eq!(chair_objects.len(), 2);
+    assert_eq!(
+        chair_objects
+            .iter()
+            .map(|object| object.instances.len())
+            .sum::<usize>(),
+        3
+    );
+    assert!(
+        !evidence
+            .objects
+            .iter()
+            .any(|object| object.object_id == "chairs")
+    );
+    assert_eq!(
+        evidence
+            .objects
+            .iter()
+            .filter(|object| object.object_id.starts_with("chair_") && object.instance_id.is_some())
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "scene.jpg".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let evidence = SceneGroundingEvidence {
+        source_image_path: "scene.jpg".to_string(),
+        depth: Some(DepthEvidenceRef {
+            provider: "depth-pro".to_string(),
+            model: Some("depth-pro".to_string()),
+            precision: Some("f16".to_string()),
+            artifact_path: None,
+            focal_length_px: None,
+            vertical_fov_degrees: None,
+            image_size: Some([1600, 900]),
+            depth_map_size: Some([1600, 900]),
+            floor_sample_count: Some(42),
+        }),
+        segmentation: None,
+        detections: Vec::new(),
+        camera: EstimatedCamera {
+            image_size: Some([1600, 900]),
+            ..EstimatedCamera::default()
+        },
+        floor: EstimatedFloorPlane::default(),
+        objects: Vec::new(),
+    };
+    let response = SceneGroundCalibrationResponse {
+        camera_height_m: 2.4,
+        vertical_fov_degrees: 62.0,
+        floor_confidence: 0.88,
+        floor_residual_m: 0.05,
+        scene_calibration: None,
+        rationale: "wide room camera".to_string(),
+    };
+
+    let (manifest, evidence, report) =
+        apply_ground_calibration_response(&manifest, &evidence, &response)
+            .expect("apply ground calibration");
+
+    assert!((evidence.floor.distance_m + 2.4).abs() < 1.0e-5);
+    assert_eq!(evidence.floor.normal, [0.0, 1.0, 0.0]);
+    assert_eq!(evidence.floor.confidence, Some(0.88));
+    assert_eq!(evidence.camera.vertical_fov_degrees, Some(62.0));
+    assert!(
+        evidence
+            .camera
+            .focal_length_px
+            .is_some_and(|value| value > 0.0)
+    );
+    assert_eq!(
+        evidence
+            .depth
+            .as_ref()
+            .and_then(|depth| depth.vertical_fov_degrees),
+        Some(62.0)
+    );
+    assert_eq!(
+        manifest
+            .scene_calibration
+            .and_then(|calibration| calibration.vertical_fov_degrees),
+        Some(62.0)
+    );
+    assert_eq!(report.applied_floor.distance_m, evidence.floor.distance_m);
 }
 
 #[test]

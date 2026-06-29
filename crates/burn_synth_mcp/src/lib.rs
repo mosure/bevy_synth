@@ -7,8 +7,10 @@ mod feedback;
 mod prelude;
 mod protocol;
 mod rotation_fit;
+mod scene_depth_sidecar;
 mod scene_grounding_report;
 mod scene_layout;
+mod scene_pipeline_strategy;
 mod server;
 mod types;
 mod visible_surface_report;
@@ -22,9 +24,10 @@ pub use types::{
     InferenceBackend, LocateAnythingBackend, MeshOutputFormat, QualityPreset,
     SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthPrecision, SceneDepthProvider,
-    SceneLocateAnythingPrecision, SceneLocatorProvider, ScenePoseFitMode, SceneRotationFitMode,
-    SceneScalePolicy, SceneSegmentationPrecision, SceneSegmentationProvider,
-    SceneSegmentationQuantization, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
+    SceneGroundCalibrationMode, SceneInstanceGenerationMode, SceneLocateAnythingPrecision,
+    SceneLocatorProvider, ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy,
+    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
+    SceneTablePoseRefinementMode, ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(

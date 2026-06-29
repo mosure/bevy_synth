@@ -1,7 +1,10 @@
 use super::*;
 use crate::cli::read_json_path;
 use crate::prelude::*;
-use crate::server::scene_object_image_generation_policy;
+use crate::server::{
+    SceneAssetLiftPolicy, scene_asset_lift_policy, scene_object_image_generation_policy,
+    validate_scene_asset_outputs_for_policy,
+};
 use burn_synth::{RuntimeConfig, TrellisComputeProfile};
 use burn_synth_grounding::LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT;
 
@@ -217,8 +220,8 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
         panic!("expected scene-build subcommand");
     };
     assert_eq!(command.composition_mode, SceneCompositionMode::CvGrounded);
-    assert_eq!(command.pose_fit, ScenePoseFitMode::ProjectedAabb);
-    assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::RenderSweep);
+    assert_eq!(command.pose_fit, ScenePoseFitMode::RenderedSilhouette);
+    assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::Off);
     assert_eq!(command.scale_policy, SceneScalePolicy::AssetPreserving);
     assert_eq!(command.max_pose_candidates, 32);
     assert_eq!(command.depth_provider, SceneDepthProvider::DepthPro);
@@ -228,11 +231,40 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
         command.feedback_rotation_selector,
         FeedbackRotationSelector::Deterministic
     );
-    assert_eq!(command.rotation_fit, SceneRotationFitMode::DepthMaskRansac);
-    assert_eq!(command.rotation_fit_max_gpt_rounds, 2);
+    assert!(!command.feedback);
+    assert_eq!(command.feedback_iters, DEFAULT_SCENE_FEEDBACK_ITERS);
+    assert_eq!(command.rotation_fit, SceneRotationFitMode::Off);
+    assert_eq!(command.rotation_fit_max_gpt_rounds, 0);
     assert!((command.rotation_fit_min_mask_iou - 0.45).abs() < 1.0e-6);
     assert!((command.rotation_fit_max_depth_error_m - 0.35).abs() < 1.0e-6);
     assert!(command.rotation_fit_write_artifacts);
+    assert_eq!(command.feedback_rubric_scorer, FeedbackRubricScorer::Off);
+}
+
+#[test]
+fn server_args_scene_ground_defaults_to_bare_bones_geometric_flow() {
+    let args = ServerArgs::parse_from([
+        "burn_synth_mcp",
+        "scene-ground",
+        "--source-scene-path",
+        "/tmp/source.jpg",
+        "--manifest",
+        "/tmp/manifest.json",
+        "--asset-bindings",
+        "/tmp/asset_bindings.json",
+    ]);
+    let Some(ServerCommand::SceneGround(command)) = args.command else {
+        panic!("expected scene-ground subcommand");
+    };
+    assert_eq!(command.composition_mode, SceneCompositionMode::CvGrounded);
+    assert_eq!(command.pose_fit, ScenePoseFitMode::RenderedSilhouette);
+    assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::Off);
+    assert_eq!(command.scale_policy, SceneScalePolicy::AssetPreserving);
+    assert_eq!(command.depth_provider, SceneDepthProvider::DepthPro);
+    assert_eq!(command.locator, SceneLocatorProvider::LocateAnything);
+    assert!(!command.feedback);
+    assert_eq!(command.rotation_fit, SceneRotationFitMode::Off);
+    assert_eq!(command.rotation_fit_max_gpt_rounds, 0);
     assert_eq!(command.feedback_rubric_scorer, FeedbackRubricScorer::Off);
 }
 
@@ -355,6 +387,80 @@ fn canonical_pose_calibration_applies_bounded_openai_selection() {
 }
 
 #[test]
+fn canonical_pose_calibration_uses_provenance_source_crop_without_requests() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_1".to_string(),
+            label: "mesh chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 1,
+            object_prompt: "single mesh chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([0.65, 0.65]),
+        }],
+    };
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair_1".to_string(),
+        label: "mesh chair".to_string(),
+        aliases: vec!["chair".to_string()],
+        path: None,
+        cache_key: Some("test/chair".to_string()),
+        reusable: true,
+        source_image_path: Some("/tmp/generated_chair.png".to_string()),
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.3, 0.0, -0.35],
+            max: [0.3, 1.0, 0.35],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, Some([0.6, 0.7]))),
+        provenance: Some(burn_synth_scene::SceneAssetProvenance {
+            run_id: "cached_run".to_string(),
+            source_scene_path: "/tmp/source.jpg".to_string(),
+            source_object_id: "chair_1".to_string(),
+            source_crop_path: Some("/tmp/persisted_chair_crop.jpg".to_string()),
+            generated_by: "scene_build_from_image".to_string(),
+        }),
+    };
+    let selected = vec![json!({
+        "object_id": "chair_1",
+        "candidate_index": 0,
+        "image_path": "/tmp/generated_chair.png",
+    })];
+    let evidence = manifest_grounding_evidence(&manifest);
+    let run = build_canonical_pose_calibration(
+        SceneCanonicalPoseMode::RenderSweep,
+        4,
+        &manifest,
+        std::slice::from_ref(&asset),
+        &selected,
+        &[],
+        &evidence,
+    );
+
+    assert_eq!(
+        run.reports[0].source_crop_path.as_deref(),
+        Some("/tmp/persisted_chair_crop.jpg")
+    );
+    assert_eq!(
+        run.selection_task["objects"][0]["source_crop_path"],
+        json!("/tmp/persisted_chair_crop.jpg")
+    );
+    assert!(
+        run.image_paths
+            .iter()
+            .any(|path| path == Path::new("/tmp/persisted_chair_crop.jpg"))
+    );
+}
+
+#[test]
 fn canonical_pose_calibration_applies_rendered_thumbnail_selection() {
     let root = unique_test_dir("canonical_pose_rendered_selection");
     let _ = fs::remove_dir_all(&root);
@@ -462,13 +568,234 @@ fn canonical_pose_calibration_applies_rendered_thumbnail_selection() {
 }
 
 #[test]
+fn canonical_pose_rendered_selection_uses_color_edge_descriptor_for_front_back() {
+    let root = unique_test_dir("canonical_pose_front_back_descriptor");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source_path = root.join("source.png");
+    let generated_path = root.join("generated.png");
+    let front_render_path = root.join("candidate_front.png");
+    let back_render_path = root.join("candidate_back.png");
+    write_asymmetric_pose_test_image(&source_path, false);
+    write_asymmetric_pose_test_image(&generated_path, false);
+    write_asymmetric_pose_test_image(&front_render_path, true);
+    write_asymmetric_pose_test_image(&back_render_path, false);
+
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_1".to_string(),
+            label: "chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 1,
+            object_prompt: "chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([0.6, 0.7]),
+        }],
+    };
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair_1".to_string(),
+        label: "chair".to_string(),
+        aliases: vec!["chair".to_string()],
+        path: None,
+        cache_key: Some("test/chair".to_string()),
+        reusable: true,
+        source_image_path: Some(generated_path.display().to_string()),
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.3, 0.0, -0.35],
+            max: [0.3, 1.0, 0.35],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, Some([0.6, 0.7]))),
+        provenance: None,
+    };
+    let request = ObjectImageRequest {
+        object: manifest.objects[0].clone(),
+        source_scene_path: "/tmp/source_1024.jpg".to_string(),
+        source_crop_path: source_path.display().to_string(),
+        object_reference_image_path: "/tmp/reference.jpg".to_string(),
+        prompt: "chair".to_string(),
+        candidate_count: 1,
+        size: "1024x1024".to_string(),
+        quality: "medium".to_string(),
+    };
+    let selected = vec![json!({
+        "object_id": "chair_1",
+        "candidate_index": 0,
+        "image_path": generated_path,
+    })];
+    let evidence = manifest_grounding_evidence(&manifest);
+    let mut run = build_canonical_pose_calibration(
+        SceneCanonicalPoseMode::RenderSweep,
+        4,
+        &manifest,
+        std::slice::from_ref(&asset),
+        &selected,
+        &[request],
+        &evidence,
+    );
+    run.reports[0].candidates[0].rendered_image_path =
+        Some(front_render_path.display().to_string());
+    let back_candidate_index = run.reports[0]
+        .candidates
+        .iter()
+        .position(|candidate| (candidate.yaw_offset_degrees - 180.0).abs() <= 1.0e-5)
+        .expect("180 candidate");
+    run.reports[0].candidates[back_candidate_index].rendered_image_path =
+        Some(back_render_path.display().to_string());
+
+    let report = apply_canonical_pose_rendered_selection(&mut run);
+
+    assert_eq!(report["applied_count"], json!(1));
+    assert_eq!(
+        run.reports[0].selected.candidate_index,
+        run.reports[0].candidates[back_candidate_index].candidate_index
+    );
+    assert!(
+        (run.reports[0].selected.yaw_offset_degrees - 180.0).abs() <= 1.0e-5,
+        "front/back descriptor should select the mirrored 180 degree candidate"
+    );
+    let selected_metrics = &run.reports[0].candidates[back_candidate_index].metrics["render_similarity"]
+        ["visual_descriptor"];
+    assert_eq!(selected_metrics["descriptor"], json!("rgb_luma_sobel_edge"));
+    assert!(
+        selected_metrics["generated"]["score"].as_f64().unwrap()
+            > run.reports[0].candidates[0].metrics["render_similarity"]["visual_descriptor"]
+                ["generated"]["score"]
+                .as_f64()
+                .unwrap()
+    );
+}
+
+#[test]
+fn canonical_pose_rendered_selection_uses_depth_mesh_normal_evidence() {
+    let root = unique_test_dir("canonical_pose_normal_evidence");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let source_path = root.join("source.png");
+    let generated_path = root.join("generated.png");
+    let front_render_path = root.join("candidate_front.png");
+    let back_render_path = root.join("candidate_back.png");
+    write_pose_test_image(&source_path, [22, 5, 42, 59]);
+    write_pose_test_image(&generated_path, [22, 5, 42, 59]);
+    write_pose_test_image(&front_render_path, [22, 5, 42, 59]);
+    write_pose_test_image(&back_render_path, [22, 5, 42, 59]);
+
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/source.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![burn_synth_scene::SceneObjectSpec {
+            id: "chair_1".to_string(),
+            label: "chair".to_string(),
+            aliases: vec!["chair".to_string()],
+            bbox: [0.2, 0.2, 0.4, 0.8],
+            instances: Vec::new(),
+            representative_instance_id: None,
+            reuse_group: Some("chair".to_string()),
+            instance_count: 1,
+            object_prompt: "chair".to_string(),
+            camera_hint: None,
+            rotation_hint_degrees: None,
+            target_footprint_m: Some([0.6, 0.7]),
+        }],
+    };
+    let asset = SceneAssetBinding {
+        asset_id: "chair_asset".to_string(),
+        object_id: "chair_1".to_string(),
+        label: "chair".to_string(),
+        aliases: vec!["chair".to_string()],
+        path: None,
+        cache_key: Some("test/chair".to_string()),
+        reusable: true,
+        source_image_path: Some(generated_path.display().to_string()),
+        pipeline: None,
+        local_aabb: Some(SceneAssetAabb {
+            min: [-0.3, 0.0, -0.35],
+            max: [0.3, 1.0, 0.35],
+        }),
+        canonical_frame: Some(SceneAssetFrame::heuristic(0.0, Some([0.6, 0.7]))),
+        provenance: None,
+    };
+    let request = ObjectImageRequest {
+        object: manifest.objects[0].clone(),
+        source_scene_path: "/tmp/source_1024.jpg".to_string(),
+        source_crop_path: source_path.display().to_string(),
+        object_reference_image_path: "/tmp/reference.jpg".to_string(),
+        prompt: "chair".to_string(),
+        candidate_count: 1,
+        size: "1024x1024".to_string(),
+        quality: "medium".to_string(),
+    };
+    let selected = vec![json!({
+        "object_id": "chair_1",
+        "candidate_index": 0,
+        "image_path": generated_path,
+    })];
+    let evidence = manifest_grounding_evidence(&manifest);
+    let mut run = build_canonical_pose_calibration(
+        SceneCanonicalPoseMode::RenderSweep,
+        4,
+        &manifest,
+        std::slice::from_ref(&asset),
+        &selected,
+        &[request],
+        &evidence,
+    );
+    run.reports[0].candidates[0].rendered_image_path =
+        Some(front_render_path.display().to_string());
+    run.reports[0].candidates[0].metrics["normal_evidence"] = json!({
+        "similarity": {
+            "score": 0.20,
+            "descriptor": "depth_normal_vs_mesh_normal",
+        }
+    });
+    let back_candidate_index = run.reports[0]
+        .candidates
+        .iter()
+        .position(|candidate| (candidate.yaw_offset_degrees - 180.0).abs() <= 1.0e-5)
+        .expect("180 candidate");
+    run.reports[0].candidates[back_candidate_index].rendered_image_path =
+        Some(back_render_path.display().to_string());
+    run.reports[0].candidates[back_candidate_index].metrics["normal_evidence"] = json!({
+        "similarity": {
+            "score": 0.92,
+            "descriptor": "depth_normal_vs_mesh_normal",
+        }
+    });
+
+    let report = apply_canonical_pose_rendered_selection(&mut run);
+
+    assert_eq!(report["applied_count"], json!(1));
+    assert_eq!(
+        run.reports[0].selected.candidate_index,
+        run.reports[0].candidates[back_candidate_index].candidate_index
+    );
+    let source_normal_score = run.reports[0].candidates[back_candidate_index].metrics
+        ["render_similarity"]["source_normal_score"]
+        .as_f64()
+        .unwrap();
+    assert!((source_normal_score - 0.92).abs() <= 1.0e-5);
+    assert!(
+        run.reports[0].selected.confidence > 0.55,
+        "normal evidence should raise selection confidence above visual-only low-confidence range"
+    );
+}
+
+#[test]
 fn canonical_pose_rendered_fallback_retains_prior_frame() {
     let root = unique_test_dir("canonical_pose_rendered_fallback");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     let source_path = root.join("source.png");
     let generated_path = root.join("generated.png");
-    let weak_render_path = root.join("weak_candidate.png");
+    let weak_render_path = root.join("weak_candidate_mask.png");
     write_pose_test_image(&source_path, [22, 5, 42, 59]);
     write_pose_test_image(&generated_path, [22, 5, 42, 59]);
     write_pose_test_image(&weak_render_path, [1, 1, 63, 5]);
@@ -648,6 +975,28 @@ fn write_pose_test_image(path: &Path, rect: [u32; 4]) {
     image.save(path).unwrap();
 }
 
+fn write_asymmetric_pose_test_image(path: &Path, accent_left: bool) {
+    let mut image = image::RgbaImage::from_pixel(64, 64, image::Rgba([255, 255, 255, 255]));
+    for y in 5..59 {
+        for x in 22..42 {
+            image.put_pixel(x, y, image::Rgba([42, 42, 42, 255]));
+        }
+    }
+    let accent = if accent_left { 23..29 } else { 35..41 };
+    for y in 12..47 {
+        for x in accent.clone() {
+            image.put_pixel(x, y, image::Rgba([205, 52, 42, 255]));
+        }
+    }
+    for y in 44..54 {
+        for x in 24..40 {
+            let shade = if accent_left { x - 24 } else { 39 - x };
+            image.put_pixel(x, y, image::Rgba([70 + shade as u8 * 4, 70, 92, 255]));
+        }
+    }
+    image.save(path).unwrap();
+}
+
 #[test]
 fn images_to_assets_captures_runtime_progress_events() {
     let root = unique_test_dir("asset_runtime_progress");
@@ -799,6 +1148,7 @@ fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
             scale_policy: SceneScalePolicy::AssetPreserving,
             max_pose_candidates: 32,
             save_pose_debug: true,
+            ground_calibration: SceneGroundCalibrationMode::DepthHeuristic,
             depth_provider: SceneDepthProvider::None,
             locator: SceneLocatorProvider::Manifest,
             locate_anything_backend: None,
@@ -818,6 +1168,7 @@ fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
             rotation_fit_min_mask_iou: 0.45,
             rotation_fit_max_depth_error_m: 0.35,
             rotation_fit_write_artifacts: true,
+            table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
             feedback_rubric_scorer: FeedbackRubricScorer::Off,
         })
         .unwrap_err();
@@ -1094,6 +1445,7 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         scale_policy: SceneScalePolicy::AssetPreserving,
         max_pose_candidates: 32,
         save_pose_debug: true,
+        ground_calibration: SceneGroundCalibrationMode::DepthHeuristic,
         depth_provider: SceneDepthProvider::None,
         locator: SceneLocatorProvider::LocateAnything,
         locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
@@ -1113,6 +1465,7 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         rotation_fit_min_mask_iou: 0.45,
         rotation_fit_max_depth_error_m: 0.35,
         rotation_fit_write_artifacts: true,
+        table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
 
@@ -1212,6 +1565,7 @@ fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
         scale_policy: SceneScalePolicy::AssetPreserving,
         max_pose_candidates: 32,
         save_pose_debug: true,
+        ground_calibration: SceneGroundCalibrationMode::DepthHeuristic,
         depth_provider: SceneDepthProvider::DepthPro,
         locator: SceneLocatorProvider::Manifest,
         locate_anything_backend: None,
@@ -1231,6 +1585,7 @@ fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
         rotation_fit_min_mask_iou: 0.45,
         rotation_fit_max_depth_error_m: 0.35,
         rotation_fit_write_artifacts: true,
+        table_pose_refinement: SceneTablePoseRefinementMode::GatedGpt,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     };
     let first_dir = root.join("first");
@@ -1385,7 +1740,7 @@ fn server_args_accept_scene_build_subcommand() {
     assert_eq!(command.batch_size, Some(0));
     assert!(!command.trellis_pbr);
     assert!(command.apply);
-    assert!(command.feedback);
+    assert!(!command.feedback);
     assert_eq!(command.feedback_iters, DEFAULT_SCENE_FEEDBACK_ITERS);
     assert_eq!(
         command.feedback_threshold_profile,
@@ -1593,6 +1948,15 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
             "runtime_cache_hit": false,
             "detection_count": 0
         },
+        "pre_generation_segmentation_report": {
+            "mask_count": 0,
+            "runtime_cache_hit": true
+        },
+        "pre_generation_depth_report": {
+            "runtime_cache_hit": true,
+            "load_ms": 0.0,
+            "infer_ms": 0.0
+        },
         "candidates": [],
         "selected_candidates": [],
         "asset_outputs": {
@@ -1683,6 +2047,14 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
             "source_scene_path": "/tmp/scene.jpg",
             "entries": []
         },
+        "scene_placement_pipeline": {
+            "schema_version": 1,
+            "quality_profile": "bare_bones_geometric",
+            "active_pose_optimizer": "visible_surface_dense_depth_search_plus_soft_point_refinement",
+            "stages": [],
+            "evidence_contracts": [],
+            "ablation_axes": []
+        },
         "stage_report": [{ "stage": "generate_object_candidates", "elapsed_ms": 7 }],
         "e2e_summary": {
             "ok": true,
@@ -1701,11 +2073,14 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
         dir.join("pre_generation_locate_anything_report.json")
             .exists()
     );
+    assert!(dir.join("pre_generation_segmentation_report.json").exists());
+    assert!(dir.join("pre_generation_depth_report.json").exists());
     assert!(dir.join("asset_outputs.json").exists());
     assert!(dir.join("stage_report.json").exists());
     assert!(dir.join("summary.json").exists());
     assert!(dir.join("grounding_contract.json").exists());
     assert!(dir.join("decision_log.json").exists());
+    assert!(dir.join("scene_placement_pipeline.json").exists());
     assert!(dir.join("scene.bsn").exists());
     assert!(dir.join("projection_fit_report.json").exists());
     assert!(dir.join("projection_fit_initial.json").exists());
@@ -1847,7 +2222,7 @@ fn grounding_contract_records_evidence_statuses_and_gpt_roles() {
         .expect("decision entries");
     assert!(decisions.iter().any(|entry| {
         entry["decision"] == "scene_pose_fit"
-            && entry["source_of_truth"] == "deterministic_projected_aabb_contact_depth_fit"
+            && entry["source_of_truth"] == "deterministic_visible_surface_mask_depth_fit"
     }));
 }
 
@@ -2032,6 +2407,7 @@ fn scene_asset_bindings_prefer_promoted_catalog_cache_keys() {
         "reuse_group": "chair_left",
         "label": "conference chair",
         "image_path": "/tmp/chair_candidate.png",
+        "source_crop_path": "/tmp/chair_source_crop.jpg",
         "candidate_index": 0,
         "score": 0.91,
         "prompt_hash": "abc",
@@ -2060,6 +2436,13 @@ fn scene_asset_bindings_prefer_promoted_catalog_cache_keys() {
     assert_eq!(
         bindings[0].local_aabb.as_ref().map(|aabb| aabb.max[1]),
         Some(1.0)
+    );
+    assert_eq!(
+        bindings[0]
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.source_crop_path.as_deref()),
+        Some("/tmp/chair_source_crop.jpg")
     );
 
     let bsn = "synth_scene_v1 {\nasset chair_left_asset = \"generated:chair_left_asset\";\nspawn chair uses chair_left_asset translation [0.0,0.0,0.0] rotation_y 0.0 scale [1.0,1.0,1.0];\n}";
@@ -2684,7 +3067,35 @@ fn feedback_deltas_apply_axis_scale_for_table_projection() {
 }
 
 #[test]
-fn feedback_deltas_emit_axis_scale_for_skinny_table_projection() {
+fn feedback_deltas_asset_preserving_policy_removes_table_axis_outlier() {
+    let commands = vec![json!({
+        "type": "spawn_cached",
+        "cache_key": "table",
+        "translation": [0.0, 0.0, 0.0],
+        "scale": [5.00385, 0.9624, 1.03558],
+    })];
+    let deltas = json!({
+        "objects": [{
+            "translation_delta": [0.0, 0.0, 0.0],
+            "scale_multiplier": 1.0,
+        }]
+    });
+
+    let adjusted = apply_feedback_deltas_to_commands_with_policy(
+        &commands,
+        &deltas,
+        SceneScalePolicy::AssetPreserving,
+    )
+    .unwrap();
+
+    let scale = json_array3(&adjusted[0]["scale"]).unwrap();
+    assert!((scale[0] - 1.03558).abs() <= 1.0e-5);
+    assert_eq!(scale[0], scale[1]);
+    assert_eq!(scale[1], scale[2]);
+}
+
+#[test]
+fn feedback_deltas_do_not_emit_axis_scale_for_skinny_table_projection() {
     let metrics = json!({
         "objects": [{
             "index": 0,
@@ -2701,12 +3112,10 @@ fn feedback_deltas_emit_axis_scale_for_skinny_table_projection() {
 
     let deltas = feedback_layout_deltas_with_policy(&metrics, SceneScalePolicy::FreeAnisotropic);
     let object = &deltas["objects"][0];
-    let axis_scale = json_array3(&object["scale_multiplier_xyz"]).unwrap();
 
-    assert_eq!(object["scale_source"], json!("axis_projection"));
-    assert!(axis_scale[0] > 1.1);
-    assert!((axis_scale[1] - 1.0).abs() <= 1.0e-6);
-    assert!(axis_scale[2] < 1.02);
+    assert!(object["scale_multiplier_xyz"].is_null());
+    assert_eq!(object["scale_source"], json!("object_projection"));
+    assert_eq!(object["scale_multiplier"], json!(1.18));
 }
 
 #[test]
@@ -4787,6 +5196,130 @@ fn scene_build_candidate_policy_batches_quality_candidates_for_mesh_fallback() {
         explicit.segmentation_quantization,
         Some(SceneSegmentationQuantization::Q8)
     );
+}
+
+#[test]
+fn scene_build_defaults_select_bare_bones_geometric_placement_pipeline() {
+    let args: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": "/tmp/scene.jpg"
+    }))
+    .expect("scene build args deserialize");
+    let config = ServerConfig::from_args(ServerArgs::parse_from(["burn_synth_mcp"]));
+    let segmentation_provider = args
+        .segmentation_provider
+        .unwrap_or(config.scene_segmentation_provider);
+
+    let plan = scene_placement_pipeline_plan(ScenePlacementPipelineSelection {
+        entry_point: ScenePlacementEntryPoint::SceneBuild,
+        lift_assets: args.lift_assets,
+        composition_mode: args.composition_mode,
+        pose_fit: args.pose_fit,
+        canonical_pose: args.canonical_pose,
+        scale_policy: args.scale_policy,
+        ground_calibration: args.ground_calibration,
+        instance_generation: args.instance_generation,
+        depth_provider: args.depth_provider,
+        locator: args.locator,
+        segmentation_provider,
+        feedback: args.feedback,
+        feedback_iters: args.feedback_iters,
+        feedback_rotation_selector: args.feedback_rotation_selector,
+        feedback_rubric_scorer: args.feedback_rubric_scorer,
+        rotation_fit: args.rotation_fit,
+        table_pose_refinement: args.table_pose_refinement,
+        max_pose_candidates: args.max_pose_candidates,
+    });
+
+    assert_eq!(plan.quality_profile, "bare_bones_geometric");
+    assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
+    assert_eq!(
+        plan.active_pose_optimizer,
+        "visible_surface_dense_depth_search_plus_soft_point_refinement_plus_table_refinement"
+    );
+    assert!(plan.stages.iter().any(|stage| {
+        stage.stage == "object_discretization"
+            && stage.enabled
+            && stage.method == "locate_anything_burn_native"
+    }));
+    assert!(plan.stages.iter().any(|stage| {
+        stage.stage == "mask_selection" && stage.enabled && stage.method == "sam2"
+    }));
+    assert!(plan.stages.iter().any(|stage| {
+        stage.stage == "object_image_synthesis"
+            && stage.enabled
+            && stage.gpt_role == "image_synthesis"
+    }));
+    assert!(
+        plan.stages
+            .iter()
+            .any(|stage| { stage.stage == "render_capture_feedback" && !stage.enabled })
+    );
+    assert_eq!(args.scale_policy, SceneScalePolicy::AssetPreserving);
+    assert!(!args.feedback);
+    assert_eq!(args.rotation_fit, SceneRotationFitMode::Off);
+    assert_eq!(
+        args.table_pose_refinement,
+        SceneTablePoseRefinementMode::GatedGpt
+    );
+}
+
+#[test]
+fn scene_asset_lift_policy_rejects_triposplat_for_mesh_pose_fit() {
+    let args: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": "/tmp/scene.jpg",
+        "synthesis_models": ["triposplat"],
+        "composition_mode": "cv-grounded",
+        "pose_fit": "rendered-silhouette",
+        "table_pose_refinement": "gated-gpt"
+    }))
+    .expect("scene build args deserialize");
+
+    let err = scene_asset_lift_policy(&args).expect_err("splat should not satisfy mesh pose fit");
+    assert!(
+        err.contains("requires GLB mesh assets"),
+        "unexpected error: {err}"
+    );
+
+    let mut projected_only: SceneBuildFromImageArgs = serde_json::from_value(json!({
+        "source_scene_path": "/tmp/scene.jpg",
+        "synthesis_models": ["triposplat"],
+        "composition_mode": "cv-grounded",
+        "pose_fit": "projected-aabb",
+        "table_pose_refinement": "off"
+    }))
+    .expect("scene build args deserialize");
+    projected_only.rotation_fit = SceneRotationFitMode::Off;
+    let policy = scene_asset_lift_policy(&projected_only).expect("projected-only splat ablation");
+    assert_eq!(policy.output_format, AssetOutputFormat::Auto);
+    assert!(!policy.requires_mesh_assets);
+}
+
+#[test]
+fn scene_asset_contract_rejects_splat_outputs_for_mesh_scene_fit() {
+    let policy = SceneAssetLiftPolicy {
+        synthesis_models: vec![SynthesisModel::Trellis],
+        output_format: AssetOutputFormat::Glb,
+        requires_mesh_assets: true,
+        warnings: Vec::new(),
+    };
+    let outputs = json!({
+        "items": [
+            {
+                "id": "asset_0",
+                "input_image_path": "/tmp/table.png",
+                "asset_kind": "gaussian_splat",
+                "output_format": "splat",
+                "synthesis_backend": "triposplat",
+                "local_aabb": null
+            }
+        ]
+    });
+
+    let err = validate_scene_asset_outputs_for_policy(&outputs, &policy)
+        .expect_err("splat output must not pass mesh scene contract");
+    assert!(err.contains("asset_kind=gaussian_splat"), "{err}");
+    assert!(err.contains("output_format=splat"), "{err}");
+    assert!(err.contains("no local_aabb"), "{err}");
 }
 
 #[test]

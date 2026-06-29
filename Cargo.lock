@@ -1861,6 +1861,7 @@ dependencies = [
  "burn_synth_scene",
  "clap",
  "console_error_panic_hook",
+ "image",
  "js-sys",
  "rattles",
  "serde",
@@ -3021,12 +3022,24 @@ dependencies = [
  "burn_segmentation",
  "burn_synth",
  "burn_synth_grounding",
+ "burn_synth_render",
  "burn_synth_scene",
  "clap",
  "cubecl",
  "gltf",
  "image",
  "meshopt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "burn_synth_render"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "criterion",
+ "image",
  "serde",
  "serde_json",
 ]

@@ -419,7 +419,7 @@ pub(crate) fn default_scene_write_artifacts() -> bool {
 }
 
 pub(crate) fn default_scene_feedback() -> bool {
-    true
+    false
 }
 
 pub(crate) fn default_scene_feedback_iters() -> usize {
@@ -439,11 +439,11 @@ pub(crate) fn default_feedback_rubric_scorer() -> FeedbackRubricScorer {
 }
 
 pub(crate) fn default_scene_rotation_fit_mode() -> SceneRotationFitMode {
-    SceneRotationFitMode::DepthMaskRansac
+    SceneRotationFitMode::Off
 }
 
 pub(crate) fn default_scene_rotation_fit_max_gpt_rounds() -> usize {
-    2
+    0
 }
 
 pub(crate) fn default_scene_rotation_fit_min_mask_iou() -> f32 {
@@ -458,16 +458,20 @@ pub(crate) fn default_scene_rotation_fit_write_artifacts() -> bool {
     true
 }
 
+pub(crate) fn default_scene_table_pose_refinement() -> SceneTablePoseRefinementMode {
+    SceneTablePoseRefinementMode::GatedGpt
+}
+
 pub(crate) fn default_scene_composition_mode() -> SceneCompositionMode {
     SceneCompositionMode::CvGrounded
 }
 
 pub(crate) fn default_scene_pose_fit_mode() -> ScenePoseFitMode {
-    ScenePoseFitMode::ProjectedAabb
+    ScenePoseFitMode::RenderedSilhouette
 }
 
 pub(crate) fn default_scene_canonical_pose_mode() -> SceneCanonicalPoseMode {
-    SceneCanonicalPoseMode::RenderSweep
+    SceneCanonicalPoseMode::Off
 }
 
 pub(crate) fn default_scene_scale_policy() -> SceneScalePolicy {
@@ -478,15 +482,19 @@ pub(crate) fn default_scene_max_pose_candidates() -> usize {
     32
 }
 
+pub(crate) fn default_scene_ground_calibration_mode() -> SceneGroundCalibrationMode {
+    SceneGroundCalibrationMode::Gpt
+}
+
+pub(crate) fn default_scene_instance_generation_mode() -> SceneInstanceGenerationMode {
+    SceneInstanceGenerationMode::CategoryRepresentative
+}
+
 pub(crate) fn default_scene_depth_provider() -> SceneDepthProvider {
     SceneDepthProvider::DepthPro
 }
 
 pub(crate) fn default_scene_locator_provider() -> SceneLocatorProvider {
-    SceneLocatorProvider::Manifest
-}
-
-pub(crate) fn default_scene_build_locator_provider() -> SceneLocatorProvider {
     SceneLocatorProvider::LocateAnything
 }
 
@@ -521,6 +529,37 @@ pub(crate) fn selected_candidates_to_values(
             })
         })
         .collect()
+}
+
+pub(crate) fn selected_candidates_to_values_with_requests(
+    selected: &[burn_synth_scene::SelectedObjectImageCandidate],
+    requests: &[ObjectImageRequest],
+) -> Vec<Value> {
+    let crops_by_object = requests
+        .iter()
+        .map(|request| {
+            (
+                request.object.id.as_str(),
+                request.source_crop_path.as_str(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut values = selected_candidates_to_values(selected);
+    for value in &mut values {
+        let Some(object_id) = value.get("object_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(source_crop_path) = crops_by_object.get(object_id).copied() else {
+            continue;
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "source_crop_path".to_string(),
+                Value::String(source_crop_path.to_string()),
+            );
+        }
+    }
+    values
 }
 
 pub(crate) fn record_stage(stage_report: &mut Vec<Value>, stage: &str, started: Instant) {
@@ -981,7 +1020,7 @@ fn scene_grounding_contract_report(
                 "segmentation_grounding_evidence",
                 segmentation_status,
                 GptDelegationRole::None,
-                ["future_visible_surface_fit"],
+                ["visible_surface_pose_fit"],
                 json!({
                     "provider": segmentation_provider,
                     "mask_count": response.pointer("/segmentation_grounding/mask_count").cloned().unwrap_or(Value::Null),
@@ -1237,7 +1276,11 @@ fn scene_decision_log(
             decision_entry(
                 "scene_pose_fit",
                 "plan_grounded_scene",
-                "deterministic_projected_aabb_contact_depth_fit",
+                if args.pose_fit == ScenePoseFitMode::RenderedSilhouette {
+                    "deterministic_visible_surface_mask_depth_fit"
+                } else {
+                    "deterministic_projected_aabb_contact_depth_fit"
+                },
                 response
                     .pointer("/grounded_layout/projection_fit/final_score")
                     .and_then(Value::as_f64)
@@ -1831,6 +1874,14 @@ pub(crate) fn write_scene_build_artifacts(
             "pre_generation_locate_anything_report",
             "pre_generation_locate_anything_report.json",
         ),
+        (
+            "pre_generation_segmentation_report",
+            "pre_generation_segmentation_report.json",
+        ),
+        (
+            "pre_generation_depth_report",
+            "pre_generation_depth_report.json",
+        ),
         ("object_image_requests", "object_image_requests.json"),
         ("provider_metadata", "provider_metadata.json"),
         ("token_usage", "token_usage.json"),
@@ -1840,6 +1891,7 @@ pub(crate) fn write_scene_build_artifacts(
         ("asset_outputs", "asset_outputs.json"),
         ("asset_lift_attempts", "asset_lift_attempts.json"),
         ("mesh_quality_failures", "mesh_quality_failures.json"),
+        ("scene_placement_pipeline", "scene_placement_pipeline.json"),
         ("asset_bindings_initial", "asset_bindings_initial.json"),
         ("asset_bindings", "asset_bindings.json"),
         (
@@ -2316,6 +2368,10 @@ pub(crate) fn scene_asset_bindings_from_outputs(
                 run_id: "scene_build_from_image".to_string(),
                 source_scene_path: manifest.source_scene_path.clone(),
                 source_object_id: object.id.clone(),
+                source_crop_path: selected
+                    .get("source_crop_path")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 generated_by: "scene_build_from_image".to_string(),
             }),
         };

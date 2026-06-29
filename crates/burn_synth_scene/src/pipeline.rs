@@ -36,6 +36,22 @@ pub trait SceneAiProvider {
             "scene quality rubric scoring is not supported by this provider".to_string(),
         ))
     }
+    fn classify_chair_types(
+        &self,
+        _request: &SceneChairTypeGroupingRequest,
+    ) -> SceneResult<SceneChairTypeGroupingResponse> {
+        Err(SceneError::Provider(
+            "chair type grouping is not supported by this provider".to_string(),
+        ))
+    }
+    fn calibrate_ground(
+        &self,
+        _request: &SceneGroundCalibrationRequest,
+    ) -> SceneResult<SceneGroundCalibrationResponse> {
+        Err(SceneError::Provider(
+            "ground calibration is not supported by this provider".to_string(),
+        ))
+    }
     fn provider_metadata(&self) -> Value {
         Value::Null
     }
@@ -69,6 +85,40 @@ pub struct SceneQualityRubricRequest {
     pub source_scene_path: PathBuf,
     pub rendered_scene_path: PathBuf,
     pub context: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneChairTypeGroupingRequest {
+    pub prompt: String,
+    pub source_scene_path: PathBuf,
+    pub crop_image_paths: Vec<PathBuf>,
+    pub items: Vec<SceneChairTypeCrop>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneChairTypeCrop {
+    pub index: usize,
+    pub instance_id: String,
+    pub bbox: [f32; 4],
+    pub point: Option<[f32; 2]>,
+    pub confidence: Option<f32>,
+    pub crop_path: String,
+    pub label: String,
+    pub source_query: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneChairTypeGroupingResponse {
+    pub groups: Vec<SceneChairTypeGroup>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneChairTypeGroup {
+    pub group_id: String,
+    pub label: String,
+    pub description: String,
+    pub member_indices: Vec<usize>,
+    pub confidence: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -217,6 +267,47 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
             });
         }
         Ok(requests)
+    }
+
+    pub fn prepare_chair_type_grouping_request(
+        &self,
+        manifest: &SceneObjectManifest,
+        evidence: &SceneGroundingEvidence,
+    ) -> SceneResult<Option<SceneChairTypeGroupingRequest>> {
+        crate::chair_types::prepare_chair_type_grouping_request(
+            &self.config.source_scene_path,
+            &self.config.output_dir,
+            manifest,
+            evidence,
+        )
+    }
+
+    pub fn classify_chair_types(
+        &self,
+        request: &SceneChairTypeGroupingRequest,
+    ) -> SceneResult<SceneChairTypeGroupingResponse> {
+        self.provider.classify_chair_types(request)
+    }
+
+    pub fn prepare_ground_calibration_request(
+        &self,
+        manifest: &SceneObjectManifest,
+        evidence: &SceneGroundingEvidence,
+        extra_image_paths: &[PathBuf],
+    ) -> SceneGroundCalibrationRequest {
+        crate::ground_calibration::prepare_ground_calibration_request(
+            &self.config.source_scene_path,
+            manifest,
+            evidence,
+            extra_image_paths,
+        )
+    }
+
+    pub fn calibrate_ground(
+        &self,
+        request: &SceneGroundCalibrationRequest,
+    ) -> SceneResult<SceneGroundCalibrationResponse> {
+        self.provider.calibrate_ground(request)
     }
 
     pub fn generate_object_candidates(

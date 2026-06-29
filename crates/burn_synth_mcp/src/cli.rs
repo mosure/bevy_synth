@@ -77,6 +77,8 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         scale_policy: args.scale_policy,
         max_pose_candidates: args.max_pose_candidates,
         save_pose_debug: args.save_pose_debug,
+        ground_calibration: args.ground_calibration,
+        instance_generation: args.instance_generation,
         depth_provider: args.depth_provider,
         locator: args.locator,
         locate_anything_backend: args.locate_anything_backend,
@@ -97,6 +99,7 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
         rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
         rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
+        table_pose_refinement: args.table_pose_refinement,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
@@ -125,6 +128,7 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         scale_policy: args.scale_policy,
         max_pose_candidates: args.max_pose_candidates,
         save_pose_debug: args.save_pose_debug,
+        ground_calibration: args.ground_calibration,
         depth_provider: args.depth_provider,
         locator: args.locator,
         locate_anything_backend: args.locate_anything_backend,
@@ -144,6 +148,7 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         rotation_fit_min_mask_iou: args.rotation_fit_min_mask_iou,
         rotation_fit_max_depth_error_m: args.rotation_fit_max_depth_error_m,
         rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
+        table_pose_refinement: args.table_pose_refinement,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(

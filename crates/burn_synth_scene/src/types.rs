@@ -30,8 +30,58 @@ impl SceneScalePolicy {
     }
 
     pub fn allows_axis_feedback(self) -> bool {
-        matches!(self, Self::FreeAnisotropic)
+        // Screen-space bbox axes do not map reliably to local X/Z after yaw and camera projection.
+        // Keep feedback scale uniform; initial layout remains the owner of explicit anisotropy.
+        false
     }
+
+    pub fn apply_to_scale(self, scale: [f32; 3]) -> [f32; 3] {
+        let Some(max_ratio) = self.max_xz_anisotropy() else {
+            return [
+                sanitize_scale_component(scale[0]),
+                sanitize_scale_component(scale[1]),
+                sanitize_scale_component(scale[2]),
+            ];
+        };
+        if max_ratio <= 1.0 + f32::EPSILON {
+            let uniform = robust_uniform_scale(scale);
+            return [uniform, uniform, uniform];
+        }
+
+        let x = sanitize_scale_component(scale[0]);
+        let y = sanitize_scale_component(scale[1]);
+        let z = sanitize_scale_component(scale[2]);
+        let ratio = (x.max(z) / x.min(z).max(1.0e-5)).max(1.0);
+        if ratio <= max_ratio {
+            return [x, y, z];
+        }
+        let area_scale = (x * z).sqrt().clamp(0.05, 20.0);
+        let root_ratio = max_ratio.sqrt();
+        let (next_x, next_z) = if x >= z {
+            (area_scale * root_ratio, area_scale / root_ratio)
+        } else {
+            (area_scale / root_ratio, area_scale * root_ratio)
+        };
+        [
+            next_x.clamp(0.05, 20.0),
+            area_scale.clamp(0.05, 20.0),
+            next_z.clamp(0.05, 20.0),
+        ]
+    }
+}
+
+fn sanitize_scale_component(value: f32) -> f32 {
+    value.abs().clamp(0.05, 20.0)
+}
+
+fn robust_uniform_scale(scale: [f32; 3]) -> f32 {
+    let mut values = [
+        sanitize_scale_component(scale[0]),
+        sanitize_scale_component(scale[1]),
+        sanitize_scale_component(scale[2]),
+    ];
+    values.sort_by(f32::total_cmp);
+    values[1]
 }
 
 pub const DEFAULT_SCENE_RECONSTRUCTION_IMAGE_SCORE: f32 = 0.45;
@@ -583,6 +633,8 @@ pub struct SceneAssetProvenance {
     pub run_id: String,
     pub source_scene_path: String,
     pub source_object_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_crop_path: Option<String>,
     pub generated_by: String,
 }
 

@@ -80,6 +80,8 @@ use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
+use serde_json::Value;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{
     Mutex,
     mpsc::{self, Receiver},
@@ -91,8 +93,9 @@ use burn_synth_mcp::{
     InferenceBackend as McpInferenceBackend, LocateAnythingBackend,
     QualityPreset as McpQualityPreset, SceneBuildExecutionKind, SceneBuildFromImageArgs,
     SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
-    SceneDepthProvider, SceneLocatorProvider, ScenePoseFitMode, SceneScalePolicy,
-    SceneSegmentationProvider, ServerArgs, ServerConfig, SynthesisModel as McpSynthesisModel,
+    SceneDepthProvider, SceneGroundCalibrationMode, SceneInstanceGenerationMode,
+    SceneLocatorProvider, ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider,
+    SceneTablePoseRefinementMode, ServerArgs, ServerConfig, SynthesisModel as McpSynthesisModel,
     TrellisQuality as McpTrellisQuality, run_scene_build_from_image_with_progress,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -109,14 +112,12 @@ use bevy_synth_runtime::args::SynthesisModel;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 #[cfg(target_arch = "wasm32")]
 use bevy_synth_runtime::args::{QualityPreset, RmbgModel, TripoSplatProfile, WeightPrecision};
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_synth_runtime::cache::CachedAssetKind;
-#[cfg(not(target_arch = "wasm32"))]
-use bevy_synth_runtime::cache::{CachedAssetAabb, CachedAssetFrame};
 use bevy_synth_runtime::cache::{
-    CachedCameraState, CachedMeshMetadata, CachedSceneMetadata, CachedSceneMetrics,
-    CachedScenePayload, CachedWorldItem, MeshCache,
+    CachedAssetAabb, CachedCameraState, CachedMeshMetadata, CachedSceneMetadata,
+    CachedSceneMetrics, CachedScenePayload, CachedWorldItem, MeshCache,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::cache::{CachedAssetFrame, CachedAssetKind};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::io::mesh_from_glb_bytes;
 use bevy_synth_runtime::io::{
@@ -163,6 +164,65 @@ const PANORBIT_ORBIT_SMOOTHNESS: f32 = 0.1;
 const PANORBIT_PAN_SMOOTHNESS: f32 = 0.02;
 const PANORBIT_ZOOM_SMOOTHNESS: f32 = 0.1;
 const PANORBIT_SNAP_EPSILON: f32 = 0.001;
+#[cfg(not(target_arch = "wasm32"))]
+const DEPTH_DEBUG_MAX_GAUSSIANS: usize = 1280 * 720;
+
+#[derive(Component)]
+struct EditorCamera;
+
+#[derive(Component)]
+struct SceneRenderCamera;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct DepthDebugCloud;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreenshotCameraTarget {
+    Editor,
+    Scene,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+struct McpSceneScreenshotRequest {
+    path: PathBuf,
+    camera: ScreenshotCameraTarget,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+struct SceneDebugCamera {
+    transform: Transform,
+    vertical_fov_degrees: f32,
+    aspect: f32,
+    source_image_path: PathBuf,
+    depth_summary_path: PathBuf,
+    depth_raw_path: PathBuf,
+    intrinsics: DepthDebugIntrinsics,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DepthDebugIntrinsics {
+    pub(crate) fx: f32,
+    pub(crate) fy: f32,
+    pub(crate) cx: f32,
+    pub(crate) cy: f32,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct SceneDepthDebugState {
+    evidence_signature: Option<String>,
+    camera: Option<SceneDebugCamera>,
+    cloud_signature: Option<String>,
+    cloud_entity: Option<Entity>,
+    last_error: Option<String>,
+}
 
 #[derive(Component, Clone, Debug)]
 struct PanOrbitCamera {
@@ -789,7 +849,8 @@ enum McpSceneCommand {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Resource, Default)]
 struct McpSceneScreenshotQueue {
-    pending: VecDeque<PathBuf>,
+    pending: VecDeque<McpSceneScreenshotRequest>,
+    active: Option<McpSceneScreenshotRequest>,
     ui_hidden: bool,
     restore_next_frame: bool,
 }
@@ -917,6 +978,8 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     app.init_resource::<McpSceneScreenshotQueue>();
     #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<SceneDepthDebugState>();
+    #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
     #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(PendingSceneBuild::default());
@@ -1036,6 +1099,8 @@ pub(crate) fn run() {
         (
             poll_mcp_scene_control.before(mark_world_cache_dirty),
             drive_mcp_scene_screenshot_queue.after(poll_mcp_scene_control),
+            sync_scene_depth_debug_artifacts,
+            sync_depth_debug_cloud.after(sync_scene_depth_debug_artifacts),
         ),
     );
 
@@ -1594,6 +1659,28 @@ fn initialize_interactive_scene(
         MeshPickingCamera,
         RenderLayers::layer(0).with(12),
         MainCamera,
+        EditorCamera,
+        Name::new("editor_camera"),
+    ));
+    commands.spawn((
+        Camera3d::default(),
+        Camera {
+            is_active: false,
+            // bevy_gaussian_splatting extracts inactive GaussianCamera entities too and
+            // requires every GaussianCamera order to be a non-negative camera index.
+            order: 1,
+            ..default()
+        },
+        Projection::Perspective(PerspectiveProjection {
+            fov: 60.0_f32.to_radians(),
+            ..default()
+        }),
+        GaussianCamera::default(),
+        Transform::from_translation(Vec3::new(0.0, 1.5, 0.0))
+            .looking_at(Vec3::new(0.0, 1.5, -1.0), Vec3::Y),
+        RenderLayers::layer(0).with(12),
+        SceneRenderCamera,
+        Name::new("scene_render_camera"),
     ));
     spawn_default_lighting(commands, ambient_light);
 
@@ -3548,6 +3635,27 @@ fn mcp_synthesis_model(model: SynthesisModel) -> McpSynthesisModel {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn scene_image_to_3d_model_for_settings(settings: &ScenePipelineUiSettings) -> SynthesisModel {
+    if settings.lift_assets
+        && settings.pose_fit_enabled
+        && matches!(settings.image_to_3d_model, SynthesisModel::Triposplat)
+    {
+        SynthesisModel::Trellis
+    } else {
+        settings.image_to_3d_model
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_synthesis_model_label(model: SynthesisModel) -> &'static str {
+    match model {
+        SynthesisModel::Triposg => "TripoSG",
+        SynthesisModel::Trellis => "Trellis.2",
+        SynthesisModel::Triposplat => "TripoSplat",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run_scene_build_for_ui(
     source_scene_path: PathBuf,
     source_image_bytes: Option<Vec<u8>>,
@@ -3566,7 +3674,15 @@ fn run_scene_build_for_ui(
     server_args.trellis_image_large_root = app_args.trellis_image_large_root.clone();
     server_args.trellis_pbr = settings.pbr_enabled;
     server_args.trellis_pbr_texture_size = Some(settings.pbr_texture_size);
-    let scene_synthesis_models = vec![mcp_synthesis_model(settings.image_to_3d_model)];
+    let effective_image_to_3d_model = scene_image_to_3d_model_for_settings(&settings);
+    if effective_image_to_3d_model != settings.image_to_3d_model {
+        warn!(
+            "scene composition with pose fitting requires mesh assets; using {} instead of {} for scene image-to-3d",
+            scene_synthesis_model_label(effective_image_to_3d_model),
+            scene_synthesis_model_label(settings.image_to_3d_model)
+        );
+    }
+    let scene_synthesis_models = vec![mcp_synthesis_model(effective_image_to_3d_model)];
     server_args.synthesis_models = scene_synthesis_models.clone();
     server_args.batch_size = app_args.max_batch_size;
     server_args.quality = match settings.quality_profile {
@@ -3641,15 +3757,33 @@ pub(crate) fn scene_build_args_from_ui_settings(
         trellis_pbr_texture_size: Some(settings.pbr_texture_size),
         promote_to_catalog: settings.promote_to_catalog,
         composition_mode,
-        pose_fit: ScenePoseFitMode::ProjectedAabb,
-        canonical_pose: if settings.canonical_pose_enabled {
-            SceneCanonicalPoseMode::RenderSweep
+        pose_fit: if settings.pose_fit_enabled
+            && settings.depth_enabled
+            && settings.segmentation_enabled
+            && settings.lift_assets
+        {
+            ScenePoseFitMode::RenderedSilhouette
         } else {
-            SceneCanonicalPoseMode::Off
+            ScenePoseFitMode::ProjectedAabb
         },
+        canonical_pose: SceneCanonicalPoseMode::Off,
         scale_policy: SceneScalePolicy::AssetPreserving,
         max_pose_candidates: 32,
         save_pose_debug: settings.write_artifacts,
+        ground_calibration: match settings.ground_calibration {
+            bevy_synth_ui::SceneGroundCalibrationSetting::DepthHeuristic => {
+                SceneGroundCalibrationMode::DepthHeuristic
+            }
+            bevy_synth_ui::SceneGroundCalibrationSetting::Gpt => SceneGroundCalibrationMode::Gpt,
+        },
+        instance_generation: match settings.instance_generation {
+            bevy_synth_ui::SceneInstanceGenerationSetting::CategoryRepresentative => {
+                SceneInstanceGenerationMode::CategoryRepresentative
+            }
+            bevy_synth_ui::SceneInstanceGenerationSetting::FineGrainedTypes => {
+                SceneInstanceGenerationMode::FineGrainedTypes
+            }
+        },
         depth_provider: if settings.depth_enabled {
             SceneDepthProvider::DepthPro
         } else {
@@ -3683,12 +3817,88 @@ pub(crate) fn scene_build_args_from_ui_settings(
         feedback_capture_dir: None,
         feedback_threshold_profile: FeedbackThresholdProfile::Standard,
         feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
-        rotation_fit: burn_synth_mcp::SceneRotationFitMode::DepthMaskRansac,
-        rotation_fit_max_gpt_rounds: 2,
+        rotation_fit: burn_synth_mcp::SceneRotationFitMode::Off,
+        rotation_fit_max_gpt_rounds: 0,
         rotation_fit_min_mask_iou: 0.45,
         rotation_fit_max_depth_error_m: 0.35,
         rotation_fit_write_artifacts: true,
+        table_pose_refinement: match settings.table_pose_refinement {
+            bevy_synth_ui::SceneTablePoseRefinementSetting::Off => {
+                SceneTablePoseRefinementMode::Off
+            }
+            bevy_synth_ui::SceneTablePoseRefinementSetting::Geometry => {
+                SceneTablePoseRefinementMode::Geometry
+            }
+            bevy_synth_ui::SceneTablePoseRefinementSetting::GatedGpt => {
+                SceneTablePoseRefinementMode::GatedGpt
+            }
+            bevy_synth_ui::SceneTablePoseRefinementSetting::AlwaysGpt => {
+                SceneTablePoseRefinementMode::AlwaysGpt
+            }
+        },
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn mcp_camera_target(
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    focus: Option<[f32; 3]>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
+    radius: Option<f32>,
+    vertical_fov: Option<f32>,
+    fallback_focus: Vec3,
+) -> Option<(Transform, Vec3, Option<f32>)> {
+    let mut target_translation = Vec3::from_array(translation);
+    let target_rotation = Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
+    let target_focus = focus
+        .map(Vec3::from_array)
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback_focus);
+    let target_yaw = yaw
+        .filter(|value| value.is_finite())
+        .map(|value| value.to_radians());
+    let target_pitch = pitch
+        .filter(|value| value.is_finite())
+        .map(|value| value.abs().to_radians());
+    let target_radius = radius.filter(|value| value.is_finite() && *value > 0.0);
+    if let (Some(yaw), Some(pitch), Some(radius)) = (target_yaw, target_pitch, target_radius) {
+        let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
+        let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
+        let orbit_rotation = yaw_rot * pitch_rot;
+        target_translation = target_focus + orbit_rotation * Vec3::new(0.0, 0.0, radius);
+    }
+    if !target_translation.is_finite() || !target_rotation.is_finite() {
+        return None;
+    }
+
+    let rotation = if target_focus.distance_squared(target_translation) > 0.000_001 {
+        Transform::from_translation(target_translation)
+            .looking_at(target_focus, Vec3::Y)
+            .rotation
+    } else if target_rotation.length_squared() > 0.0 {
+        target_rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    Some((
+        Transform {
+            translation: target_translation,
+            rotation,
+            scale: Vec3::ONE,
+        },
+        target_focus,
+        vertical_fov.filter(|value| value.is_finite() && *value > 0.0),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_mcp_camera_projection(vertical_fov: Option<f32>, projection: &mut Projection) {
+    if let (Some(vertical_fov), Projection::Perspective(perspective)) = (vertical_fov, projection) {
+        perspective.fov = vertical_fov.to_radians();
     }
 }
 
@@ -3710,9 +3920,13 @@ fn poll_mcp_scene_control(
     transformables: Query<(), With<GizmoTransformable>>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut query_set: ParamSet<(
-        Query<(&mut Transform, &mut PanOrbitCamera, &mut Projection), With<MainCamera>>,
+        Query<
+            (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+            (With<MainCamera>, Without<SceneRenderCamera>),
+        >,
         Query<(&CachedMeshInstance, &Transform)>,
         Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+        Query<(&mut Transform, &mut Projection), (With<SceneRenderCamera>, Without<MainCamera>)>,
     )>,
     mut world_cache: ResMut<WorldCachePersistence>,
 ) {
@@ -4076,93 +4290,57 @@ fn poll_mcp_scene_control(
                 radius,
                 vertical_fov,
             } => {
-                if let Ok((mut transform, mut orbit, mut projection)) = query_set.p0().single_mut()
-                {
-                    let mut target_translation = Vec3::from_array(translation);
-                    let target_rotation =
-                        Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
-                    let target_focus = focus
-                        .map(Vec3::from_array)
-                        .filter(|value| value.is_finite())
-                        .unwrap_or(orbit.focus);
-                    let target_yaw = yaw
-                        .filter(|value| value.is_finite())
-                        .map(|value| value.to_radians());
-                    let target_pitch = pitch
-                        .filter(|value| value.is_finite())
-                        .map(|value| value.abs().to_radians());
-                    let target_radius = radius.filter(|value| value.is_finite() && *value > 0.0);
-                    let target_vertical_fov =
-                        vertical_fov.filter(|value| value.is_finite() && *value > 0.0);
-                    if let (Some(yaw), Some(pitch), Some(radius)) =
-                        (target_yaw, target_pitch, target_radius)
-                    {
-                        let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
-                        let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
-                        let orbit_rotation = yaw_rot * pitch_rot;
-                        target_translation =
-                            target_focus + orbit_rotation * Vec3::new(0.0, 0.0, radius);
-                    }
-                    if target_translation.is_finite() && target_rotation.is_finite() {
-                        transform.translation = target_translation;
-                        if let (Some(yaw), Some(pitch), Some(radius)) =
-                            (target_yaw, target_pitch, target_radius)
-                        {
-                            let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
-                            let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
-                            transform.rotation = yaw_rot * pitch_rot;
-                            orbit.yaw = Some(yaw);
-                            orbit.target_yaw = yaw;
-                            orbit.pitch = Some(pitch);
-                            orbit.target_pitch = pitch;
-                            orbit.radius = Some(radius);
-                            orbit.target_radius = radius;
-                        } else if target_focus.distance_squared(target_translation) > 0.000_001 {
-                            transform.look_at(target_focus, Vec3::Y);
-                        } else {
-                            transform.rotation = if target_rotation.length_squared() > 0.0 {
-                                target_rotation.normalize()
-                            } else {
-                                Quat::IDENTITY
-                            };
-                        }
-                        orbit.focus = target_focus;
-                        orbit.target_focus = target_focus;
-                        orbit.initialized = true;
-                        if let (Some(vertical_fov), Projection::Perspective(perspective)) =
-                            (target_vertical_fov, projection.as_mut())
-                        {
-                            perspective.fov = vertical_fov.to_radians();
-                        }
-                        command_results.push(mcp_scene_command_result(
-                            command_index,
-                            "set_camera",
-                            true,
-                            "camera updated",
-                            None,
-                            None,
-                        ));
-                        scene_changed = true;
-                    } else {
-                        command_results.push(mcp_scene_command_result(
-                            command_index,
-                            "set_camera",
-                            false,
-                            "camera transform was not finite",
-                            None,
-                            None,
-                        ));
-                    }
-                } else {
+                let fallback_focus = Vec3::ZERO;
+                let Some((target_transform, target_focus, target_vertical_fov)) = mcp_camera_target(
+                    translation,
+                    rotation,
+                    focus,
+                    yaw,
+                    pitch,
+                    radius,
+                    vertical_fov,
+                    fallback_focus,
+                ) else {
                     command_results.push(mcp_scene_command_result(
                         command_index,
                         "set_camera",
                         false,
-                        "main camera not found",
+                        "camera transform was not finite",
                         None,
                         None,
                     ));
+                    continue;
+                };
+
+                let mut applied = false;
+                if let Ok((mut transform, mut projection)) = query_set.p3().single_mut() {
+                    *transform = target_transform;
+                    apply_mcp_camera_projection(target_vertical_fov, projection.as_mut());
+                    applied = true;
+                } else if let Ok((mut transform, mut orbit, mut projection)) =
+                    query_set.p0().single_mut()
+                {
+                    *transform = target_transform;
+                    orbit.focus = target_focus;
+                    orbit.target_focus = target_focus;
+                    orbit.initialized = true;
+                    apply_mcp_camera_projection(target_vertical_fov, projection.as_mut());
+                    applied = true;
                 }
+
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "set_camera",
+                    applied,
+                    if applied {
+                        "scene camera updated"
+                    } else {
+                        "scene camera not found"
+                    },
+                    None,
+                    None,
+                ));
+                scene_changed |= applied;
             }
             McpSceneCommand::CaptureScreenshot { path } => {
                 if let Some(parent) = path.parent()
@@ -4184,7 +4362,12 @@ fn poll_mcp_scene_control(
                     continue;
                 }
                 screenshots.push(path.display().to_string());
-                screenshots_to_capture.pending.push_back(path);
+                screenshots_to_capture
+                    .pending
+                    .push_back(McpSceneScreenshotRequest {
+                        path,
+                        camera: ScreenshotCameraTarget::Scene,
+                    });
                 command_results.push(mcp_scene_command_result(
                     command_index,
                     "capture_screenshot",
@@ -4361,17 +4544,30 @@ fn drive_mcp_scene_screenshot_queue(
     mut queue: ResMut<McpSceneScreenshotQueue>,
     ui_visibility: Res<UiVisibilityState>,
     mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+    mut editor_cameras: Query<&mut Camera, (With<EditorCamera>, Without<SceneRenderCamera>)>,
+    mut scene_cameras: Query<&mut Camera, (With<SceneRenderCamera>, Without<EditorCamera>)>,
 ) {
     if queue.restore_next_frame {
         set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+        set_screenshot_camera_target(
+            ScreenshotCameraTarget::Editor,
+            &mut editor_cameras,
+            &mut scene_cameras,
+        );
+        queue.active = None;
         queue.restore_next_frame = false;
         queue.ui_hidden = false;
         return;
     }
 
-    if queue.pending.is_empty() {
+    if queue.pending.is_empty() && queue.active.is_none() {
         if queue.ui_hidden {
             set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+            set_screenshot_camera_target(
+                ScreenshotCameraTarget::Editor,
+                &mut editor_cameras,
+                &mut scene_cameras,
+            );
             queue.ui_hidden = false;
         }
         return;
@@ -4379,15 +4575,38 @@ fn drive_mcp_scene_screenshot_queue(
 
     if !queue.ui_hidden {
         set_ui_root_visibility(false, &mut ui_roots);
+        queue.active = queue.pending.pop_front();
+        let target = queue
+            .active
+            .as_ref()
+            .map(|request| request.camera)
+            .unwrap_or(ScreenshotCameraTarget::Editor);
+        set_screenshot_camera_target(target, &mut editor_cameras, &mut scene_cameras);
         queue.ui_hidden = true;
         return;
     }
 
-    if let Some(path) = queue.pending.pop_front() {
+    if let Some(request) = queue.active.take() {
         commands
             .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path));
+            .observe(save_to_disk(request.path));
         queue.restore_next_frame = true;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_screenshot_camera_target(
+    target: ScreenshotCameraTarget,
+    editor_cameras: &mut Query<&mut Camera, (With<EditorCamera>, Without<SceneRenderCamera>)>,
+    scene_cameras: &mut Query<&mut Camera, (With<SceneRenderCamera>, Without<EditorCamera>)>,
+) {
+    let scene_available = !scene_cameras.is_empty();
+    let use_scene = target == ScreenshotCameraTarget::Scene && scene_available;
+    for mut camera in editor_cameras.iter_mut() {
+        camera.is_active = !use_scene;
+    }
+    for mut camera in scene_cameras.iter_mut() {
+        camera.is_active = use_scene;
     }
 }
 
@@ -5285,7 +5504,6 @@ fn json_f32(value: Option<&serde_json::Value>) -> Option<f32> {
     value.is_finite().then_some(value)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn enforce_scene_interaction_lock(
     interaction_lock: Res<SceneInteractionLock>,
     read_only: Res<SceneReadOnlyMode>,
@@ -5315,7 +5533,6 @@ fn sync_panorbit_enabled(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     ui_state: Res<CatalogUiState>,
-    interaction_lock: Res<SceneInteractionLock>,
     mut cameras: Query<&mut PanOrbitCamera>,
 ) {
     let gizmo_active = gizmos.iter().any(|gizmo| gizmo.interaction().is_some());
@@ -5328,11 +5545,7 @@ fn sync_panorbit_enabled(
         .ok()
         .map(|window| ui_state.cursor_over_ui(window))
         .unwrap_or(false);
-    let enabled = !interaction_lock.locked
-        && !gizmo_active
-        && !gizmo_handle_pressed
-        && !drag.is_dragging()
-        && !ui_block;
+    let enabled = !gizmo_active && !gizmo_handle_pressed && !drag.is_dragging() && !ui_block;
     for mut camera in cameras.iter_mut() {
         if !enabled {
             camera.target_focus = camera.focus;
@@ -6084,11 +6297,508 @@ pub(crate) fn triposplat_cloud_settings() -> CloudSettings {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_scene_depth_debug_artifacts(
+    settings: Res<ViewerDebugSettings>,
+    processing: Res<SceneProcessingState>,
+    mut state: ResMut<SceneDepthDebugState>,
+    mut scene_cameras: Query<(&mut Transform, &mut Projection), With<SceneRenderCamera>>,
+) {
+    if !settings.draw_scene_camera_frustum && !settings.depth_cloud_overlay {
+        return;
+    }
+    if !settings.is_changed() && !processing.is_changed() && state.camera.is_some() {
+        return;
+    }
+
+    let roots = processing.artifact_roots();
+    let Some(evidence_path) = find_scene_grounding_evidence_path(&roots) else {
+        return;
+    };
+    let signature = file_signature(&evidence_path);
+    if state.evidence_signature.as_deref() != Some(signature.as_str()) {
+        match load_scene_debug_camera(&evidence_path) {
+            Ok(camera) => {
+                state.camera = Some(camera);
+                state.evidence_signature = Some(signature);
+                state.cloud_signature = None;
+                state.last_error = None;
+            }
+            Err(err) => {
+                if state.last_error.as_deref() != Some(err.as_str()) {
+                    warn!("Depth debug overlay could not load scene camera evidence: {err}");
+                }
+                state.last_error = Some(err);
+                return;
+            }
+        }
+    }
+
+    let Some(camera) = state.camera.as_ref() else {
+        return;
+    };
+    for (mut transform, mut projection) in scene_cameras.iter_mut() {
+        *transform = camera.transform;
+        if let Projection::Perspective(perspective) = projection.as_mut() {
+            perspective.fov = camera.vertical_fov_degrees.to_radians();
+            perspective.aspect_ratio = camera.aspect.max(0.1);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_depth_debug_cloud(
+    mut commands: Commands,
+    settings: Res<ViewerDebugSettings>,
+    mut state: ResMut<SceneDepthDebugState>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    existing_clouds: Query<Entity, With<DepthDebugCloud>>,
+) {
+    if !settings.depth_cloud_overlay {
+        if state.cloud_entity.is_some() || !existing_clouds.is_empty() {
+            for entity in existing_clouds.iter() {
+                commands.entity(entity).despawn();
+            }
+            state.cloud_entity = None;
+            state.cloud_signature = None;
+        }
+        return;
+    }
+
+    let Some(camera) = state.camera.clone() else {
+        return;
+    };
+    let signature = format!(
+        "{}|{}|{}|{}",
+        state.evidence_signature.as_deref().unwrap_or_default(),
+        camera.source_image_path.display(),
+        camera.depth_summary_path.display(),
+        camera.depth_raw_path.display()
+    );
+    if state.cloud_signature.as_deref() == Some(signature.as_str())
+        && state.cloud_entity.is_some()
+        && !settings.is_changed()
+    {
+        return;
+    }
+
+    match load_depth_debug_cloud(&camera) {
+        Ok(cloud) => {
+            for entity in existing_clouds.iter() {
+                commands.entity(entity).despawn();
+            }
+            let handle = gaussian_clouds.add(cloud);
+            let entity = commands
+                .spawn((
+                    PlanarGaussian3dHandle(handle),
+                    triposplat_cloud_settings(),
+                    Transform::IDENTITY,
+                    RenderLayers::layer(0),
+                    Pickable {
+                        should_block_lower: false,
+                        is_hoverable: false,
+                    },
+                    DepthDebugCloud,
+                    Name::new("depth_debug_rgb_gaussian_cloud"),
+                ))
+                .id();
+            state.cloud_entity = Some(entity);
+            state.cloud_signature = Some(signature);
+            state.last_error = None;
+        }
+        Err(err) => {
+            if state.last_error.as_deref() != Some(err.as_str()) {
+                warn!("Depth debug overlay could not build RGB Gaussian cloud: {err}");
+            }
+            state.last_error = Some(err);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn find_scene_grounding_evidence_path(roots: &[PathBuf]) -> Option<PathBuf> {
+    for root in roots {
+        for candidate in scene_grounding_evidence_candidates(root) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_grounding_evidence_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if root.is_file() {
+        candidates.push(root.to_path_buf());
+        if let Some(parent) = root.parent() {
+            candidates.push(parent.join("grounding_evidence.json"));
+            candidates.push(parent.join("pre_generation_grounding_evidence.json"));
+            if let Some(run_root) = parent.parent() {
+                candidates.push(run_root.join("grounding_evidence.json"));
+                candidates.push(run_root.join("pre_generation_grounding_evidence.json"));
+            }
+        }
+    } else {
+        candidates.push(root.join("grounding_evidence.json"));
+        candidates.push(root.join("pre_generation_grounding_evidence.json"));
+    }
+    candidates
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_scene_debug_camera(evidence_path: &Path) -> Result<SceneDebugCamera, String> {
+    let evidence = read_json_value(evidence_path)?;
+    let source_image_path = evidence
+        .get("source_image_path")
+        .and_then(Value::as_str)
+        .map(|value| resolve_artifact_path(value, evidence_path.parent()))
+        .ok_or_else(|| format!("{} is missing source_image_path", evidence_path.display()))?;
+    let depth_summary_path = evidence
+        .get("depth")
+        .and_then(|depth| depth.get("artifact_path"))
+        .and_then(Value::as_str)
+        .map(|value| resolve_artifact_path(value, evidence_path.parent()))
+        .ok_or_else(|| format!("{} is missing depth.artifact_path", evidence_path.display()))?;
+    let depth_summary = read_json_value(&depth_summary_path)?;
+    let sidecar = depth_summary.get("depth_map_sidecar").ok_or_else(|| {
+        format!(
+            "{} is missing depth_map_sidecar",
+            depth_summary_path.display()
+        )
+    })?;
+    let depth_raw_path = sidecar
+        .get("raw_path")
+        .and_then(Value::as_str)
+        .map(|value| resolve_artifact_path(value, depth_summary_path.parent()))
+        .or_else(|| {
+            sidecar
+                .get("relative_raw_path")
+                .and_then(Value::as_str)
+                .map(|value| resolve_artifact_path(value, depth_summary_path.parent()))
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} depth_map_sidecar is missing raw_path",
+                depth_summary_path.display()
+            )
+        })?;
+    let intrinsics = parse_depth_debug_intrinsics(sidecar)?;
+    let vertical_fov_degrees = sidecar
+        .get("vertical_fov_degrees")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .or_else(|| {
+            evidence
+                .get("camera")
+                .and_then(|camera| camera.get("vertical_fov_degrees"))
+                .and_then(Value::as_f64)
+                .map(|value| value as f32)
+        })
+        .filter(|value| value.is_finite() && *value > 1.0)
+        .unwrap_or(60.0);
+    let origin = source_origin_xz_from_evidence_value(&evidence).unwrap_or([0.0, 0.0]);
+    let camera_height = source_camera_height_from_evidence_value(&evidence).unwrap_or(0.0);
+    let transform = scene_debug_camera_transform(origin, camera_height, 0.0);
+    Ok(SceneDebugCamera {
+        transform,
+        vertical_fov_degrees,
+        aspect: intrinsics.width as f32 / intrinsics.height.max(1) as f32,
+        source_image_path,
+        depth_summary_path,
+        depth_raw_path,
+        intrinsics,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_depth_debug_intrinsics(sidecar: &Value) -> Result<DepthDebugIntrinsics, String> {
+    let width = sidecar
+        .get("width")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "depth sidecar is missing width".to_string())? as usize;
+    let height = sidecar
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "depth sidecar is missing height".to_string())? as usize;
+    let intrinsics = sidecar
+        .get("intrinsics")
+        .ok_or_else(|| "depth sidecar is missing intrinsics".to_string())?;
+    let fx = json_field_f32(intrinsics, "fx").ok_or_else(|| "intrinsics.fx missing".to_string())?;
+    let fy = json_field_f32(intrinsics, "fy").ok_or_else(|| "intrinsics.fy missing".to_string())?;
+    let cx = json_field_f32(intrinsics, "cx").ok_or_else(|| "intrinsics.cx missing".to_string())?;
+    let cy = json_field_f32(intrinsics, "cy").ok_or_else(|| "intrinsics.cy missing".to_string())?;
+    if width == 0
+        || height == 0
+        || ![fx, fy, cx, cy].iter().all(|value| value.is_finite())
+        || fx <= 0.0
+        || fy <= 0.0
+    {
+        return Err("depth sidecar intrinsics are invalid".to_string());
+    }
+    Ok(DepthDebugIntrinsics {
+        fx,
+        fy,
+        cx,
+        cy,
+        width,
+        height,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_depth_debug_cloud(camera: &SceneDebugCamera) -> Result<PlanarGaussian3d, String> {
+    let raw = fs::read(&camera.depth_raw_path)
+        .map_err(|err| format!("read {} failed: {err}", camera.depth_raw_path.display()))?;
+    let expected_len =
+        camera.intrinsics.width * camera.intrinsics.height * std::mem::size_of::<f32>();
+    if raw.len() < expected_len {
+        return Err(format!(
+            "{} is too short for {}x{} f32 depth: {} bytes < {expected_len}",
+            camera.depth_raw_path.display(),
+            camera.intrinsics.width,
+            camera.intrinsics.height,
+            raw.len()
+        ));
+    }
+    let source = image::ImageReader::open(&camera.source_image_path)
+        .map_err(|err| format!("open {} failed: {err}", camera.source_image_path.display()))?
+        .decode()
+        .map_err(|err| {
+            format!(
+                "decode {} failed: {err}",
+                camera.source_image_path.display()
+            )
+        })?
+        .to_rgba8();
+    let image_width = source.width().max(1);
+    let image_height = source.height().max(1);
+    let stride = depth_debug_sample_stride(
+        camera.intrinsics.width,
+        camera.intrinsics.height,
+        DEPTH_DEBUG_MAX_GAUSSIANS,
+    );
+    let mut gaussians = Vec::with_capacity(
+        ((camera.intrinsics.width / stride).max(1) * (camera.intrinsics.height / stride).max(1))
+            .min(DEPTH_DEBUG_MAX_GAUSSIANS),
+    );
+
+    'rows: for y in (0..camera.intrinsics.height).step_by(stride) {
+        for x in (0..camera.intrinsics.width).step_by(stride) {
+            let offset = (y * camera.intrinsics.width + x) * std::mem::size_of::<f32>();
+            let depth = f32::from_le_bytes([
+                raw[offset],
+                raw[offset + 1],
+                raw[offset + 2],
+                raw[offset + 3],
+            ]);
+            if !depth.is_finite() || depth <= 0.0 {
+                continue;
+            }
+            let world = depth_debug_world_point(x, y, depth, camera.intrinsics, camera.transform);
+            if !world.is_finite() {
+                continue;
+            }
+            let image_x = (((x as f32 + 0.5) * image_width as f32
+                / camera.intrinsics.width.max(1) as f32)
+                .floor() as u32)
+                .min(image_width - 1);
+            let image_y = (((y as f32 + 0.5) * image_height as f32
+                / camera.intrinsics.height.max(1) as f32)
+                .floor() as u32)
+                .min(image_height - 1);
+            let rgba = source.get_pixel(image_x, image_y).0;
+            let mut spherical_harmonic = SphericalHarmonicCoefficients::default();
+            spherical_harmonic.set(0, rgba[0] as f32 / 255.0);
+            spherical_harmonic.set(1, rgba[1] as f32 / 255.0);
+            spherical_harmonic.set(2, rgba[2] as f32 / 255.0);
+            let radius = depth_debug_gaussian_radius(depth, camera.intrinsics, stride);
+            gaussians.push(Gaussian3d {
+                position_visibility: [world.x, world.y, world.z, 1.0].into(),
+                spherical_harmonic,
+                rotation: [1.0, 0.0, 0.0, 0.0].into(),
+                scale_opacity: [radius, radius, radius, 0.7].into(),
+            });
+            if gaussians.len() >= DEPTH_DEBUG_MAX_GAUSSIANS {
+                break 'rows;
+            }
+        }
+    }
+    if gaussians.is_empty() {
+        return Err(format!(
+            "no finite positive depth samples in {}",
+            camera.depth_raw_path.display()
+        ));
+    }
+    Ok(PlanarGaussian3d::from(gaussians))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn depth_debug_sample_stride(width: usize, height: usize, max_count: usize) -> usize {
+    if max_count == 0 {
+        return width.max(height).max(1);
+    }
+    let count = width.saturating_mul(height);
+    if count <= max_count {
+        return 1;
+    }
+    ((count as f64 / max_count as f64).sqrt().ceil() as usize).max(1)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn depth_debug_world_point(
+    x: usize,
+    y: usize,
+    depth_m: f32,
+    intrinsics: DepthDebugIntrinsics,
+    camera_transform: Transform,
+) -> Vec3 {
+    let camera_x = ((x as f32 + 0.5) - intrinsics.cx) * depth_m / intrinsics.fx;
+    let camera_y_down = ((y as f32 + 0.5) - intrinsics.cy) * depth_m / intrinsics.fy;
+    camera_transform.transform_point(Vec3::new(camera_x, -camera_y_down, -depth_m))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn depth_debug_gaussian_radius(
+    depth_m: f32,
+    intrinsics: DepthDebugIntrinsics,
+    stride: usize,
+) -> f32 {
+    let focal = intrinsics.fx.min(intrinsics.fy).max(1.0);
+    (depth_m / focal * stride as f32).clamp(0.0025, 0.075)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_debug_camera_transform(origin_xz: [f32; 2], height_m: f32, floor_y: f32) -> Transform {
+    let translation = Vec3::new(-origin_xz[0], floor_y + height_m, origin_xz[1]);
+    Transform::from_translation(translation).looking_at(translation + Vec3::NEG_Z, Vec3::Y)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn source_origin_xz_from_evidence_value(evidence: &Value) -> Option<[f32; 2]> {
+    let objects = evidence.get("objects")?.as_array()?;
+    let table_origin = objects
+        .iter()
+        .find(|object| object_grounding_text(object).contains("table"))
+        .and_then(metric_contact_xz_from_object);
+    if table_origin.is_some() {
+        return table_origin;
+    }
+    let mut sum = [0.0f32; 2];
+    let mut count = 0usize;
+    for object in objects {
+        if let Some(point) = metric_contact_xz_from_object(object) {
+            sum[0] += point[0];
+            sum[1] += point[1];
+            count += 1;
+        }
+    }
+    (count > 0).then_some([sum[0] / count as f32, sum[1] / count as f32])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn metric_contact_xz_from_object(object: &Value) -> Option<[f32; 2]> {
+    let point = object.get("metric_contact_point_m")?.as_array()?;
+    if point.len() < 3 {
+        return None;
+    }
+    let x = point[0].as_f64()? as f32;
+    let z = point[2].as_f64()? as f32;
+    (x.is_finite() && z.is_finite()).then_some([x, z])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn object_grounding_text(object: &Value) -> String {
+    let mut text = String::new();
+    for key in ["object_id", "instance_id", "reuse_group", "asset_id"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            text.push_str(value);
+            text.push(' ');
+        }
+    }
+    if let Some(detection) = object.get("detection") {
+        for key in ["label", "source_query"] {
+            if let Some(value) = detection.get(key).and_then(Value::as_str) {
+                text.push_str(value);
+                text.push(' ');
+            }
+        }
+    }
+    text.to_ascii_lowercase()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn source_camera_height_from_evidence_value(evidence: &Value) -> Option<f32> {
+    let floor = evidence.get("floor")?;
+    let normal = floor.get("normal")?.as_array()?;
+    if normal.len() < 2 {
+        return None;
+    }
+    let normal_y = normal[1].as_f64()? as f32;
+    let distance_m = floor.get("distance_m")?.as_f64()? as f32;
+    let residual_ok = floor
+        .get("residual_m")
+        .and_then(Value::as_f64)
+        .map(|value| value <= 0.10)
+        .unwrap_or(false);
+    let confidence_ok = floor
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .map(|value| value >= 0.72)
+        .unwrap_or(true);
+    if !normal_y.is_finite() || normal_y.abs() <= 1.0e-5 || !residual_ok || !confidence_ok {
+        return None;
+    }
+    let y_down_at_camera_origin = -distance_m / normal_y;
+    (y_down_at_camera_origin.is_finite() && (1.10..=3.80).contains(&y_down_at_camera_origin))
+        .then_some(y_down_at_camera_origin)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_json_value(path: &Path) -> Result<Value, String> {
+    let bytes = fs::read(path).map_err(|err| format!("read {} failed: {err}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|err| format!("parse {} failed: {err}", path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_field_f32(value: &Value, key: &str) -> Option<f32> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_artifact_path(path: &str, base: Option<&Path>) -> PathBuf {
+    let raw = PathBuf::from(path);
+    if raw.is_absolute() || raw.exists() {
+        raw
+    } else if let Some(base) = base {
+        base.join(raw)
+    } else {
+        raw
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn file_signature(path: &Path) -> String {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("{}#{modified}", path.display())
+}
+
 #[allow(clippy::type_complexity)]
 #[cfg(not(target_arch = "wasm32"))]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
     read_only: Res<SceneReadOnlyMode>,
+    interaction_lock: Res<SceneInteractionLock>,
     changed: Query<
         (),
         (
@@ -6109,7 +6819,8 @@ fn mark_world_cache_dirty(
         for _ in removed.read() {}
         return;
     }
-    if changed.is_empty() && changed_camera.is_empty() && removed.read().next().is_none() {
+    let camera_changed = !interaction_lock.locked && !changed_camera.is_empty();
+    if changed.is_empty() && !camera_changed && removed.read().next().is_none() {
         return;
     }
     persistence.dirty = true;
@@ -6524,6 +7235,7 @@ pub(crate) enum ViewerGroundContactState {
 #[allow(clippy::type_complexity)]
 fn draw_viewer_debug_overlays(
     settings: Res<ViewerDebugSettings>,
+    #[cfg(not(target_arch = "wasm32"))] scene_debug: Res<SceneDepthDebugState>,
     selection: Res<EditorSelection>,
     mut gizmos: Gizmos,
     meshes: Res<Assets<BevyMesh>>,
@@ -6533,6 +7245,13 @@ fn draw_viewer_debug_overlays(
         With<GizmoTransformable>,
     >,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if settings.draw_scene_camera_frustum
+        && let Some(camera) = scene_debug.camera.as_ref()
+    {
+        draw_scene_camera_frustum(&mut gizmos, camera, settings.scene_camera_frustum_length);
+    }
+
     if settings.aabb_overlay == ViewerAabbOverlayMode::Off {
         return;
     }
@@ -6561,6 +7280,50 @@ fn draw_viewer_debug_overlays(
         let (world_min, world_max) = world_aabb(bounds.center, bounds.half_extents, transform);
         draw_debug_world_aabb(&mut gizmos, world_min, world_max, selected, &settings);
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_scene_camera_frustum(gizmos: &mut Gizmos, camera: &SceneDebugCamera, frustum_length: f32) {
+    let fov = camera.vertical_fov_degrees.to_radians();
+    if !fov.is_finite() || fov <= 0.0 {
+        return;
+    }
+    let aspect = camera.aspect.max(0.1);
+    let length = scene_camera_frustum_length(frustum_length);
+    let half_height = (fov * 0.5).tan() * length;
+    let half_width = half_height * aspect;
+    let origin = camera.transform.translation;
+    let forward = camera.transform.rotation * -Vec3::Z;
+    let right = camera.transform.rotation * Vec3::X;
+    let up = camera.transform.rotation * Vec3::Y;
+    let center = origin + forward * length;
+    let far_corners = [
+        center + up * half_height - right * half_width,
+        center + up * half_height + right * half_width,
+        center - up * half_height + right * half_width,
+        center - up * half_height - right * half_width,
+    ];
+    let color = Color::srgb(1.0, 0.72, 0.18);
+    for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+        gizmos.line(far_corners[a], far_corners[b], color);
+        gizmos.line(origin, far_corners[a], color);
+    }
+    draw_debug_cross(
+        gizmos,
+        origin,
+        scene_camera_frustum_cross_size(length),
+        color,
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scene_camera_frustum_length(frustum_length: f32) -> f32 {
+    frustum_length.clamp(0.05, 3.0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scene_camera_frustum_cross_size(frustum_length: f32) -> f32 {
+    (scene_camera_frustum_length(frustum_length) * 0.025).clamp(0.02, 0.08)
 }
 
 pub(crate) fn viewer_debug_entity_visible(mode: ViewerAabbOverlayMode, selected: bool) -> bool {

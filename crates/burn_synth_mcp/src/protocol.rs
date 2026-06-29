@@ -228,7 +228,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "scene_build_from_image",
-            "description": "Quality-first OpenAI scene build: plan objects, generate source-preserving isolated object images, lift selected candidates through RMBG+TRELLIS, generate grounded restricted BSN from image bboxes plus asset AABBs, validate it, and optionally apply to Bevy. Requires OPENAI_API_KEY.",
+            "description": "Bare-bones explicit scene build: locate objects and DepthPro camera/depth/floor evidence, crop each object, generate isolated object images with gpt-image-2 plus the reference image, lift selected candidates through RMBG+TRELLIS, then compose generated 3D objects with source-camera geometric constraints. Requires OPENAI_API_KEY.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -250,11 +250,13 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "trellis_pbr_texture_size": { "type": "integer", "description": "TRELLIS PBR texture size." },
                     "promote_to_catalog": { "type": "boolean", "description": "Add lifted objects to the shared Bevy catalog/cache for later reuse. Defaults to true; fresh scene mode still does not read existing catalog assets while planning." },
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"], "description": "Scene composition path after lifting. Full scene-build defaults to cv-grounded." },
-                    "pose_fit": { "type": "string", "enum": ["projected-aabb"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette is reserved but not implemented yet." },
+                    "pose_fit": { "type": "string", "enum": ["projected-aabb", "rendered-silhouette"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette fits bounded X/Z, uniform scale, and Y-axis yaw with source masks, DepthPro dense depth sidecar crops, depth distributions, and projected GLB visible-surface point masks." },
                     "canonical_pose": { "type": "string", "enum": ["off", "heuristic", "render-sweep", "openai", "auto"], "description": "Canonical asset orientation strategy for cv-grounded composition." },
                     "scale_policy": { "type": "string", "enum": ["asset-preserving", "bounded-anisotropic", "free-anisotropic"], "description": "Generated asset scale policy. Defaults to asset-preserving to avoid skinny/distorted lifted tables." },
                     "max_pose_candidates": { "type": "integer", "description": "Maximum deterministic pose candidates per object." },
                     "save_pose_debug": { "type": "boolean", "description": "Write canonical pose, pose-fit candidate, and camera grounding artifacts." },
+                    "ground_calibration": { "type": "string", "enum": ["depth-heuristic", "gpt"], "description": "Camera/floor calibration source after depth evidence is available. gpt asks the reasoning model for camera height/FOV/floor sanity, then writes the same EstimatedCamera/EstimatedFloorPlane evidence consumed by geometry." },
+                    "instance_generation": { "type": "string", "enum": ["category-representative", "fine-grained-types"], "description": "Reusable-object generation granularity. category-representative generates one reusable asset per semantic category/reuse group; fine-grained-types uses GPT to split repeated same-category chairs into visually distinct asset types before image generation." },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"], "description": "Depth provider for CV-grounded scene composition." },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"], "description": "Object locator for CV-grounded scene composition. Full scene-build defaults to locate-anything." },
                     "locate_anything_backend": { "type": "string", "enum": ["burn-native"], "description": "Optional backend override when locator is locate-anything." },
@@ -264,17 +266,18 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "write_artifacts": { "type": "boolean", "description": "Write structured e2e artifacts such as selected candidates, asset outputs, grounded layout, commands, summary, and scene.bsn to output_dir. Defaults to true." },
                     "clear_existing": { "type": "boolean" },
                     "apply": { "type": "boolean" },
-                    "feedback": { "type": "boolean", "description": "Run bounded render-capture-feedback placement validation/refinement. Defaults to true for full scene builds." },
-                    "feedback_iters": { "type": "integer", "description": "Maximum feedback iterations. Defaults to 8." },
+                    "feedback": { "type": "boolean", "description": "Opt-in render-capture-feedback placement validation/refinement. The default flow relies on deterministic LocateAnything/SAM/DepthPro/visible-surface geometry." },
+                    "feedback_iters": { "type": "integer", "description": "Maximum feedback iterations when feedback is enabled." },
                     "feedback_keep_viewer": { "type": "boolean", "description": "Leave the temporary feedback viewer running after completion." },
                     "feedback_capture_dir": { "type": "string", "description": "Optional feedback artifact directory. Defaults to output_dir/iterations." },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
                     "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "rendered-sweep", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; rendered-sweep renders per-object yaw candidates; openai asks the reasoning model to pick candidate_index values from source/render/candidate crops." },
-                    "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Pre-feedback object yaw fitting strategy. depth-mask-ransac uses LocateAnything/SAM masks, DepthPro depth, and projected GLB visible surface; gpt-refine enables bounded GPT candidate selection after objective fitting." },
+                    "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Extra pre-feedback object yaw fitting strategy. Defaults to off; rendered-silhouette pose fit is the normal geometric yaw/position/scale solver." },
                     "rotation_fit_max_gpt_rounds": { "type": "integer", "description": "Maximum GPT refinement rounds when rotation_fit is gpt-refine." },
-                    "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask rotation candidate." },
-                    "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters." },
+                    "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask/surface rotation candidate." },
+                    "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters; depth-distribution loss is also reported." },
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
+                    "table_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Table-only pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting only on table-like objects; gated-gpt additionally marks failed or ambiguous table fits for bounded GPT candidate selection; always-gpt marks all tables." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path"],
@@ -283,7 +286,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "scene_ground",
-            "description": "Recompute source-scene composition from an existing object manifest, asset bindings, and optional grounding evidence without regenerating object images or TRELLIS assets.",
+            "description": "Recompute source-scene composition from an existing object manifest and asset bindings without regenerating object images or TRELLIS assets. When grounding evidence is omitted, the default path reruns LocateAnything, SAM, and DepthPro from the source image.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -294,14 +297,15 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                         "items": { "type": "object" },
                         "description": "Generated asset bindings with asset_id plus path/cache_key/local_aabb."
                     },
-                    "grounding_evidence": { "type": "object", "description": "Optional SceneGroundingEvidence. When omitted, manifest bbox/contact points are used as an explicit fallback." },
+                    "grounding_evidence": { "type": "object", "description": "Optional SceneGroundingEvidence. When omitted, cv-grounded mode refreshes LocateAnything/SAM/DepthPro evidence unless those providers are explicitly disabled." },
                     "output_dir": { "type": "string" },
                     "composition_mode": { "type": "string", "enum": ["heuristic", "cv-grounded"] },
-                    "pose_fit": { "type": "string", "enum": ["projected-aabb"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette is reserved but not implemented yet." },
+                    "pose_fit": { "type": "string", "enum": ["projected-aabb", "rendered-silhouette"], "description": "Pose fitting strategy used inside cv-grounded composition. rendered-silhouette fits bounded X/Z, uniform scale, and Y-axis yaw with source masks, DepthPro dense depth sidecar crops, depth distributions, and projected GLB visible-surface point masks." },
                     "canonical_pose": { "type": "string", "enum": ["off", "heuristic", "render-sweep", "openai", "auto"] },
                     "scale_policy": { "type": "string", "enum": ["asset-preserving", "bounded-anisotropic", "free-anisotropic"], "description": "Generated asset scale policy. Defaults to asset-preserving." },
                     "max_pose_candidates": { "type": "integer" },
                     "save_pose_debug": { "type": "boolean" },
+                    "ground_calibration": { "type": "string", "enum": ["depth-heuristic", "gpt"], "description": "Camera/floor calibration source when grounding evidence is refreshed." },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"] },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"] },
                     "locate_anything_backend": { "type": "string", "enum": ["burn-native"], "description": "Optional backend override when locator is locate-anything. Defaults to the server --locate-anything-backend setting." },
@@ -316,11 +320,12 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "feedback_capture_dir": { "type": "string" },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
                     "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "rendered-sweep", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; rendered-sweep renders per-object yaw candidates; openai asks the reasoning model to pick candidate_index values from source/render/candidate crops." },
-                    "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Pre-feedback object yaw fitting strategy. depth-mask-ransac uses LocateAnything/SAM masks, DepthPro depth, and projected GLB visible surface; gpt-refine enables bounded GPT candidate selection after objective fitting." },
+                    "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Extra pre-feedback object yaw fitting strategy. Defaults to off; rendered-silhouette pose fit is the normal geometric yaw/position/scale solver." },
                     "rotation_fit_max_gpt_rounds": { "type": "integer", "description": "Maximum GPT refinement rounds when rotation_fit is gpt-refine." },
-                    "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask rotation candidate." },
-                    "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters." },
+                    "rotation_fit_min_mask_iou": { "type": "number", "description": "Minimum source-mask IoU required before applying a depth/mask/surface rotation candidate." },
+                    "rotation_fit_max_depth_error_m": { "type": "number", "description": "Maximum accepted median visible-surface depth error in meters; depth-distribution loss is also reported." },
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
+                    "table_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Table-only pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting only on table-like objects; gated-gpt additionally marks failed or ambiguous table fits for bounded GPT candidate selection; always-gpt marks all tables." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path", "manifest", "asset_bindings"],
@@ -814,9 +819,13 @@ pub struct SceneBuildFromImageArgs {
     pub max_pose_candidates: usize,
     #[serde(default = "default_scene_write_artifacts")]
     pub save_pose_debug: bool,
+    #[serde(default = "default_scene_ground_calibration_mode")]
+    pub ground_calibration: SceneGroundCalibrationMode,
+    #[serde(default = "default_scene_instance_generation_mode")]
+    pub instance_generation: SceneInstanceGenerationMode,
     #[serde(default = "default_scene_depth_provider")]
     pub depth_provider: SceneDepthProvider,
-    #[serde(default = "default_scene_build_locator_provider")]
+    #[serde(default = "default_scene_locator_provider")]
     pub locator: SceneLocatorProvider,
     #[serde(default)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
@@ -854,6 +863,8 @@ pub struct SceneBuildFromImageArgs {
     pub rotation_fit_max_depth_error_m: f32,
     #[serde(default = "default_scene_rotation_fit_write_artifacts")]
     pub rotation_fit_write_artifacts: bool,
+    #[serde(default = "default_scene_table_pose_refinement")]
+    pub table_pose_refinement: SceneTablePoseRefinementMode,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
@@ -879,6 +890,8 @@ pub(crate) struct SceneGroundToolArgs {
     pub max_pose_candidates: usize,
     #[serde(default = "default_scene_write_artifacts")]
     pub save_pose_debug: bool,
+    #[serde(default = "default_scene_ground_calibration_mode")]
+    pub ground_calibration: SceneGroundCalibrationMode,
     #[serde(default = "default_scene_depth_provider")]
     pub depth_provider: SceneDepthProvider,
     #[serde(default = "default_scene_locator_provider")]
@@ -917,6 +930,8 @@ pub(crate) struct SceneGroundToolArgs {
     pub rotation_fit_max_depth_error_m: f32,
     #[serde(default = "default_scene_rotation_fit_write_artifacts")]
     pub rotation_fit_write_artifacts: bool,
+    #[serde(default = "default_scene_table_pose_refinement")]
+    pub table_pose_refinement: SceneTablePoseRefinementMode,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }

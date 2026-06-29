@@ -2,10 +2,11 @@
 //! allow you to manipulate the transforms of entities.
 #![allow(clippy::type_complexity)]
 //!
-//! NOTE: This module is an internalized copy of the standalone
-//! `bevy_transform_gizmos` crate while upstreaming/publishing is in progress.
-//! Keep behavior aligned with upstream and switch back to the published crate
-//! when available.
+//! NOTE: Bevy 0.19 ships a built-in transform gizmo, but this module is still
+//! internalized because the app needs editor-core selection, multi-selection,
+//! transform offsets, custom pickable bounds, and read-only scene locks. Keep
+//! defaults aligned with Bevy's built-in gizmo where practical and switch back
+//! once those integration hooks are available upstream.
 //!
 //! # Usage
 //!
@@ -19,6 +20,7 @@
 
 use crate::bevy_editor_core::selection::EditorSelection;
 use bevy::camera::Projection;
+use bevy::math::{Dir3, primitives::InfinitePlane3d};
 use bevy::picking::prelude::{MeshPickingPlugin, Pickable};
 use bevy::picking::{backend::ray::RayMap, pointer::PointerId};
 use bevy::{prelude::*, transform::TransformSystems};
@@ -118,10 +120,10 @@ impl Default for TransformGizmoSettings {
             enabled: true,
             alignment_rotation: default(),
             enable_rotation: true,
-            grid_snap: 0.5,     // 0.5 unit grid snapping
-            angle_snap: 15.0,   // 15 degree angle snapping
-            scale_snap: 0.1,    // 0.1 scale increment snapping
-            snap_enabled: true, // Enable snapping by default
+            grid_snap: 0.05,  // Fine optional translation snap.
+            angle_snap: 15.0, // 15 degree optional rotation snap.
+            scale_snap: 0.1,  // 0.1 optional scale increment snap.
+            snap_enabled: false,
             mode: GizmoMode::default(),
         }
     }
@@ -609,16 +611,8 @@ fn drag_gizmo(
 }
 
 fn intersect_plane(ray: Ray3d, plane_normal: Vec3, plane_origin: Vec3) -> Option<Vec3> {
-    // assuming vectors are all normalized
-    let denominator = ray.direction.dot(plane_normal);
-    if denominator.abs() > f32::EPSILON {
-        let point_to_point = plane_origin - ray.origin;
-        let intersect_dist = plane_normal.dot(point_to_point) / denominator;
-        let intersect_position = ray.direction * intersect_dist + ray.origin;
-        Some(intersect_position)
-    } else {
-        None
-    }
+    let normal = Dir3::new(plane_normal).ok()?;
+    ray.plane_intersection_point(plane_origin, InfinitePlane3d { normal })
 }
 
 /// Snap a position to the nearest grid point.
@@ -903,5 +897,48 @@ fn update_gizmo_visibility(
                 *vis = Visibility::Inherited;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_vec3_near(actual: Vec3, expected: Vec3) {
+        assert!(
+            actual.distance(expected) < 1e-6,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn transform_gizmo_defaults_do_not_snap_translation() {
+        let settings = TransformGizmoSettings::default();
+        assert!(!settings.snap_enabled);
+        assert_eq!(settings.grid_snap, 0.05);
+    }
+
+    #[test]
+    fn snap_to_grid_is_disabled_by_zero_increment() {
+        let position = Vec3::new(0.123, -0.456, 0.789);
+        assert_eq!(snap_to_grid(position, 0.0), position);
+    }
+
+    #[test]
+    fn snap_to_grid_uses_fine_optional_increment() {
+        assert_vec3_near(
+            snap_to_grid(Vec3::new(0.123, -0.456, 0.789), 0.05),
+            Vec3::new(0.1, -0.45, 0.8),
+        );
+    }
+
+    #[test]
+    fn intersect_plane_uses_bevy_infinite_plane_semantics() {
+        let ray = Ray3d::new(Vec3::ZERO, Dir3::Y);
+        assert_vec3_near(
+            intersect_plane(ray, Vec3::Y, Vec3::Y).expect("forward plane hit"),
+            Vec3::Y,
+        );
+        assert!(intersect_plane(ray, Vec3::Y, Vec3::NEG_Y).is_none());
     }
 }
