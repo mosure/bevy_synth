@@ -211,14 +211,14 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error
     }
     let vertex_count = vertices.len() as u32;
     let mut faces = Vec::with_capacity(indices.len() / 3);
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         if tri[0] >= vertex_count || tri[1] >= vertex_count || tri[2] >= vertex_count {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "GLB indices reference out-of-range vertices",
             )));
         }
-        faces.push([tri[0], tri[1], tri[2]]);
+        faces.push(*tri);
     }
 
     let mut uvs: Vec<[f32; 2]> = reader

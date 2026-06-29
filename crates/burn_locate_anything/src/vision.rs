@@ -1174,7 +1174,9 @@ mod parity_tests {
         let pixel_shape: [usize; 4] = pixel_values.shape.clone().try_into().unwrap();
         let grid_data = grid_hws
             .data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| [chunk[0] as usize, chunk[1] as usize])
             .collect::<Vec<_>>();
         let reference_shape: [usize; 2] = reference.shape.clone().try_into().unwrap();
@@ -1251,7 +1253,9 @@ mod parity_tests {
             load_tensor_from_safetensors_file(&preprocess_path, "image_grid_hws").unwrap();
         let grid_data = grid_hws
             .data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| [chunk[0] as usize, chunk[1] as usize])
             .collect::<Vec<_>>();
         let input =
@@ -1329,7 +1333,9 @@ mod parity_tests {
         assert_eq!(input_shape, reference_shape);
         let grid_data = grid_hws
             .data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| [chunk[0] as usize, chunk[1] as usize])
             .collect::<Vec<_>>();
         let model = BurnMoonVitEncoderBlock::<B>::from_weights(weights, device);

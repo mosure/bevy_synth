@@ -171,10 +171,9 @@ fn tensor_from_view_4d<B: Backend>(
 
 fn tensor_view_to_vec(view: &TensorView<'_>) -> Vec<f32> {
     view.data()
-        .chunks_exact(4)
-        .map(|chunk| {
-            let bytes: [u8; 4] = chunk.try_into().unwrap();
-            f32::from_le_bytes(bytes)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }

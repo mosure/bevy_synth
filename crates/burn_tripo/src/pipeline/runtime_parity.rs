@@ -150,10 +150,7 @@ pub fn decimate_tripo_mesh(mesh: &Mesh, target_faces: usize) -> Result<Mesh, Str
         return Err("meshopt remap produced empty mesh".to_string());
     }
 
-    let faces = indices
-        .chunks_exact(3)
-        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
-        .collect::<Vec<[u32; 3]>>();
+    let faces = indices.as_chunks::<3>().0.to_vec();
     Ok(Mesh { vertices, faces })
 }
 

@@ -4398,12 +4398,13 @@ mod tests {
         if view.dtype() != safetensors::tensor::Dtype::F32 {
             return Err(format!("{name} must be F32, got {:?}", view.dtype()).into());
         }
-        let chunks = view.data().chunks_exact(4);
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = view.data().as_chunks::<4>();
+        if !remainder.is_empty() {
             return Err(format!("{name} F32 byte length is not divisible by 4").into());
         }
         let values = chunks
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         Ok(F32Safetensor {
             shape: view.shape().to_vec(),

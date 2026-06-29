@@ -152,11 +152,11 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<Mesh, String> {
     }
     let vertex_count = vertices.len() as u32;
     let mut faces = Vec::with_capacity(indices.len() / 3);
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         if tri.iter().any(|index| *index >= vertex_count) {
             return Err("GLB indices reference out-of-range vertices".to_string());
         }
-        faces.push([tri[0], tri[1], tri[2]]);
+        faces.push(*tri);
     }
 
     let mut uvs: Vec<[f32; 2]> = reader

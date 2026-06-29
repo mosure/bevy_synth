@@ -2100,12 +2100,13 @@ fn tensor_entry<B: Backend, const D: usize>(
 }
 
 fn f32_values(view: &TensorView<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let chunks = view.data().chunks_exact(4);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = view.data().as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err("F32 tensor byte length is not divisible by 4".into());
     }
     Ok(chunks
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 

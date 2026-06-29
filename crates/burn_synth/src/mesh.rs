@@ -457,7 +457,7 @@ fn pbr_texture_metrics(mesh: &Mesh) -> MeshPbrTextureMetrics {
         return MeshPbrTextureMetrics::default();
     };
     let base = &textures.base_color;
-    let pixels = base.rgba8.chunks_exact(4);
+    let pixels = base.rgba8.as_chunks::<4>().0;
     let mut count = 0usize;
     let mut alpha_count = 0usize;
     let mut lumas = Vec::new();
