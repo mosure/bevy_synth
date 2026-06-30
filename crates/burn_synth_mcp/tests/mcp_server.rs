@@ -687,8 +687,12 @@ fn images_to_assets_can_promote_outputs_to_shared_catalog() {
     let cache_key = item["cache_key"].as_str().expect("cache key");
     assert_eq!(item["catalog_entry"]["cache_key"], json!(cache_key));
     assert_eq!(
-        item["catalog_entry"]["source_image_path"],
-        json!(input.display().to_string())
+        normalize_path_for_compare(
+            item["catalog_entry"]["source_image_path"]
+                .as_str()
+                .expect("catalog source path")
+        ),
+        normalize_path_for_compare(&input.display().to_string())
     );
 
     let index_path = catalog_root.join("index.json");
@@ -705,6 +709,10 @@ fn images_to_assets_can_promote_outputs_to_shared_catalog() {
     );
 
     client.shutdown();
+}
+
+fn normalize_path_for_compare(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
 }
 
 #[test]
