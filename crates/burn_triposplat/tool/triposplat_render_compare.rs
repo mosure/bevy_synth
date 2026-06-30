@@ -287,7 +287,9 @@ fn read_splat(path: &PathBuf) -> Result<Vec<SplatRecord>, Box<dyn std::error::Er
         .into());
     }
     let records = bytes
-        .chunks_exact(SPLAT_RECORD_BYTES)
+        .as_chunks::<SPLAT_RECORD_BYTES>()
+        .0
+        .iter()
         .map(|chunk| SplatRecord {
             position: [
                 read_f32_le(chunk, 0),

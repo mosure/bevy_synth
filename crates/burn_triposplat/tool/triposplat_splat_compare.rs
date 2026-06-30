@@ -230,7 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_splat_records(bytes: &[u8]) -> Vec<SplatRecord> {
     bytes
-        .chunks_exact(SPLAT_RECORD_BYTES)
+        .as_chunks::<SPLAT_RECORD_BYTES>()
+        .0
+        .iter()
         .map(|chunk| SplatRecord {
             position: [
                 read_f32_le(chunk, 0),
