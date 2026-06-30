@@ -1097,9 +1097,7 @@ pub(crate) fn feedback_layout_deltas_with_policy(
                 } else {
                     translation_delta
                 },
-                scale_multiplier: if axis_scale.is_some() {
-                    1.0
-                } else if projection_delta_locked {
+                scale_multiplier: if axis_scale.is_some() || projection_delta_locked {
                     1.0
                 } else {
                     grouped_scale.unwrap_or(object_scale)
@@ -1783,17 +1781,17 @@ pub(crate) fn apply_object_delta_to_command(
     translation[0] += translation_delta[0];
     translation[1] += translation_delta[1];
     translation[2] += translation_delta[2];
-    if !projection_delta_locked {
-        if let (Some(anchor), Some(max_drift_m)) = (
+    if !projection_delta_locked
+        && let (Some(anchor), Some(max_drift_m)) = (
             delta.get("ground_anchor_point").and_then(json_array3),
             delta
                 .get("ground_anchor_max_drift_m")
                 .and_then(Value::as_f64)
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .map(|value| value as f32),
-        ) {
-            clamp_translation_to_ground_anchor(&mut translation, anchor, max_drift_m);
-        }
+        )
+    {
+        clamp_translation_to_ground_anchor(&mut translation, anchor, max_drift_m);
     }
     command["translation"] = json!(translation);
 
