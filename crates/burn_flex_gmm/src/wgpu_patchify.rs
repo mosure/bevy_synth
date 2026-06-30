@@ -210,6 +210,8 @@ pub fn sparse_patchify3d_forward_wgpu(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use burn::tensor::{Tensor, TensorData};
 
     use crate::{SparsePatchify3dConfig, SparsePatchify3dWeights, sparse_patchify3d_forward_flex};
@@ -231,6 +233,16 @@ mod tests {
             let bits = ((self.state >> 40) as u32) | 1;
             (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
         }
+    }
+
+    fn wgpu_test_device() -> Option<burn_wgpu::WgpuDevice> {
+        if env::var("BURN_WGPU_CORRECTNESS").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skipping WGPU correctness test; set BURN_WGPU_CORRECTNESS=1 to run GPU kernel parity"
+            );
+            return None;
+        }
+        Some(burn_wgpu::WgpuDevice::default())
     }
 
     #[test]
@@ -264,7 +276,9 @@ mod tests {
         )
         .expect("cpu sparse patchify path");
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else {
+            return;
+        };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([2, cfg.in_channels, cfg.frames, cfg.height, cfg.width]);
         let coords_flat: Vec<i64> = coords

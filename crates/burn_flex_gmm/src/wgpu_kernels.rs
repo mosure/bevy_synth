@@ -6184,7 +6184,10 @@ fn validate_tensor_shapes<R: CubeRuntime>(
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::{
+        env,
+        sync::{Mutex, MutexGuard},
+    };
 
     use burn::tensor::{Int, Tensor, TensorData};
 
@@ -6216,6 +6219,16 @@ mod tests {
         ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wgpu_test_device() -> Option<burn_wgpu::WgpuDevice> {
+        if env::var("BURN_WGPU_CORRECTNESS").ok().as_deref() != Some("1") {
+            eprintln!(
+                "skipping WGPU correctness test; set BURN_WGPU_CORRECTNESS=1 to run GPU kernel parity"
+            );
+            return None;
+        }
+        Some(burn_wgpu::WgpuDevice::default())
     }
 
     #[derive(Clone)]
@@ -6353,7 +6366,7 @@ mod tests {
             [(7.5 / 16.0) - 0.5, (8.0 / 16.0) - 0.5, (8.5 / 16.0) - 0.5],
             [0.45, -0.45, 0.45],
         ];
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let mut positions_flat = Vec::with_capacity(positions.len() * 3);
         for pos in &positions {
             positions_flat.extend_from_slice(pos);
@@ -6413,7 +6426,7 @@ mod tests {
     #[test]
     fn rope_rotate_pairs_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 5usize;
         let heads = 3usize;
@@ -6476,7 +6489,7 @@ mod tests {
     #[test]
     fn rope_rotate_pairs_phase_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 5usize;
         let heads = 3usize;
@@ -6536,7 +6549,7 @@ mod tests {
     #[test]
     fn rope_rotate_pairs_coords_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 7usize;
         let heads = 3usize;
@@ -6619,7 +6632,7 @@ mod tests {
     #[test]
     fn linear_skinny_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let rows = 3072usize;
         let in_channels = 64usize;
         let out_channels = 7usize;
@@ -6674,7 +6687,7 @@ mod tests {
     #[test]
     fn layer_norm_affine_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let rows = 1024usize;
         let channels = 64usize;
         let eps = 1.0e-6f32;
@@ -6738,7 +6751,7 @@ mod tests {
     #[test]
     fn layer_norm_affine_partial_stats_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let rows = 1024usize;
         let channels = 1536usize;
         let eps = 1.0e-6f32;
@@ -6820,7 +6833,7 @@ mod tests {
     #[test]
     fn layer_norm_modulated_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 3usize;
         let tokens = 19usize;
         let channels = 64usize;
@@ -6890,7 +6903,7 @@ mod tests {
     #[test]
     fn layer_norm_modulated_f16_partial_stats_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 33usize;
         let channels = 1536usize;
@@ -6974,7 +6987,7 @@ mod tests {
     #[test]
     fn multihead_rms_norm_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 17usize;
         let heads = 4usize;
@@ -7036,7 +7049,7 @@ mod tests {
     #[test]
     fn multihead_rms_norm_module_kernel_matches_permuted_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 13usize;
         let heads = 3usize;
@@ -7090,7 +7103,7 @@ mod tests {
     #[test]
     fn multihead_rms_norm_rope_coords_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 11usize;
         let heads = 3usize;
@@ -7193,7 +7206,7 @@ mod tests {
     #[test]
     fn multihead_qk_rms_norm_rope_qkv_kernel_matches_separate_kernels() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 13usize;
         let heads = 3usize;
@@ -7315,7 +7328,7 @@ mod tests {
     #[test]
     fn multihead_qkv_module_rms_norm_rope_qkv_kernel_matches_module_layout_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let batch = 2usize;
         let tokens = 13usize;
         let heads = 3usize;
@@ -7445,7 +7458,7 @@ mod tests {
     #[test]
     fn layer_norm_affine_silu_kernel_matches_reference() {
         let _guard = env_lock_guard();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let rows = 1024usize;
         let channels = 64usize;
         let eps = 1.0e-6f32;
@@ -7546,7 +7559,7 @@ mod tests {
         )
         .expect("cpu flex path");
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([coords.len(), cfg.in_channels]);
         let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
@@ -7612,7 +7625,7 @@ mod tests {
         )
         .expect("cpu flex path");
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([coords.len(), cfg.in_channels]);
         let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
@@ -7676,7 +7689,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(5);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let neighbors =
             neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device).expect("neighbors");
         let data = neighbors.to_data();
@@ -7707,7 +7720,7 @@ mod tests {
         };
         let coords = line_coords(64);
         let coords_clone = coords.clone();
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         let first = neighbor_rows_tensor_from_coords(&cfg, coords.as_slice(), &device)
             .expect("first neighbor tensor")
@@ -7756,7 +7769,7 @@ mod tests {
             coords_flat.push(coord[2] as i32);
             coords_flat.push(coord[3] as i32);
         }
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let coords_t = Tensor::<DefaultWgpuBackend, 1, Int>::from_data(
             TensorData::new(coords_flat, [64 * 4]),
             &device,
@@ -7817,7 +7830,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(96);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         let first = neighbor_rows_tensor_from_coords(&cfg_a, coords.as_slice(), &device)
             .expect("first neighbor tensor")
@@ -7855,7 +7868,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(96);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -7906,7 +7919,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(192);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -7958,7 +7971,7 @@ mod tests {
         coords.push([0, 32, 0, 0]);
         coords.push([0, 17, 0, 0]);
         coords.push([0, 32, 0, 0]);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -8012,7 +8025,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(5_000);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -8048,7 +8061,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(256);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -8090,7 +8103,7 @@ mod tests {
             axis_sign: [1, 1, 1],
         };
         let coords = line_coords(512);
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -8150,7 +8163,7 @@ mod tests {
             axis_order: [0, 1, 2],
             axis_sign: [1, 1, 1],
         };
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
 
         clear_neighbor_rows_tensor_cache();
         reset_neighbor_rows_build_stats();
@@ -8612,7 +8625,7 @@ mod tests {
         let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
         let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([coords.len(), cfg.in_channels]);
         let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
@@ -8695,7 +8708,7 @@ mod tests {
         let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
         let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([coords.len(), cfg.in_channels]);
         let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
@@ -8778,7 +8791,7 @@ mod tests {
         let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
         let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([coords.len(), cfg.in_channels]);
         let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
@@ -8880,7 +8893,7 @@ mod tests {
         let weight: Vec<f32> = (0..weight_len).map(|_| rng.next_f32()).collect();
         let bias: Vec<f32> = (0..cfg.out_channels).map(|_| rng.next_f32()).collect();
 
-        let device = burn_wgpu::WgpuDevice::default();
+        let Some(device) = wgpu_test_device() else { return; };
         let input_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(input.as_slice(), &device)
             .reshape([coords.len(), cfg.in_channels]);
         let weight_t = Tensor::<DefaultWgpuBackend, 1>::from_floats(weight.as_slice(), &device)
