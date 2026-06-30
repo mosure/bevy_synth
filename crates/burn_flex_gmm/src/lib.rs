@@ -1003,8 +1003,9 @@ mod tests {
             let t0 = tubelet as usize * cfg.tubelet_size;
             let y0 = patch_row as usize * cfg.patch_h;
             let x0 = patch_col as usize * cfg.patch_w;
-            for out_channel in 0..cfg.out_channels {
-                let mut acc = bias[out_channel];
+            for (out_channel, bias_value) in bias.iter().copied().enumerate().take(cfg.out_channels)
+            {
+                let mut acc = bias_value;
                 for c in 0..cfg.in_channels {
                     for dt in 0..cfg.tubelet_size {
                         let t = t0 + dt;
