@@ -1299,18 +1299,21 @@ fn server_args_accept_cubecl_autotune_controls() {
 }
 
 #[test]
-fn repo_burn_toml_sets_cubecl_autotune_cache_global() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+fn burn_toml_fixture_sets_cubecl_autotune_cache_global() {
+    let dir = unique_test_dir("burn_toml_cubecl");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let burn_toml = dir.join("Burn.toml");
+    std::fs::write(
+        &burn_toml,
+        "[cubecl.autotune]\nlevel = \"balanced\"\ncache = \"global\"\n",
+    )
+    .expect("write Burn.toml fixture");
     let config =
         <cubecl::config::CubeClRuntimeConfig as cubecl::config::RuntimeConfig>::from_section_file_path(
-            repo_root.join("Burn.toml"),
+            &burn_toml,
             "cubecl",
         )
-        .expect("parse workspace Burn.toml cubecl section");
+        .expect("parse Burn.toml fixture cubecl section");
     assert!(matches!(
         config.autotune.level,
         cubecl::config::autotune::AutotuneLevel::Balanced
@@ -1319,6 +1322,7 @@ fn repo_burn_toml_sets_cubecl_autotune_cache_global() {
         config.autotune.cache,
         cubecl::config::cache::CacheConfig::Global
     ));
+    std::fs::remove_dir_all(dir).expect("remove temp dir");
 }
 
 #[test]

@@ -334,11 +334,12 @@ fn startup_bsn_scene_accepts_self_contained_path_asset() {
     let command_path = dir.join("scene_commands.json");
     let mesh_path = dir.join("chair.glb");
     write_glb(&mesh_path, &dummy_mesh()).expect("write generated glb");
+    let bsn_mesh_path = mesh_path.to_string_lossy().replace('\\', "\\\\");
     std::fs::write(
         &bsn_path,
         format!(
             "synth_scene_v1 {{\nasset chair_asset = \"path:{}\";\nspawn chair_left uses chair_asset translation [0.0,0.0,0.0] rotation_y 0.0 scale [1.0,1.0,1.0];\n}}\n",
-            mesh_path.display()
+            bsn_mesh_path
         ),
     )
     .expect("write bsn");
