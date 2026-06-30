@@ -194,7 +194,7 @@ mod native {
         B: burn::tensor::backend::Backend,
         B::Device: Default,
     {
-        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let device = B::Device::default();
 
         if let Some((weights, config)) = rmbg14 {
             import_if_needed(

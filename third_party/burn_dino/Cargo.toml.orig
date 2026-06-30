@@ -1,0 +1,142 @@
+[package]
+name = "burn_dino"
+description = "burn dino model inference and training"
+version = "0.7.0"
+edition = "2024"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+keywords = [
+  "burn",
+  "dino",
+  "vit",
+]
+categories = [
+  "computer-vision",
+]
+homepage = "https://github.com/mosure/burn_dino"
+repository = "https://github.com/mosure/burn_dino"
+readme = "README.md"
+exclude = [
+  ".devcontainer",
+  ".github",
+  "docs",
+  "dist",
+  "build",
+  "assets",
+  "credits",
+]
+
+[workspace]
+members = [
+  "crates/bevy_burn_dino",
+]
+
+resolver = "2"
+
+
+[features]
+default = ["backend_ndarray"]
+
+benchmark = ["burn/autotune", "burn/fusion"]
+import = [
+  "backend_ndarray",
+  "burn-store",
+  "clap",
+  "serde_json",
+]
+
+backend_cpu = ["burn/cpu"]
+backend_cuda = ["burn/cuda"]
+backend_ndarray = ["burn/ndarray"]
+backend_wgpu = ["burn/wgpu"]
+
+
+[dependencies]
+burn-store = { version = "=0.21.0", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+safetensors = "0.6"
+serde_json = { version = "1.0", optional = true }
+
+
+[dependencies.burn]
+version = "=0.21.0"
+default-features = false
+features = [
+  "std",
+]
+
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  'Document',
+  'Element',
+  'HtmlElement',
+  'Location',
+  'Node',
+  'Window',
+]
+
+
+[dev-dependencies]
+bhtsne = "0.5.3"
+criterion = { version = "0.7", features = ["html_reports"] }
+futures-intrusive = { version = "0.5.0" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = { version = "0.4.0" }
+
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.wasm-release]
+strip = "symbols"
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "import"
+path = "tool/import.rs"
+required-features = ["import"]
+
+[[example]]
+name = "correctness"
+path = "example/correctness.rs"
+
+[[example]]
+name = "pca"
+path = "example/pca.rs"
+required-features = ["backend_wgpu"]
+
+[[example]]
+name = "tsne"
+path = "example/tsne.rs"
+required-features = ["backend_wgpu"]
+
+[[bench]]
+name = "dinov2"
+path = "tool/benchmark.rs"
+harness = false

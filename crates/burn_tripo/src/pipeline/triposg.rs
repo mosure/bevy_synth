@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn decode_grid_device_accumulate_matches_chunked_host() {
         type B = burn::backend::NdArray<f32>;
-        let device = <B as Backend>::Device::default();
+        let device = <B as burn::tensor::backend::BackendTypes>::Device::default();
         let vae = TripoSGVae::new(
             &device,
             TripoSGVaeConfig {

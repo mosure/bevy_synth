@@ -1,5 +1,10 @@
 import { defineConfig } from '@playwright/test';
 
+const chromiumExecutable =
+  process.env.BURN_SYNTH_WEB_CHROMIUM_EXECUTABLE ||
+  process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ||
+  undefined;
+
 export default defineConfig({
   testDir: './tests',
   globalSetup: './webgpu-lock.global-setup.mjs',
@@ -12,6 +17,7 @@ export default defineConfig({
     headless: true,
     viewport: { width: 1280, height: 720 },
     launchOptions: {
+      executablePath: chromiumExecutable,
       args: [
         '--enable-unsafe-webgpu',
         '--use-angle=vulkan',

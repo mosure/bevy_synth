@@ -639,11 +639,10 @@ fn diff_dmc(grid: &[f32], dims: [usize; 3], iso: f32) -> DmcOutput {
 
     let mut verts = vec![[0.0f32; 3]; total_patches];
     for (used_index, cell) in used_cells.iter().enumerate() {
-        let mut out = patch_start[used_index];
         let cube = cell.code as usize;
         let start_patch = MCFIRSTPATCHINDEX[cube] as usize;
         let end_patch = MCFIRSTPATCHINDEX[cube + 1] as usize;
-        for patch_index in start_patch..end_patch {
+        for (out, patch_index) in (patch_start[used_index]..).zip(start_patch..end_patch) {
             let edge_start = MCFIRSTEDGEINDEX[patch_index] as usize;
             let edge_end = MCFIRSTEDGEINDEX[patch_index + 1] as usize;
             let mut p = [0.0f32; 3];
@@ -670,7 +669,6 @@ fn diff_dmc(grid: &[f32], dims: [usize; 3], iso: f32) -> DmcOutput {
                 p[2] /= count;
             }
             verts[out] = p;
-            out += 1;
         }
     }
 

@@ -3,9 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy_args::{Deserialize, Parser, Serialize, parse_args};
 use burn::prelude::*;
+use clap::Parser;
 use safetensors::tensor::{SafeTensors, TensorView};
+use serde::{Deserialize, Serialize};
 
 use burn_tripo::model::triposg::{
     hooks::HookRecorder,
@@ -31,8 +32,8 @@ struct HookConfig {
 type BackendImpl = burn::backend::NdArray<f32>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args::<HookConfig>();
-    let device = <BackendImpl as burn::tensor::backend::Backend>::Device::default();
+    let args = HookConfig::parse();
+    let device = <BackendImpl as burn::tensor::backend::BackendTypes>::Device::default();
     let inputs = resolve_io_path(args.inputs);
     let output = resolve_output_path(args.output);
     let weights = resolve_weights_path(args.weights, "vae/diffusion_pytorch_model.safetensors");
@@ -127,10 +128,9 @@ fn tensor_from_view<B: Backend>(
 
 fn tensor_view_to_vec(view: &TensorView<'_>) -> Vec<f32> {
     view.data()
-        .chunks_exact(4)
-        .map(|chunk| {
-            let bytes: [u8; 4] = chunk.try_into().unwrap();
-            f32::from_le_bytes(bytes)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }

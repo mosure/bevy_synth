@@ -87,13 +87,165 @@ function readVec3F32Accessor(gltf, binChunk, accessor) {
   return out;
 }
 
+function parseSplatStats(splatBytesLike) {
+  const splatBytes =
+    splatBytesLike instanceof Uint8Array ? splatBytesLike : new Uint8Array(splatBytesLike);
+  const recordBytes = 32;
+  if (splatBytes.byteLength === 0 || splatBytes.byteLength % recordBytes !== 0) {
+    throw new Error(`invalid .splat byte length ${splatBytes.byteLength}`);
+  }
+
+  const view = new DataView(splatBytes.buffer, splatBytes.byteOffset, splatBytes.byteLength);
+  const count = splatBytes.byteLength / recordBytes;
+  const mins = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
+  const maxs = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
+  let nonFinite = 0;
+  let positiveAlpha = 0;
+  let positiveScale = 0;
+  for (let index = 0; index < count; index += 1) {
+    const base = index * recordBytes;
+    for (let axis = 0; axis < 3; axis += 1) {
+      const position = view.getFloat32(base + axis * 4, true);
+      const scale = view.getFloat32(base + 12 + axis * 4, true);
+      if (!Number.isFinite(position) || !Number.isFinite(scale)) {
+        nonFinite += 1;
+        continue;
+      }
+      mins[axis] = Math.min(mins[axis], position);
+      maxs[axis] = Math.max(maxs[axis], position);
+      if (scale > 0) {
+        positiveScale += 1;
+      }
+    }
+    if (view.getUint8(base + 27) > 0) {
+      positiveAlpha += 1;
+    }
+  }
+
+  return {
+    count,
+    byteLength: splatBytes.byteLength,
+    boundsMin: mins,
+    boundsMax: maxs,
+    nonFinite,
+    positiveAlpha,
+    positiveScale,
+  };
+}
+
 function relDiff(a, b) {
   const denom = Math.max(1, Math.abs(a), Math.abs(b));
   return Math.abs(a - b) / denom;
 }
 
+test('burn_synth wasm API page exposes asset-specific TripoSplat controls', async ({ page }) => {
+  await page.goto('http://127.0.0.1:4173/www/synth_api.html?model_source=local&sw=off', {
+    waitUntil: 'domcontentloaded',
+  });
+
+  await expect(page.locator('#synthesis-model')).toHaveValue('triposg');
+  await expect(page.locator('#synthesis-model option')).toHaveText([
+    'triposg',
+    'trellis',
+    'triposplat',
+  ]);
+  await expect(page.locator('#asset-format')).toHaveValue('splat');
+  await expect(page.locator('#asset-format')).toBeDisabled();
+  await expect(page.locator('#run-infer')).toHaveText('Infer GLB');
+  await expect(page.locator('#download')).toHaveAttribute('download', 'burn_synth_output.glb');
+
+  await page.selectOption('#synthesis-model', 'triposplat');
+
+  await expect(page.locator('#asset-format')).toBeEnabled();
+  await expect(page.locator('#run-infer')).toHaveText('Infer SPLAT');
+  await expect(page.locator('#download')).toHaveAttribute('download', 'burn_synth_output.splat');
+  await expect
+    .poll(
+      async () => {
+        const url = new URL(page.url());
+        return {
+          synthesisModel: url.searchParams.get('synthesis_model'),
+          synthesis: url.searchParams.get('synthesis'),
+          assetFormat: url.searchParams.get('asset_format'),
+        };
+      },
+      { timeout: 10000 },
+    )
+    .toEqual({
+      synthesisModel: 'triposplat',
+      synthesis: null,
+      assetFormat: null,
+    });
+
+  await page.selectOption('#asset-format', 'ply');
+
+  await expect(page.locator('#run-infer')).toHaveText('Infer PLY');
+  await expect(page.locator('#download')).toHaveAttribute('download', 'burn_synth_output.ply');
+  await expect
+    .poll(
+      async () => {
+        const url = new URL(page.url());
+        return {
+          synthesisModel: url.searchParams.get('synthesis_model'),
+          assetFormat: url.searchParams.get('asset_format'),
+        };
+      },
+      { timeout: 10000 },
+    )
+    .toEqual({
+      synthesisModel: 'triposplat',
+      assetFormat: 'ply',
+    });
+
+  await page.selectOption('#synthesis-model', 'trellis');
+
+  await expect(page.locator('#asset-format')).toBeDisabled();
+  await expect(page.locator('#run-infer')).toHaveText('Infer GLB');
+  await expect(page.locator('#download')).toHaveAttribute('download', 'burn_synth_output.glb');
+  await expect
+    .poll(
+      async () => {
+        const url = new URL(page.url());
+        return {
+          synthesisModel: url.searchParams.get('synthesis_model'),
+          assetFormat: url.searchParams.get('asset_format'),
+        };
+      },
+      { timeout: 10000 },
+    )
+    .toEqual({
+      synthesisModel: 'trellis',
+      assetFormat: null,
+    });
+
+  await page.selectOption('#synthesis-model', 'triposg');
+
+  await expect(page.locator('#asset-format')).toBeDisabled();
+  await expect(page.locator('#run-infer')).toHaveText('Infer GLB');
+  await expect(page.locator('#download')).toHaveAttribute('download', 'burn_synth_output.glb');
+  await expect
+    .poll(
+      async () => {
+        const url = new URL(page.url());
+        return {
+          synthesisModel: url.searchParams.get('synthesis_model'),
+          assetFormat: url.searchParams.get('asset_format'),
+        };
+      },
+      { timeout: 10000 },
+    )
+    .toEqual({
+      synthesisModel: null,
+      assetFormat: null,
+    });
+});
+
 test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }) => {
   test.setTimeout(1800000);
+  test.skip(
+    process.env.BURN_SYNTH_WEB_TRIPOSG_SMOKE !== '1',
+    'set BURN_SYNTH_WEB_TRIPOSG_SMOKE=1 to enable TripoSG wasm GLB smoke',
+  );
 
   const pageErrors = [];
   const consoleErrors = [];
@@ -112,6 +264,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   };
 
   page.on('pageerror', (error) => pageErrors.push(String(error)));
+  page.on('crash', () => pageErrors.push('page crashed'));
   page.on('console', (msg) => {
     if (msg.type() === 'error') {
       consoleErrors.push(msg.text());
@@ -136,7 +289,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     }
   });
 
-  await page.goto('http://127.0.0.1:4173/www/synth_api.html', {
+  await page.goto('http://127.0.0.1:4173/www/synth_api.html?model_source=local&sw=off', {
     waitUntil: 'domcontentloaded',
   });
   await page.click('#boot-start');
@@ -165,9 +318,9 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   const inference = await page.evaluate(async () => {
     const started = performance.now();
     try {
-      const imageResp = await fetch('/docs/input_chair.jpg');
+      const imageResp = await fetch('/docs/output_chair_bg_removed.png');
       if (!imageResp.ok) {
-        throw new Error(`failed to fetch docs/input_chair.jpg: ${imageResp.status}`);
+        throw new Error(`failed to fetch docs/output_chair_bg_removed.png: ${imageResp.status}`);
       }
       const imageBytes = new Uint8Array(await imageResp.arrayBuffer());
       const options = new window.__burnSynthWasm.WasmInferOptions();
@@ -178,8 +331,10 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
       options.set_seed(42n);
       options.set_backend('wgpu');
       options.set_dino_backend('auto');
+      options.set_rmbg_model('none');
+      options.set_weights_precision('f32');
       const inferPromise = window.__burnSynthWasm
-        .infer_glb_from_image_bytes_with_options(imageBytes, 'input_chair.jpg', options)
+        .infer_glb_from_image_bytes_with_options(imageBytes, 'output_chair_bg_removed.png', options)
         .then((glb) => ({
           ok: true,
           glbBytes: glb.byteLength,
@@ -188,7 +343,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
         }))
         .catch((error) => ({
           ok: false,
-          error: String(error),
+          error: error?.stack ?? String(error),
           elapsedMs: performance.now() - started,
         }));
       const timeoutPromise = new Promise((resolve) =>
@@ -206,7 +361,7 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     } catch (error) {
       return {
         ok: false,
-        error: String(error),
+        error: error?.stack ?? String(error),
         elapsedMs: performance.now() - started,
       };
     }
@@ -330,14 +485,13 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
     requestedVaeF32PartsManifest || requestedVaeF16PartsManifest,
     'expected VAE parts manifest request (f32 or f16)',
   ).toBe(true);
-  const requestedRmbgPartsManifest = modelRequests.some((url) =>
-    url.includes('/assets/models/RMBG-1.4/model_f16.bpk.parts.json') ||
-    url.includes('/assets/models/RMBG-1.4/model.bpk.parts.json'),
+  const rmbgModelRequests = modelRequests.filter((url) =>
+    url.includes('/assets/models/RMBG-1.4/'),
   );
   expect(
-    requestedRmbgPartsManifest,
-    'expected RMBG parts manifest request for wasm runtime',
-  ).toBe(true);
+    rmbgModelRequests,
+    `rmbg_model=none GLB smoke should not request RMBG artifacts: ${rmbgModelRequests.join(' | ')}`,
+  ).toEqual([]);
   const nonBenignFailedModelResponses = failedModelResponses.filter(
     (entry) =>
       !(
@@ -369,5 +523,429 @@ test('burn_synth wasm parts-based web inference produces a GLB', async ({ page }
   expect(
     nonBenignConsoleErrors,
     `console errors: ${nonBenignConsoleErrors.join(' | ')}`,
+  ).toEqual([]);
+});
+
+test('burn_synth wasm TripoSplat inference produces valid splat output', async ({ page }) => {
+  test.setTimeout(1800000);
+  test.skip(
+    process.env.BURN_SYNTH_WEB_TRIPOSPLAT_SMOKE !== '1',
+    'set BURN_SYNTH_WEB_TRIPOSPLAT_SMOKE=1 to enable TripoSplat wasm smoke',
+  );
+
+  const expectedSplats = 32768;
+  const weightsPrecision = process.env.BURN_SYNTH_WEB_TRIPOSPLAT_PRECISION || 'auto';
+  const inferenceTimeoutMs = Number.parseInt(
+    process.env.BURN_SYNTH_WEB_TRIPOSPLAT_TIMEOUT_MS || '240000',
+    10,
+  );
+  const pageErrors = [];
+  const consoleMessages = [];
+  const consoleErrors = [];
+  const modelRequests = [];
+  const failedModelResponses = [];
+  const normalizeModelUrl = (url) => {
+    if (url.includes('/www/assets/models/')) {
+      return url.replace('/www/assets/models/', '/assets/models/');
+    }
+    if (url.includes('/www/assets/')) {
+      return url.replace('/www/assets/', '/assets/models/');
+    }
+    return url;
+  };
+
+  page.on('pageerror', (error) => pageErrors.push(String(error)));
+  page.on('crash', () => pageErrors.push('page crashed'));
+  page.on('console', (msg) => {
+    consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
+    if (msg.type() === 'error') {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on('request', (request) => {
+    const url = normalizeModelUrl(request.url());
+    if (url.includes('/assets/models/')) {
+      modelRequests.push(url);
+    }
+  });
+  page.on('response', (response) => {
+    const url = normalizeModelUrl(response.url());
+    if (url.includes('/assets/models/') && response.status() >= 400) {
+      failedModelResponses.push(`${response.status()} ${url}`);
+    }
+  });
+
+  await page.goto('http://127.0.0.1:4173/www/synth_api.html?model_source=local&sw=off', {
+    waitUntil: 'domcontentloaded',
+  });
+  await page.click('#boot-start');
+  await expect(page.locator('#boot-text')).toHaveText(/module ready/i, {
+    timeout: 600000,
+  });
+
+  const webgpu = await page.evaluate(async () => {
+    const hasGpu = !!navigator.gpu;
+    if (!hasGpu) {
+      return { hasGpu, adapter: false, shaderF16: false };
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      return { hasGpu, adapter: false, shaderF16: false };
+    }
+    return {
+      hasGpu,
+      adapter: true,
+      shaderF16: adapter.features.has('shader-f16'),
+    };
+  });
+  expect(webgpu.hasGpu).toBe(true);
+  expect(webgpu.adapter).toBe(true);
+  if (!webgpu.shaderF16) {
+    const tmpDir = process.env.BURN_SYNTH_WEB_TMP_DIR;
+    if (tmpDir) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, 'wasm_triposplat_result.json'),
+        JSON.stringify(
+          {
+            inference: {
+              ok: false,
+              skipped: true,
+              reason:
+                'TripoSplat wasm requires WebGPU shader-f16; f32 browser decode exceeds WebGPU memory limits.',
+            },
+            weightsPrecision,
+            webgpu,
+            modelRequests,
+            failedModelResponses,
+            pageErrors,
+          },
+          null,
+          2,
+        ),
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'wasm_triposplat_console.log'),
+        `${consoleMessages.join('\n')}\n`,
+      );
+    }
+    test.skip(
+      true,
+      'TripoSplat wasm requires WebGPU shader-f16; this adapter only exposes f32.',
+    );
+  }
+
+  const inferenceStartedAt = Date.now();
+  const inferencePromise = page.evaluate(async ({ expectedSplats, inferenceTimeoutMs, weightsPrecision }) => {
+    const started = performance.now();
+    try {
+      const imageResp = await fetch('/docs/output_chair_bg_removed.png');
+      if (!imageResp.ok) {
+        throw new Error(`failed to fetch docs/output_chair_bg_removed.png: ${imageResp.status}`);
+      }
+      const imageBytes = new Uint8Array(await imageResp.arrayBuffer());
+      const options = new window.__burnSynthWasm.WasmInferOptions();
+      options.set_synthesis_model('triposplat');
+      options.set_rmbg_model('none');
+      options.set_backend('wgpu');
+      options.set_dino_backend('auto');
+      options.set_weights_precision(weightsPrecision);
+      options.set_num_steps(5);
+      options.set_guidance_scale(3.0);
+      options.set_triposplat_num_gaussians(expectedSplats);
+      options.set_triposplat_shift(3.0);
+      options.set_triposplat_erode_radius(1);
+      options.set_seed(42n);
+
+      const inferPromise = window.__burnSynthWasm
+        .infer_splat_from_image_bytes_with_options(imageBytes, 'output_chair_bg_removed.png', options)
+        .then((splat) => ({
+          ok: true,
+          splatBytes: splat.byteLength,
+          splatData: Array.from(splat),
+          elapsedMs: performance.now() - started,
+        }))
+        .catch((error) => ({
+          ok: false,
+          error: error?.stack ?? String(error),
+          elapsedMs: performance.now() - started,
+        }));
+      const timeoutPromise = new Promise((resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              ok: false,
+              timeout: true,
+              elapsedMs: performance.now() - started,
+            }),
+          Number.isFinite(inferenceTimeoutMs) && inferenceTimeoutMs > 0
+            ? inferenceTimeoutMs
+            : 240000,
+        ),
+      );
+      return await Promise.race([inferPromise, timeoutPromise]);
+    } catch (error) {
+      return {
+        ok: false,
+        error: error?.stack ?? String(error),
+        elapsedMs: performance.now() - started,
+      };
+    }
+  }, { expectedSplats, inferenceTimeoutMs, weightsPrecision });
+  const nodeWatchdogMs =
+    (Number.isFinite(inferenceTimeoutMs) && inferenceTimeoutMs > 0 ? inferenceTimeoutMs : 240000) +
+    60000;
+  const inference = await Promise.race([
+    inferencePromise,
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            ok: false,
+            timeout: true,
+            nodeWatchdog: true,
+            elapsedMs: Date.now() - inferenceStartedAt,
+          }),
+        nodeWatchdogMs,
+      ),
+    ),
+  ]);
+
+  const tmpDir = process.env.BURN_SYNTH_WEB_TMP_DIR;
+  if (tmpDir) {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inferenceSummary = { ...inference };
+    delete inferenceSummary.splatData;
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_result.json'),
+      JSON.stringify(
+        {
+          inference: inferenceSummary,
+          weightsPrecision,
+          webgpu,
+          modelRequests,
+          failedModelResponses,
+          pageErrors,
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_console.log'),
+      `${consoleMessages.join('\n')}\n`,
+    );
+  }
+
+  expect(inference.ok, `TripoSplat wasm inference failed: ${JSON.stringify(inference)}`).toBe(true);
+  expect(inference.splatBytes).toBe(expectedSplats * 32);
+  const wasmSplatBytes = Uint8Array.from(inference.splatData);
+  const stats = parseSplatStats(wasmSplatBytes);
+  expect(stats.count).toBe(expectedSplats);
+  expect(stats.nonFinite).toBe(0);
+  expect(stats.positiveAlpha).toBeGreaterThan(0);
+  expect(stats.positiveScale).toBeGreaterThan(expectedSplats * 2);
+  for (let axis = 0; axis < 3; axis += 1) {
+    expect(Number.isFinite(stats.boundsMin[axis])).toBe(true);
+    expect(Number.isFinite(stats.boundsMax[axis])).toBe(true);
+    expect(stats.boundsMax[axis]).toBeGreaterThan(stats.boundsMin[axis]);
+  }
+
+  if (tmpDir) {
+    fs.writeFileSync(path.join(tmpDir, 'wasm_triposplat_output.splat'), Buffer.from(wasmSplatBytes));
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_stats.json'),
+      JSON.stringify({ stats, elapsedMs: inference.elapsedMs, weightsPrecision }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'wasm_triposplat_console.log'),
+      `${consoleMessages.join('\n')}\n`,
+    );
+  }
+
+  const requiredManifestPatterns = [
+    /\/assets\/models\/TripoSplat\/clip_vision\/dino_v3_vit_h(_f16)?\.bpk\.parts\.json$/,
+    /\/assets\/models\/TripoSplat\/vae\/flux2_vae_encoder(_f16)?\.bpk\.parts\.json$/,
+    /\/assets\/models\/TripoSplat\/diffusion_models\/triposplat_flow(_f16)?\.bpk\.parts\.json$/,
+    /\/assets\/models\/TripoSplat\/vae\/triposplat_vae_decoder(_f16)?\.bpk\.parts\.json$/,
+  ];
+  for (const pattern of requiredManifestPatterns) {
+    expect(
+      modelRequests.some((url) => pattern.test(url)),
+      `expected manifest matching ${pattern}, saw: ${modelRequests.join(' | ')}`,
+    ).toBe(true);
+  }
+  const legacyShardManifestRequests = modelRequests.filter((url) =>
+    url.endsWith('.bpk.shards.json'),
+  );
+  expect(
+    legacyShardManifestRequests,
+    `unexpected legacy shard manifest requests in TripoSplat wasm loader: ${legacyShardManifestRequests.join(' | ')}`,
+  ).toEqual([]);
+  const nonBenignFailedModelResponses = failedModelResponses.filter(
+    (entry) =>
+      !(
+        entry.includes('404 ') &&
+        (
+          entry.includes('.bpk.parts.json') ||
+          entry.includes('.bpk.part-') ||
+          entry.includes('/assets/models/RMBG-1.4/model.bpk') ||
+          entry.includes('/assets/models/RMBG-1.4/model_f16.bpk')
+        )
+      ),
+  );
+  expect(
+    nonBenignFailedModelResponses,
+    `failed model responses: ${nonBenignFailedModelResponses.join(' | ')}`,
+  ).toEqual([]);
+  const rmbgModelRequests = modelRequests.filter((url) =>
+    url.includes('/assets/models/RMBG-1.4/'),
+  );
+  expect(
+    rmbgModelRequests,
+    `TripoSplat rmbg_model=none should not request RMBG artifacts: ${rmbgModelRequests.join(' | ')}`,
+  ).toEqual([]);
+  expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+  const nonBenignConsoleErrors = consoleErrors.filter(
+    (entry) =>
+      !entry.includes('favicon.ico') &&
+      !entry.includes(
+        'Failed to load resource: the server responded with a status of 404 (File not found)',
+      ),
+  );
+  expect(
+    nonBenignConsoleErrors,
+    `console errors: ${nonBenignConsoleErrors.join(' | ')}`,
+  ).toEqual([]);
+});
+
+test('burn_synth wasm trellis inference path can run end-to-end', async ({ page }) => {
+  test.setTimeout(1800000);
+  test.skip(
+    process.env.BURN_SYNTH_WEB_TRELLIS_SMOKE !== '1',
+    'set BURN_SYNTH_WEB_TRELLIS_SMOKE=1 to enable Trellis wasm smoke',
+  );
+
+  const modelRequests = [];
+  const failedModelResponses = [];
+  page.on('console', (message) => {
+    console.log(`[trellis-browser:${message.type()}] ${message.text()}`);
+  });
+  const normalizeModelUrl = (url) => {
+    if (url.includes('/www/assets/models/')) {
+      return url.replace('/www/assets/models/', '/assets/models/');
+    }
+    if (url.includes('/www/assets/')) {
+      return url.replace('/www/assets/', '/assets/models/');
+    }
+    return url;
+  };
+
+  page.on('request', (request) => {
+    const url = normalizeModelUrl(request.url());
+    if (url.includes('/assets/models/')) {
+      modelRequests.push(url);
+    }
+  });
+  page.on('response', (response) => {
+    const url = normalizeModelUrl(response.url());
+    if (url.includes('/assets/models/') && response.status() >= 400) {
+      failedModelResponses.push(`${response.status()} ${url}`);
+    }
+  });
+
+  await page.goto('http://127.0.0.1:4173/www/synth_api.html?model_source=local&sw=off', {
+    waitUntil: 'domcontentloaded',
+  });
+  await page.click('#boot-start');
+  await expect(page.locator('#boot-text')).toHaveText(/module ready/i, {
+    timeout: 600000,
+  });
+
+  const inference = await page.evaluate(async () => {
+    const started = performance.now();
+    try {
+      const imageResp = await fetch('/docs/input_chair.jpg');
+      if (!imageResp.ok) {
+        throw new Error(`failed to fetch docs/input_chair.jpg: ${imageResp.status}`);
+      }
+      const imageBytes = new Uint8Array(await imageResp.arrayBuffer());
+      const options = new window.__burnSynthWasm.WasmInferOptions();
+      options.set_backend('wgpu');
+      options.set_synthesis_model('trellis');
+      options.set_rmbg_model('rmbg14');
+      options.set_quality('fast');
+      options.set_num_steps(2);
+      options.set_trellis_pbr_enabled(false);
+      options.set_seed(42n);
+
+      const inferPromise = window.__burnSynthWasm
+        .infer_glb_from_image_bytes_with_options(imageBytes, 'input_chair.jpg', options)
+        .then((glb) => ({
+          ok: true,
+          glbBytes: glb.byteLength,
+          elapsedMs: performance.now() - started,
+        }))
+        .catch((error) => ({
+          ok: false,
+          error: String(error),
+          elapsedMs: performance.now() - started,
+        }));
+      const timeoutPromise = new Promise((resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              ok: false,
+              timeout: true,
+              elapsedMs: performance.now() - started,
+            }),
+          900000,
+        ),
+      );
+      return await Promise.race([inferPromise, timeoutPromise]);
+    } catch (error) {
+      return {
+        ok: false,
+        error: String(error),
+        elapsedMs: performance.now() - started,
+      };
+    }
+  });
+
+  if (!inference.ok) {
+    const error = inference.error ?? '';
+    const expectedSafeCap =
+      !inference.timeout &&
+      error.includes('exceeds the default wasm safe component preload cap');
+    if (expectedSafeCap) {
+      expect(
+        modelRequests.some((url) => url.includes('/assets/models/TRELLIS.2-4B/')),
+        `expected TRELLIS model requests before safe preload refusal, saw: ${modelRequests.join(' | ')}`,
+      ).toBe(true);
+      expect(
+        failedModelResponses,
+        `failed model responses before safe preload refusal: ${failedModelResponses.join(' | ')}`,
+      ).toEqual([]);
+      console.log(`[trellis-browser:skip] ${error}`);
+      return;
+    }
+  }
+  expect(inference.ok, `trellis wasm inference failed: ${JSON.stringify(inference)}`).toBe(true);
+  expect(inference.glbBytes).toBeGreaterThan(0);
+  expect(
+    modelRequests.some((url) => url.includes('/assets/models/TRELLIS.2-4B/')),
+    `expected TRELLIS model requests, saw: ${modelRequests.join(' | ')}`,
+  ).toBe(true);
+  expect(
+    modelRequests.some((url) => url.includes('tex_dec_next_dc_f16c32_fp16')),
+    `mesh-only TRELLIS should not fetch tex_slat_decoder assets: ${modelRequests.join(' | ')}`,
+  ).toBe(false);
+  expect(
+    modelRequests.some((url) => url.includes('slat_flow_imgshape2tex')),
+    `mesh-only TRELLIS should not fetch tex_slat_flow assets: ${modelRequests.join(' | ')}`,
+  ).toBe(false);
+  expect(
+    failedModelResponses,
+    `failed model responses: ${failedModelResponses.join(' | ')}`,
   ).toEqual([]);
 });

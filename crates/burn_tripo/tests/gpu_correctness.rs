@@ -191,8 +191,8 @@ fn gpu_dit_matches_cpu_small() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cpu_device = <CpuBackend as Backend>::Device::default();
-    let gpu_device = <GpuBackend as Backend>::Device::default();
+    let cpu_device = <CpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
+    let gpu_device = <GpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
 
     let config = TripoSGDiTConfig {
         in_channels: 8,
@@ -252,8 +252,8 @@ fn gpu_vae_decode_matches_cpu_small() -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    let cpu_device = <CpuBackend as Backend>::Device::default();
-    let gpu_device = <GpuBackend as Backend>::Device::default();
+    let cpu_device = <CpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
+    let gpu_device = <GpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
 
     let config = TripoSGVaeConfig {
         embed_frequency: 2,
@@ -311,8 +311,8 @@ fn gpu_flash_extract_matches_cpu_small() -> Result<(), Box<dyn std::error::Error
         return Ok(());
     }
 
-    let cpu_device = <CpuBackend as Backend>::Device::default();
-    let gpu_device = <GpuBackend as Backend>::Device::default();
+    let cpu_device = <CpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
+    let gpu_device = <GpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
 
     let config = TripoSGVaeConfig {
         embed_frequency: 2,

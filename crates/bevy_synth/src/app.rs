@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::RecvTimeoutError;
@@ -11,17 +13,17 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use bevy::app::AppExit;
-use bevy::asset::RenderAssetUsages;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::io::web::WebAssetPlugin;
 #[cfg(target_arch = "wasm32")]
-use bevy::asset::{AssetMetaCheck, AssetMode, AssetPlugin, UnapprovedPathMode};
+use bevy::asset::{AssetMetaCheck, AssetMode};
+use bevy::asset::{AssetPlugin, RenderAssetUsages, UnapprovedPathMode};
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
-use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::ecs::message::MessageWriter;
 use bevy::ecs::system::SystemParam;
 use bevy::light::{
-    AmbientLight, CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap,
+    CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight,
     PointLight,
 };
 use bevy::math::primitives::Cuboid;
@@ -38,16 +40,23 @@ use bevy::render::renderer::{
 };
 #[cfg(target_arch = "wasm32")]
 use bevy::render::settings::{Backends, WgpuSettings};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PrimaryWindow, WindowCloseRequested};
 #[cfg(target_arch = "wasm32")]
 use bevy::window::{Window, WindowPlugin};
 #[cfg(not(target_arch = "wasm32"))]
-use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WakeUp, WinitSettings};
-use bevy_infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
+use bevy::winit::{
+    EventLoopProxy, EventLoopProxyWrapper, UpdateMode, WinitSettings, WinitUserEvent,
+};
+use bevy_gaussian_splatting::gaussian::settings::GaussianColorSpace;
+use bevy_gaussian_splatting::sort::SortMode;
+use bevy_gaussian_splatting::{
+    CloudSettings, Gaussian3d, GaussianCamera, GaussianSplattingPlugin, PlanarGaussian3d,
+    PlanarGaussian3dHandle, SphericalHarmonicCoefficients,
+};
 use bevy_mesh::{Mesh as BevyMesh, Mesh3d};
-use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet};
 use bevy_picking::DefaultPickingPlugins;
-use bevy_picking::hover::PickingInteraction;
 use bevy_picking::input::PointerInputPlugin;
 use bevy_picking::prelude::MeshPickingSettings;
 use bevy_picking::prelude::{MeshPickingCamera, Pickable};
@@ -55,30 +64,67 @@ use bevy_synth_ui::bevy_editor_core::selection::{
     EditorSelection, Selectable, remove_entity_from_selection_if_despawned,
 };
 use bevy_synth_ui::bevy_file_dialog::prelude::{
-    DialogFileDropped, DialogFileLoaded, FileDialogExt, FileDialogPlugin,
+    DialogFileDropped, DialogFileLoaded, DialogFileSaveCanceled, DialogFileSaved, FileDialogExt,
+    FileDialogPlugin,
 };
 use bevy_synth_ui::bevy_transform_gizmos;
 use bevy_synth_ui::bevy_transform_gizmos::TransformGizmoSystems;
 use bevy_synth_ui::bevy_transform_gizmos::prelude::GizmoCamera;
 use bevy_synth_ui::bevy_transform_gizmos::prelude::TransformGizmoPlugin;
-use bevy_synth_ui::bevy_transform_gizmos::{GizmoTransformable, TransformGizmo};
+use bevy_synth_ui::bevy_transform_gizmos::{
+    GizmoTransformable, TransformGizmo, TransformGizmoOffset,
+};
 use clap::Parser;
 #[cfg(not(target_arch = "wasm32"))]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{
+    Mutex,
+    mpsc::{self, Receiver},
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+use burn_synth_mcp::{
+    FeedbackRotationSelector, FeedbackRubricScorer, FeedbackThresholdProfile,
+    InferenceBackend as McpInferenceBackend, LocateAnythingBackend,
+    QualityPreset as McpQualityPreset, SceneBuildExecutionKind, SceneBuildFromImageArgs,
+    SceneBuildProgressEvent, SceneBuildProgressPhase, SceneCanonicalPoseMode, SceneCompositionMode,
+    SceneDepthProvider, SceneGroundCalibrationMode, SceneInstanceGenerationMode,
+    SceneLocatorProvider, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
+    ScenePoseFitMode, SceneScalePolicy, SceneSegmentationProvider, ServerArgs, ServerConfig,
+    SynthesisModel as McpSynthesisModel, TrellisQuality as McpTrellisQuality,
+    run_scene_build_from_image_with_progress,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use burn_synth_scene::scene_bsn_file_to_mcp_command_envelope;
+#[cfg(not(target_arch = "wasm32"))]
+use burn_synth_scene::{
+    SceneAssetAabb, SceneAssetBinding, SceneAssetFrame, SceneCamera, SceneQualityProfile,
+    parse_scene_bsn,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_synth_runtime::args::BackendKind;
-#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
-use bevy_synth_runtime::args::MeshMode;
+use bevy_synth_runtime::args::SynthesisModel;
 use bevy_synth_runtime::args::{AppArgs, Args, build_app_args};
 #[cfg(target_arch = "wasm32")]
-use bevy_synth_runtime::args::{QualityPreset, WeightPrecision};
-use bevy_synth_runtime::cache::{CachedCameraState, CachedWorldItem, MeshCache};
-use bevy_synth_runtime::io::{is_image_file, is_mesh_file, resolve_output_path, write_glb};
+use bevy_synth_runtime::args::{QualityPreset, RmbgModel, TripoSplatProfile, WeightPrecision};
+use bevy_synth_runtime::cache::{
+    CachedAssetAabb, CachedCameraState, CachedMeshMetadata, CachedSceneMetadata,
+    CachedSceneMetrics, CachedScenePayload, CachedWorldItem, MeshCache,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::cache::{CachedAssetFrame, CachedAssetKind};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_runtime::io::mesh_from_glb_bytes;
+use bevy_synth_runtime::io::{
+    SceneGlbMeshInstance, image_bytes_to_bevy_image, is_image_file, is_mesh_file,
+    resolve_output_path, scene_meshes_to_glb_bytes, write_glb,
+};
 use bevy_synth_runtime::mesh::to_bevy_mesh_synth;
 use bevy_synth_runtime::state::{
-    ExitState, InferenceQueue, InferenceRequest, InferenceWorker, Spinner, TitlePulse, UiStatus,
-    WorkerCommand,
+    ExitState, InferenceQueue, InferenceRequest, InferenceSettings, InferenceWorker, Spinner,
+    TitlePulse, UiStatus, WorkerCommand,
 };
 #[cfg(target_arch = "wasm32")]
 use bevy_synth_runtime::state::{
@@ -92,18 +138,133 @@ use bevy_synth_runtime::worker::{
 };
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "wgpu")))]
 use bevy_synth_runtime::worker::{WorkerWakeCallback, start_worker_with_wake};
-use bevy_synth_runtime::{SynthMesh, SynthMeshTexture, TripoMesh};
+use bevy_synth_runtime::{GaussianSplatCloud, SynthAsset, SynthMesh, SynthMeshTexture, TripoMesh};
 use bevy_synth_ui::ImagePickDialog;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_ui::SceneProcessingEvent;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy_synth_ui::SceneQualityProfileSetting;
 use bevy_synth_ui::{
-    BurnSynthUiPlugin, CatalogDeleteRequest, CatalogSpawnRequest, CatalogState, CatalogStatus,
-    CatalogUiState, DragState, MainCamera, preview_light_layers,
+    BurnSynthUiPlugin, BurnSynthUiSystemSet, CatalogDeleteRequest, CatalogMode,
+    CatalogScenePreviewItem, CatalogSpawnAsset, CatalogSpawnRequest, CatalogState, CatalogStatus,
+    CatalogUiState, MainCamera, SceneBuildRequest, SceneDeleteRequest, SceneLoadRequest,
+    ScenePipelineUiSettings, SceneProcessingState, SceneSaveKind, SceneSaveRequest, UiRootNode,
+    ViewerAabbOverlayMode, ViewerDebugSettings, preview_light_layers,
+};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) use crate::depth_debug::{
+    DepthDebugIntrinsics, depth_debug_sample_stride, depth_debug_world_point,
+    scene_camera_frustum_cross_size, scene_camera_frustum_length,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::depth_debug::{
+    SceneDepthDebugState, draw_scene_camera_frustum, sync_depth_debug_cloud,
+    sync_scene_depth_debug_artifacts,
+};
+use crate::infinite_grid::{InfiniteGridBundle, InfiniteGridPlugin, InfiniteGridSettings};
+use crate::panorbit::{
+    PanOrbitCamera, PanOrbitCameraPlugin, PanOrbitCameraSystemSet, sync_panorbit_bindings,
+    sync_panorbit_enabled,
 };
 
 const BUILTIN_CUBE_SOURCE_IMAGE: &str = "builtin/cube";
 
+#[derive(Component)]
+struct EditorCamera;
+
+#[derive(Component)]
+pub(crate) struct SceneRenderCamera;
+
+#[derive(Component, Clone, Copy, Debug)]
+struct SceneRenderCameraTarget {
+    focus: Vec3,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreenshotCameraTarget {
+    Editor,
+    Scene,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+struct McpSceneScreenshotRequest {
+    path: PathBuf,
+    camera: ScreenshotCameraTarget,
+}
+
 #[derive(Component, Clone, Debug)]
 pub(crate) struct CachedMeshInstance {
     pub(crate) cache_key: String,
+    pub(crate) local_aabb: Option<CachedAssetAabb>,
+}
+
+#[derive(Clone, Debug)]
+struct SceneBsnSaveDialog;
+
+#[derive(Clone, Debug)]
+struct SceneGlbSaveDialog;
+
+#[derive(Resource, Default)]
+struct PendingSceneBsnSave {
+    assets_json: Option<Vec<u8>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct PendingSceneBuild {
+    receiver: Option<Mutex<Receiver<Result<SceneBuildOutput, String>>>>,
+    progress_receiver: Option<Mutex<Receiver<SceneBuildProgressEvent>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SceneBuildOutput {
+    source_scene_path: PathBuf,
+    source_image_bytes: Option<Vec<u8>>,
+    response: serde_json::Value,
+}
+
+#[allow(dead_code)]
+#[derive(Resource, Clone, Debug, Default)]
+pub(crate) struct SceneInteractionLock {
+    pub(crate) locked: bool,
+    pub(crate) reason: Option<String>,
+}
+
+impl SceneInteractionLock {
+    #[allow(dead_code)]
+    pub(crate) fn set(&mut self, locked: bool, reason: Option<String>) {
+        self.locked = locked;
+        self.reason = if locked {
+            reason.filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UiVisibilityState {
+    pub(crate) visible: bool,
+}
+
+impl UiVisibilityState {
+    pub(crate) fn new(visible: bool) -> Self {
+        Self { visible }
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SceneReadOnlyMode {
+    pub(crate) enabled: bool,
+}
+
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GaussianSplatPickBounds {
+    pub(crate) center: Vec3,
+    pub(crate) half_extents: Vec3,
 }
 
 #[derive(Resource)]
@@ -151,6 +312,7 @@ impl Default for WorldCachePersistence {
 #[derive(Resource, Default)]
 struct McpSceneControl {
     path: Option<PathBuf>,
+    status_path: Option<PathBuf>,
     last_modified: Option<SystemTime>,
 }
 
@@ -173,7 +335,10 @@ struct WasmWarmupKickoff {
 impl Default for WasmWarmupKickoff {
     fn default() -> Self {
         Self {
-            sent: false,
+            // The wasm worker warms model pipelines on demand before the first
+            // matching inference request. Startup should show the app first so
+            // model/profile selection happens inside the Bevy UI.
+            sent: true,
             timer: Timer::from_seconds(1.5, TimerMode::Once),
         }
     }
@@ -182,11 +347,58 @@ impl Default for WasmWarmupKickoff {
 #[cfg(not(target_arch = "wasm32"))]
 impl McpSceneControl {
     fn from_args(args: &AppArgs) -> Self {
+        let status_path = args
+            .mcp_scene_control_path
+            .as_ref()
+            .map(|path| path.with_extension("status.json"));
         Self {
             path: args.mcp_scene_control_path.clone(),
+            status_path,
             last_modified: None,
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn prepare_startup_bsn_scene(args: &mut AppArgs) -> Result<(), String> {
+    let Some(bsn_path) = args.scene_bsn.as_ref() else {
+        if args.scene_assets_json.is_some() {
+            return Err("--scene-assets-json requires --scene-bsn".to_string());
+        }
+        return Ok(());
+    };
+    let command_path = args.mcp_scene_control_path.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "bevy_synth_bsn_scene_{}_commands.json",
+            std::process::id()
+        ))
+    });
+    let envelope = scene_bsn_file_to_mcp_command_envelope(
+        bsn_path,
+        args.scene_assets_json.as_deref(),
+        args.scene_bsn_clear_existing,
+        Some("bevy_synth-startup-bsn"),
+        Some(1),
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(parent) = command_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create BSN scene command directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&envelope)
+        .map_err(|err| format!("failed to serialize BSN scene command envelope: {err}"))?;
+    fs::write(&command_path, bytes).map_err(|err| {
+        format!(
+            "failed to write BSN scene command envelope {}: {err}",
+            command_path.display()
+        )
+    })?;
+    args.mcp_scene_control_path = Some(command_path);
+    Ok(())
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
@@ -229,9 +441,7 @@ impl Plugin for SharedWgpuInferenceDevicePlugin {
             ))
         };
 
-        if shared_device.is_some() {
-            info!("Initialized shared Burn WGPU device from Bevy render context.");
-        }
+        info!("Initialized shared Burn WGPU device from Bevy render context.");
         app.insert_resource(SharedWgpuInferenceDevice {
             device: shared_device,
         });
@@ -240,10 +450,37 @@ impl Plugin for SharedWgpuInferenceDevicePlugin {
 
 #[cfg(not(target_arch = "wasm32"))]
 const INFERENCE_PAUSE_WAIT: Duration = Duration::from_secs(60 * 60);
+#[cfg(not(target_arch = "wasm32"))]
+const INFERENCE_DISPATCH_VISIBLE_FRAMES: u8 = 3;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 struct InferencePauseOverlay;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Debug, Clone)]
+pub(crate) struct InferenceDispatchGate {
+    visible_frames_remaining: u8,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for InferenceDispatchGate {
+    fn default() -> Self {
+        Self {
+            visible_frames_remaining: INFERENCE_DISPATCH_VISIBLE_FRAMES,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InferenceDispatchGate {
+    #[cfg(test)]
+    pub(crate) fn ready_for_dispatch() -> Self {
+        Self {
+            visible_frames_remaining: 0,
+        }
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Resource, Debug, Default, Clone)]
@@ -277,12 +514,32 @@ pub(crate) fn should_pause_render_during_inference(
     if !args.pause_render_during_inference || exit_requested {
         return false;
     }
-    let active = queue
+    queue
         .active
         .as_ref()
         .map(|batch| !batch.is_empty())
-        .unwrap_or(false);
-    active || !queue.pending.is_empty()
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn should_wait_before_inference_dispatch(
+    gate: &mut InferenceDispatchGate,
+    queue: &InferenceQueue,
+) -> bool {
+    if queue.active.is_some() || queue.pending.is_empty() {
+        gate.visible_frames_remaining = INFERENCE_DISPATCH_VISIBLE_FRAMES;
+        return false;
+    }
+    if gate.visible_frames_remaining == 0 {
+        return false;
+    }
+    gate.visible_frames_remaining -= 1;
+    true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reset_inference_dispatch_gate(gate: &mut InferenceDispatchGate) {
+    gate.visible_frames_remaining = INFERENCE_DISPATCH_VISIBLE_FRAMES;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -292,7 +549,7 @@ fn sync_inference_render_pause(
     exit_state: Res<ExitState>,
     mut pause_state: ResMut<InferenceRenderPauseState>,
     winit_settings: Option<ResMut<WinitSettings>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     mut overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
 ) {
     let mut request_wakeup = false;
@@ -340,7 +597,7 @@ fn sync_inference_render_pause(
     }
 
     if request_wakeup && let Some(proxy) = event_loop_proxy.as_ref() {
-        let _ = proxy.send_event(WakeUp);
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }
 }
 
@@ -366,7 +623,7 @@ fn sync_inference_render_pause_before(
     exit_state: Res<ExitState>,
     pause_state: ResMut<InferenceRenderPauseState>,
     winit_settings: Option<ResMut<WinitSettings>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
 ) {
     sync_inference_render_pause(
@@ -387,7 +644,7 @@ fn sync_inference_render_pause_after(
     exit_state: Res<ExitState>,
     pause_state: ResMut<InferenceRenderPauseState>,
     winit_settings: Option<ResMut<WinitSettings>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     overlays: Query<&mut Visibility, With<InferencePauseOverlay>>,
 ) {
     sync_inference_render_pause(
@@ -404,14 +661,14 @@ fn sync_inference_render_pause_after(
 #[cfg(not(target_arch = "wasm32"))]
 fn make_worker_wake_callback(
     args: &AppArgs,
-    event_loop_proxy: Option<&Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<&Res<EventLoopProxyWrapper>>,
 ) -> Option<WorkerWakeCallback> {
     if !args.pause_render_during_inference {
         return None;
     }
     let proxy = event_loop_proxy.map(|proxy| EventLoopProxy::clone(&**proxy))?;
     Some(std::sync::Arc::new(move || {
-        let _ = proxy.send_event(WakeUp);
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }))
 }
 
@@ -423,30 +680,22 @@ pub(crate) fn should_share_wgpu_inference_device(args: &AppArgs) -> bool {
 #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
 pub(crate) fn should_share_wgpu_inference_device_for_platform(
     args: &AppArgs,
-    is_linux: bool,
+    _is_linux: bool,
 ) -> bool {
-    if !matches!(args.backend, BackendKind::Wgpu) {
-        return false;
-    }
-
-    let full_flash_workload = matches!(args.mesh_mode, MeshMode::Flash)
-        && args.flash_octree_depth >= 9
-        && args.flash_min_resolution >= 63;
-    if is_linux && full_flash_workload {
-        info!(
-            "Using isolated Burn WGPU device for Linux full+flash workload \
-             (octree_depth={}, min_resolution={}) to avoid render swapchain instability.",
-            args.flash_octree_depth, args.flash_min_resolution
-        );
-        return false;
-    }
-
-    true
+    matches!(args.backend, BackendKind::Wgpu)
+        && !args
+            .available_synthesis_models
+            .iter()
+            .any(|model| matches!(model, bevy_synth_runtime::args::SynthesisModel::Trellis))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Deserialize)]
 struct McpSceneCommandEnvelope {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    sequence: Option<u64>,
     commands: Vec<McpSceneCommand>,
 }
 
@@ -456,6 +705,23 @@ struct McpSceneCommandEnvelope {
 enum McpSceneCommand {
     SpawnCached {
         cache_key: String,
+        #[serde(default)]
+        local_aabb: Option<CachedAssetAabb>,
+        #[serde(default)]
+        translation: Option<[f32; 3]>,
+        #[serde(default)]
+        rotation: Option<[f32; 4]>,
+        #[serde(default)]
+        scale: Option<[f32; 3]>,
+        #[serde(default)]
+        select: bool,
+    },
+    SpawnPath {
+        path: PathBuf,
+        #[serde(default)]
+        cache_key: Option<String>,
+        #[serde(default)]
+        local_aabb: Option<CachedAssetAabb>,
         #[serde(default)]
         translation: Option<[f32; 3]>,
         #[serde(default)]
@@ -468,6 +734,7 @@ enum McpSceneCommand {
     DeleteByCacheKey {
         cache_key: String,
     },
+    ClearScene,
     DeleteSelected,
     ClearSelection,
     SetCamera {
@@ -481,8 +748,71 @@ enum McpSceneCommand {
         pitch: Option<f32>,
         #[serde(default)]
         radius: Option<f32>,
+        #[serde(default)]
+        vertical_fov: Option<f32>,
     },
+    CaptureScreenshot {
+        path: PathBuf,
+    },
+    SetInteractionLock {
+        locked: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    ReloadCache,
     SaveCache,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct McpSceneScreenshotQueue {
+    pending: VecDeque<McpSceneScreenshotRequest>,
+    active: Option<McpSceneScreenshotRequest>,
+    ui_hidden: bool,
+    restore_next_frame: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize)]
+struct McpSceneStatus {
+    session_id: Option<String>,
+    last_sequence: Option<u64>,
+    ok: bool,
+    message: String,
+    requested_commands: usize,
+    applied_commands: usize,
+    command_results: Vec<McpSceneCommandResult>,
+    cache_entries: Vec<CachedMeshMetadata>,
+    world_items: Vec<CachedWorldItem>,
+    projected_items: Vec<McpProjectedWorldItem>,
+    camera: Option<CachedCameraState>,
+    screenshots: Vec<String>,
+    interaction_locked: bool,
+    interaction_lock_reason: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize)]
+struct McpProjectedWorldItem {
+    cache_key: String,
+    world_aabb: Option<CachedAssetAabb>,
+    screen_bbox: Option<[f32; 4]>,
+    screen_contact: Option<[f32; 2]>,
+    projected_corners: usize,
+    total_corners: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize)]
+struct McpSceneCommandResult {
+    index: usize,
+    command_type: &'static str,
+    applied: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 #[derive(SystemParam)]
@@ -491,9 +821,12 @@ pub(crate) struct InferenceContext<'w, 's> {
     queue: ResMut<'w, InferenceQueue>,
     worker: Res<'w, InferenceWorker>,
     args: Res<'w, AppArgs>,
+    #[cfg(not(target_arch = "wasm32"))]
+    dispatch_gate: ResMut<'w, InferenceDispatchGate>,
     meshes: ResMut<'w, Assets<BevyMesh>>,
     images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
+    gaussian_clouds: ResMut<'w, Assets<PlanarGaussian3d>>,
     cache: ResMut<'w, MeshCacheResource>,
     status: ResMut<'w, UiStatus>,
     catalog: ResMut<'w, CatalogState>,
@@ -504,12 +837,14 @@ pub(crate) struct InferenceContext<'w, 's> {
 
 pub(crate) fn run() {
     let args = Args::parse();
-    #[cfg(target_arch = "wasm32")]
     let mut app_args = build_app_args(args);
-    #[cfg(not(target_arch = "wasm32"))]
-    let app_args = build_app_args(args);
     #[cfg(target_arch = "wasm32")]
     apply_wasm_url_overrides(&mut app_args);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(err) = prepare_startup_bsn_scene(&mut app_args) {
+        eprintln!("failed to prepare BSN scene viewer: {err}");
+        std::process::exit(1);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if should_run_headless_once(&app_args) {
         if let Err(err) = run_headless_once(&app_args) {
@@ -521,6 +856,10 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     let mcp_scene_control = McpSceneControl::from_args(&app_args);
 
+    let ui_visibility = UiVisibilityState::new(app_args.ui_visible);
+    let scene_read_only = SceneReadOnlyMode {
+        enabled: app_args.read_only,
+    };
     let status_message = if app_args.image.is_none() && app_args.mesh.is_none() {
         "upload an image (.png/.jpg) to begin.".to_string()
     } else {
@@ -536,6 +875,10 @@ pub(crate) fn run() {
         .init_resource::<EditorSelection>()
         .insert_resource(MeshCacheResource::load_or_empty())
         .insert_resource(WorldCachePersistence::default())
+        .insert_resource(PendingSceneBsnSave::default())
+        .insert_resource(SceneInteractionLock::default())
+        .insert_resource(ui_visibility)
+        .insert_resource(scene_read_only)
         .insert_resource(UiStatus {
             message: status_message,
             processing: false,
@@ -548,7 +891,15 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     app.init_resource::<InferenceRenderPauseState>();
     #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<InferenceDispatchGate>();
+    #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<McpSceneScreenshotQueue>();
+    #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<SceneDepthDebugState>();
+    #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(mcp_scene_control);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.insert_resource(PendingSceneBuild::default());
     add_default_plugins(&mut app);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
     app.add_plugins(SharedWgpuInferenceDevicePlugin);
@@ -558,6 +909,7 @@ pub(crate) fn run() {
     app.add_plugins(TransformGizmoPlugin);
     app.add_plugins(PanOrbitCameraPlugin);
     app.add_plugins(InfiniteGridPlugin);
+    app.add_plugins(GaussianSplattingPlugin);
     app.add_plugins(BurnSynthUiPlugin);
     app.add_systems(
         Update,
@@ -566,6 +918,10 @@ pub(crate) fn run() {
             handle_open_file_dialog,
             handle_file_dialog_loads,
             handle_dropped_files,
+            handle_scene_save_requests,
+            handle_scene_bsn_save_results,
+            handle_scene_glb_save_results,
+            handle_ui_visibility_shortcut,
             #[cfg(target_arch = "wasm32")]
             kickoff_wasm_warmup.before(finish_wasm_startup_when_models_ready),
             #[cfg(target_arch = "wasm32")]
@@ -575,8 +931,8 @@ pub(crate) fn run() {
             drive_inference,
             #[cfg(not(target_arch = "wasm32"))]
             sync_inference_render_pause_after.after(drive_inference),
-            handle_catalog_spawn_requests,
-            handle_catalog_delete_requests,
+            handle_catalog_spawn_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            handle_catalog_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
             delete_selected_meshes,
             (mark_world_cache_dirty, persist_world_cache).chain(),
             update_spinner,
@@ -585,13 +941,41 @@ pub(crate) fn run() {
         ),
     );
     app.add_systems(
+        Update,
+        (
+            handle_scene_load_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            handle_scene_delete_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            handle_scene_build_requests.after(BurnSynthUiSystemSet::CatalogRequests),
+            #[cfg(not(target_arch = "wasm32"))]
+            poll_scene_build_results,
+        ),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
+        sync_ui_root_visibility
+            .after(handle_ui_visibility_shortcut)
+            .after(drive_mcp_scene_screenshot_queue),
+    );
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Update,
+        sync_ui_root_visibility.after(handle_ui_visibility_shortcut),
+    );
+    app.add_systems(
+        PostUpdate,
+        enforce_scene_interaction_lock.before(TransformGizmoSystems::Main),
+    );
+    app.add_systems(
         PostUpdate,
         (sync_panorbit_bindings, sync_panorbit_enabled).before(PanOrbitCameraSystemSet),
     );
     app.add_plugins(
         FileDialogPlugin::new()
             .with_load_file::<ImagePickDialog>()
-            .with_drop_file::<ImagePickDialog>(),
+            .with_drop_file::<ImagePickDialog>()
+            .with_save_file::<SceneBsnSaveDialog>()
+            .with_save_file::<SceneGlbSaveDialog>(),
     );
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -600,8 +984,12 @@ pub(crate) fn run() {
         app.add_systems(
             PostUpdate,
             (
+                sync_gaussian_splat_pick_bounds,
                 remove_entity_from_selection_if_despawned,
-                update_selection_from_primary_click.after(TransformGizmoSystems::Main),
+                update_selection_from_primary_click
+                    .after(TransformGizmoSystems::Main)
+                    .after(sync_gaussian_splat_pick_bounds),
+                draw_viewer_debug_overlays.after(sync_gaussian_splat_pick_bounds),
             ),
         );
     }
@@ -612,8 +1000,12 @@ pub(crate) fn run() {
         app.add_systems(
             PostUpdate,
             (
+                sync_gaussian_splat_pick_bounds,
                 remove_entity_from_selection_if_despawned,
-                update_selection_from_primary_click.after(TransformGizmoSystems::Main),
+                update_selection_from_primary_click
+                    .after(TransformGizmoSystems::Main)
+                    .after(sync_gaussian_splat_pick_bounds),
+                draw_viewer_debug_overlays.after(sync_gaussian_splat_pick_bounds),
             ),
         );
     }
@@ -621,7 +1013,12 @@ pub(crate) fn run() {
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(
         Update,
-        poll_mcp_scene_control.before(mark_world_cache_dirty),
+        (
+            poll_mcp_scene_control.before(mark_world_cache_dirty),
+            drive_mcp_scene_screenshot_queue.after(poll_mcp_scene_control),
+            sync_scene_depth_debug_artifacts,
+            sync_depth_debug_cloud.after(sync_scene_depth_debug_artifacts),
+        ),
     );
 
     app.run();
@@ -645,7 +1042,7 @@ fn run_headless_once(args: &AppArgs) -> Result<(), String> {
     if !image_path.exists() {
         return Err(format!("input image not found: {}", image_path.display()));
     }
-    let output_path = resolve_output_path(args.output.as_ref(), &image_path, 0)
+    let output_path = resolve_asset_output_path(args, &image_path, 0)
         .ok_or_else(|| "headless mode requires --output".to_string())?;
 
     println!(
@@ -655,26 +1052,30 @@ fn run_headless_once(args: &AppArgs) -> Result<(), String> {
     );
 
     let start = Instant::now();
-    let mesh = run_headless_once_inference(args, &image_path)?;
+    let asset = run_headless_once_inference(args, &image_path)?;
+    let asset_kind = synth_asset_kind(&asset);
 
-    write_glb(&output_path, &mesh)
+    write_synthesis_asset(&output_path, asset)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
     println!(
-        "headless synthesis completed in {:.2}s -> {}",
-        start.elapsed().as_secs_f32(),
+        "headless synthesis completed: asset_kind={} total_ms={:.1} -> {}",
+        asset_kind,
+        start.elapsed().as_secs_f64() * 1000.0,
         output_path.display()
     );
     Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<SynthMesh, String> {
+fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<SynthAsset, String> {
     let worker = start_worker(args);
     let request = InferenceRequest {
         id: 0,
         image_path: image_path.to_path_buf(),
         image_contents: None,
         output_path: None,
+        synthesis_models: args.synthesis_models.clone(),
+        settings: InferenceSettings::from_args(args),
     };
     worker
         .sender
@@ -722,15 +1123,111 @@ fn run_headless_once_inference(args: &AppArgs, image_path: &Path) -> Result<Synt
 
     let _ = worker.sender.send(WorkerCommand::Shutdown);
     match result.expect("result must be set before loop exits") {
-        Ok(Some(mesh)) => Ok(mesh),
+        Ok(Some(asset)) => Ok(asset),
         Ok(None) => Err(format!(
-            "synthesis produced an empty mesh for {}",
+            "synthesis produced an empty asset for {}",
             image_path.display()
         )),
         Err(err) => Err(format!(
             "synthesis inference failed for {}: {err}",
             image_path.display()
         )),
+    }
+}
+
+fn primary_synthesis_model_is_triposplat(args: &AppArgs) -> bool {
+    args.synthesis_models
+        .first()
+        .is_some_and(|model| matches!(model, SynthesisModel::Triposplat))
+}
+
+fn resolve_asset_output_path(args: &AppArgs, image_path: &Path, index: u32) -> Option<PathBuf> {
+    if primary_synthesis_model_is_triposplat(args) {
+        resolve_gaussian_splat_output_path(args.output.as_ref(), image_path, index)
+    } else {
+        resolve_output_path(args.output.as_ref(), image_path, index)
+    }
+}
+
+fn resolve_gaussian_splat_output_path(
+    output: Option<&PathBuf>,
+    image_path: &Path,
+    index: u32,
+) -> Option<PathBuf> {
+    let output = output?;
+    if output.extension().is_none() || output.is_dir() {
+        let dir = output.to_path_buf();
+        let stem = image_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("splats");
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!("_{index}")
+        };
+        return Some(dir.join(format!("{stem}{suffix}.splat")));
+    }
+
+    let output = if is_gaussian_splat_output_path(output) {
+        output.clone()
+    } else {
+        output.with_extension("splat")
+    };
+
+    if index == 0 {
+        return Some(output);
+    }
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("splats");
+    let ext = output
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("splat");
+    Some(parent.join(format!("{stem}_{index}.{ext}")))
+}
+
+fn is_gaussian_splat_output_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.to_ascii_lowercase()),
+        Some(ext) if matches!(ext.as_str(), "splat" | "ply")
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_synthesis_asset(path: &Path, asset: SynthAsset) -> Result<(), String> {
+    match asset {
+        SynthAsset::Mesh(mesh) => write_glb(path, &mesh).map_err(|err| err.to_string()),
+        SynthAsset::GaussianSplat(splats) => write_gaussian_splat_output(path, &splats),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn synth_asset_kind(asset: &SynthAsset) -> &'static str {
+    match asset {
+        SynthAsset::Mesh(_) => "mesh",
+        SynthAsset::GaussianSplat(_) => "gaussian_splat",
+    }
+}
+
+fn write_gaussian_splat_output(path: &Path, splats: &GaussianSplatCloud) -> Result<(), String> {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("splat") => splats.write_splat(path),
+        Some("ply") => splats.write_ply(path),
+        Some(ext) => Err(format!(
+            "Gaussian splat output requires .splat or .ply extension, got .{ext}"
+        )),
+        None => Err("Gaussian splat output requires .splat or .ply extension".to_string()),
     }
 }
 
@@ -741,7 +1238,12 @@ fn configure_mesh_picking(mut settings: ResMut<MeshPickingSettings>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn add_default_plugins(app: &mut App) {
-    app.add_plugins(DefaultPlugins);
+    app.add_plugins(DefaultPlugins.set(AssetPlugin {
+        // Native users and MCP agents spawn generated assets from tmp/run dirs,
+        // desktop file pickers, and cache paths outside Bevy's asset root.
+        unapproved_path_mode: UnapprovedPathMode::Allow,
+        ..default()
+    }));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -814,6 +1316,47 @@ fn parse_quality_override(value: &str) -> Option<QualityPreset> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn parse_triposplat_profile_override(value: &str) -> Option<TripoSplatProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" | "fast" => Some(TripoSplatProfile::Low),
+        "balanced" | "balance" | "default" => Some(TripoSplatProfile::Balanced),
+        "high" | "full" => Some(TripoSplatProfile::High),
+        "custom" => Some(TripoSplatProfile::Custom),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_synthesis_model_override(value: &str) -> Option<SynthesisModel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "triposg" | "tripo" => Some(SynthesisModel::Triposg),
+        "triposplat" | "tripo-splat" | "splat" => Some(SynthesisModel::Triposplat),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_synthesis_models_override(value: &str) -> Option<Vec<SynthesisModel>> {
+    let mut models = Vec::new();
+    for item in value.split(',') {
+        if let Some(model) = parse_synthesis_model_override(item)
+            && !models.contains(&model)
+        {
+            models.push(model);
+        }
+    }
+    (!models.is_empty()).then_some(models)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_rmbg_model_override(value: &str) -> Option<RmbgModel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rmbg14" | "rmbg-1.4" | "bria-rmbg-1.4" => Some(RmbgModel::Rmbg14),
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn apply_quality_override(args: &mut AppArgs, quality: QualityPreset) {
     let defaults = quality.defaults();
     args.quality = quality;
@@ -845,6 +1388,8 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
     }
 
     let mut quality_override: Option<QualityPreset> = None;
+    let mut triposplat_profile_override: Option<TripoSplatProfile> = None;
+    let mut synthesis_models_override: Option<Vec<SynthesisModel>> = None;
     for pair in search.trim_start_matches('?').split('&') {
         if pair.is_empty() {
             continue;
@@ -860,6 +1405,34 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
             if let Some(quality) = parse_quality_override(value) {
                 quality_override = Some(quality);
             }
+            continue;
+        }
+
+        if matches!(key.as_str(), "triposplat_profile" | "splat_profile") {
+            if let Some(profile) = parse_triposplat_profile_override(value) {
+                triposplat_profile_override = Some(profile);
+            }
+            continue;
+        }
+
+        if matches!(key.as_str(), "synthesis_model" | "synthesis")
+            && let Some(model) = parse_synthesis_model_override(value)
+        {
+            synthesis_models_override = Some(vec![model]);
+            continue;
+        }
+
+        if key == "synthesis_models"
+            && let Some(models) = parse_synthesis_models_override(value)
+        {
+            synthesis_models_override = Some(models);
+            continue;
+        }
+
+        if matches!(key.as_str(), "rmbg_model" | "foreground_model")
+            && let Some(model) = parse_rmbg_model_override(value)
+        {
+            args.rmbg_model = model;
             continue;
         }
 
@@ -882,6 +1455,13 @@ fn apply_wasm_url_overrides(args: &mut AppArgs) {
 
     if let Some(quality) = quality_override {
         apply_quality_override(args, quality);
+    }
+    if let Some(profile) = triposplat_profile_override {
+        args.apply_triposplat_profile(profile);
+    }
+    if let Some(models) = synthesis_models_override {
+        args.synthesis_models = models.clone();
+        args.available_synthesis_models = models;
     }
 }
 
@@ -932,7 +1512,7 @@ fn spawn_inference_pause_overlay(commands: &mut Commands) {
                 ..default()
             },
             GlobalZIndex(10_000),
-            BackgroundColor(Color::srgba(0.03, 0.04, 0.06, 0.9)),
+            BackgroundColor(Color::srgba(0.03, 0.04, 0.06, 0.58)),
             Visibility::Hidden,
         ))
         .with_children(|root| {
@@ -956,7 +1536,7 @@ fn spawn_inference_pause_overlay(commands: &mut Commands) {
                     ),
                     TextFont::from_font_size(22.0),
                     TextColor(Color::srgb(0.94, 0.96, 1.0)),
-                    TextLayout::new_with_justify(Justify::Center),
+                    TextLayout::justify(Justify::Center),
                 ));
             });
         });
@@ -969,7 +1549,8 @@ fn initialize_interactive_scene(
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
-    ambient_light: &mut ResMut<AmbientLight>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+    ambient_light: &mut ResMut<GlobalAmbientLight>,
     args: &AppArgs,
     queue: &mut ResMut<InferenceQueue>,
     status: &mut ResMut<UiStatus>,
@@ -979,15 +1560,7 @@ fn initialize_interactive_scene(
 ) {
     let mut camera_transform =
         Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)).looking_at(Vec3::ZERO, Vec3::Y);
-    let mut camera_orbit = PanOrbitCamera {
-        allow_upside_down: true,
-        orbit_smoothness: 0.1,
-        pan_smoothness: 0.1,
-        zoom_smoothness: 0.1,
-        button_orbit: MouseButton::Right,
-        button_pan: MouseButton::Middle,
-        ..default()
-    };
+    let mut camera_orbit = PanOrbitCamera::default();
     if let Some(cached_camera) = cache.cache.camera_state()
         && !apply_cached_camera_state(cached_camera, &mut camera_transform, &mut camera_orbit)
     {
@@ -996,20 +1569,51 @@ fn initialize_interactive_scene(
 
     commands.spawn((
         Camera3d::default(),
+        GaussianCamera::default(),
         camera_transform,
         camera_orbit,
         GizmoCamera,
         MeshPickingCamera,
         RenderLayers::layer(0).with(12),
         MainCamera,
+        EditorCamera,
+        Name::new("editor_camera"),
+    ));
+    commands.spawn((
+        Camera3d::default(),
+        Camera {
+            is_active: false,
+            // bevy_gaussian_splatting extracts inactive GaussianCamera entities too and
+            // requires every GaussianCamera order to be a non-negative camera index.
+            order: 1,
+            ..default()
+        },
+        Projection::Perspective(PerspectiveProjection {
+            fov: 60.0_f32.to_radians(),
+            ..default()
+        }),
+        GaussianCamera::default(),
+        Transform::from_translation(Vec3::new(0.0, 1.5, 0.0))
+            .looking_at(Vec3::new(0.0, 1.5, -1.0), Vec3::Y),
+        SceneRenderCameraTarget {
+            focus: Vec3::new(0.0, 1.5, -1.0),
+        },
+        RenderLayers::layer(0).with(12),
+        SceneRenderCamera,
+        Name::new("scene_render_camera"),
     ));
     spawn_default_lighting(commands, ambient_light);
 
     commands.spawn((
         InfiniteGridBundle {
             settings: InfiniteGridSettings {
-                fadeout_distance: 200.0,
-                ..default()
+                scale: 1.0,
+                fadeout_distance: 90.0,
+                dot_fadeout_strength: 0.22,
+                minor_line_color: Color::srgba(0.32, 0.36, 0.44, 0.24),
+                major_line_color: Color::srgba(0.60, 0.66, 0.76, 0.42),
+                x_axis_color: Color::srgb(0.92, 0.24, 0.22),
+                z_axis_color: Color::srgb(0.20, 0.42, 0.95),
             },
             ..default()
         },
@@ -1017,14 +1621,32 @@ fn initialize_interactive_scene(
         RenderLayers::layer(0),
     ));
 
-    hydrate_from_cache(commands, meshes, images, materials, queue, catalog, cache);
+    hydrate_from_cache(
+        commands,
+        meshes,
+        images,
+        materials,
+        gaussian_clouds,
+        queue,
+        catalog,
+        cache,
+    );
     seed_default_catalog_cube(meshes, materials, queue, catalog, cache);
     world_cache.dirty = false;
     world_cache.timer.reset();
 
     if let Some(mesh_path) = args.mesh.as_ref() {
         if mesh_path.exists() {
-            spawn_mesh_asset(commands, asset_server, materials, mesh_path.clone());
+            if let Err(err) = spawn_mesh_asset(
+                commands,
+                asset_server,
+                meshes,
+                images,
+                materials,
+                mesh_path.clone(),
+            ) {
+                warn!("failed to load mesh path {}: {err}", mesh_path.display());
+            }
         } else {
             warn!("mesh path {:?} does not exist; skipping", mesh_path);
         }
@@ -1046,14 +1668,13 @@ fn setup(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut ambient_light: ResMut<AmbientLight>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    mut ambient_light: ResMut<GlobalAmbientLight>,
     args: Res<AppArgs>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))] shared_wgpu_device: Option<
         Res<SharedWgpuInferenceDevice>,
     >,
-    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<
-        Res<EventLoopProxyWrapper<WakeUp>>,
-    >,
+    #[cfg(not(target_arch = "wasm32"))] event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
@@ -1094,6 +1715,7 @@ fn setup(
         &mut meshes,
         &mut images,
         &mut materials,
+        &mut gaussian_clouds,
         &mut ambient_light,
         args.as_ref(),
         &mut queue,
@@ -1105,16 +1727,22 @@ fn setup(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn setup(mut commands: Commands, args: Res<AppArgs>, mut status: ResMut<UiStatus>) {
+fn setup(
+    mut commands: Commands,
+    args: Res<AppArgs>,
+    mut status: ResMut<UiStatus>,
+    mut startup: ResMut<WasmStartupGate>,
+) {
     info!("bevy_synth args: {:?}", *args);
-    wasm_set_warmup_state("idle");
-    wasm_set_warmup_message("Initializing wasm runtime...");
+    wasm_set_warmup_state("ready");
+    wasm_set_warmup_message("App ready. Open or drop an image to run inference.");
 
     let worker = start_worker(args.as_ref());
     commands.insert_resource(worker);
 
-    status.worker_message = Some("Initializing wasm runtime...".to_string());
-    status.message = "Initializing wasm runtime...".to_string();
+    startup.model_ready = true;
+    status.worker_message = None;
+    status.message = "upload an image (.png/.jpg) to begin.".to_string();
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1161,7 +1789,8 @@ fn finish_wasm_startup_when_models_ready(
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut ambient_light: ResMut<AmbientLight>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    mut ambient_light: ResMut<GlobalAmbientLight>,
     args: Res<AppArgs>,
     mut queue: ResMut<InferenceQueue>,
     mut status: ResMut<UiStatus>,
@@ -1179,6 +1808,7 @@ fn finish_wasm_startup_when_models_ready(
         &mut meshes,
         &mut images,
         &mut materials,
+        &mut gaussian_clouds,
         &mut ambient_light,
         args.as_ref(),
         &mut queue,
@@ -1194,7 +1824,7 @@ fn finish_wasm_startup_when_models_ready(
     }
 }
 
-fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLight) {
+fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut GlobalAmbientLight) {
     // Keep a modest ambient base and drive shape with a single sun + soft point fills.
     // Web targets commonly support only one directional light in forward mode.
     ambient_light.color = Color::srgb(0.86, 0.9, 0.96);
@@ -1204,7 +1834,7 @@ fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLi
         DirectionalLight {
             color: Color::srgb(1.0, 0.98, 0.95),
             illuminance: 24_000.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             // Slightly higher bias to reduce self-shadow acne on simple hard-edge meshes (e.g. cube).
             shadow_depth_bias: 0.24,
             shadow_normal_bias: 1.8,
@@ -1257,11 +1887,24 @@ fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut AmbientLi
     ));
 }
 
+#[derive(Clone)]
+enum CachedAssetHandles {
+    Mesh {
+        mesh: Handle<BevyMesh>,
+        material: Handle<StandardMaterial>,
+    },
+    GaussianSplat {
+        cloud: Handle<PlanarGaussian3d>,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
 fn hydrate_from_cache(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
     queue: &mut ResMut<InferenceQueue>,
     catalog: &mut ResMut<CatalogState>,
     cache: &mut ResMut<MeshCacheResource>,
@@ -1274,92 +1917,368 @@ fn hydrate_from_cache(
         warn!("failed to refresh built-in cube cache entry: {err}");
     }
 
-    let mesh_entries = cache.cache.mesh_entries().to_vec();
+    let asset_entries = cache.cache.asset_entries().to_vec();
     let world_items = cache.cache.world_items().to_vec();
-    if mesh_entries.is_empty() && world_items.is_empty() {
-        return;
-    }
+    let scene_entries = cache.cache.scene_entries().to_vec();
 
-    let mut loaded_meshes = 0usize;
+    let mut loaded_assets = 0usize;
     let mut loaded_world_items = 0usize;
-    let mut handles_by_key: HashMap<String, (Handle<BevyMesh>, Handle<StandardMaterial>)> =
-        HashMap::new();
+    let mut loaded_scenes = 0usize;
+    let mut handles_by_key: HashMap<String, CachedAssetHandles> = HashMap::new();
 
-    for metadata in mesh_entries {
-        let mesh = match cache.cache.load_mesh(&metadata.cache_key) {
-            Ok(Some(mesh)) => mesh,
+    for metadata in asset_entries {
+        let asset = match cache.cache.load_asset(&metadata.cache_key) {
+            Ok(Some(asset)) => asset,
             Ok(None) => {
                 warn!(
-                    "cache metadata exists for key {} but mesh payload is missing.",
+                    "cache metadata exists for key {} but asset payload is missing.",
                     metadata.cache_key
                 );
                 continue;
             }
             Err(err) => {
                 warn!(
-                    "failed to load cached mesh for key {}: {err}",
+                    "failed to load cached asset for key {}: {err}",
                     metadata.cache_key
                 );
                 continue;
             }
         };
 
-        let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
-        let material = if metadata.source_image_path == BUILTIN_CUBE_SOURCE_IMAGE {
-            materials.add(default_cube_material())
-        } else {
-            materials.add(standard_material_for_inference(&mesh, images.as_mut()))
+        let Some(handles) =
+            cached_asset_handles(asset, &metadata, meshes, images, materials, gaussian_clouds)
+        else {
+            continue;
         };
-        handles_by_key.insert(
-            metadata.cache_key.clone(),
-            (mesh_handle.clone(), material.clone()),
-        );
+        handles_by_key.insert(metadata.cache_key.clone(), handles.clone());
 
         let entry_id = queue.counter;
         queue.counter = queue.counter.wrapping_add(1);
-        catalog.add_ready(
-            entry_id,
-            metadata.label.clone(),
-            mesh_handle,
-            material,
-            Some(metadata.source_image_path.clone()),
-            Some(metadata.cache_key.clone()),
-        );
-        loaded_meshes += 1;
+        match handles {
+            CachedAssetHandles::Mesh { mesh, material } => {
+                catalog.add_ready(
+                    entry_id,
+                    metadata.label.clone(),
+                    mesh,
+                    material,
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+            CachedAssetHandles::GaussianSplat { cloud } => {
+                catalog.add_ready_gaussian_splat(
+                    entry_id,
+                    metadata.label.clone(),
+                    cloud,
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+        }
+        let source_image = cached_source_image_handle(&cache.cache, &metadata, images.as_mut());
+        catalog.set_source_image(entry_id, source_image);
+        loaded_assets += 1;
     }
 
-    for item in world_items {
-        let Some((mesh, material)) = handles_by_key.get(&item.cache_key) else {
+    for item in &world_items {
+        let Some(handles) = handles_by_key.get(&item.cache_key) else {
             warn!(
                 "skipping cached world item for unknown cache key {}",
                 item.cache_key
             );
             continue;
         };
-        let Some(transform) = transform_from_cached_world_item(&item) else {
+        let Some(transform) = transform_from_cached_world_item(item) else {
             warn!(
                 "skipping cached world item with invalid transform for key {}",
                 item.cache_key
             );
             continue;
         };
-        spawn_mesh_instance(
+        spawn_cached_asset_instance(
             commands,
-            mesh.clone(),
-            material.clone(),
+            handles,
             transform,
             Some(item.cache_key.clone()),
+            None,
         );
         loaded_world_items += 1;
     }
 
-    if loaded_meshes > 0 {
-        queue.completed = queue.completed.max(loaded_meshes);
-    }
-    if loaded_meshes > 0 || loaded_world_items > 0 {
-        info!(
-            "loaded {loaded_meshes} cached catalog mesh(es) and {loaded_world_items} cached world item(s)."
+    catalog.upsert_unsaved_scene(
+        scene_preview_items_from_world(&world_items, &handles_by_key),
+        None,
+    );
+
+    for metadata in scene_entries {
+        let payload = match cache.cache.load_scene(&metadata.scene_key) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => {
+                warn!(
+                    "scene metadata exists for key {} but scene payload is missing.",
+                    metadata.scene_key
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!("failed to load cached scene {}: {err}", metadata.scene_key);
+                continue;
+            }
+        };
+        let scene_items = scene_preview_items_from_world(&payload.world_items, &handles_by_key);
+        let source_image =
+            cached_scene_source_image_handle(&cache.cache, &metadata, images.as_mut());
+        let entry_id = queue.counter;
+        queue.counter = queue.counter.wrapping_add(1);
+        catalog.add_ready_scene(
+            entry_id,
+            metadata.label.clone(),
+            Some(metadata.scene_key.clone()),
+            scene_items,
+            Some(metadata.source_scene_path.clone()),
+            source_image,
+            Some(metadata.pipeline.clone()),
+            metadata.metrics.clone(),
+            metadata.artifact_dir.clone(),
         );
+        loaded_scenes += 1;
+    }
+
+    if loaded_assets > 0 {
+        queue.completed = queue.completed.max(loaded_assets);
+    }
+    if loaded_assets > 0 || loaded_world_items > 0 || loaded_scenes > 0 {
+        info!(
+            "loaded {loaded_assets} cached catalog asset(s), {loaded_world_items} cached world item(s), and {loaded_scenes} cached scene(s)."
+        );
+    }
+}
+
+fn scene_preview_items_from_world(
+    world_items: &[CachedWorldItem],
+    handles_by_key: &HashMap<String, CachedAssetHandles>,
+) -> Vec<CatalogScenePreviewItem> {
+    world_items
+        .iter()
+        .filter_map(|item| {
+            let handles = handles_by_key.get(&item.cache_key)?;
+            let transform = transform_from_cached_world_item(item)?;
+            let asset = match handles {
+                CachedAssetHandles::Mesh { mesh, material } => CatalogSpawnAsset::Mesh {
+                    mesh: mesh.clone(),
+                    material: material.clone(),
+                },
+                CachedAssetHandles::GaussianSplat { cloud } => CatalogSpawnAsset::GaussianSplat {
+                    cloud: cloud.clone(),
+                },
+            };
+            Some(CatalogScenePreviewItem { asset, transform })
+        })
+        .collect()
+}
+
+fn unique_world_asset_count(world_items: &[CachedWorldItem]) -> usize {
+    let mut keys = Vec::<&str>::new();
+    for item in world_items {
+        if !keys.contains(&item.cache_key.as_str()) {
+            keys.push(item.cache_key.as_str());
+        }
+    }
+    keys.len()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_cached_asset_handles_by_key(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+) -> HashMap<String, CachedAssetHandles> {
+    let metadata_by_key = cache
+        .asset_entries()
+        .iter()
+        .cloned()
+        .map(|metadata| (metadata.cache_key.clone(), metadata))
+        .collect::<HashMap<_, _>>();
+    let mut handles_by_key = HashMap::new();
+    for item in world_items {
+        if handles_by_key.contains_key(&item.cache_key) {
+            continue;
+        }
+        let Some(metadata) = metadata_by_key.get(&item.cache_key) else {
+            warn!(
+                "scene item skipped: cache metadata missing for {}",
+                item.cache_key
+            );
+            continue;
+        };
+        let asset = match cache.load_asset(&item.cache_key) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                warn!(
+                    "scene item skipped: asset payload missing for {}",
+                    item.cache_key
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    "scene item skipped: failed to load {}: {err}",
+                    item.cache_key
+                );
+                continue;
+            }
+        };
+        if let Some(handles) =
+            cached_asset_handles(asset, metadata, meshes, images, materials, gaussian_clouds)
+        {
+            handles_by_key.insert(item.cache_key.clone(), handles);
+        }
+    }
+    handles_by_key
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_object_catalog_entries_for_scene(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    handles_by_key: &HashMap<String, CachedAssetHandles>,
+    catalog: &mut CatalogState,
+    queue: &mut InferenceQueue,
+    images: &mut Assets<Image>,
+) {
+    let metadata_by_key = cache
+        .asset_entries()
+        .iter()
+        .map(|metadata| (metadata.cache_key.as_str(), metadata))
+        .collect::<HashMap<_, _>>();
+    for item in world_items {
+        if catalog.has_object_cache_key(&item.cache_key) {
+            continue;
+        }
+        let Some(metadata) = metadata_by_key.get(item.cache_key.as_str()) else {
+            continue;
+        };
+        let Some(handles) = handles_by_key.get(&item.cache_key) else {
+            continue;
+        };
+        let source_image = cached_source_image_handle(cache, metadata, images);
+        let id = queue.counter;
+        queue.counter = queue.counter.wrapping_add(1);
+        match handles {
+            CachedAssetHandles::Mesh { mesh, material } => {
+                catalog.add_ready(
+                    id,
+                    metadata.label.clone(),
+                    mesh.clone(),
+                    material.clone(),
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+            CachedAssetHandles::GaussianSplat { cloud } => {
+                catalog.add_ready_gaussian_splat(
+                    id,
+                    metadata.label.clone(),
+                    cloud.clone(),
+                    Some(metadata.source_image_path.clone()),
+                    Some(metadata.cache_key.clone()),
+                );
+            }
+        }
+        catalog.set_source_image(id, source_image);
+    }
+}
+
+fn cached_asset_handles(
+    asset: SynthAsset,
+    metadata: &CachedMeshMetadata,
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+) -> Option<CachedAssetHandles> {
+    match asset {
+        SynthAsset::Mesh(mesh) => {
+            let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
+            let material = if metadata.source_image_path == BUILTIN_CUBE_SOURCE_IMAGE {
+                materials.add(default_cube_material())
+            } else {
+                materials.add(standard_material_for_inference(&mesh, images.as_mut()))
+            };
+            Some(CachedAssetHandles::Mesh {
+                mesh: mesh_handle,
+                material,
+            })
+        }
+        SynthAsset::GaussianSplat(splats) => {
+            match gaussian_splat_cloud_handle(&splats, gaussian_clouds) {
+                Ok(cloud) => Some(CachedAssetHandles::GaussianSplat { cloud }),
+                Err(err) => {
+                    warn!(
+                        "failed to build cached TripoSplat Gaussian cloud for key {}: {err}",
+                        metadata.cache_key
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn cached_source_image_handle(
+    cache: &MeshCache,
+    metadata: &CachedMeshMetadata,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    match cache.load_source_image(metadata) {
+        Ok(Some(source)) => match image_bytes_to_bevy_image(source.bytes.as_slice()) {
+            Ok(image) => Some(images.add(image)),
+            Err(err) => {
+                warn!(
+                    "failed to decode cached source image for key {}: {err}",
+                    metadata.cache_key
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                "failed to load cached source image for key {}: {err}",
+                metadata.cache_key
+            );
+            None
+        }
+    }
+}
+
+fn cached_scene_source_image_handle(
+    cache: &MeshCache,
+    metadata: &CachedSceneMetadata,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    match cache.load_scene_source_image(metadata) {
+        Ok(Some(source)) => match image_bytes_to_bevy_image(source.bytes.as_slice()) {
+            Ok(image) => Some(images.add(image)),
+            Err(err) => {
+                warn!(
+                    "failed to decode cached scene source image for key {}: {err}",
+                    metadata.scene_key
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                "failed to load cached scene source image for key {}: {err}",
+                metadata.scene_key
+            );
+            None
+        }
     }
 }
 
@@ -1498,6 +2417,7 @@ fn transform_from_cached_world_item(item: &CachedWorldItem) -> Option<Transform>
 fn camera_state_from_components(
     transform: &Transform,
     orbit: &PanOrbitCamera,
+    projection: Option<&Projection>,
 ) -> Option<CachedCameraState> {
     let translation = transform.translation;
     let rotation = if transform.rotation.length_squared() > 0.0 {
@@ -1527,6 +2447,52 @@ fn camera_state_from_components(
         yaw,
         pitch,
         radius,
+        vertical_fov_degrees: projection.and_then(|projection| match projection {
+            Projection::Perspective(perspective) => Some(perspective.fov.to_degrees()),
+            _ => None,
+        }),
+    })
+}
+
+fn camera_state_from_scene_components(
+    transform: &Transform,
+    target: &SceneRenderCameraTarget,
+    projection: Option<&Projection>,
+) -> Option<CachedCameraState> {
+    let translation = transform.translation;
+    let rotation = if transform.rotation.length_squared() > 0.0 {
+        transform.rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let focus = target.focus;
+    let delta = translation - focus;
+    let radius = delta.length();
+    if !translation.is_finite()
+        || !rotation.is_finite()
+        || !focus.is_finite()
+        || !radius.is_finite()
+        || radius <= 0.0
+    {
+        return None;
+    }
+    let yaw = delta.x.atan2(delta.z);
+    let pitch = (delta.y / radius).clamp(-1.0, 1.0).asin();
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return None;
+    }
+
+    Some(CachedCameraState {
+        translation: translation.to_array(),
+        rotation: rotation.to_array(),
+        focus: focus.to_array(),
+        yaw,
+        pitch,
+        radius,
+        vertical_fov_degrees: projection.and_then(|projection| match projection {
+            Projection::Perspective(perspective) => Some(perspective.fov.to_degrees()),
+            _ => None,
+        }),
     })
 }
 
@@ -1573,6 +2539,7 @@ fn apply_cached_camera_state(
     orbit.target_pitch = state.pitch;
     orbit.radius = Some(state.radius);
     orbit.target_radius = state.radius;
+    orbit.initialized = true;
     true
 }
 
@@ -1580,8 +2547,10 @@ fn handle_open_file_dialog(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
     exit_state: Res<ExitState>,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    if exit_state.requested {
+    if exit_state.requested || interaction_lock.locked || read_only.enabled {
         return;
     }
     let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
@@ -1605,18 +2574,44 @@ fn handle_file_dialog_loads(
     mut events: MessageReader<DialogFileLoaded<ImagePickDialog>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut queue: ResMut<InferenceQueue>,
     args: Res<AppArgs>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
+    scene_settings: Res<ScenePipelineUiSettings>,
+    #[cfg(not(target_arch = "wasm32"))] mut pending_scene_build: ResMut<PendingSceneBuild>,
     exit_state: Res<ExitState>,
+    mut processing: ResMut<SceneProcessingState>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
         return;
     }
+    if interaction_lock.locked || read_only.enabled {
+        for _ in events.read() {}
+        return;
+    }
     let mut queued = 0usize;
     for event in events.read() {
+        if catalog.active_mode() == CatalogMode::Scene {
+            queued += ingest_scene_candidate_file(
+                event.path(),
+                &event.file_name,
+                event.contents.as_slice(),
+                &args,
+                &scene_settings,
+                &mut status,
+                &mut processing,
+                &mut interaction_lock,
+                #[cfg(not(target_arch = "wasm32"))]
+                pending_scene_build.as_mut(),
+            );
+            continue;
+        }
         queued += ingest_candidate_file(
             event.path(),
             &event.file_name,
@@ -1626,6 +2621,8 @@ fn handle_file_dialog_loads(
             &mut catalog,
             &mut commands,
             &asset_server,
+            &mut meshes,
+            &mut images,
             &mut materials,
             "selected file",
         );
@@ -1641,18 +2638,44 @@ fn handle_dropped_files(
     mut events: MessageReader<DialogFileDropped<ImagePickDialog>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut queue: ResMut<InferenceQueue>,
     args: Res<AppArgs>,
     mut status: ResMut<UiStatus>,
     mut catalog: ResMut<CatalogState>,
+    scene_settings: Res<ScenePipelineUiSettings>,
+    #[cfg(not(target_arch = "wasm32"))] mut pending_scene_build: ResMut<PendingSceneBuild>,
     exit_state: Res<ExitState>,
+    mut processing: ResMut<SceneProcessingState>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
         return;
     }
+    if interaction_lock.locked || read_only.enabled {
+        for _ in events.read() {}
+        return;
+    }
     let mut queued = 0usize;
     for event in events.read() {
+        if catalog.active_mode() == CatalogMode::Scene {
+            queued += ingest_scene_candidate_file(
+                event.path(),
+                &event.file_name,
+                event.contents.as_slice(),
+                &args,
+                &scene_settings,
+                &mut status,
+                &mut processing,
+                &mut interaction_lock,
+                #[cfg(not(target_arch = "wasm32"))]
+                pending_scene_build.as_mut(),
+            );
+            continue;
+        }
         queued += ingest_candidate_file(
             event.path(),
             &event.file_name,
@@ -1662,6 +2685,8 @@ fn handle_dropped_files(
             &mut catalog,
             &mut commands,
             &asset_server,
+            &mut meshes,
+            &mut images,
             &mut materials,
             "dropped file",
         );
@@ -1669,6 +2694,478 @@ fn handle_dropped_files(
     if queued > 0 {
         update_status_message(&args, &queue, &mut status);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_scene_save_requests(
+    mut requests: MessageReader<SceneSaveRequest>,
+    mut commands: Commands,
+    mut cache: ResMut<MeshCacheResource>,
+    mut catalog: ResMut<CatalogState>,
+    mut queue: ResMut<InferenceQueue>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    cached_query: Query<(&CachedMeshInstance, &Transform)>,
+    camera_query: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
+    mut pending_bsn: ResMut<PendingSceneBsnSave>,
+    mut status: ResMut<UiStatus>,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
+) {
+    let mut last_request = None;
+    for request in requests.read() {
+        last_request = Some(request.kind);
+    }
+    if interaction_lock.locked || read_only.enabled {
+        if read_only.enabled && last_request.is_some() {
+            status.message = "read-only scene: save/export disabled.".to_string();
+        }
+        return;
+    }
+    let Some(kind) = last_request else {
+        return;
+    };
+
+    let (world_items, _) = collect_cached_world_items(&cached_query);
+    let camera_state = camera_query
+        .single()
+        .ok()
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
+
+    match kind {
+        SceneSaveKind::Catalog => {
+            if world_items.is_empty() {
+                status.message = "scene catalog save skipped: scene is empty.".to_string();
+                warn!("{}", status.message);
+                return;
+            }
+            let label = format!("scene {}", unix_seconds_run_id());
+            #[cfg(not(target_arch = "wasm32"))]
+            let bsn = {
+                scene_bsn_export_for_world(&cache.cache, &world_items, camera_state.clone())
+                    .ok()
+                    .map(|(bsn, _)| bsn)
+            };
+            #[cfg(target_arch = "wasm32")]
+            let bsn: Option<String> = None;
+            let payload = CachedScenePayload {
+                world_items: world_items.clone(),
+                camera: camera_state.clone(),
+                bsn,
+                asset_bindings: None,
+                e2e_summary: None,
+                response_summary: Some(serde_json::json!({
+                    "source": "bevy_synth_manual_snapshot",
+                    "label": label,
+                })),
+            };
+            let metrics = CachedSceneMetrics {
+                ok: Some(true),
+                object_count: Some(world_items.len()),
+                asset_count: Some(unique_world_asset_count(&world_items)),
+                placement_count: Some(world_items.len()),
+                ..default()
+            };
+            let metadata = match cache.cache.upsert_scene_snapshot(
+                Path::new("current_scene"),
+                None,
+                label,
+                "manual",
+                &payload,
+                None,
+                Some(metrics),
+            ) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    status.message = format!("scene catalog save failed: {err}");
+                    warn!("{}", status.message);
+                    return;
+                }
+            };
+            let handles_by_key = load_cached_asset_handles_by_key(
+                &cache.cache,
+                &world_items,
+                &mut meshes,
+                &mut images,
+                &mut materials,
+                &mut gaussian_clouds,
+            );
+            let scene_items = scene_preview_items_from_world(&world_items, &handles_by_key);
+            let source_image =
+                cached_scene_source_image_handle(&cache.cache, &metadata, images.as_mut());
+            let id = queue.counter;
+            queue.counter = queue.counter.wrapping_add(1);
+            catalog.add_ready_scene(
+                id,
+                metadata.label.clone(),
+                Some(metadata.scene_key.clone()),
+                scene_items,
+                Some(metadata.source_scene_path.clone()),
+                source_image,
+                Some(metadata.pipeline.clone()),
+                metadata.metrics.clone(),
+                metadata.artifact_dir.clone(),
+            );
+            status.message = format!("saved {} to scene catalog.", metadata.label);
+        }
+        SceneSaveKind::Bsn => {
+            #[cfg(not(target_arch = "wasm32"))]
+            match scene_bsn_export_for_world(&cache.cache, &world_items, camera_state) {
+                Ok((bsn, assets_json)) => {
+                    pending_bsn.assets_json = Some(assets_json);
+                    commands
+                        .dialog()
+                        .set_title("save scene")
+                        .set_file_name("scene.bsn")
+                        .add_filter("BSN scene", &["bsn"])
+                        .save_file::<SceneBsnSaveDialog>(bsn.into_bytes());
+                }
+                Err(err) => {
+                    pending_bsn.assets_json = None;
+                    status.message = format!("scene save failed: {err}");
+                    warn!("{}", status.message);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = camera_state;
+                pending_bsn.assets_json = None;
+                status.message =
+                    "BSN scene save requires native sidecar file support; export GLB instead."
+                        .to_string();
+                warn!("{}", status.message);
+            }
+        }
+        SceneSaveKind::Glb => match scene_glb_export_for_world(&cache.cache, &world_items) {
+            Ok(glb) => {
+                commands
+                    .dialog()
+                    .set_title("export scene")
+                    .set_file_name("scene.glb")
+                    .add_filter("GLB scene", &["glb"])
+                    .save_file::<SceneGlbSaveDialog>(glb);
+            }
+            Err(err) => {
+                status.message = format!("GLB export failed: {err}");
+                warn!("{}", status.message);
+            }
+        },
+    }
+}
+
+fn handle_scene_bsn_save_results(
+    mut saved: MessageReader<DialogFileSaved<SceneBsnSaveDialog>>,
+    mut canceled: MessageReader<DialogFileSaveCanceled<SceneBsnSaveDialog>>,
+    mut pending: ResMut<PendingSceneBsnSave>,
+    mut status: ResMut<UiStatus>,
+) {
+    let mut canceled_any = false;
+    for _ in canceled.read() {
+        canceled_any = true;
+    }
+    if canceled_any {
+        pending.assets_json = None;
+        status.message = "scene save canceled.".to_string();
+    }
+
+    for event in saved.read() {
+        match &event.result {
+            Ok(()) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(path) = event.path()
+                    && let Some(assets_json) = pending.assets_json.take()
+                {
+                    let sidecar = scene_assets_sidecar_path(path);
+                    if let Err(err) = fs::write(&sidecar, assets_json) {
+                        status.message = format!(
+                            "saved {}, but failed to write {}: {err}",
+                            event.file_name,
+                            sidecar.display()
+                        );
+                        warn!("{}", status.message);
+                        continue;
+                    }
+                    status.message = format!(
+                        "saved {} and {}.",
+                        event.file_name,
+                        sidecar
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("scene.assets.json")
+                    );
+                    continue;
+                }
+                pending.assets_json = None;
+                status.message = format!("saved {}.", event.file_name);
+            }
+            Err(err) => {
+                pending.assets_json = None;
+                status.message = format!("scene save failed: {err}");
+                warn!("{}", status.message);
+            }
+        }
+    }
+}
+
+fn handle_scene_glb_save_results(
+    mut saved: MessageReader<DialogFileSaved<SceneGlbSaveDialog>>,
+    mut canceled: MessageReader<DialogFileSaveCanceled<SceneGlbSaveDialog>>,
+    mut status: ResMut<UiStatus>,
+) {
+    for _ in canceled.read() {
+        status.message = "GLB export canceled.".to_string();
+    }
+    for event in saved.read() {
+        match &event.result {
+            Ok(()) => {
+                status.message = format!("exported {}.", event.file_name);
+            }
+            Err(err) => {
+                status.message = format!("GLB export failed: {err}");
+                warn!("{}", status.message);
+            }
+        }
+    }
+}
+
+pub(crate) fn scene_glb_export_for_world(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+) -> Result<Vec<u8>, String> {
+    if world_items.is_empty() {
+        return Err("scene is empty".to_string());
+    }
+
+    let mut instances = Vec::with_capacity(world_items.len());
+    for (index, item) in world_items.iter().enumerate() {
+        let asset = cache
+            .load_asset(&item.cache_key)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("cache entry {} is missing its payload", item.cache_key))?;
+        match asset {
+            SynthAsset::Mesh(mesh) => {
+                instances.push(SceneGlbMeshInstance {
+                    name: scene_entity_name(index, &item.cache_key),
+                    mesh,
+                    translation: item.translation,
+                    rotation: item.rotation,
+                    scale: item.scale,
+                });
+            }
+            SynthAsset::GaussianSplat(_) => {
+                return Err(
+                    "GLB export currently supports mesh scenes only; use BSN for splats."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    scene_meshes_to_glb_bytes(&instances).map_err(|err| err.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scene_bsn_export_for_world(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    camera_state: Option<CachedCameraState>,
+) -> Result<(String, Vec<u8>), String> {
+    if world_items.is_empty() {
+        return Err("scene is empty".to_string());
+    }
+
+    let (assets, asset_ids) = scene_asset_bindings_for_world(cache, world_items)?;
+    let mut bsn = String::from("synth_scene_v1 {\n");
+    for asset in &assets {
+        bsn.push_str(&format!(
+            "asset {} = \"cache:{}\";\n",
+            asset.asset_id,
+            asset
+                .cache_key
+                .as_deref()
+                .unwrap_or(asset.asset_id.as_str())
+        ));
+    }
+    for (index, item) in world_items.iter().enumerate() {
+        let asset_id = asset_ids
+            .get(&item.cache_key)
+            .ok_or_else(|| format!("missing scene asset id for {}", item.cache_key))?;
+        bsn.push_str(&format!(
+            "spawn {} uses {} translation [{}] rotation_y {} scale [{}];\n",
+            scene_entity_name(index, &item.cache_key),
+            asset_id,
+            fmt_scene_vec3(item.translation),
+            fmt_scene_f32(rotation_y_degrees_from_quat(item.rotation)),
+            fmt_scene_vec3(item.scale)
+        ));
+    }
+    if let Some(camera) = camera_state.map(scene_camera_from_cached_state) {
+        bsn.push_str(&format!(
+            "camera translation [{}] focus [{}] yaw {} pitch {} radius {};\n",
+            fmt_scene_vec3(camera.translation),
+            fmt_scene_vec3(camera.focus),
+            fmt_scene_f32(camera.yaw.unwrap_or(0.0)),
+            fmt_scene_f32(camera.pitch.unwrap_or(0.0)),
+            fmt_scene_f32(camera.radius.unwrap_or(0.0))
+        ));
+    }
+    bsn.push_str("}\n");
+
+    parse_scene_bsn(&bsn, &assets).map_err(|err| err.to_string())?;
+    let assets_json = serde_json::to_vec_pretty(&assets).map_err(|err| err.to_string())?;
+    Ok((bsn, assets_json))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_asset_bindings_for_world(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+) -> Result<(Vec<SceneAssetBinding>, HashMap<String, String>), String> {
+    let mut assets = Vec::new();
+    let mut asset_ids = HashMap::new();
+    for item in world_items {
+        if asset_ids.contains_key(&item.cache_key) {
+            continue;
+        }
+        let metadata = cache
+            .asset_entries()
+            .iter()
+            .find(|entry| entry.cache_key == item.cache_key)
+            .ok_or_else(|| format!("cache entry {} is missing metadata", item.cache_key))?;
+        let mut asset_id = format!("asset_{}", sanitize_scene_identifier(&item.cache_key));
+        if asset_ids.values().any(|existing| existing == &asset_id) {
+            asset_id = format!("{asset_id}_{}", assets.len() + 1);
+        }
+        asset_ids.insert(item.cache_key.clone(), asset_id.clone());
+        assets.push(SceneAssetBinding {
+            asset_id,
+            object_id: sanitize_scene_identifier(&metadata.label),
+            label: metadata.label.clone(),
+            aliases: Vec::new(),
+            path: None,
+            cache_key: Some(metadata.cache_key.clone()),
+            reusable: true,
+            source_image_path: Some(metadata.source_image_path.clone()),
+            pipeline: Some(scene_pipeline_label(metadata.asset_kind).to_string()),
+            local_aabb: metadata.local_aabb.map(scene_aabb_from_cached),
+            canonical_frame: metadata.canonical_frame.map(scene_frame_from_cached),
+            provenance: None,
+        });
+    }
+    Ok((assets, asset_ids))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_pipeline_label(kind: CachedAssetKind) -> &'static str {
+    match kind {
+        CachedAssetKind::Mesh => "mesh",
+        CachedAssetKind::GaussianSplat => "gaussian_splat",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_aabb_from_cached(aabb: bevy_synth_runtime::cache::CachedAssetAabb) -> SceneAssetAabb {
+    SceneAssetAabb {
+        min: aabb.min,
+        max: aabb.max,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_frame_from_cached(frame: CachedAssetFrame) -> SceneAssetFrame {
+    SceneAssetFrame {
+        yaw_offset_degrees: frame.yaw_offset_degrees,
+        footprint_m: frame.footprint_m,
+        symmetry: None,
+        confidence: None,
+        source: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_camera_from_cached_state(camera: CachedCameraState) -> SceneCamera {
+    SceneCamera {
+        translation: camera.translation,
+        focus: camera.focus,
+        yaw: Some(camera.yaw.to_degrees()),
+        pitch: Some(camera.pitch.to_degrees()),
+        radius: Some(camera.radius),
+        vertical_fov_degrees: camera.vertical_fov_degrees,
+    }
+}
+
+fn scene_entity_name(index: usize, cache_key: &str) -> String {
+    format!(
+        "item_{:03}_{}",
+        index + 1,
+        sanitize_scene_identifier(cache_key)
+    )
+}
+
+fn sanitize_scene_identifier(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().max(1));
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("asset");
+    }
+    if out
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        out.insert_str(0, "id_");
+    }
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rotation_y_degrees_from_quat(rotation: [f32; 4]) -> f32 {
+    if rotation.iter().any(|value| !value.is_finite()) {
+        return 0.0;
+    }
+    let quat = Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
+    let quat = if quat.length_squared() > 0.0 {
+        quat.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let (yaw, _, _) = quat.to_euler(EulerRot::YXZ);
+    yaw.to_degrees()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_scene_vec3(value: [f32; 3]) -> String {
+    value.map(fmt_scene_f32).join(",")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fmt_scene_f32(value: f32) -> String {
+    let value = if value.abs() < 1.0e-6 { 0.0 } else { value };
+    let mut out = format!("{value:.6}");
+    while out.contains('.') && out.ends_with('0') {
+        out.pop();
+    }
+    if out.ends_with('.') {
+        out.pop();
+    }
+    if out == "-0" { "0".to_string() } else { out }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_assets_sidecar_path(path: &Path) -> PathBuf {
+    path.with_extension("assets.json")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1681,6 +3178,8 @@ fn ingest_candidate_file(
     catalog: &mut CatalogState,
     commands: &mut Commands,
     asset_server: &AssetServer,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     source_label: &str,
 ) -> usize {
@@ -1692,8 +3191,17 @@ fn ingest_candidate_file(
             return 1;
         }
         if is_mesh_file(path) {
-            spawn_mesh_asset(commands, asset_server, materials, path.to_path_buf());
-            info!("loaded mesh asset {}", path.display());
+            match spawn_mesh_asset(
+                commands,
+                asset_server,
+                meshes,
+                images,
+                materials,
+                path.to_path_buf(),
+            ) {
+                Ok(_) => info!("loaded mesh asset {}", path.display()),
+                Err(err) => warn!("failed to load mesh asset {}: {err}", path.display()),
+            }
             return 0;
         }
         warn!(
@@ -1737,21 +3245,448 @@ fn virtual_upload_path(file_name: &str, request_id: u32) -> PathBuf {
     PathBuf::from(format!("uploaded/{request_id:03}_{sanitized}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+fn ingest_scene_candidate_file(
+    path: Option<&Path>,
+    file_name: &str,
+    contents: &[u8],
+    args: &AppArgs,
+    scene_settings: &ScenePipelineUiSettings,
+    status: &mut UiStatus,
+    processing: &mut SceneProcessingState,
+    interaction_lock: &mut SceneInteractionLock,
+    pending: &mut PendingSceneBuild,
+) -> usize {
+    if pending.receiver.is_some() {
+        status.message = "scene build already running.".to_string();
+        return 0;
+    }
+    let source_path = match scene_source_path_for_input(path, file_name, contents) {
+        Ok(path) => path,
+        Err(err) => {
+            status.message = format!("scene input rejected: {err}");
+            warn!("{}", status.message);
+            return 0;
+        }
+    };
+    if !is_image_file(&source_path) {
+        status.message = "scene catalog accepts source images only.".to_string();
+        warn!("{}", status.message);
+        return 0;
+    }
+
+    let source_bytes = if contents.is_empty() {
+        fs::read(&source_path).ok()
+    } else {
+        Some(contents.to_vec())
+    };
+    let settings = scene_settings.clone();
+    let app_args = args.clone();
+    let source_path_for_thread = source_path.clone();
+    let (sender, receiver) = mpsc::channel();
+    let (progress_sender, progress_receiver) = mpsc::channel();
+    pending.receiver = Some(Mutex::new(receiver));
+    pending.progress_receiver = Some(Mutex::new(progress_receiver));
+    interaction_lock.set(true, Some("building scene".to_string()));
+    let source_label = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string();
+    processing.begin(source_label.clone());
+    status.worker_message = Some(format!("scene build queued: {source_label}"));
+    status.message = status.worker_message.clone().unwrap_or_default();
+    std::thread::spawn(move || {
+        let result = run_scene_build_for_ui(
+            source_path_for_thread,
+            source_bytes,
+            app_args,
+            settings,
+            progress_sender,
+        );
+        let _ = sender.send(result);
+    });
+    1
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "wasm32")]
+fn ingest_scene_candidate_file(
+    _path: Option<&Path>,
+    _file_name: &str,
+    _contents: &[u8],
+    _args: &AppArgs,
+    _scene_settings: &ScenePipelineUiSettings,
+    status: &mut UiStatus,
+    _processing: &mut SceneProcessingState,
+    _interaction_lock: &mut SceneInteractionLock,
+) -> usize {
+    status.message =
+        "scene generation is native-only in this build; cached scenes can still be viewed."
+            .to_string();
+    status.worker_message = Some(status.message.clone());
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_source_path_for_input(
+    path: Option<&Path>,
+    file_name: &str,
+    contents: &[u8],
+) -> Result<PathBuf, String> {
+    if let Some(path) = path {
+        return Ok(path.to_path_buf());
+    }
+    if contents.is_empty() {
+        return Err("uploaded scene image has no bytes".to_string());
+    }
+    let output_dir = PathBuf::from("tmp")
+        .join("runs")
+        .join(format!("{}_bevy_scene_upload", unix_seconds_run_id()));
+    fs::create_dir_all(&output_dir)
+        .map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let path = output_dir.join(file_name);
+    fs::write(&path, contents)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unix_seconds_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{seconds}")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unix_seconds_run_id() -> String {
+    format!("{}", (js_sys::Date::now() / 1000.0).floor() as u64)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mcp_synthesis_model(model: SynthesisModel) -> McpSynthesisModel {
+    match model {
+        SynthesisModel::Triposg => McpSynthesisModel::Triposg,
+        SynthesisModel::Trellis => McpSynthesisModel::Trellis,
+        SynthesisModel::Triposplat => McpSynthesisModel::Triposplat,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_image_to_3d_model_for_settings(settings: &ScenePipelineUiSettings) -> SynthesisModel {
+    if settings.lift_assets
+        && settings.pose_fit_enabled
+        && matches!(settings.image_to_3d_model, SynthesisModel::Triposplat)
+    {
+        SynthesisModel::Trellis
+    } else {
+        settings.image_to_3d_model
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_synthesis_model_label(model: SynthesisModel) -> &'static str {
+    match model {
+        SynthesisModel::Triposg => "TripoSG",
+        SynthesisModel::Trellis => "Trellis.2",
+        SynthesisModel::Triposplat => "TripoSplat",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_scene_build_for_ui(
+    source_scene_path: PathBuf,
+    source_image_bytes: Option<Vec<u8>>,
+    app_args: AppArgs,
+    settings: ScenePipelineUiSettings,
+    progress_sender: mpsc::Sender<SceneBuildProgressEvent>,
+) -> Result<SceneBuildOutput, String> {
+    let mut server_args = ServerArgs::parse_from(["burn_synth_mcp"]);
+    server_args.backend = match app_args.backend {
+        BackendKind::Cpu => McpInferenceBackend::Cpu,
+        BackendKind::Wgpu => McpInferenceBackend::Wgpu,
+        BackendKind::Cuda => McpInferenceBackend::Cuda,
+    };
+    server_args.weights_root = app_args.weights_root.clone();
+    server_args.trellis_weights_root = app_args.trellis_weights_root.clone();
+    server_args.trellis_image_large_root = app_args.trellis_image_large_root.clone();
+    server_args.trellis_pbr = settings.pbr_enabled;
+    server_args.trellis_pbr_texture_size = Some(settings.pbr_texture_size);
+    let effective_image_to_3d_model = scene_image_to_3d_model_for_settings(&settings);
+    if effective_image_to_3d_model != settings.image_to_3d_model {
+        warn!(
+            "scene composition with pose fitting requires mesh assets; using {} instead of {} for scene image-to-3d",
+            scene_synthesis_model_label(effective_image_to_3d_model),
+            scene_synthesis_model_label(settings.image_to_3d_model)
+        );
+    }
+    let scene_synthesis_models = vec![mcp_synthesis_model(effective_image_to_3d_model)];
+    server_args.synthesis_models = scene_synthesis_models.clone();
+    server_args.batch_size = app_args.max_batch_size;
+    server_args.quality = match settings.quality_profile {
+        SceneQualityProfileSetting::Fast => McpQualityPreset::Fast,
+        SceneQualityProfileSetting::Balanced => McpQualityPreset::Balanced,
+        SceneQualityProfileSetting::Full => McpQualityPreset::Full,
+    };
+    server_args.trellis_quality = match settings.quality_profile {
+        SceneQualityProfileSetting::Fast => McpTrellisQuality::Low,
+        SceneQualityProfileSetting::Balanced => McpTrellisQuality::Medium,
+        SceneQualityProfileSetting::Full => McpTrellisQuality::High,
+    };
+    let config = ServerConfig::from_args(server_args);
+    let output_dir = Some(
+        PathBuf::from("tmp")
+            .join("runs")
+            .join(format!("{}_scene_ui_explicit", unix_seconds_run_id())),
+    );
+    let scene_args = scene_build_args_from_ui_settings(
+        source_scene_path.clone(),
+        output_dir,
+        app_args.max_batch_size,
+        scene_synthesis_models,
+        &settings,
+    );
+    let response = run_scene_build_from_image_with_progress(config, scene_args, |event| {
+        let _ = progress_sender.send(event);
+    })?;
+    Ok(SceneBuildOutput {
+        source_scene_path,
+        source_image_bytes,
+        response,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn scene_build_args_from_ui_settings(
+    source_scene_path: PathBuf,
+    output_dir: Option<PathBuf>,
+    max_batch_size: usize,
+    scene_synthesis_models: Vec<McpSynthesisModel>,
+    settings: &ScenePipelineUiSettings,
+) -> SceneBuildFromImageArgs {
+    let composition_mode = if settings.pose_fit_enabled {
+        SceneCompositionMode::CvGrounded
+    } else {
+        SceneCompositionMode::Heuristic
+    };
+    let feedback_enabled =
+        settings.feedback_enabled && settings.feedback_iterations > 0 && settings.lift_assets;
+    SceneBuildFromImageArgs {
+        source_scene_path,
+        object_reference_image_path: None,
+        output_dir,
+        candidate_count: Some(settings.candidate_count),
+        candidate_retry_attempts: None,
+        candidate_batch_size: None,
+        min_reconstruction_score: None,
+        quality_profile: Some(match settings.quality_profile {
+            SceneQualityProfileSetting::Fast => SceneQualityProfile::Draft,
+            SceneQualityProfileSetting::Balanced | SceneQualityProfileSetting::Full => {
+                SceneQualityProfile::Quality
+            }
+        }),
+        allow_catalog_reuse: settings.allow_catalog_reuse,
+        lift_assets: settings.lift_assets,
+        synthesis_models: Some(scene_synthesis_models),
+        target_faces: Some(settings.target_faces),
+        batch_size: Some(max_batch_size.max(1)),
+        batch_vram_mb: None,
+        trellis_pbr: Some(settings.pbr_enabled),
+        trellis_pbr_texture_size: Some(settings.pbr_texture_size),
+        promote_to_catalog: settings.promote_to_catalog,
+        composition_mode,
+        pose_fit: if settings.pose_fit_enabled
+            && settings.depth_enabled
+            && settings.segmentation_enabled
+            && settings.lift_assets
+        {
+            ScenePoseFitMode::RenderedSilhouette
+        } else {
+            ScenePoseFitMode::ProjectedAabb
+        },
+        canonical_pose: SceneCanonicalPoseMode::Off,
+        scale_policy: SceneScalePolicy::AssetPreserving,
+        max_pose_candidates: 32,
+        save_pose_debug: settings.write_artifacts,
+        ground_calibration: match settings.ground_calibration {
+            bevy_synth_ui::SceneGroundCalibrationSetting::DepthHeuristic => {
+                SceneGroundCalibrationMode::DepthHeuristic
+            }
+            bevy_synth_ui::SceneGroundCalibrationSetting::Gpt => SceneGroundCalibrationMode::Gpt,
+        },
+        instance_generation: match settings.instance_generation {
+            bevy_synth_ui::SceneInstanceGenerationSetting::CategoryRepresentative => {
+                SceneInstanceGenerationMode::CategoryRepresentative
+            }
+            bevy_synth_ui::SceneInstanceGenerationSetting::FineGrainedTypes => {
+                SceneInstanceGenerationMode::FineGrainedTypes
+            }
+        },
+        depth_provider: if settings.depth_enabled {
+            SceneDepthProvider::DepthPro
+        } else {
+            SceneDepthProvider::None
+        },
+        locator: if settings.locate_anything_enabled {
+            SceneLocatorProvider::LocateAnything
+        } else {
+            SceneLocatorProvider::Manifest
+        },
+        locate_anything_backend: settings
+            .locate_anything_enabled
+            .then_some(LocateAnythingBackend::BurnNative),
+        segmentation_provider: Some(if settings.segmentation_enabled {
+            SceneSegmentationProvider::Sam2
+        } else {
+            SceneSegmentationProvider::None
+        }),
+        segmentation_precision: None,
+        segmentation_quantization: None,
+        write_artifacts: settings.write_artifacts,
+        apply: false,
+        clear_existing: true,
+        feedback: feedback_enabled,
+        feedback_iters: if feedback_enabled {
+            settings.feedback_iterations
+        } else {
+            0
+        },
+        feedback_keep_viewer: false,
+        feedback_capture_dir: None,
+        feedback_threshold_profile: FeedbackThresholdProfile::Standard,
+        feedback_rotation_selector: FeedbackRotationSelector::Deterministic,
+        rotation_fit: burn_synth_mcp::SceneRotationFitMode::Off,
+        rotation_fit_max_gpt_rounds: 0,
+        rotation_fit_min_mask_iou: 0.45,
+        rotation_fit_max_depth_error_m: 0.35,
+        rotation_fit_write_artifacts: true,
+        object_pose_refinement: match settings.object_pose_refinement {
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::Off => {
+                SceneObjectPoseRefinementMode::Off
+            }
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::Geometry => {
+                SceneObjectPoseRefinementMode::Geometry
+            }
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::GatedGpt => {
+                SceneObjectPoseRefinementMode::GatedGpt
+            }
+            bevy_synth_ui::SceneObjectPoseRefinementSetting::AlwaysGpt => {
+                SceneObjectPoseRefinementMode::AlwaysGpt
+            }
+        },
+        object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
+        feedback_rubric_scorer: FeedbackRubricScorer::Off,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn mcp_camera_target(
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    focus: Option<[f32; 3]>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
+    radius: Option<f32>,
+    vertical_fov: Option<f32>,
+    fallback_focus: Vec3,
+) -> Option<(Transform, Vec3, Option<f32>)> {
+    let mut target_translation = Vec3::from_array(translation);
+    let target_rotation = Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
+    let target_focus = focus
+        .map(Vec3::from_array)
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback_focus);
+    let target_yaw = yaw
+        .filter(|value| value.is_finite())
+        .map(|value| value.to_radians());
+    let target_pitch = pitch
+        .filter(|value| value.is_finite())
+        .map(|value| value.abs().to_radians());
+    let target_radius = radius.filter(|value| value.is_finite() && *value > 0.0);
+    if let (Some(yaw), Some(pitch), Some(radius)) = (target_yaw, target_pitch, target_radius) {
+        let yaw_rot = Quat::from_axis_angle(Vec3::Y, yaw);
+        let pitch_rot = Quat::from_axis_angle(Vec3::X, -pitch);
+        let orbit_rotation = yaw_rot * pitch_rot;
+        target_translation = target_focus + orbit_rotation * Vec3::new(0.0, 0.0, radius);
+    }
+    if !target_translation.is_finite() || !target_rotation.is_finite() {
+        return None;
+    }
+
+    let rotation = if target_focus.distance_squared(target_translation) > 0.000_001 {
+        Transform::from_translation(target_translation)
+            .looking_at(target_focus, Vec3::Y)
+            .rotation
+    } else if target_rotation.length_squared() > 0.0 {
+        target_rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    Some((
+        Transform {
+            translation: target_translation,
+            rotation,
+            scale: Vec3::ONE,
+        },
+        target_focus,
+        vertical_fov.filter(|value| value.is_finite() && *value > 0.0),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_mcp_camera_projection(vertical_fov: Option<f32>, projection: &mut Projection) {
+    if let (Some(vertical_fov), Projection::Perspective(perspective)) = (vertical_fov, projection) {
+        perspective.fov = vertical_fov.to_radians();
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn poll_mcp_scene_control(
     mut control: ResMut<McpSceneControl>,
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<BevyMesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
     mut cache: ResMut<MeshCacheResource>,
     mut selection: ResMut<EditorSelection>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    mut screenshots_to_capture: ResMut<McpSceneScreenshotQueue>,
+    read_only: Res<SceneReadOnlyMode>,
     transformables: Query<(), With<GizmoTransformable>>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut query_set: ParamSet<(
-        Query<(&mut Transform, &mut PanOrbitCamera), With<MainCamera>>,
+        Query<
+            (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+            (With<MainCamera>, Without<SceneRenderCamera>),
+        >,
         Query<(&CachedMeshInstance, &Transform)>,
+        Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+        Query<
+            (
+                &mut Transform,
+                &mut Projection,
+                &mut SceneRenderCameraTarget,
+            ),
+            (With<SceneRenderCamera>, Without<MainCamera>),
+        >,
+        Query<
+            (
+                &Camera,
+                &GlobalTransform,
+                &Transform,
+                &Projection,
+                &SceneRenderCameraTarget,
+            ),
+            (With<SceneRenderCamera>, Without<MainCamera>),
+        >,
     )>,
     mut world_cache: ResMut<WorldCachePersistence>,
 ) {
@@ -1782,8 +3717,8 @@ fn poll_mcp_scene_control(
     }
     control.last_modified = Some(modified);
 
-    let commands_to_apply = match read_mcp_scene_commands(&path) {
-        Ok(commands_to_apply) => commands_to_apply,
+    let envelope = match read_mcp_scene_commands(&path) {
+        Ok(envelope) => envelope,
         Err(err) => {
             warn!(
                 "Failed to parse MCP scene control file {}: {err}",
@@ -1792,50 +3727,232 @@ fn poll_mcp_scene_control(
             return;
         }
     };
+    let session_id = envelope.session_id.clone();
+    let sequence = envelope.sequence;
+    let commands_to_apply = envelope.commands;
     if commands_to_apply.is_empty() {
         return;
     }
+    let requested_commands = commands_to_apply.len();
 
     let mut scene_changed = false;
     let mut force_cache_flush = false;
-    for command in commands_to_apply {
+    let mut screenshots = Vec::new();
+    let mut predicted_world_items = Vec::new();
+    let mut predicted_world_aabbs = HashMap::<String, CachedAssetAabb>::new();
+    let mut deleted_cache_keys = Vec::new();
+    let mut cleared_scene = false;
+    let mut command_results = Vec::with_capacity(requested_commands);
+    for (command_index, command) in commands_to_apply.into_iter().enumerate() {
         match command {
             McpSceneCommand::SpawnCached {
                 cache_key,
+                local_aabb,
                 translation,
                 rotation,
                 scale,
                 select,
             } => {
-                let mesh = match cache.cache.load_mesh(&cache_key) {
-                    Ok(Some(mesh)) => mesh,
+                let asset = match cache.cache.load_asset(&cache_key) {
+                    Ok(Some(asset)) => asset,
                     Ok(None) => {
                         warn!("MCP spawn_cached skipped: cache key {cache_key} not found");
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "spawn_cached",
+                            false,
+                            format!("cache key {cache_key} not found"),
+                            Some(cache_key),
+                            None,
+                        ));
                         continue;
                     }
                     Err(err) => {
                         warn!("MCP spawn_cached failed for {cache_key}: {err}");
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "spawn_cached",
+                            false,
+                            format!("cache load failed: {err}"),
+                            Some(cache_key),
+                            None,
+                        ));
                         continue;
                     }
                 };
                 let Some(transform) = transform_from_optional_parts(translation, rotation, scale)
                 else {
                     warn!("MCP spawn_cached skipped due to invalid transform values");
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_cached",
+                        false,
+                        "invalid transform values",
+                        Some(cache_key),
+                        None,
+                    ));
                     continue;
                 };
-                let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
-                let material =
-                    materials.add(standard_material_for_inference(&mesh, images.as_mut()));
-                let entity = spawn_mesh_instance(
+                let metadata = cache
+                    .cache
+                    .asset_entries()
+                    .iter()
+                    .find(|entry| entry.cache_key == cache_key)
+                    .cloned()
+                    .unwrap_or_else(|| CachedMeshMetadata {
+                        cache_key: cache_key.clone(),
+                        source_image_path: cache_key.clone(),
+                        label: cache_key.clone(),
+                        source_image_payload_id: None,
+                        source_image_name: None,
+                        source_image_mime: None,
+                        asset_kind: Default::default(),
+                        mesh_payload_id: String::new(),
+                        gltf_output_id: None,
+                        glb_output_id: String::new(),
+                        splat_payload_id: None,
+                        local_aabb: None,
+                        canonical_frame: None,
+                        updated_at_unix_ms: 0,
+                    });
+                let effective_local_aabb = local_aabb.or(metadata.local_aabb);
+                let Some(handles) = cached_asset_handles(
+                    asset,
+                    &metadata,
+                    &mut meshes,
+                    &mut images,
+                    &mut materials,
+                    &mut gaussian_clouds,
+                ) else {
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_cached",
+                        false,
+                        "failed to prepare cached asset handles",
+                        Some(cache_key),
+                        None,
+                    ));
+                    continue;
+                };
+                let predicted_item =
+                    cached_world_item_from_transform(cache_key.clone(), &transform);
+                if let Some(local_aabb) = effective_local_aabb {
+                    predicted_world_aabbs.insert(cache_key.clone(), local_aabb);
+                }
+                let entity = spawn_cached_asset_instance(
                     &mut commands,
-                    mesh_handle,
-                    material,
+                    &handles,
                     transform,
-                    Some(cache_key),
+                    Some(cache_key.clone()),
+                    effective_local_aabb,
                 );
                 if select {
                     selection.set(entity);
                 }
+                predicted_world_items.push(predicted_item);
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "spawn_cached",
+                    true,
+                    "spawned cached asset",
+                    Some(cache_key),
+                    None,
+                ));
+                scene_changed = true;
+            }
+            McpSceneCommand::SpawnPath {
+                path,
+                cache_key,
+                local_aabb,
+                translation,
+                rotation,
+                scale,
+                select,
+            } => {
+                if !path.exists() {
+                    warn!("MCP spawn_path skipped: path {} not found", path.display());
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_path",
+                        false,
+                        "path not found",
+                        cache_key,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                }
+                if !is_mesh_file(path.as_path()) {
+                    warn!(
+                        "MCP spawn_path skipped: {} is not a supported mesh file",
+                        path.display()
+                    );
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_path",
+                        false,
+                        "unsupported mesh file",
+                        cache_key,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                }
+                let Some(transform) = transform_from_optional_parts(translation, rotation, scale)
+                else {
+                    warn!("MCP spawn_path skipped due to invalid transform values");
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "spawn_path",
+                        false,
+                        "invalid transform values",
+                        cache_key,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                };
+                let cache_key = cache_key.unwrap_or_else(|| format!("path:{}", path.display()));
+                let path_label = path.display().to_string();
+                let predicted_item =
+                    cached_world_item_from_transform(cache_key.clone(), &transform);
+                if let Some(local_aabb) = local_aabb {
+                    predicted_world_aabbs.insert(cache_key.clone(), local_aabb);
+                }
+                let entity = match spawn_mesh_asset_with_transform(
+                    &mut commands,
+                    &asset_server,
+                    &mut meshes,
+                    &mut images,
+                    &mut materials,
+                    path.clone(),
+                    transform,
+                    Some(cache_key.clone()),
+                    local_aabb,
+                ) {
+                    Ok(entity) => entity,
+                    Err(err) => {
+                        warn!("MCP spawn_path failed for {}: {err}", path.display());
+                        command_results.push(mcp_scene_command_result(
+                            command_index,
+                            "spawn_path",
+                            false,
+                            format!("failed to load mesh path: {err}"),
+                            Some(cache_key),
+                            Some(path.display().to_string()),
+                        ));
+                        continue;
+                    }
+                };
+                if select {
+                    selection.set(entity);
+                }
+                predicted_world_items.push(predicted_item);
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "spawn_path",
+                    true,
+                    "spawned mesh path",
+                    Some(cache_key),
+                    Some(path_label),
+                ));
                 scene_changed = true;
             }
             McpSceneCommand::DeleteByCacheKey { cache_key } => {
@@ -1849,24 +3966,80 @@ fn poll_mcp_scene_control(
                         }
                     })
                     .collect();
+                let deleted = !to_despawn.is_empty();
                 for entity in to_despawn {
                     commands.entity(entity).despawn();
                     scene_changed = true;
                 }
+                deleted_cache_keys.push(cache_key);
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "delete_by_cache_key",
+                    deleted,
+                    if deleted {
+                        "deleted cached instances"
+                    } else {
+                        "no cached instances matched"
+                    },
+                    deleted_cache_keys.last().cloned(),
+                    None,
+                ));
+            }
+            McpSceneCommand::ClearScene => {
+                let to_despawn = cached_instances
+                    .iter()
+                    .map(|(entity, _)| entity)
+                    .collect::<Vec<_>>();
+                let deleted = to_despawn.len();
+                for entity in to_despawn {
+                    commands.entity(entity).despawn();
+                }
+                selection.clear();
+                cleared_scene = true;
+                scene_changed = true;
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "clear_scene",
+                    true,
+                    format!("cleared {deleted} cached scene item(s)"),
+                    None,
+                    None,
+                ));
             }
             McpSceneCommand::DeleteSelected => {
                 let to_despawn: Vec<Entity> = selection
                     .iter()
                     .filter(|entity| transformables.contains(*entity))
                     .collect();
+                let deleted = !to_despawn.is_empty();
                 for entity in to_despawn {
                     commands.entity(entity).despawn();
                     scene_changed = true;
                 }
                 selection.clear();
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "delete_selected",
+                    true,
+                    if deleted {
+                        "deleted selected transformables"
+                    } else {
+                        "selection cleared; no transformables selected"
+                    },
+                    None,
+                    None,
+                ));
             }
             McpSceneCommand::ClearSelection => {
                 selection.clear();
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "clear_selection",
+                    true,
+                    "selection cleared",
+                    None,
+                    None,
+                ));
             }
             McpSceneCommand::SetCamera {
                 translation,
@@ -1875,61 +4048,179 @@ fn poll_mcp_scene_control(
                 yaw,
                 pitch,
                 radius,
+                vertical_fov,
             } => {
-                if let Ok((mut transform, mut orbit)) = query_set.p0().single_mut() {
-                    let target_translation = Vec3::from_array(translation);
-                    let target_rotation =
-                        Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]);
-                    if target_translation.is_finite() && target_rotation.is_finite() {
-                        transform.translation = target_translation;
-                        transform.rotation = if target_rotation.length_squared() > 0.0 {
-                            target_rotation.normalize()
-                        } else {
-                            Quat::IDENTITY
-                        };
-                        if let Some(focus) = focus {
-                            let focus = Vec3::from_array(focus);
-                            if focus.is_finite() {
-                                orbit.focus = focus;
-                                orbit.target_focus = focus;
-                            }
-                        }
-                        if let Some(yaw) = yaw
-                            && yaw.is_finite()
-                        {
-                            orbit.yaw = Some(yaw);
-                            orbit.target_yaw = yaw;
-                        }
-                        if let Some(pitch) = pitch
-                            && pitch.is_finite()
-                        {
-                            orbit.pitch = Some(pitch);
-                            orbit.target_pitch = pitch;
-                        }
-                        if let Some(radius) = radius
-                            && radius.is_finite()
-                            && radius > 0.0
-                        {
-                            orbit.radius = Some(radius);
-                            orbit.target_radius = radius;
-                        }
-                        scene_changed = true;
-                    }
+                let fallback_focus = Vec3::ZERO;
+                let Some((target_transform, target_focus, target_vertical_fov)) = mcp_camera_target(
+                    translation,
+                    rotation,
+                    focus,
+                    yaw,
+                    pitch,
+                    radius,
+                    vertical_fov,
+                    fallback_focus,
+                ) else {
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "set_camera",
+                        false,
+                        "camera transform was not finite",
+                        None,
+                        None,
+                    ));
+                    continue;
+                };
+
+                let mut applied = false;
+                if let Ok((mut transform, mut projection, mut scene_target)) =
+                    query_set.p3().single_mut()
+                {
+                    *transform = target_transform;
+                    scene_target.focus = target_focus;
+                    apply_mcp_camera_projection(target_vertical_fov, projection.as_mut());
+                    applied = true;
+                } else if let Ok((mut transform, mut orbit, mut projection)) =
+                    query_set.p0().single_mut()
+                {
+                    *transform = target_transform;
+                    orbit.focus = target_focus;
+                    orbit.target_focus = target_focus;
+                    orbit.initialized = true;
+                    apply_mcp_camera_projection(target_vertical_fov, projection.as_mut());
+                    applied = true;
                 }
+
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "set_camera",
+                    applied,
+                    if applied {
+                        "scene camera updated"
+                    } else {
+                        "scene camera not found"
+                    },
+                    None,
+                    None,
+                ));
+                scene_changed |= applied;
             }
+            McpSceneCommand::CaptureScreenshot { path } => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(err) = fs::create_dir_all(parent)
+                {
+                    warn!(
+                        "MCP capture_screenshot could not create {}: {err}",
+                        parent.display()
+                    );
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "capture_screenshot",
+                        false,
+                        format!("could not create parent directory: {err}"),
+                        None,
+                        Some(path.display().to_string()),
+                    ));
+                    continue;
+                }
+                screenshots.push(path.display().to_string());
+                screenshots_to_capture
+                    .pending
+                    .push_back(McpSceneScreenshotRequest {
+                        path,
+                        camera: ScreenshotCameraTarget::Scene,
+                    });
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "capture_screenshot",
+                    true,
+                    "render-only screenshot queued",
+                    None,
+                    screenshots.last().cloned(),
+                ));
+            }
+            McpSceneCommand::SetInteractionLock { locked, reason } => {
+                interaction_lock.set(locked, reason.clone());
+                if locked {
+                    selection.clear();
+                }
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "set_interaction_lock",
+                    true,
+                    if locked {
+                        reason
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or("scene interaction locked")
+                            .to_string()
+                    } else {
+                        "scene interaction unlocked".to_string()
+                    },
+                    None,
+                    None,
+                ));
+            }
+            McpSceneCommand::ReloadCache => match MeshCache::load_default() {
+                Ok(reloaded_cache) => {
+                    let entries = reloaded_cache.asset_entries().len();
+                    cache.cache = reloaded_cache;
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "reload_cache",
+                        true,
+                        format!("reloaded {entries} cached catalog asset(s)"),
+                        None,
+                        None,
+                    ));
+                }
+                Err(err) => {
+                    warn!("MCP reload_cache failed: {err}");
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "reload_cache",
+                        false,
+                        format!("cache reload failed: {err}"),
+                        None,
+                        None,
+                    ));
+                }
+            },
             McpSceneCommand::SaveCache => {
+                if read_only.enabled {
+                    command_results.push(mcp_scene_command_result(
+                        command_index,
+                        "save_cache",
+                        false,
+                        "read-only scene: cache flush disabled",
+                        None,
+                        None,
+                    ));
+                    continue;
+                }
                 force_cache_flush = true;
+                command_results.push(mcp_scene_command_result(
+                    command_index,
+                    "save_cache",
+                    true,
+                    "cache flush requested",
+                    None,
+                    None,
+                ));
             }
         }
     }
 
-    if force_cache_flush {
+    if force_cache_flush && !read_only.enabled {
         let camera_state = {
             let main_camera = query_set.p0();
             main_camera
                 .single()
                 .ok()
-                .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit))
+                .and_then(|(transform, orbit, projection)| {
+                    camera_state_from_components(transform, orbit, Some(projection))
+                })
         };
         let cached_query = query_set.p1();
         if let Err(err) = flush_world_cache_now(&mut cache, &cached_query, camera_state) {
@@ -1938,9 +4229,210 @@ fn poll_mcp_scene_control(
             world_cache.dirty = false;
             world_cache.timer.reset();
         }
-    } else if scene_changed {
+    } else if scene_changed && !read_only.enabled {
         world_cache.dirty = true;
         world_cache.timer.reset();
+    }
+
+    if let Some(status_path) = control.status_path.as_deref() {
+        let camera_state = {
+            let scene_camera = query_set.p4();
+            scene_camera
+                .single()
+                .ok()
+                .and_then(|(_, _, transform, projection, scene_target)| {
+                    camera_state_from_scene_components(transform, scene_target, Some(projection))
+                })
+        }
+        .or_else(|| {
+            let main_camera = query_set.p0();
+            main_camera
+                .single()
+                .ok()
+                .and_then(|(transform, orbit, projection)| {
+                    camera_state_from_components(transform, orbit, Some(projection))
+                })
+        });
+        let (mut world_items, mut world_item_aabbs) = {
+            let cached_query = query_set.p1();
+            if cleared_scene {
+                (Vec::new(), HashMap::new())
+            } else {
+                collect_cached_world_items(&cached_query)
+            }
+        };
+        if !deleted_cache_keys.is_empty() {
+            world_items.retain(|item| !deleted_cache_keys.contains(&item.cache_key));
+            for cache_key in &deleted_cache_keys {
+                world_item_aabbs.remove(cache_key);
+            }
+        }
+        world_items.extend(predicted_world_items);
+        world_item_aabbs.extend(predicted_world_aabbs);
+        let projected_items = {
+            let scene_camera = query_set.p4();
+            scene_camera
+                .single()
+                .ok()
+                .map(|(camera, camera_transform, _, _, _)| {
+                    collect_projected_world_items(
+                        &cache.cache,
+                        &world_items,
+                        &world_item_aabbs,
+                        Some((camera, camera_transform)),
+                    )
+                })
+        }
+        .unwrap_or_else(|| {
+            let camera_query = query_set.p2();
+            collect_projected_world_items(
+                &cache.cache,
+                &world_items,
+                &world_item_aabbs,
+                camera_query.single().ok(),
+            )
+        });
+        let status = McpSceneStatus {
+            session_id,
+            last_sequence: sequence,
+            ok: command_results.iter().all(|result| result.applied),
+            message: if command_results.iter().all(|result| result.applied) {
+                "applied".to_string()
+            } else {
+                "partially_applied".to_string()
+            },
+            requested_commands,
+            applied_commands: command_results
+                .iter()
+                .filter(|result| result.applied)
+                .count(),
+            command_results,
+            cache_entries: cache.cache.asset_entries().to_vec(),
+            world_items,
+            projected_items,
+            camera: camera_state,
+            screenshots,
+            interaction_locked: interaction_lock.locked,
+            interaction_lock_reason: interaction_lock.reason.clone(),
+        };
+        if let Err(err) = write_mcp_scene_status(status_path, &status) {
+            warn!(
+                "Failed to write MCP scene status {}: {err}",
+                status_path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drive_mcp_scene_screenshot_queue(
+    mut commands: Commands,
+    mut queue: ResMut<McpSceneScreenshotQueue>,
+    ui_visibility: Res<UiVisibilityState>,
+    mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+    mut editor_cameras: Query<&mut Camera, (With<EditorCamera>, Without<SceneRenderCamera>)>,
+    mut scene_cameras: Query<&mut Camera, (With<SceneRenderCamera>, Without<EditorCamera>)>,
+) {
+    if queue.restore_next_frame {
+        set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+        set_screenshot_camera_target(
+            ScreenshotCameraTarget::Editor,
+            &mut editor_cameras,
+            &mut scene_cameras,
+        );
+        queue.active = None;
+        queue.restore_next_frame = false;
+        queue.ui_hidden = false;
+        return;
+    }
+
+    if queue.pending.is_empty() && queue.active.is_none() {
+        if queue.ui_hidden {
+            set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+            set_screenshot_camera_target(
+                ScreenshotCameraTarget::Editor,
+                &mut editor_cameras,
+                &mut scene_cameras,
+            );
+            queue.ui_hidden = false;
+        }
+        return;
+    }
+
+    if !queue.ui_hidden {
+        set_ui_root_visibility(false, &mut ui_roots);
+        queue.active = queue.pending.pop_front();
+        let target = queue
+            .active
+            .as_ref()
+            .map(|request| request.camera)
+            .unwrap_or(ScreenshotCameraTarget::Editor);
+        set_screenshot_camera_target(target, &mut editor_cameras, &mut scene_cameras);
+        queue.ui_hidden = true;
+        return;
+    }
+
+    if let Some(request) = queue.active.take() {
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(request.path));
+        queue.restore_next_frame = true;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_screenshot_camera_target(
+    target: ScreenshotCameraTarget,
+    editor_cameras: &mut Query<&mut Camera, (With<EditorCamera>, Without<SceneRenderCamera>)>,
+    scene_cameras: &mut Query<&mut Camera, (With<SceneRenderCamera>, Without<EditorCamera>)>,
+) {
+    let scene_available = !scene_cameras.is_empty();
+    let use_scene = target == ScreenshotCameraTarget::Scene && scene_available;
+    for mut camera in editor_cameras.iter_mut() {
+        camera.is_active = !use_scene;
+    }
+    for mut camera in scene_cameras.iter_mut() {
+        camera.is_active = use_scene;
+    }
+}
+
+pub(crate) fn handle_ui_visibility_shortcut(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut ui_visibility: ResMut<UiVisibilityState>,
+) {
+    if keys.just_pressed(KeyCode::F1) {
+        ui_visibility.visible = !ui_visibility.visible;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_ui_root_visibility(
+    ui_visibility: Res<UiVisibilityState>,
+    screenshot_queue: Res<McpSceneScreenshotQueue>,
+    mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+) {
+    if screenshot_queue.ui_hidden {
+        return;
+    }
+    set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sync_ui_root_visibility(
+    ui_visibility: Res<UiVisibilityState>,
+    mut ui_roots: Query<&mut Visibility, With<UiRootNode>>,
+) {
+    set_ui_root_visibility(ui_visibility.visible, &mut ui_roots);
+}
+
+fn set_ui_root_visibility(visible: bool, ui_roots: &mut Query<&mut Visibility, With<UiRootNode>>) {
+    let next = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut visibility in ui_roots.iter_mut() {
+        *visibility = next;
     }
 }
 
@@ -2005,12 +4497,13 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
                         event.requests.len()
                     );
                 }
-                for (request, result) in event.requests.into_iter().zip(event.results.into_iter()) {
+                for (request, result) in event.requests.into_iter().zip(event.results) {
                     handle_inference_result(
                         &mut ctx.commands,
                         &mut ctx.meshes,
                         &mut ctx.images,
                         &mut ctx.materials,
+                        &mut ctx.gaussian_clouds,
                         &mut ctx.cache,
                         &mut ctx.catalog,
                         request,
@@ -2035,6 +4528,12 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
     }
 
     if ctx.queue.active.is_none() && !ctx.queue.pending.is_empty() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if should_wait_before_inference_dispatch(&mut ctx.dispatch_gate, &ctx.queue) {
+            update_status_message(&ctx.args, &ctx.queue, &mut ctx.status);
+            return;
+        }
+
         if ctx.status.worker_message.is_some() {
             ctx.status.worker_message = None;
         }
@@ -2058,6 +4557,11 @@ pub(crate) fn drive_inference(mut ctx: InferenceContext) {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if ctx.queue.active.is_none() && ctx.queue.pending.is_empty() {
+        reset_inference_dispatch_gate(&mut ctx.dispatch_gate);
+    }
+
     update_status_message(&ctx.args, &ctx.queue, &mut ctx.status);
 }
 
@@ -2065,15 +4569,31 @@ fn handle_catalog_spawn_requests(
     mut requests: MessageReader<CatalogSpawnRequest>,
     mut commands: Commands,
     mut selection: Option<ResMut<EditorSelection>>,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
+    if interaction_lock.locked || read_only.enabled {
+        for _ in requests.read() {}
+        return;
+    }
     for request in requests.read() {
-        let entity = spawn_mesh_instance(
-            &mut commands,
-            request.mesh.clone(),
-            request.material.clone(),
-            request.transform,
-            request.cache_key.clone(),
-        );
+        let entity = match &request.asset {
+            CatalogSpawnAsset::Mesh { mesh, material } => spawn_mesh_instance(
+                &mut commands,
+                mesh.clone(),
+                material.clone(),
+                request.transform,
+                request.cache_key.clone(),
+                None,
+            ),
+            CatalogSpawnAsset::GaussianSplat { cloud } => spawn_gaussian_splat_instance(
+                &mut commands,
+                cloud.clone(),
+                request.transform,
+                request.cache_key.clone(),
+                None,
+            ),
+        };
         if request.select_spawned
             && let Some(selection) = selection.as_mut()
         {
@@ -2082,12 +4602,18 @@ fn handle_catalog_spawn_requests(
     }
 }
 
-fn handle_catalog_delete_requests(
+pub(crate) fn handle_catalog_delete_requests(
     mut requests: MessageReader<CatalogDeleteRequest>,
     mut cache: ResMut<MeshCacheResource>,
     cached_instances: Query<(Entity, &CachedMeshInstance)>,
     mut commands: Commands,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
+    if interaction_lock.locked || read_only.enabled {
+        for _ in requests.read() {}
+        return;
+    }
     for request in requests.read() {
         let Some(cache_key) = request.cache_key.as_ref() else {
             continue;
@@ -2113,51 +4639,664 @@ fn handle_catalog_delete_requests(
     }
 }
 
-fn sync_panorbit_bindings(mut cameras: Query<&mut PanOrbitCamera>) {
-    for mut camera in cameras.iter_mut() {
-        if camera.button_orbit != MouseButton::Right {
-            camera.button_orbit = MouseButton::Right;
+#[allow(clippy::too_many_arguments)]
+fn handle_scene_load_requests(
+    mut requests: MessageReader<SceneLoadRequest>,
+    mut commands: Commands,
+    mut cache: ResMut<MeshCacheResource>,
+    mut queue: ResMut<InferenceQueue>,
+    mut catalog: ResMut<CatalogState>,
+    mut status: ResMut<UiStatus>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    mut selection: ResMut<EditorSelection>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+    interaction_lock: Res<SceneInteractionLock>,
+    cached_instances: Query<(Entity, &CachedMeshInstance)>,
+    mut camera_query: Query<
+        (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+        With<MainCamera>,
+    >,
+) {
+    let mut last_scene_key = None;
+    for request in requests.read() {
+        last_scene_key = Some(request.scene_key.clone());
+    }
+    if interaction_lock.locked {
+        return;
+    }
+    let Some(scene_key) = last_scene_key else {
+        return;
+    };
+    let payload = match cache.cache.load_scene(&scene_key) {
+        Ok(Some(payload)) => payload,
+        Ok(None) => {
+            status.message = "cached scene payload is missing.".to_string();
+            warn!("cached scene payload missing for {scene_key}");
+            return;
         }
-        if camera.button_pan != MouseButton::Middle {
-            camera.button_pan = MouseButton::Middle;
+        Err(err) => {
+            status.message = format!("failed to load cached scene: {err}");
+            warn!("{}", status.message);
+            return;
+        }
+    };
+    match apply_cached_scene_payload(
+        &mut commands,
+        &mut cache,
+        &payload,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut gaussian_clouds,
+        &mut catalog,
+        &mut queue,
+        &mut selection,
+        &cached_instances,
+        &mut camera_query,
+    ) {
+        Ok(applied) => {
+            world_cache.dirty = false;
+            world_cache.timer.reset();
+            status.message = format!("loaded cached scene with {applied} item(s).");
+        }
+        Err(err) => {
+            status.message = format!("scene load failed: {err}");
+            warn!("{}", status.message);
         }
     }
 }
 
-fn sync_panorbit_enabled(
-    gizmos: Query<&TransformGizmo>,
-    gizmo_handles_hover: Query<&PickingInteraction, With<bevy_transform_gizmos::InteractionKind>>,
-    drag: Res<DragState>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    ui_state: Res<CatalogUiState>,
-    mut cameras: Query<&mut PanOrbitCamera>,
+fn handle_scene_delete_requests(
+    mut requests: MessageReader<SceneDeleteRequest>,
+    mut cache: ResMut<MeshCacheResource>,
+    mut status: ResMut<UiStatus>,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
-    let gizmo_active = gizmos.iter().any(|gizmo| gizmo.interaction().is_some());
-    let gizmo_handle_pressed = buttons.pressed(MouseButton::Left)
-        && gizmo_handles_hover
-            .iter()
-            .any(|interaction| *interaction != PickingInteraction::None);
-    let ui_block = windows
-        .single()
-        .ok()
-        .map(|window| ui_state.cursor_over_ui(window) && buttons.pressed(MouseButton::Left))
-        .unwrap_or(false);
-    let enabled = !gizmo_active && !gizmo_handle_pressed && !drag.is_dragging() && !ui_block;
-    for mut camera in cameras.iter_mut() {
-        if !enabled {
-            camera.target_focus = camera.focus;
-            if let Some(yaw) = camera.yaw {
-                camera.target_yaw = yaw;
+    if interaction_lock.locked || read_only.enabled {
+        for _ in requests.read() {}
+        return;
+    }
+    for request in requests.read() {
+        match cache.cache.remove_scene_entry(&request.scene_key) {
+            Ok(true) => {
+                status.message = "removed scene catalog entry.".to_string();
             }
-            if let Some(pitch) = camera.pitch {
-                camera.target_pitch = pitch;
-            }
-            if let Some(radius) = camera.radius {
-                camera.target_radius = radius;
+            Ok(false) => {}
+            Err(err) => {
+                status.message = format!("failed to remove scene entry: {err}");
+                warn!("{}", status.message);
             }
         }
-        camera.enabled = enabled;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn handle_scene_build_requests(
+    mut requests: MessageReader<SceneBuildRequest>,
+    args: Res<AppArgs>,
+    mut status: ResMut<UiStatus>,
+    mut processing: ResMut<SceneProcessingState>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    mut pending_scene_build: ResMut<PendingSceneBuild>,
+) {
+    if interaction_lock.locked {
+        for _ in requests.read() {}
+        return;
+    }
+    for request in requests.read() {
+        let contents = request.contents.as_deref().unwrap_or(&[]);
+        let _ = ingest_scene_candidate_file(
+            request.source_path.as_deref(),
+            &request.file_name,
+            contents,
+            &args,
+            &request.settings,
+            &mut status,
+            &mut processing,
+            &mut interaction_lock,
+            pending_scene_build.as_mut(),
+        );
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn handle_scene_build_requests(
+    mut requests: MessageReader<SceneBuildRequest>,
+    mut status: ResMut<UiStatus>,
+) {
+    if requests.read().next().is_some() {
+        status.message = "scene generation is native-only in this build.".to_string();
+        status.worker_message = Some(status.message.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_scene_build_results(
+    mut pending: ResMut<PendingSceneBuild>,
+    mut commands: Commands,
+    mut cache: ResMut<MeshCacheResource>,
+    mut queue: ResMut<InferenceQueue>,
+    mut catalog: ResMut<CatalogState>,
+    mut status: ResMut<UiStatus>,
+    mut processing: ResMut<SceneProcessingState>,
+    mut interaction_lock: ResMut<SceneInteractionLock>,
+    mut world_cache: ResMut<WorldCachePersistence>,
+    mut meshes: ResMut<Assets<BevyMesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gaussian_clouds: ResMut<Assets<PlanarGaussian3d>>,
+    mut selection: ResMut<EditorSelection>,
+    cached_instances: Query<(Entity, &CachedMeshInstance)>,
+    mut camera_query: Query<
+        (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+        With<MainCamera>,
+    >,
+) {
+    drain_scene_build_progress(&pending, &mut processing, &mut status);
+
+    let result = match pending.receiver.as_ref() {
+        Some(receiver) => match receiver.lock() {
+            Ok(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("scene build worker disconnected".to_string()))
+                }
+            },
+            Err(_) => Some(Err("scene build receiver lock poisoned".to_string())),
+        },
+        None => None,
+    };
+    let Some(result) = result else {
+        return;
+    };
+    pending.receiver = None;
+    pending.progress_receiver = None;
+    interaction_lock.set(false, None);
+    status.worker_message = None;
+
+    let output = match result {
+        Ok(output) => output,
+        Err(err) => {
+            status.message = format!("scene build failed: {err}");
+            processing.finish_failure(status.message.clone());
+            warn!("{}", status.message);
+            return;
+        }
+    };
+
+    match MeshCache::load_default() {
+        Ok(reloaded_cache) => {
+            cache.cache = reloaded_cache;
+        }
+        Err(err) => {
+            warn!("failed to reload asset cache after scene build: {err}");
+        }
+    }
+
+    let payload = match scene_payload_from_build_response(&output.response) {
+        Ok(payload) => payload,
+        Err(err) => {
+            status.message = format!("scene build cache failed: {err}");
+            processing.finish_failure(status.message.clone());
+            warn!("{}", status.message);
+            return;
+        }
+    };
+    if payload.world_items.is_empty() {
+        status.message = "scene build produced no spawnable cached objects.".to_string();
+        processing.finish_failure(status.message.clone());
+        warn!("{}", status.message);
+        return;
+    }
+
+    let label = generated_scene_label(&output.source_scene_path);
+    let metrics = scene_metrics_from_build_response(&output.response);
+    let artifact_dir = scene_artifact_dir_from_build_response(&output.response);
+    let metadata = match cache.cache.upsert_scene_snapshot(
+        &output.source_scene_path,
+        output.source_image_bytes.as_deref(),
+        label,
+        "explicit",
+        &payload,
+        artifact_dir,
+        Some(metrics),
+    ) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            status.message = format!("failed to cache generated scene: {err}");
+            processing.finish_failure(status.message.clone());
+            warn!("{}", status.message);
+            return;
+        }
+    };
+
+    let applied = match apply_cached_scene_payload(
+        &mut commands,
+        &mut cache,
+        &payload,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut gaussian_clouds,
+        &mut catalog,
+        &mut queue,
+        &mut selection,
+        &cached_instances,
+        &mut camera_query,
+    ) {
+        Ok(applied) => applied,
+        Err(err) => {
+            status.message = format!("scene build load failed: {err}");
+            processing.finish_failure(status.message.clone());
+            warn!("{}", status.message);
+            return;
+        }
+    };
+
+    let handles_by_key = load_cached_asset_handles_by_key(
+        &cache.cache,
+        &payload.world_items,
+        &mut meshes,
+        &mut images,
+        &mut materials,
+        &mut gaussian_clouds,
+    );
+    let scene_items = scene_preview_items_from_world(&payload.world_items, &handles_by_key);
+    let source_image = cached_scene_source_image_handle(&cache.cache, &metadata, images.as_mut());
+    let id = queue.counter;
+    queue.counter = queue.counter.wrapping_add(1);
+    catalog.add_ready_scene(
+        id,
+        metadata.label.clone(),
+        Some(metadata.scene_key.clone()),
+        scene_items,
+        Some(metadata.source_scene_path.clone()),
+        source_image,
+        Some(metadata.pipeline.clone()),
+        metadata.metrics.clone(),
+        metadata.artifact_dir.clone(),
+    );
+    world_cache.dirty = false;
+    world_cache.timer.reset();
+    status.message = format!("scene build complete: {applied} item(s) loaded.");
+    processing.finish_success(status.message.clone());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_scene_build_progress(
+    pending: &PendingSceneBuild,
+    processing: &mut SceneProcessingState,
+    status: &mut UiStatus,
+) {
+    let Some(receiver) = pending.progress_receiver.as_ref() else {
+        return;
+    };
+    let Ok(receiver) = receiver.lock() else {
+        status.worker_message = Some("scene build progress receiver lock poisoned".to_string());
+        processing.finish_failure("scene build progress receiver lock poisoned");
+        return;
+    };
+    while let Ok(event) = receiver.try_recv() {
+        apply_scene_build_progress_event(event, processing, status);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn apply_scene_build_progress_event(
+    event: SceneBuildProgressEvent,
+    processing: &mut SceneProcessingState,
+    status: &mut UiStatus,
+) {
+    let phase = scene_progress_phase_label(event.phase).to_string();
+    let execution = scene_progress_execution_label(event.execution).to_string();
+    let stage = event.stage.clone();
+    let message = event.message.clone();
+    let is_failure = event.phase == SceneBuildProgressPhase::Failed;
+    let token_usage = scene_progress_token_usage_label(&event.detail);
+    status.worker_message = Some(format!("scene {phase}: {stage} - {message}"));
+    processing.push_event(
+        event.run_id,
+        SceneProcessingEvent {
+            stage,
+            phase,
+            execution,
+            message,
+            elapsed_ms: event.elapsed_ms,
+            item_index: event.item_index,
+            item_count: event.item_count,
+            artifact_path: event.artifact_path,
+            token_usage,
+            is_failure,
+        },
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_progress_token_usage_label(detail: &serde_json::Value) -> Option<String> {
+    let usage = detail.get("token_usage")?;
+    let total = json_u64(usage.pointer("/total/total_tokens")).unwrap_or_default();
+    let requests = json_u64(usage.pointer("/total/requests")).unwrap_or_default();
+    if total == 0 && requests == 0 {
+        return None;
+    }
+    let input = json_u64(usage.pointer("/total/input_tokens")).unwrap_or_default();
+    let output = json_u64(usage.pointer("/total/output_tokens")).unwrap_or_default();
+    let reported = json_u64(usage.pointer("/total/reported_requests")).unwrap_or_default();
+    let stage_text = usage
+        .get("by_stage")
+        .and_then(serde_json::Value::as_array)
+        .map(|stages| {
+            stages
+                .iter()
+                .filter_map(|stage| {
+                    let label = stage.get("stage").and_then(serde_json::Value::as_str)?;
+                    let total = json_u64(stage.get("total_tokens")).unwrap_or_default();
+                    Some(format!("{label}:{total}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|text| !text.is_empty());
+    Some(match stage_text {
+        Some(stage_text) => format!(
+            "tokens total={total} input={input} output={output} reported={reported}/{requests} stages=[{stage_text}]"
+        ),
+        None => {
+            format!(
+                "tokens total={total} input={input} output={output} reported={reported}/{requests}"
+            )
+        }
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_f64().map(|number| number.max(0.0).round() as u64))
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_progress_phase_label(phase: SceneBuildProgressPhase) -> &'static str {
+    match phase {
+        SceneBuildProgressPhase::Started => "started",
+        SceneBuildProgressPhase::Progress => "progress",
+        SceneBuildProgressPhase::Waiting => "waiting",
+        SceneBuildProgressPhase::Completed => "completed",
+        SceneBuildProgressPhase::Failed => "failed",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_progress_execution_label(execution: SceneBuildExecutionKind) -> &'static str {
+    match execution {
+        SceneBuildExecutionKind::Cpu => "cpu",
+        SceneBuildExecutionKind::Gpu => "gpu",
+        SceneBuildExecutionKind::Network => "network",
+        SceneBuildExecutionKind::Cache => "cache",
+        SceneBuildExecutionKind::FileIo => "file-io",
+        SceneBuildExecutionKind::Viewer => "viewer",
+        SceneBuildExecutionKind::Mixed => "mixed",
+        SceneBuildExecutionKind::Unknown => "unknown",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_cached_scene_payload(
+    commands: &mut Commands,
+    cache: &mut ResMut<MeshCacheResource>,
+    payload: &CachedScenePayload,
+    meshes: &mut ResMut<Assets<BevyMesh>>,
+    images: &mut ResMut<Assets<Image>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
+    catalog: &mut CatalogState,
+    queue: &mut InferenceQueue,
+    selection: &mut EditorSelection,
+    cached_instances: &Query<(Entity, &CachedMeshInstance)>,
+    camera_query: &mut Query<
+        (&mut Transform, &mut PanOrbitCamera, &mut Projection),
+        With<MainCamera>,
+    >,
+) -> Result<usize, String> {
+    for (entity, _) in cached_instances.iter() {
+        commands.entity(entity).despawn();
+    }
+    selection.clear();
+
+    let handles_by_key = load_cached_asset_handles_by_key(
+        &cache.cache,
+        &payload.world_items,
+        meshes,
+        images,
+        materials,
+        gaussian_clouds,
+    );
+    ensure_object_catalog_entries_for_scene(
+        &cache.cache,
+        &payload.world_items,
+        &handles_by_key,
+        catalog,
+        queue,
+        images.as_mut(),
+    );
+
+    let mut applied_items = Vec::new();
+    for item in &payload.world_items {
+        let Some(handles) = handles_by_key.get(&item.cache_key) else {
+            continue;
+        };
+        let Some(transform) = transform_from_cached_world_item(item) else {
+            warn!(
+                "scene item skipped: non-finite transform for {}",
+                item.cache_key
+            );
+            continue;
+        };
+        spawn_cached_asset_instance(
+            commands,
+            handles,
+            transform,
+            Some(item.cache_key.clone()),
+            None,
+        );
+        applied_items.push(item.clone());
+    }
+
+    if let Some(camera_state) = payload.camera.as_ref()
+        && let Ok((mut transform, mut orbit, mut projection)) = camera_query.single_mut()
+        && apply_cached_camera_state(camera_state, &mut transform, &mut orbit)
+        && let Some(vertical_fov) = camera_state.vertical_fov_degrees
+        && let Projection::Perspective(perspective) = projection.as_mut()
+    {
+        perspective.fov = vertical_fov.to_radians();
+    }
+
+    cache
+        .cache
+        .set_world_items(applied_items.clone())
+        .map_err(|err| err.to_string())?;
+    cache
+        .cache
+        .set_camera_state(payload.camera.clone())
+        .map_err(|err| err.to_string())?;
+    let scene_items = scene_preview_items_from_world(&applied_items, &handles_by_key);
+    catalog.upsert_unsaved_scene(scene_items, None);
+    Ok(applied_items.len())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_payload_from_build_response(
+    response: &serde_json::Value,
+) -> Result<CachedScenePayload, String> {
+    let world_items = scene_world_items_from_response_commands(response)?;
+    let camera = scene_camera_from_response_commands(response);
+    Ok(CachedScenePayload {
+        world_items,
+        camera,
+        bsn: response
+            .get("bsn")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        asset_bindings: response.get("asset_bindings").cloned(),
+        e2e_summary: response.get("e2e_summary").cloned(),
+        response_summary: Some(serde_json::json!({
+            "tool": response.get("tool").cloned().unwrap_or(serde_json::Value::Null),
+            "composition_mode": response.get("composition_mode").cloned().unwrap_or(serde_json::Value::Null),
+            "grounding_source": response.get("grounding_source").cloned().unwrap_or(serde_json::Value::Null),
+            "failed_stage": response.get("failed_stage").cloned().unwrap_or(serde_json::Value::Null),
+        })),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_world_items_from_response_commands(
+    response: &serde_json::Value,
+) -> Result<Vec<CachedWorldItem>, String> {
+    let commands = response
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "scene build response missing commands array".to_string())?;
+    let mut out = Vec::new();
+    for command in commands {
+        let command_type = command
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(command_type, "spawn_cached" | "spawn_path") {
+            continue;
+        }
+        let Some(cache_key) = command
+            .get("cache_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(transform) = transform_from_optional_parts(
+            json_fixed_f32_array::<3>(command.get("translation")),
+            json_fixed_f32_array::<4>(command.get("rotation")),
+            json_fixed_f32_array::<3>(command.get("scale")),
+        ) else {
+            warn!("scene command skipped: invalid transform for {cache_key}");
+            continue;
+        };
+        out.push(cached_world_item_from_transform(cache_key, &transform));
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_camera_from_response_commands(response: &serde_json::Value) -> Option<CachedCameraState> {
+    response
+        .get("commands")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .find_map(scene_camera_from_response_command)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_camera_from_response_command(command: &serde_json::Value) -> Option<CachedCameraState> {
+    let command_type = command.get("type").and_then(serde_json::Value::as_str)?;
+    if command_type != "set_camera" {
+        return None;
+    }
+    let translation = json_fixed_f32_array::<3>(command.get("translation"))?;
+    let rotation =
+        json_fixed_f32_array::<4>(command.get("rotation")).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let focus = json_fixed_f32_array::<3>(command.get("focus")).unwrap_or([0.0, 0.0, 0.0]);
+    let translation_vec = Vec3::from_array(translation);
+    let focus_vec = Vec3::from_array(focus);
+    let offset = translation_vec - focus_vec;
+    let radius = json_f32(command.get("radius"))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| offset.length().max(0.05));
+    let direction = if offset.length_squared() > 0.000_001 {
+        offset.normalize()
+    } else {
+        Vec3::Z
+    };
+    let yaw = json_f32(command.get("yaw"))
+        .map(f32::to_radians)
+        .unwrap_or_else(|| direction.x.atan2(direction.z));
+    let pitch = json_f32(command.get("pitch"))
+        .map(f32::to_radians)
+        .unwrap_or_else(|| direction.y.clamp(-1.0, 1.0).asin());
+    let vertical_fov_degrees =
+        json_f32(command.get("vertical_fov")).filter(|value| value.is_finite() && *value > 0.0);
+    Some(CachedCameraState {
+        translation,
+        rotation,
+        focus,
+        yaw,
+        pitch,
+        radius,
+        vertical_fov_degrees,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_metrics_from_build_response(response: &serde_json::Value) -> CachedSceneMetrics {
+    CachedSceneMetrics::from_scene_build_response(response)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_artifact_dir_from_build_response(response: &serde_json::Value) -> Option<String> {
+    response
+        .pointer("/preparation/output_dir")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            response
+                .pointer("/e2e_summary/feedback/capture_dir")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn generated_scene_label(source_scene_path: &Path) -> String {
+    let stem = source_scene_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("scene");
+    format!("{stem} {}", unix_seconds_run_id())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_fixed_f32_array<const N: usize>(value: Option<&serde_json::Value>) -> Option<[f32; N]> {
+    let array = value?.as_array()?;
+    if array.len() != N {
+        return None;
+    }
+    let mut out = [0.0_f32; N];
+    for (index, value) in array.iter().enumerate() {
+        out[index] = json_f32(Some(value))?;
+    }
+    Some(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn json_f32(value: Option<&serde_json::Value>) -> Option<f32> {
+    let value = value?.as_f64()? as f32;
+    value.is_finite().then_some(value)
+}
+
+fn enforce_scene_interaction_lock(
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
+    mut selection: ResMut<EditorSelection>,
+) {
+    if interaction_lock.locked || read_only.enabled {
+        selection.clear();
     }
 }
 
@@ -2212,7 +5351,7 @@ fn update_window_title(
     if processing {
         pulse.timer.tick(time.delta());
         if pulse.timer.just_finished() {
-            pulse.phase = (pulse.phase + 1) % 4;
+            pulse.phase = (pulse.phase + 1) % title_rattler_frame_count();
             should_update = true;
         }
     } else if pulse.phase != 0 {
@@ -2225,7 +5364,6 @@ fn update_window_title(
     }
 
     let title = if let Some(active) = queue.active.as_ref() {
-        let dots = ".".repeat(pulse.phase);
         let name = if active.len() == 1 {
             active[0]
                 .image_path
@@ -2236,10 +5374,7 @@ fn update_window_title(
         } else {
             format!("{} images", active.len())
         };
-        format!(
-            "bevy_synth — processing: {name} (queued: {}){dots}",
-            queue.pending.len()
-        )
+        processing_window_title(&name, queue.pending.len(), pulse.phase)
     } else {
         format!("bevy_synth — {}", status.message)
     };
@@ -2247,6 +5382,26 @@ fn update_window_title(
     if let Ok(mut window) = windows.single_mut() {
         window.title = title;
     }
+}
+
+pub(crate) fn processing_window_title(name: &str, queued: usize, phase: usize) -> String {
+    format!(
+        "bevy_synth [{}] processing: {name} (queued: {queued})",
+        title_rattler_frame(phase)
+    )
+}
+
+pub(crate) fn title_rattler_frame(phase: usize) -> &'static str {
+    let rattler = rattles::presets::ascii::simple_dots();
+    let len = rattler.len();
+    if len == 0 {
+        return "   ";
+    }
+    rattler.frame(phase % len)
+}
+
+fn title_rattler_frame_count() -> usize {
+    rattles::presets::ascii::simple_dots().len().max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2261,6 +5416,7 @@ fn handle_exit_requests(
     mut cache: ResMut<MeshCacheResource>,
     cached_instances: Query<(&CachedMeshInstance, &Transform)>,
     main_camera: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
     if exit_state.requested {
         return;
@@ -2274,12 +5430,14 @@ fn handle_exit_requests(
     }
 
     exit_state.requested = true;
-    let camera_state = main_camera
-        .single()
-        .ok()
-        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
-    if let Err(err) = flush_world_cache_now(&mut cache, &cached_instances, camera_state) {
-        warn!("Failed to flush world cache during shutdown: {err}");
+    if !read_only.enabled {
+        let camera_state = main_camera
+            .single()
+            .ok()
+            .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
+        if let Err(err) = flush_world_cache_now(&mut cache, &cached_instances, camera_state) {
+            warn!("Failed to flush world cache during shutdown: {err}");
+        }
     }
     queue.active = None;
     queue.pending.clear();
@@ -2297,23 +5455,25 @@ fn handle_inference_result(
     meshes: &mut ResMut<Assets<BevyMesh>>,
     images: &mut ResMut<Assets<Image>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    gaussian_clouds: &mut ResMut<Assets<PlanarGaussian3d>>,
     cache: &mut ResMut<MeshCacheResource>,
     catalog: &mut ResMut<CatalogState>,
     request: InferenceRequest,
-    result: Result<Option<SynthMesh>, String>,
+    result: Result<Option<SynthAsset>, String>,
 ) {
     match result {
-        Ok(Some(mesh)) => {
+        Ok(Some(SynthAsset::Mesh(mesh))) => {
             if let Some(output) = request.output_path.as_ref()
                 && let Err(err) = write_glb(output, &mesh)
             {
                 warn!("failed to write mesh to {}: {err}", output.display());
             }
 
-            let cached_metadata = match cache
-                .cache
-                .upsert_mesh_for_image(&request.image_path, &mesh)
-            {
+            let cached_metadata = match cache.cache.upsert_mesh_for_image_with_source_bytes(
+                &request.image_path,
+                request.image_contents.as_deref(),
+                &mesh,
+            ) {
                 Ok(metadata) => Some(metadata),
                 Err(err) => {
                     warn!(
@@ -2326,6 +5486,9 @@ fn handle_inference_result(
             let cache_key = cached_metadata
                 .as_ref()
                 .map(|metadata| metadata.cache_key.clone());
+            let local_aabb = cached_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.local_aabb);
 
             let bevy_mesh = to_bevy_mesh_synth(&mesh);
             let mesh_handle = meshes.add(bevy_mesh);
@@ -2336,27 +5499,113 @@ fn handle_inference_result(
                 material.clone(),
                 Transform::default(),
                 cache_key.clone(),
+                local_aabb,
             );
             if let Some(entry) = catalog.entry_mut(request.id) {
                 entry.status = CatalogStatus::Ready;
                 entry.mesh = Some(mesh_handle);
                 entry.material = Some(material);
+                entry.gaussian = None;
                 entry.source_image_path = Some(request.image_path.display().to_string());
                 entry.cache_key = cache_key;
-                if let Some(metadata) = cached_metadata {
-                    entry.label = metadata.label;
-                    entry.source_image_path = Some(metadata.source_image_path);
+                entry.source_image = cached_metadata.as_ref().and_then(|metadata| {
+                    cached_source_image_handle(&cache.cache, metadata, images.as_mut())
+                });
+                if let Some(metadata) = cached_metadata.as_ref() {
+                    entry.label = metadata.label.clone();
+                    entry.source_image_path = Some(metadata.source_image_path.clone());
                 }
                 catalog.bump_revision();
             }
         }
+        Ok(Some(SynthAsset::GaussianSplat(splats))) => {
+            let count = splats.len();
+            if let Some(output) = request.output_path.as_ref() {
+                match write_gaussian_splat_output(output, &splats) {
+                    Ok(()) => info!(
+                        "Wrote Gaussian splat asset with {count} splats to {}",
+                        output.display()
+                    ),
+                    Err(err) => warn!(
+                        "Failed to write Gaussian splat asset to {}: {err}",
+                        output.display()
+                    ),
+                }
+            }
+
+            let cached_metadata = match cache
+                .cache
+                .upsert_gaussian_splat_for_image_with_source_bytes(
+                    &request.image_path,
+                    request.image_contents.as_deref(),
+                    &splats,
+                ) {
+                Ok(metadata) => Some(metadata),
+                Err(err) => {
+                    warn!(
+                        "Failed to cache Gaussian splat output for {}: {err}",
+                        request.image_path.display()
+                    );
+                    None
+                }
+            };
+            let cache_key = cached_metadata
+                .as_ref()
+                .map(|metadata| metadata.cache_key.clone());
+            let local_aabb = cached_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.local_aabb);
+
+            match gaussian_splat_cloud_handle(&splats, gaussian_clouds) {
+                Ok(cloud_handle) => {
+                    info!(
+                        "Showing Bevy Gaussian cloud with {count} TripoSplat splats from {}",
+                        request.image_path.display()
+                    );
+                    spawn_gaussian_splat_instance(
+                        commands,
+                        cloud_handle.clone(),
+                        Transform::default(),
+                        cache_key.clone(),
+                        local_aabb,
+                    );
+                    if let Some(entry) = catalog.entry_mut(request.id) {
+                        entry.status = CatalogStatus::Ready;
+                        entry.mesh = None;
+                        entry.material = None;
+                        entry.gaussian = Some(cloud_handle);
+                        entry.source_image_path = Some(request.image_path.display().to_string());
+                        entry.cache_key = cache_key;
+                        entry.source_image = cached_metadata.as_ref().and_then(|metadata| {
+                            cached_source_image_handle(&cache.cache, metadata, images.as_mut())
+                        });
+                        if let Some(metadata) = cached_metadata.as_ref() {
+                            entry.label = metadata.label.clone();
+                            entry.source_image_path = Some(metadata.source_image_path.clone());
+                        }
+                        catalog.bump_revision();
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to build Gaussian splat cloud for {}: {err}",
+                        request.image_path.display()
+                    );
+                    if let Some(entry) = catalog.entry_mut(request.id) {
+                        entry.status =
+                            CatalogStatus::Failed(format!("Gaussian splat cloud failed: {err}"));
+                        catalog.bump_revision();
+                    }
+                }
+            }
+        }
         Ok(None) => {
             warn!(
-                "Synthesis inference produced an empty mesh for {}",
+                "Synthesis inference produced an empty asset for {}",
                 request.image_path.display()
             );
             if let Some(entry) = catalog.entry_mut(request.id) {
-                entry.status = CatalogStatus::Failed("empty mesh".to_string());
+                entry.status = CatalogStatus::Failed("empty asset".to_string());
                 catalog.bump_revision();
             }
         }
@@ -2401,7 +5650,19 @@ fn standard_material_for_inference(
         }
     };
 
+    let has_valid_uvs = mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty();
     if let Some(pbr) = mesh.pbr_textures.as_ref() {
+        // TRELLIS outputs ship PBR textures + UVs and should render through
+        // texture-backed StandardMaterial. TripoSG outputs have no PBR textures
+        // and stay on the default non-textured material path.
+        if !has_valid_uvs {
+            warn!(
+                "Skipping PBR texture assignment because mesh UVs are missing or invalid (vertices={}, uvs={}).",
+                mesh.mesh.vertices.len(),
+                mesh.uvs.len()
+            );
+            return out;
+        }
         out.base_color_texture = Some(images.add(synth_texture_to_image(
             &pbr.base_color,
             TextureFormat::Rgba8UnormSrgb,
@@ -2431,6 +5692,48 @@ fn standard_material_for_inference(
     }
 
     out
+}
+
+fn gaussian_splat_cloud_handle(
+    splats: &GaussianSplatCloud,
+    gaussian_clouds: &mut Assets<PlanarGaussian3d>,
+) -> Result<Handle<PlanarGaussian3d>, String> {
+    Ok(gaussian_clouds.add(gaussian_splat_cloud_to_planar_gaussian_3d(splats)?))
+}
+
+pub(crate) fn gaussian_splat_cloud_to_planar_gaussian_3d(
+    splats: &GaussianSplatCloud,
+) -> Result<PlanarGaussian3d, String> {
+    let transformed = splats.transformed_splats_for_bevy_display()?;
+    let gaussians = transformed
+        .iter()
+        .enumerate()
+        .map(|(index, splat)| {
+            if !splat.opacity.is_finite() {
+                return Err(format!(
+                    "Gaussian splat {index} contains non-finite opacity"
+                ));
+            }
+            let mut spherical_harmonic = SphericalHarmonicCoefficients::default();
+            for channel in 0..3 {
+                spherical_harmonic.set(channel, splat.features_dc[channel]);
+            }
+            Ok(Gaussian3d {
+                position_visibility: [splat.position[0], splat.position[1], splat.position[2], 1.0]
+                    .into(),
+                spherical_harmonic,
+                rotation: splat.rotation.into(),
+                scale_opacity: [
+                    splat.scale[0],
+                    splat.scale[1],
+                    splat.scale[2],
+                    splat.opacity.clamp(0.0, 1.0),
+                ]
+                .into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(PlanarGaussian3d::from(gaussians))
 }
 
 fn synth_texture_to_image(texture: &SynthMeshTexture, format: TextureFormat) -> Image {
@@ -2467,12 +5770,14 @@ pub(crate) fn enqueue_inference_with_contents(
     args: &AppArgs,
     queue: &mut InferenceQueue,
 ) -> InferenceRequest {
-    let output_path = resolve_output_path(args.output.as_ref(), &image_path, queue.counter);
+    let output_path = resolve_asset_output_path(args, &image_path, queue.counter);
     let request = InferenceRequest {
         id: queue.counter,
         image_path,
         image_contents,
         output_path,
+        synthesis_models: args.synthesis_models.clone(),
+        settings: InferenceSettings::from_args(args),
     };
     queue.counter = queue.counter.wrapping_add(1);
     queue.pending.push_back(request.clone());
@@ -2518,16 +5823,127 @@ fn update_status_message(args: &AppArgs, queue: &InferenceQueue, status: &mut Ui
 fn spawn_mesh_asset(
     commands: &mut Commands,
     asset_server: &AssetServer,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     mesh_path: PathBuf,
-) {
+) -> Result<Entity, String> {
+    spawn_mesh_asset_with_transform(
+        commands,
+        asset_server,
+        meshes,
+        images,
+        materials,
+        mesh_path,
+        Transform::default(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_mesh_asset_with_transform(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+    mesh_path: PathBuf,
+    transform: Transform,
+    cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
+) -> Result<Entity, String> {
+    #[cfg(target_arch = "wasm32")]
+    let _ = (&mut *meshes, &mut *images);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if is_glb_file(&mesh_path) {
+        let (mesh_handle, material) =
+            load_generated_glb_mesh_asset(&mesh_path, meshes, images, materials)?;
+        return Ok(spawn_mesh_instance(
+            commands,
+            mesh_handle,
+            material,
+            transform,
+            cache_key,
+            local_aabb,
+        ));
+    }
+
+    if is_gltf_file(&mesh_path) {
+        let mesh_handle: Handle<BevyMesh> = asset_server.load(
+            GltfAssetLabel::Primitive {
+                mesh: 0,
+                primitive: 0,
+            }
+            .from_asset(mesh_path),
+        );
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.82, 0.82, 0.9),
+            cull_mode: None,
+            ..default()
+        });
+        return Ok(spawn_mesh_instance(
+            commands,
+            mesh_handle,
+            material,
+            transform,
+            cache_key,
+            local_aabb,
+        ));
+    }
+
     let mesh_handle: Handle<BevyMesh> = asset_server.load(mesh_path);
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.82, 0.82, 0.9),
         cull_mode: None,
         ..default()
     });
-    spawn_mesh_instance(commands, mesh_handle, material, Transform::default(), None);
+    Ok(spawn_mesh_instance(
+        commands,
+        mesh_handle,
+        material,
+        transform,
+        cache_key,
+        local_aabb,
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn load_generated_glb_mesh_asset(
+    path: &Path,
+    meshes: &mut Assets<BevyMesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Result<(Handle<BevyMesh>, Handle<StandardMaterial>), String> {
+    let bytes =
+        std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mesh = mesh_from_glb_bytes(bytes.as_slice())
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let mesh_handle = meshes.add(to_bevy_mesh_synth(&mesh));
+    let material = materials.add(standard_material_for_inference(&mesh, images));
+    Ok((mesh_handle, material))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_glb_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("glb")
+    )
+}
+
+fn is_gltf_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("glb" | "gltf")
+    )
 }
 
 pub(crate) fn spawn_mesh_instance(
@@ -2536,6 +5952,7 @@ pub(crate) fn spawn_mesh_instance(
     material: Handle<StandardMaterial>,
     transform: Transform,
     cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
 ) -> Entity {
     let mut entity_commands = commands.spawn((
         GizmoTransformable,
@@ -2550,15 +5967,79 @@ pub(crate) fn spawn_mesh_instance(
         RenderLayers::layer(0),
     ));
     if let Some(cache_key) = cache_key {
-        entity_commands.insert(CachedMeshInstance { cache_key });
+        entity_commands.insert(CachedMeshInstance {
+            cache_key,
+            local_aabb,
+        });
     }
     entity_commands.id()
+}
+
+fn spawn_cached_asset_instance(
+    commands: &mut Commands,
+    handles: &CachedAssetHandles,
+    transform: Transform,
+    cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
+) -> Entity {
+    match handles {
+        CachedAssetHandles::Mesh { mesh, material } => spawn_mesh_instance(
+            commands,
+            mesh.clone(),
+            material.clone(),
+            transform,
+            cache_key,
+            local_aabb,
+        ),
+        CachedAssetHandles::GaussianSplat { cloud } => {
+            spawn_gaussian_splat_instance(commands, cloud.clone(), transform, cache_key, local_aabb)
+        }
+    }
+}
+
+pub(crate) fn spawn_gaussian_splat_instance(
+    commands: &mut Commands,
+    cloud_handle: Handle<PlanarGaussian3d>,
+    transform: Transform,
+    cache_key: Option<String>,
+    local_aabb: Option<CachedAssetAabb>,
+) -> Entity {
+    let mut entity_commands = commands.spawn((
+        GizmoTransformable,
+        Selectable,
+        Pickable {
+            should_block_lower: false,
+            is_hoverable: true,
+        },
+        PlanarGaussian3dHandle(cloud_handle),
+        triposplat_cloud_settings(),
+        transform,
+        RenderLayers::layer(0),
+        Name::new("triposplat_gaussian_cloud"),
+    ));
+    if let Some(cache_key) = cache_key {
+        entity_commands.insert(CachedMeshInstance {
+            cache_key,
+            local_aabb,
+        });
+    }
+    entity_commands.id()
+}
+
+pub(crate) fn triposplat_cloud_settings() -> CloudSettings {
+    CloudSettings {
+        sort_mode: SortMode::Std,
+        color_space: GaussianColorSpace::SrgbRec709Display,
+        ..default()
+    }
 }
 
 #[allow(clippy::type_complexity)]
 #[cfg(not(target_arch = "wasm32"))]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
+    read_only: Res<SceneReadOnlyMode>,
+    interaction_lock: Res<SceneInteractionLock>,
     changed: Query<
         (),
         (
@@ -2575,7 +6056,12 @@ fn mark_world_cache_dirty(
     >,
     mut removed: RemovedComponents<CachedMeshInstance>,
 ) {
-    if changed.is_empty() && changed_camera.is_empty() && removed.read().next().is_none() {
+    if read_only.enabled {
+        for _ in removed.read() {}
+        return;
+    }
+    let camera_changed = !interaction_lock.locked && !changed_camera.is_empty();
+    if changed.is_empty() && !camera_changed && removed.read().next().is_none() {
         return;
     }
     persistence.dirty = true;
@@ -2586,6 +6072,7 @@ fn mark_world_cache_dirty(
 #[cfg(target_arch = "wasm32")]
 fn mark_world_cache_dirty(
     mut persistence: ResMut<WorldCachePersistence>,
+    read_only: Res<SceneReadOnlyMode>,
     changed: Query<
         (),
         (
@@ -2595,6 +6082,10 @@ fn mark_world_cache_dirty(
     >,
     mut removed: RemovedComponents<CachedMeshInstance>,
 ) {
+    if read_only.enabled {
+        for _ in removed.read() {}
+        return;
+    }
     if changed.is_empty() && removed.read().next().is_none() {
         return;
     }
@@ -2608,7 +6099,12 @@ fn persist_world_cache(
     mut cache: ResMut<MeshCacheResource>,
     query: Query<(&CachedMeshInstance, &Transform)>,
     main_camera: Query<(&Transform, &PanOrbitCamera), With<MainCamera>>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
+    if read_only.enabled {
+        persistence.dirty = false;
+        return;
+    }
     if !persistence.dirty {
         return;
     }
@@ -2620,7 +6116,7 @@ fn persist_world_cache(
     let camera_state = main_camera
         .single()
         .ok()
-        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit));
+        .and_then(|(transform, orbit)| camera_state_from_components(transform, orbit, None));
     match flush_world_cache_now(&mut cache, &query, camera_state) {
         Ok(()) => {
             persistence.dirty = false;
@@ -2634,22 +6130,186 @@ fn persist_world_cache(
 
 fn collect_cached_world_items(
     query: &Query<(&CachedMeshInstance, &Transform)>,
-) -> Vec<CachedWorldItem> {
+) -> (Vec<CachedWorldItem>, HashMap<String, CachedAssetAabb>) {
     let mut world_items = Vec::new();
+    let mut local_aabbs = HashMap::new();
     for (cached, transform) in query.iter() {
-        let rotation = if transform.rotation.length_squared() > 0.0 {
-            transform.rotation.normalize()
-        } else {
-            Quat::IDENTITY
-        };
-        world_items.push(CachedWorldItem {
-            cache_key: cached.cache_key.clone(),
-            translation: transform.translation.to_array(),
-            rotation: rotation.to_array(),
-            scale: transform.scale.to_array(),
-        });
+        world_items.push(cached_world_item_from_transform(
+            cached.cache_key.clone(),
+            transform,
+        ));
+        if let Some(local_aabb) = cached.local_aabb {
+            local_aabbs.insert(cached.cache_key.clone(), local_aabb);
+        }
     }
+    (world_items, local_aabbs)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_projected_world_items(
+    cache: &MeshCache,
+    world_items: &[CachedWorldItem],
+    explicit_local_aabbs: &HashMap<String, CachedAssetAabb>,
+    camera: Option<(&Camera, &GlobalTransform)>,
+) -> Vec<McpProjectedWorldItem> {
+    let metadata_by_key = cache
+        .asset_entries()
+        .iter()
+        .map(|entry| (entry.cache_key.as_str(), entry))
+        .collect::<HashMap<_, _>>();
     world_items
+        .iter()
+        .map(|item| {
+            let world_aabb = world_item_local_aabb(&metadata_by_key, explicit_local_aabbs, item)
+                .and_then(|aabb| {
+                    transform_from_cached_world_item(item)
+                        .map(|transform| transformed_world_aabb(&transform, aabb))
+                });
+            let (screen_bbox, screen_contact, projected_corners, total_corners) = if let (
+                Some(world_aabb),
+                Some((camera, camera_transform)),
+            ) =
+                (world_aabb, camera)
+            {
+                project_world_aabb(camera, camera_transform, world_aabb)
+            } else {
+                (None, None, 0, 0)
+            };
+            McpProjectedWorldItem {
+                cache_key: item.cache_key.clone(),
+                world_aabb,
+                screen_bbox,
+                screen_contact,
+                projected_corners,
+                total_corners,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn world_item_local_aabb(
+    metadata_by_key: &HashMap<&str, &CachedMeshMetadata>,
+    explicit_local_aabbs: &HashMap<String, CachedAssetAabb>,
+    item: &CachedWorldItem,
+) -> Option<CachedAssetAabb> {
+    explicit_local_aabbs
+        .get(item.cache_key.as_str())
+        .copied()
+        .or_else(|| {
+            metadata_by_key
+                .get(item.cache_key.as_str())
+                .and_then(|metadata| metadata.local_aabb)
+        })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn transformed_world_aabb(transform: &Transform, local_aabb: CachedAssetAabb) -> CachedAssetAabb {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for corner in aabb_corners(local_aabb) {
+        let world = transform.transform_point(corner);
+        min = min.min(world);
+        max = max.max(world);
+    }
+    CachedAssetAabb {
+        min: min.to_array(),
+        max: max.to_array(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn aabb_corners(aabb: CachedAssetAabb) -> [Vec3; 8] {
+    let min = Vec3::from_array(aabb.min);
+    let max = Vec3::from_array(aabb.max);
+    [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+        Vec3::new(max.x, max.y, max.z),
+    ]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn project_world_aabb(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    world_aabb: CachedAssetAabb,
+) -> (Option<[f32; 4]>, Option<[f32; 2]>, usize, usize) {
+    let Some(viewport) = camera
+        .logical_viewport_size()
+        .filter(|size| size.x > 0.0 && size.y > 0.0)
+    else {
+        return (None, None, 0, 8);
+    };
+    let mut projected = Vec::with_capacity(8);
+    for corner in aabb_corners(world_aabb) {
+        if let Ok(pixel) = camera.world_to_viewport(camera_transform, corner) {
+            let normalized = Vec2::new(pixel.x / viewport.x, pixel.y / viewport.y);
+            if normalized.is_finite() {
+                projected.push(normalized);
+            }
+        }
+    }
+    let screen_bbox = if projected.is_empty() {
+        None
+    } else {
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
+        for point in &projected {
+            min = min.min(*point);
+            max = max.max(*point);
+        }
+        Some([min.x, min.y, max.x, max.y])
+    };
+    let contact_world = Vec3::new(
+        (world_aabb.min[0] + world_aabb.max[0]) * 0.5,
+        world_aabb.min[1],
+        (world_aabb.min[2] + world_aabb.max[2]) * 0.5,
+    );
+    let screen_contact = camera
+        .world_to_viewport(camera_transform, contact_world)
+        .ok()
+        .map(|pixel| [pixel.x / viewport.x, pixel.y / viewport.y])
+        .filter(|point| point[0].is_finite() && point[1].is_finite());
+    (screen_bbox, screen_contact, projected.len(), 8)
+}
+
+fn cached_world_item_from_transform(cache_key: String, transform: &Transform) -> CachedWorldItem {
+    let rotation = if transform.rotation.length_squared() > 0.0 {
+        transform.rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    CachedWorldItem {
+        cache_key,
+        translation: transform.translation.to_array(),
+        rotation: rotation.to_array(),
+        scale: transform.scale.to_array(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mcp_scene_command_result(
+    index: usize,
+    command_type: &'static str,
+    applied: bool,
+    message: impl Into<String>,
+    cache_key: Option<String>,
+    path: Option<String>,
+) -> McpSceneCommandResult {
+    McpSceneCommandResult {
+        index,
+        command_type,
+        applied,
+        message: message.into(),
+        cache_key,
+        path,
+    }
 }
 
 fn flush_world_cache_now(
@@ -2659,7 +6319,7 @@ fn flush_world_cache_now(
 ) -> Result<(), String> {
     cache
         .cache
-        .set_world_items(collect_cached_world_items(query))
+        .set_world_items(collect_cached_world_items(query).0)
         .map_err(|err| err.to_string())?;
     cache
         .cache
@@ -2669,29 +6329,54 @@ fn flush_world_cache_now(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn read_mcp_scene_commands(path: &std::path::Path) -> Result<Vec<McpSceneCommand>, io::Error> {
+fn read_mcp_scene_commands(path: &std::path::Path) -> Result<McpSceneCommandEnvelope, io::Error> {
     let content = fs::read_to_string(path)?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(McpSceneCommandEnvelope {
+            session_id: None,
+            sequence: None,
+            commands: Vec::new(),
+        });
     }
     if trimmed.starts_with('[') {
-        return serde_json::from_str::<Vec<McpSceneCommand>>(trimmed).map_err(|err| {
+        let commands = serde_json::from_str::<Vec<McpSceneCommand>>(trimmed).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid command array JSON: {err}"),
             )
+        })?;
+        return Ok(McpSceneCommandEnvelope {
+            session_id: None,
+            sequence: None,
+            commands,
         });
     }
 
-    serde_json::from_str::<McpSceneCommandEnvelope>(trimmed)
-        .map(|envelope| envelope.commands)
-        .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid command envelope JSON: {err}"),
-            )
-        })
+    serde_json::from_str::<McpSceneCommandEnvelope>(trimmed).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid command envelope JSON: {err}"),
+        )
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_mcp_scene_status(path: &std::path::Path, status: &McpSceneStatus) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("status.json.tmp");
+    let bytes = serde_json::to_vec_pretty(status).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to serialize MCP scene status: {err}"),
+        )
+    })?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2724,12 +6409,238 @@ fn transform_from_optional_parts(
     })
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) fn sync_gaussian_splat_pick_bounds(
+    mut commands: Commands,
+    gaussian_clouds: Res<Assets<PlanarGaussian3d>>,
+    clouds_without_bounds: Query<
+        (Entity, &PlanarGaussian3dHandle),
+        (With<GizmoTransformable>, Without<GaussianSplatPickBounds>),
+    >,
+) {
+    for (entity, cloud_handle) in clouds_without_bounds.iter() {
+        let Some(cloud) = gaussian_clouds.get(&cloud_handle.0) else {
+            continue;
+        };
+        if let Some(bounds) = gaussian_splat_pick_bounds(cloud) {
+            commands
+                .entity(entity)
+                .insert((bounds, TransformGizmoOffset(bounds.center)));
+        }
+    }
+}
+
+pub(crate) fn gaussian_splat_pick_bounds(
+    cloud: &PlanarGaussian3d,
+) -> Option<GaussianSplatPickBounds> {
+    if cloud.position_visibility.is_empty() {
+        return None;
+    }
+
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for (position_visibility, scale_opacity) in cloud
+        .position_visibility
+        .iter()
+        .zip(cloud.scale_opacity.iter())
+    {
+        let position = Vec3::from_array(position_visibility.position);
+        let scale = Vec3::from_array(scale_opacity.scale);
+        if !position.is_finite() || !scale.is_finite() {
+            return None;
+        }
+        let radius = scale.abs() * 3.0 + Vec3::splat(0.01);
+        min = min.min(position - radius);
+        max = max.max(position + radius);
+    }
+
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let center = (min + max) * 0.5;
+    let half_extents = ((max - min) * 0.5).max(Vec3::splat(0.05));
+    Some(GaussianSplatPickBounds {
+        center,
+        half_extents,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewerGroundContactState {
+    Grounded,
+    Floating,
+    BelowGround,
+}
+
+#[allow(clippy::type_complexity)]
+fn draw_viewer_debug_overlays(
+    settings: Res<ViewerDebugSettings>,
+    #[cfg(not(target_arch = "wasm32"))] scene_debug: Res<SceneDepthDebugState>,
+    selection: Res<EditorSelection>,
+    mut gizmos: Gizmos,
+    meshes: Res<Assets<BevyMesh>>,
+    mesh_transformables: Query<(Entity, &Mesh3d, &GlobalTransform), With<GizmoTransformable>>,
+    gaussian_transformables: Query<
+        (Entity, &GaussianSplatPickBounds, &GlobalTransform),
+        With<GizmoTransformable>,
+    >,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if settings.draw_scene_camera_frustum
+        && let Some(camera) = scene_debug.camera.as_ref()
+    {
+        draw_scene_camera_frustum(&mut gizmos, camera, settings.scene_camera_frustum_length);
+    }
+
+    if settings.aabb_overlay == ViewerAabbOverlayMode::Off {
+        return;
+    }
+
+    for (entity, mesh3d, transform) in mesh_transformables.iter() {
+        let selected = selection.contains(entity);
+        if !viewer_debug_entity_visible(settings.aabb_overlay, selected) {
+            continue;
+        }
+        let Some(mesh) = meshes.get(&mesh3d.0) else {
+            continue;
+        };
+        let Some(aabb) = mesh.compute_aabb() else {
+            continue;
+        };
+        let (world_min, world_max) =
+            world_aabb(aabb.center.into(), aabb.half_extents.into(), transform);
+        draw_debug_world_aabb(&mut gizmos, world_min, world_max, selected, &settings);
+    }
+
+    for (entity, bounds, transform) in gaussian_transformables.iter() {
+        let selected = selection.contains(entity);
+        if !viewer_debug_entity_visible(settings.aabb_overlay, selected) {
+            continue;
+        }
+        let (world_min, world_max) = world_aabb(bounds.center, bounds.half_extents, transform);
+        draw_debug_world_aabb(&mut gizmos, world_min, world_max, selected, &settings);
+    }
+}
+
+pub(crate) fn viewer_debug_entity_visible(mode: ViewerAabbOverlayMode, selected: bool) -> bool {
+    match mode {
+        ViewerAabbOverlayMode::Off => false,
+        ViewerAabbOverlayMode::Selected => selected,
+        ViewerAabbOverlayMode::All => true,
+    }
+}
+
+fn draw_debug_world_aabb(
+    gizmos: &mut Gizmos,
+    world_min: Vec3,
+    world_max: Vec3,
+    selected: bool,
+    settings: &ViewerDebugSettings,
+) {
+    let box_color = if selected {
+        Color::srgb(0.28, 0.72, 1.0)
+    } else {
+        Color::srgba(0.78, 0.84, 0.94, 0.72)
+    };
+    draw_debug_box_lines(gizmos, world_min, world_max, box_color);
+
+    if settings.draw_ground_contact {
+        let contact = Vec3::new(
+            (world_min.x + world_max.x) * 0.5,
+            world_min.y,
+            (world_min.z + world_max.z) * 0.5,
+        );
+        let ground = Vec3::new(contact.x, settings.ground_y, contact.z);
+        let contact_color = viewer_ground_contact_color(viewer_ground_contact_state(
+            contact.y,
+            settings.ground_y,
+            settings.contact_tolerance,
+        ));
+        gizmos.line(contact, ground, contact_color);
+        draw_debug_cross(gizmos, contact, 0.045, contact_color);
+        draw_debug_ground_marker(gizmos, ground, 0.08, contact_color);
+    }
+}
+
+fn draw_debug_box_lines(gizmos: &mut Gizmos, min: Vec3, max: Vec3, color: Color) {
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    for (a, b) in [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ] {
+        gizmos.line(corners[a], corners[b], color);
+    }
+}
+
+fn draw_debug_cross(gizmos: &mut Gizmos, center: Vec3, radius: f32, color: Color) {
+    gizmos.line(center - Vec3::X * radius, center + Vec3::X * radius, color);
+    gizmos.line(center - Vec3::Y * radius, center + Vec3::Y * radius, color);
+    gizmos.line(center - Vec3::Z * radius, center + Vec3::Z * radius, color);
+}
+
+fn draw_debug_ground_marker(gizmos: &mut Gizmos, center: Vec3, radius: f32, color: Color) {
+    let x = Vec3::X * radius;
+    let z = Vec3::Z * radius;
+    gizmos.line(center - x - z, center + x - z, color);
+    gizmos.line(center + x - z, center + x + z, color);
+    gizmos.line(center + x + z, center - x + z, color);
+    gizmos.line(center - x + z, center - x - z, color);
+}
+
+pub(crate) fn viewer_ground_contact_state(
+    bottom_y: f32,
+    ground_y: f32,
+    tolerance: f32,
+) -> ViewerGroundContactState {
+    let gap = bottom_y - ground_y;
+    let tolerance = tolerance.max(0.0);
+    if gap.abs() <= tolerance {
+        ViewerGroundContactState::Grounded
+    } else if gap > 0.0 {
+        ViewerGroundContactState::Floating
+    } else {
+        ViewerGroundContactState::BelowGround
+    }
+}
+
+fn viewer_ground_contact_color(state: ViewerGroundContactState) -> Color {
+    match state {
+        ViewerGroundContactState::Grounded => Color::srgb(0.2, 0.9, 0.46),
+        ViewerGroundContactState::Floating => Color::srgb(0.95, 0.74, 0.18),
+        ViewerGroundContactState::BelowGround => Color::srgb(0.95, 0.22, 0.24),
+    }
+}
+
 fn delete_selected_meshes(
     keys: Res<ButtonInput<KeyCode>>,
     mut selection: ResMut<EditorSelection>,
     transformables: Query<(), With<GizmoTransformable>>,
     mut commands: Commands,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
+    if interaction_lock.locked || read_only.enabled {
+        return;
+    }
     if !keys.just_pressed(KeyCode::Delete) && !keys.just_pressed(KeyCode::Backspace) {
         return;
     }
@@ -2762,8 +6673,17 @@ fn update_selection_from_primary_click(
         With<bevy_transform_gizmos::InteractionKind>,
     >,
     transformables: Query<(Entity, &Mesh3d, &GlobalTransform), With<GizmoTransformable>>,
+    gaussian_transformables: Query<
+        (Entity, &GaussianSplatPickBounds, &GlobalTransform),
+        With<GizmoTransformable>,
+    >,
     meshes: Res<Assets<BevyMesh>>,
+    interaction_lock: Res<SceneInteractionLock>,
+    read_only: Res<SceneReadOnlyMode>,
 ) {
+    if interaction_lock.locked || read_only.enabled {
+        return;
+    }
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
@@ -2840,6 +6760,21 @@ fn update_selection_from_primary_click(
             best_hit = Some((entity, distance));
         }
     }
+    for (entity, bounds, transform) in gaussian_transformables.iter() {
+        let (world_min, world_max) = world_aabb(bounds.center, bounds.half_extents, transform);
+        let Some(distance) =
+            ray_aabb_intersection(ray.origin, ray.direction.as_vec3(), world_min, world_max)
+        else {
+            continue;
+        };
+        if best_hit
+            .as_ref()
+            .map(|(_, best_distance)| distance < *best_distance)
+            .unwrap_or(true)
+        {
+            best_hit = Some((entity, distance));
+        }
+    }
 
     if let Some((entity, _)) = best_hit {
         if keyboard_input.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
@@ -2855,7 +6790,7 @@ fn update_selection_from_primary_click(
     }
 }
 
-fn world_aabb(
+pub(crate) fn world_aabb(
     local_center: Vec3,
     local_half_extents: Vec3,
     transform: &GlobalTransform,
@@ -2877,7 +6812,12 @@ fn world_aabb(
     (world_min, world_max)
 }
 
-fn ray_aabb_intersection(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+pub(crate) fn ray_aabb_intersection(
+    origin: Vec3,
+    direction: Vec3,
+    min: Vec3,
+    max: Vec3,
+) -> Option<f32> {
     let mut t_min: f32 = 0.0;
     let mut t_max: f32 = f32::INFINITY;
     for (origin_axis, direction_axis, min_axis, max_axis) in [

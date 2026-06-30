@@ -73,6 +73,7 @@ pub struct MetricStats {
     pub mean_abs: f32,
     pub max_abs: f32,
     pub rmse: f32,
+    pub non_finite_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +168,14 @@ pub fn compute_stats(actual: &[f32], reference: &[f32]) -> MetricStats {
     let mut sum_abs = 0.0f32;
     let mut max_abs = 0.0f32;
     let mut sum_sq = 0.0f32;
+    let mut non_finite_count = 0usize;
 
     for i in 0..len {
         let diff = actual[i] - reference[i];
+        if !actual[i].is_finite() || !reference[i].is_finite() || !diff.is_finite() {
+            non_finite_count += 1;
+            continue;
+        }
         let abs = diff.abs();
         sum_abs += abs;
         max_abs = max_abs.max(abs);
@@ -177,10 +183,20 @@ pub fn compute_stats(actual: &[f32], reference: &[f32]) -> MetricStats {
     }
 
     let n = len as f32;
+    if non_finite_count > 0 {
+        return MetricStats {
+            mean_abs: f32::NAN,
+            max_abs: f32::INFINITY,
+            rmse: f32::NAN,
+            non_finite_count,
+        };
+    }
+
     MetricStats {
         mean_abs: sum_abs / n,
         max_abs,
         rmse: (sum_sq / n).sqrt(),
+        non_finite_count,
     }
 }
 
@@ -280,6 +296,16 @@ mod tests {
         assert!((stats.mean_abs - 0.5).abs() < 1e-6);
         assert!((stats.max_abs - 1.0).abs() < 1e-6);
         assert!((stats.rmse - (1.25f32 / 3.0f32).sqrt()).abs() < 1e-6);
+        assert_eq!(stats.non_finite_count, 0);
+    }
+
+    #[test]
+    fn compute_stats_reports_non_finite_values() {
+        let stats = compute_stats(&[1.0, f32::NAN, 3.0], &[1.0, 2.0, f32::INFINITY]);
+        assert_eq!(stats.non_finite_count, 2);
+        assert!(stats.mean_abs.is_nan());
+        assert_eq!(stats.max_abs, f32::INFINITY);
+        assert!(stats.rmse.is_nan());
     }
 
     #[test]

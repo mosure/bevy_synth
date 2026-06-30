@@ -13,9 +13,10 @@ repository.workspace = true
 readme = "README.md"
 
 [features]
-default = ["wgpu", "triposg"]
+default = ["wgpu", "triposg", "trellis-native-pbr"]
 triposg = ["bevy_synth_runtime/triposg", "bevy_synth_runtime/shared-runtime", "bevy_synth_ui/triposg"]
 trellis = ["bevy_synth_runtime/trellis", "bevy_synth_runtime/shared-runtime", "bevy_synth_ui/trellis"]
+trellis-native-pbr = ["trellis", "bevy_synth_runtime/trellis-native-pbr"]
 wgpu = ["bevy_synth_runtime/wgpu", "bevy_synth_runtime/shared-runtime"]
 cuda = ["bevy_synth_runtime/cuda", "bevy_synth_runtime/shared-runtime"]
 solari = []
@@ -23,18 +24,24 @@ dlss = []
 force_disable_dlss = []
 
 [dependencies]
-bevy = { version = "0.17", features = ["http", "https", "webgpu"] }
-bevy_panorbit_camera = "0.33.0"
-bevy_infinite_grid = "0.17"
-bevy_mesh = "0.17"
-bevy_picking = { version = "0.17", features = ["bevy_mesh_picking_backend"] }
+bevy = { version = "0.19.0", features = ["http", "https", "webgpu"] }
+bevy_mesh = "0.19.0"
+bevy_picking = { version = "0.19.0", features = ["mesh_picking"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rattles = "0.3.1"
 bevy_synth_runtime = { version = "0.2.0", path = "../bevy_synth_runtime", default-features = false, features = ["shared-runtime"] }
 bevy_synth_ui = { version = "0.2.0", path = "../bevy_synth_ui" }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy_gaussian_splatting = { version = "8.0.0", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std"] }
+burn_synth_mcp = { version = "0.2.0", path = "../burn_synth_mcp" }
+burn_synth_scene = { version = "0.2.0", path = "../burn_synth_scene" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy_gaussian_splatting = { version = "8.0.0", default-features = false, features = ["io_flexbuffers", "planar", "buffer_storage", "sh0", "sort_std", "webgpu"] }
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
 wasm-bindgen = "0.2"

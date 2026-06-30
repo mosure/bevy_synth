@@ -22,7 +22,7 @@ fn main() {
 }
 
 fn run() {
-    let device = <BackendImpl as Backend>::Device::default();
+    let device = <BackendImpl as burn::tensor::backend::BackendTypes>::Device::default();
 
     let weights_root = resolve_weights_root(
         "TRIPOSG_WEIGHTS_ROOT",

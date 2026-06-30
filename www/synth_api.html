@@ -50,12 +50,60 @@
         opacity: 0.6;
         cursor: default;
       }
+      #boot-controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .boot-control {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .boot-control-label {
+        font-size: 12px;
+        letter-spacing: 0.01em;
+        color: #afc3e6;
+      }
+      .boot-control-select {
+        appearance: none;
+        border: 1px solid rgba(180, 200, 240, 0.28);
+        background: rgba(24, 38, 60, 0.7);
+        color: #d6deeb;
+        border-radius: 8px;
+        padding: 5px 8px;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .boot-control-select:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
     </style>
   </head>
   <body>
     <div id="boot">
       <div id="boot-text">click start to initialize burn_synth wasm</div>
       <button id="boot-start" type="button">Start</button>
+      <div id="boot-controls">
+        <div class="boot-control">
+          <label class="boot-control-label" for="synthesis-model">synthesis</label>
+          <select id="synthesis-model" class="boot-control-select" name="synthesis_model">
+            <option value="triposg" selected>triposg</option>
+            <option value="trellis">trellis</option>
+            <option value="triposplat">triposplat</option>
+          </select>
+        </div>
+        <div class="boot-control">
+          <label class="boot-control-label" for="asset-format">format</label>
+          <select id="asset-format" class="boot-control-select" name="asset_format">
+            <option value="splat" selected>splat</option>
+            <option value="ply">ply</option>
+          </select>
+        </div>
+      </div>
       <input id="image-file" type="file" accept=".png,.jpg,.jpeg,.webp" disabled />
       <button id="run-infer" type="button" disabled>Infer GLB</button>
       <a id="download" style="display: none" download="burn_synth_output.glb">download glb</a>
@@ -63,6 +111,8 @@
     <script type="module">
       const text = document.getElementById("boot-text");
       const startButton = document.getElementById("boot-start");
+      const synthesisModelSelect = document.getElementById("synthesis-model");
+      const assetFormatSelect = document.getElementById("asset-format");
       const imageInput = document.getElementById("image-file");
       const runButton = document.getElementById("run-infer");
       const download = document.getElementById("download");
@@ -88,7 +138,27 @@
         ];
       };
 
+      const serviceWorkerDisabledByQuery = () => {
+        const params = new URLSearchParams(window.location.search);
+        const raw = params.get("sw") ?? params.get("service_worker");
+        if (!raw) {
+          return false;
+        }
+        const value = raw.trim().toLowerCase();
+        return (
+          value === "0" ||
+          value === "off" ||
+          value === "false" ||
+          value === "disable" ||
+          value === "disabled" ||
+          value === "none"
+        );
+      };
+
       const ensureModelCacheServiceWorker = async () => {
+        if (serviceWorkerDisabledByQuery()) {
+          return false;
+        }
         if (!("serviceWorker" in navigator)) {
           return false;
         }
@@ -110,6 +180,80 @@
         })();
         return serviceWorkerReadyPromise;
       };
+
+      const normalizeSynthesisModel = (value) => {
+        const normalized = String(value || "").trim().toLowerCase();
+        if (normalized === "triposg" || normalized === "tripo") return "triposg";
+        if (normalized === "trellis" || normalized === "trellis2" || normalized === "trellis.2") {
+          return "trellis";
+        }
+        if (
+          normalized === "triposplat" ||
+          normalized === "tripo-splat" ||
+          normalized === "splat"
+        ) {
+          return "triposplat";
+        }
+        return null;
+      };
+
+      const normalizeAssetFormat = (value) => {
+        const normalized = String(value || "").trim().toLowerCase();
+        if (normalized === "ply") return "ply";
+        if (normalized === "splat" || normalized === "3dgs") return "splat";
+        return null;
+      };
+
+      const setInferButtonForSelection = ({ synthesisModel, assetFormat }) => {
+        if (synthesisModel === "triposplat") {
+          assetFormatSelect.disabled = false;
+          const ext = assetFormat === "ply" ? "ply" : "splat";
+          runButton.textContent = `Infer ${ext.toUpperCase()}`;
+          download.download = `burn_synth_output.${ext}`;
+          download.textContent = `download ${ext}`;
+        } else {
+          assetFormatSelect.disabled = true;
+          runButton.textContent = "Infer GLB";
+          download.download = "burn_synth_output.glb";
+          download.textContent = "download glb";
+        }
+      };
+
+      const setBootQueryParams = ({ synthesisModelValue, assetFormatValue }) => {
+        const synthesisModel = normalizeSynthesisModel(synthesisModelValue) || "triposg";
+        const assetFormat = normalizeAssetFormat(assetFormatValue) || "splat";
+        const url = new URL(window.location.href);
+        if (synthesisModel === "triposg") {
+          url.searchParams.delete("synthesis_model");
+          url.searchParams.delete("synthesis");
+        } else {
+          url.searchParams.set("synthesis_model", synthesisModel);
+          url.searchParams.delete("synthesis");
+        }
+        if (synthesisModel === "triposplat" && assetFormat === "ply") {
+          url.searchParams.set("asset_format", assetFormat);
+        } else {
+          url.searchParams.delete("asset_format");
+        }
+        window.history.replaceState({}, "", url);
+        const selected = { synthesisModel, assetFormat };
+        setInferButtonForSelection(selected);
+        return selected;
+      };
+
+      const urlSearchParams = new URLSearchParams(window.location.search);
+      const initialSynthesisModel =
+        normalizeSynthesisModel(
+          urlSearchParams.get("synthesis_model") || urlSearchParams.get("synthesis"),
+        ) || "triposg";
+      const initialAssetFormat =
+        normalizeAssetFormat(urlSearchParams.get("asset_format")) || "splat";
+      synthesisModelSelect.value = initialSynthesisModel;
+      assetFormatSelect.value = initialAssetFormat;
+      setInferButtonForSelection({
+        synthesisModel: initialSynthesisModel,
+        assetFormat: initialAssetFormat,
+      });
 
       const start = async () => {
         startButton.disabled = true;
@@ -133,10 +277,17 @@
           if (!hasWebGpu) {
             imageInput.disabled = true;
             runButton.disabled = true;
+            synthesisModelSelect.disabled = true;
+            assetFormatSelect.disabled = true;
             text.textContent = "module ready (WebGPU unavailable in this browser/runtime)";
           } else {
             imageInput.disabled = false;
             runButton.disabled = false;
+            synthesisModelSelect.disabled = false;
+            setBootQueryParams({
+              synthesisModelValue: synthesisModelSelect.value,
+              assetFormatValue: assetFormatSelect.value,
+            });
             text.textContent = "module ready";
           }
         } catch (err) {
@@ -156,12 +307,40 @@
         download.style.display = "none";
         text.textContent = "running inference...";
         try {
+          const selected = setBootQueryParams({
+            synthesisModelValue: synthesisModelSelect.value,
+            assetFormatValue: assetFormatSelect.value,
+          });
           const bytes = new Uint8Array(await file.arrayBuffer());
-          const glb = await wasm.infer_glb_from_image_bytes(bytes, file.name);
-          const blob = new Blob([glb], { type: "model/gltf-binary" });
+          const options = new wasm.WasmInferOptions();
+          options.set_synthesis_model(selected.synthesisModel);
+          options.set_rmbg_model("rmbg14");
+          options.set_backend("wgpu");
+
+          let output = null;
+          let mime = "model/gltf-binary";
+          let extension = "glb";
+          if (selected.synthesisModel === "triposplat") {
+            mime = "application/octet-stream";
+            extension = selected.assetFormat === "ply" ? "ply" : "splat";
+            const inferFn =
+              selected.assetFormat === "ply"
+                ? wasm.infer_ply_from_image_bytes_with_options
+                : wasm.infer_splat_from_image_bytes_with_options;
+            if (typeof inferFn !== "function") {
+              throw new Error(`burn_synth wasm module does not expose ${extension} inference`);
+            }
+            output = await inferFn(bytes, file.name, options);
+          } else {
+            output = await wasm.infer_glb_from_image_bytes_with_options(bytes, file.name, options);
+          }
+
+          const blob = new Blob([output], { type: mime });
           download.href = URL.createObjectURL(blob);
+          download.download = `burn_synth_output.${extension}`;
+          download.textContent = `download ${extension}`;
           download.style.display = "inline";
-          text.textContent = `inference complete (${(glb.byteLength / (1024 * 1024)).toFixed(1)} MiB)`;
+          text.textContent = `inference complete (${(output.byteLength / (1024 * 1024)).toFixed(1)} MiB)`;
         } catch (err) {
           console.error("burn_synth wasm inference failed", err);
           text.textContent = `inference failed: ${String(err)}`;
@@ -170,6 +349,18 @@
         }
       };
 
+      synthesisModelSelect.addEventListener("change", () => {
+        setBootQueryParams({
+          synthesisModelValue: synthesisModelSelect.value,
+          assetFormatValue: assetFormatSelect.value,
+        });
+      });
+      assetFormatSelect.addEventListener("change", () => {
+        setBootQueryParams({
+          synthesisModelValue: synthesisModelSelect.value,
+          assetFormatValue: assetFormatSelect.value,
+        });
+      });
       startButton.addEventListener("click", start);
       runButton.addEventListener("click", infer);
     </script>

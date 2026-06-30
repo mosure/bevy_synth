@@ -1,6 +1,6 @@
 [package]
 name = "burn_flex_gmm"
-version = "0.1.0"
+version = "0.21.2"
 edition = "2024"
 description = "Sparse submanifold convolution kernels and FlexGMM-style gather+GEMM helpers."
 authors.workspace = true
@@ -13,30 +13,42 @@ readme = "README.md"
 
 [features]
 default = []
+# Compatibility alias retained for older local commands; the ported CubeCL
+# sparse kernels are enabled by `wgpu-kernel`.
+legacy-wgpu-kernel = []
 wgpu-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-wgpu"]
+cuda-kernel = ["dep:burn", "dep:burn-cubecl", "dep:burn-cuda"]
 
 [dependencies]
 matrixmultiply = "0.3"
-burn = { version = "0.19", default-features = false, features = ["std"], optional = true }
-burn-cubecl = { version = "0.19", optional = true }
+burn = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+half = "2.4"
+# Keep CubeCL deterministic on the canonical WGPU path: avoid default
+# `autotune` so runtime doesn't select vecmat kernels that require
+# unavailable plane-wide ops on some adapters.
+burn-cubecl = { version = "=0.21.0", optional = true, default-features = false, features = ["std"] }
+burn-cuda = { version = "=0.21.0", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
-version = "0.19"
+version = "=0.21.0"
 optional = true
 default-features = false
-features = ["std", "vulkan"]
+features = ["fusion", "std", "vulkan"]
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
-version = "0.19"
+version = "=0.21.0"
 optional = true
 default-features = false
-features = ["std", "metal"]
+features = ["fusion", "std", "metal"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
-version = "0.19"
+version = "=0.21.0"
 optional = true
 default-features = false
 features = ["std", "webgpu"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
@@ -44,3 +56,17 @@ criterion = { version = "0.6", features = ["html_reports"] }
 [[bench]]
 name = "sparse_subm_conv"
 harness = false
+
+[[bench]]
+name = "sparse_patchify"
+harness = false
+
+[[bin]]
+name = "neighbor_stage_bench"
+path = "tool/neighbor_stage_bench.rs"
+required-features = ["wgpu-kernel"]
+
+[[bin]]
+name = "sparse_conv_stage_bench"
+path = "tool/sparse_conv_stage_bench.rs"
+required-features = ["wgpu-kernel"]

@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use burn_trellis::hook_diff::{HookDiffStatus, HookSnapshot, compare_hook_snapshots};
 use clap::Parser;
+use serde::Serialize;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,6 +46,51 @@ struct Args {
     /// Allow keys that exist in actual but not in reference.
     #[arg(long, default_value_t = false)]
     allow_extra: bool,
+
+    /// Optional path for a machine-readable JSON report.
+    #[arg(long)]
+    json_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonReport {
+    reference: String,
+    actual: String,
+    prefix: Option<String>,
+    passed: bool,
+    summary: JsonSummary,
+    entries: Vec<JsonEntry>,
+    extra_in_actual: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonSummary {
+    matched: usize,
+    missing: usize,
+    shape_mismatch: usize,
+    extra: usize,
+    worst_mean_abs: f32,
+    worst_max_abs: f32,
+    worst_rmse: f32,
+    threshold_failures: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonEntry {
+    key: String,
+    status: &'static str,
+    reference_shape: Vec<usize>,
+    actual_shape: Option<Vec<usize>>,
+    stats: Option<JsonStats>,
+    threshold_failed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonStats {
+    mean_abs: f32,
+    max_abs: f32,
+    rmse: f32,
+    non_finite_count: usize,
 }
 
 fn main() {
@@ -69,12 +115,13 @@ fn run(args: Args) -> Result<(), String> {
     let mut worst_max_abs = 0.0f32;
     let mut worst_mean_abs = 0.0f32;
     let mut worst_rmse = 0.0f32;
+    let mut json_entries = Vec::with_capacity(report.entries.len());
 
     println!(
-        "{:<48} {:<16} {:>12} {:>12} {:>12}",
-        "hook", "status", "mean_abs", "max_abs", "rmse"
+        "{:<48} {:<16} {:>12} {:>12} {:>12} {:>12}",
+        "hook", "status", "mean_abs", "max_abs", "rmse", "non_finite"
     );
-    println!("{}", "-".repeat(108));
+    println!("{}", "-".repeat(121));
 
     for entry in &report.entries {
         match entry.status {
@@ -104,12 +151,29 @@ fn run(args: Args) -> Result<(), String> {
                 {
                     failed = true;
                 }
+                if stats.non_finite_count > 0 {
+                    failed = true;
+                }
                 if failed {
                     threshold_failures += 1;
                 }
 
+                json_entries.push(JsonEntry {
+                    key: entry.key.clone(),
+                    status: "match",
+                    reference_shape: entry.reference_shape.clone(),
+                    actual_shape: entry.actual_shape.clone(),
+                    stats: Some(JsonStats {
+                        mean_abs: stats.mean_abs,
+                        max_abs: stats.max_abs,
+                        rmse: stats.rmse,
+                        non_finite_count: stats.non_finite_count,
+                    }),
+                    threshold_failed: failed,
+                });
+
                 println!(
-                    "{:<48} {:<16} {:>12.6e} {:>12.6e} {:>12.6e}",
+                    "{:<48} {:<16} {:>12.6e} {:>12.6e} {:>12.6e} {:>12}",
                     entry.key,
                     if failed {
                         "match(thresh-fail)"
@@ -118,21 +182,38 @@ fn run(args: Args) -> Result<(), String> {
                     },
                     stats.mean_abs,
                     stats.max_abs,
-                    stats.rmse
+                    stats.rmse,
+                    stats.non_finite_count
                 );
             }
             HookDiffStatus::MissingInActual => {
                 missing += 1;
+                json_entries.push(JsonEntry {
+                    key: entry.key.clone(),
+                    status: "missing",
+                    reference_shape: entry.reference_shape.clone(),
+                    actual_shape: None,
+                    stats: None,
+                    threshold_failed: false,
+                });
                 println!(
-                    "{:<48} {:<16} {:>12} {:>12} {:>12}",
-                    entry.key, "missing", "-", "-", "-"
+                    "{:<48} {:<16} {:>12} {:>12} {:>12} {:>12}",
+                    entry.key, "missing", "-", "-", "-", "-"
                 );
             }
             HookDiffStatus::ShapeMismatch => {
                 shape_mismatch += 1;
+                json_entries.push(JsonEntry {
+                    key: entry.key.clone(),
+                    status: "shape_mismatch",
+                    reference_shape: entry.reference_shape.clone(),
+                    actual_shape: entry.actual_shape.clone(),
+                    stats: None,
+                    threshold_failed: false,
+                });
                 println!(
-                    "{:<48} {:<16} {:>12} {:>12} {:>12}",
-                    entry.key, "shape-mismatch", "-", "-", "-"
+                    "{:<48} {:<16} {:>12} {:>12} {:>12} {:>12}",
+                    entry.key, "shape-mismatch", "-", "-", "-", "-"
                 );
                 if let Some(actual_shape) = entry.actual_shape.as_ref() {
                     println!(
@@ -161,6 +242,41 @@ fn run(args: Args) -> Result<(), String> {
         worst_mean_abs, worst_max_abs, worst_rmse
     );
     println!("  threshold_failures={threshold_failures}");
+
+    let failed = (missing > 0 && !args.allow_missing)
+        || (shape_mismatch > 0 && !args.allow_shape_mismatch)
+        || (!report.extra_in_actual.is_empty() && !args.allow_extra)
+        || threshold_failures > 0;
+
+    if let Some(json_out) = args.json_out.as_ref() {
+        let json_report = JsonReport {
+            reference: args.reference.display().to_string(),
+            actual: args.actual.display().to_string(),
+            prefix: args.prefix.clone(),
+            passed: !failed,
+            summary: JsonSummary {
+                matched,
+                missing,
+                shape_mismatch,
+                extra: report.extra_in_actual.len(),
+                worst_mean_abs,
+                worst_max_abs,
+                worst_rmse,
+                threshold_failures,
+            },
+            entries: json_entries,
+            extra_in_actual: report.extra_in_actual.clone(),
+        };
+        if let Some(parent) = json_out.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create json output directory: {err}"))?;
+        }
+        let json = serde_json::to_string_pretty(&json_report)
+            .map_err(|err| format!("failed to encode json report: {err}"))?;
+        fs::write(json_out, json).map_err(|err| format!("failed to write json report: {err}"))?;
+    }
 
     if missing > 0 && !args.allow_missing {
         return Err("hook diff failed: missing hooks in actual".to_string());

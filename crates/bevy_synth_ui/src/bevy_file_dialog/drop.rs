@@ -8,7 +8,7 @@ use bevy_tasks::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_window::FileDragAndDrop;
 #[cfg(not(target_arch = "wasm32"))]
-use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper, WakeUp};
+use bevy_winit::{EventLoopProxy, EventLoopProxyWrapper};
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 #[cfg(target_arch = "wasm32")]
@@ -111,7 +111,7 @@ impl FileDialogPlugin {
 fn handle_native_file_drop<T: DropFileContents>(
     mut events: MessageReader<FileDragAndDrop>,
     sender: Res<DropStreamSender<T>>,
-    event_loop_proxy: Option<Res<EventLoopProxyWrapper<WakeUp>>>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
 ) {
     let event_loop_proxy = event_loop_proxy
         .as_ref()
@@ -237,7 +237,7 @@ fn install_web_drop_listeners<T: DropFileContents>(app: &mut App) {
         return;
     }
 
-    app.insert_non_send_resource(WebDropListeners::<T> {
+    app.insert_non_send(WebDropListeners::<T> {
         document,
         dragover,
         drop,

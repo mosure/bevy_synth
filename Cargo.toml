@@ -5,12 +5,24 @@ members = [
   "crates/burn_flex_gmm",
   "crates/burn_synth",
   "crates/burn_trellis",
+  "crates/burn_flux",
+  "crates/burn_triposplat",
   "crates/burn_tripo",
   "crates/bevy_synth",
   "crates/bevy_synth_runtime",
   "crates/bevy_synth_ui",
   "crates/burn_foreground",
+  "crates/burn_synth_scene",
+  "crates/burn_synth_grounding",
   "crates/burn_synth_mcp",
+  "crates/burn_locate_anything",
+  "crates/burn_segmentation",
+  "crates/burn_synth_render",
+]
+exclude = [
+  "third_party/burn_dino",
+  "third_party/cubek-attention",
+  "third_party/gpu-allocator",
 ]
 
 [workspace.package]
@@ -53,3 +65,8 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[patch.crates-io]
+burn_dino = { path = "third_party/burn_dino" }
+cubek-attention = { path = "third_party/cubek-attention" }
+gpu-allocator = { path = "third_party/gpu-allocator" }

@@ -79,6 +79,11 @@ pub fn resolve_trellis2_image_large_root(explicit: Option<&Path>) -> PathBuf {
     image_selected
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn trellis2_ovoxel_postprocess_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tool/trellis2_postprocess_from_hook.py")
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn resolve_trellis2_image_large_root(explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {

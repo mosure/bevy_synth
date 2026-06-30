@@ -3,6 +3,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use bevy::asset::RenderAssetUsages;
+use bevy::prelude::Image;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use burn::prelude::*;
 use image::ImageEncoder;
 use safetensors::tensor::{SafeTensors, TensorView};
@@ -15,6 +18,27 @@ pub fn write_glb(path: &Path, mesh: &SynthMesh) -> Result<(), Box<dyn std::error
         fs::create_dir_all(parent)?;
     }
     let glb = mesh_to_glb_bytes(mesh)?;
+    fs::write(path, glb)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct SceneGlbMeshInstance {
+    pub name: String,
+    pub mesh: SynthMesh,
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+pub fn write_scene_glb(
+    path: &Path,
+    instances: &[SceneGlbMeshInstance],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let glb = scene_meshes_to_glb_bytes(instances)?;
     fs::write(path, glb)?;
     Ok(())
 }
@@ -34,6 +58,115 @@ pub fn mesh_to_glb_bytes(mesh: &SynthMesh) -> Result<Vec<u8>, Box<dyn std::error
     }
     .to_vec()?;
     Ok(glb)
+}
+
+pub fn scene_meshes_to_glb_bytes(
+    instances: &[SceneGlbMeshInstance],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if instances.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot export empty scene",
+        )));
+    }
+
+    let mut buffer = Vec::new();
+    let mut buffer_views = Vec::new();
+    let mut accessors = Vec::new();
+    let mut images = Vec::new();
+    let mut textures = Vec::new();
+    let mut materials = Vec::new();
+    let mut meshes = Vec::new();
+    let mut nodes = Vec::new();
+    let mut scene_nodes = Vec::new();
+
+    for instance in instances {
+        let layout = build_mesh_binary_layout(&instance.mesh)?;
+        pad_buffer_4(&mut buffer);
+        let base_offset = buffer.len();
+        buffer.extend_from_slice(layout.buffer.as_slice());
+
+        let primitive = append_mesh_primitive_json(
+            &instance.mesh,
+            &layout,
+            base_offset,
+            &mut buffer_views,
+            &mut accessors,
+            &mut images,
+            &mut textures,
+            &mut materials,
+        );
+        let mesh_index = meshes.len();
+        meshes.push(serde_json::json!({
+            "name": instance.name,
+            "primitives": [primitive],
+        }));
+        let node_index = nodes.len();
+        nodes.push(serde_json::json!({
+            "name": instance.name,
+            "mesh": mesh_index,
+            "translation": instance.translation,
+            "rotation": normalized_quat(instance.rotation),
+            "scale": sanitized_scale(instance.scale),
+        }));
+        scene_nodes.push(node_index);
+    }
+
+    let mut gltf = serde_json::json!({
+        "asset": {
+            "version": "2.0",
+            "generator": "bevy_synth_runtime"
+        },
+        "scene": 0,
+        "scenes": [
+            { "nodes": scene_nodes }
+        ],
+        "nodes": nodes,
+        "meshes": meshes,
+        "buffers": [
+            { "byteLength": buffer.len() }
+        ],
+        "bufferViews": buffer_views,
+        "accessors": accessors
+    });
+    if !materials.is_empty() {
+        gltf["materials"] = serde_json::Value::Array(materials);
+    }
+    if !images.is_empty() {
+        gltf["images"] = serde_json::Value::Array(images);
+    }
+    if !textures.is_empty() {
+        gltf["textures"] = serde_json::Value::Array(textures);
+    }
+
+    let json_bytes = serde_json::to_vec(&gltf)?;
+    let glb = gltf::Glb {
+        header: gltf::binary::Header {
+            magic: *b"glTF",
+            version: 2,
+            length: 0,
+        },
+        json: Cow::Owned(json_bytes),
+        bin: Some(Cow::Owned(buffer)),
+    }
+    .to_vec()?;
+    Ok(glb)
+}
+
+pub fn image_bytes_to_bevy_image(bytes: &[u8]) -> Result<Image, Box<dyn std::error::Error>> {
+    let rgba = image::load_from_memory(bytes)?.to_rgba8();
+    let size = Extent3d {
+        width: rgba.width(),
+        height: rgba.height(),
+        depth_or_array_layers: 1,
+    };
+    Ok(Image::new(
+        size,
+        TextureDimension::D2,
+        rgba.into_raw(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ))
 }
 
 pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error::Error>> {
@@ -78,14 +211,14 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error
     }
     let vertex_count = vertices.len() as u32;
     let mut faces = Vec::with_capacity(indices.len() / 3);
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         if tri[0] >= vertex_count || tri[1] >= vertex_count || tri[2] >= vertex_count {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "GLB indices reference out-of-range vertices",
             )));
         }
-        faces.push([tri[0], tri[1], tri[2]]);
+        faces.push(*tri);
     }
 
     let mut uvs: Vec<[f32; 2]> = reader
@@ -94,6 +227,13 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error
         .unwrap_or_default();
     if uvs.len() != vertices.len() {
         uvs.clear();
+    }
+    let mut normals: Vec<[f32; 3]> = reader
+        .read_normals()
+        .map(|normals| normals.collect())
+        .unwrap_or_default();
+    if normals.len() != vertices.len() {
+        normals.clear();
     }
 
     let material_ref = primitive.material();
@@ -141,6 +281,7 @@ pub fn mesh_from_glb_bytes(bytes: &[u8]) -> Result<SynthMesh, Box<dyn std::error
     Ok(SynthMesh {
         mesh: crate::TripoMesh { vertices, faces },
         uvs,
+        normals,
         material,
         pbr_textures,
     })
@@ -228,7 +369,17 @@ fn build_mesh_binary_layout(
     let positions_byte_length = buffer.len() - positions_byte_offset;
 
     pad_buffer_4(&mut buffer);
-    let normals = compute_normals(&mesh.mesh);
+    let normals = if mesh.normals.len() == mesh.mesh.vertices.len() && !mesh.normals.is_empty() {
+        let mut normals = mesh.normals.clone();
+        burn_synth::align_normals_with_faces(
+            mesh.mesh.vertices.as_slice(),
+            mesh.mesh.faces.as_slice(),
+            normals.as_mut_slice(),
+        );
+        normals
+    } else {
+        compute_normals(&mesh.mesh)
+    };
     let normals_byte_offset = buffer.len();
     for normal in &normals {
         for component in normal {
@@ -319,150 +470,25 @@ fn build_mesh_binary_layout(
 }
 
 fn gltf_json(mesh: &SynthMesh, layout: &MeshBinaryLayout) -> serde_json::Value {
-    let mut primitive = serde_json::json!({
-        "attributes": {
-            "POSITION": 0,
-            "NORMAL": 1
-        },
-        "indices": 2,
-        "mode": 4
-    });
-    if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
-        primitive["attributes"]["TEXCOORD_0"] = serde_json::json!(3);
-    }
-
     let buffers = vec![serde_json::json!({
         "byteLength": layout.buffer.len(),
     })];
 
     let mut buffer_views = Vec::new();
-    buffer_views.push(serde_json::json!({
-        "buffer": 0,
-        "byteOffset": layout.positions_byte_offset,
-        "byteLength": layout.positions_byte_length,
-        "target": 34962
-    }));
-    buffer_views.push(serde_json::json!({
-        "buffer": 0,
-        "byteOffset": layout.normals_byte_offset,
-        "byteLength": layout.normals_byte_length,
-        "target": 34962
-    }));
-    buffer_views.push(serde_json::json!({
-        "buffer": 0,
-        "byteOffset": layout.indices_byte_offset,
-        "byteLength": layout.indices_byte_length,
-        "target": 34963
-    }));
-    if let (Some(uv_offset), Some(uv_len)) = (layout.uvs_byte_offset, layout.uvs_byte_length) {
-        buffer_views.push(serde_json::json!({
-            "buffer": 0,
-            "byteOffset": uv_offset,
-            "byteLength": uv_len,
-            "target": 34962
-        }));
-    }
-
     let mut accessors = Vec::new();
-    accessors.push(serde_json::json!({
-        "bufferView": 0,
-        "componentType": 5126,
-        "count": mesh.mesh.vertices.len(),
-        "type": "VEC3",
-        "min": layout.min,
-        "max": layout.max
-    }));
-    accessors.push(serde_json::json!({
-        "bufferView": 1,
-        "componentType": 5126,
-        "count": mesh.mesh.vertices.len(),
-        "type": "VEC3"
-    }));
-    accessors.push(serde_json::json!({
-        "bufferView": 2,
-        "componentType": 5125,
-        "count": mesh.mesh.faces.len() * 3,
-        "type": "SCALAR"
-    }));
-    if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
-        accessors.push(serde_json::json!({
-            "bufferView": 3,
-            "componentType": 5126,
-            "count": mesh.uvs.len(),
-            "type": "VEC2"
-        }));
-    }
-
     let mut images = Vec::new();
     let mut textures = Vec::new();
     let mut materials = Vec::new();
-    let mut pbr_mr = serde_json::json!({});
-    let mut push_texture_image = |byte_offset: usize, byte_length: usize| -> usize {
-        let view_index = buffer_views.len();
-        buffer_views.push(serde_json::json!({
-            "buffer": 0,
-            "byteOffset": byte_offset,
-            "byteLength": byte_length
-        }));
-        let image_index = images.len();
-        images.push(serde_json::json!({
-            "bufferView": view_index,
-            "mimeType": "image/png"
-        }));
-        let texture_index = textures.len();
-        textures.push(serde_json::json!({ "source": image_index }));
-        texture_index
-    };
-    if let Some(material) = mesh.material {
-        pbr_mr = serde_json::json!({
-            "baseColorFactor": [
-                material.base_color[0],
-                material.base_color[1],
-                material.base_color[2],
-                material.alpha.clamp(0.0, 1.0)
-            ],
-            "metallicFactor": material.metallic.clamp(0.0, 1.0),
-            "roughnessFactor": material.roughness.clamp(0.0, 1.0)
-        });
-    }
-    if let Some((base_offset, base_len)) = layout.base_color_image_view {
-        let texture_index = push_texture_image(base_offset, base_len);
-        pbr_mr["baseColorTexture"] = serde_json::json!({ "index": texture_index });
-    }
-    if let Some((mr_offset, mr_len)) = layout.metallic_roughness_image_view {
-        let texture_index = push_texture_image(mr_offset, mr_len);
-        pbr_mr["metallicRoughnessTexture"] = serde_json::json!({ "index": texture_index });
-    }
-
-    if mesh.material.is_some() || mesh.pbr_textures.is_some() {
-        let alpha = mesh
-            .material
-            .map(|value| value.alpha)
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        let material_index = materials.len();
-        let mut material = serde_json::json!({
-            "pbrMetallicRoughness": pbr_mr,
-            "alphaMode": if alpha < 0.995 { "BLEND" } else { "OPAQUE" },
-            "doubleSided": true
-        });
-        if let Some((normal_offset, normal_len)) = layout.normal_image_view {
-            let texture_index = push_texture_image(normal_offset, normal_len);
-            material["normalTexture"] = serde_json::json!({ "index": texture_index });
-        }
-        if let Some((emissive_offset, emissive_len)) = layout.emissive_image_view {
-            let texture_index = push_texture_image(emissive_offset, emissive_len);
-            material["emissiveTexture"] = serde_json::json!({ "index": texture_index });
-            material["emissiveFactor"] = serde_json::json!([1.0, 1.0, 1.0]);
-        }
-        if let Some((occlusion_offset, occlusion_len)) = layout.occlusion_image_view {
-            let texture_index = push_texture_image(occlusion_offset, occlusion_len);
-            material["occlusionTexture"] = serde_json::json!({ "index": texture_index });
-        }
-        materials.push(material);
-        primitive["material"] = serde_json::json!(material_index);
-    }
-
+    let primitive = append_mesh_primitive_json(
+        mesh,
+        layout,
+        0,
+        &mut buffer_views,
+        &mut accessors,
+        &mut images,
+        &mut textures,
+        &mut materials,
+    );
     let mut gltf = serde_json::json!({
         "asset": {
             "version": "2.0",
@@ -496,6 +522,195 @@ fn gltf_json(mesh: &SynthMesh, layout: &MeshBinaryLayout) -> serde_json::Value {
         gltf["textures"] = serde_json::Value::Array(textures);
     }
     gltf
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_mesh_primitive_json(
+    mesh: &SynthMesh,
+    layout: &MeshBinaryLayout,
+    base_offset: usize,
+    buffer_views: &mut Vec<serde_json::Value>,
+    accessors: &mut Vec<serde_json::Value>,
+    images: &mut Vec<serde_json::Value>,
+    textures: &mut Vec<serde_json::Value>,
+    materials: &mut Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let position_view = buffer_views.len();
+    buffer_views.push(serde_json::json!({
+        "buffer": 0,
+        "byteOffset": base_offset + layout.positions_byte_offset,
+        "byteLength": layout.positions_byte_length,
+        "target": 34962
+    }));
+    let normal_view = buffer_views.len();
+    buffer_views.push(serde_json::json!({
+        "buffer": 0,
+        "byteOffset": base_offset + layout.normals_byte_offset,
+        "byteLength": layout.normals_byte_length,
+        "target": 34962
+    }));
+    let index_view = buffer_views.len();
+    buffer_views.push(serde_json::json!({
+        "buffer": 0,
+        "byteOffset": base_offset + layout.indices_byte_offset,
+        "byteLength": layout.indices_byte_length,
+        "target": 34963
+    }));
+    let mut uv_view = None;
+    if let (Some(uv_offset), Some(uv_len)) = (layout.uvs_byte_offset, layout.uvs_byte_length) {
+        let view = buffer_views.len();
+        buffer_views.push(serde_json::json!({
+            "buffer": 0,
+            "byteOffset": base_offset + uv_offset,
+            "byteLength": uv_len,
+            "target": 34962
+        }));
+        uv_view = Some(view);
+    }
+
+    let position_accessor = accessors.len();
+    accessors.push(serde_json::json!({
+        "bufferView": position_view,
+        "componentType": 5126,
+        "count": mesh.mesh.vertices.len(),
+        "type": "VEC3",
+        "min": layout.min,
+        "max": layout.max
+    }));
+    let normal_accessor = accessors.len();
+    accessors.push(serde_json::json!({
+        "bufferView": normal_view,
+        "componentType": 5126,
+        "count": mesh.mesh.vertices.len(),
+        "type": "VEC3"
+    }));
+    let index_accessor = accessors.len();
+    accessors.push(serde_json::json!({
+        "bufferView": index_view,
+        "componentType": 5125,
+        "count": mesh.mesh.faces.len() * 3,
+        "type": "SCALAR"
+    }));
+    let mut uv_accessor = None;
+    if mesh.uvs.len() == mesh.mesh.vertices.len() && !mesh.uvs.is_empty() {
+        let accessor = accessors.len();
+        accessors.push(serde_json::json!({
+            "bufferView": uv_view.expect("uv buffer view exists"),
+            "componentType": 5126,
+            "count": mesh.uvs.len(),
+            "type": "VEC2"
+        }));
+        uv_accessor = Some(accessor);
+    }
+
+    let mut pbr_mr = serde_json::json!({});
+    let mut push_texture_image = |byte_offset: usize, byte_length: usize| -> usize {
+        let view_index = buffer_views.len();
+        buffer_views.push(serde_json::json!({
+            "buffer": 0,
+            "byteOffset": base_offset + byte_offset,
+            "byteLength": byte_length
+        }));
+        let image_index = images.len();
+        images.push(serde_json::json!({
+            "bufferView": view_index,
+            "mimeType": "image/png"
+        }));
+        let texture_index = textures.len();
+        textures.push(serde_json::json!({ "source": image_index }));
+        texture_index
+    };
+    let has_pbr_textures = mesh.pbr_textures.is_some();
+    if has_pbr_textures {
+        pbr_mr = serde_json::json!({
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "metallicFactor": 1.0,
+            "roughnessFactor": 1.0
+        });
+    } else if let Some(material) = mesh.material {
+        pbr_mr = serde_json::json!({
+            "baseColorFactor": [
+                material.base_color[0],
+                material.base_color[1],
+                material.base_color[2],
+                material.alpha.clamp(0.0, 1.0)
+            ],
+            "metallicFactor": material.metallic.clamp(0.0, 1.0),
+            "roughnessFactor": material.roughness.clamp(0.0, 1.0)
+        });
+    }
+    if let Some((base_offset, base_len)) = layout.base_color_image_view {
+        let texture_index = push_texture_image(base_offset, base_len);
+        pbr_mr["baseColorTexture"] = serde_json::json!({ "index": texture_index });
+    }
+    if let Some((mr_offset, mr_len)) = layout.metallic_roughness_image_view {
+        let texture_index = push_texture_image(mr_offset, mr_len);
+        pbr_mr["metallicRoughnessTexture"] = serde_json::json!({ "index": texture_index });
+    }
+
+    let mut primitive = serde_json::json!({
+        "attributes": {
+            "POSITION": position_accessor,
+            "NORMAL": normal_accessor
+        },
+        "indices": index_accessor,
+        "mode": 4
+    });
+    if let Some(uv_accessor) = uv_accessor {
+        primitive["attributes"]["TEXCOORD_0"] = serde_json::json!(uv_accessor);
+    }
+
+    if mesh.material.is_some() || has_pbr_textures {
+        let alpha = mesh
+            .material
+            .map(|value| value.alpha)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let material_index = materials.len();
+        let mut material = serde_json::json!({
+            "pbrMetallicRoughness": pbr_mr,
+            "alphaMode": if has_pbr_textures || alpha >= 0.99 { "OPAQUE" } else { "BLEND" },
+            "doubleSided": !has_pbr_textures
+        });
+        if let Some((normal_offset, normal_len)) = layout.normal_image_view {
+            let texture_index = push_texture_image(normal_offset, normal_len);
+            material["normalTexture"] = serde_json::json!({ "index": texture_index });
+        }
+        if let Some((emissive_offset, emissive_len)) = layout.emissive_image_view {
+            let texture_index = push_texture_image(emissive_offset, emissive_len);
+            material["emissiveTexture"] = serde_json::json!({ "index": texture_index });
+            material["emissiveFactor"] = serde_json::json!([1.0, 1.0, 1.0]);
+        }
+        if let Some((occlusion_offset, occlusion_len)) = layout.occlusion_image_view {
+            let texture_index = push_texture_image(occlusion_offset, occlusion_len);
+            material["occlusionTexture"] = serde_json::json!({ "index": texture_index });
+        }
+        materials.push(material);
+        primitive["material"] = serde_json::json!(material_index);
+    }
+    primitive
+}
+
+fn normalized_quat(rotation: [f32; 4]) -> [f32; 4] {
+    let len_sq = rotation.iter().map(|value| value * value).sum::<f32>();
+    if !len_sq.is_finite() || len_sq <= 0.0 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let inv_len = len_sq.sqrt().recip();
+    [
+        rotation[0] * inv_len,
+        rotation[1] * inv_len,
+        rotation[2] * inv_len,
+        rotation[3] * inv_len,
+    ]
+}
+
+fn sanitized_scale(scale: [f32; 3]) -> [f32; 3] {
+    if scale.iter().all(|value| value.is_finite()) {
+        scale
+    } else {
+        [1.0, 1.0, 1.0]
+    }
 }
 
 fn pad_buffer_4(buffer: &mut Vec<u8>) {
@@ -665,6 +880,7 @@ mod tests {
                 faces: vec![[0, 1, 2]],
             },
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         };
@@ -679,5 +895,101 @@ mod tests {
         assert_eq!(primitive["indices"], 2);
         assert_eq!(primitive["attributes"]["TEXCOORD_0"], 3);
         assert_eq!(json["accessors"][1]["type"], "VEC3");
+    }
+
+    #[test]
+    fn glb_export_uses_neutral_material_factors_for_pbr_textures() {
+        let mesh = SynthMesh {
+            mesh: crate::TripoMesh {
+                vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.75, 0.0]],
+                faces: vec![[0, 1, 2]],
+            },
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
+            material: Some(crate::SynthMeshMaterial {
+                base_color: [0.2, 0.3, 0.4],
+                metallic: 0.25,
+                roughness: 0.5,
+                alpha: 0.75,
+            }),
+            pbr_textures: Some(crate::SynthMeshPbrTextures {
+                base_color: crate::SynthMeshTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![200, 190, 180, 255],
+                },
+                metallic_roughness: crate::SynthMeshTexture {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![0, 255, 255, 255],
+                },
+                normal: None,
+                emissive: None,
+                occlusion: None,
+            }),
+        };
+
+        let glb_bytes = mesh_to_glb_bytes(&mesh).expect("glb export");
+        let glb = gltf::Glb::from_slice(glb_bytes.as_slice()).expect("parse glb");
+        let json: Value = serde_json::from_slice(glb.json.as_ref()).expect("parse glb json");
+        let material = &json["materials"][0];
+        let pbr = &material["pbrMetallicRoughness"];
+
+        assert_eq!(
+            pbr["baseColorFactor"],
+            serde_json::json!([1.0, 1.0, 1.0, 1.0])
+        );
+        assert_eq!(pbr["metallicFactor"], serde_json::json!(1.0));
+        assert_eq!(pbr["roughnessFactor"], serde_json::json!(1.0));
+        assert!(pbr.get("baseColorTexture").is_some());
+        assert!(pbr.get("metallicRoughnessTexture").is_some());
+        assert_eq!(material["alphaMode"], "OPAQUE");
+        assert_eq!(material["doubleSided"], false);
+    }
+
+    #[test]
+    fn scene_glb_export_contains_one_node_per_instance() {
+        let mesh = SynthMesh {
+            mesh: crate::TripoMesh {
+                vertices: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.75, 0.0]],
+                faces: vec![[0, 1, 2]],
+            },
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+            normals: Vec::new(),
+            material: None,
+            pbr_textures: None,
+        };
+
+        let glb_bytes = scene_meshes_to_glb_bytes(&[
+            SceneGlbMeshInstance {
+                name: "chair_left".to_string(),
+                mesh: mesh.clone(),
+                translation: [-1.0, 0.0, 2.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+            SceneGlbMeshInstance {
+                name: "chair_right".to_string(),
+                mesh,
+                translation: [1.0, 0.0, 2.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.5, 1.0, 1.5],
+            },
+        ])
+        .expect("scene glb export");
+        let glb = gltf::Glb::from_slice(glb_bytes.as_slice()).expect("parse glb");
+        let json: Value = serde_json::from_slice(glb.json.as_ref()).expect("parse glb json");
+
+        assert_eq!(json["nodes"].as_array().expect("nodes").len(), 2);
+        assert_eq!(json["meshes"].as_array().expect("meshes").len(), 2);
+        assert_eq!(json["scenes"][0]["nodes"], serde_json::json!([0, 1]));
+        assert_eq!(
+            json["nodes"][0]["translation"],
+            serde_json::json!([-1.0, 0.0, 2.0])
+        );
+        assert_eq!(
+            json["nodes"][1]["scale"],
+            serde_json::json!([1.5, 1.0, 1.5])
+        );
     }
 }

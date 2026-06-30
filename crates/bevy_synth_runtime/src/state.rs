@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 
-use crate::SynthMesh;
+use crate::SynthAsset;
+use crate::args::{AppArgs, SynthesisModel, TrellisQuality};
 
 #[derive(Resource, Default)]
 pub struct UiStatus {
@@ -49,6 +50,39 @@ pub struct InferenceRequest {
     pub image_path: PathBuf,
     pub image_contents: Option<Vec<u8>>,
     pub output_path: Option<PathBuf>,
+    pub synthesis_models: Vec<SynthesisModel>,
+    pub settings: InferenceSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InferenceSettings {
+    pub num_steps: usize,
+    pub num_tokens: usize,
+    pub guidance_scale: f32,
+    pub target_faces: Option<usize>,
+    pub triposplat_num_gaussians: usize,
+    pub trellis_quality: TrellisQuality,
+    pub trellis_pbr_enabled: bool,
+    pub trellis_pbr_texture_size: Option<usize>,
+    pub trellis_target_faces: Option<usize>,
+    pub trellis_max_sparse_coords: Option<usize>,
+}
+
+impl InferenceSettings {
+    pub fn from_args(args: &AppArgs) -> Self {
+        Self {
+            num_steps: args.num_steps,
+            num_tokens: args.num_tokens,
+            guidance_scale: args.guidance_scale,
+            target_faces: args.target_faces,
+            triposplat_num_gaussians: args.triposplat_num_gaussians,
+            trellis_quality: args.trellis_quality,
+            trellis_pbr_enabled: args.trellis_pbr_enabled,
+            trellis_pbr_texture_size: args.trellis_pbr_texture_size,
+            trellis_target_faces: args.trellis_target_faces,
+            trellis_max_sparse_coords: args.trellis_max_sparse_coords,
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -69,7 +103,7 @@ pub const WASM_STATUS_MODEL_LOAD_FAILED_PREFIX: &str = "Model load failed:";
 
 pub struct WorkerEvent {
     pub requests: Vec<InferenceRequest>,
-    pub results: Vec<Result<Option<SynthMesh>, String>>,
+    pub results: Vec<Result<Option<SynthAsset>, String>>,
     pub elapsed: Duration,
     pub status_message: Option<String>,
 }

@@ -1,8 +1,22 @@
+#[cfg(all(feature = "runtime-model", target_arch = "wasm32"))]
+pub(crate) mod chunked_blob_safetensors;
 #[cfg(feature = "runtime-model")]
 pub mod fdg_decoder;
 #[cfg(feature = "runtime-model")]
+pub mod image_conditioning;
+#[cfg(feature = "runtime-model")]
+pub mod runtime_config;
+#[cfg(feature = "runtime-model")]
 pub mod sparse_decoder;
+#[cfg(feature = "runtime-model")]
+pub mod sparse_structure_decoder;
 #[cfg(feature = "runtime-model")]
 pub mod sparse_structure_flow;
 #[cfg(feature = "runtime-model")]
 pub mod sparse_unet_vae_decoder;
+#[cfg(feature = "runtime-model")]
+pub mod types;
+#[cfg(feature = "runtime-model")]
+pub(crate) mod weight_parts;
+#[cfg(all(feature = "runtime-model-wgpu", target_arch = "wasm32"))]
+pub(crate) mod wgpu_safe_ops;

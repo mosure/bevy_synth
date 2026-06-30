@@ -8,27 +8,35 @@ mod native_model_bootstrap;
 pub mod pipeline;
 #[cfg(feature = "runtime")]
 pub mod progress;
+pub mod quality;
 #[cfg(feature = "runtime")]
 pub mod runtime;
+#[cfg(any(feature = "runtime", all(target_arch = "wasm32", feature = "wasm-api")))]
+mod triposplat_preprocess;
 pub mod wasm;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-api"))]
 pub mod wasm_api;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_loader;
 
+#[cfg(feature = "runtime")]
+pub use io::mesh_from_glb_bytes;
 #[cfg(any(feature = "runtime", feature = "wasm-api"))]
 pub use io::mesh_to_glb_bytes;
 #[cfg(feature = "runtime")]
 pub use io::write_glb_mesh;
 pub use io::{ImageSource, TextPrompt};
 pub use mesh::{
-    Mesh, MeshLike, MeshMaterial, MeshPbrTextures, MeshStats, MeshTexture, mesh_bounds, mesh_stats,
+    Mesh, MeshConnectivityMetrics, MeshLike, MeshMaterial, MeshPbrTextureMetrics, MeshPbrTextures,
+    MeshQualityMetrics, MeshStats, MeshTexture, align_normals_with_faces,
+    compute_position_welded_normals, compute_vertex_normals, mesh_bounds, mesh_quality_failures,
+    mesh_quality_metrics, mesh_stats,
 };
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
 pub use native_model_bootstrap::set_bootstrap_status_callback;
 pub use pipeline::{
-    ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisModel,
-    sanitize_synthesis_models,
+    ForegroundModel, MeshOutput, ModelSelection, PipelineInput, PipelineOutput, SynthesisAsset,
+    SynthesisModel, sanitize_synthesis_models,
 };
 #[cfg(feature = "runtime")]
 pub use progress::{
@@ -37,8 +45,11 @@ pub use progress::{
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{
-    DinoBackend, ForegroundOutput, ForegroundRequest, InferenceBackend,
-    MeshOutput as RuntimeMeshOutput, MeshRequest, RuntimeConfig, RuntimeError, SynthRuntime,
+    AssetBatchItem, AssetBatchItemOutput, AssetBatchOutput, AssetBatchRequest,
+    AssetOutput as RuntimeAssetOutput, AssetRequest, DinoBackend, ForegroundOutput,
+    ForegroundRequest, InferenceBackend, MeshOutput as RuntimeMeshOutput, MeshRequest,
+    RuntimeBatchExecutionMode, RuntimeBatchPolicy, RuntimeBatchStats, RuntimeConfig, RuntimeError,
+    SplatOutput as RuntimeSplatOutput, SplatRequest, SynthRuntime, TrellisComputeProfile,
     TrellisQuality,
 };
 
@@ -47,6 +58,8 @@ pub use burn_tripo as triposg;
 
 #[cfg(feature = "trellis")]
 pub use burn_trellis as trellis;
+
+pub use burn_triposplat as triposplat;
 
 #[cfg(feature = "bg-removal")]
 pub use burn_foreground as bg_removal;

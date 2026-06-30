@@ -443,7 +443,7 @@ fn run_with_backend<B: Backend>(
             .to_ascii_lowercase()
             .contains("wgpu")
     {
-        let cpu_device = <CpuBackend as Backend>::Device::default();
+        let cpu_device = <CpuBackend as burn::tensor::backend::BackendTypes>::Device::default();
         let cpu_pipeline =
             TripoSGPipeline::<CpuBackend>::from_pretrained(weights_root, &cpu_device)?;
         let cpu_image = tensor_from_data_4d::<CpuBackend>(&input_image_hook, &cpu_device)?;
@@ -685,11 +685,10 @@ impl HookReference {
 
 fn tensor_view_to_vec(view: &TensorView<'_>) -> Vec<f32> {
     view.data()
-        .chunks_exact(4)
-        .map(|chunk| {
-            let bytes: [u8; 4] = chunk.try_into().unwrap();
-            f32::from_le_bytes(bytes)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 

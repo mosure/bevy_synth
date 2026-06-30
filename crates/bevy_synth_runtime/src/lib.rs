@@ -10,6 +10,7 @@ pub mod state;
 pub mod worker;
 
 pub use burn_tripo::pipeline::mesh::Mesh as TripoMesh;
+pub use burn_triposplat::{GaussianSplat, GaussianSplatCloud, GaussianSplatStats};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SynthMeshMaterial {
@@ -39,8 +40,38 @@ pub struct SynthMeshPbrTextures {
 pub struct SynthMesh {
     pub mesh: TripoMesh,
     pub uvs: Vec<[f32; 2]>,
+    pub normals: Vec<[f32; 3]>,
     pub material: Option<SynthMeshMaterial>,
     pub pbr_textures: Option<SynthMeshPbrTextures>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SynthAsset {
+    Mesh(SynthMesh),
+    GaussianSplat(GaussianSplatCloud),
+}
+
+impl SynthAsset {
+    pub fn as_mesh(&self) -> Option<&SynthMesh> {
+        match self {
+            Self::Mesh(mesh) => Some(mesh),
+            Self::GaussianSplat(_) => None,
+        }
+    }
+
+    pub fn into_mesh(self) -> Option<SynthMesh> {
+        match self {
+            Self::Mesh(mesh) => Some(mesh),
+            Self::GaussianSplat(_) => None,
+        }
+    }
+}
+
+impl From<SynthMesh> for SynthAsset {
+    fn from(mesh: SynthMesh) -> Self {
+        Self::Mesh(mesh)
+    }
 }
 
 impl From<TripoMesh> for SynthMesh {
@@ -48,6 +79,7 @@ impl From<TripoMesh> for SynthMesh {
         Self {
             mesh,
             uvs: Vec::new(),
+            normals: Vec::new(),
             material: None,
             pbr_textures: None,
         }
@@ -63,6 +95,7 @@ impl From<burn_trellis::Mesh> for SynthMesh {
                 faces: mesh.faces,
             },
             uvs: mesh.uvs,
+            normals: mesh.normals,
             material: mesh.material.map(|material| SynthMeshMaterial {
                 base_color: material.base_color,
                 metallic: material.metallic,

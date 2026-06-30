@@ -18,9 +18,14 @@ pub struct FlowEulerSampleConfig {
 pub struct FlowEulerSampleTrace {
     pub steps: usize,
     pub samples: Vec<f32>,
+    pub step_0_pred_v: Vec<f32>,
+    pub step_0_pred_v_pos: Vec<f32>,
+    pub step_0_pred_v_neg: Vec<f32>,
     pub step_0_x_t: Vec<f32>,
     pub step_mid_x_t: Vec<f32>,
     pub step_last_x_t: Vec<f32>,
+    pub step_pred_v: Vec<Vec<f32>>,
+    pub step_x_t: Vec<Vec<f32>>,
 }
 
 impl FlowEulerGuidanceIntervalSampler {
@@ -75,16 +80,36 @@ impl FlowEulerGuidanceIntervalSampler {
         F: FnMut(&[f32], f32, bool) -> Vec<f32>,
     {
         let mut sample = noise.to_vec();
+        let mut step_0_pred_v: Option<Vec<f32>> = None;
         let mut step_0_x_t: Option<Vec<f32>> = None;
         let mut step_mid_x_t: Option<Vec<f32>> = None;
         let mut step_last_x_t: Option<Vec<f32>> = None;
+        let mut step_pred_v = if capture_snapshots {
+            Vec::with_capacity(config.steps)
+        } else {
+            Vec::new()
+        };
+        let mut step_x_t = if capture_snapshots {
+            Vec::with_capacity(config.steps)
+        } else {
+            Vec::new()
+        };
         let t_pairs = timestep_pairs(config.steps, config.rescale_t);
         let mid_step = mid_snapshot_step(config.steps);
         for (step_idx, (t, t_prev)) in t_pairs.into_iter().enumerate() {
             let pred_v = self.predict_with_cfg(&sample, t, &config, &mut predict_v);
+            if capture_snapshots && step_idx == 0 {
+                step_0_pred_v = Some(pred_v.clone());
+            }
+            if capture_snapshots {
+                step_pred_v.push(pred_v.clone());
+            }
             let dt = t - t_prev;
             for (idx, value) in sample.iter_mut().enumerate() {
                 *value -= dt * pred_v[idx];
+            }
+            if capture_snapshots {
+                step_x_t.push(sample.clone());
             }
             if capture_snapshots && step_idx == 0 {
                 step_0_x_t = Some(sample.clone());
@@ -96,15 +121,21 @@ impl FlowEulerGuidanceIntervalSampler {
                 step_last_x_t = Some(sample.clone());
             }
         }
+        let step_0_pred_v = step_0_pred_v.unwrap_or_default();
         let step_0_x_t = step_0_x_t.unwrap_or_else(|| sample.clone());
         let step_mid_x_t = step_mid_x_t.unwrap_or_else(|| sample.clone());
         let step_last_x_t = step_last_x_t.unwrap_or_else(|| sample.clone());
         FlowEulerSampleTrace {
             steps: config.steps,
             samples: sample,
+            step_0_pred_v,
+            step_0_pred_v_pos: Vec::new(),
+            step_0_pred_v_neg: Vec::new(),
             step_0_x_t,
             step_mid_x_t,
             step_last_x_t,
+            step_pred_v,
+            step_x_t,
         }
     }
 
@@ -118,9 +149,7 @@ impl FlowEulerGuidanceIntervalSampler {
     where
         F: FnMut(&[f32], f32, bool) -> Vec<f32>,
     {
-        let in_guidance_interval =
-            config.guidance_interval[0] <= t && t <= config.guidance_interval[1];
-        if !in_guidance_interval {
+        if !guidance_interval_contains(t, config.guidance_interval) {
             return predict_v(x_t, t, true);
         }
 
@@ -139,23 +168,54 @@ impl FlowEulerGuidanceIntervalSampler {
             pred[idx] = w * pos[idx] + (1.0 - w) * neg[idx];
         }
 
-        if config.guidance_rescale <= 0.0 {
-            return pred;
+        let guidance_rescale = config.guidance_rescale.max(0.0);
+        if guidance_rescale > 0.0 {
+            let x0_pos = self.pred_to_xstart(x_t, t, &pos);
+            let x0_cfg = self.pred_to_xstart(x_t, t, &pred);
+            let std_pos = sample_std(&x0_pos);
+            let std_cfg = sample_std(&x0_cfg).max(1.0e-12);
+            let mut x0 = vec![0.0f32; pred.len()];
+            for idx in 0..pred.len() {
+                let x0_rescaled = x0_cfg[idx] * (std_pos / std_cfg);
+                x0[idx] = guidance_rescale * x0_rescaled + (1.0 - guidance_rescale) * x0_cfg[idx];
+            }
+            pred = self.xstart_to_pred(x_t, t, &x0);
         }
-
-        let x0_pos = pred_to_xstart(x_t, t, &pos, self.sigma_min);
-        let x0_cfg = pred_to_xstart(x_t, t, &pred, self.sigma_min);
-        let std_pos = stddev(&x0_pos);
-        let std_cfg = stddev(&x0_cfg).max(1.0e-12);
-        let scale = std_pos / std_cfg;
-        let mut x0 = vec![0.0f32; x0_cfg.len()];
-        for idx in 0..x0.len() {
-            let x0_rescaled = x0_cfg[idx] * scale;
-            x0[idx] = config.guidance_rescale * x0_rescaled
-                + (1.0 - config.guidance_rescale) * x0_cfg[idx];
-        }
-        xstart_to_pred(x_t, t, &x0, self.sigma_min)
+        pred
     }
+
+    fn pred_to_xstart(&self, x_t: &[f32], t: f32, pred: &[f32]) -> Vec<f32> {
+        let factor = self.sigma_min + (1.0 - self.sigma_min) * t;
+        let keep = 1.0 - self.sigma_min;
+        x_t.iter()
+            .zip(pred.iter())
+            .map(|(x, p)| keep * *x - factor * *p)
+            .collect()
+    }
+
+    fn xstart_to_pred(&self, x_t: &[f32], t: f32, x0: &[f32]) -> Vec<f32> {
+        let factor = self.sigma_min + (1.0 - self.sigma_min) * t;
+        let keep = 1.0 - self.sigma_min;
+        x_t.iter()
+            .zip(x0.iter())
+            .map(|(x, x0)| (keep * *x - *x0) / factor)
+            .collect()
+    }
+}
+
+fn sample_std(values: &[f32]) -> f32 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let var_sum = values
+        .iter()
+        .map(|value| {
+            let diff = *value - mean;
+            diff * diff
+        })
+        .sum::<f32>();
+    (var_sum / (values.len() - 1) as f32).sqrt()
 }
 
 pub(crate) fn mid_snapshot_step(steps: usize) -> usize {
@@ -163,6 +223,12 @@ pub(crate) fn mid_snapshot_step(steps: usize) -> usize {
         return 0;
     }
     ((steps - 1) as f32 * 0.5).round() as usize
+}
+
+pub(crate) fn guidance_interval_contains(timestep: f32, interval: [f32; 2]) -> bool {
+    const GUIDANCE_INTERVAL_EPS: f32 = 1.0e-6;
+    timestep + GUIDANCE_INTERVAL_EPS >= interval[0]
+        && timestep <= interval[1] + GUIDANCE_INTERVAL_EPS
 }
 
 pub(crate) fn timestep_pairs(steps: usize, rescale_t: f32) -> Vec<(f32, f32)> {
@@ -179,42 +245,6 @@ pub(crate) fn timestep_pairs(steps: usize, rescale_t: f32) -> Vec<(f32, f32)> {
 
 fn rescaled_t(t: f32, rescale_t: f32) -> f32 {
     rescale_t * t / (1.0 + (rescale_t - 1.0) * t)
-}
-
-fn pred_to_xstart(x_t: &[f32], t: f32, pred: &[f32], sigma_min: f32) -> Vec<f32> {
-    let factor = sigma_min + (1.0 - sigma_min) * t;
-    let keep = 1.0 - sigma_min;
-    let mut out = vec![0.0f32; x_t.len()];
-    for idx in 0..out.len() {
-        out[idx] = keep * x_t[idx] - factor * pred[idx];
-    }
-    out
-}
-
-fn xstart_to_pred(x_t: &[f32], t: f32, x0: &[f32], sigma_min: f32) -> Vec<f32> {
-    let factor = sigma_min + (1.0 - sigma_min) * t;
-    let keep = 1.0 - sigma_min;
-    let mut out = vec![0.0f32; x_t.len()];
-    for idx in 0..out.len() {
-        out[idx] = (keep * x_t[idx] - x0[idx]) / factor;
-    }
-    out
-}
-
-fn stddev(values: &[f32]) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mean = values.iter().sum::<f32>() / values.len() as f32;
-    let var = values
-        .iter()
-        .map(|value| {
-            let d = *value - mean;
-            d * d
-        })
-        .sum::<f32>()
-        / values.len() as f32;
-    var.sqrt()
 }
 
 #[cfg(test)]
@@ -256,5 +286,54 @@ mod tests {
             }
         });
         assert!(out.iter().all(|v| v.abs() < 0.5));
+    }
+
+    #[test]
+    fn cfg_matches_upstream_weighting_and_rescale() {
+        let sampler = FlowEulerGuidanceIntervalSampler::new(0.01);
+        let sample = vec![0.1f32, -0.4, 0.7, -1.2];
+        let cfg = FlowEulerSampleConfig {
+            steps: 1,
+            rescale_t: 1.0,
+            guidance_strength: 3.0,
+            guidance_rescale: 0.0,
+            guidance_interval: [0.0, 1.0],
+        };
+        let pred = sampler.predict_with_cfg(&sample, 0.5, &cfg, &mut |_x_t, _t, cond| {
+            if cond {
+                vec![1.0, 2.0, -1.0, -2.0]
+            } else {
+                vec![0.25, -0.5, 0.75, -1.0]
+            }
+        });
+        assert_eq!(
+            pred,
+            vec![
+                3.0 * 1.0 + (1.0 - 3.0) * 0.25,
+                3.0 * 2.0 + (1.0 - 3.0) * -0.5,
+                3.0 * -1.0 + (1.0 - 3.0) * 0.75,
+                3.0 * -2.0 + (1.0 - 3.0) * -1.0,
+            ]
+        );
+
+        let cfg = FlowEulerSampleConfig {
+            guidance_rescale: 0.7,
+            ..cfg
+        };
+        let pred_rescaled = sampler.predict_with_cfg(&sample, 0.5, &cfg, &mut |_x_t, _t, cond| {
+            if cond {
+                vec![1.0, 2.0, -1.0, -2.0]
+            } else {
+                vec![0.25, -0.5, 0.75, -1.0]
+            }
+        });
+        assert_ne!(pred_rescaled, pred);
+        assert!(pred_rescaled.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn guidance_interval_includes_rescaled_boundary_roundoff() {
+        assert!(super::guidance_interval_contains(0.599_999_964, [0.6, 1.0]));
+        assert!(!super::guidance_interval_contains(0.599_9, [0.6, 1.0]));
     }
 }

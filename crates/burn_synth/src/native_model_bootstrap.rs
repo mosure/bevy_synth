@@ -8,9 +8,17 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use burn_foreground::rmbg14::import::resolve_rmbg_weights_root;
-use burn_synth_import::parts::{BurnpackPartEntry, read_parts_manifest, resolve_part_entry_path};
+use burn_synth_import::parts::{
+    BurnpackPartEntry, read_parts_manifest, resolve_part_entry_path,
+    validate_burnpack_part_integrity,
+};
+#[cfg(feature = "trellis")]
+use burn_trellis::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use burn_tripo::paths::resolve_triposg_weights_root;
+use burn_triposplat::artifact::TRIPOSPLAT_ARTIFACTS;
 use log::{info, warn};
+#[cfg(feature = "trellis")]
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::model_loader::{candidate_burnpack_names, parse_parts_manifest_bytes};
@@ -19,6 +27,11 @@ const DEFAULT_MODEL_BASE_URL: &str = "https://aberration.technology/model";
 const CACHE_MODELS_DIR: &str = ".burn_synth/models";
 const TRIPOSG_DIR: &str = "MIDI-3D";
 const RMBG14_DIR: &str = "RMBG-1.4";
+const TRIPOSPLAT_DIR: &str = "TripoSplat";
+#[cfg(feature = "trellis")]
+const TRELLIS2_DIR: &str = "TRELLIS.2-4B";
+#[cfg(feature = "trellis")]
+const TRELLIS2_IMAGE_LARGE_DIR: &str = "TRELLIS-image-large";
 const DOWNLOAD_MAX_ATTEMPTS: u32 = 6;
 const DOWNLOAD_RETRY_BASE_DELAY_MS: u64 = 800;
 const DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 20;
@@ -29,6 +42,21 @@ const DOWNLOAD_PROGRESS_LOG_EVERY_SECS: u64 = 10;
 type BootstrapStatusCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 static BOOTSTRAP_STATUS_CALLBACK: OnceLock<Mutex<Option<BootstrapStatusCallback>>> =
     OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct DownloadPartContext {
+    label: String,
+    artifact: String,
+    part_number: usize,
+    part_count: usize,
+}
+
+#[derive(Debug)]
+enum CachedPartState {
+    Ready,
+    MissingOrStale,
+    Invalid(String),
+}
 
 const TRIPOSG_OPTIONAL_TEXT_RELPATHS: &[&str] = &[
     "vae/config.json",
@@ -46,6 +74,8 @@ const TRIPOSG_REQUIRED_PARTS_BASES: &[&str] = &[
 
 const RMBG14_OPTIONAL_TEXT_RELPATHS: &[&str] = &["config.json"];
 const RMBG14_REQUIRED_PARTS_BASES: &[&str] = &["model.safetensors"];
+#[cfg(feature = "trellis")]
+const TRELLIS2_REQUIRED_TEXT_RELPATHS: &[&str] = &["pipeline.json"];
 
 pub fn set_bootstrap_status_callback(callback: Option<BootstrapStatusCallback>) {
     let lock = BOOTSTRAP_STATUS_CALLBACK.get_or_init(|| Mutex::new(None));
@@ -126,6 +156,189 @@ pub(crate) fn resolve_or_bootstrap_rmbg14_root(prefer_f16: bool) -> Result<PathB
     }
 }
 
+pub(crate) fn resolve_or_bootstrap_triposplat_root(prefer_f16: bool) -> Result<PathBuf, String> {
+    let cache_root = default_cache_models_root();
+    let target_root = cache_root.join(TRIPOSPLAT_DIR);
+    let remote_root = triposplat_remote_root();
+
+    match ensure_triposplat_model_ready(&target_root, &remote_root, prefer_f16) {
+        Ok(()) => Ok(target_root),
+        Err(cache_err) => match burn_triposplat::resolve_triposplat_weights_root(None) {
+            Ok(fallback) => {
+                warn!(
+                    "TripoSplat cache bootstrap failed ({cache_err}); falling back to {}",
+                    fallback.display()
+                );
+                Ok(fallback)
+            }
+            Err(fallback_err) => Err(format!(
+                "TripoSplat cache bootstrap failed ({cache_err}); no valid local fallback ({fallback_err})"
+            )),
+        },
+    }
+}
+
+#[cfg(feature = "trellis")]
+pub(crate) fn resolve_or_bootstrap_trellis_roots(
+    prefer_f16: bool,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let cache_root = default_cache_models_root();
+    let weights_root = cache_root.join(TRELLIS2_DIR);
+    let image_large_root = cache_root.join(TRELLIS2_IMAGE_LARGE_DIR);
+    let remote_weights_root = trellis2_remote_root();
+    let remote_image_large_root = trellis2_image_large_remote_root();
+
+    match ensure_trellis_model_ready(
+        &weights_root,
+        &image_large_root,
+        &remote_weights_root,
+        &remote_image_large_root,
+        prefer_f16,
+    ) {
+        Ok(()) => Ok((weights_root, Some(image_large_root))),
+        Err(cache_err) => {
+            let fallback_weights = resolve_trellis2_weights_root(None);
+            let fallback_image_large = resolve_trellis2_image_large_root(None);
+            if fallback_weights.exists() {
+                let fallback_image_large = if fallback_image_large.exists() {
+                    Some(fallback_image_large)
+                } else {
+                    None
+                };
+                warn!(
+                    "Trellis2 cache bootstrap failed ({cache_err}); falling back to {}",
+                    fallback_weights.display()
+                );
+                Ok((fallback_weights, fallback_image_large))
+            } else {
+                Err(cache_err)
+            }
+        }
+    }
+}
+
+fn ensure_triposplat_model_ready(
+    local_root: &Path,
+    remote_root: &str,
+    prefer_f16: bool,
+) -> Result<(), String> {
+    fs::create_dir_all(local_root).map_err(|err| {
+        format!(
+            "failed to create TripoSplat cache directory {}: {err}",
+            local_root.display()
+        )
+    })?;
+
+    for base in triposplat_required_parts_bases() {
+        ensure_parts_bundle(local_root, remote_root, &base, prefer_f16, "TripoSplat")?;
+    }
+
+    emit_status(format!(
+        "TripoSplat weights ready under {}",
+        local_root.display()
+    ));
+    Ok(())
+}
+
+fn triposplat_required_parts_bases() -> Vec<String> {
+    TRIPOSPLAT_ARTIFACTS
+        .into_iter()
+        .filter(|artifact| artifact.is_triposplat_runtime_required())
+        .map(|artifact| {
+            format!(
+                "{}/{}.safetensors",
+                artifact.component, artifact.burnpack_stem
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "trellis")]
+fn ensure_trellis_model_ready(
+    local_weights_root: &Path,
+    local_image_large_root: &Path,
+    remote_weights_root: &str,
+    remote_image_large_root: &str,
+    prefer_f16: bool,
+) -> Result<(), String> {
+    fs::create_dir_all(local_weights_root).map_err(|err| {
+        format!(
+            "failed to create Trellis2 cache directory {}: {err}",
+            local_weights_root.display()
+        )
+    })?;
+    fs::create_dir_all(local_image_large_root).map_err(|err| {
+        format!(
+            "failed to create Trellis2 image-large cache directory {}: {err}",
+            local_image_large_root.display()
+        )
+    })?;
+
+    for rel in TRELLIS2_REQUIRED_TEXT_RELPATHS {
+        sync_required_text_file(local_weights_root, remote_weights_root, rel, "Trellis2")?;
+    }
+
+    let pipeline_path = local_weights_root.join("pipeline.json");
+    let pipeline_bytes = fs::read(&pipeline_path).map_err(|err| {
+        format!(
+            "failed reading Trellis2 pipeline config {}: {err}",
+            pipeline_path.display()
+        )
+    })?;
+    let requirements =
+        parse_trellis_requirements(&pipeline_bytes).map_err(|err| format!("Trellis2: {err}"))?;
+
+    for rel in &requirements.weights_required_text_relpaths {
+        sync_required_text_file(
+            local_weights_root,
+            remote_weights_root,
+            rel,
+            "Trellis2 model metadata",
+        )?;
+    }
+    for rel in &requirements.image_large_required_text_relpaths {
+        sync_required_text_file(
+            local_image_large_root,
+            remote_image_large_root,
+            rel,
+            "Trellis2 image-large metadata",
+        )?;
+    }
+    for rel in &requirements.weights_optional_text_relpaths {
+        sync_optional_text_file(local_weights_root, remote_weights_root, rel)?;
+    }
+
+    for base in &requirements.weights_required_parts_bases {
+        ensure_parts_bundle(
+            local_weights_root,
+            remote_weights_root,
+            base,
+            prefer_f16,
+            "Trellis2",
+        )?;
+    }
+    for base in &requirements.image_large_required_parts_bases {
+        ensure_parts_bundle(
+            local_image_large_root,
+            remote_image_large_root,
+            base,
+            prefer_f16,
+            "Trellis2-image-large",
+        )?;
+    }
+
+    emit_status(format!(
+        "Trellis2 weights ready under {}",
+        local_weights_root.display()
+    ));
+    emit_status(format!(
+        "Trellis2 image-large weights ready under {}",
+        local_image_large_root.display()
+    ));
+
+    Ok(())
+}
+
 fn ensure_model_ready(
     local_root: &Path,
     remote_root: &str,
@@ -154,6 +367,96 @@ fn ensure_model_ready(
         local_root.display()
     ));
     Ok(())
+}
+
+#[cfg(feature = "trellis")]
+#[derive(Debug, Default)]
+struct TrellisBootstrapRequirements {
+    weights_required_text_relpaths: Vec<String>,
+    weights_optional_text_relpaths: Vec<String>,
+    weights_required_parts_bases: Vec<String>,
+    image_large_required_text_relpaths: Vec<String>,
+    image_large_required_parts_bases: Vec<String>,
+}
+
+#[cfg(feature = "trellis")]
+fn parse_trellis_requirements(
+    pipeline_json_bytes: &[u8],
+) -> Result<TrellisBootstrapRequirements, String> {
+    let pipeline_json: Value = serde_json::from_slice(pipeline_json_bytes)
+        .map_err(|err| format!("failed to parse Trellis2 pipeline.json: {err}"))?;
+    let models = pipeline_json
+        .get("args")
+        .and_then(|value| value.get("models"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "pipeline.json missing args.models".to_string())?;
+
+    let mut requirements = TrellisBootstrapRequirements::default();
+    for value in models.values() {
+        let Some(stem) = value.as_str() else {
+            continue;
+        };
+        if stem.starts_with("ckpts/") {
+            requirements
+                .weights_required_text_relpaths
+                .push(format!("{stem}.json"));
+            requirements
+                .weights_required_parts_bases
+                .push(format!("{stem}.safetensors"));
+            continue;
+        }
+        if let Some((_, suffix)) = stem.split_once("/ckpts/") {
+            let image_large_stem = format!("ckpts/{suffix}");
+            requirements
+                .image_large_required_text_relpaths
+                .push(format!("{image_large_stem}.json"));
+            requirements
+                .image_large_required_parts_bases
+                .push(format!("{image_large_stem}.safetensors"));
+            continue;
+        }
+        requirements
+            .weights_required_text_relpaths
+            .push(format!("{stem}.json"));
+        requirements
+            .weights_required_parts_bases
+            .push(format!("{stem}.safetensors"));
+    }
+
+    if let Some(model_name) = pipeline_json
+        .get("args")
+        .and_then(|value| value.get("image_cond_model"))
+        .and_then(|value| value.get("args"))
+        .and_then(|value| value.get("model_name"))
+        .and_then(Value::as_str)
+    {
+        let model_name = model_name.trim();
+        if !model_name.is_empty() {
+            requirements
+                .weights_optional_text_relpaths
+                .push(format!("{model_name}/config.json"));
+            requirements
+                .weights_required_parts_bases
+                .push(format!("{model_name}/model.safetensors"));
+        }
+    }
+
+    if requirements.weights_required_parts_bases.is_empty() {
+        return Err("pipeline.json has no models in args.models".to_string());
+    }
+
+    sort_dedup(&mut requirements.weights_required_text_relpaths);
+    sort_dedup(&mut requirements.weights_optional_text_relpaths);
+    sort_dedup(&mut requirements.weights_required_parts_bases);
+    sort_dedup(&mut requirements.image_large_required_text_relpaths);
+    sort_dedup(&mut requirements.image_large_required_parts_bases);
+    Ok(requirements)
+}
+
+#[cfg(feature = "trellis")]
+fn sort_dedup(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
 }
 
 fn ensure_triposg_metadata_aliases(local_root: &Path) -> Result<(), String> {
@@ -227,35 +530,66 @@ fn ensure_parts_bundle(
         write_file_atomically(&local_manifest_path, &manifest_bytes)?;
 
         let part_count = manifest.parts.len();
+        let artifact = burnpack_display_name(&candidate);
+        let mut invalid_candidate = None;
         for (index, part) in manifest.parts.iter().enumerate() {
             let local_part_path = resolve_part_entry_path(&local_manifest_path, &part.path)?;
-            if part_matches_cache(&local_part_path, part)? {
-                continue;
+            match cached_part_state(&local_part_path, part)? {
+                CachedPartState::Ready => continue,
+                CachedPartState::Invalid(err) => {
+                    invalid_candidate = Some(format!(
+                        "cached part {} failed integrity validation: {err}",
+                        local_part_path.display()
+                    ));
+                    break;
+                }
+                CachedPartState::MissingOrStale => {}
             }
             let part_url = resolve_manifest_entry_url(&manifest_url, &part.path);
             let part_number = index + 1;
-            emit_status(format!(
+            let context = DownloadPartContext {
+                label: label.to_string(),
+                artifact: artifact.clone(),
+                part_number,
+                part_count,
+            };
+            info!(
                 "Downloading {label} part {part_number}/{part_count}: {} -> {} (expected_bytes={})",
                 part_url,
                 local_part_path.display(),
                 part.bytes
-            ));
-            let downloaded =
-                download_part_file(&part_url, &local_part_path, part).map_err(|err| {
+            );
+            emit_status(download_part_started_message(&context, part.bytes));
+            let downloaded = download_part_file(&part_url, &local_part_path, part, &context)
+                .map_err(|err| {
                     format!(
                         "failed downloading {label} part {part_number}/{part_count} ({}): {err}",
                         part.path
                     )
                 })?;
-            emit_status(format!(
+            info!(
                 "Downloaded {label} part {part_number}/{part_count}: {} bytes -> {}",
                 downloaded,
                 local_part_path.display()
-            ));
+            );
+            emit_status(download_part_completed_message(&context));
+            if let CachedPartState::Invalid(err) = cached_part_state(&local_part_path, part)? {
+                invalid_candidate = Some(format!(
+                    "downloaded part {} failed integrity validation: {err}",
+                    local_part_path.display()
+                ));
+                break;
+            }
+        }
+
+        if let Some(reason) = invalid_candidate {
+            warn!("Skipping {label} {artifact} burnpack candidate {manifest_url}: {reason}");
+            checked.push(format!("{manifest_url} ({reason})"));
+            continue;
         }
 
         if manifest_is_complete(&local_manifest_path)? {
-            emit_status(format!("Downloaded {label} parts manifest {manifest_url}"));
+            emit_status(format!("Downloaded {label} {artifact} manifest."));
             return Ok(());
         }
     }
@@ -279,24 +613,41 @@ fn manifest_is_complete(manifest_path: &Path) -> Result<bool, String> {
     }
     for part in &manifest.parts {
         let path = resolve_part_entry_path(manifest_path, &part.path)?;
-        if !part_matches_cache(&path, part)? {
-            return Ok(false);
+        match cached_part_state(&path, part)? {
+            CachedPartState::Ready => {}
+            CachedPartState::MissingOrStale | CachedPartState::Invalid(_) => return Ok(false),
         }
     }
     Ok(true)
 }
 
-fn part_matches_cache(path: &Path, part: &BurnpackPartEntry) -> Result<bool, String> {
+fn cached_part_state(path: &Path, part: &BurnpackPartEntry) -> Result<CachedPartState, String> {
     if !path.exists() {
-        return Ok(false);
+        return Ok(CachedPartState::MissingOrStale);
     }
     if part.bytes == 0 {
-        return Ok(true);
+        return match validate_burnpack_part_integrity(path) {
+            Ok(_) => Ok(CachedPartState::Ready),
+            Err(err) => Ok(CachedPartState::Invalid(err)),
+        };
     }
     let bytes = fs::metadata(path)
         .map_err(|err| format!("failed to read part metadata {}: {err}", path.display()))?
         .len();
-    Ok(bytes == part.bytes)
+    if bytes != part.bytes {
+        return Ok(CachedPartState::MissingOrStale);
+    }
+    let expected_sha = part.sha256.trim();
+    if !expected_sha.is_empty() {
+        let actual_sha = sha256_file(path)?;
+        if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+            return Ok(CachedPartState::MissingOrStale);
+        }
+    }
+    match validate_burnpack_part_integrity(path) {
+        Ok(_) => Ok(CachedPartState::Ready),
+        Err(err) => Ok(CachedPartState::Invalid(err)),
+    }
 }
 
 fn sync_optional_text_file(
@@ -318,17 +669,41 @@ fn sync_optional_text_file(
     Ok(())
 }
 
+#[cfg(feature = "trellis")]
+fn sync_required_text_file(
+    local_root: &Path,
+    remote_root: &str,
+    rel_path: &str,
+    label: &str,
+) -> Result<(), String> {
+    let local_path = local_root.join(rel_path);
+    if local_path.exists() {
+        return Ok(());
+    }
+
+    let url = join_url(remote_root, rel_path);
+    let Some(bytes) = download_optional_bytes(&url)? else {
+        return Err(format!(
+            "required {label} file is missing from remote root: {url}"
+        ));
+    };
+    write_file_atomically(&local_path, &bytes)?;
+    emit_status(format!("Downloaded required model metadata {url}"));
+    Ok(())
+}
+
 fn download_part_file(
     url: &str,
     destination: &Path,
     part: &BurnpackPartEntry,
+    context: &DownloadPartContext,
 ) -> Result<u64, String> {
     ensure_parent_dir(destination)?;
     let partial_path = partial_download_path(destination);
     let mut last_error = None;
 
     for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
-        match download_part_file_once(url, destination, &partial_path, part) {
+        match download_part_file_once(url, destination, &partial_path, part, context) {
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 if attempt == DOWNLOAD_MAX_ATTEMPTS {
@@ -401,6 +776,7 @@ fn download_part_file_once(
     destination: &Path,
     partial_path: &Path,
     part: &BurnpackPartEntry,
+    context: &DownloadPartContext,
 ) -> Result<u64, String> {
     let mut resume_from = if partial_path.exists() {
         fs::metadata(partial_path)
@@ -565,22 +941,18 @@ fn download_part_file_once(
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
             let throughput = (bytes_written.saturating_sub(resume_from)) as f64 / elapsed;
             if part.bytes > 0 {
-                let percent =
-                    ((bytes_written as f64 / part.bytes as f64) * 100.0).clamp(0.0, 100.0);
-                emit_status(format!(
-                    "Downloading {}: {:.1}% ({}/{}) {:.1} MiB/s",
-                    destination.display(),
-                    percent,
-                    format_mebibytes(bytes_written),
-                    format_mebibytes(part.bytes),
-                    throughput / (1024.0 * 1024.0)
+                emit_status(download_part_progress_message(
+                    context,
+                    bytes_written,
+                    Some(part.bytes),
+                    throughput,
                 ));
             } else {
-                emit_status(format!(
-                    "Downloading {}: {} ({:.1} MiB/s)",
-                    destination.display(),
-                    format_mebibytes(bytes_written),
-                    throughput / (1024.0 * 1024.0)
+                emit_status(download_part_progress_message(
+                    context,
+                    bytes_written,
+                    None,
+                    throughput,
                 ));
             }
             last_progress_log = Instant::now();
@@ -699,6 +1071,72 @@ fn format_mebibytes(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+fn burnpack_display_name(candidate: &str) -> String {
+    candidate
+        .trim_end_matches(".parts.json")
+        .trim_end_matches(".bpk")
+        .trim_end_matches(".safetensors")
+        .replace('\\', "/")
+}
+
+fn download_part_started_message(context: &DownloadPartContext, expected_bytes: u64) -> String {
+    if expected_bytes > 0 {
+        format!(
+            "Downloading model weights: {} {} shard {} of {} ({})",
+            context.label,
+            context.artifact,
+            context.part_number,
+            context.part_count,
+            format_mebibytes(expected_bytes)
+        )
+    } else {
+        format!(
+            "Downloading model weights: {} {} shard {} of {}",
+            context.label, context.artifact, context.part_number, context.part_count
+        )
+    }
+}
+
+fn download_part_progress_message(
+    context: &DownloadPartContext,
+    loaded_bytes: u64,
+    total_bytes: Option<u64>,
+    throughput_bytes_per_sec: f64,
+) -> String {
+    let throughput_mib = throughput_bytes_per_sec / (1024.0 * 1024.0);
+    if let Some(total_bytes) = total_bytes.filter(|bytes| *bytes > 0) {
+        let percent = ((loaded_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+        format!(
+            "Downloading model weights: {} {} shard {} of {} {:.1}% ({}/{}, {:.1} MiB/s)",
+            context.label,
+            context.artifact,
+            context.part_number,
+            context.part_count,
+            percent,
+            format_mebibytes(loaded_bytes),
+            format_mebibytes(total_bytes),
+            throughput_mib
+        )
+    } else {
+        format!(
+            "Downloading model weights: {} {} shard {} of {} {} ({:.1} MiB/s)",
+            context.label,
+            context.artifact,
+            context.part_number,
+            context.part_count,
+            format_mebibytes(loaded_bytes),
+            throughput_mib
+        )
+    }
+}
+
+fn download_part_completed_message(context: &DownloadPartContext) -> String {
+    format!(
+        "Downloaded model weights: {} {} shard {} of {}",
+        context.label, context.artifact, context.part_number, context.part_count
+    )
+}
+
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     ensure_parent_dir(path)?;
     let temp_path = temp_download_path(path);
@@ -771,6 +1209,31 @@ fn rmbg14_remote_root() -> String {
         .unwrap_or_else(|| format!("{}/{}", model_base_url(), RMBG14_DIR))
 }
 
+fn triposplat_remote_root() -> String {
+    option_env!("TRIPOSPLAT_REMOTE_ROOT")
+        .or(option_env!("TRIPOSPLAT_WEIGHTS_REMOTE_ROOT"))
+        .or(option_env!("TRIPOSPLAT_WEIGHTS_ROOT"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}/{}", model_base_url(), TRIPOSPLAT_DIR))
+}
+
+#[cfg(feature = "trellis")]
+fn trellis2_remote_root() -> String {
+    option_env!("TRELLIS2_WEIGHTS_REMOTE_ROOT")
+        .or(option_env!("TRELLIS2_REMOTE_ROOT"))
+        .or(option_env!("TRELLIS2_WEIGHTS_ROOT"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}/{}", model_base_url(), TRELLIS2_DIR))
+}
+
+#[cfg(feature = "trellis")]
+fn trellis2_image_large_remote_root() -> String {
+    option_env!("TRELLIS2_IMAGE_LARGE_REMOTE_ROOT")
+        .or(option_env!("TRELLIS2_IMAGE_LARGE_ROOT"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}/{}", model_base_url(), TRELLIS2_IMAGE_LARGE_DIR))
+}
+
 fn model_base_url() -> String {
     option_env!("MODEL_BASE_URL")
         .unwrap_or(DEFAULT_MODEL_BASE_URL)
@@ -810,13 +1273,20 @@ fn temp_download_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use burn_synth_import::parts::{BurnpackPartEntry, BurnpackPartsManifest};
 
-    use super::{manifest_is_complete, resolve_manifest_entry_url};
+    #[cfg(feature = "trellis")]
+    use super::parse_trellis_requirements;
+    use super::{
+        DownloadPartContext, download_part_completed_message, download_part_progress_message,
+        download_part_started_message, manifest_is_complete, resolve_manifest_entry_url,
+        triposplat_required_parts_bases,
+    };
 
     fn unique_tmp_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -824,6 +1294,61 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("burn_synth_native_bootstrap_test_{nanos}"))
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestBurnpackMetadata {
+        tensors: BTreeMap<String, TestTensorDescriptor>,
+        metadata: BTreeMap<String, String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestTensorDescriptor {
+        dtype: ciborium::Value,
+        shape: Vec<u64>,
+        data_offsets: (u64, u64),
+        #[serde(skip_serializing_if = "Option::is_none")]
+        param_id: Option<u64>,
+    }
+
+    fn tiny_burnpack_part_bytes(data: &[u8]) -> Vec<u8> {
+        tiny_burnpack_part_bytes_with_declared_len(data, data.len() as u64)
+    }
+
+    fn tiny_burnpack_part_bytes_with_declared_len(data: &[u8], declared_len: u64) -> Vec<u8> {
+        const HEADER_SIZE: usize = 10;
+        const MAGIC_NUMBER: u32 = 0x4255_524E;
+        const TENSOR_ALIGNMENT: usize = 256;
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "tensor".to_string(),
+            TestTensorDescriptor {
+                dtype: ciborium::Value::Text("F32".to_string()),
+                shape: vec![declared_len / 4],
+                data_offsets: (0, declared_len),
+                param_id: None,
+            },
+        );
+        let metadata = TestBurnpackMetadata {
+            tensors,
+            metadata: BTreeMap::new(),
+        };
+        let mut metadata_bytes = Vec::new();
+        ciborium::ser::into_writer(&metadata, &mut metadata_bytes)
+            .expect("serialize test burnpack metadata");
+        let metadata_size = u32::try_from(metadata_bytes.len()).expect("metadata size");
+        let data_start =
+            (HEADER_SIZE + metadata_bytes.len()).div_ceil(TENSOR_ALIGNMENT) * TENSOR_ALIGNMENT;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&metadata_size.to_le_bytes());
+        bytes.extend_from_slice(&metadata_bytes);
+        bytes.resize(data_start, 0);
+        bytes.extend_from_slice(data);
+        bytes
     }
 
     #[test]
@@ -845,17 +1370,18 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         let manifest_path = root.join("model.bpk.parts.json");
         let part_path = root.join("model.bpk.part-00000.bpk");
-        fs::write(&part_path, b"abc").expect("write part");
+        let part_bytes = tiny_burnpack_part_bytes(&[1, 2, 3, 4]);
+        fs::write(&part_path, &part_bytes).expect("write part");
 
         let manifest = BurnpackPartsManifest {
             version: 1,
             source_file: "model.bpk".to_string(),
             source_modified_unix_ms: 0,
-            total_bytes: 3,
-            max_part_bytes: 3,
+            total_bytes: part_bytes.len() as u64,
+            max_part_bytes: part_bytes.len() as u64,
             parts: vec![BurnpackPartEntry {
                 path: "model.bpk.part-00000.bpk".to_string(),
-                bytes: 3,
+                bytes: part_bytes.len() as u64,
                 sha256: String::new(),
                 tensors: 1,
             }],
@@ -877,5 +1403,173 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn manifest_complete_accepts_legacy_small_trailing_shortfall() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let manifest_path = root.join("model.bpk.parts.json");
+        let part_path = root.join("model.bpk.part-00000.bpk");
+        let part_bytes = tiny_burnpack_part_bytes_with_declared_len(&[1, 2], 4);
+        fs::write(&part_path, &part_bytes).expect("write short-tail part");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: part_bytes.len() as u64,
+            max_part_bytes: part_bytes.len() as u64,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: part_bytes.len() as u64,
+                sha256: String::new(),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        assert!(
+            manifest_is_complete(&manifest_path).expect("check complete"),
+            "small legacy short-tail parts are normalized at load time"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn manifest_complete_rejects_integrity_invalid_parts() {
+        let root = unique_tmp_dir();
+        fs::create_dir_all(&root).expect("create temp root");
+        let manifest_path = root.join("model.bpk.parts.json");
+        let part_path = root.join("model.bpk.part-00000.bpk");
+        let part_bytes = tiny_burnpack_part_bytes_with_declared_len(&[1, 2], 512);
+        fs::write(&part_path, &part_bytes).expect("write truncated part");
+
+        let manifest = BurnpackPartsManifest {
+            version: 1,
+            source_file: "model.bpk".to_string(),
+            source_modified_unix_ms: 0,
+            total_bytes: part_bytes.len() as u64,
+            max_part_bytes: part_bytes.len() as u64,
+            parts: vec![BurnpackPartEntry {
+                path: "model.bpk.part-00000.bpk".to_string(),
+                bytes: part_bytes.len() as u64,
+                sha256: String::new(),
+                tensors: 1,
+            }],
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        assert!(
+            !manifest_is_complete(&manifest_path).expect("check incomplete"),
+            "large integrity-invalid manifest-matching parts must not mark a bundle complete"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn triposplat_bootstrap_bases_match_burnpack_output_names() {
+        let bases = triposplat_required_parts_bases();
+        assert_eq!(
+            bases,
+            vec![
+                "clip_vision/dino_v3_vit_h.safetensors".to_string(),
+                "vae/flux2_vae_encoder.safetensors".to_string(),
+                "diffusion_models/triposplat_flow.safetensors".to_string(),
+                "vae/triposplat_vae_decoder.safetensors".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn download_status_messages_expose_artifact_and_shard_progress() {
+        let context = DownloadPartContext {
+            label: "TripoSplat".to_string(),
+            artifact: "clip_vision/dino_v3_vit_h_f16".to_string(),
+            part_number: 7,
+            part_count: 26,
+        };
+        assert_eq!(
+            download_part_started_message(&context, 64 * 1024 * 1024),
+            "Downloading model weights: TripoSplat clip_vision/dino_v3_vit_h_f16 shard 7 of 26 (64.0 MiB)"
+        );
+        assert_eq!(
+            download_part_progress_message(
+                &context,
+                32 * 1024 * 1024,
+                Some(64 * 1024 * 1024),
+                8.5 * 1024.0 * 1024.0,
+            ),
+            "Downloading model weights: TripoSplat clip_vision/dino_v3_vit_h_f16 shard 7 of 26 50.0% (32.0 MiB/64.0 MiB, 8.5 MiB/s)"
+        );
+        assert_eq!(
+            download_part_completed_message(&context),
+            "Downloaded model weights: TripoSplat clip_vision/dino_v3_vit_h_f16 shard 7 of 26"
+        );
+    }
+
+    #[cfg(feature = "trellis")]
+    #[test]
+    fn parse_trellis_requirements_routes_stems_and_image_cond() {
+        let pipeline = serde_json::json!({
+            "args": {
+                "models": {
+                    "sparse": "ckpts/ss_flow_img_dit_1_3B_64_bf16",
+                    "shape_decoder": "TRELLIS-image-large/ckpts/shape_dec_next_dc_f16c32_fp16",
+                    "texture_decoder": "TRELLIS-image-large/ckpts/tex_dec_next_dc_f16c32_fp16"
+                },
+                "image_cond_model": {
+                    "args": {
+                        "model_name": "facebook/dinov3-vitl16-pretrain-lvd1689m"
+                    }
+                }
+            }
+        });
+
+        let requirements = parse_trellis_requirements(
+            serde_json::to_vec(&pipeline).expect("serialize").as_slice(),
+        )
+        .expect("parse requirements");
+
+        assert!(
+            requirements
+                .weights_required_parts_bases
+                .contains(&"ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors".to_string()),
+            "expected sparse flow to resolve under TRELLIS.2-4B"
+        );
+        assert!(
+            requirements
+                .image_large_required_parts_bases
+                .contains(&"ckpts/shape_dec_next_dc_f16c32_fp16.safetensors".to_string()),
+            "expected shape decoder to resolve under TRELLIS-image-large"
+        );
+        assert!(
+            requirements
+                .image_large_required_parts_bases
+                .contains(&"ckpts/tex_dec_next_dc_f16c32_fp16.safetensors".to_string()),
+            "expected texture decoder to resolve under TRELLIS-image-large"
+        );
+        assert!(
+            requirements.weights_required_parts_bases.contains(
+                &"facebook/dinov3-vitl16-pretrain-lvd1689m/model.safetensors".to_string()
+            ),
+            "expected image-conditioning DINO weights to be required under TRELLIS.2-4B"
+        );
+        assert!(
+            requirements
+                .weights_optional_text_relpaths
+                .contains(&"facebook/dinov3-vitl16-pretrain-lvd1689m/config.json".to_string()),
+            "expected image-conditioning config metadata to be tracked"
+        );
     }
 }

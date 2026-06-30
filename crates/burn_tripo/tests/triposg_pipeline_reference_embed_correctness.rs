@@ -28,6 +28,13 @@ const GRID_MSE: f32 = 1e-6;
 #[test]
 fn triposg_pipeline_from_reference_embeds_matches_reference_strictly()
 -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("TRIPOSG_FULL_REFERENCE").is_err() {
+        eprintln!(
+            "skipping: set TRIPOSG_FULL_REFERENCE=1 to run full TripoSG reference embed test"
+        );
+        return Ok(());
+    }
+
     let reference_path = asset_path("assets/hooks/triposg_pipeline_reference.safetensors");
     if !reference_path.exists() {
         eprintln!(

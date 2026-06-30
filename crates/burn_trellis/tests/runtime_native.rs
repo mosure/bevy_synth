@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use burn_trellis::hook_diff::HookSnapshot;
-use burn_trellis::mesh::load_obj_mesh;
 use burn_trellis::pipeline::{Trellis2Pipeline, Trellis2PipelineConfig, TrellisRunOptions};
 use image::{ImageBuffer, Rgba};
 
@@ -53,28 +51,37 @@ fn native_pipeline_writes_mesh_and_preprocess_hook() {
         .validate_runtime()
         .expect("runtime assets should validate");
 
-    pipeline
-        .infer_mesh_to_obj(
-            &input,
-            &output,
-            &TrellisRunOptions {
-                hook_output: Some(hook.clone()),
-                ..TrellisRunOptions::default()
-            },
-        )
-        .expect("native pipeline should emit a mesh");
-    assert!(output.exists(), "mesh output was not emitted");
-    assert!(hook.exists(), "hook file was not emitted");
-
-    let mesh = load_obj_mesh(&output).expect("failed to parse output OBJ");
-    assert!(!mesh.vertices.is_empty(), "output mesh has no vertices");
-    assert!(!mesh.faces.is_empty(), "output mesh has no faces");
-
-    let snapshot = HookSnapshot::from_file(&hook).expect("failed to read hook");
-    assert!(
-        snapshot.tensors.contains_key("preprocess_image.output"),
-        "preprocess hook tensor missing"
+    let result = pipeline.infer_mesh_to_obj(
+        &input,
+        &output,
+        &TrellisRunOptions {
+            hook_output: Some(hook.clone()),
+            ..TrellisRunOptions::default()
+        },
     );
+
+    #[cfg(not(feature = "runtime-model"))]
+    {
+        let err = result.expect_err("runtime-model-disabled pipeline should fail explicitly");
+        assert!(
+            err.to_string().contains("requires `runtime-model` feature"),
+            "unexpected runtime-model-disabled error: {err}"
+        );
+    }
+
+    #[cfg(feature = "runtime-model")]
+    {
+        let err = result.expect_err("fake runtime assets should fail before synthetic fallback");
+        assert!(
+            err.to_string()
+                .contains("missing TRELLIS image conditioning"),
+            "unexpected runtime-model fake-asset error: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "runtime-model fake assets must not emit a placeholder mesh"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(root);
 }

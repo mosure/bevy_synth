@@ -1,4 +1,4 @@
-use burn::{module::Ignored, nn, prelude::*};
+use burn::{nn, prelude::*};
 
 use super::{
     components::{
@@ -99,7 +99,8 @@ pub struct TripoSGVae<B: Backend> {
     pub decoder: TripoSGDecoder<B>,
     pub quant: Option<nn::Linear<B>>,
     pub post_quant: nn::Linear<B>,
-    freq_embed: Ignored<FrequencyPositionalEmbedding>,
+    #[module(skip)]
+    freq_embed: FrequencyPositionalEmbedding,
     in_channels: usize,
     latent_channels: usize,
 }
@@ -141,7 +142,7 @@ impl<B: Backend> TripoSGVae<B> {
             decoder,
             quant: Some(quant),
             post_quant,
-            freq_embed: Ignored(freq_embed),
+            freq_embed,
             in_channels: config.in_channels,
             latent_channels: config.latent_channels,
         }
@@ -171,7 +172,7 @@ impl<B: Backend> TripoSGVae<B> {
             decoder,
             quant: None,
             post_quant,
-            freq_embed: Ignored(freq_embed),
+            freq_embed,
             in_channels: config.in_channels,
             latent_channels: config.latent_channels,
         }

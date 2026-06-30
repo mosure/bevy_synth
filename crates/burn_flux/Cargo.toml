@@ -1,0 +1,31 @@
+[package]
+name = "burn_flux"
+description = "Burn implementations of Flux-family latent image encoders used by 3D synthesis pipelines"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[features]
+default = ["backend_ndarray"]
+backend_ndarray = ["burn/ndarray"]
+backend_cuda = ["burn/cuda", "burn/autotune", "burn/fusion"]
+backend_wgpu = ["burn/wgpu", "burn/autotune", "burn/fusion"]
+import = ["dep:burn-store", "dep:clap", "dep:safetensors", "dep:serde_json"]
+
+[dependencies]
+burn = { version = "=0.21.0", features = ["std"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+burn-store = { version = "=0.21.0", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+safetensors = { version = "0.6", optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[lib]
+name = "burn_flux"
+path = "src/lib.rs"

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use burn::backend::NdArray;
 #[cfg(feature = "import")]
-use burn::prelude::Backend;
+use burn::backend::ndarray::NdArrayDevice;
 
 use crate::pipeline::{
     PrepareImageConfig, PrepareImageError, PreparedImageData, RmbgPipeline, prepare_image_data,
@@ -30,7 +30,7 @@ impl Rmbg2Pipeline {
         use crate::rmbg14::import::{load_rmbg, load_rmbg_config, load_rmbg_processor_config};
 
         let root = weights_root.as_ref();
-        let device = <NdArray<f32> as Backend>::Device::default();
+        let device = NdArrayDevice::default();
         let config = load_rmbg_config(root)?;
         let weights_path = root.join("model.safetensors");
         let model = load_rmbg(&device, weights_path, &config)?;
@@ -53,7 +53,7 @@ pub mod import {
     use std::path::{Path, PathBuf};
 
     use burn::backend::NdArray;
-    use burn::prelude::Backend;
+    use burn::backend::ndarray::NdArrayDevice;
 
     use crate::preprocess::RmbgImageProcessor;
     use crate::rmbg14::RmbgConfig;
@@ -82,7 +82,7 @@ pub mod import {
         use_f16: bool,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let root = root.as_ref();
-        let device = <NdArray<f32> as Backend>::Device::default();
+        let device = NdArrayDevice::default();
         let config = load_rmbg_config(root).unwrap_or_else(|_| RmbgConfig::rmbg_1_4());
         let weights_path = root.join("model.safetensors");
         import_rmbg_burnpack::<NdArray<f32>>(&device, weights_path, &config, use_f16)

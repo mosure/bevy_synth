@@ -77,9 +77,44 @@ Get-ChildItem crates/burn_foreground/assets/models/RMBG-2.0/model*.bpk
 
 - Set `TRELLIS2_WEIGHTS_ROOT` to the TRELLIS.2-4B root containing `pipeline.json`.
 - Set `TRELLIS2_IMAGE_LARGE_ROOT` to the TRELLIS-image-large root for decoder assets.
+- Trellis2 image conditioning also requires DINOv3 weights for:
+  - `facebook/dinov3-vitl16-pretrain-lvd1689m`
 - Canonical in-repo locations:
   - `crates/burn_trellis/assets/models/TRELLIS.2-4B`
   - `crates/burn_trellis/assets/models/TRELLIS-image-large`
+
+### Native CLI auto-bootstrap
+
+- When `burn_synth` selects `--synthesis-models trellis` on native, it now auto-downloads missing
+  Trellis assets into the same cache family used by Tripo:
+  - `~/.burn_synth/models/TRELLIS.2-4B`
+  - `~/.burn_synth/models/TRELLIS-image-large`
+- Auto-bootstrap includes:
+  - `pipeline.json`
+  - required model manifests/parts from `pipeline.json` (`args.models`)
+  - DINOv3 image-conditioning burnpack parts under
+    `facebook/dinov3-vitl16-pretrain-lvd1689m`
+- Remote roots default to:
+  - `${MODEL_BASE_URL}/TRELLIS.2-4B`
+  - `${MODEL_BASE_URL}/TRELLIS-image-large`
+  where `MODEL_BASE_URL` defaults to `https://aberration.technology/model`.
+
+### DINOv3 image-conditioning weights
+
+- Runtime discovers DINOv3 snapshots from Hugging Face cache roots in this order:
+  - `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`
+  - `HF_HOME/hub`, `HUGGINGFACE_HOME/hub`
+  - `XDG_CACHE_HOME/huggingface/hub`
+  - `~/.cache/huggingface/hub`
+- If you use a shared disk cache, set one of the cache env vars above so runtime resolves snapshots deterministically.
+- Download command (requires Hugging Face access to the model):
+
+```bash
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id="facebook/dinov3-vitl16-pretrain-lvd1689m")
+PY
+```
 
 ### Runtime requirements
 
@@ -99,6 +134,8 @@ cargo run -p burn_trellis --features import --bin trellis2_import -- --quantizat
 - `trellis2_import` now writes:
   - primary assets into `TRELLIS.2-4B`
   - image-large assets into `TRELLIS-image-large`
+  - image-conditioning assets into `<output_root>/<image_cond_model>/model{,_f16}.bpk`
+    and supports wasm parts manifests for those burnpacks.
 - Import fails on missing source checkpoints (no silent skip).
 
 ### Verify imported files
@@ -125,6 +162,8 @@ Get-ChildItem crates/burn_trellis/assets/models/TRELLIS-image-large/ckpts -Filte
 
 - Use `scripts/bundle_web_assets.ps1` to collect runtime web assets into `www/assets/models`.
 - The bundle now includes Trellis runtime assets (`TRELLIS.2-4B` and `TRELLIS-image-large`) in addition to TripoSG and RMBG.
+- Trellis bundle validation now requires DINOv3 image-conditioning burnpack parts under
+  `TRELLIS.2-4B/facebook/dinov3-vitl16-pretrain-lvd1689m`.
 
 ### App selection
 

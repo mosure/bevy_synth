@@ -17,7 +17,7 @@ pub fn resize_chw_align_corners_false(
         InterpolateMode::Nearest => resize_nearest_align_corners_false(
             input, channels, in_height, in_width, out_height, out_width,
         ),
-        InterpolateMode::Bicubic | InterpolateMode::Bilinear => {
+        InterpolateMode::Bicubic | InterpolateMode::Bilinear | InterpolateMode::Lanczos3 => {
             if out_height < in_height || out_width < in_width {
                 resize_area_align_corners_false(
                     input, channels, in_height, in_width, out_height, out_width,

@@ -37,6 +37,14 @@ Build numerically correct, GPU-efficient, production-grade 3D synthesis pipeline
 8. For GPU-capable backends, default inference/extraction paths must stay on GPU and fail fast on GPU errors rather than silently rerouting to CPU.
 9. If host transfer is unavoidable, keep it narrow (stage boundary only), explicit in code, and documented with rationale.
 
+## Container + GPU Verification Contract
+
+1. In containerized runs, do not treat backend selection flags as proof of GPU execution.
+2. For every claimed `wgpu`/GPU benchmark, capture evidence of actual device usage (adapter/backend logs plus utilization or process-level GPU sample).
+3. If in-container GPU evidence tooling is missing, stop and report a blocker with exact environment gap; do not report benchmark/correctness completion.
+4. If runtime falls back to CPU (`ndarray`/llvmpipe/software path), treat it as a regression unless explicitly requested for debug.
+5. Long-running worker loops must keep publishing progress/blocker signals; never silently stall after first failure.
+
 ## Model Import and Loading
 
 1. `.bpk` artifacts are canonical in this repo; support both `f32` and `f16` variants.

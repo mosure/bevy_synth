@@ -3,32 +3,49 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
+#[cfg(feature = "runtime-model-wgpu")]
+use burn::tensor::{Int, Tensor};
 use clap::ValueEnum;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::TrellisQuality;
+use crate::config::{TrellisComputeProfile, TrellisQuality};
 use crate::hook_diff::{HookSnapshot, HookTensor};
 use crate::hook_trace::HookTrace;
-use crate::mesh::{Mesh, write_obj_mesh};
+use crate::mesh::{
+    Mesh, orient_mesh_faces_to_positive_volume, remap_mesh_to_python_glb_frame, write_obj_mesh,
+};
 use crate::paths::{resolve_trellis2_image_large_root, resolve_trellis2_weights_root};
 use crate::preprocess::{
     PreprocessConfig, PreprocessOutput, preprocess_image, preprocess_image_path,
 };
+#[cfg(feature = "runtime-model-wgpu")]
+use crate::runtime_model::sparse_structure_flow::WgpuRuntimeBackend as PipelineWgpuBackend;
 use crate::sampler::{FlowEulerSampleConfig, timestep_pairs};
 use crate::staged_pipeline::{
-    DecodeStageSource, SamplerConfigOverride, SparseRowNoiseOverride, SparseStructureStageSource,
-    TrellisNoiseOverrides, TrellisStageOutput, TrellisStageRuntime,
+    DecodeStageSource, SamplerConfigOverride, ShapeSLatSample, SparseFlowOpTimingSummary,
+    SparseRowNoiseOverride, SparseStructureSample, SparseStructureStageSource, TexSLatSample,
+    TrellisDecodeOutputMode, TrellisNoiseOverrides, TrellisSamplerRuntimeOverrides,
+    TrellisStageOutput, TrellisStageRunConfig, TrellisStageRuntime,
 };
+use crate::time::Instant;
 use crate::trellis_config::{TrellisPipelineArgs, TrellisPipelineConfig};
+use crate::virtual_fs;
 
 const HOOK_MAX_ROWS: usize = usize::MAX;
 const HOOK_MAX_DENSE_ELEMENTS: usize = usize::MAX;
 const HOOK_SAMPLER_SNAPSHOTS: usize = 3;
 const STAGE_RUNTIME_CACHE_MAX: usize = 2;
+
+#[cfg(target_arch = "wasm32")]
+fn trellis_wasm_log(message: &str) {
+    web_sys::console::log_1(&message.into());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn trellis_wasm_log(_message: &str) {}
 
 #[cfg(feature = "runtime-model")]
 fn reset_runtime_transfer_stats() {
@@ -65,6 +82,22 @@ fn stage_runtime_cache_disabled() -> bool {
     false
 }
 
+fn apply_explicit_sampler_overrides_to_hook(
+    sampler: &mut Option<SamplerConfigOverride>,
+    steps: Option<usize>,
+    guidance_strength: Option<f32>,
+) {
+    let Some(sampler) = sampler.as_mut() else {
+        return;
+    };
+    if let Some(steps) = steps {
+        sampler.config.steps = steps.max(1);
+    }
+    if let Some(guidance_strength) = guidance_strength {
+        sampler.config.guidance_strength = guidance_strength;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrellisDevice {
@@ -90,9 +123,19 @@ impl TrellisDevice {
 pub struct TrellisRunOptions {
     pub quality: TrellisQuality,
     pub device: TrellisDevice,
+    pub compute_profile: TrellisComputeProfile,
     pub seed: Option<u64>,
     pub hook_output: Option<PathBuf>,
     pub noise_overrides_hook: Option<PathBuf>,
+    pub max_sparse_coords: Option<usize>,
+    pub target_faces: Option<usize>,
+    pub pbr_texture_size: Option<usize>,
+    pub decode_output_mode: TrellisDecodeOutputMode,
+    pub runtime_stage_debug: bool,
+    pub runtime_attention_debug: bool,
+    pub runtime_decoder_conv_telemetry: bool,
+    pub runtime_stage_fence: bool,
+    pub sampler_overrides: TrellisSamplerRuntimeOverrides,
 }
 
 #[derive(Clone, Debug)]
@@ -106,13 +149,28 @@ pub struct TrellisPipelineTimings {
     pub preprocess_ms: f64,
     pub runtime_setup_ms: f64,
     pub sparse_ms: f64,
+    pub sparse_cond_ms: f64,
+    pub sparse_sample_ms: f64,
+    pub sparse_post_ms: f64,
+    pub sparse_flow_ops: SparseFlowOpTimingSummary,
     pub shape_slat_ms: f64,
+    pub shape_slat_flow_ops: SparseFlowOpTimingSummary,
     pub tex_slat_ms: f64,
+    pub tex_slat_flow_ops: SparseFlowOpTimingSummary,
     pub decode_ms: f64,
+    pub decode_stage_fenced: bool,
+    pub decode_model_load_ms: f64,
     pub decode_shape_decoder_ms: f64,
     pub decode_tex_decoder_ms: f64,
+    pub decode_output_materialize_ms: f64,
     pub decode_attr_merge_ms: f64,
     pub decode_mesh_ms: f64,
+    pub decode_remesh_bvh_ms: f64,
+    pub decode_remesh_refine_ms: f64,
+    pub decode_remesh_dc_ms: f64,
+    pub decode_remesh_cleanup_ms: f64,
+    pub decode_remesh_total_ms: f64,
+    pub decode_pre_pbr_decimate_ms: f64,
     pub decode_pbr_ms: f64,
     pub decode_shape_conv_calls: u64,
     pub decode_tex_conv_calls: u64,
@@ -139,13 +197,84 @@ pub struct TrellisPipelineStepCounts {
     pub tex_slat: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrellisPipelineShapes {
+    pub sparse_coords: usize,
+    pub shape_slat_lr_rows: usize,
+    pub shape_slat_rows: usize,
+    pub tex_slat_rows: usize,
+    pub cond_512_tokens: usize,
+    pub cond_1024_tokens: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct TrellisInferenceProfile {
     pub mesh: Mesh,
     pub timings: TrellisPipelineTimings,
     pub sparse_source: SparseStructureStageSource,
     pub decode_source: DecodeStageSource,
+    pub decode_output_mode: TrellisDecodeOutputMode,
     pub step_counts: TrellisPipelineStepCounts,
+    pub shapes: TrellisPipelineShapes,
+}
+
+fn sparse_structure_row_count(sample: &SparseStructureSample) -> usize {
+    if !sample.coords.is_empty() {
+        return sample.coords.len();
+    }
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        if let Some(coords) = sample.coords_wgpu.as_ref() {
+            return coords.dims()[0];
+        }
+    }
+    0
+}
+
+fn shape_slat_row_count(sample: &ShapeSLatSample) -> usize {
+    let host_rows = sample.coords.len().max(sample.features.len());
+    if host_rows > 0 {
+        return host_rows;
+    }
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        let coord_rows = sample
+            .coords_wgpu
+            .as_ref()
+            .map(|coords| coords.dims()[0])
+            .unwrap_or(0);
+        let feature_rows = sample
+            .features_wgpu
+            .as_ref()
+            .map(|features| features.dims()[0])
+            .unwrap_or(0);
+        return coord_rows.max(feature_rows);
+    }
+    #[allow(unreachable_code)]
+    0
+}
+
+fn tex_slat_row_count(sample: &TexSLatSample) -> usize {
+    let host_rows = sample.coords.len().max(sample.features.len());
+    if host_rows > 0 {
+        return host_rows;
+    }
+    #[cfg(feature = "runtime-model-wgpu")]
+    {
+        let coord_rows = sample
+            .coords_wgpu
+            .as_ref()
+            .map(|coords| coords.dims()[0])
+            .unwrap_or(0);
+        let feature_rows = sample
+            .features_wgpu
+            .as_ref()
+            .map(|features| features.dims()[0])
+            .unwrap_or(0);
+        return coord_rows.max(feature_rows);
+    }
+    #[allow(unreachable_code)]
+    0
 }
 
 impl Default for Trellis2PipelineConfig {
@@ -193,7 +322,12 @@ pub struct Trellis2Pipeline {
 struct StageRuntimeCacheKey {
     preferred_pipeline_type: String,
     prefer_wgpu: bool,
-    sampler_steps_override: Option<usize>,
+    sparse_steps: usize,
+    shape_steps: usize,
+    tex_steps: usize,
+    sparse_guidance_bits: Option<u32>,
+    shape_guidance_bits: Option<u32>,
+    tex_guidance_bits: Option<u32>,
     runtime_model_disabled: bool,
     runtime_decoders_disabled: bool,
     runtime_lazy_model_load: bool,
@@ -231,14 +365,14 @@ impl Trellis2Pipeline {
 
     pub fn validate_runtime(&self) -> Result<(), TrellisRuntimeError> {
         let pipeline_path = self.config.weights_root.join("pipeline.json");
-        if !pipeline_path.exists() {
+        if !virtual_fs::exists(&pipeline_path) {
             return Err(TrellisRuntimeError::new(format!(
                 "missing Trellis2 pipeline.json: {}",
                 pipeline_path.display()
             )));
         }
 
-        let pipeline_bytes = std::fs::read(&pipeline_path).map_err(|err| {
+        let pipeline_bytes = virtual_fs::read(&pipeline_path).map_err(|err| {
             TrellisRuntimeError::new(format!(
                 "failed to read Trellis2 pipeline config '{}': {err}",
                 pipeline_path.display()
@@ -266,7 +400,7 @@ impl Trellis2Pipeline {
                 &self.config.weights_root,
                 self.config.image_large_root.as_deref(),
             );
-            if !config_path.exists() {
+            if !virtual_fs::exists(&config_path) {
                 missing.push(config_path.display().to_string());
             }
 
@@ -278,12 +412,21 @@ impl Trellis2Pipeline {
             );
             let bpk_path = safetensors_path.with_extension("bpk");
             let bpk_f16_path = with_file_stem_suffix(&bpk_path, "_f16");
-            if !safetensors_path.exists() && !bpk_path.exists() && !bpk_f16_path.exists() {
+            let bpk_parts_path = burnpack_parts_manifest_path(&bpk_path);
+            let bpk_f16_parts_path = burnpack_parts_manifest_path(&bpk_f16_path);
+            if !virtual_fs::exists(&safetensors_path)
+                && !virtual_fs::exists(&bpk_path)
+                && !virtual_fs::exists(&bpk_f16_path)
+                && !virtual_fs::exists(&bpk_parts_path)
+                && !virtual_fs::exists(&bpk_f16_parts_path)
+            {
                 missing.push(format!(
-                    "{} (or {} / {})",
+                    "{} (or {} / {} / {} / {})",
                     safetensors_path.display(),
                     bpk_path.display(),
-                    bpk_f16_path.display()
+                    bpk_f16_path.display(),
+                    bpk_parts_path.display(),
+                    bpk_f16_parts_path.display()
                 ));
             }
         }
@@ -336,12 +479,24 @@ impl Trellis2Pipeline {
         let seed = options.seed.unwrap_or(42);
         let noise_overrides = self.load_noise_overrides(options)?;
         reset_runtime_transfer_stats();
-        let (stage_output, stage_timings) = runtime
+        let (mut stage_output, stage_timings) = runtime
             .run_profiled_with_overrides(
                 &preprocess,
                 seed,
                 noise_overrides.as_ref(),
                 options.hook_output.is_some(),
+                TrellisStageRunConfig {
+                    max_sparse_coords: options.max_sparse_coords,
+                    max_num_tokens: options.quality.settings().max_num_tokens,
+                    target_faces: options.target_faces.filter(|limit| *limit > 0),
+                    pbr_texture_size: options.pbr_texture_size.filter(|size| *size > 0),
+                    compute_profile: options.compute_profile,
+                    decode_output_mode: options.decode_output_mode,
+                    runtime_stage_debug: options.runtime_stage_debug,
+                    runtime_attention_debug: options.runtime_attention_debug,
+                    runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
+                    runtime_stage_fence: options.runtime_stage_fence,
+                },
             )
             .map_err(|err| {
                 TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
@@ -350,22 +505,56 @@ impl Trellis2Pipeline {
         let hook_capture_start = Instant::now();
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
         let hook_capture_ms = hook_capture_start.elapsed().as_secs_f64() * 1000.0;
+        remap_mesh_to_python_glb_frame(&mut stage_output.mesh);
+        orient_mesh_faces_to_positive_volume(&mut stage_output.mesh);
         let step_counts = TrellisPipelineStepCounts {
             sparse: stage_output.sparse.step_count,
             shape_slat: stage_output.shape_slat.step_count,
             tex_slat: stage_output.tex_slat.step_count,
         };
+        let shapes = TrellisPipelineShapes {
+            sparse_coords: sparse_structure_row_count(&stage_output.sparse),
+            shape_slat_lr_rows: stage_output
+                .shape_slat_lr
+                .as_ref()
+                .map(shape_slat_row_count)
+                .unwrap_or(0),
+            shape_slat_rows: shape_slat_row_count(&stage_output.shape_slat),
+            tex_slat_rows: tex_slat_row_count(&stage_output.tex_slat),
+            cond_512_tokens: stage_output.conditioning.cond_512.len() / 1024,
+            cond_1024_tokens: stage_output
+                .conditioning
+                .cond_1024
+                .as_ref()
+                .map(|cond| cond.len() / 1024)
+                .unwrap_or(0),
+        };
         let timings = TrellisPipelineTimings {
             preprocess_ms,
             runtime_setup_ms,
             sparse_ms: stage_timings.sparse_ms,
+            sparse_cond_ms: stage_timings.sparse_cond_ms,
+            sparse_sample_ms: stage_timings.sparse_sample_ms,
+            sparse_post_ms: stage_timings.sparse_post_ms,
+            sparse_flow_ops: stage_timings.sparse_flow_ops,
             shape_slat_ms: stage_timings.shape_slat_ms,
+            shape_slat_flow_ops: stage_timings.shape_slat_flow_ops,
             tex_slat_ms: stage_timings.tex_slat_ms,
+            tex_slat_flow_ops: stage_timings.tex_slat_flow_ops,
             decode_ms: stage_timings.decode_ms,
+            decode_stage_fenced: stage_timings.decode_stage_fenced,
+            decode_model_load_ms: stage_timings.decode_model_load_ms,
             decode_shape_decoder_ms: stage_timings.decode_shape_decoder_ms,
             decode_tex_decoder_ms: stage_timings.decode_tex_decoder_ms,
+            decode_output_materialize_ms: stage_timings.decode_output_materialize_ms,
             decode_attr_merge_ms: stage_timings.decode_attr_merge_ms,
             decode_mesh_ms: stage_timings.decode_mesh_ms,
+            decode_remesh_bvh_ms: stage_timings.decode_remesh_bvh_ms,
+            decode_remesh_refine_ms: stage_timings.decode_remesh_refine_ms,
+            decode_remesh_dc_ms: stage_timings.decode_remesh_dc_ms,
+            decode_remesh_cleanup_ms: stage_timings.decode_remesh_cleanup_ms,
+            decode_remesh_total_ms: stage_timings.decode_remesh_total_ms,
+            decode_pre_pbr_decimate_ms: stage_timings.decode_pre_pbr_decimate_ms,
             decode_pbr_ms: stage_timings.decode_pbr_ms,
             decode_shape_conv_calls: stage_timings.decode_shape_conv_calls,
             decode_tex_conv_calls: stage_timings.decode_tex_conv_calls,
@@ -387,9 +576,11 @@ impl Trellis2Pipeline {
         Ok(TrellisInferenceProfile {
             sparse_source: stage_output.sparse.source,
             decode_source: stage_output.decode_source,
+            decode_output_mode: options.decode_output_mode,
             mesh: stage_output.mesh,
             timings,
             step_counts,
+            shapes,
         })
     }
 
@@ -409,24 +600,110 @@ impl Trellis2Pipeline {
         image: DynamicImage,
         options: &TrellisRunOptions,
     ) -> Result<Mesh, TrellisRuntimeError> {
+        trellis_wasm_log("burn_trellis wasm: preprocess start");
         let preprocess = preprocess_image(image, PreprocessConfig::default())
             .map_err(|err| TrellisRuntimeError::new(format!("preprocess failed: {err}")))?;
+        trellis_wasm_log("burn_trellis wasm: preprocess done");
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime start");
         let runtime = self.load_stage_runtime(options)?;
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime done");
         let seed = options.seed.unwrap_or(42);
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides start");
         let noise_overrides = self.load_noise_overrides(options)?;
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides done");
         reset_runtime_transfer_stats();
+        trellis_wasm_log("burn_trellis wasm: staged runtime start");
         let stage_output = runtime
             .run_profiled_with_overrides(
                 &preprocess,
                 seed,
                 noise_overrides.as_ref(),
                 options.hook_output.is_some(),
+                TrellisStageRunConfig {
+                    max_sparse_coords: options.max_sparse_coords,
+                    max_num_tokens: options.quality.settings().max_num_tokens,
+                    target_faces: options.target_faces.filter(|limit| *limit > 0),
+                    pbr_texture_size: options.pbr_texture_size.filter(|size| *size > 0),
+                    compute_profile: options.compute_profile,
+                    decode_output_mode: options.decode_output_mode,
+                    runtime_stage_debug: options.runtime_stage_debug,
+                    runtime_attention_debug: options.runtime_attention_debug,
+                    runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
+                    runtime_stage_fence: options.runtime_stage_fence,
+                },
             )
             .map_err(|err| {
                 TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
             })?
             .0;
+        trellis_wasm_log("burn_trellis wasm: staged runtime done");
+        trellis_wasm_log("burn_trellis wasm: capture hook start");
         self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
+        trellis_wasm_log("burn_trellis wasm: capture hook done");
+        Ok(stage_output.mesh)
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "runtime-model"))]
+    pub async fn infer_mesh_from_image_async(
+        &self,
+        image: DynamicImage,
+        options: &TrellisRunOptions,
+    ) -> Result<Mesh, TrellisRuntimeError> {
+        trellis_wasm_log("burn_trellis wasm: preprocess start");
+        let preprocess = preprocess_image(image, PreprocessConfig::default())
+            .map_err(|err| TrellisRuntimeError::new(format!("preprocess failed: {err}")))?;
+        trellis_wasm_log("burn_trellis wasm: preprocess done");
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime start");
+        let runtime = self.load_stage_runtime(options)?;
+        trellis_wasm_log("burn_trellis wasm: load_stage_runtime done");
+        let seed = options.seed.unwrap_or(42);
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides start");
+        let mut noise_overrides = self.load_noise_overrides(options)?.unwrap_or_default();
+        trellis_wasm_log("burn_trellis wasm: load_noise_overrides done");
+        trellis_wasm_log("burn_trellis wasm: resolve conditioning async start");
+        let conditioning = runtime
+            .resolve_runtime_conditioning_async(&preprocess, Some(&noise_overrides))
+            .await
+            .map_err(|err| {
+                TrellisRuntimeError::new(format!(
+                    "trellis async conditioning extraction failed: {err}"
+                ))
+            })?;
+        noise_overrides.cond_512 = Some(conditioning.cond_512);
+        noise_overrides.neg_cond_512 = Some(conditioning.neg_cond_512);
+        noise_overrides.cond_1024 = conditioning.cond_1024;
+        noise_overrides.neg_cond_1024 = conditioning.neg_cond_1024;
+        trellis_wasm_log("burn_trellis wasm: resolve conditioning async done");
+        reset_runtime_transfer_stats();
+        trellis_wasm_log("burn_trellis wasm: staged runtime start");
+        let stage_output = runtime
+            .run_profiled_with_overrides_async(
+                &preprocess,
+                seed,
+                Some(&noise_overrides),
+                options.hook_output.is_some(),
+                TrellisStageRunConfig {
+                    max_sparse_coords: options.max_sparse_coords,
+                    max_num_tokens: options.quality.settings().max_num_tokens,
+                    target_faces: options.target_faces.filter(|limit| *limit > 0),
+                    pbr_texture_size: options.pbr_texture_size.filter(|size| *size > 0),
+                    compute_profile: options.compute_profile,
+                    decode_output_mode: options.decode_output_mode,
+                    runtime_stage_debug: options.runtime_stage_debug,
+                    runtime_attention_debug: options.runtime_attention_debug,
+                    runtime_decoder_conv_telemetry: options.runtime_decoder_conv_telemetry,
+                    runtime_stage_fence: options.runtime_stage_fence,
+                },
+            )
+            .await
+            .map_err(|err| {
+                TrellisRuntimeError::new(format!("trellis staged runtime execution failed: {err}"))
+            })?
+            .0;
+        trellis_wasm_log("burn_trellis wasm: staged runtime done");
+        trellis_wasm_log("burn_trellis wasm: capture hook start");
+        self.capture_pipeline_hook(&preprocess, &stage_output, runtime.pipeline_type(), options)?;
+        trellis_wasm_log("burn_trellis wasm: capture hook done");
         Ok(stage_output.mesh)
     }
 
@@ -452,8 +729,10 @@ impl Trellis2Pipeline {
             return Ok(hit.clone());
         }
 
-        let preferred_pipeline_type = options.quality.settings().pipeline_type;
+        let quality_settings = options.quality.settings();
+        let preferred_pipeline_type = quality_settings.pipeline_type;
         let prefer_wgpu = cache_key.prefer_wgpu;
+        let sampler_overrides = self.effective_sampler_overrides(options);
         #[allow(clippy::arc_with_non_send_sync)]
         let runtime = Arc::new(TrellisStageRuntime::from_args_with_assets(
             self.pipeline_args()?,
@@ -461,6 +740,8 @@ impl Trellis2Pipeline {
             Some(self.config.weights_root.as_path()),
             self.config.image_large_root.as_deref(),
             prefer_wgpu,
+            Some(sampler_overrides),
+            options.decode_output_mode.needs_texture_attrs(),
         ));
 
         if !stage_runtime_cache_disabled() {
@@ -475,12 +756,24 @@ impl Trellis2Pipeline {
         Ok(runtime)
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "runtime-model"))]
+    pub fn warm_runtime_component(
+        &self,
+        options: &TrellisRunOptions,
+        component_key: &str,
+    ) -> Result<(), TrellisRuntimeError> {
+        let runtime = self.load_stage_runtime(options)?;
+        runtime
+            .warm_runtime_component(component_key)
+            .map_err(TrellisRuntimeError::new)
+    }
+
     fn pipeline_args(&self) -> Result<&TrellisPipelineArgs, TrellisRuntimeError> {
         if let Some(args) = self.pipeline_args_cache.get() {
             return Ok(args);
         }
         let pipeline_path = self.config.weights_root.join("pipeline.json");
-        let pipeline_bytes = std::fs::read(&pipeline_path).map_err(|err| {
+        let pipeline_bytes = virtual_fs::read(&pipeline_path).map_err(|err| {
             TrellisRuntimeError::new(format!(
                 "failed to read Trellis2 pipeline config '{}': {err}",
                 pipeline_path.display()
@@ -499,14 +792,53 @@ impl Trellis2Pipeline {
     }
 
     fn stage_runtime_cache_key(&self, options: &TrellisRunOptions) -> StageRuntimeCacheKey {
+        let sampler_overrides = self.effective_sampler_overrides(options);
         StageRuntimeCacheKey {
             preferred_pipeline_type: options.quality.settings().pipeline_type.to_string(),
             prefer_wgpu: !matches!(options.device, TrellisDevice::Cpu),
-            sampler_steps_override: None,
+            sparse_steps: sampler_overrides.sparse_steps.unwrap_or(1),
+            shape_steps: sampler_overrides.shape_steps.unwrap_or(1),
+            tex_steps: sampler_overrides.tex_steps.unwrap_or(1),
+            sparse_guidance_bits: sampler_overrides.sparse_guidance_strength.map(f32::to_bits),
+            shape_guidance_bits: sampler_overrides.shape_guidance_strength.map(f32::to_bits),
+            tex_guidance_bits: sampler_overrides.tex_guidance_strength.map(f32::to_bits),
             runtime_model_disabled: false,
             runtime_decoders_disabled: false,
             runtime_lazy_model_load: true,
             slat_dense_resolution: None,
+        }
+    }
+
+    fn effective_sampler_overrides(
+        &self,
+        options: &TrellisRunOptions,
+    ) -> TrellisSamplerRuntimeOverrides {
+        let quality_settings = options.quality.settings();
+        TrellisSamplerRuntimeOverrides {
+            sparse_steps: Some(
+                options
+                    .sampler_overrides
+                    .sparse_steps
+                    .unwrap_or(quality_settings.sparse_steps)
+                    .max(1),
+            ),
+            shape_steps: Some(
+                options
+                    .sampler_overrides
+                    .shape_steps
+                    .unwrap_or(quality_settings.shape_steps)
+                    .max(1),
+            ),
+            tex_steps: Some(
+                options
+                    .sampler_overrides
+                    .tex_steps
+                    .unwrap_or(quality_settings.texture_steps)
+                    .max(1),
+            ),
+            sparse_guidance_strength: options.sampler_overrides.sparse_guidance_strength,
+            shape_guidance_strength: options.sampler_overrides.shape_guidance_strength,
+            tex_guidance_strength: options.sampler_overrides.tex_guidance_strength,
         }
     }
 
@@ -528,23 +860,67 @@ impl Trellis2Pipeline {
         if let Some(tensor) = snapshot.tensors.get("sample_sparse_structure.noise") {
             overrides.sparse_noise = Some(tensor.data.clone());
         }
-        if let Some(tensor) = snapshot.tensors.get("sample_sparse_structure.coords") {
-            overrides.sparse_coords = Some(hook_tensor_to_coords4(
-                "sample_sparse_structure.coords",
-                tensor,
-            )?);
-        }
-        overrides.shape_noise = extract_sparse_row_noise_override(
-            &snapshot,
-            "sample_shape_slat.noise",
-            path.as_path(),
-        )?;
-        overrides.tex_noise =
-            extract_sparse_row_noise_override(&snapshot, "sample_tex_slat.noise", path.as_path())?;
+        // Do not inject sparse coordinates from hook captures. Coordinates are
+        // the sparse-structure decoder output, so treating them as an override
+        // bypasses the first decoder parity boundary and can mask stale hooks.
+        overrides.sparse_coords = None;
         overrides.shape_noise_dense =
             extract_dense_f32_override(&snapshot, "sample_shape_slat.noise_dense");
         overrides.tex_noise_dense =
             extract_dense_f32_override(&snapshot, "sample_tex_slat.noise_dense");
+        let generic_shape_noise = if overrides.shape_noise_dense.is_some() {
+            None
+        } else {
+            extract_sparse_row_noise_override(&snapshot, "sample_shape_slat.noise", path.as_path())?
+        };
+        let shape_noise_lr = if overrides.shape_noise_dense.is_some() {
+            None
+        } else {
+            extract_sparse_row_noise_override(
+                &snapshot,
+                "sample_shape_slat_lr.noise",
+                path.as_path(),
+            )?
+        };
+        let shape_noise_hr = if overrides.shape_noise_dense.is_some() {
+            None
+        } else {
+            extract_sparse_row_noise_override(
+                &snapshot,
+                "sample_shape_slat_hr.noise",
+                path.as_path(),
+            )?
+        };
+        if matches!(
+            options.quality.settings().pipeline_type,
+            "1024_cascade" | "1536_cascade"
+        ) {
+            overrides.shape_noise = None;
+            overrides.shape_noise_lr = shape_noise_lr;
+            overrides.shape_noise_hr = shape_noise_hr.or(generic_shape_noise);
+        } else {
+            overrides.shape_noise = generic_shape_noise;
+            overrides.shape_noise_lr = shape_noise_lr;
+            overrides.shape_noise_hr = shape_noise_hr;
+        }
+        overrides.tex_noise = if overrides.tex_noise_dense.is_some() {
+            None
+        } else {
+            extract_sparse_row_noise_override(&snapshot, "sample_tex_slat.noise", path.as_path())?
+        };
+        // Keep runtime model stages active during parity runs; do not inject final
+        // stage outputs from hooks because that bypasses canonical shape/tex flows.
+        overrides.shape_slat = None;
+        overrides.tex_slat = None;
+        // Canonical runtime decode is intentionally fail-fast and non-bypassable.
+        // Keep hook overrides restricted to sampling/conditioning stages so strict
+        // parity runs compare real runtime decode outputs instead of injected tensors.
+        overrides.decode_shape_input = None;
+        overrides.decode_tex_input = None;
+        overrides.decode_shape_subs = None;
+        overrides.decode_tex_voxels = None;
+        overrides.decode_mesh_vertices = None;
+        overrides.decode_mesh_faces = None;
         overrides.sparse_sampler = extract_sampler_override(
             &snapshot,
             "sample_sparse_structure.sampler.config",
@@ -557,6 +933,21 @@ impl Trellis2Pipeline {
         )?;
         overrides.tex_sampler =
             extract_sampler_override(&snapshot, "sample_tex_slat.sampler.config", path.as_path())?;
+        apply_explicit_sampler_overrides_to_hook(
+            &mut overrides.sparse_sampler,
+            options.sampler_overrides.sparse_steps,
+            options.sampler_overrides.sparse_guidance_strength,
+        );
+        apply_explicit_sampler_overrides_to_hook(
+            &mut overrides.shape_sampler,
+            options.sampler_overrides.shape_steps,
+            options.sampler_overrides.shape_guidance_strength,
+        );
+        apply_explicit_sampler_overrides_to_hook(
+            &mut overrides.tex_sampler,
+            options.sampler_overrides.tex_steps,
+            options.sampler_overrides.tex_guidance_strength,
+        );
         overrides.cond_512 = extract_dense_f32_override(&snapshot, "get_cond_512.out.cond");
         overrides.neg_cond_512 = extract_dense_f32_override(&snapshot, "get_cond_512.out.neg_cond");
         overrides.cond_1024 = extract_dense_f32_override(&snapshot, "get_cond_1024.out.cond");
@@ -570,7 +961,7 @@ impl Trellis2Pipeline {
             )));
         }
         eprintln!(
-            "burn_trellis: loaded noise overrides from '{}': sparse={} sparse_coords={} shape_rows={} tex_rows={} shape_dense={} tex_dense={} sparse_sampler={} shape_sampler={} tex_sampler={} cond512={} neg512={} cond1024={} neg1024={}",
+            "burn_trellis: loaded noise overrides from '{}': sparse={} sparse_coords={} shape_rows={} tex_rows={} shape_slat_rows={} tex_slat_rows={} decode_shape_input_rows={} decode_tex_input_rows={} decode_shape_levels={} decode_tex_rows={} decode_mesh_vertices={} decode_mesh_faces={} shape_dense={} tex_dense={} sparse_sampler={} shape_sampler={} tex_sampler={} cond512={} neg512={} cond1024={} neg1024={}",
             path.display(),
             overrides.sparse_noise.as_ref().map_or(0usize, |v| v.len()),
             overrides
@@ -585,6 +976,38 @@ impl Trellis2Pipeline {
                 .tex_noise
                 .as_ref()
                 .map_or(0usize, |v| v.coords.len()),
+            overrides
+                .shape_slat
+                .as_ref()
+                .map_or(0usize, |v| v.coords.len()),
+            overrides
+                .tex_slat
+                .as_ref()
+                .map_or(0usize, |v| v.coords.len()),
+            overrides
+                .decode_shape_input
+                .as_ref()
+                .map_or(0usize, |v| v.coords.len()),
+            overrides
+                .decode_tex_input
+                .as_ref()
+                .map_or(0usize, |v| v.coords.len()),
+            overrides
+                .decode_shape_subs
+                .as_ref()
+                .map_or(0usize, |levels| levels.len()),
+            overrides
+                .decode_tex_voxels
+                .as_ref()
+                .map_or(0usize, |voxels| voxels.coords.len()),
+            overrides
+                .decode_mesh_vertices
+                .as_ref()
+                .map_or(0usize, |vertices| vertices.len()),
+            overrides
+                .decode_mesh_faces
+                .as_ref()
+                .map_or(0usize, |faces| faces.len()),
             overrides
                 .shape_noise_dense
                 .as_ref()
@@ -647,26 +1070,54 @@ impl Trellis2Pipeline {
 
             let cond_channels = 1024usize;
             let cond_512_tokens = 32usize * 32usize + 5usize;
-            let cond = build_synthetic_cond_trace(preprocess, cond_512_tokens, cond_channels);
+            let cond_512_expected = cond_512_tokens * cond_channels;
+            if stage_output.conditioning.cond_512.len() != cond_512_expected {
+                return Err(TrellisRuntimeError::new(format!(
+                    "runtime conditioning 'get_cond_512.out.cond' has {} values, expected {}",
+                    stage_output.conditioning.cond_512.len(),
+                    cond_512_expected
+                )));
+            }
             let (cond_shape, cond_values) = sample_dense_f32_for_hook(
                 &[1usize, cond_512_tokens, cond_channels],
-                cond.as_slice(),
+                stage_output.conditioning.cond_512.as_slice(),
             );
             trace
                 .insert_f32("get_cond_512.out.cond", cond_shape.clone(), cond_values)
                 .map_err(TrellisRuntimeError::new)?;
-            let neg_cond = vec![0.0f32; cond_512_tokens * cond_channels];
+            if stage_output.conditioning.neg_cond_512.len() != cond_512_expected {
+                return Err(TrellisRuntimeError::new(format!(
+                    "runtime conditioning 'get_cond_512.out.neg_cond' has {} values, expected {}",
+                    stage_output.conditioning.neg_cond_512.len(),
+                    cond_512_expected
+                )));
+            }
             let (neg_cond_shape, neg_cond_values) = sample_dense_f32_for_hook(
                 &[1usize, cond_512_tokens, cond_channels],
-                neg_cond.as_slice(),
+                stage_output.conditioning.neg_cond_512.as_slice(),
             );
             trace
                 .insert_f32("get_cond_512.out.neg_cond", neg_cond_shape, neg_cond_values)
                 .map_err(TrellisRuntimeError::new)?;
             if pipeline_type != "512" && pipeline_type != "512_base" {
                 let cond_1024_tokens = 64usize * 64usize + 5usize;
-                let cond_1024 =
-                    build_synthetic_cond_trace(preprocess, cond_1024_tokens, cond_channels);
+                let cond_1024_expected = cond_1024_tokens * cond_channels;
+                let cond_1024 = stage_output
+                    .conditioning
+                    .cond_1024
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TrellisRuntimeError::new(
+                            "runtime conditioning missing 'get_cond_1024.out.cond'".to_string(),
+                        )
+                    })?;
+                if cond_1024.len() != cond_1024_expected {
+                    return Err(TrellisRuntimeError::new(format!(
+                        "runtime conditioning 'get_cond_1024.out.cond' has {} values, expected {}",
+                        cond_1024.len(),
+                        cond_1024_expected
+                    )));
+                }
                 let (cond_1024_shape, cond_1024_values) = sample_dense_f32_for_hook(
                     &[1usize, cond_1024_tokens, cond_channels],
                     cond_1024.as_slice(),
@@ -678,7 +1129,22 @@ impl Trellis2Pipeline {
                         cond_1024_values,
                     )
                     .map_err(TrellisRuntimeError::new)?;
-                let neg_cond_1024 = vec![0.0f32; cond_1024_tokens * cond_channels];
+                let neg_cond_1024 = stage_output
+                    .conditioning
+                    .neg_cond_1024
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TrellisRuntimeError::new(
+                            "runtime conditioning missing 'get_cond_1024.out.neg_cond'".to_string(),
+                        )
+                    })?;
+                if neg_cond_1024.len() != cond_1024_expected {
+                    return Err(TrellisRuntimeError::new(format!(
+                        "runtime conditioning 'get_cond_1024.out.neg_cond' has {} values, expected {}",
+                        neg_cond_1024.len(),
+                        cond_1024_expected
+                    )));
+                }
                 let (neg_cond_1024_shape, neg_cond_1024_values) = sample_dense_f32_for_hook(
                     &[1usize, cond_1024_tokens, cond_channels],
                     neg_cond_1024.as_slice(),
@@ -713,20 +1179,79 @@ impl Trellis2Pipeline {
                 stage_output.sparse.sigma_min,
             )
             .map_err(TrellisRuntimeError::new)?;
-            for step_idx in
-                sampler_snapshot_steps(stage_output.sparse.step_count, HOOK_SAMPLER_SNAPSHOTS)
+            let sparse_step_count = stage_output.sparse.step_count.max(1);
+            let sparse_state_len: usize = sparse_shape.iter().product();
+            let inserted_sparse_step_pred_v = insert_sparse_step_tensor_hooks(
+                &mut trace,
+                "sample_sparse_structure.sampler",
+                sparse_step_count,
+                "pred_v",
+                sparse_shape.as_slice(),
+                sparse_state_len,
+                stage_output.sparse.step_pred_v.as_slice(),
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            if !inserted_sparse_step_pred_v
+                && stage_output.sparse.step_0_pred_v.len() == sparse_state_len
             {
-                let key = format!(
-                    "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.x_t",
-                    stage_output.sparse.step_count.max(1)
-                );
                 trace
                     .insert_f32(
-                        key,
+                        format!(
+                            "sample_sparse_structure.sampler.step_000_of_{sparse_step_count:03}.pred_v"
+                        ),
                         sparse_shape.clone(),
-                        sparse_step_values(&stage_output.sparse, step_idx),
+                        stage_output.sparse.step_0_pred_v.clone(),
                     )
                     .map_err(TrellisRuntimeError::new)?;
+            }
+            if stage_output.sparse.step_0_pred_v_pos.len() == sparse_state_len {
+                trace
+                    .insert_f32(
+                        format!(
+                            "sample_sparse_structure.sampler.step_000_of_{sparse_step_count:03}.pred_v_pos"
+                        ),
+                        sparse_shape.clone(),
+                        stage_output.sparse.step_0_pred_v_pos.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+            }
+            if stage_output.sparse.step_0_pred_v_neg.len() == sparse_state_len {
+                trace
+                    .insert_f32(
+                        format!(
+                            "sample_sparse_structure.sampler.step_000_of_{sparse_step_count:03}.pred_v_neg"
+                        ),
+                        sparse_shape.clone(),
+                        stage_output.sparse.step_0_pred_v_neg.clone(),
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+            }
+            let inserted_sparse_step_x_t = insert_sparse_step_tensor_hooks(
+                &mut trace,
+                "sample_sparse_structure.sampler",
+                sparse_step_count,
+                "x_t",
+                sparse_shape.as_slice(),
+                sparse_state_len,
+                stage_output.sparse.step_x_t.as_slice(),
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            if !inserted_sparse_step_x_t {
+                for step_idx in
+                    sampler_snapshot_steps(stage_output.sparse.step_count, HOOK_SAMPLER_SNAPSHOTS)
+                {
+                    let key = format!(
+                        "sample_sparse_structure.sampler.step_{step_idx:03}_of_{:03}.x_t",
+                        stage_output.sparse.step_count.max(1)
+                    );
+                    trace
+                        .insert_f32(
+                            key,
+                            sparse_shape.clone(),
+                            sparse_step_values(&stage_output.sparse, step_idx),
+                        )
+                        .map_err(TrellisRuntimeError::new)?;
+                }
             }
             trace
                 .insert_f32(
@@ -735,12 +1260,43 @@ impl Trellis2Pipeline {
                     stage_output.sparse.latent.clone(),
                 )
                 .map_err(TrellisRuntimeError::new)?;
-            let sparse_indices = sampled_row_indices(stage_output.sparse.coords.len(), 4);
+            #[cfg(feature = "runtime-model-wgpu")]
+            let sparse_coords_for_hook = hook_sparse_coords_for_trace(
+                stage_output.sparse.coords.as_slice(),
+                stage_output.sparse.coords_wgpu.as_ref(),
+                "sample_sparse_structure.coords",
+            )?;
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            let sparse_coords_for_hook =
+                hook_sparse_coords_for_trace(stage_output.sparse.coords.as_slice(), None, "")?;
+            #[cfg(feature = "runtime-model-wgpu")]
+            let shape_coords_for_hook = hook_sparse_coords_for_trace(
+                stage_output.shape_slat.coords.as_slice(),
+                stage_output.shape_slat.coords_wgpu.as_ref(),
+                "sample_shape_slat.coords",
+            )?;
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            let shape_coords_for_hook =
+                hook_sparse_coords_for_trace(stage_output.shape_slat.coords.as_slice(), None, "")?;
+            #[cfg(feature = "runtime-model-wgpu")]
+            let tex_coords_for_hook = hook_sparse_coords_for_trace(
+                stage_output.tex_slat.coords.as_slice(),
+                stage_output.tex_slat.coords_wgpu.as_ref(),
+                "sample_tex_slat.coords",
+            )?;
+            #[cfg(not(feature = "runtime-model-wgpu"))]
+            let tex_coords_for_hook =
+                hook_sparse_coords_for_trace(stage_output.tex_slat.coords.as_slice(), None, "")?;
+
+            let sparse_indices = sampled_row_indices(sparse_coords_for_hook.len(), 4);
             trace
                 .insert_f32(
                     "sample_sparse_structure.coords",
                     vec![sparse_indices.len(), 4],
-                    flatten_coords_indices(&stage_output.sparse.coords, sparse_indices.as_slice()),
+                    flatten_coords_indices(
+                        sparse_coords_for_hook.as_slice(),
+                        sparse_indices.as_slice(),
+                    ),
                 )
                 .map_err(TrellisRuntimeError::new)?;
             if let Some(dense_noise) = stage_output.shape_slat.dense_noise.as_ref()
@@ -762,48 +1318,40 @@ impl Trellis2Pipeline {
                     .map_err(TrellisRuntimeError::new)?;
             }
 
-            insert_sparse_trace_rows(
+            insert_shape_slat_sample_hooks(
                 &mut trace,
-                "sample_shape_slat.noise",
-                &stage_output.shape_slat.coords,
-                &stage_output.shape_slat.noise,
-                32,
-                stage_output.sparse.resolution,
+                "sample_shape_slat",
+                shape_coords_for_hook.as_slice(),
+                &stage_output.shape_slat,
             )
             .map_err(TrellisRuntimeError::new)?;
-            insert_sampler_hook_config(
-                &mut trace,
-                "sample_shape_slat.sampler",
-                stage_output.shape_slat.sampler_config,
-                stage_output.shape_slat.sigma_min,
-            )
-            .map_err(TrellisRuntimeError::new)?;
-            for step_idx in
-                sampler_snapshot_steps(stage_output.shape_slat.step_count, HOOK_SAMPLER_SNAPSHOTS)
-            {
-                let prefix = format!(
-                    "sample_shape_slat.sampler.step_{step_idx:03}_of_{:03}.x_t",
-                    stage_output.shape_slat.step_count.max(1)
-                );
-                insert_sparse_trace_rows(
+            if matches!(pipeline_type, "1024_cascade" | "1536_cascade") {
+                insert_shape_slat_sample_hooks(
                     &mut trace,
-                    prefix.as_str(),
-                    &stage_output.shape_slat.coords,
-                    shape_slat_step_values(&stage_output.shape_slat, step_idx),
-                    32,
-                    stage_output.sparse.resolution,
+                    "sample_shape_slat_hr",
+                    shape_coords_for_hook.as_slice(),
+                    &stage_output.shape_slat,
                 )
                 .map_err(TrellisRuntimeError::new)?;
+                if let Some(shape_slat_lr) = stage_output.shape_slat_lr.as_ref() {
+                    #[cfg(feature = "runtime-model-wgpu")]
+                    let shape_lr_coords_for_hook = hook_sparse_coords_for_trace(
+                        shape_slat_lr.coords.as_slice(),
+                        shape_slat_lr.coords_wgpu.as_ref(),
+                        "sample_shape_slat_lr.coords",
+                    )?;
+                    #[cfg(not(feature = "runtime-model-wgpu"))]
+                    let shape_lr_coords_for_hook =
+                        hook_sparse_coords_for_trace(shape_slat_lr.coords.as_slice(), None, "")?;
+                    insert_shape_slat_sample_hooks(
+                        &mut trace,
+                        "sample_shape_slat_lr",
+                        shape_lr_coords_for_hook.as_slice(),
+                        shape_slat_lr,
+                    )
+                    .map_err(TrellisRuntimeError::new)?;
+                }
             }
-            insert_sparse_trace_rows(
-                &mut trace,
-                "sample_shape_slat.slat",
-                &stage_output.shape_slat.coords,
-                &stage_output.shape_slat.features,
-                32,
-                stage_output.sparse.resolution,
-            )
-            .map_err(TrellisRuntimeError::new)?;
             if let Some(dense_noise) = stage_output.tex_slat.dense_noise.as_ref()
                 && stage_output.tex_slat.dense_resolution > 0
                 && stage_output.tex_slat.dense_channels > 0
@@ -826,7 +1374,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.noise",
-                &stage_output.tex_slat.coords,
+                tex_coords_for_hook.as_slice(),
                 &stage_output.tex_slat.noise,
                 32,
                 stage_output.sparse.resolution,
@@ -839,6 +1387,45 @@ impl Trellis2Pipeline {
                 stage_output.tex_slat.sigma_min,
             )
             .map_err(TrellisRuntimeError::new)?;
+            let tex_step_0_pred_prefix = format!(
+                "sample_tex_slat.sampler.step_000_of_{:03}.pred_v",
+                stage_output.tex_slat.step_count.max(1)
+            );
+            insert_sparse_trace_rows(
+                &mut trace,
+                tex_step_0_pred_prefix.as_str(),
+                tex_coords_for_hook.as_slice(),
+                stage_output.tex_slat.step_0_pred_v.as_slice(),
+                32,
+                stage_output.sparse.resolution,
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            let tex_step_0_pred_pos_prefix = format!(
+                "sample_tex_slat.sampler.step_000_of_{:03}.pred_v_pos",
+                stage_output.tex_slat.step_count.max(1)
+            );
+            insert_sparse_trace_rows(
+                &mut trace,
+                tex_step_0_pred_pos_prefix.as_str(),
+                tex_coords_for_hook.as_slice(),
+                stage_output.tex_slat.step_0_pred_v_pos.as_slice(),
+                32,
+                stage_output.sparse.resolution,
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            let tex_step_0_pred_neg_prefix = format!(
+                "sample_tex_slat.sampler.step_000_of_{:03}.pred_v_neg",
+                stage_output.tex_slat.step_count.max(1)
+            );
+            insert_sparse_trace_rows(
+                &mut trace,
+                tex_step_0_pred_neg_prefix.as_str(),
+                tex_coords_for_hook.as_slice(),
+                stage_output.tex_slat.step_0_pred_v_neg.as_slice(),
+                32,
+                stage_output.sparse.resolution,
+            )
+            .map_err(TrellisRuntimeError::new)?;
             for step_idx in
                 sampler_snapshot_steps(stage_output.tex_slat.step_count, HOOK_SAMPLER_SNAPSHOTS)
             {
@@ -849,7 +1436,7 @@ impl Trellis2Pipeline {
                 insert_sparse_trace_rows(
                     &mut trace,
                     prefix.as_str(),
-                    &stage_output.tex_slat.coords,
+                    tex_coords_for_hook.as_slice(),
                     tex_slat_step_values(&stage_output.tex_slat, step_idx),
                     32,
                     stage_output.sparse.resolution,
@@ -859,7 +1446,7 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.shape_slat_cond",
-                &stage_output.tex_slat.coords,
+                tex_coords_for_hook.as_slice(),
                 &stage_output.tex_slat.shape_slat_cond,
                 32,
                 stage_output.sparse.resolution,
@@ -868,8 +1455,44 @@ impl Trellis2Pipeline {
             insert_sparse_trace_rows(
                 &mut trace,
                 "sample_tex_slat.slat",
-                &stage_output.tex_slat.coords,
+                tex_coords_for_hook.as_slice(),
                 &stage_output.tex_slat.features,
+                32,
+                stage_output.sparse.resolution,
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            let (decode_shape_coords, decode_shape_feats) =
+                if let Some(rows) = stage_output.decode_shape_input.as_ref() {
+                    (rows.coords.as_slice(), rows.feats.as_slice())
+                } else {
+                    (
+                        shape_coords_for_hook.as_slice(),
+                        stage_output.shape_slat.features.as_slice(),
+                    )
+                };
+            insert_sparse_trace_rows(
+                &mut trace,
+                "decode_shape_slat.input",
+                decode_shape_coords,
+                decode_shape_feats,
+                32,
+                stage_output.sparse.resolution,
+            )
+            .map_err(TrellisRuntimeError::new)?;
+            let (decode_tex_coords, decode_tex_feats) =
+                if let Some(rows) = stage_output.decode_tex_input.as_ref() {
+                    (rows.coords.as_slice(), rows.feats.as_slice())
+                } else {
+                    (
+                        tex_coords_for_hook.as_slice(),
+                        stage_output.tex_slat.features.as_slice(),
+                    )
+                };
+            insert_sparse_trace_rows(
+                &mut trace,
+                "decode_tex_slat.input",
+                decode_tex_coords,
+                decode_tex_feats,
                 32,
                 stage_output.sparse.resolution,
             )
@@ -1263,6 +1886,56 @@ fn extract_sampler_override(
     }))
 }
 
+#[cfg(feature = "runtime-model-wgpu")]
+fn hook_sparse_coords_for_trace(
+    host_coords: &[[u32; 4]],
+    coords_wgpu: Option<&Tensor<PipelineWgpuBackend, 2, Int>>,
+    context: &str,
+) -> Result<Vec<[u32; 4]>, TrellisRuntimeError> {
+    if !host_coords.is_empty() {
+        return Ok(host_coords.to_vec());
+    }
+    let Some(coords_t) = coords_wgpu else {
+        return Ok(Vec::new());
+    };
+    let [rows, cols] = coords_t.dims();
+    if cols != 4 {
+        return Err(TrellisRuntimeError::new(format!(
+            "{context}: invalid device coord shape [{rows},{cols}], expected [N,4]"
+        )));
+    }
+    let flat =
+        crate::runtime_model::types::extraction::tensor_i32_to_vec(coords_t.clone(), context)
+            .map_err(TrellisRuntimeError::new)?;
+    if flat.len() != rows.saturating_mul(4) {
+        return Err(TrellisRuntimeError::new(format!(
+            "{context}: invalid device coord payload len {} for rows {}",
+            flat.len(),
+            rows
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let base = row * 4;
+        out.push([
+            flat[base].max(0) as u32,
+            flat[base + 1].max(0) as u32,
+            flat[base + 2].max(0) as u32,
+            flat[base + 3].max(0) as u32,
+        ]);
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "runtime-model-wgpu"))]
+fn hook_sparse_coords_for_trace(
+    host_coords: &[[u32; 4]],
+    _coords_wgpu: Option<&()>,
+    _context: &str,
+) -> Result<Vec<[u32; 4]>, TrellisRuntimeError> {
+    Ok(host_coords.to_vec())
+}
+
 fn hook_tensor_to_coords4(
     key: &str,
     tensor: &HookTensor,
@@ -1329,72 +2002,6 @@ fn final_resolution_for_pipeline(pipeline_type: &str) -> usize {
         "1536_cascade" => 1536,
         _ => 512,
     }
-}
-
-fn build_synthetic_cond_trace(
-    preprocess: &PreprocessOutput,
-    tokens: usize,
-    cond_channels: usize,
-) -> Vec<f32> {
-    if preprocess.rgb.is_empty() {
-        return vec![0.0; tokens * cond_channels];
-    }
-    let patch_side = (tokens as f32).sqrt().floor().max(1.0) as usize;
-    let patch_tokens = (patch_side * patch_side).min(tokens);
-    let extra_tokens = tokens.saturating_sub(patch_tokens);
-    let width = preprocess.width.max(1) as usize;
-    let height = preprocess.height.max(1) as usize;
-    let mut out = Vec::with_capacity(tokens * cond_channels);
-    for token_idx in 0..tokens {
-        let (x, y, extra_scale) = if token_idx < patch_tokens {
-            let x = token_idx % patch_side;
-            let y = token_idx / patch_side;
-            (x, y, 0.0f32)
-        } else {
-            let extra_idx = token_idx - patch_tokens;
-            let x = width / 2;
-            let y = height / 2;
-            let scale = if extra_tokens > 0 {
-                extra_idx as f32 / extra_tokens as f32
-            } else {
-                0.0
-            };
-            (x, y, scale)
-        };
-        let xx = if token_idx < patch_tokens {
-            (x * width / patch_side).min(width - 1)
-        } else {
-            x.min(width - 1)
-        };
-        let yy = if token_idx < patch_tokens {
-            (y * height / patch_side).min(height - 1)
-        } else {
-            y.min(height - 1)
-        };
-        let offset = (yy * width + xx) * 3;
-        let r = preprocess.rgb[offset] as f32 / 255.0;
-        let g = preprocess.rgb[offset + 1] as f32 / 255.0;
-        let b = preprocess.rgb[offset + 2] as f32 / 255.0;
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let nx = if patch_side > 1 {
-            x as f32 / (patch_side as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let ny = if patch_side > 1 {
-            y as f32 / (patch_side as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let basis = [r, g, b, luma, nx, ny, extra_scale];
-        for channel in 0..cond_channels {
-            let base = basis[channel % basis.len()];
-            let gain = 1.0 + ((channel / basis.len()) % 17) as f32 / 17.0;
-            let phase = ((token_idx + channel + 1) as f32 * 0.013).sin();
-            out.push((base * gain + 0.1 * phase).clamp(-1.0, 1.0));
-        }
-    }
-    out
 }
 
 fn insert_sampler_hook_config(
@@ -1467,6 +2074,36 @@ fn insert_sparse_trace_rows(
     Ok(())
 }
 
+fn insert_sparse_step_tensor_hooks(
+    trace: &mut HookTrace,
+    prefix: &str,
+    step_count: usize,
+    suffix: &str,
+    shape: &[usize],
+    expected_len: usize,
+    values: &[Vec<f32>],
+) -> Result<bool, String> {
+    if values.is_empty() {
+        return Ok(false);
+    }
+    let mut inserted = false;
+    for (step_idx, step_values) in values.iter().enumerate() {
+        if step_idx >= step_count {
+            break;
+        }
+        if step_values.len() != expected_len {
+            continue;
+        }
+        trace.insert_f32(
+            format!("{prefix}.step_{step_idx:03}_of_{step_count:03}.{suffix}"),
+            shape.to_vec(),
+            step_values.clone(),
+        )?;
+        inserted = true;
+    }
+    Ok(inserted)
+}
+
 fn sparse_step_values(
     sparse: &crate::staged_pipeline::SparseStructureSample,
     step_idx: usize,
@@ -1503,6 +2140,73 @@ fn shape_slat_step_values(
         return shape.step_last_x_t.as_slice();
     }
     shape.step_last_x_t.as_slice()
+}
+
+fn insert_shape_slat_sample_hooks(
+    trace: &mut HookTrace,
+    prefix: &str,
+    coords: &[[u32; 4]],
+    shape: &crate::staged_pipeline::ShapeSLatSample,
+) -> Result<(), String> {
+    let spatial_resolution = shape.dense_resolution.max(1);
+    insert_sparse_trace_rows(
+        trace,
+        &format!("{prefix}.noise"),
+        coords,
+        shape.noise.as_slice(),
+        32,
+        spatial_resolution,
+    )?;
+    insert_sampler_hook_config(
+        trace,
+        &format!("{prefix}.sampler"),
+        shape.sampler_config,
+        shape.sigma_min,
+    )?;
+    let step_count = shape.step_count.max(1);
+    insert_sparse_trace_rows(
+        trace,
+        &format!("{prefix}.sampler.step_000_of_{step_count:03}.pred_v"),
+        coords,
+        shape.step_0_pred_v.as_slice(),
+        32,
+        spatial_resolution,
+    )?;
+    insert_sparse_trace_rows(
+        trace,
+        &format!("{prefix}.sampler.step_000_of_{step_count:03}.pred_v_pos"),
+        coords,
+        shape.step_0_pred_v_pos.as_slice(),
+        32,
+        spatial_resolution,
+    )?;
+    insert_sparse_trace_rows(
+        trace,
+        &format!("{prefix}.sampler.step_000_of_{step_count:03}.pred_v_neg"),
+        coords,
+        shape.step_0_pred_v_neg.as_slice(),
+        32,
+        spatial_resolution,
+    )?;
+    for step_idx in sampler_snapshot_steps(shape.step_count, HOOK_SAMPLER_SNAPSHOTS) {
+        insert_sparse_trace_rows(
+            trace,
+            &format!("{prefix}.sampler.step_{step_idx:03}_of_{step_count:03}.x_t"),
+            coords,
+            shape_slat_step_values(shape, step_idx),
+            32,
+            spatial_resolution,
+        )?;
+    }
+    insert_sparse_trace_rows(
+        trace,
+        &format!("{prefix}.slat"),
+        coords,
+        shape.features.as_slice(),
+        32,
+        spatial_resolution,
+    )?;
+    Ok(())
 }
 
 fn tex_slat_step_values(
@@ -1816,4 +2520,12 @@ fn with_file_stem_suffix(path: &Path, suffix: &str) -> PathBuf {
         file_name.push_str(ext);
     }
     path.with_file_name(file_name)
+}
+
+fn burnpack_parts_manifest_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model.bpk");
+    path.with_file_name(format!("{file_name}.parts.json"))
 }

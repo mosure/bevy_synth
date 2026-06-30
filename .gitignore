@@ -1,5 +1,7 @@
 __pycache__/
 
+.env
+Burn.toml
 debug/
 target/
 vendor/
@@ -10,8 +12,15 @@ out/
 **/*.rs.bk
 *.pdb
 tmp/
+docs/reports/
 
 *.py
+!crates/burn_locate_anything/python/
+!crates/burn_locate_anything/python/locate_anything_reference.py
+!crates/burn_segmentation/python/
+!crates/burn_segmentation/python/sam2_export_components.py
+!crates/burn_segmentation/python/sam2_python_bench.py
+!crates/burn_segmentation/python/sam2_reference.py
 
 *.ply
 *.obj
@@ -26,9 +35,24 @@ tmp/
 .tmp/
 *.patch
 
-scripts/
+scripts/*
+!scripts/bundle_web_assets.ps1
+!scripts/check_trellis_strict_benchmark_invariants.py
+!scripts/guard_canonical_runtime.sh
+!scripts/trellis2_blender_render_compare.py
+!scripts/trellis2_render_psnr.py
+!scripts/trellis2_python_reference.py
+!scripts/trellis2_perf_matrix.sh
+!scripts/triposplat_bootstrap.sh
+!scripts/triposplat_compare_splat.py
+!scripts/triposplat_compare_stage_tensors.py
+!scripts/triposplat_gsplat_render.py
+!scripts/triposplat_reference.py
+!scripts/triposplat_torch_flow_bench.py
+!scripts/triposplat_wgpu_reference_parity.sh
 src/dino/
 screenshots/
+test-results/
 headless_output/
 www/assets/
 
@@ -54,6 +78,8 @@ assets/images/
 *.engine
 *.gguf
 *.ggml
+!crates/burn_triposplat/src/torch_sobol_seed123_dim3_8192_f32le.bin
+!crates/burn_triposplat/src/torch_latent_position_seed123_8192x1024_f32le.bin
 output/
 sandbox/
 .burn_synth_cache/

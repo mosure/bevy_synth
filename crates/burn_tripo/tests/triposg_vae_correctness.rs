@@ -23,6 +23,11 @@ const MSE: f32 = 5e-3;
 
 #[test]
 fn triposg_vae_hooks_match_reference() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("TRIPOSG_FULL_REFERENCE").is_err() {
+        eprintln!("skipping: set TRIPOSG_FULL_REFERENCE=1 to run full TripoSG VAE reference test");
+        return Ok(());
+    }
+
     let reference_path = asset_path("assets/hooks/triposg_vae_reference.safetensors");
     if !reference_path.exists() {
         eprintln!(

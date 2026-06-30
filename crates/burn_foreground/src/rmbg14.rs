@@ -65,7 +65,7 @@ impl<B: Backend> RebnConv<B> {
         let conv = Conv2dConfig::new([in_ch, out_ch], [3, 3])
             .with_stride([stride, stride])
             .with_dilation([dirate, dirate])
-            .with_padding(PaddingConfig2d::Explicit(dirate, dirate))
+            .with_padding(PaddingConfig2d::Explicit(dirate, dirate, dirate, dirate))
             .init(device);
         let bn = nn::BatchNormConfig::new(out_ch).init(device);
         let relu = nn::Relu::new();
@@ -379,7 +379,7 @@ impl<B: Backend> BriaRmbg<B> {
     pub fn new(device: &B::Device, config: RmbgConfig) -> Self {
         let conv_in = Conv2dConfig::new([config.in_ch, 64], [3, 3])
             .with_stride([2, 2])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         let stage1 = Rsu7::new(device, 64, 32, 64);
@@ -396,22 +396,22 @@ impl<B: Backend> BriaRmbg<B> {
         let stage1d = Rsu7::new(device, 128, 16, 64);
 
         let side1 = Conv2dConfig::new([64, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side2 = Conv2dConfig::new([64, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side3 = Conv2dConfig::new([128, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side4 = Conv2dConfig::new([256, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side5 = Conv2dConfig::new([512, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let side6 = Conv2dConfig::new([512, config.out_ch], [3, 3])
-            .with_padding(PaddingConfig2d::Explicit(1, 1))
+            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         Self {
@@ -531,6 +531,7 @@ fn upsample_like<B: Backend>(src: Tensor<B, 4>, target: &Tensor<B, 4>) -> Tensor
     }
     let options = InterpolateOptions {
         mode: InterpolateMode::Bilinear,
+        align_corners: true,
     };
     interpolate(src, [height, width], options)
 }
@@ -595,7 +596,7 @@ fn max_pool2d_ceil<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
         x = x.pad((0, pad_w, 0, pad_h), f32::NEG_INFINITY);
     }
 
-    max_pool2d(x, [kernel, kernel], [stride, stride], [0, 0], [1, 1])
+    max_pool2d(x, [kernel, kernel], [stride, stride], [0, 0], [1, 1], false)
 }
 
 #[cfg(feature = "import")]
@@ -605,6 +606,8 @@ pub mod import {
     use burn::module::{Module, ModuleMapper, Param};
     use burn::prelude::*;
     use burn::tensor::Bytes;
+    use burn::tensor::DType;
+    use burn::tensor::Element;
     use burn::tensor::FloatDType;
     use burn_store::{
         BurnpackStore, KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
@@ -621,8 +624,24 @@ pub mod import {
         config: &RmbgConfig,
     ) -> Result<BriaRmbg<B>, Box<dyn std::error::Error>> {
         let weights_path = weights_path.as_ref();
-        let burnpack_candidates = candidate_burnpack_paths(weights_path);
-        if let Some(model) = load_model_from_burnpack_parts(
+        let burnpack_candidates = candidate_burnpack_paths::<B>(device, weights_path);
+        let target_dtype = backend_float_dtype::<B>();
+        let mut burnpack_errors = Vec::new();
+
+        for burnpack_path in burnpack_candidates
+            .iter()
+            .filter(|candidate| candidate.exists())
+        {
+            let mut model = BriaRmbg::new(device, config.clone());
+            let mut store =
+                BurnpackStore::from_file(burnpack_path).validate(should_validate_burnpack());
+            match model.load_from(&mut store) {
+                Ok(_) => return Ok(cast_module_float_dtype(model, target_dtype)),
+                Err(err) => burnpack_errors.push(format!("{}: {err}", burnpack_path.display())),
+            }
+        }
+
+        match load_model_from_burnpack_parts(
             &burnpack_candidates,
             "RMBG",
             should_validate_burnpack(),
@@ -631,32 +650,32 @@ pub mod import {
                 apply_rmbg_burnpack_part_bytes(model, part_bytes)
                     .map_err(|err| format!("failed to apply RMBG burnpack part bytes: {err}"))
             },
-        )? {
-            return Ok(model);
+        ) {
+            Ok(Some(model)) => return Ok(cast_module_float_dtype(model, target_dtype)),
+            Ok(None) => {}
+            Err(err) => burnpack_errors.push(err.to_string()),
         }
-        let burnpack_path = burnpack_candidates
-            .iter()
-            .find(|candidate| candidate.exists())
-            .cloned();
-        let Some(burnpack_path) = burnpack_path else {
-            let checked = burnpack_candidates
-                .iter()
-                .map(|candidate| candidate.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "Burnpack weights missing. Checked: {checked}. Run `foreground_import` to generate .bpk files."
-            )
-            .into());
-        };
 
-        let mut model = BriaRmbg::new(device, config.clone());
-        let mut store =
-            BurnpackStore::from_file(&burnpack_path).validate(should_validate_burnpack());
-        model
-            .load_from(&mut store)
-            .map_err(|err| format!("failed to load RMBG burnpack: {err}"))?;
-        Ok(model)
+        match load_rmbg_from_safetensors::<B>(device, weights_path, config) {
+            Ok(model) => Ok(cast_module_float_dtype(model, target_dtype)),
+            Err(err) => {
+                let checked = burnpack_candidates
+                    .iter()
+                    .map(|candidate| candidate.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let burnpack_context = if burnpack_errors.is_empty() {
+                    "none".to_string()
+                } else {
+                    burnpack_errors.join(" | ")
+                };
+                Err(format!(
+                    "failed to load RMBG from burnpack candidates [{checked}] and safetensors '{}': {err}; burnpack_errors={burnpack_context}",
+                    weights_path.display()
+                )
+                .into())
+            }
+        }
     }
 
     pub fn load_rmbg_from_burnpack_bytes<B: Backend>(
@@ -670,7 +689,7 @@ pub mod import {
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG burnpack bytes: {err}"))?;
-        Ok(model)
+        Ok(cast_module_float_dtype(model, backend_float_dtype::<B>()))
     }
 
     pub fn apply_rmbg_burnpack_part_bytes<B: Backend>(
@@ -697,7 +716,7 @@ pub mod import {
         model
             .load_from(&mut store)
             .map_err(|err| format!("failed to load RMBG burnpack file: {err}"))?;
-        Ok(model)
+        Ok(cast_module_float_dtype(model, backend_float_dtype::<B>()))
     }
 
     pub fn load_rmbg_config_from_json_bytes(
@@ -759,24 +778,40 @@ pub mod import {
         ]
     }
 
-    fn candidate_burnpack_paths(path: &Path) -> Vec<PathBuf> {
+    fn candidate_burnpack_paths<B: Backend>(device: &B::Device, path: &Path) -> Vec<PathBuf> {
         let default = burnpack_path(path, false);
         let f16 = burnpack_path(path, true);
         if f16 == default {
-            vec![default]
-        } else if prefer_f16_burnpack() {
+            return vec![default];
+        }
+        let supports_f16 = B::supports_dtype(device, DType::F16);
+        if prefer_f16_burnpack::<B>() && supports_f16 {
             vec![f16, default]
-        } else {
+        } else if supports_f16 {
             vec![default, f16]
+        } else {
+            // Do not try *_f16 burnpacks on non-f16 backend element types: this
+            // causes dtype mismatches (or unsupported dtype panics on NdArray).
+            vec![default]
         }
     }
 
-    fn prefer_f16_burnpack() -> bool {
-        true
+    fn prefer_f16_burnpack<B: Backend>() -> bool {
+        std::mem::size_of::<B::FloatElem>() == 2
+    }
+
+    fn backend_float_dtype<B: Backend>() -> FloatDType {
+        match <B::FloatElem as Element>::dtype() {
+            DType::F16 => FloatDType::F16,
+            DType::BF16 => FloatDType::BF16,
+            DType::F32 => FloatDType::F32,
+            DType::F64 => FloatDType::F64,
+            _ => FloatDType::F32,
+        }
     }
 
     fn should_validate_burnpack() -> bool {
-        cfg!(all(not(target_arch = "wasm32"), debug_assertions))
+        true
     }
 
     fn burnpack_path(path: &Path, use_f16: bool) -> PathBuf {

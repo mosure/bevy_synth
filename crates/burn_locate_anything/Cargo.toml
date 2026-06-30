@@ -1,0 +1,70 @@
+[package]
+name = "burn_locate_anything"
+version = "0.1.2"
+edition = "2024"
+
+description = "Burn runtime scaffolding for NVIDIA LocateAnything visual grounding"
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+exclude = ["python/**"]
+
+[features]
+default = []
+import = ["dep:clap", "dep:burn_synth_import"]
+backend_ndarray = ["dep:burn", "burn/ndarray"]
+backend_wgpu = ["dep:burn", "dep:burn-wgpu"]
+backend_cuda = ["dep:burn", "dep:burn-cuda"]
+
+[dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["std"], optional = true }
+burn_synth_import = { version = "0.1.0", path = "../burn_synth_import", optional = true }
+ciborium = "0.2"
+clap = { version = "4.5", features = ["derive"], optional = true }
+half = "2.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+memmap2 = "0.9"
+safetensors = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.ureq]
+version = "2.12"
+default-features = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
+version = "=0.21.0"
+optional = true
+default-features = false
+features = ["autotune", "fusion", "std", "vulkan"]
+
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
+version = "=0.21.0"
+optional = true
+default-features = false
+features = ["autotune", "fusion", "std", "metal"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
+version = "=0.21.0"
+optional = true
+default-features = false
+features = ["autotune", "fusion", "std", "webgpu"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cuda]
+version = "=0.21.0"
+optional = true
+default-features = false
+features = ["std"]
+
+[[bin]]
+name = "locate_anything_import"
+path = "src/bin/locate_anything_import.rs"
+required-features = ["import"]

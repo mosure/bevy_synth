@@ -1,5 +1,5 @@
 use burn::prelude::*;
-use burn::tensor::TensorData;
+use burn::tensor::{IndexingUpdateOp, TensorData};
 
 use crate::model::triposg::vae::TripoSGVae;
 use crate::pipeline::mesh::DenseGrid;
@@ -453,6 +453,7 @@ async fn tensor_to_vec_f32_async_wasm<B: Backend, const D: usize>(
     tensor
         .into_data_async()
         .await
+        .map_err(|err| format!("failed to materialize tensor data: {err:?}"))?
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|err| format!("failed to read tensor data: {err:?}"))
@@ -469,6 +470,7 @@ async fn build_flash_refinement_coords_from_mask_async_wasm<B: Backend>(
     let curr_mask_values = curr_mask
         .into_data_async()
         .await
+        .map_err(|err| format!("failed to materialize refinement mask: {err:?}"))?
         .convert::<bool>()
         .to_vec::<bool>()
         .map_err(|err| format!("failed to read refinement mask: {err:?}"))?;
@@ -647,7 +649,7 @@ fn flash_refinement_next_index_mask_from_doubled_indices<B: Backend>(
 ) -> Tensor<B, 3, Bool> {
     let ones = Tensor::<B, 1>::ones([doubled_indices.shape().dims::<1>()[0]], device);
     let mut next_index = Tensor::<B, 1>::zeros([next_total], device);
-    next_index = next_index.scatter(0, doubled_indices, ones);
+    next_index = next_index.scatter(0, doubled_indices, ones, IndexingUpdateOp::Add);
     next_index
         .reshape([next_size as i32, next_size as i32, next_size as i32])
         .greater_elem(0.0)
@@ -1077,7 +1079,7 @@ fn decode_flash_points_gpu<B: Backend>(
         }
         // Burn scatter uses sum reduction. Flash indices are unique per decode pass.
         // For padded fp16 wasm chunks we append one extra index and zero out its delta.
-        out = out.scatter(0, indices_chunk, delta);
+        out = out.scatter(0, indices_chunk, delta, IndexingUpdateOp::Add);
         start = end;
     }
 
@@ -1918,7 +1920,7 @@ mod tests {
     #[test]
     fn zero_padded_flash_delta_tail_masks_only_padding() {
         type B = NdArray<f32>;
-        let device = <B as Backend>::Device::default();
+        let device = <B as burn::tensor::backend::BackendTypes>::Device::default();
         let delta = Tensor::<B, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device);
         let masked = zero_padded_flash_delta_tail(delta, 3);
         let values = masked
