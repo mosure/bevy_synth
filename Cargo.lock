@@ -3026,7 +3026,6 @@ dependencies = [
  "burn_synth_scene",
  "clap",
  "cubecl",
- "gltf",
  "image",
  "meshopt",
  "serde",
@@ -3039,6 +3038,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "criterion",
+ "gltf",
  "image",
  "serde",
  "serde_json",
@@ -3049,6 +3049,8 @@ name = "burn_synth_scene"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
+ "burn_segmentation",
+ "burn_synth_render",
  "clap",
  "image",
  "reqwest",

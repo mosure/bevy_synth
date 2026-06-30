@@ -20,6 +20,60 @@ pub enum SceneScalePolicy {
     FreeAnisotropic,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneRotationFitMode {
+    Off,
+    DepthMaskRansac,
+    GptRefine,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneObjectPoseRefinementMode {
+    Off,
+    Geometry,
+    GatedGpt,
+    AlwaysGpt,
+}
+
+impl SceneObjectPoseRefinementMode {
+    pub fn geometry_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn gpt_allowed(self) -> bool {
+        matches!(self, Self::GatedGpt | Self::AlwaysGpt)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SceneObjectPoseRefinementSet {
+    Tables,
+    LargeSeating,
+    TablesAndLargeSeating,
+    AllFurniture,
+}
+
+impl SceneObjectPoseRefinementSet {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tables => "tables",
+            Self::LargeSeating => "large-seating",
+            Self::TablesAndLargeSeating => "tables-and-large-seating",
+            Self::AllFurniture => "all-furniture",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScenePoseFitMode {
+    ProjectedAabb,
+    RenderedSilhouette,
+}
+
 impl SceneScalePolicy {
     pub fn max_xz_anisotropy(self) -> Option<f32> {
         match self {

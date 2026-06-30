@@ -176,6 +176,11 @@ struct EditorCamera;
 #[derive(Component)]
 pub(crate) struct SceneRenderCamera;
 
+#[derive(Component, Clone, Copy, Debug)]
+struct SceneRenderCameraTarget {
+    focus: Vec3,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScreenshotCameraTarget {
@@ -1590,6 +1595,9 @@ fn initialize_interactive_scene(
         GaussianCamera::default(),
         Transform::from_translation(Vec3::new(0.0, 1.5, 0.0))
             .looking_at(Vec3::new(0.0, 1.5, -1.0), Vec3::Y),
+        SceneRenderCameraTarget {
+            focus: Vec3::new(0.0, 1.5, -1.0),
+        },
         RenderLayers::layer(0).with(12),
         SceneRenderCamera,
         Name::new("scene_render_camera"),
@@ -2429,6 +2437,48 @@ fn camera_state_from_components(
         || !radius.is_finite()
         || radius <= 0.0
     {
+        return None;
+    }
+
+    Some(CachedCameraState {
+        translation: translation.to_array(),
+        rotation: rotation.to_array(),
+        focus: focus.to_array(),
+        yaw,
+        pitch,
+        radius,
+        vertical_fov_degrees: projection.and_then(|projection| match projection {
+            Projection::Perspective(perspective) => Some(perspective.fov.to_degrees()),
+            _ => None,
+        }),
+    })
+}
+
+fn camera_state_from_scene_components(
+    transform: &Transform,
+    target: &SceneRenderCameraTarget,
+    projection: Option<&Projection>,
+) -> Option<CachedCameraState> {
+    let translation = transform.translation;
+    let rotation = if transform.rotation.length_squared() > 0.0 {
+        transform.rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let focus = target.focus;
+    let delta = translation - focus;
+    let radius = delta.length();
+    if !translation.is_finite()
+        || !rotation.is_finite()
+        || !focus.is_finite()
+        || !radius.is_finite()
+        || radius <= 0.0
+    {
+        return None;
+    }
+    let yaw = delta.x.atan2(delta.z);
+    let pitch = (delta.y / radius).clamp(-1.0, 1.0).asin();
+    if !yaw.is_finite() || !pitch.is_finite() {
         return None;
     }
 
@@ -3619,7 +3669,24 @@ fn poll_mcp_scene_control(
         >,
         Query<(&CachedMeshInstance, &Transform)>,
         Query<(&Camera, &GlobalTransform), With<MainCamera>>,
-        Query<(&mut Transform, &mut Projection), (With<SceneRenderCamera>, Without<MainCamera>)>,
+        Query<
+            (
+                &mut Transform,
+                &mut Projection,
+                &mut SceneRenderCameraTarget,
+            ),
+            (With<SceneRenderCamera>, Without<MainCamera>),
+        >,
+        Query<
+            (
+                &Camera,
+                &GlobalTransform,
+                &Transform,
+                &Projection,
+                &SceneRenderCameraTarget,
+            ),
+            (With<SceneRenderCamera>, Without<MainCamera>),
+        >,
     )>,
     mut world_cache: ResMut<WorldCachePersistence>,
 ) {
@@ -4006,8 +4073,11 @@ fn poll_mcp_scene_control(
                 };
 
                 let mut applied = false;
-                if let Ok((mut transform, mut projection)) = query_set.p3().single_mut() {
+                if let Ok((mut transform, mut projection, mut scene_target)) =
+                    query_set.p3().single_mut()
+                {
                     *transform = target_transform;
+                    scene_target.focus = target_focus;
                     apply_mcp_camera_projection(target_vertical_fov, projection.as_mut());
                     applied = true;
                 } else if let Ok((mut transform, mut orbit, mut projection)) =
@@ -4166,6 +4236,15 @@ fn poll_mcp_scene_control(
 
     if let Some(status_path) = control.status_path.as_deref() {
         let camera_state = {
+            let scene_camera = query_set.p4();
+            scene_camera
+                .single()
+                .ok()
+                .and_then(|(_, _, transform, projection, scene_target)| {
+                    camera_state_from_scene_components(transform, scene_target, Some(projection))
+                })
+        }
+        .or_else(|| {
             let main_camera = query_set.p0();
             main_camera
                 .single()
@@ -4173,7 +4252,7 @@ fn poll_mcp_scene_control(
                 .and_then(|(transform, orbit, projection)| {
                     camera_state_from_components(transform, orbit, Some(projection))
                 })
-        };
+        });
         let (mut world_items, mut world_item_aabbs) = {
             let cached_query = query_set.p1();
             if cleared_scene {
@@ -4191,14 +4270,28 @@ fn poll_mcp_scene_control(
         world_items.extend(predicted_world_items);
         world_item_aabbs.extend(predicted_world_aabbs);
         let projected_items = {
+            let scene_camera = query_set.p4();
+            scene_camera
+                .single()
+                .ok()
+                .map(|(camera, camera_transform, _, _, _)| {
+                    collect_projected_world_items(
+                        &cache.cache,
+                        &world_items,
+                        &world_item_aabbs,
+                        Some((camera, camera_transform)),
+                    )
+                })
+        }
+        .unwrap_or_else(|| {
             let camera_query = query_set.p2();
             collect_projected_world_items(
                 &cache.cache,
                 &world_items,
                 &world_item_aabbs,
-                &camera_query,
+                camera_query.single().ok(),
             )
-        };
+        });
         let status = McpSceneStatus {
             session_id,
             last_sequence: sequence,
@@ -6057,14 +6150,13 @@ fn collect_projected_world_items(
     cache: &MeshCache,
     world_items: &[CachedWorldItem],
     explicit_local_aabbs: &HashMap<String, CachedAssetAabb>,
-    camera_query: &Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    camera: Option<(&Camera, &GlobalTransform)>,
 ) -> Vec<McpProjectedWorldItem> {
     let metadata_by_key = cache
         .asset_entries()
         .iter()
         .map(|entry| (entry.cache_key.as_str(), entry))
         .collect::<HashMap<_, _>>();
-    let camera = camera_query.single().ok();
     world_items
         .iter()
         .map(|item| {

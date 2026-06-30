@@ -60,10 +60,10 @@ pub(super) struct VisibleSurfacePoseCandidate {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_visible_surface_pose_candidates(
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     baseline: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
-    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
+    fit_object: &crate::ProjectionFitObjectReport,
+    projection_camera: Option<&crate::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -285,11 +285,11 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
 #[allow(clippy::too_many_arguments)]
 fn push_visible_surface_pose_candidate(
     candidates: &mut Vec<VisibleSurfacePoseCandidate>,
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     baseline: &GroundedScenePlacement,
     placement: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
-    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
+    fit_object: &crate::ProjectionFitObjectReport,
+    projection_camera: Option<&crate::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -322,10 +322,10 @@ fn push_visible_surface_pose_candidate(
 
 #[allow(clippy::too_many_arguments)]
 fn visible_surface_pose_candidate(
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     placement: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
-    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
+    fit_object: &crate::ProjectionFitObjectReport,
+    projection_camera: Option<&crate::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -1034,11 +1034,8 @@ pub(super) fn rotation_fit_asset_path(
         })
 }
 
-pub(super) fn load_rotation_fit_mesh(path: &Path) -> Result<CachedSynthMesh, String> {
-    let bytes =
-        fs::read(path).map_err(|err| format!("failed to read GLB {}: {err}", path.display()))?;
-    bevy_synth_runtime::io::mesh_from_glb_bytes(&bytes)
-        .map_err(|err| format!("failed to parse GLB {}: {err}", path.display()))
+pub(super) fn load_rotation_fit_mesh(path: &Path) -> Result<RenderMesh, String> {
+    burn_synth_render::mesh::load_glb_mesh(path)
 }
 
 pub(super) fn placement_with_yaw(
@@ -1051,7 +1048,7 @@ pub(super) fn placement_with_yaw(
 }
 
 pub(super) fn projection_fit_object_matches_placement(
-    object: &burn_synth_scene::ProjectionFitObjectReport,
+    object: &crate::ProjectionFitObjectReport,
     placement: &GroundedScenePlacement,
 ) -> bool {
     object.object_id == placement.object_id
@@ -1093,9 +1090,9 @@ pub(super) fn rotation_fit_object_dir_name(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_rotation_fit_candidates(
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     placement: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    fit_object: &crate::ProjectionFitObjectReport,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -1162,9 +1159,9 @@ pub(super) fn evaluate_rotation_fit_candidates(
 
 #[allow(clippy::too_many_arguments)]
 fn evaluate_rotation_fit_candidate(
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     placement: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    fit_object: &crate::ProjectionFitObjectReport,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,

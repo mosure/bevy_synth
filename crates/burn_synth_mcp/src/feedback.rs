@@ -418,6 +418,7 @@ pub(crate) fn scene_feedback_metrics(
             contact_error,
             score,
             passed,
+            projection_relaxed,
             bbox_overscan,
             max_bbox_overscan,
         ) = if let Some(observed_bbox) = observed_bbox {
@@ -489,11 +490,26 @@ pub(crate) fn scene_feedback_metrics(
             let overscan_passed = bbox_overscan <= max_bbox_overscan;
             let overscan_score =
                 (1.0 - bbox_overscan / (max_bbox_overscan * 1.75).max(1.0e-5)).clamp(0.0, 1.0);
-            let score = score * (0.65 + 0.35 * overscan_score);
-            let passed = center_error <= center_limit
+            let mut score = score * (0.65 + 0.35 * overscan_score);
+            let mut passed = center_error <= center_limit
                 && contact_error <= thresholds.max_contact_error
                 && area_log2_error <= area_limit
                 && overscan_passed;
+            let projection_relaxed = !passed
+                && feedback_large_edge_cropped_furniture_can_soft_pass(
+                    placement,
+                    uses_center_anchor,
+                    center_error,
+                    contact_error,
+                    area_log2_error,
+                    bbox_overscan,
+                    max_bbox_overscan,
+                    thresholds,
+                );
+            passed |= projection_relaxed;
+            if projection_relaxed {
+                score = score.max(thresholds.min_overall_score);
+            }
             (
                 center_error,
                 area_log2_error,
@@ -501,11 +517,12 @@ pub(crate) fn scene_feedback_metrics(
                 contact_error,
                 score,
                 passed,
+                projection_relaxed,
                 bbox_overscan,
                 max_bbox_overscan,
             )
         } else {
-            (1.0, 8.0, 8.0, 1.0, 0.0, false, 1.0, 0.0)
+            (1.0, 8.0, 8.0, 1.0, 0.0, false, false, 1.0, 0.0)
         };
         if passed {
             passed_count += 1;
@@ -663,6 +680,7 @@ pub(crate) fn scene_feedback_metrics(
             "max_bbox_overscan": max_bbox_overscan,
             "score": score,
             "passed": passed,
+            "projection_relaxed": projection_relaxed,
             "translation_delta": translation_delta,
             "grounding_basis": grounding_basis,
             "center_residual_applied": center_residual_applied,
@@ -888,6 +906,33 @@ pub(crate) fn feedback_bbox_overscan(bbox: [f32; 4]) -> f32 {
     .fold(0.0f32, f32::max)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn feedback_large_edge_cropped_furniture_can_soft_pass(
+    placement: &GroundedScenePlacement,
+    uses_center_anchor: bool,
+    center_error: f32,
+    contact_error: f32,
+    area_log2_error: f32,
+    bbox_overscan: f32,
+    max_bbox_overscan: f32,
+    thresholds: SceneFeedbackThresholds,
+) -> bool {
+    if !uses_center_anchor || !feedback_source_bbox_edge_cropped(placement) {
+        return false;
+    }
+    let descriptor = format!("{} {}", placement.object_id, placement.label).to_ascii_lowercase();
+    let is_large_seating = descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+        || descriptor.contains("banquette");
+    is_large_seating
+        && bbox_overscan <= max_bbox_overscan
+        && center_error <= thresholds.max_center_error * 1.25
+        && contact_error <= thresholds.max_contact_error * 1.25
+        && area_log2_error <= thresholds.max_area_log2_error.max(0.35)
+}
+
 pub(crate) fn feedback_max_bbox_overscan(placement: &GroundedScenePlacement) -> f32 {
     let descriptor = format!("{} {}", placement.object_id, placement.label).to_ascii_lowercase();
     if !feedback_source_bbox_edge_cropped(placement) {
@@ -937,6 +982,9 @@ pub(crate) fn feedback_layout_deltas_with_policy(
     let mut camera_ray_contact_sum = 0.0f64;
     let mut camera_ray_contact_count = 0usize;
     for object in &objects {
+        if feedback_lock_failed_large_edge_crop_delta(object) {
+            continue;
+        }
         if object
             .get("grounding_basis")
             .and_then(Value::as_str)
@@ -1006,6 +1054,7 @@ pub(crate) fn feedback_layout_deltas_with_policy(
     let mut object_deltas = objects
         .iter()
         .map(|object| {
+            let projection_delta_locked = feedback_lock_failed_large_edge_crop_delta(object);
             let group_key = feedback_scale_group_key(object);
             let grouped_scale = group_key
                 .as_ref()
@@ -1020,40 +1069,64 @@ pub(crate) fn feedback_layout_deltas_with_policy(
             let object_scale =
                 feedback_scale_multiplier_for_policy(object, object_scale, scale_policy);
             let axis_scale = feedback_axis_scale_multiplier(object, scale_policy);
+            let translation_delta = object
+                .get("translation_delta")
+                .and_then(json_array3)
+                .unwrap_or([0.0, 0.0, 0.0]);
+            let ground_anchor_point = (!projection_delta_locked)
+                .then(|| {
+                    object
+                        .get("target_ground_point")
+                        .and_then(json_array3)
+                        .or_else(|| object.get("ground_anchor_point").and_then(json_array3))
+                })
+                .flatten();
+            let ground_anchor_max_drift_m = (!projection_delta_locked)
+                .then(|| {
+                    object
+                        .get("ground_anchor_max_drift_m")
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .map(|value| value as f32)
+                })
+                .flatten();
             FeedbackDeltaDraft {
                 index: object.get("index").cloned().unwrap_or(Value::Null),
-                translation_delta: object
-                    .get("translation_delta")
-                    .and_then(json_array3)
-                    .unwrap_or([0.0, 0.0, 0.0]),
+                translation_delta: if projection_delta_locked {
+                    [0.0, 0.0, 0.0]
+                } else {
+                    translation_delta
+                },
                 scale_multiplier: if axis_scale.is_some() {
+                    1.0
+                } else if projection_delta_locked {
                     1.0
                 } else {
                     grouped_scale.unwrap_or(object_scale)
                 },
-                scale_multiplier_xyz: axis_scale,
+                scale_multiplier_xyz: (!projection_delta_locked).then_some(axis_scale).flatten(),
                 scale_group_key: group_key,
-                scale_source: if grouped_scale.is_some() {
+                scale_source: if projection_delta_locked {
+                    "locked_failed_large_edge_crop"
+                } else if grouped_scale.is_some() {
                     "repeated_instance_group"
                 } else if axis_scale.is_some() {
                     "axis_projection"
                 } else {
                     "object_projection"
                 },
-                yaw_delta_degrees: object
-                    .get("yaw_delta_degrees")
-                    .cloned()
-                    .unwrap_or(json!(0.0)),
+                yaw_delta_degrees: if projection_delta_locked {
+                    json!(0.0)
+                } else {
+                    object
+                        .get("yaw_delta_degrees")
+                        .cloned()
+                        .unwrap_or(json!(0.0))
+                },
                 max_yaw_delta_degrees: feedback_yaw_delta_limit_for_object(object),
-                ground_anchor_point: object
-                    .get("target_ground_point")
-                    .and_then(json_array3)
-                    .or_else(|| object.get("ground_anchor_point").and_then(json_array3)),
-                ground_anchor_max_drift_m: object
-                    .get("ground_anchor_max_drift_m")
-                    .and_then(Value::as_f64)
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                    .map(|value| value as f32),
+                ground_anchor_point,
+                ground_anchor_max_drift_m,
+                projection_delta_locked,
             }
         })
         .collect::<Vec<_>>();
@@ -1068,6 +1141,7 @@ pub(crate) fn feedback_layout_deltas_with_policy(
                 "scale_multiplier_xyz": delta.scale_multiplier_xyz,
                 "scale_group_key": delta.scale_group_key,
                 "scale_source": delta.scale_source,
+                "projection_delta_locked": delta.projection_delta_locked,
                 "yaw_delta_degrees": delta.yaw_delta_degrees,
                 "max_yaw_delta_degrees": delta.max_yaw_delta_degrees,
                 "ground_anchor_point": delta.ground_anchor_point,
@@ -1092,6 +1166,7 @@ pub(crate) struct FeedbackDeltaDraft {
     pub(crate) max_yaw_delta_degrees: f64,
     pub(crate) ground_anchor_point: Option<[f32; 3]>,
     pub(crate) ground_anchor_max_drift_m: Option<f32>,
+    pub(crate) projection_delta_locked: bool,
 }
 
 fn feedback_yaw_delta_limit_for_object(object: &Value) -> f64 {
@@ -1295,20 +1370,32 @@ pub(crate) fn feedback_project_delta_collisions(
                     {
                         let [left_delta, right_delta] =
                             seating_pair_separation_delta(left, right, signed_clearance_m);
-                        let left_changed = apply_projected_delta(
-                            deltas,
-                            &mut footprints,
-                            left.index,
-                            left_delta,
-                            1.25,
-                        );
-                        let right_changed = apply_projected_delta(
-                            deltas,
-                            &mut footprints,
-                            right.index,
-                            right_delta,
-                            1.25,
-                        );
+                        let left_locked = deltas
+                            .get(left.index)
+                            .is_some_and(|delta| delta.projection_delta_locked);
+                        let right_locked = deltas
+                            .get(right.index)
+                            .is_some_and(|delta| delta.projection_delta_locked);
+                        let left_changed = if left_locked {
+                            false
+                        } else {
+                            let delta = if right_locked {
+                                scale_xz_delta(left_delta, 2.0)
+                            } else {
+                                left_delta
+                            };
+                            apply_projected_delta(deltas, &mut footprints, left.index, delta, 1.25)
+                        };
+                        let right_changed = if right_locked {
+                            false
+                        } else {
+                            let delta = if left_locked {
+                                scale_xz_delta(right_delta, 2.0)
+                            } else {
+                                right_delta
+                            };
+                            apply_projected_delta(deltas, &mut footprints, right.index, delta, 1.25)
+                        };
                         changed |= left_changed || right_changed;
                     }
                     _ => {}
@@ -1507,6 +1594,40 @@ pub(crate) fn feedback_json_object_is_large_edge_cropped_furniture(object: &Valu
         || descriptor.contains("banquette")
 }
 
+pub(crate) fn feedback_lock_failed_large_edge_crop_delta(object: &Value) -> bool {
+    if !feedback_json_object_is_large_edge_cropped_furniture(object) {
+        return false;
+    }
+    if !object
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let area_error = object
+        .get("area_log2_error")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let center_error = object
+        .get("center_error")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let bbox_overscan = object
+        .get("bbox_overscan")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let max_bbox_overscan = object
+        .get("max_bbox_overscan")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0);
+    area_error > 1.10 || center_error > 0.12 || bbox_overscan > max_bbox_overscan.max(0.02)
+}
+
 pub(crate) fn feedback_json_object_is_open_sectional_seating(object: &Value) -> bool {
     let descriptor = format!(
         "{} {}",
@@ -1647,6 +1768,10 @@ pub(crate) fn apply_object_delta_to_command(
     delta: &Value,
     scale_policy: SceneScalePolicy,
 ) -> Result<(), String> {
+    let projection_delta_locked = delta
+        .get("projection_delta_locked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut translation = command
         .get("translation")
         .and_then(json_array3)
@@ -1658,15 +1783,17 @@ pub(crate) fn apply_object_delta_to_command(
     translation[0] += translation_delta[0];
     translation[1] += translation_delta[1];
     translation[2] += translation_delta[2];
-    if let (Some(anchor), Some(max_drift_m)) = (
-        delta.get("ground_anchor_point").and_then(json_array3),
-        delta
-            .get("ground_anchor_max_drift_m")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .map(|value| value as f32),
-    ) {
-        clamp_translation_to_ground_anchor(&mut translation, anchor, max_drift_m);
+    if !projection_delta_locked {
+        if let (Some(anchor), Some(max_drift_m)) = (
+            delta.get("ground_anchor_point").and_then(json_array3),
+            delta
+                .get("ground_anchor_max_drift_m")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value as f32),
+        ) {
+            clamp_translation_to_ground_anchor(&mut translation, anchor, max_drift_m);
+        }
     }
     command["translation"] = json!(translation);
 
@@ -2352,10 +2479,22 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         .filter(|value| value.is_finite())
         .unwrap_or(0.0)
         / object_count;
-    let projection_bonus = metrics
+    let projection_passed = metrics
         .get("projection_passed")
         .and_then(Value::as_bool)
-        .map(|passed| if passed { 1.00 } else { 0.0 })
+        .unwrap_or(false);
+    let projection_bonus = if projection_passed { 1.00 } else { 0.0 };
+    let projection_failure_penalty = if projection_passed {
+        0.0
+    } else {
+        let missed_fraction = (1.0 - object_pass_fraction).clamp(0.0, 1.0);
+        2.50 + missed_fraction * 3.00
+    };
+    let zero_projection_penalty = metrics
+        .get("object_pass_count")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|count| if count <= 0.0 { 2.0 } else { 0.0 })
         .unwrap_or(0.0);
     let rotation_bonus = metrics
         .get("rotation_passed")
@@ -2402,6 +2541,8 @@ pub(crate) fn feedback_selection_score(metrics: &Value) -> f64 {
         + rotation_bonus
         - hard_failures * 3.0
         - max_overlap * 1.5
+        - projection_failure_penalty
+        - zero_projection_penalty
         - scale_hard_failures * 3.0
         - scale_max_relative_delta * 2.0
         + rubric_adjustment
@@ -4089,6 +4230,10 @@ pub(crate) fn cross3(lhs: [f32; 3], rhs: [f32; 3]) -> [f32; 3] {
 
 pub(crate) fn add3(lhs: [f32; 3], rhs: [f32; 3]) -> [f32; 3] {
     [lhs[0] + rhs[0], lhs[1] + rhs[1], lhs[2] + rhs[2]]
+}
+
+pub(crate) fn scale_xz_delta(delta: [f32; 3], scalar: f32) -> [f32; 3] {
+    [delta[0] * scalar, delta[1], delta[2] * scalar]
 }
 
 pub(crate) fn sub3(lhs: [f32; 3], rhs: [f32; 3]) -> [f32; 3] {

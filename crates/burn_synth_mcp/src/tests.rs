@@ -2983,6 +2983,44 @@ fn feedback_deltas_clamp_spawn_translation_to_ground_anchor() {
 }
 
 #[test]
+fn feedback_deltas_ignore_anchor_for_locked_projection_delta() {
+    let commands = vec![json!({
+        "type": "spawn_cached",
+        "cache_key": "tan_open_sectional_sofa_asset",
+        "translation": [-0.2179, 0.4059, -0.3961],
+        "scale": [3.138, 3.138, 3.138],
+        "rotation": [0.0, 0.0, 0.0, 1.0]
+    })];
+    let deltas = json!({
+        "objects": [{
+            "index": 0,
+            "translation_delta": [0.0, 0.0, 0.0],
+            "scale_multiplier": 1.0,
+            "yaw_delta_degrees": 0.0,
+            "ground_anchor_point": [0.52577114, 0.0, 0.13589025],
+            "ground_anchor_max_drift_m": 0.56,
+            "projection_delta_locked": true
+        }]
+    });
+
+    let adjusted = apply_feedback_deltas_to_commands_with_policy(
+        &commands,
+        &deltas,
+        SceneScalePolicy::FreeAnisotropic,
+    )
+    .unwrap();
+
+    let translation = json_array3(&adjusted[0]["translation"]).unwrap();
+    assert!((translation[0] + 0.2179).abs() <= 1.0e-5);
+    assert!((translation[1] - 0.4059).abs() <= 1.0e-5);
+    assert!((translation[2] + 0.3961).abs() <= 1.0e-5);
+    let scale = json_array3(&adjusted[0]["scale"]).unwrap();
+    assert!((scale[0] - 3.138).abs() <= 1.0e-5);
+    assert!((scale[1] - 3.138).abs() <= 1.0e-5);
+    assert!((scale[2] - 3.138).abs() <= 1.0e-5);
+}
+
+#[test]
 fn feedback_layout_deltas_prefer_target_ground_point_as_anchor() {
     let metrics = json!({
         "objects": [{
@@ -3020,6 +3058,7 @@ fn projected_collision_correction_clears_anchor_clamp() {
         max_yaw_delta_degrees: 30.0,
         ground_anchor_point: Some([0.0, 0.0, 0.0]),
         ground_anchor_max_drift_m: Some(0.25),
+        projection_delta_locked: false,
     }];
     let mut footprints = vec![Some(FeedbackFootprint {
         index: 0,
@@ -3042,6 +3081,77 @@ fn projected_collision_correction_clears_anchor_clamp() {
 
     assert_eq!(deltas[0].ground_anchor_point, None);
     assert_eq!(deltas[0].ground_anchor_max_drift_m, None);
+}
+
+#[test]
+fn projected_collision_correction_respects_locked_large_edge_crop() {
+    let objects = vec![
+        json!({
+            "object_id": "tan_open_sectional_sofa",
+            "label": "tan open crescent sectional sofa",
+            "source_edge_cropped": true,
+            "passed": false,
+            "physical_kind": "seating",
+            "world_footprint": {
+                "min_x": -1.0,
+                "min_z": -1.0,
+                "max_x": 1.0,
+                "max_z": 1.0
+            }
+        }),
+        json!({
+            "object_id": "chair",
+            "label": "chair",
+            "physical_kind": "seating",
+            "expected_bbox": [0.1, 0.1, 0.2, 0.3],
+            "world_footprint": {
+                "min_x": 0.4,
+                "min_z": -0.2,
+                "max_x": 1.2,
+                "max_z": 0.6
+            }
+        }),
+    ];
+    let mut deltas = vec![
+        FeedbackDeltaDraft {
+            index: json!(0),
+            translation_delta: [0.0, 0.0, 0.0],
+            scale_multiplier: 1.0,
+            scale_multiplier_xyz: None,
+            scale_group_key: None,
+            scale_source: "locked_failed_large_edge_crop",
+            yaw_delta_degrees: json!(0.0),
+            max_yaw_delta_degrees: 30.0,
+            ground_anchor_point: None,
+            ground_anchor_max_drift_m: None,
+            projection_delta_locked: true,
+        },
+        FeedbackDeltaDraft {
+            index: json!(1),
+            translation_delta: [0.0, 0.0, 0.0],
+            scale_multiplier: 1.0,
+            scale_multiplier_xyz: None,
+            scale_group_key: None,
+            scale_source: "object_projection",
+            yaw_delta_degrees: json!(0.0),
+            max_yaw_delta_degrees: 30.0,
+            ground_anchor_point: None,
+            ground_anchor_max_drift_m: None,
+            projection_delta_locked: false,
+        },
+    ];
+
+    feedback_project_delta_collisions(
+        &objects,
+        &mut deltas,
+        FeedbackThresholdProfile::Standard.thresholds(),
+    );
+
+    assert_eq!(deltas[0].translation_delta, [0.0, 0.0, 0.0]);
+    assert!(
+        deltas[1].translation_delta[0].abs() + deltas[1].translation_delta[2].abs() > 0.01,
+        "unlocked chair should absorb seating collision correction"
+    );
 }
 
 #[test]
@@ -3657,6 +3767,39 @@ fn feedback_selection_score_prefers_projection_over_rotation_only_candidate() {
     });
 
     assert!(feedback_selection_score(&projection_fixed) > feedback_selection_score(&rotation_only));
+}
+
+#[test]
+fn feedback_selection_score_rejects_zero_projection_pass_candidate() {
+    let no_overlap_but_unprojected = json!({
+        "score": 0.60,
+        "object_count": 5,
+        "object_pass_count": 0,
+        "rotation_pass_count": 5,
+        "projection_passed": false,
+        "rotation_passed": true,
+        "physical_layout": {
+            "hard_failure_count": 0,
+            "max_overlap_fraction_smaller": 0.0
+        }
+    });
+    let lower_score_with_some_projection = json!({
+        "score": 0.35,
+        "object_count": 5,
+        "object_pass_count": 2,
+        "rotation_pass_count": 3,
+        "projection_passed": false,
+        "rotation_passed": false,
+        "physical_layout": {
+            "hard_failure_count": 0,
+            "max_overlap_fraction_smaller": 0.0
+        }
+    });
+
+    assert!(
+        feedback_selection_score(&lower_score_with_some_projection)
+            > feedback_selection_score(&no_overlap_but_unprojected)
+    );
 }
 
 #[test]
@@ -4354,6 +4497,60 @@ fn feedback_metrics_reject_bad_edge_cropped_sofa_projection() {
 }
 
 #[test]
+fn feedback_metrics_soft_pass_near_aligned_large_edge_cropped_sofa() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "/tmp/curry.png".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let layout = GroundedSceneLayout {
+        bsn: String::new(),
+        placements: vec![test_feedback_placement(
+            "tan_open_crescent_sectional_sofa",
+            "tan open crescent sectional sofa",
+            [0.0, 0.0, 0.0],
+            [0.13232613, 0.12424664, 0.86923677, 1.0],
+        )],
+        camera: SceneCamera {
+            translation: [0.0, 2.0, -3.0],
+            focus: [0.0, 0.7, 0.0],
+            yaw: Some(180.0),
+            pitch: Some(25.0),
+            radius: Some(4.0),
+            vertical_fov_degrees: Some(70.0),
+        },
+        rug_center: [0.0, 0.0, 0.0],
+        rug_scale: [1.0, 1.0, 1.0],
+        projection_fit: None,
+    };
+    let status = json!({
+        "projected_items": [{
+            "cache_key": "tan_open_crescent_sectional_sofa_asset",
+            "screen_bbox": [-0.3401628, 0.13999727, 0.81468737, 0.886991],
+            "screen_contact": [0.38983032, 0.47265795],
+            "projected_corners": 8,
+            "total_corners": 8
+        }]
+    });
+
+    let metrics = scene_feedback_metrics(
+        &manifest,
+        &layout,
+        &status,
+        Path::new("/tmp/near-curry-sofa.png"),
+        FeedbackThresholdProfile::Standard.thresholds(),
+        FeedbackThresholdProfile::Standard,
+    )
+    .unwrap();
+
+    assert_eq!(metrics["object_pass_count"], json!(1));
+    assert_eq!(metrics["projection_passed"], json!(true));
+    assert_eq!(metrics["objects"][0]["passed"], json!(true));
+    assert_eq!(metrics["objects"][0]["projection_relaxed"], json!(true));
+    assert_eq!(metrics["objects"][0]["source_edge_cropped"], json!(true));
+}
+
+#[test]
 fn feedback_metrics_use_visible_bbox_for_frame_clipped_seating() {
     let manifest = SceneObjectManifest {
         source_scene_path: "/tmp/source.png".to_string(),
@@ -4735,7 +4932,7 @@ fn feedback_deltas_do_not_axis_scale_edge_cropped_tables() {
 }
 
 #[test]
-fn feedback_deltas_apply_full_bounded_scale_for_large_edge_cropped_sofa() {
+fn feedback_deltas_freeze_failed_large_edge_cropped_sofa() {
     let metrics = json!({
         "score": 0.70,
         "thresholds": {
@@ -4761,6 +4958,7 @@ fn feedback_deltas_apply_full_bounded_scale_for_large_edge_cropped_sofa() {
             "contact_error": 0.0047,
             "center_error": 0.267,
             "area_log2_error": 1.69,
+            "passed": false,
             "translation_delta": [0.0, 0.0, 0.16],
             "scale_multiplier": 1.071,
             "yaw_delta_degrees": 0.0,
@@ -4779,11 +4977,76 @@ fn feedback_deltas_apply_full_bounded_scale_for_large_edge_cropped_sofa() {
     });
 
     let deltas = feedback_layout_deltas(&metrics);
-    assert!(deltas["objects"][0]["scale_multiplier"].as_f64().unwrap() > 1.06);
+    assert_eq!(deltas["objects"][0]["scale_multiplier"], json!(1.0));
+    assert_eq!(
+        deltas["objects"][0]["translation_delta"],
+        json!([0.0, 0.0, 0.0])
+    );
     assert_eq!(
         deltas["objects"][0]["scale_source"],
-        json!("object_projection")
+        json!("locked_failed_large_edge_crop")
     );
+    assert_eq!(deltas["objects"][0]["projection_delta_locked"], json!(true));
+    assert!(deltas["objects"][0]["ground_anchor_point"].is_null());
+    assert!(deltas["objects"][0]["ground_anchor_max_drift_m"].is_null());
+}
+
+#[test]
+fn feedback_deltas_freeze_high_area_edge_cropped_sofa_even_when_passed() {
+    let metrics = json!({
+        "score": 0.70,
+        "thresholds": {
+            "max_center_error": 0.08,
+            "max_contact_error": 0.08,
+            "max_area_log2_error": 0.65,
+            "min_overall_score": 0.55,
+            "max_seating_table_overlap_fraction": 0.38,
+            "max_seating_table_penetration_m": 0.18,
+            "max_seating_seating_overlap_fraction": 0.42,
+            "max_seating_seating_penetration_m": 0.12
+        },
+        "objects": [{
+            "index": 0,
+            "object_id": "tan_open_sectional_sofa",
+            "label": "tan open crescent sectional sofa",
+            "cache_key": "tan_open_sectional_sofa_asset",
+            "expected_bbox": [0.13, 0.12, 0.871, 1.0],
+            "observed_bbox": [0.18, 0.64, 0.78, 1.0],
+            "source_edge_cropped": true,
+            "visible_bbox_scoring": true,
+            "grounding_basis": "camera-ray-ground-plane",
+            "contact_error": 0.038,
+            "center_error": 0.039,
+            "area_log2_error": 1.75,
+            "bbox_overscan": 0.0,
+            "max_bbox_overscan": 0.38,
+            "passed": true,
+            "translation_delta": [0.8, 0.0, 0.9],
+            "scale_multiplier": 1.22,
+            "yaw_delta_degrees": 0.0,
+            "physical_kind": "seating",
+            "physical_failures": [],
+            "world_footprint": {
+                "min_x": -1.0,
+                "min_z": -0.5,
+                "max_x": 1.0,
+                "max_z": 0.5
+            }
+        }],
+        "physical_layout": {
+            "pairs": []
+        }
+    });
+
+    let deltas = feedback_layout_deltas(&metrics);
+    assert_eq!(deltas["objects"][0]["scale_multiplier"], json!(1.0));
+    assert_eq!(
+        deltas["objects"][0]["translation_delta"],
+        json!([0.0, 0.0, 0.0])
+    );
+    assert_eq!(deltas["objects"][0]["projection_delta_locked"], json!(true));
+    assert!(deltas["objects"][0]["ground_anchor_point"].is_null());
+    assert!(deltas["objects"][0]["ground_anchor_max_drift_m"].is_null());
 }
 
 #[test]

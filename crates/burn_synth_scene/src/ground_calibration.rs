@@ -182,7 +182,10 @@ pub fn apply_ground_calibration_response(
     SceneGroundingEvidence,
     SceneGroundCalibrationReport,
 )> {
-    let camera_height_m = finite_range(response.camera_height_m, 1.1, 3.8, "camera_height_m")?;
+    let requested_camera_height_m =
+        finite_range(response.camera_height_m, 1.1, 3.8, "camera_height_m")?;
+    let camera_height_m =
+        bounded_ground_calibration_camera_height(requested_camera_height_m, evidence.floor);
     let vertical_fov_degrees = finite_range(
         response.vertical_fov_degrees,
         35.0,
@@ -197,6 +200,9 @@ pub fn apply_ground_calibration_response(
         calibration.vertical_fov_degrees = calibration
             .vertical_fov_degrees
             .or(Some(vertical_fov_degrees));
+        calibration.camera_yaw_degrees = None;
+        calibration.camera_pitch_degrees = None;
+        calibration.camera_radius_m = None;
         next_manifest.scene_calibration = Some(calibration);
     } else {
         next_manifest.scene_calibration = Some(SceneCalibration {
@@ -272,4 +278,23 @@ fn finite_range(value: f32, min: f32, max: f32, name: &str) -> SceneResult<f32> 
         )));
     }
     Ok(value.clamp(min, max))
+}
+
+fn bounded_ground_calibration_camera_height(
+    requested_camera_height_m: f32,
+    previous_floor: EstimatedFloorPlane,
+) -> f32 {
+    let prior_height_m = -previous_floor.distance_m;
+    if !prior_height_m.is_finite() || !(0.8..=4.5).contains(&prior_height_m) {
+        return requested_camera_height_m;
+    }
+
+    let confidence = previous_floor.confidence.unwrap_or(0.0);
+    let residual_m = previous_floor.residual_m.unwrap_or(f32::INFINITY);
+    if confidence >= 0.75 && residual_m <= 0.12 {
+        return prior_height_m;
+    }
+
+    let max_delta_m = (prior_height_m * 0.12).clamp(0.15, 0.35);
+    requested_camera_height_m.clamp(prior_height_m - max_delta_m, prior_height_m + max_delta_m)
 }

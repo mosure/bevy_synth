@@ -499,16 +499,35 @@ fn source_camera_height_from_floor(floor: &EstimatedFloorPlane) -> Option<f32> {
 fn source_camera_from_grounding_geometry(
     geometry: &GroundingGeometry,
     floor_y: f32,
+    metric_frame: Option<MetricSceneFrame>,
 ) -> Option<SceneCamera> {
     let origin = geometry.source_origin_xz?;
     let camera_height = geometry.source_camera_height_m?;
     let y = floor_y + camera_height;
     let translation = [-origin[0], y, origin[1]];
+    let pitch_degrees = metric_frame
+        .and_then(|frame| frame.camera_pitch_degrees)
+        .map(f32::abs)
+        .filter(|value| value.is_finite() && *value > 1.0)
+        .unwrap_or(35.0)
+        .clamp(5.0, 80.0);
+    let yaw_degrees = metric_frame
+        .and_then(|frame| frame.camera_yaw_degrees)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let horizontal =
+        (camera_height / pitch_degrees.to_radians().tan().max(1.0e-4)).clamp(0.25, 12.0);
+    let yaw = yaw_degrees.to_radians();
+    let focus = [
+        translation[0] - yaw.sin() * horizontal,
+        floor_y,
+        translation[2] - yaw.cos() * horizontal,
+    ];
     Some(SceneCamera {
         translation,
-        focus: [translation[0], y, translation[2] - 1.0],
-        yaw: None,
-        pitch: None,
+        focus,
+        yaw: metric_frame.and_then(|frame| frame.camera_yaw_degrees),
+        pitch: Some(pitch_degrees),
         radius: None,
         vertical_fov_degrees: geometry.source_vertical_fov_degrees,
     })
@@ -886,7 +905,9 @@ fn grounded_scene_layout_internal(
     normalize_repeated_asset_scales(&mut placements, config.floor_y);
 
     let camera = grounding_geometry
-        .and_then(|(geometry, _)| source_camera_from_grounding_geometry(geometry, config.floor_y))
+        .and_then(|(geometry, _)| {
+            source_camera_from_grounding_geometry(geometry, config.floor_y, metric_frame)
+        })
         .unwrap_or_else(|| grounded_camera_from_placements(&placements, config, metric_frame));
     let projection_fit = grounding_geometry.and_then(|(_, evidence)| {
         fit_grounded_scene_projection(&mut placements, &camera, evidence, config.floor_y)

@@ -9,10 +9,10 @@ use burn_synth_render::{
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dense_soft_surface_refine_pose(
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     placement: &GroundedScenePlacement,
     baseline: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+    fit_object: &crate::ProjectionFitObjectReport,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     target: &RotationFitTarget,
@@ -155,7 +155,7 @@ pub(super) struct DenseSoftSurfaceTransformContext {
 impl DenseSoftSurfaceTransformContext {
     pub(super) fn from_placement(
         placement: &GroundedScenePlacement,
-        fit_object: &burn_synth_scene::ProjectionFitObjectReport,
+        fit_object: &crate::ProjectionFitObjectReport,
         evidence: &SceneGroundingEvidence,
     ) -> Option<Self> {
         let origin_xz = fit_object.source_camera_origin_xz?;
@@ -205,25 +205,19 @@ impl DenseSoftSurfaceTransformContext {
     }
 }
 
-pub(super) fn dense_soft_surface_points(
-    mesh: &CachedSynthMesh,
-    max_points: usize,
-) -> Vec<[f32; 3]> {
+pub(super) fn dense_soft_surface_points(mesh: &RenderMesh, max_points: usize) -> Vec<[f32; 3]> {
     let mut points = Vec::new();
-    for vertex in &mesh.mesh.vertices {
+    for vertex in &mesh.vertices {
         points.push([vertex[0], -vertex[1], -vertex[2]]);
     }
-    for face in &mesh.mesh.faces {
+    for face in &mesh.faces {
         let indices = [face[0] as usize, face[1] as usize, face[2] as usize];
-        if indices
-            .iter()
-            .any(|index| *index >= mesh.mesh.vertices.len())
-        {
+        if indices.iter().any(|index| *index >= mesh.vertices.len()) {
             continue;
         }
-        let a = mesh.mesh.vertices[indices[0]];
-        let b = mesh.mesh.vertices[indices[1]];
-        let c = mesh.mesh.vertices[indices[2]];
+        let a = mesh.vertices[indices[0]];
+        let b = mesh.vertices[indices[1]];
+        let c = mesh.vertices[indices[2]];
         let centroid = [
             (a[0] + b[0] + c[0]) / 3.0,
             (a[1] + b[1] + c[1]) / 3.0,

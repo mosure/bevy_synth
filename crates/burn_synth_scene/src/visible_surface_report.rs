@@ -1,6 +1,15 @@
-use crate::prelude::*;
+use std::path::{Path, PathBuf};
 
-pub(crate) fn write_visible_surface_fit_artifacts(
+use burn_synth_render::mesh::load_glb_mesh;
+use serde_json::{Value, json};
+
+use crate::pose_fit_prelude::normalized_bbox_iou;
+use crate::{
+    GroundedScenePlacement, ObjectGroundingEvidence, SceneAssetBinding, SceneGroundingEvidence,
+    write_json_file,
+};
+
+pub fn write_visible_surface_fit_artifacts(
     output_dir: &Path,
     response: &Value,
     projection_fit: &Value,
@@ -257,11 +266,8 @@ fn project_glb_mesh_visible_surface(
     evidence: &SceneGroundingEvidence,
     intrinsics: VisibleSourceIntrinsics,
 ) -> Result<MeshSurfaceProjection, String> {
-    let bytes = fs::read(path)
-        .map_err(|err| format!("failed to read GLB mesh {}: {err}", path.display()))?;
-    let mesh = bevy_synth_runtime::io::mesh_from_glb_bytes(&bytes)
-        .map_err(|err| format!("failed to parse GLB mesh {}: {err}", path.display()))?;
-    if mesh.mesh.vertices.is_empty() {
+    let mesh = load_glb_mesh(path)?;
+    if mesh.vertices.is_empty() {
         return Err("GLB mesh has no vertices".to_string());
     }
     let origin = fit_object
@@ -286,19 +292,16 @@ fn project_glb_mesh_visible_surface(
     let mut projected = Vec::new();
     let mut depths = Vec::new();
     let mut front_facing_face_count = 0usize;
-    for face in &mesh.mesh.faces {
+    for face in &mesh.faces {
         let indices = [face[0] as usize, face[1] as usize, face[2] as usize];
-        if indices
-            .iter()
-            .any(|index| *index >= mesh.mesh.vertices.len())
-        {
+        if indices.iter().any(|index| *index >= mesh.vertices.len()) {
             continue;
         }
         let mut camera_points = [[0.0; 3]; 3];
         let mut projected_points = [[0.0; 2]; 3];
         let mut valid = true;
         for (slot, index) in indices.iter().copied().enumerate() {
-            let world = transform_report_local_point(placement, mesh.mesh.vertices[index]);
+            let world = transform_report_local_point(placement, mesh.vertices[index]);
             let Some(camera_point) =
                 report_source_camera_point(world, origin, anchor, ground_anchor_basis, evidence)
             else {
@@ -340,7 +343,7 @@ fn project_glb_mesh_visible_surface(
         backface_culling_fallback = true;
         projected.clear();
         depths.clear();
-        for vertex in &mesh.mesh.vertices {
+        for vertex in &mesh.vertices {
             let world = transform_report_local_point(placement, *vertex);
             let Some(camera_point) =
                 report_source_camera_point(world, origin, anchor, ground_anchor_basis, evidence)
@@ -365,8 +368,8 @@ fn project_glb_mesh_visible_surface(
     Ok(MeshSurfaceProjection {
         bbox,
         median_depth_m,
-        vertex_count: mesh.mesh.vertices.len(),
-        face_count: mesh.mesh.faces.len(),
+        vertex_count: mesh.vertices.len(),
+        face_count: mesh.faces.len(),
         front_facing_face_count,
         backface_culling_fallback,
         projection_kind: if backface_culling_fallback {
@@ -388,7 +391,7 @@ fn fit_object_matches_placement(object: &Value, placement: &GroundedScenePlaceme
 fn best_grounding_object_for_placement<'a>(
     placement: &GroundedScenePlacement,
     evidence: &'a SceneGroundingEvidence,
-) -> Option<&'a burn_synth_scene::ObjectGroundingEvidence> {
+) -> Option<&'a ObjectGroundingEvidence> {
     evidence
         .objects
         .iter()
@@ -529,6 +532,19 @@ fn json_array3(value: &Value) -> Option<[f32; 3]> {
         values[0].as_f64()? as f32,
         values[1].as_f64()? as f32,
         values[2].as_f64()? as f32,
+    ])
+}
+
+fn json_array4(value: &Value) -> Option<[f32; 4]> {
+    let values = value.as_array()?;
+    if values.len() != 4 {
+        return None;
+    }
+    Some([
+        values[0].as_f64()? as f32,
+        values[1].as_f64()? as f32,
+        values[2].as_f64()? as f32,
+        values[3].as_f64()? as f32,
     ])
 }
 

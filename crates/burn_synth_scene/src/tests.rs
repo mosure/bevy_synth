@@ -1083,13 +1083,15 @@ fn depth_grounding_preserves_source_camera_frame_with_yaw_hint() {
         layout.camera
     );
     assert_eq!(layout.camera.translation, [-2.0, 1.5, 5.0]);
-    assert_eq!(layout.camera.focus, [-2.0, 1.5, 4.0]);
-    assert_eq!(layout.camera.yaw, None);
-    assert_eq!(layout.camera.pitch, None);
+    assert!((layout.camera.focus[0] + 2.0).abs() < 1.0e-4);
+    assert!((layout.camera.focus[1] - 0.0).abs() < 1.0e-4);
+    assert!((layout.camera.focus[2] - 6.5).abs() < 1.0e-4);
+    assert_eq!(layout.camera.yaw, Some(180.0));
+    assert_eq!(layout.camera.pitch, Some(45.0));
     assert_eq!(layout.camera.radius, None);
     assert!(layout.bsn.contains("vertical_fov 60"));
-    assert!(!layout.bsn.contains(" yaw "));
-    assert!(!layout.bsn.contains(" pitch "));
+    assert!(layout.bsn.contains(" yaw 180"));
+    assert!(layout.bsn.contains(" pitch 45"));
     assert!(!layout.bsn.contains(" radius "));
 }
 
@@ -3143,7 +3145,15 @@ fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
         vertical_fov_degrees: 62.0,
         floor_confidence: 0.88,
         floor_residual_m: 0.05,
-        scene_calibration: None,
+        scene_calibration: Some(SceneCalibration {
+            table_center: Some([0.1, -0.2]),
+            table_axis_degrees: Some(12.0),
+            table_size_m: Some([2.4, 0.9]),
+            camera_yaw_degrees: Some(180.0),
+            camera_pitch_degrees: Some(39.0),
+            camera_radius_m: Some(4.5),
+            vertical_fov_degrees: None,
+        }),
         rationale: "wide room camera".to_string(),
     };
 
@@ -3155,6 +3165,16 @@ fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
     assert_eq!(evidence.floor.normal, [0.0, 1.0, 0.0]);
     assert_eq!(evidence.floor.confidence, Some(0.88));
     assert_eq!(evidence.camera.vertical_fov_degrees, Some(62.0));
+    let calibration = manifest
+        .scene_calibration
+        .expect("ground calibration should preserve non-camera hints");
+    assert_eq!(calibration.table_center, Some([0.1, -0.2]));
+    assert_eq!(calibration.table_axis_degrees, Some(12.0));
+    assert_eq!(calibration.table_size_m, Some([2.4, 0.9]));
+    assert_eq!(calibration.vertical_fov_degrees, Some(62.0));
+    assert_eq!(calibration.camera_yaw_degrees, None);
+    assert_eq!(calibration.camera_pitch_degrees, None);
+    assert_eq!(calibration.camera_radius_m, None);
     assert!(
         evidence
             .camera
@@ -3175,6 +3195,73 @@ fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
         Some(62.0)
     );
     assert_eq!(report.applied_floor.distance_m, evidence.floor.distance_m);
+}
+
+#[test]
+fn gpt_ground_calibration_preserves_high_confidence_depth_floor_height() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "scene.jpg".to_string(),
+        scene_calibration: None,
+        objects: Vec::new(),
+    };
+    let evidence = SceneGroundingEvidence {
+        source_image_path: "scene.jpg".to_string(),
+        depth: Some(DepthEvidenceRef {
+            provider: "depth-pro".to_string(),
+            model: Some("depth-pro".to_string()),
+            precision: Some("f16".to_string()),
+            artifact_path: None,
+            focal_length_px: None,
+            vertical_fov_degrees: None,
+            image_size: Some([3839, 2157]),
+            depth_map_size: Some([3839, 2157]),
+            floor_sample_count: Some(674),
+        }),
+        segmentation: None,
+        detections: Vec::new(),
+        camera: EstimatedCamera {
+            image_size: Some([3839, 2157]),
+            ..EstimatedCamera::default()
+        },
+        floor: EstimatedFloorPlane {
+            normal: [-0.0089, 0.7792, 0.6267],
+            distance_m: -1.6620882,
+            residual_m: Some(0.013),
+            confidence: Some(0.904),
+        },
+        objects: Vec::new(),
+    };
+    let response = SceneGroundCalibrationResponse {
+        camera_height_m: 2.55,
+        vertical_fov_degrees: 62.0,
+        floor_confidence: 0.82,
+        floor_residual_m: 0.08,
+        scene_calibration: Some(SceneCalibration {
+            table_center: Some([0.39, 0.49]),
+            table_axis_degrees: Some(-12.0),
+            table_size_m: Some([1.15, 0.65]),
+            camera_yaw_degrees: None,
+            camera_pitch_degrees: Some(55.0),
+            camera_radius_m: None,
+            vertical_fov_degrees: Some(62.0),
+        }),
+        rationale: "overestimated elevated camera".to_string(),
+    };
+
+    let (manifest, evidence, report) =
+        apply_ground_calibration_response(&manifest, &evidence, &response)
+            .expect("apply ground calibration");
+
+    assert!((evidence.floor.distance_m + 1.6620882).abs() < 1.0e-5);
+    assert_eq!(evidence.floor.normal, [0.0, 1.0, 0.0]);
+    assert_eq!(report.response.camera_height_m, 2.55);
+    assert_eq!(report.applied_floor.distance_m, evidence.floor.distance_m);
+    let calibration = manifest
+        .scene_calibration
+        .expect("non-camera hints should be retained");
+    assert_eq!(calibration.table_center, Some([0.39, 0.49]));
+    assert_eq!(calibration.table_axis_degrees, Some(-12.0));
+    assert_eq!(calibration.camera_pitch_degrees, None);
 }
 
 #[test]

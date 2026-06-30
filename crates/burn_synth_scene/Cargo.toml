@@ -14,6 +14,8 @@ readme = "README.md"
 
 [dependencies]
 base64 = "0.22"
+burn_segmentation = { version = "0.1.0", path = "../burn_segmentation" }
+burn_synth_render = { version = "0.1.0", path = "../burn_synth_render" }
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }

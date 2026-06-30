@@ -2,14 +2,18 @@ mod bsn;
 mod canonical_pose;
 mod chair_types;
 mod cli;
+mod depth_sidecar;
 mod error;
 mod ground_calibration;
 mod layout;
 mod object_images;
 mod openai;
 mod pipeline;
+mod pose_fit;
+mod pose_fit_prelude;
 mod projection_fit;
 mod types;
+mod visible_surface_report;
 
 pub use bsn::{
     crop_scene_object, load_scene_asset_bindings, object_manifest_schema, parse_scene_bsn,
@@ -51,11 +55,17 @@ pub use pipeline::{
     SceneRotationSelectionResponse, object_image_candidate_rejections,
     select_object_image_candidates, select_object_image_candidates_with_exclusions,
 };
+pub use pose_fit::{
+    SceneObjectPoseRefinementConfig, ScenePoseFitObjectFilter, SceneRotationFitConfig,
+    SceneRotationFitOutcome, SceneVisibleSurfacePoseFitConfig, apply_scene_object_pose_refinement,
+    apply_scene_rotation_fit, apply_scene_visible_surface_pose_fit,
+};
 pub use projection_fit::{
     ProjectionFitCameraReport, ProjectionFitCandidateReport, ProjectionFitObjectReport,
     ProjectionFitReport, ProjectionFitVisibleSurfaceReport,
 };
 pub use types::*;
+pub use visible_surface_report::write_visible_surface_fit_artifacts;
 
 #[cfg(test)]
 mod tests;

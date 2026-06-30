@@ -10,7 +10,10 @@ use burn_synth_grounding::{
     SegmentationPrecision, SegmentationQuantization,
 };
 use burn_synth_scene::SceneQualityProfile;
-pub use burn_synth_scene::SceneScalePolicy;
+pub use burn_synth_scene::{
+    SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet, ScenePoseFitMode,
+    SceneRotationFitMode, SceneScalePolicy,
+};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -119,53 +122,6 @@ pub enum FeedbackRotationSelector {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SceneRotationFitMode {
-    Off,
-    DepthMaskRansac,
-    GptRefine,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SceneObjectPoseRefinementMode {
-    Off,
-    Geometry,
-    GatedGpt,
-    AlwaysGpt,
-}
-
-impl SceneObjectPoseRefinementMode {
-    pub(crate) fn geometry_enabled(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-
-    pub(crate) fn gpt_allowed(self) -> bool {
-        matches!(self, Self::GatedGpt | Self::AlwaysGpt)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SceneObjectPoseRefinementSet {
-    Tables,
-    LargeSeating,
-    TablesAndLargeSeating,
-    AllFurniture,
-}
-
-impl SceneObjectPoseRefinementSet {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Tables => "tables",
-            Self::LargeSeating => "large-seating",
-            Self::TablesAndLargeSeating => "tables-and-large-seating",
-            Self::AllFurniture => "all-furniture",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum FeedbackRubricScorer {
     Off,
     Openai,
@@ -238,13 +194,6 @@ pub enum AssetOutputFormat {
 pub enum SceneCompositionMode {
     Heuristic,
     CvGrounded,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ScenePoseFitMode {
-    ProjectedAabb,
-    RenderedSilhouette,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]

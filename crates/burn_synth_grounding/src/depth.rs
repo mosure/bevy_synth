@@ -271,10 +271,16 @@ pub fn annotate_grounding_evidence_with_depth_map(
     depth_map: &SceneDepthMapEvidence,
     provenance_label: &str,
 ) -> SceneDepthAnnotationSummary {
-    let floor_exclusions = floor_sample_exclusion_bboxes(evidence);
+    let floor_exclusions = FloorSampleExclusions::from_evidence(evidence);
     let floor_report =
-        estimate_scene_floor_plane_report_with_exclusions(depth_map, &floor_exclusions)
-            .or_else(|| estimate_scene_floor_plane_report_with_exclusions(depth_map, &[]));
+        estimate_scene_floor_plane_report_with_exclusions(depth_map, &floor_exclusions).or_else(
+            || {
+                estimate_scene_floor_plane_report_with_exclusions(
+                    depth_map,
+                    &FloorSampleExclusions::default(),
+                )
+            },
+        );
     let floor_residual_m = floor_report
         .as_ref()
         .and_then(|report| report.floor.residual_m);
@@ -520,7 +526,8 @@ pub(crate) fn estimate_scene_floor_plane_with_exclusions(
     depth_map: &SceneDepthMapEvidence,
     exclusion_bboxes: &[[f32; 4]],
 ) -> Option<(EstimatedFloorPlane, usize)> {
-    estimate_scene_floor_plane_report_with_exclusions(depth_map, exclusion_bboxes)
+    let exclusions = FloorSampleExclusions::from_bboxes(exclusion_bboxes);
+    estimate_scene_floor_plane_report_with_exclusions(depth_map, &exclusions)
         .map(|report| (report.floor, report.inlier_count))
 }
 
@@ -540,6 +547,93 @@ struct FloorPlaneFitReport {
     method: &'static str,
 }
 
+#[derive(Clone, Debug, Default)]
+struct FloorSampleExclusions {
+    bboxes: Vec<[f32; 4]>,
+    masks: Vec<FloorSampleMaskExclusion>,
+}
+
+#[derive(Clone, Debug)]
+struct FloorSampleMaskExclusion {
+    width: u32,
+    height: u32,
+    bbox: [f32; 4],
+    data: Vec<u8>,
+}
+
+impl FloorSampleExclusions {
+    fn from_bboxes(bboxes: &[[f32; 4]]) -> Self {
+        Self {
+            bboxes: bboxes.to_vec(),
+            masks: Vec::new(),
+        }
+    }
+
+    fn from_evidence(evidence: &SceneGroundingEvidence) -> Self {
+        let mut out = Self::default();
+        let mut mask_bboxes = Vec::new();
+        let mut masked_detection_bboxes = Vec::new();
+        for object in &evidence.objects {
+            let Some(mask) = object.mask.as_ref() else {
+                if let Some(detection) = object.detection.as_ref() {
+                    push_unique_bbox(&mut out.bboxes, detection.bbox);
+                }
+                continue;
+            };
+            if let Some(detection) = object.detection.as_ref() {
+                masked_detection_bboxes.push(detection.bbox);
+            }
+            if !mask.mask_rle.is_empty()
+                && let Ok(binary) =
+                    BinaryMask::decode_rle(mask.image_size[0], mask.image_size[1], &mask.mask_rle)
+            {
+                mask_bboxes.push(mask.bbox);
+                out.masks.push(FloorSampleMaskExclusion {
+                    width: binary.width(),
+                    height: binary.height(),
+                    bbox: mask.bbox,
+                    data: binary.data().to_vec(),
+                });
+            } else {
+                push_unique_bbox(&mut out.bboxes, mask.bbox);
+            }
+        }
+        for detection in &evidence.detections {
+            if masked_detection_bboxes
+                .iter()
+                .any(|bbox| normalized_bbox_iou(*bbox, detection.bbox) >= 0.92)
+                || mask_bboxes
+                    .iter()
+                    .any(|bbox| normalized_bbox_iou(*bbox, detection.bbox) >= 0.45)
+            {
+                continue;
+            }
+            push_unique_bbox(&mut out.bboxes, detection.bbox);
+        }
+        out
+    }
+
+    fn excludes(&self, pixel: [f32; 2]) -> bool {
+        self.masks
+            .iter()
+            .any(|mask| floor_sample_mask_excluded(pixel, mask))
+            || floor_sample_bbox_excluded(pixel, &self.bboxes)
+    }
+}
+
+fn push_unique_bbox(bboxes: &mut Vec<[f32; 4]>, bbox: [f32; 4]) {
+    if !bbox.iter().all(|value| value.is_finite()) {
+        return;
+    }
+    if bboxes
+        .iter()
+        .any(|existing| normalized_bbox_iou(*existing, bbox) >= 0.92)
+    {
+        return;
+    }
+    bboxes.push(bbox);
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CandidatePlane {
     normal: [f32; 3],
@@ -548,15 +642,15 @@ struct CandidatePlane {
 
 fn estimate_scene_floor_plane_report_with_exclusions(
     depth_map: &SceneDepthMapEvidence,
-    exclusion_bboxes: &[[f32; 4]],
+    exclusions: &FloorSampleExclusions,
 ) -> Option<FloorPlaneFitReport> {
-    let samples = collect_floor_depth_samples(depth_map, exclusion_bboxes);
+    let samples = collect_floor_depth_samples(depth_map, exclusions);
     fit_floor_plane_from_samples(&samples)
 }
 
 fn collect_floor_depth_samples(
     depth_map: &SceneDepthMapEvidence,
-    exclusion_bboxes: &[[f32; 4]],
+    exclusions: &FloorSampleExclusions,
 ) -> Vec<FloorDepthSample> {
     let mut points = Vec::new();
     let step_x = (depth_map.width / 64).max(1);
@@ -568,7 +662,7 @@ fn collect_floor_depth_samples(
                 x as f32 / depth_map.width.saturating_sub(1).max(1) as f32,
                 y as f32 / depth_map.height.saturating_sub(1).max(1) as f32,
             ];
-            if floor_sample_excluded(normalized, exclusion_bboxes) {
+            if exclusions.excludes(normalized) {
                 continue;
             }
             let index = y as usize * depth_map.width as usize + x as usize;
@@ -843,6 +937,7 @@ fn floor_sample_depth_is_locally_smooth(
     (center_depth - median).abs() <= threshold
 }
 
+#[cfg(test)]
 pub(crate) fn floor_sample_exclusion_bboxes(evidence: &SceneGroundingEvidence) -> Vec<[f32; 4]> {
     let mut bboxes = evidence
         .detections
@@ -864,7 +959,7 @@ pub(crate) fn floor_sample_exclusion_bboxes(evidence: &SceneGroundingEvidence) -
     bboxes
 }
 
-fn floor_sample_excluded(pixel: [f32; 2], exclusion_bboxes: &[[f32; 4]]) -> bool {
+fn floor_sample_bbox_excluded(pixel: [f32; 2], exclusion_bboxes: &[[f32; 4]]) -> bool {
     const MARGIN: f32 = 0.04;
     exclusion_bboxes.iter().any(|bbox| {
         let x0 = bbox[0].min(bbox[2]).clamp(0.0, 1.0);
@@ -876,6 +971,50 @@ fn floor_sample_excluded(pixel: [f32; 2], exclusion_bboxes: &[[f32; 4]]) -> bool
             && pixel[1] >= (y0 - MARGIN).max(0.0)
             && pixel[1] <= (y1 + MARGIN).min(1.0)
     })
+}
+
+fn floor_sample_mask_excluded(pixel: [f32; 2], mask: &FloorSampleMaskExclusion) -> bool {
+    if !normalized_point_inside_bbox(pixel, mask.bbox) {
+        return false;
+    }
+    let x =
+        (pixel[0].clamp(0.0, 1.0) * mask.width.saturating_sub(1).max(1) as f32).round() as usize;
+    let y =
+        (pixel[1].clamp(0.0, 1.0) * mask.height.saturating_sub(1).max(1) as f32).round() as usize;
+    mask.data
+        .get(y.saturating_mul(mask.width as usize).saturating_add(x))
+        .copied()
+        .unwrap_or(0)
+        != 0
+}
+
+fn normalized_point_inside_bbox(pixel: [f32; 2], bbox: [f32; 4]) -> bool {
+    let x0 = bbox[0].min(bbox[2]).clamp(0.0, 1.0);
+    let x1 = bbox[0].max(bbox[2]).clamp(0.0, 1.0);
+    let y0 = bbox[1].min(bbox[3]).clamp(0.0, 1.0);
+    let y1 = bbox[1].max(bbox[3]).clamp(0.0, 1.0);
+    pixel[0] >= x0 && pixel[0] <= x1 && pixel[1] >= y0 && pixel[1] <= y1
+}
+
+fn normalized_bbox_iou(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let lx0 = left[0].min(left[2]).clamp(0.0, 1.0);
+    let ly0 = left[1].min(left[3]).clamp(0.0, 1.0);
+    let lx1 = left[0].max(left[2]).clamp(0.0, 1.0);
+    let ly1 = left[1].max(left[3]).clamp(0.0, 1.0);
+    let rx0 = right[0].min(right[2]).clamp(0.0, 1.0);
+    let ry0 = right[1].min(right[3]).clamp(0.0, 1.0);
+    let rx1 = right[0].max(right[2]).clamp(0.0, 1.0);
+    let ry1 = right[1].max(right[3]).clamp(0.0, 1.0);
+    let intersection =
+        (lx1.min(rx1) - lx0.max(rx0)).max(0.0) * (ly1.min(ry1) - ly0.max(ry0)).max(0.0);
+    let left_area = (lx1 - lx0).max(0.0) * (ly1 - ly0).max(0.0);
+    let right_area = (rx1 - rx0).max(0.0) * (ry1 - ry0).max(0.0);
+    let union = left_area + right_area - intersection;
+    if union <= 1.0e-6 {
+        0.0
+    } else {
+        intersection / union
+    }
 }
 
 fn write_depth_visualizations(
@@ -1080,8 +1219,8 @@ fn write_floor_samples_overlay(
             )
         })?
         .to_rgba8();
-    let exclusion_bboxes = floor_sample_exclusion_bboxes(evidence);
-    let samples = collect_floor_depth_samples(depth_map, &exclusion_bboxes);
+    let exclusions = FloorSampleExclusions::from_evidence(evidence);
+    let samples = collect_floor_depth_samples(depth_map, &exclusions);
     let fit = fit_floor_plane_from_samples(&samples);
     let mut inlier_flags = vec![false; samples.len()];
     if let Some(fit) = fit.as_ref() {
@@ -1319,4 +1458,76 @@ fn estimate_depth_target_footprint(
         [width_m.clamp(0.2, 4.0), width_m.clamp(0.2, 4.0)]
     };
     Some(footprint)
+}
+
+#[cfg(test)]
+mod depth_unit_tests {
+    use super::*;
+    use burn_synth_scene::ObjectMaskEvidence;
+
+    #[test]
+    fn floor_exclusion_uses_sam_mask_instead_of_large_detection_bbox() {
+        let width = 100;
+        let height = 80;
+        let detection = Detection {
+            label: "sectional sofa".to_string(),
+            bbox: [0.10, 0.30, 0.92, 0.98],
+            point: Some([0.50, 0.94]),
+            confidence: Some(0.90),
+            source_query: "sofa".to_string(),
+        };
+        let mut mask_data = vec![0_u8; width as usize * height as usize];
+        for y in 56..72 {
+            for x in 68..88 {
+                mask_data[y as usize * width as usize + x as usize] = 1;
+            }
+        }
+        let mask = BinaryMask::new(width, height, mask_data).unwrap();
+        let evidence = SceneGroundingEvidence {
+            source_image_path: "source.png".to_string(),
+            depth: None,
+            segmentation: None,
+            detections: vec![detection.clone()],
+            camera: Default::default(),
+            floor: Default::default(),
+            objects: vec![ObjectGroundingEvidence {
+                object_id: "sofa".to_string(),
+                instance_id: None,
+                reuse_group: None,
+                detection: Some(detection),
+                mask: Some(ObjectMaskEvidence {
+                    provider: "sam2".to_string(),
+                    model: "sam2.1".to_string(),
+                    bbox: [0.68, 0.70, 0.88, 0.90],
+                    score: 0.95,
+                    area_px: 20 * 16,
+                    image_size: [width, height],
+                    mask_rle: mask.encode_rle(),
+                    center_pixel: Some([0.78, 0.80]),
+                    contact_pixel: Some([0.78, 0.90]),
+                    coverage: Some(0.04),
+                    artifact_path: None,
+                    mask_png_path: None,
+                }),
+                asset_id: None,
+                contact_pixel: None,
+                depth_stats: None,
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: None,
+                provenance: Vec::new(),
+            }],
+        };
+        let bbox_exclusions = floor_sample_exclusion_bboxes(&evidence);
+        let precise_exclusions = FloorSampleExclusions::from_evidence(&evidence);
+        let central_floor_pixel = [0.42, 0.74];
+        let masked_sofa_pixel = [0.78, 0.80];
+
+        assert!(floor_sample_bbox_excluded(
+            central_floor_pixel,
+            &bbox_exclusions
+        ));
+        assert!(!precise_exclusions.excludes(central_floor_pixel));
+        assert!(precise_exclusions.excludes(masked_sofa_pixel));
+    }
 }

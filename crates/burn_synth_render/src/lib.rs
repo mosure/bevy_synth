@@ -1,6 +1,7 @@
 use burn::tensor::{Tensor, backend::Backend};
 use serde::{Deserialize, Serialize};
 
+pub mod mesh;
 pub mod normal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

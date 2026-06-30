@@ -32,10 +32,10 @@ pub(super) struct MaskPointMoments {
 }
 
 pub(super) fn project_mesh_visible_surface_mask(
-    mesh: &CachedSynthMesh,
+    mesh: &RenderMesh,
     placement: &GroundedScenePlacement,
-    fit_object: &burn_synth_scene::ProjectionFitObjectReport,
-    projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
+    fit_object: &crate::ProjectionFitObjectReport,
+    projection_camera: Option<&crate::ProjectionFitCameraReport>,
     evidence: &SceneGroundingEvidence,
     intrinsics: RotationFitIntrinsics,
     crop_bbox: [f32; 4],
@@ -49,19 +49,16 @@ pub(super) fn project_mesh_visible_surface_mask(
     let mut depths = Vec::new();
     let mut front_facing_face_count = 0usize;
 
-    for face in &mesh.mesh.faces {
+    for face in &mesh.faces {
         let indices = [face[0] as usize, face[1] as usize, face[2] as usize];
-        if indices
-            .iter()
-            .any(|index| *index >= mesh.mesh.vertices.len())
-        {
+        if indices.iter().any(|index| *index >= mesh.vertices.len()) {
             continue;
         }
         let mut camera_points = [[0.0; 3]; 3];
         let mut projected = [[0.0; 2]; 3];
         let mut valid = true;
         for (slot, index) in indices.iter().copied().enumerate() {
-            let world = rotation_fit_transform_local_point(placement, mesh.mesh.vertices[index]);
+            let world = rotation_fit_transform_local_point(placement, mesh.vertices[index]);
             let Some((camera_point, projected_point)) = projection.project(world, evidence) else {
                 valid = false;
                 break;
@@ -105,7 +102,7 @@ pub(super) fn project_mesh_visible_surface_mask(
     let mut fallback_points = false;
     if mask.iter().all(|value| *value == 0) {
         fallback_points = true;
-        for vertex in &mesh.mesh.vertices {
+        for vertex in &mesh.vertices {
             let world = rotation_fit_transform_local_point(placement, *vertex);
             let Some((camera_point, projected_point)) = projection.project(world, evidence) else {
                 continue;
@@ -171,8 +168,8 @@ enum RotationFitProjection {
 
 impl RotationFitProjection {
     fn from_fit_object(
-        fit_object: &burn_synth_scene::ProjectionFitObjectReport,
-        projection_camera: Option<&burn_synth_scene::ProjectionFitCameraReport>,
+        fit_object: &crate::ProjectionFitObjectReport,
+        projection_camera: Option<&crate::ProjectionFitCameraReport>,
         intrinsics: RotationFitIntrinsics,
     ) -> Option<Self> {
         if let (Some(origin), Some(anchor)) = (
@@ -480,7 +477,7 @@ pub(super) fn binary_mask_iou(left: &[u8], right: &[u8]) -> f32 {
 }
 
 impl SurfaceDepthSummary {
-    pub(super) fn from_object_stats(stats: burn_synth_scene::ObjectDepthStats) -> Self {
+    pub(super) fn from_object_stats(stats: crate::ObjectDepthStats) -> Self {
         let median = stats.median_m.max(1.0e-4);
         let min = stats.min_m.min(median).max(1.0e-4);
         let max = stats.max_m.max(median).max(min + 1.0e-4);
