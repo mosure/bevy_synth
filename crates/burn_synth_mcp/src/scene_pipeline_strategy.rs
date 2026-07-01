@@ -29,6 +29,8 @@ pub(crate) struct ScenePlacementPipelineSelection {
     pub(crate) rotation_fit: SceneRotationFitMode,
     pub(crate) object_pose_refinement: SceneObjectPoseRefinementMode,
     pub(crate) object_pose_refinement_set: SceneObjectPoseRefinementSet,
+    pub(crate) final_yaw_refinement: SceneFinalYawRefinementMode,
+    pub(crate) final_yaw_refinement_set: SceneObjectPoseRefinementSet,
     pub(crate) max_pose_candidates: usize,
 }
 
@@ -110,6 +112,8 @@ pub(crate) fn scene_placement_pipeline_plan(
     let dense_pose_enabled = rendered_silhouette && has_depth && has_any_mask;
     let object_refinement_enabled =
         dense_pose_enabled && selection.object_pose_refinement.geometry_enabled();
+    let final_yaw_refinement_enabled =
+        dense_pose_enabled && selection.final_yaw_refinement.enabled();
     let feedback_enabled =
         selection.lift_assets && selection.feedback && selection.feedback_iters > 0;
 
@@ -200,6 +204,8 @@ pub(crate) fn scene_placement_pipeline_plan(
         && selection.object_pose_refinement == SceneObjectPoseRefinementMode::GatedGpt
         && selection.object_pose_refinement_set
             == SceneObjectPoseRefinementSet::TablesAndLargeSeating
+        && selection.final_yaw_refinement == SceneFinalYawRefinementMode::GatedGpt
+        && selection.final_yaw_refinement_set == SceneObjectPoseRefinementSet::TablesAndLargeSeating
     {
         "bare_bones_geometric"
     } else if dense_pose_enabled {
@@ -494,6 +500,40 @@ pub(crate) fn scene_placement_pipeline_plan(
         },
     }));
     stages.push(stage(StageTemplate {
+        stage: "final_context_yaw_refinement",
+        role: "bounded_semantic_selection",
+        method: match selection.final_yaw_refinement {
+            SceneFinalYawRefinementMode::Off => "disabled",
+            SceneFinalYawRefinementMode::GatedGpt => {
+                "full_scene_context_gated_gpt_yaw_selector"
+            }
+            SceneFinalYawRefinementMode::AlwaysGpt => {
+                "full_scene_context_required_gpt_yaw_selector"
+            }
+        },
+        enabled: final_yaw_refinement_enabled,
+        status: if final_yaw_refinement_enabled {
+            "active"
+        } else if selection.final_yaw_refinement == SceneFinalYawRefinementMode::Off {
+            "disabled"
+        } else {
+            "waiting_for_dense_pose_inputs"
+        },
+        mutual_exclusion_group: "final_yaw_refinement",
+        evidence_inputs: vec![
+            "object_pose_candidates",
+            "source_object_crops",
+            "full_scene_candidate_renders",
+        ],
+        outputs: vec!["yaw_only_scene_commands", "final_yaw_selection_report"],
+        objective: "Use full-scene contextual renders to choose a bounded candidate_index for table/large-seating yaw without changing translation or scale.",
+        gpt_role: if selection.final_yaw_refinement.requires_selection() {
+            "bounded_candidate_selection_yaw_only"
+        } else {
+            "none"
+        },
+    }));
+    stages.push(stage(StageTemplate {
         stage: "render_capture_feedback",
         role: "validation",
         method: if feedback_enabled {
@@ -702,6 +742,34 @@ pub(crate) fn scene_placement_pipeline_plan(
             "Medium/high: widening the refinement set can improve more objects but increases runtime and ambiguity.",
         ),
         ablation_axis(
+            "final_yaw_refinement",
+            match selection.final_yaw_refinement {
+                SceneFinalYawRefinementMode::Off => "off",
+                SceneFinalYawRefinementMode::GatedGpt => "gated_gpt",
+                SceneFinalYawRefinementMode::AlwaysGpt => "always_gpt",
+            },
+            vec!["off", "gated_gpt", "always_gpt"],
+            "final_yaw_refinement",
+            "Medium: bounded full-scene yaw selection can repair table/sofa semantic orientation after geometry has fixed placement.",
+        ),
+        ablation_axis(
+            "final_yaw_refinement_set",
+            match selection.final_yaw_refinement_set {
+                SceneObjectPoseRefinementSet::Tables => "tables",
+                SceneObjectPoseRefinementSet::LargeSeating => "large_seating",
+                SceneObjectPoseRefinementSet::TablesAndLargeSeating => "tables_and_large_seating",
+                SceneObjectPoseRefinementSet::AllFurniture => "all_furniture",
+            },
+            vec![
+                "tables",
+                "large_seating",
+                "tables_and_large_seating",
+                "all_furniture",
+            ],
+            "final_yaw_refinement",
+            "Medium: restrict this stage to high-risk categories unless an ablation proves broader use.",
+        ),
+        ablation_axis(
             "scale_policy",
             match selection.scale_policy {
                 SceneScalePolicy::AssetPreserving => "asset_preserving",
@@ -828,6 +896,8 @@ mod tests {
             rotation_fit: SceneRotationFitMode::Off,
             object_pose_refinement: SceneObjectPoseRefinementMode::GatedGpt,
             object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
+            final_yaw_refinement: SceneFinalYawRefinementMode::GatedGpt,
+            final_yaw_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
             max_pose_candidates: 32,
         }
     }

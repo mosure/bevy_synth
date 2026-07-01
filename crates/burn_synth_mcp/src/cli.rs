@@ -101,6 +101,10 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
         object_pose_refinement: args.object_pose_refinement,
         object_pose_refinement_set: args.object_pose_refinement_set,
+        final_yaw_refinement: args.final_yaw_refinement,
+        final_yaw_refinement_set: args.final_yaw_refinement_set,
+        final_yaw_confidence_threshold: args.final_yaw_confidence_threshold,
+        final_yaw_max_candidates: args.final_yaw_max_candidates,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(
@@ -142,6 +146,7 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         feedback_iters: args.feedback_iters,
         feedback_keep_viewer: args.feedback_keep_viewer,
         feedback_capture_dir: args.feedback_capture_dir,
+        promote_to_catalog: args.promote_to_catalog,
         feedback_threshold_profile: args.feedback_threshold_profile,
         feedback_rotation_selector: args.feedback_rotation_selector,
         rotation_fit: args.rotation_fit,
@@ -151,6 +156,10 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         rotation_fit_write_artifacts: args.rotation_fit_write_artifacts,
         object_pose_refinement: args.object_pose_refinement,
         object_pose_refinement_set: args.object_pose_refinement_set,
+        final_yaw_refinement: args.final_yaw_refinement,
+        final_yaw_refinement_set: args.final_yaw_refinement_set,
+        final_yaw_confidence_threshold: args.final_yaw_confidence_threshold,
+        final_yaw_max_candidates: args.final_yaw_max_candidates,
         feedback_rubric_scorer: args.feedback_rubric_scorer,
     })?;
     println!(

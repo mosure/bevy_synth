@@ -127,9 +127,7 @@ pub(super) fn dense_soft_surface_refine_pose(
     }
     let mut refined = transform_context.placement_from_soft_transform(placement, result.transform);
     refined.scale = config.scale_policy.apply_to_scale(refined.scale);
-    refined.translation[1] = -refined.local_aabb.min[1] * refined.scale[1];
-    refined.ground_point[0] = refined.translation[0];
-    refined.ground_point[2] = refined.translation[2];
+    refined.sync_translation_to_current_ground_anchor();
     clamp_visible_surface_pose_candidate(&mut refined, baseline, config.scale_policy);
     Some((
         refined,
@@ -160,8 +158,8 @@ impl DenseSoftSurfaceTransformContext {
     ) -> Option<Self> {
         let origin_xz = fit_object.source_camera_origin_xz?;
         let anchor = fit_object.source_camera_anchor?;
-        let camera_x = placement.translation[0] + origin_xz[0];
-        let camera_z = origin_xz[1] - placement.translation[2];
+        let camera_x = placement.ground_point[0] + origin_xz[0];
+        let camera_z = origin_xz[1] - placement.ground_point[2];
         let ground_anchor_basis_camera_ray =
             fit_object.ground_anchor_basis == "camera-ray-ground-plane";
         let floor_y_camera = if ground_anchor_basis_camera_ray {
@@ -180,9 +178,9 @@ impl DenseSoftSurfaceTransformContext {
         placement: &GroundedScenePlacement,
     ) -> SoftObjectTransformValues {
         SoftObjectTransformValues {
-            tx: self.origin_xz[0] + placement.translation[0],
-            ty: self.floor_y_camera - placement.translation[1],
-            tz: self.origin_xz[1] - placement.translation[2],
+            tx: self.origin_xz[0] + placement.ground_point[0],
+            ty: self.floor_y_camera - placement.ground_point[1],
+            tz: self.origin_xz[1] - placement.ground_point[2],
             yaw: -placement.rotation_y_degrees.to_radians(),
             scale: representative_pose_scale(placement.scale),
         }
@@ -194,13 +192,12 @@ impl DenseSoftSurfaceTransformContext {
         transform: SoftObjectTransformValues,
     ) -> GroundedScenePlacement {
         let mut out = placement.clone();
-        out.translation[0] = transform.tx - self.origin_xz[0];
-        out.translation[2] = self.origin_xz[1] - transform.tz;
+        out.ground_point[0] = transform.tx - self.origin_xz[0];
+        out.ground_point[1] = self.floor_y_camera - transform.ty;
+        out.ground_point[2] = self.origin_xz[1] - transform.tz;
         out.rotation_y_degrees = normalize_degrees(-transform.yaw.to_degrees());
         out.scale = [transform.scale, transform.scale, transform.scale];
-        out.translation[1] = -out.local_aabb.min[1] * out.scale[1];
-        out.ground_point[0] = out.translation[0];
-        out.ground_point[2] = out.translation[2];
+        out.sync_translation_to_current_ground_anchor();
         out
     }
 }

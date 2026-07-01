@@ -347,6 +347,7 @@ mod tests {
                 model: Some("depth-pro".to_string()),
                 precision: Some("f16".to_string()),
                 artifact_path: Some(metadata_path.display().to_string()),
+                intrinsics: None,
                 focal_length_px: Some(4.0),
                 vertical_fov_degrees: Some(60.0),
                 image_size: Some([4, 4]),
@@ -356,6 +357,7 @@ mod tests {
             segmentation: None,
             detections: Vec::new(),
             camera: crate::EstimatedCamera {
+                intrinsics: None,
                 focal_length_px: Some(4.0),
                 principal_point: Some([1.5, 1.5]),
                 image_size: Some([4, 4]),

@@ -1,9 +1,45 @@
 use crate::prelude::*;
+use image::GenericImageView;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 const FEEDBACK_RENDER_SETTLE_MS: u64 = 750;
 const FEEDBACK_ROTATION_RENDER_MAX_CANDIDATES: usize = 18;
+const FINAL_YAW_RENDER_MIN_FOREGROUND_RATIO: f32 = 0.04;
+const FINAL_YAW_TARGET_ONLY_RENDER_MIN_FOREGROUND_RATIO: f32 = 0.008;
+const FINAL_YAW_RENDER_SAMPLE_STRIDE: u32 = 4;
+const FINAL_YAW_VISUAL_SCORE_IMPROVEMENT: f64 = 0.045;
+const FINAL_YAW_EDGE_SEATING_FINE_PARENT_SCORE_IMPROVEMENT: f64 = 0.04;
+const FINAL_YAW_EDGE_SEATING_CONFIDENT_SELECTION_MAX_VISUAL_REGRESSION: f64 = 0.08;
+const FINAL_YAW_FINE_DELTAS_DEGREES: [f32; 8] = [-20.0, -15.0, -10.0, -5.0, 5.0, 10.0, 15.0, 20.0];
+const FINAL_YAW_MASK_DESCRIPTOR_BINS: usize = 8;
+const FINAL_YAW_MASK_DESCRIPTOR_MIN_PIXELS: usize = 16;
+const FINAL_YAW_CONTACT_SHEET_TILE_WIDTH: u32 = 360;
+const FINAL_YAW_CONTACT_SHEET_TILE_HEIGHT: u32 = 203;
+const FINAL_YAW_CONTACT_SHEET_BORDER: u32 = 8;
+const FINAL_YAW_CONTACT_SHEET_GAP: u32 = 14;
+const FINAL_YAW_CONTACT_SHEET_COLUMNS: usize = 3;
+const SCENE_CAPTURE_WINDOW_LONG_EDGE: u32 = 1600;
+const SCENE_CAPTURE_WINDOW_MIN_SHORT_EDGE: u32 = 360;
+
+fn scene_capture_window_size_for_source(source_scene_path: &str) -> Option<(u32, u32)> {
+    let (width, height) = image::image_dimensions(source_scene_path).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let aspect = width as f32 / height as f32;
+    if aspect >= 1.0 {
+        let target_width = SCENE_CAPTURE_WINDOW_LONG_EDGE;
+        let target_height = ((target_width as f32 / aspect).round() as u32)
+            .max(SCENE_CAPTURE_WINDOW_MIN_SHORT_EDGE);
+        Some((target_width, target_height))
+    } else {
+        let target_height = SCENE_CAPTURE_WINDOW_LONG_EDGE;
+        let target_width = ((target_height as f32 * aspect).round() as u32)
+            .max(SCENE_CAPTURE_WINDOW_MIN_SHORT_EDGE);
+        Some((target_width, target_height))
+    }
+}
 
 pub fn run_stdio_server(config: ServerConfig) -> Result<(), String> {
     let stdin = io::stdin();
@@ -110,6 +146,1382 @@ fn feedback_rotation_candidate_commands(
         spawn,
         camera_command.clone(),
     ]
+}
+
+fn final_yaw_full_scene_candidate_commands(
+    commands: &[Value],
+    target_command_index: usize,
+    candidate: &Value,
+) -> Vec<Value> {
+    let candidate_yaw_degrees = candidate
+        .get("candidate_yaw_degrees")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or(0.0);
+    let candidate_pose = final_yaw_candidate_pose(candidate);
+    let mut out = vec![
+        json!({ "type": "clear_scene" }),
+        json!({ "type": "reload_cache" }),
+    ];
+    let mut camera_commands = Vec::new();
+    for (command_index, command) in commands.iter().enumerate() {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        match command_type {
+            "spawn_cached" | "spawn_path" => {
+                let mut spawn = command.clone();
+                spawn["select"] = json!(false);
+                if command_index == target_command_index {
+                    if let Some((translation, scale)) = candidate_pose {
+                        spawn["translation"] = json!(translation);
+                        spawn["scale"] = json!(scale);
+                    }
+                    spawn["rotation"] = json!(quat_from_y_degrees(candidate_yaw_degrees));
+                }
+                out.push(spawn);
+            }
+            "set_camera" => camera_commands.push(command.clone()),
+            _ => {}
+        }
+    }
+    out.extend(camera_commands);
+    out
+}
+
+fn final_yaw_target_only_candidate_commands(
+    commands: &[Value],
+    target_command_index: usize,
+    candidate: &Value,
+) -> Option<Vec<Value>> {
+    let candidate_yaw_degrees = candidate
+        .get("candidate_yaw_degrees")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or(0.0);
+    let candidate_pose = final_yaw_candidate_pose(candidate);
+    let mut out = vec![
+        json!({ "type": "clear_scene" }),
+        json!({ "type": "reload_cache" }),
+    ];
+    let mut camera_commands = Vec::new();
+    let mut target_spawn = None;
+    for (command_index, command) in commands.iter().enumerate() {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        match command_type {
+            "spawn_cached" | "spawn_path" if command_index == target_command_index => {
+                let mut spawn = command.clone();
+                spawn["select"] = json!(false);
+                if let Some((translation, scale)) = candidate_pose {
+                    spawn["translation"] = json!(translation);
+                    spawn["scale"] = json!(scale);
+                }
+                spawn["rotation"] = json!(quat_from_y_degrees(candidate_yaw_degrees));
+                target_spawn = Some(spawn);
+            }
+            "set_camera" => camera_commands.push(command.clone()),
+            _ => {}
+        }
+    }
+    out.push(target_spawn?);
+    out.extend(camera_commands);
+    Some(out)
+}
+
+fn final_yaw_candidate_pose(candidate: &Value) -> Option<([f32; 3], [f32; 3])> {
+    let metrics = candidate
+        .get("geometry_metrics")
+        .filter(|value| value.is_object())
+        .unwrap_or(candidate);
+    let translation = metrics.get("translation").and_then(final_yaw_json_array3)?;
+    let scale = metrics.get("scale").and_then(final_yaw_json_array3)?;
+    Some((translation, scale))
+}
+
+fn final_yaw_render_foreground_report(path: &Path, min_foreground_ratio: f32) -> Value {
+    let image = match image::open(path) {
+        Ok(image) => image.to_rgba8(),
+        Err(err) => {
+            return json!({
+                "ok": false,
+                "min_foreground_ratio": min_foreground_ratio,
+                "error": err.to_string(),
+            });
+        }
+    };
+    let stride = FINAL_YAW_RENDER_SAMPLE_STRIDE.max(1) as usize;
+    let mut samples = 0usize;
+    let mut foreground = 0usize;
+    for y in (0..image.height()).step_by(stride) {
+        for x in (0..image.width()).step_by(stride) {
+            let pixel = image.get_pixel(x, y).0;
+            let r = pixel[0] as f32 / 255.0;
+            let g = pixel[1] as f32 / 255.0;
+            let b = pixel[2] as f32 / 255.0;
+            let max_channel = r.max(g).max(b);
+            let min_channel = r.min(g).min(b);
+            let saturation = if max_channel > 1.0e-5 {
+                (max_channel - min_channel) / max_channel
+            } else {
+                0.0
+            };
+            let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if (saturation > 0.16 && luminance > 0.12) || luminance > 0.56 {
+                foreground = foreground.saturating_add(1);
+            }
+            samples = samples.saturating_add(1);
+        }
+    }
+    let foreground_ratio = if samples > 0 {
+        foreground as f32 / samples as f32
+    } else {
+        0.0
+    };
+    json!({
+        "ok": foreground_ratio >= min_foreground_ratio,
+        "foreground_ratio": foreground_ratio,
+        "foreground_samples": foreground,
+        "sample_count": samples,
+        "min_foreground_ratio": min_foreground_ratio,
+        "sample_stride": FINAL_YAW_RENDER_SAMPLE_STRIDE,
+    })
+}
+
+fn final_yaw_render_path_has_foreground(path: &str) -> bool {
+    final_yaw_render_foreground_report(Path::new(path), FINAL_YAW_RENDER_MIN_FOREGROUND_RATIO)
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn final_yaw_spawn_ordinal(commands: &[Value], target_command_index: usize) -> Option<usize> {
+    let mut ordinal = 0usize;
+    for (command_index, command) in commands.iter().enumerate() {
+        let command_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(command_type, "spawn_cached" | "spawn_path") {
+            continue;
+        }
+        if command_index == target_command_index {
+            return Some(ordinal);
+        }
+        ordinal = ordinal.saturating_add(1);
+    }
+    None
+}
+
+fn final_yaw_target_projected_bbox(
+    status: &Value,
+    commands: &[Value],
+    target_command_index: usize,
+) -> Option<[f32; 4]> {
+    let ordinal = final_yaw_spawn_ordinal(commands, target_command_index)?;
+    status
+        .get("projected_items")
+        .and_then(Value::as_array)?
+        .get(ordinal)
+        .and_then(|item| item.get("screen_bbox"))
+        .and_then(json_array4)
+        .and_then(feedback_visible_bbox)
+}
+
+fn final_yaw_bbox_area(bbox: [f32; 4]) -> f32 {
+    (bbox[2] - bbox[0]).max(0.0) * (bbox[3] - bbox[1]).max(0.0)
+}
+
+fn final_yaw_bbox_iou(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let intersection = final_yaw_bbox_area([
+        left[0].max(right[0]),
+        left[1].max(right[1]),
+        left[2].min(right[2]),
+        left[3].min(right[3]),
+    ]);
+    let union = final_yaw_bbox_area(left) + final_yaw_bbox_area(right) - intersection;
+    if union > 1.0e-6 {
+        (intersection / union).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn final_yaw_bbox_center_error(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let left_center = [(left[0] + left[2]) * 0.5, (left[1] + left[3]) * 0.5];
+    let right_center = [(right[0] + right[2]) * 0.5, (right[1] + right[3]) * 0.5];
+    let dx = left_center[0] - right_center[0];
+    let dy = left_center[1] - right_center[1];
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn final_yaw_bbox_area_log2_error(left: [f32; 4], right: [f32; 4]) -> f32 {
+    let left_area = final_yaw_bbox_area(left).max(1.0e-6);
+    let right_area = final_yaw_bbox_area(right).max(1.0e-6);
+    (left_area / right_area).log2().abs()
+}
+
+#[derive(Clone)]
+struct FinalYawMaskDescriptor {
+    bbox: [f32; 4],
+    centroid: [f32; 2],
+    area_ratio: f32,
+    full_histogram: Vec<f64>,
+    local_histogram: Vec<f64>,
+    local_row_profile: Vec<f64>,
+    local_column_profile: Vec<f64>,
+    foreground_samples: usize,
+    sample_count: usize,
+}
+
+fn final_yaw_mask_descriptor_from_image<F>(
+    image: &image::DynamicImage,
+    stride: u32,
+    is_foreground: F,
+) -> Option<FinalYawMaskDescriptor>
+where
+    F: Fn(image::Rgba<u8>) -> bool,
+{
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    let stride = stride.max(1) as usize;
+    let width_denom = width.saturating_sub(1).max(1) as f32;
+    let height_denom = height.saturating_sub(1).max(1) as f32;
+    let mut points = Vec::new();
+    let mut sample_count = 0usize;
+    for y in (0..height).step_by(stride) {
+        for x in (0..width).step_by(stride) {
+            sample_count = sample_count.saturating_add(1);
+            if is_foreground(image.get_pixel(x, y)) {
+                points.push([x as f32 / width_denom, y as f32 / height_denom]);
+            }
+        }
+    }
+    if points.len() < FINAL_YAW_MASK_DESCRIPTOR_MIN_PIXELS {
+        return None;
+    }
+
+    let mut min_x = 1.0f32;
+    let mut min_y = 1.0f32;
+    let mut max_x = 0.0f32;
+    let mut max_y = 0.0f32;
+    let mut sum_x = 0.0f32;
+    let mut sum_y = 0.0f32;
+    for [x, y] in &points {
+        min_x = min_x.min(*x);
+        min_y = min_y.min(*y);
+        max_x = max_x.max(*x);
+        max_y = max_y.max(*y);
+        sum_x += *x;
+        sum_y += *y;
+    }
+    let foreground_samples = points.len();
+    let centroid = [
+        sum_x / foreground_samples as f32,
+        sum_y / foreground_samples as f32,
+    ];
+    let bbox = [min_x, min_y, max_x, max_y];
+    let mut full_histogram =
+        vec![0.0f64; FINAL_YAW_MASK_DESCRIPTOR_BINS * FINAL_YAW_MASK_DESCRIPTOR_BINS];
+    let mut local_histogram =
+        vec![0.0f64; FINAL_YAW_MASK_DESCRIPTOR_BINS * FINAL_YAW_MASK_DESCRIPTOR_BINS];
+    let bbox_width = (bbox[2] - bbox[0]).max(1.0e-6);
+    let bbox_height = (bbox[3] - bbox[1]).max(1.0e-6);
+    for [x, y] in &points {
+        let full_x = ((*x * FINAL_YAW_MASK_DESCRIPTOR_BINS as f32).floor() as usize)
+            .min(FINAL_YAW_MASK_DESCRIPTOR_BINS - 1);
+        let full_y = ((*y * FINAL_YAW_MASK_DESCRIPTOR_BINS as f32).floor() as usize)
+            .min(FINAL_YAW_MASK_DESCRIPTOR_BINS - 1);
+        full_histogram[full_y * FINAL_YAW_MASK_DESCRIPTOR_BINS + full_x] += 1.0;
+
+        let local_x_norm = ((*x - bbox[0]) / bbox_width).clamp(0.0, 0.999_999);
+        let local_y_norm = ((*y - bbox[1]) / bbox_height).clamp(0.0, 0.999_999);
+        let local_x = ((local_x_norm * FINAL_YAW_MASK_DESCRIPTOR_BINS as f32).floor() as usize)
+            .min(FINAL_YAW_MASK_DESCRIPTOR_BINS - 1);
+        let local_y = ((local_y_norm * FINAL_YAW_MASK_DESCRIPTOR_BINS as f32).floor() as usize)
+            .min(FINAL_YAW_MASK_DESCRIPTOR_BINS - 1);
+        local_histogram[local_y * FINAL_YAW_MASK_DESCRIPTOR_BINS + local_x] += 1.0;
+    }
+    let inv_count = 1.0 / foreground_samples as f64;
+    for value in &mut full_histogram {
+        *value *= inv_count;
+    }
+    for value in &mut local_histogram {
+        *value *= inv_count;
+    }
+
+    let mut local_row_profile = vec![0.0f64; FINAL_YAW_MASK_DESCRIPTOR_BINS];
+    let mut local_column_profile = vec![0.0f64; FINAL_YAW_MASK_DESCRIPTOR_BINS];
+    for row in 0..FINAL_YAW_MASK_DESCRIPTOR_BINS {
+        for column in 0..FINAL_YAW_MASK_DESCRIPTOR_BINS {
+            let value = local_histogram[row * FINAL_YAW_MASK_DESCRIPTOR_BINS + column];
+            local_row_profile[row] += value;
+            local_column_profile[column] += value;
+        }
+    }
+
+    Some(FinalYawMaskDescriptor {
+        bbox,
+        centroid,
+        area_ratio: foreground_samples as f32 / sample_count.max(1) as f32,
+        full_histogram,
+        local_histogram,
+        local_row_profile,
+        local_column_profile,
+        foreground_samples,
+        sample_count,
+    })
+}
+
+fn final_yaw_source_mask_descriptor(path: &Path) -> Result<FinalYawMaskDescriptor, String> {
+    let image = image::open(path).map_err(|err| {
+        format!(
+            "failed to open final-yaw source mask {}: {err}",
+            path.display()
+        )
+    })?;
+    final_yaw_mask_descriptor_from_image(&image, FINAL_YAW_RENDER_SAMPLE_STRIDE, |pixel| {
+        pixel.0[3] > 127
+    })
+    .ok_or_else(|| {
+        format!(
+            "final-yaw source mask {} has too few alpha foreground samples",
+            path.display()
+        )
+    })
+}
+
+fn final_yaw_target_render_mask_descriptor(path: &Path) -> Result<FinalYawMaskDescriptor, String> {
+    let image = image::open(path).map_err(|err| {
+        format!(
+            "failed to open final-yaw target-only render {}: {err}",
+            path.display()
+        )
+    })?;
+    final_yaw_mask_descriptor_from_image(&image, FINAL_YAW_RENDER_SAMPLE_STRIDE, |pixel| {
+        let r = pixel.0[0] as f32 / 255.0;
+        let g = pixel.0[1] as f32 / 255.0;
+        let b = pixel.0[2] as f32 / 255.0;
+        let max_channel = r.max(g).max(b);
+        let min_channel = r.min(g).min(b);
+        let saturation = if max_channel > 1.0e-5 {
+            (max_channel - min_channel) / max_channel
+        } else {
+            0.0
+        };
+        let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        (saturation > 0.16 && luminance > 0.12) || luminance > 0.56
+    })
+    .ok_or_else(|| {
+        format!(
+            "final-yaw target-only render {} has too few foreground samples",
+            path.display()
+        )
+    })
+}
+
+fn final_yaw_histogram_similarity(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let l1 = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| (left - right).abs())
+        .sum::<f64>();
+    (1.0 - 0.5 * l1).clamp(0.0, 1.0)
+}
+
+fn final_yaw_mask_descriptor_fit_report(
+    source: &FinalYawMaskDescriptor,
+    target: &FinalYawMaskDescriptor,
+) -> Value {
+    let bbox_iou = final_yaw_bbox_iou(source.bbox, target.bbox) as f64;
+    let center_error = final_yaw_bbox_center_error(source.bbox, target.bbox) as f64;
+    let centroid_error = {
+        let dx = source.centroid[0] - target.centroid[0];
+        let dy = source.centroid[1] - target.centroid[1];
+        (dx * dx + dy * dy).sqrt() as f64
+    };
+    let center_component = (1.0 - centroid_error * 3.0).clamp(0.0, 1.0);
+    let area_log2_error = (target.area_ratio.max(1.0e-6) / source.area_ratio.max(1.0e-6))
+        .log2()
+        .abs() as f64;
+    let area_component = (-area_log2_error * 0.75).exp().clamp(0.0, 1.0);
+    let full_histogram_similarity =
+        final_yaw_histogram_similarity(&source.full_histogram, &target.full_histogram);
+    let local_histogram_similarity =
+        final_yaw_histogram_similarity(&source.local_histogram, &target.local_histogram);
+    let row_profile_similarity =
+        final_yaw_histogram_similarity(&source.local_row_profile, &target.local_row_profile);
+    let column_profile_similarity =
+        final_yaw_histogram_similarity(&source.local_column_profile, &target.local_column_profile);
+    let score = (0.24 * full_histogram_similarity)
+        + (0.28 * local_histogram_similarity)
+        + (0.14 * bbox_iou)
+        + (0.14 * center_component)
+        + (0.10 * area_component)
+        + (0.05 * row_profile_similarity)
+        + (0.05 * column_profile_similarity);
+    json!({
+        "score": score.clamp(0.0, 1.0),
+        "source_bbox": source.bbox,
+        "target_bbox": target.bbox,
+        "source_centroid": source.centroid,
+        "target_centroid": target.centroid,
+        "source_area_ratio": source.area_ratio,
+        "target_area_ratio": target.area_ratio,
+        "source_foreground_samples": source.foreground_samples,
+        "target_foreground_samples": target.foreground_samples,
+        "source_sample_count": source.sample_count,
+        "target_sample_count": target.sample_count,
+        "bbox_iou": bbox_iou,
+        "bbox_center_error": center_error,
+        "centroid_error": centroid_error,
+        "center_component": center_component,
+        "area_log2_error": area_log2_error,
+        "area_component": area_component,
+        "full_histogram_similarity": full_histogram_similarity,
+        "local_histogram_similarity": local_histogram_similarity,
+        "row_profile_similarity": row_profile_similarity,
+        "column_profile_similarity": column_profile_similarity,
+        "score_policy": "0.24*full_hist + 0.28*local_hist + 0.14*bbox_iou + 0.14*centroid + 0.10*area + 0.05*rows + 0.05*cols",
+    })
+}
+
+fn final_yaw_render_mask_fit_report(object: &Value, target_only_path: &Path) -> Value {
+    let Some(source_mask_path) = object.get("source_mask_path").and_then(Value::as_str) else {
+        return json!({
+            "enabled": false,
+            "reason": "missing_source_mask_path",
+        });
+    };
+    let source_mask_path = Path::new(source_mask_path);
+    match (
+        final_yaw_source_mask_descriptor(source_mask_path),
+        final_yaw_target_render_mask_descriptor(target_only_path),
+    ) {
+        (Ok(source), Ok(target)) => {
+            let mut report = final_yaw_mask_descriptor_fit_report(&source, &target);
+            report["enabled"] = json!(true);
+            report["source_mask_path"] = json!(source_mask_path.display().to_string());
+            report["target_only_render_path"] = json!(target_only_path.display().to_string());
+            report["descriptor"] = json!("alpha_source_vs_target_only_foreground_8x8_histogram");
+            report
+        }
+        (source_result, target_result) => json!({
+            "enabled": false,
+            "source_mask_path": source_mask_path.display().to_string(),
+            "target_only_render_path": target_only_path.display().to_string(),
+            "source_error": source_result.err(),
+            "target_error": target_result.err(),
+        }),
+    }
+}
+
+fn final_yaw_render_visual_fit_report(
+    object: &Value,
+    screenshot_path: &Path,
+    target_bbox: [f32; 4],
+    crop_path: &Path,
+    foreground: &Value,
+    target_only_screenshot_path: Option<&Path>,
+) -> Value {
+    let source_bbox = object
+        .get("source_bbox")
+        .and_then(final_yaw_json_array4)
+        .unwrap_or(target_bbox);
+    let bbox_iou = final_yaw_bbox_iou(target_bbox, source_bbox);
+    let center_error = final_yaw_bbox_center_error(target_bbox, source_bbox);
+    let area_log2_error = final_yaw_bbox_area_log2_error(target_bbox, source_bbox);
+    let mut crop_error = Value::Null;
+    let mut visual_similarity = Value::Null;
+    let mut visual_score = None;
+    match image::open(screenshot_path) {
+        Ok(image) => match write_feedback_crop(&image, target_bbox, crop_path) {
+            Ok(()) => {
+                if let Some(source_crop) = object.get("source_crop").and_then(Value::as_str) {
+                    match feedback_crop_visual_similarity(Path::new(source_crop), crop_path) {
+                        Ok(value) => {
+                            visual_score = value.get("score").and_then(Value::as_f64);
+                            visual_similarity = value;
+                        }
+                        Err(err) => crop_error = json!(err),
+                    }
+                }
+            }
+            Err(err) => crop_error = json!(err),
+        },
+        Err(err) => crop_error = json!(err.to_string()),
+    }
+    let center_component = (1.0 - center_error as f64 * 3.0).clamp(0.0, 1.0);
+    let area_component = (-(area_log2_error as f64) * 0.75).exp().clamp(0.0, 1.0);
+    let crop_component = visual_score.unwrap_or(0.5).clamp(0.0, 1.0);
+    let target_silhouette_fit = target_only_screenshot_path
+        .map(|path| final_yaw_render_mask_fit_report(object, path))
+        .unwrap_or_else(|| {
+            json!({
+                "enabled": false,
+                "reason": "missing_target_only_render",
+            })
+        });
+    let target_silhouette_score = target_silhouette_fit
+        .get("score")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite());
+    let foreground_ratio = foreground
+        .get("foreground_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let foreground_component = (foreground_ratio / 0.18).clamp(0.0, 1.0);
+    let (score, score_policy) = if let Some(mask_component) = target_silhouette_score {
+        (
+            (0.44 * mask_component)
+                + (0.22 * bbox_iou as f64)
+                + (0.14 * center_component)
+                + (0.08 * area_component)
+                + (0.08 * crop_component)
+                + (0.04 * foreground_component),
+            "0.44*source_mask_target_silhouette + 0.22*bbox_iou + 0.14*center + 0.08*area + 0.08*crop + 0.04*foreground",
+        )
+    } else {
+        (
+            (0.42 * bbox_iou as f64)
+                + (0.28 * center_component)
+                + (0.18 * area_component)
+                + (0.08 * crop_component)
+                + (0.04 * foreground_component),
+            "0.42*bbox_iou + 0.28*center + 0.18*area + 0.08*crop + 0.04*foreground",
+        )
+    };
+    json!({
+        "score": score.clamp(0.0, 1.0),
+        "bbox_iou": bbox_iou,
+        "center_error": center_error,
+        "area_log2_error": area_log2_error,
+        "center_component": center_component,
+        "area_component": area_component,
+        "crop_visual_score": visual_score,
+        "foreground_ratio": foreground_ratio,
+        "foreground_component": foreground_component,
+        "target_silhouette_score": target_silhouette_score,
+        "target_silhouette_fit": target_silhouette_fit,
+        "source_bbox": source_bbox,
+        "projected_bbox": target_bbox,
+        "rendered_crop": crop_path.display().to_string(),
+        "visual_similarity": visual_similarity,
+        "crop_error": crop_error,
+        "score_policy": score_policy,
+    })
+}
+
+fn final_yaw_candidate_visual_score(candidate: &Value) -> Option<f64> {
+    candidate
+        .pointer("/final_yaw_visual_fit/score")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            candidate
+                .pointer("/visual_fit/score")
+                .and_then(Value::as_f64)
+        })
+        .filter(|value| value.is_finite())
+}
+
+pub(crate) fn final_yaw_visual_best_response(
+    task: &Value,
+    response: &SceneRotationSelectionResponse,
+) -> SceneRotationSelectionResponse {
+    let mut objects = Vec::with_capacity(response.objects.len());
+    for selection in &response.objects {
+        let Some(object) = task
+            .get("objects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|object| {
+                object.get("index").and_then(Value::as_u64) == Some(selection.index as u64)
+            })
+        else {
+            objects.push(selection.clone());
+            continue;
+        };
+        if !final_yaw_object_allows_fine_refinement(object) {
+            objects.push(selection.clone());
+            continue;
+        }
+        let Some(candidates) = object
+            .pointer("/rotation_selection/candidates")
+            .and_then(Value::as_array)
+        else {
+            objects.push(selection.clone());
+            continue;
+        };
+        let selected_score = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.get("candidate_index").and_then(Value::as_u64)
+                    == Some(selection.candidate_index as u64)
+            })
+            .and_then(final_yaw_candidate_visual_score)
+            .unwrap_or(f64::NEG_INFINITY);
+        let best = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let index = candidate.get("candidate_index").and_then(Value::as_u64)? as usize;
+                let score = final_yaw_candidate_visual_score(candidate)?;
+                Some((score, index))
+            })
+            .max_by(|left, right| left.0.total_cmp(&right.0));
+        if final_yaw_object_is_edge_cropped_large_seating(object)
+            && selection.confidence >= 0.72
+            && candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.get("candidate_index").and_then(Value::as_u64)
+                        == Some(selection.candidate_index as u64)
+                })
+                .is_some_and(final_yaw_candidate_has_rendered_context)
+            && best.is_none_or(|(best_score, _)| {
+                selected_score.is_finite()
+                    && best_score
+                        <= selected_score
+                            + FINAL_YAW_EDGE_SEATING_CONFIDENT_SELECTION_MAX_VISUAL_REGRESSION
+            })
+        {
+            objects.push(selection.clone());
+            continue;
+        }
+        if let Some(parent_guard) = final_yaw_fine_parent_hysteresis_selection(
+            object,
+            selection,
+            candidates,
+            selected_score,
+        ) {
+            objects.push(parent_guard);
+            continue;
+        }
+        let Some((best_score, best_index)) = best else {
+            objects.push(selection.clone());
+            continue;
+        };
+        if best_index != selection.candidate_index
+            && best_score > selected_score + FINAL_YAW_VISUAL_SCORE_IMPROVEMENT
+        {
+            let mut next = selection.clone();
+            next.candidate_index = best_index;
+            next.confidence = next.confidence.max(0.86);
+            next.rationale = format!(
+                "visual fit gate selected candidate {best_index}: score {best_score:.3} beats selected candidate {} score {:.3} by more than {:.3}. Previous rationale: {}",
+                selection.candidate_index,
+                selected_score,
+                FINAL_YAW_VISUAL_SCORE_IMPROVEMENT,
+                selection.rationale
+            );
+            objects.push(next);
+        } else {
+            objects.push(selection.clone());
+        }
+    }
+    SceneRotationSelectionResponse { objects }
+}
+
+fn final_yaw_fine_parent_hysteresis_selection(
+    object: &Value,
+    selection: &burn_synth_scene::SceneRotationSelection,
+    candidates: &[Value],
+    selected_score: f64,
+) -> Option<burn_synth_scene::SceneRotationSelection> {
+    if !selected_score.is_finite() || !final_yaw_object_is_edge_cropped_large_seating(object) {
+        return None;
+    }
+    let selected = candidates.iter().find(|candidate| {
+        candidate.get("candidate_index").and_then(Value::as_u64)
+            == Some(selection.candidate_index as u64)
+    })?;
+    let parent_index = selected
+        .pointer("/fine_refinement/parent_candidate_index")
+        .and_then(Value::as_u64)? as usize;
+    let parent = candidates.iter().find(|candidate| {
+        candidate.get("candidate_index").and_then(Value::as_u64) == Some(parent_index as u64)
+    })?;
+    let parent_score = final_yaw_candidate_visual_score(parent)?;
+    if selected_score >= parent_score + FINAL_YAW_EDGE_SEATING_FINE_PARENT_SCORE_IMPROVEMENT {
+        return None;
+    }
+    let mut next = selection.clone();
+    next.candidate_index = parent_index;
+    next.confidence = next.confidence.clamp(0.72, 0.84);
+    next.rationale = format!(
+        "fine-parent hysteresis kept edge-cropped large seating candidate {parent_index}: fine candidate {} score {:.3} did not improve parent score {:.3} by at least {:.3}. Previous rationale: {}",
+        selection.candidate_index,
+        selected_score,
+        parent_score,
+        FINAL_YAW_EDGE_SEATING_FINE_PARENT_SCORE_IMPROVEMENT,
+        selection.rationale
+    );
+    Some(next)
+}
+
+pub(crate) fn final_yaw_add_fine_refinement_candidates(
+    task: &mut Value,
+    response: &SceneRotationSelectionResponse,
+) -> usize {
+    let Some(objects) = task.get_mut("objects").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut added = 0usize;
+    for selection in &response.objects {
+        let Some(object) = objects.iter_mut().find(|object| {
+            object.get("index").and_then(Value::as_u64) == Some(selection.index as u64)
+        }) else {
+            continue;
+        };
+        if !final_yaw_object_allows_fine_refinement(object) {
+            continue;
+        }
+        let current_yaw = object
+            .get("current_yaw_degrees")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32);
+        let Some(candidates) = object
+            .pointer_mut("/rotation_selection/candidates")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(parent) = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.get("candidate_index").and_then(Value::as_u64)
+                    == Some(selection.candidate_index as u64)
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(parent_yaw) = parent
+            .get("candidate_yaw_degrees")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .map(|value| value as f32)
+        else {
+            continue;
+        };
+        let current_yaw = current_yaw.unwrap_or(parent_yaw);
+        let mut next_index = candidates
+            .iter()
+            .filter_map(|candidate| candidate.get("candidate_index").and_then(Value::as_u64))
+            .max()
+            .map(|value| value as usize + 1)
+            .unwrap_or(candidates.len());
+        for delta in FINAL_YAW_FINE_DELTAS_DEGREES {
+            let yaw = normalize_degrees(parent_yaw + delta);
+            if candidates.iter().any(|candidate| {
+                candidate
+                    .get("candidate_yaw_degrees")
+                    .and_then(Value::as_f64)
+                    .map(|candidate_yaw| normalize_degrees(candidate_yaw as f32 - yaw).abs() < 1.0)
+                    .unwrap_or(false)
+            }) {
+                continue;
+            }
+            candidates.push(json!({
+                "candidate_index": next_index,
+                "candidate_yaw_degrees": yaw,
+                "yaw_degrees": yaw,
+                "yaw_delta_degrees": normalize_degrees(yaw - current_yaw),
+                "source": "fine_probe",
+                "fine_refinement": {
+                    "parent_candidate_index": selection.candidate_index,
+                    "parent_yaw_degrees": parent_yaw,
+                    "delta_degrees": delta,
+                },
+                "selected": false,
+            }));
+            next_index += 1;
+            added += 1;
+        }
+    }
+    added
+}
+
+fn final_yaw_object_allows_fine_refinement(object: &Value) -> bool {
+    let descriptor = final_yaw_object_descriptor(object);
+    descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+        || descriptor.contains("settee")
+        || descriptor.contains("table")
+        || descriptor.contains("desk")
+        || descriptor.contains("counter")
+}
+
+fn final_yaw_object_is_edge_cropped_large_seating(object: &Value) -> bool {
+    final_yaw_object_is_large_seating(object)
+        && object
+            .get("source_bbox")
+            .and_then(final_yaw_json_array4)
+            .is_some_and(final_yaw_bbox_touches_image_edge)
+}
+
+fn final_yaw_object_is_large_seating(object: &Value) -> bool {
+    let descriptor = final_yaw_object_descriptor(object);
+    descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+        || descriptor.contains("settee")
+}
+
+fn final_yaw_object_descriptor(object: &Value) -> String {
+    ["object_id", "label", "asset_id", "instance_id"]
+        .iter()
+        .filter_map(|key| object.get(*key).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn final_yaw_bbox_touches_image_edge(bbox: [f32; 4]) -> bool {
+    bbox[0] <= 0.03 || bbox[1] <= 0.03 || bbox[2] >= 0.97 || bbox[3] >= 0.97
+}
+
+pub(crate) fn final_yaw_metric_best_response(
+    task: &Value,
+) -> Option<SceneRotationSelectionResponse> {
+    let objects = task
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|object| {
+            let index = object.get("index").and_then(Value::as_u64)? as usize;
+            let candidates = object
+                .pointer("/rotation_selection/candidates")
+                .and_then(Value::as_array)?;
+            let candidate = candidates
+                .iter()
+                .filter(|candidate| candidate.get("geometry_metrics").is_some())
+                .filter(|candidate| final_yaw_candidate_safe_without_renderer(object, candidate))
+                .filter_map(|candidate| {
+                    let score = final_yaw_candidate_metric_score(candidate)?;
+                    Some((score, candidate))
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0))
+                .map(|(_, candidate)| candidate)?;
+            let candidate_index =
+                candidate.get("candidate_index").and_then(Value::as_u64)? as usize;
+            Some(burn_synth_scene::SceneRotationSelection {
+                index,
+                candidate_index,
+                confidence: 1.0,
+                rationale: "renderer unavailable; selected lowest safe measured final-pose loss"
+                    .to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!objects.is_empty()).then_some(SceneRotationSelectionResponse { objects })
+}
+
+fn final_yaw_candidate_safe_without_renderer(object: &Value, candidate: &Value) -> bool {
+    if final_yaw_candidate_passed_geometry_gate(candidate) {
+        return true;
+    }
+    !final_yaw_object_requires_rendered_metric_fallback(object)
+        && final_yaw_candidate_has_relaxed_metric_evidence(candidate)
+}
+
+fn final_yaw_candidate_passed_geometry_gate(candidate: &Value) -> bool {
+    candidate
+        .get("passed")
+        .or_else(|| {
+            candidate
+                .get("geometry_metrics")
+                .and_then(|metrics| metrics.get("passed"))
+        })
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn final_yaw_object_requires_rendered_metric_fallback(object: &Value) -> bool {
+    let descriptor = [
+        object.get("label").and_then(Value::as_str).unwrap_or(""),
+        object
+            .get("object_id")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("table")
+        || descriptor.contains("desk")
+}
+
+fn final_yaw_candidate_has_relaxed_metric_evidence(candidate: &Value) -> bool {
+    let bbox = final_yaw_candidate_metric(candidate, "bbox_iou").unwrap_or(0.0);
+    let mask = final_yaw_candidate_metric(candidate, "mask_iou").unwrap_or(0.0);
+    let depth = final_yaw_candidate_metric(candidate, "depth_error_m").unwrap_or(f32::INFINITY);
+    bbox >= 0.50 && mask >= 0.40 && depth <= 0.75
+}
+
+fn final_yaw_candidate_has_rendered_context(candidate: &Value) -> bool {
+    candidate.get("rendered_candidate_full_scene").is_some()
+        || candidate.get("rendered_candidate_full_frame").is_some()
+}
+
+fn final_yaw_candidate_metric_score(candidate: &Value) -> Option<f32> {
+    final_yaw_candidate_metric(candidate, "loss").or_else(|| {
+        let bbox = final_yaw_candidate_metric(candidate, "bbox_iou");
+        let mask = final_yaw_candidate_metric(candidate, "mask_iou");
+        let depth = final_yaw_candidate_metric(candidate, "depth_error_m");
+        let surface = final_yaw_candidate_metric(candidate, "surface_depth_loss");
+        if bbox.is_none() && mask.is_none() && depth.is_none() && surface.is_none() {
+            return None;
+        }
+        Some(
+            (1.0 - bbox.unwrap_or(0.0))
+                + (1.0 - mask.unwrap_or(0.0))
+                + depth.unwrap_or(0.0) * 0.25
+                + surface.unwrap_or(0.0) * 0.10,
+        )
+    })
+}
+
+fn final_yaw_candidate_metric(candidate: &Value, key: &str) -> Option<f32> {
+    candidate
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| value as f32)
+        .or_else(|| {
+            candidate
+                .get("geometry_metrics")
+                .and_then(|metrics| metrics.get(key))
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .map(|value| value as f32)
+        })
+}
+
+pub(crate) fn final_yaw_refinement_prompt(task: &Value) -> String {
+    let task_json = serde_json::to_string_pretty(task)
+        .unwrap_or_else(|_| serde_json::to_string(task).unwrap_or_default());
+    format!(
+        "You are selecting final bounded pose candidates for a 3D scene composition.\n\
+         The goal is not to choose an object-canonical front view. The goal is to choose the \
+         candidate whose yaw makes the generated 3D object semantically match the original source \
+         image from the source camera perspective. For each object, use the original full source \
+         scene, source-reference overlay, object source mask, and mask-tight source crop as the \
+         primary evidence, then compare candidate renders. Full-scene candidate renders keep all \
+         other scene objects visible and apply only the selected object's measured candidate pose. \
+         Target-only full-frame renders preserve the same source-camera projection and screen-space \
+         position but hide other objects so object orientation is easier to inspect. \
+         Rendered cardinal probes without geometry metrics are valid choices when they visibly \
+         match the source object orientation better than the measured metric-best candidate. \
+         Compare candidates in screen space against the source overlay and crop: the same object \
+         face should occupy the same side of the source bbox, visible seat cushions should face the \
+         camera on the same side, backs/outer shells should not be flipped toward the camera when \
+         the source shows seats, and curved/return sections should bend in the same image direction. \
+         Use the source mask/bbox to reason about what part of the object is actually visible; do \
+         not reward a candidate solely because its AABB covers more pixels when its front/back or \
+         left/right semantic surfaces are flipped relative to the source image. \
+         For large sofas/sectionals, prioritize visible cushion/back orientation, curve direction, \
+         open side, foreground-vs-background ordering, and relation to the table over bbox-only \
+         coverage when those disagree. Sectionals are not symmetric under 180-degree flips; do not \
+         keep a candidate just because it is labeled current if a cardinal probe better matches the \
+         source silhouette and visible seating direction. \
+         Fine-probe candidates are local yaw refinements around a previously plausible rendered \
+         candidate. Prefer a fine probe only when it provides a clear source-perspective semantic \
+         improvement over its parent candidate; if the source object is clipped by an image edge, \
+         occluded, or the fine probe only slightly improves bbox/crop metrics while rotating the \
+         object farther from the parent semantic orientation, keep the parent/cardinal candidate \
+         and report lower confidence. \
+         When contact_sheet_path is present, use the contact sheet as the primary visual \
+         comparison artifact: source evidence is shown first, and each candidate is identified by \
+         the border color recorded in rotation_selection.candidates[].contact_sheet_border_color. \
+         Choose exactly one candidate_index from the provided list. Do not invent yaw values, \
+         transforms, positions, scales, objects, or explanations that require changing anything \
+         except the selected candidate_index. Respect measured metrics in the JSON when comparing \
+         candidates with comparable visual orientation. Treat final_yaw_visual_fit.score as a \
+         measured source-perspective render match; if you choose a materially lower-scoring \
+         candidate, your rationale must identify the exact semantic surface flip or source-camera \
+         mismatch that justifies it. Do not let a failed measured candidate win solely on bbox/mask \
+         coverage if a rendered candidate is semantically better aligned. \
+         If the evidence is ambiguous, keep the current-yaw candidate and use lower confidence. \
+         Respond with JSON using exactly this shape: \
+         {{\"objects\":[{{\"index\":0,\"candidate_index\":0,\"confidence\":0.0,\"rationale\":\"...\"}}]}}. \
+         Include one entry in objects for every input object index.\n\n\
+         JSON task:\n{task_json}"
+    )
+}
+
+pub(crate) fn final_yaw_refinement_image_paths(task: &Value) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for key in ["source_scene_path", "source_reference_image"] {
+        let Some(path) = task.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        if !path.trim().is_empty() && seen.insert(path.to_string()) {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    for object in task
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for key in [
+            "contact_sheet_path",
+            "source_crop",
+            "source_mask_path",
+            "current_full_scene_render",
+        ] {
+            let Some(path) = object.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            if !path.trim().is_empty() && seen.insert(path.to_string()) {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        if let Some(path) = object
+            .get("source_mask")
+            .and_then(|mask| mask.get("mask_png_path"))
+            .and_then(Value::as_str)
+            && !path.trim().is_empty()
+            && seen.insert(path.to_string())
+        {
+            paths.push(PathBuf::from(path));
+        }
+        for candidate in object
+            .pointer("/rotation_selection/candidates")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for key in [
+                "rendered_candidate_full_scene",
+                "rendered_candidate_full_frame",
+                "rendered_candidate_object_only_full_frame",
+            ] {
+                let Some(path) = candidate.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if !path.trim().is_empty() && seen.insert(path.to_string()) {
+                    paths.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    paths
+}
+
+pub(crate) fn write_final_yaw_candidate_contact_sheets(
+    task: &mut Value,
+    output_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let objects = task
+        .get_mut("objects")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "final-yaw task missing objects array".to_string())?;
+    let contact_dir = output_dir.join("contact_sheets");
+    fs::create_dir_all(&contact_dir).map_err(|err| {
+        format!(
+            "failed to create final-yaw contact sheet dir {}: {err}",
+            contact_dir.display()
+        )
+    })?;
+    let mut paths = Vec::new();
+    for object in objects {
+        let index = object.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let label = object
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("object");
+        let slug = final_yaw_contact_sheet_slug(label);
+        let output_path = contact_dir.join(format!("{index:02}_{slug}_contact_sheet.png"));
+        if write_final_yaw_candidate_contact_sheet(object, &output_path)? {
+            object["contact_sheet_path"] = json!(output_path.display().to_string());
+            paths.push(output_path);
+        }
+    }
+    Ok(paths)
+}
+
+fn write_final_yaw_candidate_contact_sheet(
+    object: &mut Value,
+    output_path: &Path,
+) -> Result<bool, String> {
+    let mut tiles = Vec::new();
+    for key in [
+        "source_crop",
+        "source_mask_path",
+        "current_full_scene_render",
+    ] {
+        if let Some(path) = object.get(key).and_then(Value::as_str) {
+            tiles.push(FinalYawContactSheetTile {
+                path: PathBuf::from(path),
+                color: image::Rgba([245, 245, 245, 255]),
+            });
+        }
+    }
+    let Some(candidates) = object
+        .pointer_mut("/rotation_selection/candidates")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(false);
+    };
+    for candidate in candidates.iter_mut() {
+        let candidate_index = candidate
+            .get("candidate_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let (color_name, color) = final_yaw_candidate_contact_color(candidate_index);
+        candidate["contact_sheet_border_color"] = json!({
+            "name": color_name,
+            "rgba": [color[0], color[1], color[2], color[3]],
+        });
+        let Some(path) = candidate
+            .get("rendered_candidate_full_scene")
+            .or_else(|| candidate.get("rendered_candidate_full_frame"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        tiles.push(FinalYawContactSheetTile {
+            path: PathBuf::from(path),
+            color,
+        });
+    }
+    if tiles.len() <= 1 {
+        return Ok(false);
+    }
+    let columns = FINAL_YAW_CONTACT_SHEET_COLUMNS.min(tiles.len()).max(1);
+    let rows = tiles.len().div_ceil(columns);
+    let tile_w = FINAL_YAW_CONTACT_SHEET_TILE_WIDTH + FINAL_YAW_CONTACT_SHEET_BORDER * 2;
+    let tile_h = FINAL_YAW_CONTACT_SHEET_TILE_HEIGHT + FINAL_YAW_CONTACT_SHEET_BORDER * 2;
+    let width = (columns as u32 * tile_w)
+        + ((columns.saturating_sub(1)) as u32 * FINAL_YAW_CONTACT_SHEET_GAP);
+    let height =
+        (rows as u32 * tile_h) + ((rows.saturating_sub(1)) as u32 * FINAL_YAW_CONTACT_SHEET_GAP);
+    let mut sheet = image::RgbaImage::from_pixel(width, height, image::Rgba([12, 14, 18, 255]));
+    for (tile_index, tile) in tiles.iter().enumerate() {
+        let Some(tile_image) = load_final_yaw_contact_tile(&tile.path)? else {
+            continue;
+        };
+        let col = tile_index % columns;
+        let row = tile_index / columns;
+        let x = col as u32 * (tile_w + FINAL_YAW_CONTACT_SHEET_GAP);
+        let y = row as u32 * (tile_h + FINAL_YAW_CONTACT_SHEET_GAP);
+        draw_final_yaw_contact_border(&mut sheet, x, y, tile_w, tile_h, tile.color);
+        image::imageops::overlay(
+            &mut sheet,
+            &tile_image,
+            (x + FINAL_YAW_CONTACT_SHEET_BORDER) as i64,
+            (y + FINAL_YAW_CONTACT_SHEET_BORDER) as i64,
+        );
+    }
+    sheet.save(output_path).map_err(|err| {
+        format!(
+            "failed to write final-yaw contact sheet {}: {err}",
+            output_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+fn final_yaw_contact_sheet_slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() {
+        "object".to_string()
+    } else {
+        slug
+    }
+}
+
+struct FinalYawContactSheetTile {
+    path: PathBuf,
+    color: image::Rgba<u8>,
+}
+
+fn final_yaw_candidate_contact_color(index: usize) -> (&'static str, image::Rgba<u8>) {
+    const COLORS: [(&str, [u8; 4]); 12] = [
+        ("red", [238, 75, 75, 255]),
+        ("green", [80, 210, 116, 255]),
+        ("blue", [84, 150, 255, 255]),
+        ("magenta", [238, 84, 214, 255]),
+        ("cyan", [60, 210, 218, 255]),
+        ("orange", [255, 160, 56, 255]),
+        ("purple", [168, 116, 255, 255]),
+        ("yellow", [245, 220, 70, 255]),
+        ("pink", [255, 125, 170, 255]),
+        ("lime", [168, 230, 72, 255]),
+        ("teal", [62, 184, 160, 255]),
+        ("white", [244, 244, 244, 255]),
+    ];
+    let (name, rgba) = COLORS[index % COLORS.len()];
+    (name, image::Rgba(rgba))
+}
+
+fn load_final_yaw_contact_tile(path: &Path) -> Result<Option<image::RgbaImage>, String> {
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Ok(None);
+    }
+    let image = image::open(path).map_err(|err| {
+        format!(
+            "failed to open final-yaw contact tile {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(Some(
+        image
+            .resize_to_fill(
+                FINAL_YAW_CONTACT_SHEET_TILE_WIDTH,
+                FINAL_YAW_CONTACT_SHEET_TILE_HEIGHT,
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgba8(),
+    ))
+}
+
+fn draw_final_yaw_contact_border(
+    sheet: &mut image::RgbaImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    color: image::Rgba<u8>,
+) {
+    let max_x = (x + width).min(sheet.width());
+    let max_y = (y + height).min(sheet.height());
+    for yy in y..max_y {
+        for xx in x..max_x {
+            let on_border = xx < x + FINAL_YAW_CONTACT_SHEET_BORDER
+                || yy < y + FINAL_YAW_CONTACT_SHEET_BORDER
+                || xx >= max_x.saturating_sub(FINAL_YAW_CONTACT_SHEET_BORDER)
+                || yy >= max_y.saturating_sub(FINAL_YAW_CONTACT_SHEET_BORDER);
+            if on_border {
+                sheet.put_pixel(xx, yy, color);
+            }
+        }
+    }
+}
+
+fn write_final_yaw_source_reference_image(
+    source_scene_path: &str,
+    task: &Value,
+    output_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if source_scene_path.trim().is_empty() {
+        return Ok(None);
+    }
+    let source_path = Path::new(source_scene_path);
+    let mut image = image::open(source_path)
+        .map_err(|err| {
+            format!(
+                "failed to open source scene {}: {err}",
+                source_path.display()
+            )
+        })?
+        .to_rgba8();
+    let colors = [
+        image::Rgba([36, 220, 74, 255]),
+        image::Rgba([255, 196, 44, 255]),
+        image::Rgba([68, 158, 255, 255]),
+        image::Rgba([255, 76, 216, 255]),
+    ];
+    for (index, object) in task
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(bbox) = object.get("source_bbox").and_then(final_yaw_json_array4) {
+            draw_final_yaw_reference_rect(&mut image, bbox, colors[index % colors.len()]);
+        }
+    }
+    if let Err(err) = fs::create_dir_all(output_dir) {
+        return Err(format!(
+            "failed to create final-yaw output dir {}: {err}",
+            output_dir.display()
+        ));
+    }
+    let output_path = output_dir.join("source_scene_final_yaw_reference.png");
+    image.save(&output_path).map_err(|err| {
+        format!(
+            "failed to write final-yaw source reference {}: {err}",
+            output_path.display()
+        )
+    })?;
+    Ok(Some(output_path))
+}
+
+fn final_yaw_json_array4(value: &Value) -> Option<[f32; 4]> {
+    let array = value.as_array()?;
+    if array.len() != 4 {
+        return None;
+    }
+    Some([
+        array[0].as_f64()? as f32,
+        array[1].as_f64()? as f32,
+        array[2].as_f64()? as f32,
+        array[3].as_f64()? as f32,
+    ])
+}
+
+fn final_yaw_json_array3(value: &Value) -> Option<[f32; 3]> {
+    let array = value.as_array()?;
+    if array.len() != 3 {
+        return None;
+    }
+    Some([
+        array[0].as_f64()? as f32,
+        array[1].as_f64()? as f32,
+        array[2].as_f64()? as f32,
+    ])
+}
+
+fn draw_final_yaw_reference_rect(
+    image: &mut image::RgbaImage,
+    bbox: [f32; 4],
+    color: image::Rgba<u8>,
+) {
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    let x0 = (bbox[0].clamp(0.0, 1.0) * (width - 1) as f32).round() as u32;
+    let y0 = (bbox[1].clamp(0.0, 1.0) * (height - 1) as f32).round() as u32;
+    let x1 = (bbox[2].clamp(0.0, 1.0) * (width - 1) as f32).round() as u32;
+    let y1 = (bbox[3].clamp(0.0, 1.0) * (height - 1) as f32).round() as u32;
+    let (min_x, max_x) = (x0.min(x1), x0.max(x1));
+    let (min_y, max_y) = (y0.min(y1), y0.max(y1));
+    for thickness in 0..3 {
+        let left = min_x.saturating_sub(thickness);
+        let right = (max_x + thickness).min(width - 1);
+        let top = min_y.saturating_sub(thickness);
+        let bottom = (max_y + thickness).min(height - 1);
+        for x in left..=right {
+            image.put_pixel(x, top, color);
+            image.put_pixel(x, bottom, color);
+        }
+        for y in top..=bottom {
+            image.put_pixel(left, y, color);
+            image.put_pixel(right, y, color);
+        }
+    }
 }
 
 fn apply_gpt_ground_calibration<P: SceneAiProvider>(
@@ -2269,6 +3681,8 @@ impl McpServer {
                 rotation_fit: args.rotation_fit,
                 object_pose_refinement: args.object_pose_refinement,
                 object_pose_refinement_set: args.object_pose_refinement_set,
+                final_yaw_refinement: args.final_yaw_refinement,
+                final_yaw_refinement_set: args.final_yaw_refinement_set,
                 max_pose_candidates: args.max_pose_candidates,
             });
 
@@ -3041,6 +4455,82 @@ impl McpServer {
                 }),
             );
         }
+        if args.pose_fit == ScenePoseFitMode::RenderedSilhouette
+            && args.lift_assets
+            && args.final_yaw_refinement.enabled()
+        {
+            let stage_started = Instant::now();
+            progress.emit(
+                "final_context_yaw_refinement",
+                SceneBuildProgressPhase::Started,
+                SceneBuildExecutionKind::Viewer,
+                "selecting final full-scene contextual yaw candidates for high-risk objects",
+                json!({
+                    "mode": args.final_yaw_refinement,
+                    "object_set": args.final_yaw_refinement_set,
+                    "confidence_threshold": args.final_yaw_confidence_threshold,
+                    "max_candidates": args.final_yaw_max_candidates,
+                }),
+            );
+            let prior_pose_report = response
+                .get("object_pose_refinement")
+                .or_else(|| response.get("visible_surface_pose_fit"))
+                .cloned();
+            let fit = self.run_final_context_yaw_refinement(
+                &output_dir.join("final_yaw_refinement"),
+                &manifest,
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+                Some(&grounding_evidence),
+                prior_pose_report.as_ref(),
+                args.final_yaw_refinement,
+                args.final_yaw_refinement_set,
+                args.final_yaw_confidence_threshold,
+                args.final_yaw_max_candidates,
+                args.write_artifacts,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, &asset_bindings);
+            selected_composition.layout = fit.grounded_layout;
+            let pose_bsn = feedback_bsn_from_commands(
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+            )?;
+            selected_composition.plan =
+                parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
+            selected_composition.layout.bsn = pose_bsn;
+            selected_composition.commands = commands.clone();
+            response["final_yaw_refinement"] = fit.report;
+            record_stage(
+                &mut stage_report,
+                "final_context_yaw_refinement",
+                stage_started,
+            );
+            progress.emit_with_items(
+                "final_context_yaw_refinement",
+                SceneBuildProgressPhase::Completed,
+                SceneBuildExecutionKind::Viewer,
+                "final contextual yaw refinement complete",
+                None,
+                Some(selected_composition.layout.placements.len()),
+                Some(
+                    output_dir
+                        .join("final_yaw_refinement")
+                        .join("final_yaw_refinement_report.json"),
+                ),
+                json!({
+                    "status": response
+                        .pointer("/final_yaw_refinement/status")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "applied_count": response
+                        .pointer("/final_yaw_refinement/applied_count")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }),
+            );
+        }
         if args.feedback && args.lift_assets {
             let stage_started = Instant::now();
             progress.emit_with_items(
@@ -3510,6 +5000,8 @@ impl McpServer {
                 rotation_fit: args.rotation_fit,
                 object_pose_refinement: args.object_pose_refinement,
                 object_pose_refinement_set: args.object_pose_refinement_set,
+                final_yaw_refinement: args.final_yaw_refinement,
+                final_yaw_refinement_set: args.final_yaw_refinement_set,
                 max_pose_candidates: args.max_pose_candidates,
             });
 
@@ -3543,6 +5035,7 @@ impl McpServer {
             "grounding_evidence": evidence.clone(),
             "clear_existing": args.clear_existing,
             "apply": args.apply,
+            "promote_to_catalog": args.promote_to_catalog,
         });
         mark_canonical_pose_verification_failure(&mut response, &canonical_pose_verification);
         if let Some(report) = segmentation_report {
@@ -3628,6 +5121,47 @@ impl McpServer {
             record_stage(&mut stage_report, "object_pose_refinement", stage_started);
         }
 
+        if args.pose_fit == ScenePoseFitMode::RenderedSilhouette
+            && args.final_yaw_refinement.enabled()
+        {
+            let stage_started = Instant::now();
+            let prior_pose_report = response
+                .get("object_pose_refinement")
+                .or_else(|| response.get("visible_surface_pose_fit"))
+                .cloned();
+            let fit = self.run_final_context_yaw_refinement(
+                &output_dir.join("final_yaw_refinement"),
+                &manifest,
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+                Some(&evidence),
+                prior_pose_report.as_ref(),
+                args.final_yaw_refinement,
+                args.final_yaw_refinement_set,
+                args.final_yaw_confidence_threshold,
+                args.final_yaw_max_candidates,
+                true,
+            )?;
+            commands = scene_commands_with_asset_local_aabbs(fit.commands, &asset_bindings);
+            selected_composition.layout = fit.grounded_layout;
+            let pose_bsn = feedback_bsn_from_commands(
+                &asset_bindings,
+                &selected_composition.layout,
+                &commands,
+            )?;
+            selected_composition.plan =
+                parse_scene_bsn(&pose_bsn, &asset_bindings).map_err(|err| err.to_string())?;
+            selected_composition.layout.bsn = pose_bsn;
+            selected_composition.commands = commands.clone();
+            response["final_yaw_refinement"] = fit.report;
+            record_stage(
+                &mut stage_report,
+                "final_context_yaw_refinement",
+                stage_started,
+            );
+        }
+
         if args.feedback {
             let stage_started = Instant::now();
             let selection = self.run_scene_composition_feedback_selection(
@@ -3701,6 +5235,28 @@ impl McpServer {
             "composition_mode": response["composition_mode"],
             "grounding_source": response["grounding_source"],
         });
+        if args.promote_to_catalog {
+            let stage_started = Instant::now();
+            let mut catalog_cache = self.open_catalog_cache()?;
+            let scene_catalog_entry = promote_scene_build_scene_to_catalog(
+                &mut catalog_cache,
+                &args.source_scene_path,
+                &output_dir,
+                response["bsn"].as_str().unwrap_or_default(),
+                &asset_bindings,
+                &grounded_layout,
+                &response,
+            )?;
+            record_stage(&mut stage_report, "promote_scene_to_catalog", stage_started);
+            response["scene_catalog_entry"] = scene_catalog_entry;
+            response["stage_report"] = json!(stage_report);
+            response["e2e_summary"] = json!({
+                "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "objects": response["grounded_layout"]["placements"].as_array().map(Vec::len).unwrap_or_default(),
+                "composition_mode": response["composition_mode"],
+                "grounding_source": response["grounding_source"],
+            });
+        }
         write_scene_ground_artifacts(&output_dir, &response)?;
         Ok(response)
     }
@@ -3958,7 +5514,7 @@ impl McpServer {
         let original_control_path = self.config.scene_control_path.clone();
         let original_status_path = self.config.scene_status_path.clone();
         let original_timeout = self.config.scene_timeout;
-        let mut spawned_viewer = match spawn_feedback_viewer(&control_path, &log_path) {
+        let mut spawned_viewer = match spawn_feedback_viewer(&control_path, &log_path, None) {
             Ok(child) => child,
             Err(err) => {
                 let message = format!("failed to spawn canonical pose thumbnail viewer: {err}");
@@ -4590,7 +6146,11 @@ impl McpServer {
             let control_path = bridge_dir.join("scene_commands.json");
             let status_path = bridge_dir.join("scene_commands.status.json");
             let log_path = bridge_dir.join("viewer.log");
-            spawned_viewer = Some(spawn_feedback_viewer(&control_path, &log_path)?);
+            spawned_viewer = Some(spawn_feedback_viewer(
+                &control_path,
+                &log_path,
+                scene_capture_window_size_for_source(&manifest.source_scene_path),
+            )?);
             self.config.scene_control_path = Some(control_path);
             self.config.scene_status_path = Some(status_path);
             self.config.scene_timeout = self.config.scene_timeout.max(Duration::from_secs(60));
@@ -5152,6 +6712,807 @@ impl McpServer {
         }
     }
 
+    fn capture_feedback_when_projected_ready_with_foreground(
+        &self,
+        apply_ack: &Value,
+        screenshot_path: &Path,
+        expected_items: usize,
+        min_foreground_ratio: f32,
+    ) -> Result<(Value, Value, Value), String> {
+        let timeout = self.config.scene_timeout.max(Duration::from_secs(10));
+        let started = Instant::now();
+        let mut attempt = 0usize;
+        thread::sleep(Duration::from_millis(FEEDBACK_RENDER_SETTLE_MS));
+        loop {
+            let capture = self.call_scene_capture(SceneCaptureArgs {
+                output_path: screenshot_path.to_path_buf(),
+            })?;
+            let status = Self::feedback_capture_status(apply_ack, &capture);
+            let foreground =
+                final_yaw_render_foreground_report(screenshot_path, min_foreground_ratio);
+            let ready = Self::feedback_status_projected_items_ready(&status, expected_items)
+                && foreground
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if ready || started.elapsed() >= timeout {
+                return Ok((capture, status, foreground));
+            }
+            attempt = attempt.saturating_add(1);
+            let sleep_ms = if attempt < 4 { 250 } else { 500 };
+            thread::sleep(Duration::from_millis(sleep_ms));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_final_context_yaw_refinement(
+        &mut self,
+        output_dir: &Path,
+        manifest: &SceneObjectManifest,
+        asset_bindings: &[SceneAssetBinding],
+        grounded_layout: &GroundedSceneLayout,
+        commands: &[Value],
+        grounding_evidence: Option<&SceneGroundingEvidence>,
+        prior_pose_report: Option<&Value>,
+        mode: SceneFinalYawRefinementMode,
+        object_set: SceneObjectPoseRefinementSet,
+        confidence_threshold: f32,
+        max_candidates: usize,
+        write_artifacts: bool,
+    ) -> Result<SceneRotationFitOutcome, String> {
+        let config = SceneFinalYawRefinementConfig {
+            mode,
+            object_set,
+            confidence_threshold,
+            max_candidates,
+            write_artifacts,
+            output_dir,
+            grounding_evidence,
+            rendered_selection_task: None,
+        };
+        let mut prepared = apply_scene_final_yaw_refinement(
+            config,
+            manifest,
+            asset_bindings,
+            grounded_layout,
+            commands,
+            prior_pose_report,
+            None,
+        )?;
+        if !mode.requires_selection() {
+            return Ok(prepared);
+        }
+        let task = prepared
+            .report
+            .get("selection_task")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if task.is_null() {
+            return Ok(prepared);
+        }
+        let original_control_path = self.config.scene_control_path.clone();
+        let original_status_path = self.config.scene_status_path.clone();
+        let original_timeout = self.config.scene_timeout;
+        let mut spawned_viewer = None;
+        if self.config.scene_control_path.is_none() {
+            let bridge_dir = output_dir.join("_viewer");
+            fs::create_dir_all(&bridge_dir).map_err(|err| {
+                format!(
+                    "failed to create final-yaw viewer directory {}: {err}",
+                    bridge_dir.display()
+                )
+            })?;
+            let control_path = bridge_dir.join("scene_commands.json");
+            let status_path = control_path.with_extension("status.json");
+            let log_path = bridge_dir.join("viewer.log");
+            let window_size = scene_capture_window_size_for_source(&manifest.source_scene_path);
+            match spawn_feedback_viewer(&control_path, &log_path, window_size) {
+                Ok(child) => {
+                    prepared.report["private_viewer"] = json!({
+                        "enabled": true,
+                        "control_path": control_path.display().to_string(),
+                        "status_path": status_path.display().to_string(),
+                        "log_path": log_path.display().to_string(),
+                        "window_size": window_size,
+                    });
+                    spawned_viewer = Some(child);
+                    self.config.scene_control_path = Some(control_path);
+                    self.config.scene_status_path = Some(status_path);
+                    self.config.scene_timeout =
+                        self.config.scene_timeout.max(Duration::from_secs(60));
+                }
+                Err(err) => {
+                    prepared.report["selection_status"] = json!("private_viewer_spawn_failed");
+                    prepared.report["selection_error"] = json!(err);
+                    if write_artifacts {
+                        write_json_file(
+                            &output_dir.join("final_yaw_refinement_report.json"),
+                            &prepared.report,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                    return Ok(prepared);
+                }
+            }
+        }
+
+        let result = self.run_final_context_yaw_refinement_with_scene_bridge(
+            output_dir,
+            manifest,
+            asset_bindings,
+            grounded_layout,
+            commands,
+            prior_pose_report,
+            config,
+            prepared,
+            task,
+        );
+
+        if let Some(mut child) = spawned_viewer {
+            let _ = self.send_scene_commands_unacknowledged(vec![json!({ "type": "clear_scene" })]);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.config.scene_control_path = original_control_path;
+        self.config.scene_status_path = original_status_path;
+        self.config.scene_timeout = original_timeout;
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_final_context_yaw_refinement_with_scene_bridge(
+        &self,
+        output_dir: &Path,
+        manifest: &SceneObjectManifest,
+        asset_bindings: &[SceneAssetBinding],
+        grounded_layout: &GroundedSceneLayout,
+        commands: &[Value],
+        prior_pose_report: Option<&Value>,
+        config: SceneFinalYawRefinementConfig<'_>,
+        mut prepared: SceneRotationFitOutcome,
+        mut task: Value,
+    ) -> Result<SceneRotationFitOutcome, String> {
+        let write_artifacts = config.write_artifacts;
+        let render_report =
+            self.render_final_context_yaw_candidates(output_dir, commands, &mut task)?;
+        prepared.report["candidate_render_report"] = render_report.clone();
+        if write_artifacts {
+            match write_final_yaw_source_reference_image(
+                &manifest.source_scene_path,
+                &task,
+                output_dir,
+            ) {
+                Ok(Some(path)) => {
+                    let path = path.display().to_string();
+                    task["source_reference_image"] = json!(path);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    prepared.report["source_reference_warning"] = json!(err);
+                }
+            }
+            match write_final_yaw_candidate_contact_sheets(&mut task, output_dir) {
+                Ok(paths) => {
+                    prepared.report["contact_sheets"] = json!(
+                        paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                Err(err) => {
+                    prepared.report["contact_sheet_warning"] = json!(err);
+                }
+            }
+        }
+        prepared.report["selection_task"] = task.clone();
+        if write_artifacts {
+            write_json_file(&output_dir.join("selection_task.rendered.json"), &task)
+                .map_err(|err| err.to_string())?;
+        }
+        if render_report
+            .get("rendered")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+        {
+            prepared.report["selection_status"] = json!("rendering_unavailable");
+            if let Some(response) = final_yaw_metric_best_response(&task) {
+                let rendered_config = SceneFinalYawRefinementConfig {
+                    rendered_selection_task: Some(&task),
+                    ..config
+                };
+                let mut applied = apply_scene_final_yaw_refinement(
+                    rendered_config,
+                    manifest,
+                    asset_bindings,
+                    grounded_layout,
+                    commands,
+                    prior_pose_report,
+                    Some(&response),
+                )?;
+                applied.report["candidate_render_report"] = render_report;
+                applied.report["selection_task"] = task;
+                applied.report["selection_status"] =
+                    json!("rendering_unavailable_safe_metric_best_applied");
+                applied.report["selection_response"] =
+                    serde_json::to_value(response).map_err(|err| err.to_string())?;
+                if write_artifacts {
+                    write_json_file(
+                        &output_dir.join("selection_response.metric_best.json"),
+                        &applied.report["selection_response"],
+                    )
+                    .map_err(|err| err.to_string())?;
+                    write_json_file(
+                        &output_dir.join("final_yaw_refinement_report.json"),
+                        &applied.report,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+                return Ok(applied);
+            }
+            prepared.report["selection_status"] =
+                json!("rendering_unavailable_no_safe_metric_fallback");
+            prepared.report["selection_blocker"] = json!(
+                "final contextual renders are required for failed or ambiguous large-object candidates"
+            );
+            if write_artifacts {
+                write_json_file(
+                    &output_dir.join("final_yaw_refinement_report.json"),
+                    &prepared.report,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            return Ok(prepared);
+        }
+
+        let prompt = final_yaw_refinement_prompt(&task);
+        let image_paths = final_yaw_refinement_image_paths(&task);
+        if write_artifacts {
+            write_json_file(
+                &output_dir.join("selection_request.json"),
+                &json!({
+                    "prompt": prompt,
+                    "task": task,
+                    "image_paths": image_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                }),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        let mut response = match self.openai_provider().and_then(|provider| {
+            provider
+                .select_rotation_candidates(&SceneRotationSelectionRequest {
+                    prompt: final_yaw_refinement_prompt(&task),
+                    task: task.clone(),
+                    image_paths,
+                })
+                .map_err(|err| err.to_string())
+        }) {
+            Ok(response) => response,
+            Err(err) => {
+                prepared.report["selection_status"] = json!("openai_unavailable");
+                prepared.report["selection_error"] = json!(err);
+                return Ok(prepared);
+            }
+        };
+        if write_artifacts {
+            write_json_file(
+                &output_dir.join("selection_response.json"),
+                &serde_json::to_value(&response).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        let coarse_visual_response = final_yaw_visual_best_response(&task, &response);
+        let coarse_visual_response_value =
+            serde_json::to_value(&coarse_visual_response).map_err(|err| err.to_string())?;
+        let coarse_response_value =
+            serde_json::to_value(&response).map_err(|err| err.to_string())?;
+        let visual_gate_changed = coarse_visual_response_value != coarse_response_value;
+        if visual_gate_changed {
+            prepared.report["visual_gate_response"] = coarse_visual_response_value.clone();
+            prepared.report["visual_gate_previous_response"] = coarse_response_value;
+            prepared.report["visual_gate_stage"] = json!("coarse");
+            response = coarse_visual_response;
+            if write_artifacts {
+                write_json_file(
+                    &output_dir.join("selection_response.visual_gate.json"),
+                    &coarse_visual_response_value,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+        }
+        let mut fine_render_report = Value::Null;
+        let fine_candidate_count = final_yaw_add_fine_refinement_candidates(&mut task, &response);
+        if fine_candidate_count > 0 {
+            fine_render_report =
+                self.render_final_context_yaw_candidates(output_dir, commands, &mut task)?;
+            if write_artifacts {
+                match write_final_yaw_candidate_contact_sheets(&mut task, output_dir) {
+                    Ok(paths) => {
+                        prepared.report["fine_contact_sheets"] = json!(
+                            paths
+                                .iter()
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    Err(err) => {
+                        prepared.report["fine_contact_sheet_warning"] = json!(err);
+                    }
+                }
+            }
+            let fine_prompt = final_yaw_refinement_prompt(&task);
+            let fine_image_paths = final_yaw_refinement_image_paths(&task);
+            if write_artifacts {
+                write_json_file(&output_dir.join("selection_task.fine.rendered.json"), &task)
+                    .map_err(|err| err.to_string())?;
+                write_json_file(
+                    &output_dir.join("selection_request.fine.json"),
+                    &json!({
+                        "prompt": fine_prompt,
+                        "task": task,
+                        "image_paths": fine_image_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>(),
+                        "fine_candidate_count": fine_candidate_count,
+                    }),
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            match self.openai_provider().and_then(|provider| {
+                provider
+                    .select_rotation_candidates(&SceneRotationSelectionRequest {
+                        prompt: final_yaw_refinement_prompt(&task),
+                        task: task.clone(),
+                        image_paths: fine_image_paths,
+                    })
+                    .map_err(|err| err.to_string())
+            }) {
+                Ok(fine_response) => {
+                    response = fine_response;
+                    if write_artifacts {
+                        write_json_file(
+                            &output_dir.join("selection_response.fine.json"),
+                            &serde_json::to_value(&response).map_err(|err| err.to_string())?,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                }
+                Err(err) => {
+                    prepared.report["fine_selection_warning"] = json!(err);
+                }
+            }
+            let visual_response = final_yaw_visual_best_response(&task, &response);
+            let visual_response_value =
+                serde_json::to_value(&visual_response).map_err(|err| err.to_string())?;
+            let response_value = serde_json::to_value(&response).map_err(|err| err.to_string())?;
+            if visual_response_value != response_value {
+                prepared.report["visual_gate_response"] = visual_response_value.clone();
+                prepared.report["visual_gate_previous_response"] = response_value;
+                prepared.report["visual_gate_stage"] = json!("fine");
+                response = visual_response;
+                if write_artifacts {
+                    write_json_file(
+                        &output_dir.join("selection_response.visual_gate.json"),
+                        &visual_response_value,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+            }
+        }
+        let rendered_config = SceneFinalYawRefinementConfig {
+            rendered_selection_task: Some(&task),
+            ..config
+        };
+        let mut applied = apply_scene_final_yaw_refinement(
+            rendered_config,
+            manifest,
+            asset_bindings,
+            grounded_layout,
+            commands,
+            prior_pose_report,
+            Some(&response),
+        )?;
+        applied.report["candidate_render_report"] = json!({
+            "coarse": render_report,
+            "fine": fine_render_report,
+            "fine_candidate_count": fine_candidate_count,
+        });
+        applied.report["selection_task"] = task;
+        applied.report["selection_response"] =
+            serde_json::to_value(response).map_err(|err| err.to_string())?;
+        if write_artifacts {
+            write_json_file(
+                &output_dir.join("final_yaw_refinement_report.json"),
+                &applied.report,
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        Ok(applied)
+    }
+
+    fn render_final_context_yaw_candidates(
+        &self,
+        output_dir: &Path,
+        commands: &[Value],
+        task: &mut Value,
+    ) -> Result<Value, String> {
+        let root = output_dir.join("full_scene_candidates");
+        fs::create_dir_all(&root).map_err(|err| {
+            format!(
+                "failed to create final yaw candidate directory {}: {err}",
+                root.display()
+            )
+        })?;
+        let expected_items = feedback_rotation_spawn_commands(commands).len().max(1);
+        let mut attempted = 0usize;
+        let mut rendered = 0usize;
+        let mut target_only_attempted = 0usize;
+        let mut target_only_rendered = 0usize;
+        let mut reused = 0usize;
+        let mut target_only_reused = 0usize;
+        let mut errors = Vec::new();
+        let Some(objects) = task.get_mut("objects").and_then(Value::as_array_mut) else {
+            return Ok(json!({
+                "enabled": true,
+                "attempted": 0,
+                "rendered": 0,
+                "reason": "selection_task_missing_objects",
+            }));
+        };
+        for object in objects {
+            let index = object
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(usize::MAX);
+            let command_index = object
+                .get("command_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(usize::MAX);
+            if index == usize::MAX || command_index == usize::MAX {
+                errors.push(json!({
+                    "index": index,
+                    "reason": "missing_index_or_command_index",
+                }));
+                continue;
+            }
+            let object_id = object
+                .get("object_id")
+                .and_then(Value::as_str)
+                .unwrap_or("object");
+            let object_dir = root.join(sanitize_feedback_crop_name(index, object_id));
+            fs::create_dir_all(&object_dir).map_err(|err| {
+                format!(
+                    "failed to create final yaw object candidate directory {}: {err}",
+                    object_dir.display()
+                )
+            })?;
+            let object_context = object.clone();
+            let Some(candidates) = object
+                .pointer_mut("/rotation_selection/candidates")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let mut current_full_scene_render = None;
+            for candidate in candidates {
+                let candidate_index = candidate
+                    .get("candidate_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let Some(candidate_yaw) = candidate
+                    .get("candidate_yaw_degrees")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite())
+                    .map(|value| value as f32)
+                else {
+                    errors.push(json!({
+                        "index": index,
+                        "candidate_index": candidate_index,
+                        "reason": "candidate_missing_yaw",
+                    }));
+                    continue;
+                };
+                let has_full_render = candidate
+                    .get("rendered_candidate_full_scene")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| {
+                        Path::new(path).exists() && final_yaw_render_path_has_foreground(path)
+                    });
+                let has_target_only_render = candidate
+                    .get("rendered_candidate_object_only_full_frame")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| {
+                        Path::new(path).exists() && final_yaw_render_path_has_foreground(path)
+                    });
+                if has_full_render && has_target_only_render {
+                    let full_path = candidate
+                        .get("rendered_candidate_full_scene")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from);
+                    let target_only_path = candidate
+                        .get("rendered_candidate_object_only_full_frame")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from);
+                    let target_bbox = candidate
+                        .get("rendered_candidate_bbox")
+                        .and_then(final_yaw_json_array4)
+                        .or_else(|| {
+                            candidate
+                                .pointer("/final_yaw_visual_fit/projected_bbox")
+                                .and_then(final_yaw_json_array4)
+                        });
+                    if let (Some(full_path), Some(target_only_path), Some(target_bbox)) =
+                        (full_path, target_only_path, target_bbox)
+                    {
+                        let yaw_label = candidate
+                            .get("candidate_yaw_degrees")
+                            .and_then(Value::as_f64)
+                            .map(|value| canonical_pose_yaw_file_component(value as f32))
+                            .unwrap_or_else(|| format!("candidate_{candidate_index:02}"));
+                        let crop_path = candidate
+                            .get("rendered_candidate_crop")
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| {
+                                object_dir.join(format!(
+                                    "candidate_{candidate_index:02}_yaw_{yaw_label}_full_scene_target_crop.png"
+                                ))
+                            });
+                        let foreground = candidate
+                            .pointer("/rendered_candidate_capture/foreground")
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                final_yaw_render_foreground_report(
+                                    &full_path,
+                                    FINAL_YAW_RENDER_MIN_FOREGROUND_RATIO,
+                                )
+                            });
+                        let visual_fit = final_yaw_render_visual_fit_report(
+                            &object_context,
+                            &full_path,
+                            target_bbox,
+                            &crop_path,
+                            &foreground,
+                            Some(&target_only_path),
+                        );
+                        candidate["rendered_candidate_bbox"] = json!(target_bbox);
+                        candidate["rendered_candidate_crop"] =
+                            json!(crop_path.display().to_string());
+                        candidate["final_yaw_visual_fit"] = visual_fit;
+                    }
+                    attempted += 1;
+                    rendered += 1;
+                    target_only_attempted += 1;
+                    target_only_rendered += 1;
+                    reused += 1;
+                    target_only_reused += 1;
+                    continue;
+                }
+                attempted += 1;
+                let yaw_label = canonical_pose_yaw_file_component(candidate_yaw);
+                let screenshot_path = object_dir.join(format!(
+                    "candidate_{candidate_index:02}_yaw_{yaw_label}_full_scene.png"
+                ));
+                let apply_ack = match self.send_scene_commands(
+                    final_yaw_full_scene_candidate_commands(commands, command_index, candidate),
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(json!({
+                            "index": index,
+                            "candidate_index": candidate_index,
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                };
+                let (capture, status, foreground) = match self
+                    .capture_feedback_when_projected_ready_with_foreground(
+                        &apply_ack,
+                        &screenshot_path,
+                        expected_items,
+                        FINAL_YAW_RENDER_MIN_FOREGROUND_RATIO,
+                    ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(json!({
+                            "index": index,
+                            "candidate_index": candidate_index,
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                };
+                if !foreground
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    candidate["rendered_candidate_full_scene_validation"] = foreground.clone();
+                    errors.push(json!({
+                        "index": index,
+                        "candidate_index": candidate_index,
+                        "reason": "full_scene_candidate_render_blank_or_not_ready",
+                        "foreground": foreground,
+                    }));
+                    continue;
+                }
+                let target_bbox = final_yaw_target_projected_bbox(&status, commands, command_index);
+                if let Some(target_bbox) = target_bbox {
+                    let crop_path = object_dir.join(format!(
+                        "candidate_{candidate_index:02}_yaw_{yaw_label}_full_scene_target_crop.png"
+                    ));
+                    let visual_fit = final_yaw_render_visual_fit_report(
+                        &object_context,
+                        &screenshot_path,
+                        target_bbox,
+                        &crop_path,
+                        &foreground,
+                        None,
+                    );
+                    candidate["rendered_candidate_bbox"] = json!(target_bbox);
+                    candidate["rendered_candidate_crop"] = json!(crop_path.display().to_string());
+                    candidate["final_yaw_visual_fit"] = visual_fit;
+                } else {
+                    candidate["final_yaw_visual_fit"] = json!({
+                        "error": "missing_target_projected_bbox",
+                    });
+                }
+                candidate["rendered_candidate_full_scene"] =
+                    json!(screenshot_path.display().to_string());
+                candidate["rendered_candidate_full_frame"] =
+                    json!(screenshot_path.display().to_string());
+                candidate["rendered_candidate_capture"] = json!({
+                    "ok": capture.get("ok").cloned().unwrap_or(Value::Null),
+                    "output_path": screenshot_path.display().to_string(),
+                    "expected_items": expected_items,
+                    "projected_item_count": status
+                        .get("projected_items")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    "foreground": foreground,
+                });
+                if candidate_index == 0 {
+                    current_full_scene_render = Some(screenshot_path.display().to_string());
+                }
+                rendered += 1;
+
+                let target_only_path = object_dir.join(format!(
+                    "candidate_{candidate_index:02}_yaw_{yaw_label}_target_only_full_frame.png"
+                ));
+                let Some(target_only_commands) =
+                    final_yaw_target_only_candidate_commands(commands, command_index, candidate)
+                else {
+                    errors.push(json!({
+                        "index": index,
+                        "candidate_index": candidate_index,
+                        "reason": "target_only_candidate_missing_spawn_command",
+                    }));
+                    continue;
+                };
+                target_only_attempted += 1;
+                let apply_ack = match self.send_scene_commands(target_only_commands) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(json!({
+                            "index": index,
+                            "candidate_index": candidate_index,
+                            "target_only": true,
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                };
+                let (capture, status, foreground) = match self
+                    .capture_feedback_when_projected_ready_with_foreground(
+                        &apply_ack,
+                        &target_only_path,
+                        1,
+                        FINAL_YAW_TARGET_ONLY_RENDER_MIN_FOREGROUND_RATIO,
+                    ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        errors.push(json!({
+                            "index": index,
+                            "candidate_index": candidate_index,
+                            "target_only": true,
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                };
+                if !foreground
+                    .get("ok")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    candidate["rendered_candidate_object_only_validation"] = foreground.clone();
+                    errors.push(json!({
+                        "index": index,
+                        "candidate_index": candidate_index,
+                        "target_only": true,
+                        "reason": "target_only_candidate_render_blank_or_not_ready",
+                        "foreground": foreground,
+                    }));
+                    continue;
+                }
+                candidate["rendered_candidate_object_only_full_frame"] =
+                    json!(target_only_path.display().to_string());
+                candidate["rendered_candidate_object_only_capture"] = json!({
+                    "ok": capture.get("ok").cloned().unwrap_or(Value::Null),
+                    "output_path": target_only_path.display().to_string(),
+                    "expected_items": 1,
+                    "projected_item_count": status
+                        .get("projected_items")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    "foreground": foreground,
+                });
+                if let Some(target_bbox) = candidate
+                    .get("rendered_candidate_bbox")
+                    .and_then(final_yaw_json_array4)
+                {
+                    let crop_path = candidate
+                        .get("rendered_candidate_crop")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            object_dir.join(format!(
+                                "candidate_{candidate_index:02}_yaw_{yaw_label}_full_scene_target_crop.png"
+                            ))
+                        });
+                    let full_foreground = candidate
+                        .pointer("/rendered_candidate_capture/foreground")
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            final_yaw_render_foreground_report(
+                                &screenshot_path,
+                                FINAL_YAW_RENDER_MIN_FOREGROUND_RATIO,
+                            )
+                        });
+                    let visual_fit = final_yaw_render_visual_fit_report(
+                        &object_context,
+                        &screenshot_path,
+                        target_bbox,
+                        &crop_path,
+                        &full_foreground,
+                        Some(&target_only_path),
+                    );
+                    candidate["rendered_candidate_crop"] = json!(crop_path.display().to_string());
+                    candidate["final_yaw_visual_fit"] = visual_fit;
+                }
+                target_only_rendered += 1;
+            }
+            if let Some(path) = current_full_scene_render {
+                object["current_full_scene_render"] = json!(path);
+            }
+        }
+        let _ = self.send_scene_commands_unacknowledged(commands.to_vec());
+        Ok(json!({
+            "enabled": true,
+            "selector_support": "full_scene_context_single_object_measured_pose_candidates",
+            "root": root.display().to_string(),
+            "attempted": attempted,
+            "rendered": rendered,
+            "reused": reused,
+            "target_only_attempted": target_only_attempted,
+            "target_only_rendered": target_only_rendered,
+            "target_only_reused": target_only_reused,
+            "error_count": errors.len(),
+            "errors": errors,
+        }))
+    }
+
     fn render_feedback_rotation_candidate_crops(
         &self,
         iteration_dir: &Path,
@@ -5500,7 +7861,7 @@ impl McpServer {
                 }),
             );
         }
-        let _ = self.send_scene_commands(commands.to_vec());
+        let _ = self.send_scene_commands_unacknowledged(commands.to_vec());
         Ok(json!({
             "enabled": true,
             "selector_support": "isolated_per_object_scene_camera_yaw_candidates",
@@ -5657,6 +8018,15 @@ impl McpServer {
 
     pub(crate) fn feedback_capture_status(apply_ack: &Value, capture_ack: &Value) -> Value {
         let apply_status = apply_ack.get("status").cloned().unwrap_or(Value::Null);
+        let capture_status = capture_ack
+            .get("acknowledgement")
+            .and_then(|ack| ack.get("status"))
+            .cloned();
+        if let Some(capture_status) = capture_status
+            && Self::feedback_status_has_projected_aabbs(&capture_status)
+        {
+            return capture_status;
+        }
         if Self::feedback_status_has_projected_aabbs(&apply_status) {
             return apply_status;
         }
@@ -5705,7 +8075,10 @@ impl McpServer {
         })
     }
 
-    pub(crate) fn send_scene_commands(&self, commands: Vec<Value>) -> Result<Value, String> {
+    fn scene_command_envelope(
+        &self,
+        commands: Vec<Value>,
+    ) -> Result<(PathBuf, u64, Value), String> {
         if commands.is_empty() {
             return Err("scene command list must not be empty".to_string());
         }
@@ -5721,8 +8094,23 @@ impl McpServer {
             "sequence": sequence,
             "commands": commands,
         });
-        atomic_write_json(control_path, &envelope)?;
+        Ok((control_path.clone(), sequence, envelope))
+    }
 
+    fn send_scene_commands_unacknowledged(&self, commands: Vec<Value>) -> Result<Value, String> {
+        let (control_path, sequence, envelope) = self.scene_command_envelope(commands)?;
+        atomic_write_json(&control_path, &envelope)?;
+        Ok(json!({
+            "tool": "scene_command",
+            "command_path": control_path.display().to_string(),
+            "sequence": sequence,
+            "acknowledged": false,
+        }))
+    }
+
+    pub(crate) fn send_scene_commands(&self, commands: Vec<Value>) -> Result<Value, String> {
+        let (control_path, sequence, envelope) = self.scene_command_envelope(commands)?;
+        atomic_write_json(&control_path, &envelope)?;
         let Some(status_path) = self.config.scene_status_path.as_ref() else {
             return Ok(json!({
                 "tool": "scene_command",

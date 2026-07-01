@@ -35,7 +35,8 @@ use crate::app::{
     UiVisibilityState, apply_scene_build_progress_event, drive_inference, enqueue_inference,
     handle_catalog_delete_requests, handle_ui_visibility_shortcut, processing_window_title,
     scene_bsn_export_for_world, scene_glb_export_for_world, should_run_headless_once,
-    title_rattler_frame,
+    title_rattler_frame, viewer_camera_exposure, viewer_camera_tonemapping,
+    viewer_lighting_profile,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::{
@@ -110,6 +111,8 @@ fn test_args() -> AppArgs {
         pause_render_during_inference: true,
         ui_visible: true,
         read_only: false,
+        window_width: None,
+        window_height: None,
         max_batch_size: 1,
         mcp_scene_control_path: None,
         scene_bsn: None,
@@ -123,6 +126,25 @@ fn dummy_mesh() -> SynthMesh {
         vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         faces: vec![[0, 1, 2]],
     })
+}
+
+#[test]
+fn viewer_lighting_profile_is_soft_and_wasm_portable() {
+    let profile = viewer_lighting_profile();
+    assert!(profile.ambient_brightness <= 140.0);
+    assert!(profile.key_illuminance <= 12_000.0);
+    assert_eq!(profile.fill_lights.len(), 2);
+    for fill in profile.fill_lights {
+        assert!(fill.intensity <= 8_000.0);
+        assert!(fill.range <= 24.0);
+        assert!(fill.radius >= 1.0);
+    }
+    let exposure = viewer_camera_exposure();
+    assert!((9.5..=10.5).contains(&exposure.ev100));
+    assert!(matches!(
+        viewer_camera_tonemapping(),
+        bevy::core_pipeline::tonemapping::Tonemapping::KhronosPbrNeutral
+    ));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -175,7 +197,7 @@ fn scene_ui_stage_toggles_map_to_scene_build_args() {
         SceneCompositionMode::CvGrounded
     );
     assert_eq!(default_args.pose_fit, ScenePoseFitMode::RenderedSilhouette);
-    assert_eq!(default_args.canonical_pose, SceneCanonicalPoseMode::Off);
+    assert_eq!(default_args.canonical_pose, SceneCanonicalPoseMode::Auto);
     assert_eq!(default_args.scale_policy, SceneScalePolicy::AssetPreserving);
     assert_eq!(default_args.depth_provider, SceneDepthProvider::DepthPro);
     assert_eq!(default_args.locator, SceneLocatorProvider::LocateAnything);
@@ -220,7 +242,7 @@ fn scene_ui_stage_toggles_map_to_scene_build_args() {
     assert!(!args.lift_assets);
     assert!(!args.promote_to_catalog);
     assert_eq!(args.composition_mode, SceneCompositionMode::Heuristic);
-    assert_eq!(args.canonical_pose, SceneCanonicalPoseMode::Off);
+    assert_eq!(args.canonical_pose, SceneCanonicalPoseMode::Auto);
     assert_eq!(args.scale_policy, SceneScalePolicy::AssetPreserving);
     assert_eq!(args.depth_provider, SceneDepthProvider::None);
     assert_eq!(args.locator, SceneLocatorProvider::Manifest);

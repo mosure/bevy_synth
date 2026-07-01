@@ -298,6 +298,7 @@ pub struct SceneDepthMapEvidence {
     pub height: u32,
     pub intrinsics: CameraIntrinsics,
     pub focal_length_px: Option<f32>,
+    pub fov_x_degrees: Option<f32>,
     pub vertical_fov_degrees: Option<f32>,
 }
 
@@ -308,6 +309,7 @@ pub struct SceneDepthAnnotationSummary {
     pub total_objects: usize,
     pub depth_map_size: [u32; 2],
     pub focal_length_px: Option<f32>,
+    pub fov_x_degrees: Option<f32>,
     pub vertical_fov_degrees: Option<f32>,
     /// Accepted inlier samples used by the final floor fit.
     pub floor_sample_count: usize,

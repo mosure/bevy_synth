@@ -49,6 +49,24 @@ impl SceneObjectPoseRefinementMode {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+pub enum SceneFinalYawRefinementMode {
+    Off,
+    GatedGpt,
+    AlwaysGpt,
+}
+
+impl SceneFinalYawRefinementMode {
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn requires_selection(self) -> bool {
+        matches!(self, Self::GatedGpt | Self::AlwaysGpt)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum SceneObjectPoseRefinementSet {
     Tables,
     LargeSeating,
@@ -278,6 +296,8 @@ pub struct DepthEvidenceRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intrinsics: Option<SceneCameraIntrinsics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focal_length_px: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vertical_fov_degrees: Option<f32>,
@@ -289,8 +309,93 @@ pub struct DepthEvidenceRef {
     pub floor_sample_count: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SceneCameraIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub width: u32,
+    pub height: u32,
+    pub fov_x_degrees: f32,
+    pub fov_y_degrees: f32,
+}
+
+impl SceneCameraIntrinsics {
+    pub fn from_fx_fy(fx: f32, fy: f32, cx: f32, cy: f32, width: u32, height: u32) -> Option<Self> {
+        if !fx.is_finite()
+            || !fy.is_finite()
+            || !cx.is_finite()
+            || !cy.is_finite()
+            || fx <= 1.0
+            || fy <= 1.0
+            || width == 0
+            || height == 0
+        {
+            return None;
+        }
+        let fov_x_degrees = 2.0 * ((width as f32 * 0.5) / fx).atan().to_degrees();
+        let fov_y_degrees = 2.0 * ((height as f32 * 0.5) / fy).atan().to_degrees();
+        if !fov_x_degrees.is_finite() || !fov_y_degrees.is_finite() {
+            return None;
+        }
+        Some(Self {
+            fx,
+            fy,
+            cx,
+            cy,
+            width,
+            height,
+            fov_x_degrees,
+            fov_y_degrees,
+        })
+    }
+
+    pub fn from_focal_length_px(
+        focal_length_px: f32,
+        width: u32,
+        height: u32,
+        principal_point: Option<[f32; 2]>,
+    ) -> Option<Self> {
+        let [cx, cy] = principal_point.unwrap_or([
+            (width.saturating_sub(1)) as f32 * 0.5,
+            (height.saturating_sub(1)) as f32 * 0.5,
+        ]);
+        Self::from_fx_fy(focal_length_px, focal_length_px, cx, cy, width, height)
+    }
+
+    pub fn from_vertical_fov_degrees(
+        vertical_fov_degrees: f32,
+        width: u32,
+        height: u32,
+        principal_point: Option<[f32; 2]>,
+    ) -> Option<Self> {
+        if !vertical_fov_degrees.is_finite() || vertical_fov_degrees <= 1.0 {
+            return None;
+        }
+        let fy =
+            (height as f32 * 0.5) / (vertical_fov_degrees.to_radians() * 0.5).tan().max(1.0e-5);
+        Self::from_focal_length_px(fy, width, height, principal_point)
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.fx.is_finite()
+            && self.fy.is_finite()
+            && self.cx.is_finite()
+            && self.cy.is_finite()
+            && self.fov_x_degrees.is_finite()
+            && self.fov_y_degrees.is_finite()
+            && self.fx > 1.0
+            && self.fy > 1.0
+            && self.width > 0
+            && self.height > 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct EstimatedCamera {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intrinsics: Option<SceneCameraIntrinsics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focal_length_px: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

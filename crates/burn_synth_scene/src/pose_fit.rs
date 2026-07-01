@@ -25,6 +25,14 @@ const DENSE_SOFT_FIT_MAX_POINTS: usize = 96;
 const DENSE_SOFT_FIT_ITERATIONS: usize = 10;
 const ROTATION_FIT_MIN_APPLY_IMPROVEMENT: f32 = 0.04;
 const VISIBLE_SURFACE_POSE_FIT_MIN_APPLY_IMPROVEMENT: f32 = 0.025;
+const VISIBLE_SURFACE_SEMANTIC_YAW_REPAIR_MAX_LOSS_REGRESSION: f32 = 0.35;
+const FINAL_YAW_LOSS_REGRESSION_EPSILON: f32 = 0.25;
+const FINAL_YAW_BBOX_REGRESSION_EPSILON: f32 = 0.08;
+const FINAL_YAW_MASK_REGRESSION_EPSILON: f32 = 0.04;
+const FINAL_YAW_DEPTH_REGRESSION_EPSILON_M: f32 = 0.35;
+const FINAL_YAW_POSE_TRANSLATION_MAX_DELTA_M: f32 = 0.65;
+const FINAL_YAW_POSE_SCALE_RATIO_MIN: f32 = 0.68;
+const FINAL_YAW_POSE_SCALE_RATIO_MAX: f32 = 1.48;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneRotationFitConfig<'a> {
@@ -47,6 +55,18 @@ pub struct SceneObjectPoseRefinementConfig<'a> {
     pub mode: SceneObjectPoseRefinementMode,
     pub object_set: SceneObjectPoseRefinementSet,
     pub pose_fit: SceneVisibleSurfacePoseFitConfig<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SceneFinalYawRefinementConfig<'a> {
+    pub mode: SceneFinalYawRefinementMode,
+    pub object_set: SceneObjectPoseRefinementSet,
+    pub confidence_threshold: f32,
+    pub max_candidates: usize,
+    pub write_artifacts: bool,
+    pub output_dir: &'a Path,
+    pub grounding_evidence: Option<&'a SceneGroundingEvidence>,
+    pub rendered_selection_task: Option<&'a Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -623,11 +643,15 @@ pub fn apply_scene_visible_surface_pose_fit(
         let best = candidates
             .iter()
             .min_by(|left, right| left.loss.total_cmp(&right.loss));
-        let selected = best.filter(|best| {
-            let Some(baseline) = baseline else {
-                return false;
-            };
-            visible_surface_pose_candidate_passes_target(best, baseline, &target, config)
+        let selected = baseline.and_then(|baseline| {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    visible_surface_pose_candidate_passes_target(
+                        candidate, baseline, &target, config,
+                    )
+                })
+                .min_by(|left, right| left.loss.total_cmp(&right.loss))
         });
         let candidate_reports = candidates
             .iter()
@@ -755,6 +779,1132 @@ pub fn apply_scene_object_pose_refinement(
         )?;
     }
     Ok(outcome)
+}
+
+pub fn apply_scene_final_yaw_refinement(
+    config: SceneFinalYawRefinementConfig<'_>,
+    manifest: &SceneObjectManifest,
+    asset_bindings: &[SceneAssetBinding],
+    grounded_layout: &GroundedSceneLayout,
+    commands: &[Value],
+    prior_pose_report: Option<&Value>,
+    response: Option<&SceneRotationSelectionResponse>,
+) -> Result<SceneRotationFitOutcome, String> {
+    let mut out_commands = commands.to_vec();
+    let mut out_layout = grounded_layout.clone();
+    if !config.mode.enabled() {
+        let report = final_yaw_refinement_report(
+            config,
+            manifest,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "disabled",
+        );
+        write_final_yaw_refinement_artifacts_if_requested(config, &report)?;
+        return Ok(SceneRotationFitOutcome {
+            commands: out_commands,
+            grounded_layout: out_layout,
+            report,
+        });
+    }
+
+    let spawn_command_indices = rotation_fit_spawn_command_indices(commands);
+    let mut objects = final_yaw_refinement_objects(
+        config,
+        asset_bindings,
+        grounded_layout,
+        commands,
+        prior_pose_report,
+        &spawn_command_indices,
+    );
+    let mut applied = Vec::new();
+    let mut ignored = Vec::new();
+    if let Some(response) = response {
+        for selection in &response.objects {
+            let Some(object_position) = objects.iter().position(|object| {
+                object.get("index").and_then(Value::as_u64) == Some(selection.index as u64)
+            }) else {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "reason": "object_index_not_available",
+                }));
+                continue;
+            };
+            let object = &mut objects[object_position];
+            let Some(gpt_candidate) =
+                final_yaw_refinement_candidate_for_object(object, selection.candidate_index)
+            else {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "reason": "candidate_index_not_available",
+                }));
+                continue;
+            };
+            let (candidate, selection_policy, override_reason) = final_yaw_metric_guarded_candidate(
+                config.mode,
+                object,
+                gpt_candidate,
+                selection.confidence,
+                config.confidence_threshold,
+            );
+            let accepted_candidate_index = candidate
+                .get("candidate_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(selection.candidate_index);
+            if selection.confidence < config.confidence_threshold {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "confidence": selection.confidence,
+                    "threshold": config.confidence_threshold,
+                    "reason": "confidence_below_threshold",
+                }));
+                continue;
+            }
+            if let Err(reason) =
+                final_yaw_refinement_candidate_passes_gate(config.mode, object, &candidate)
+            {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "accepted_candidate_index": accepted_candidate_index,
+                    "confidence": selection.confidence,
+                    "reason": reason,
+                    "selection_policy": selection_policy,
+                    "override_reason": override_reason,
+                }));
+                continue;
+            }
+            let Some(command_index) = object
+                .get("command_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+            else {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "reason": "missing_command_index",
+                }));
+                continue;
+            };
+            let Some(placement_index) = object
+                .get("placement_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+            else {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "reason": "missing_placement_index",
+                }));
+                continue;
+            };
+            let Some(yaw) = candidate
+                .get("candidate_yaw_degrees")
+                .and_then(Value::as_f64)
+                .map(|value| normalize_degrees(value as f32))
+            else {
+                ignored.push(json!({
+                    "index": selection.index,
+                    "candidate_index": selection.candidate_index,
+                    "reason": "candidate_missing_yaw",
+                }));
+                continue;
+            };
+            let pose_apply = final_yaw_pose_apply_for_candidate(object, &candidate);
+            if let Some(command) = out_commands.get_mut(command_index) {
+                if let Some(pose_apply) = &pose_apply {
+                    command["translation"] = json!(pose_apply.translation);
+                    command["scale"] = json!(pose_apply.scale);
+                }
+                command["rotation"] = json!(quat_from_y_degrees(yaw));
+            }
+            if let Some(placement) = out_layout.placements.get_mut(placement_index) {
+                if let Some(pose_apply) = &pose_apply {
+                    placement.translation = pose_apply.translation;
+                    placement.scale = pose_apply.scale;
+                    placement.rotation_y_degrees = yaw;
+                    placement.sync_ground_anchor_from_current_translation();
+                } else {
+                    placement.rotation_y_degrees = yaw;
+                    placement.sync_translation_to_current_ground_anchor();
+                }
+            }
+            object["applied"] = json!(true);
+            object["selected_candidate_index"] = json!(accepted_candidate_index);
+            object["selected_yaw_degrees"] = json!(yaw);
+            if let Some(pose_apply) = &pose_apply {
+                object["selected_pose_application"] = json!({
+                    "applied": true,
+                    "translation": pose_apply.translation,
+                    "scale": pose_apply.scale,
+                    "reason": pose_apply.reason,
+                });
+            }
+            object["selector_result"] = json!({
+                "gpt_candidate_index": selection.candidate_index,
+                "accepted_candidate_index": accepted_candidate_index,
+                "confidence": selection.confidence,
+                "rationale": selection.rationale,
+                "selection_policy": selection_policy,
+                "override_reason": override_reason,
+            });
+            if let Some(candidates) = object
+                .pointer_mut("/rotation_selection/candidates")
+                .and_then(Value::as_array_mut)
+            {
+                for item in candidates {
+                    let candidate_index = item
+                        .get("candidate_index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize);
+                    item["selected"] = json!(candidate_index == Some(accepted_candidate_index));
+                }
+            }
+            applied.push(json!({
+                "index": selection.index,
+                "candidate_index": accepted_candidate_index,
+                "accepted_candidate_index": accepted_candidate_index,
+                "gpt_candidate_index": selection.candidate_index,
+                "yaw_degrees": yaw,
+                "pose_application": pose_apply
+                    .as_ref()
+                    .map(|pose| {
+                        json!({
+                            "translation": pose.translation,
+                            "scale": pose.scale,
+                            "reason": pose.reason,
+                        })
+                    })
+                    .unwrap_or(Value::Null),
+                "confidence": selection.confidence,
+                "selection_policy": selection_policy,
+                "override_reason": override_reason,
+            }));
+        }
+    }
+
+    sync_layout_placements_from_commands(&mut out_layout, &out_commands);
+    let status = if !applied.is_empty() {
+        "applied"
+    } else if response.is_some() {
+        "selection_rejected_or_noop"
+    } else if objects.is_empty() {
+        "no_targets"
+    } else {
+        "awaiting_candidate_selection"
+    };
+    let report = final_yaw_refinement_report(config, manifest, objects, applied, ignored, status);
+    write_final_yaw_refinement_artifacts_if_requested(config, &report)?;
+    Ok(SceneRotationFitOutcome {
+        commands: out_commands,
+        grounded_layout: out_layout,
+        report,
+    })
+}
+
+fn final_yaw_refinement_objects(
+    config: SceneFinalYawRefinementConfig<'_>,
+    asset_bindings: &[SceneAssetBinding],
+    grounded_layout: &GroundedSceneLayout,
+    commands: &[Value],
+    prior_pose_report: Option<&Value>,
+    spawn_command_indices: &[usize],
+) -> Vec<Value> {
+    let mut objects = Vec::new();
+    for placement_index in 0..grounded_layout.placements.len() {
+        let placement = &grounded_layout.placements[placement_index];
+        if !object_pose_refinement_set_includes(config.object_set, placement) {
+            continue;
+        }
+        let Some(command_index) = spawn_command_indices.get(placement_index).copied() else {
+            continue;
+        };
+        let prior = final_yaw_prior_object_report(prior_pose_report, placement);
+        if config.mode == SceneFinalYawRefinementMode::GatedGpt
+            && !final_yaw_refinement_object_requires_selection(placement, prior)
+        {
+            continue;
+        }
+        let command = commands.get(command_index);
+        let current_yaw = command
+            .and_then(|command| command.get("rotation"))
+            .and_then(json_array4)
+            .map(quat_y_degrees)
+            .unwrap_or(placement.rotation_y_degrees);
+        let mut candidates = Vec::new();
+        let current_metrics = prior.and_then(|prior| final_yaw_current_metrics(prior, current_yaw));
+        final_yaw_push_candidate(
+            &mut candidates,
+            current_yaw,
+            current_yaw,
+            "current",
+            current_metrics.as_ref().map(|(_, metrics)| metrics.clone()),
+            current_metrics.map(|(source, _)| source),
+            config.max_candidates,
+        );
+        if let Some(prior) = prior {
+            for key in ["selected", "best", "baseline"] {
+                if let Some(candidate) = prior.get(key)
+                    && !candidate.is_null()
+                    && let Some(yaw) = candidate.get("yaw_degrees").and_then(Value::as_f64)
+                {
+                    final_yaw_push_candidate(
+                        &mut candidates,
+                        current_yaw,
+                        yaw as f32,
+                        key,
+                        Some(candidate.clone()),
+                        Some(key),
+                        config.max_candidates,
+                    );
+                }
+            }
+            let mut geometry_candidates = prior
+                .get("candidates")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|candidate| {
+                    let yaw = candidate.get("yaw_degrees").and_then(Value::as_f64)? as f32;
+                    let loss = candidate
+                        .get("loss")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(f64::INFINITY);
+                    Some((loss, yaw, candidate.clone()))
+                })
+                .collect::<Vec<_>>();
+            geometry_candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+            for (_, yaw, candidate) in geometry_candidates.into_iter().take(6) {
+                final_yaw_push_candidate(
+                    &mut candidates,
+                    current_yaw,
+                    yaw,
+                    "geometry_top_loss",
+                    Some(candidate),
+                    Some("geometry_top_loss"),
+                    config.max_candidates,
+                );
+            }
+        }
+        for delta in [180.0, -180.0, 90.0, -90.0, 45.0, -45.0, 30.0, -30.0] {
+            final_yaw_push_candidate(
+                &mut candidates,
+                current_yaw,
+                current_yaw + delta,
+                "cardinal_probe",
+                None,
+                None,
+                config.max_candidates,
+            );
+        }
+        let measured_best = final_yaw_best_measured_candidate_from_candidates(&candidates);
+        let source_crop = final_yaw_source_crop_for_placement(placement, asset_bindings);
+        let source_evidence =
+            final_yaw_grounding_evidence_for_placement(config.grounding_evidence, placement);
+        let source_mask = source_evidence
+            .and_then(|evidence| evidence.mask.as_ref())
+            .map(final_yaw_source_mask_report)
+            .unwrap_or(Value::Null);
+        let source_mask_path = source_evidence
+            .and_then(|evidence| evidence.mask.as_ref())
+            .and_then(|mask| mask.mask_png_path.clone())
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        let source_depth_stats = source_evidence
+            .and_then(|evidence| evidence.depth_stats)
+            .map(|depth_stats| json!(depth_stats))
+            .unwrap_or(Value::Null);
+        let baseline = prior
+            .and_then(|report| report.get("baseline").cloned())
+            .unwrap_or(Value::Null);
+        let best = prior
+            .and_then(|report| report.get("best").cloned())
+            .unwrap_or(Value::Null);
+        let mut object = json!({
+            "index": placement_index,
+            "placement_index": placement_index,
+            "command_index": command_index,
+            "object_id": placement.object_id,
+            "instance_id": placement.instance_id,
+            "label": placement.label,
+            "asset_id": placement.asset_id,
+            "source_crop": source_crop,
+            "source_mask": source_mask,
+            "source_mask_path": source_mask_path,
+            "source_depth_stats": source_depth_stats,
+            "source_bbox": placement.source_bbox,
+            "current_yaw_degrees": current_yaw,
+            "asset_yaw_offset_degrees": placement.asset_yaw_offset_degrees,
+            "translation": placement.translation,
+            "scale": placement.scale,
+            "baseline": baseline,
+            "best": best,
+            "measured_best_candidate_index": measured_best
+                .as_ref()
+                .and_then(|candidate| candidate.get("candidate_index"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "measured_best_yaw_degrees": measured_best
+                .as_ref()
+                .and_then(|candidate| candidate.get("candidate_yaw_degrees"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "applied": false,
+            "requires_selection": true,
+            "rotation_selection": {
+                "selection_source": "final_contextual_measured_pose_candidates",
+                "instruction": "Choose candidate_index only. This final stage may apply the selected measured candidate pose for the target object; do not invent transforms outside the listed candidates.",
+                "current_yaw_degrees": current_yaw,
+                "selected_candidate_index": 0,
+                "selected_yaw_degrees": current_yaw,
+                "candidates": candidates,
+            },
+        });
+        final_yaw_attach_rendered_selection_task_evidence(
+            &mut object,
+            config.rendered_selection_task,
+            placement_index,
+        );
+        objects.push(object);
+    }
+    objects
+}
+
+fn final_yaw_attach_rendered_selection_task_evidence(
+    object: &mut Value,
+    rendered_selection_task: Option<&Value>,
+    placement_index: usize,
+) {
+    let Some(rendered_object) =
+        final_yaw_rendered_selection_task_object(rendered_selection_task, placement_index)
+    else {
+        return;
+    };
+    for key in ["current_full_scene_render"] {
+        if let Some(value) = rendered_object.get(key) {
+            object[key] = value.clone();
+        }
+    }
+    let Some(rendered_candidates) = rendered_object
+        .pointer("/rotation_selection/candidates")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let Some(candidates) = object
+        .pointer_mut("/rotation_selection/candidates")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for candidate in candidates.iter_mut() {
+        let candidate_index = candidate
+            .get("candidate_index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let Some(rendered_candidate) = rendered_candidates.iter().find(|rendered_candidate| {
+            rendered_candidate
+                .get("candidate_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                == candidate_index
+        }) else {
+            continue;
+        };
+        for key in [
+            "rendered_candidate_full_scene",
+            "rendered_candidate_full_frame",
+            "rendered_candidate_capture",
+            "rendered_candidate_bbox",
+            "rendered_candidate_crop",
+            "rendered_candidate_object_only_full_frame",
+            "rendered_candidate_object_only_capture",
+            "final_yaw_visual_fit",
+        ] {
+            if let Some(value) = rendered_candidate.get(key) {
+                candidate[key] = value.clone();
+            }
+        }
+    }
+    for rendered_candidate in rendered_candidates {
+        let candidate_index = rendered_candidate
+            .get("candidate_index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let exists = candidates.iter().any(|candidate| {
+            candidate
+                .get("candidate_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                == candidate_index
+        });
+        if !exists {
+            candidates.push(rendered_candidate.clone());
+        }
+    }
+}
+
+fn final_yaw_rendered_selection_task_object(
+    rendered_selection_task: Option<&Value>,
+    placement_index: usize,
+) -> Option<&Value> {
+    rendered_selection_task?
+        .get("objects")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|object| {
+            object
+                .get("placement_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                == Some(placement_index)
+                || object
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    == Some(placement_index)
+        })
+}
+
+fn final_yaw_current_metrics(prior: &Value, current_yaw: f32) -> Option<(&'static str, Value)> {
+    for key in ["selected", "baseline", "best"] {
+        let Some(candidate) = prior.get(key) else {
+            continue;
+        };
+        if final_yaw_candidate_matches_yaw(candidate, current_yaw) {
+            return Some((key, candidate.clone()));
+        }
+    }
+    prior
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|candidate| final_yaw_candidate_matches_yaw(candidate, current_yaw))
+        .cloned()
+        .map(|candidate| ("candidates", candidate))
+}
+
+fn final_yaw_candidate_matches_yaw(candidate: &Value, yaw: f32) -> bool {
+    candidate
+        .get("yaw_degrees")
+        .or_else(|| candidate.get("candidate_yaw_degrees"))
+        .and_then(Value::as_f64)
+        .map(|candidate_yaw| normalize_degrees(candidate_yaw as f32 - yaw).abs() < 0.5)
+        .unwrap_or(false)
+}
+
+fn final_yaw_prior_object_report<'a>(
+    prior_pose_report: Option<&'a Value>,
+    placement: &GroundedScenePlacement,
+) -> Option<&'a Value> {
+    prior_pose_report
+        .and_then(|report| report.get("objects"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|object| {
+            object.get("object_id").and_then(Value::as_str) == Some(placement.object_id.as_str())
+                && object
+                    .get("instance_id")
+                    .and_then(Value::as_str)
+                    .map(Some)
+                    .unwrap_or(None)
+                    == placement.instance_id.as_deref()
+        })
+        .or_else(|| {
+            prior_pose_report
+                .and_then(|report| report.get("objects"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|object| {
+                    object.get("object_id").and_then(Value::as_str)
+                        == Some(placement.object_id.as_str())
+                        && object.get("instance_id").is_none_or(Value::is_null)
+                })
+        })
+}
+
+fn final_yaw_refinement_object_requires_selection(
+    placement: &GroundedScenePlacement,
+    prior: Option<&Value>,
+) -> bool {
+    if placement_is_large_seating_like(placement) {
+        return true;
+    }
+    let Some(prior) = prior else {
+        return true;
+    };
+    if !prior
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let selected = prior.get("selected").unwrap_or(&Value::Null);
+    let mask_iou = selected
+        .get("mask_iou")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let bbox_iou = selected
+        .get("bbox_iou")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    mask_iou < 0.35 || bbox_iou < 0.50 || placement_is_table_like(placement)
+}
+
+fn final_yaw_push_candidate(
+    candidates: &mut Vec<Value>,
+    current_yaw: f32,
+    yaw: f32,
+    source: &'static str,
+    metrics: Option<Value>,
+    metrics_source: Option<&str>,
+    max_candidates: usize,
+) {
+    if candidates.len() >= max_candidates.max(1) {
+        return;
+    }
+    let yaw = normalize_degrees(yaw);
+    if candidates.iter().any(|candidate| {
+        candidate
+            .get("candidate_yaw_degrees")
+            .and_then(Value::as_f64)
+            .map(|existing| normalize_degrees(existing as f32 - yaw).abs() < 0.5)
+            .unwrap_or(false)
+    }) {
+        return;
+    }
+    let candidate_index = candidates.len();
+    let mut candidate = json!({
+        "candidate_index": candidate_index,
+        "candidate_yaw_degrees": yaw,
+        "yaw_delta_degrees": normalize_degrees(yaw - current_yaw),
+        "source": source,
+        "selected": candidate_index == 0,
+    });
+    if let Some(metrics) = metrics {
+        candidate["geometry_metrics"] = metrics.clone();
+        if let Some(metrics_source) = metrics_source {
+            candidate["metrics_source"] = json!(metrics_source);
+        }
+        for key in [
+            "mask_iou",
+            "bbox_iou",
+            "center_error",
+            "depth_error_m",
+            "surface_depth_loss",
+            "dense_depth_loss",
+            "loss",
+            "passed",
+            "projected_bbox",
+            "artifact_path",
+        ] {
+            if let Some(value) = metrics.get(key) {
+                candidate[key] = value.clone();
+            }
+        }
+    }
+    candidates.push(candidate);
+}
+
+fn final_yaw_source_crop_for_placement(
+    placement: &GroundedScenePlacement,
+    asset_bindings: &[SceneAssetBinding],
+) -> Value {
+    asset_bindings
+        .iter()
+        .find(|binding| binding.asset_id == placement.asset_id)
+        .or_else(|| {
+            asset_bindings
+                .iter()
+                .find(|binding| binding.object_id == placement.object_id)
+        })
+        .and_then(|binding| {
+            binding
+                .provenance
+                .as_ref()
+                .and_then(|provenance| provenance.source_crop_path.clone())
+                .or_else(|| binding.source_image_path.clone())
+        })
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+fn final_yaw_grounding_evidence_for_placement<'a>(
+    evidence: Option<&'a SceneGroundingEvidence>,
+    placement: &GroundedScenePlacement,
+) -> Option<&'a ObjectGroundingEvidence> {
+    let objects = &evidence?.objects;
+    objects
+        .iter()
+        .find(|object| {
+            object.object_id == placement.object_id && object.instance_id == placement.instance_id
+        })
+        .or_else(|| {
+            objects.iter().find(|object| {
+                object.object_id == placement.object_id && object.instance_id.is_none()
+            })
+        })
+        .or_else(|| {
+            placement.instance_id.as_ref().and_then(|instance_id| {
+                objects.iter().find(|object| {
+                    object.instance_id.as_ref() == Some(instance_id)
+                        && object
+                            .reuse_group
+                            .as_ref()
+                            .is_none_or(|reuse_group| reuse_group == &placement.object_id)
+                })
+            })
+        })
+}
+
+fn final_yaw_source_mask_report(mask: &ObjectMaskEvidence) -> Value {
+    json!({
+        "provider": mask.provider,
+        "model": mask.model,
+        "bbox": mask.bbox,
+        "score": mask.score,
+        "area_px": mask.area_px,
+        "image_size": mask.image_size,
+        "center_pixel": mask.center_pixel,
+        "contact_pixel": mask.contact_pixel,
+        "coverage": mask.coverage,
+        "artifact_path": mask.artifact_path,
+        "mask_png_path": mask.mask_png_path,
+    })
+}
+
+fn final_yaw_refinement_candidate_for_object(
+    object: &Value,
+    candidate_index: usize,
+) -> Option<Value> {
+    object
+        .pointer("/rotation_selection/candidates")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|candidate| {
+            candidate
+                .get("candidate_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                == Some(candidate_index)
+        })
+        .cloned()
+}
+
+fn final_yaw_metric_guarded_candidate(
+    mode: SceneFinalYawRefinementMode,
+    object: &Value,
+    candidate: Value,
+    confidence: f32,
+    confidence_threshold: f32,
+) -> (Value, &'static str, Option<&'static str>) {
+    if mode != SceneFinalYawRefinementMode::GatedGpt {
+        return (candidate, "gpt_selection", None);
+    }
+    let Some(best) = final_yaw_best_measured_candidate(object) else {
+        return (candidate, "gpt_selection_no_measured_best", None);
+    };
+    let selected_index = candidate
+        .get("candidate_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let best_index = best
+        .get("candidate_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    if selected_index == best_index {
+        return (candidate, "gpt_selected_metric_best", None);
+    }
+    if let Some(reason) = final_yaw_metric_regression_reason(&candidate, &best) {
+        if final_yaw_rendered_context_selection_may_override_metric_guard(
+            object,
+            &candidate,
+            confidence,
+            confidence_threshold,
+        ) {
+            return (candidate, "gpt_rendered_context_selection", Some(reason));
+        }
+        return (best, "gpt_overridden_by_metric_gate", Some(reason));
+    }
+    (candidate, "gpt_selection_metric_compatible", None)
+}
+
+fn final_yaw_best_measured_candidate(object: &Value) -> Option<Value> {
+    let candidates = object
+        .pointer("/rotation_selection/candidates")
+        .and_then(Value::as_array)?;
+    final_yaw_best_measured_candidate_from_candidates(candidates)
+}
+
+fn final_yaw_best_measured_candidate_from_candidates(candidates: &[Value]) -> Option<Value> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.get("geometry_metrics").is_some())
+        .filter_map(|candidate| {
+            final_yaw_candidate_quality_score(candidate).map(|score| (score, candidate))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, candidate)| candidate.clone())
+}
+
+fn final_yaw_candidate_quality_score(candidate: &Value) -> Option<f32> {
+    final_yaw_metric(candidate, "loss").or_else(|| {
+        let bbox = final_yaw_metric(candidate, "bbox_iou");
+        let mask = final_yaw_metric(candidate, "mask_iou");
+        let depth = final_yaw_metric(candidate, "depth_error_m");
+        let surface = final_yaw_metric(candidate, "surface_depth_loss");
+        if bbox.is_none() && mask.is_none() && depth.is_none() && surface.is_none() {
+            return None;
+        }
+        Some(
+            (1.0 - bbox.unwrap_or(0.0))
+                + (1.0 - mask.unwrap_or(0.0))
+                + depth.unwrap_or(0.0) * 0.25
+                + surface.unwrap_or(0.0) * 0.10,
+        )
+    })
+}
+
+fn final_yaw_metric_regression_reason(
+    candidate: &Value,
+    measured_best: &Value,
+) -> Option<&'static str> {
+    if let (Some(candidate_loss), Some(best_loss)) = (
+        final_yaw_metric(candidate, "loss"),
+        final_yaw_metric(measured_best, "loss"),
+    ) && candidate_loss > best_loss + FINAL_YAW_LOSS_REGRESSION_EPSILON
+    {
+        return Some("loss_regression_vs_measured_best");
+    }
+    if let (Some(candidate_bbox), Some(best_bbox), Some(candidate_mask), Some(best_mask)) = (
+        final_yaw_metric(candidate, "bbox_iou"),
+        final_yaw_metric(measured_best, "bbox_iou"),
+        final_yaw_metric(candidate, "mask_iou"),
+        final_yaw_metric(measured_best, "mask_iou"),
+    ) && candidate_bbox + FINAL_YAW_BBOX_REGRESSION_EPSILON < best_bbox
+        && candidate_mask + FINAL_YAW_MASK_REGRESSION_EPSILON < best_mask
+    {
+        return Some("bbox_mask_regression_vs_measured_best");
+    }
+    if let (Some(candidate_depth), Some(best_depth), Some(candidate_bbox), Some(best_bbox)) = (
+        final_yaw_metric(candidate, "depth_error_m"),
+        final_yaw_metric(measured_best, "depth_error_m"),
+        final_yaw_metric(candidate, "bbox_iou"),
+        final_yaw_metric(measured_best, "bbox_iou"),
+    ) && candidate_depth > best_depth + FINAL_YAW_DEPTH_REGRESSION_EPSILON_M
+        && candidate_bbox + 0.03 < best_bbox
+    {
+        return Some("depth_bbox_regression_vs_measured_best");
+    }
+    None
+}
+
+fn final_yaw_rendered_context_selection_may_override_metric_guard(
+    object: &Value,
+    candidate: &Value,
+    confidence: f32,
+    confidence_threshold: f32,
+) -> bool {
+    if confidence < confidence_threshold {
+        return false;
+    }
+    if !final_yaw_candidate_has_render_evidence(candidate) {
+        return false;
+    }
+    final_yaw_object_is_contextual_metric_weak(object)
+}
+
+fn final_yaw_object_is_contextual_metric_weak(object: &Value) -> bool {
+    let descriptor = ["object_id", "label", "asset_id", "instance_id"]
+        .iter()
+        .filter_map(|key| object.get(*key).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    descriptor.contains("sofa")
+        || descriptor.contains("couch")
+        || descriptor.contains("sectional")
+        || descriptor.contains("loveseat")
+        || descriptor.contains("settee")
+        || descriptor.contains("table")
+        || descriptor.contains("desk")
+        || descriptor.contains("counter")
+}
+
+fn final_yaw_refinement_candidate_passes_gate(
+    mode: SceneFinalYawRefinementMode,
+    object: &Value,
+    candidate: &Value,
+) -> Result<(), &'static str> {
+    let current_yaw = object
+        .get("current_yaw_degrees")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let candidate_yaw = candidate
+        .get("candidate_yaw_degrees")
+        .and_then(Value::as_f64)
+        .unwrap_or(current_yaw as f64) as f32;
+    if normalize_degrees(candidate_yaw - current_yaw).abs() < 0.5 {
+        return Ok(());
+    }
+    let baseline = object.get("baseline").unwrap_or(&Value::Null);
+    if candidate.get("geometry_metrics").is_none()
+        && mode != SceneFinalYawRefinementMode::AlwaysGpt
+        && !final_yaw_candidate_has_render_evidence(candidate)
+    {
+        return Err("candidate_missing_geometry_metrics");
+    }
+    let baseline_bbox = final_yaw_metric(baseline, "bbox_iou").unwrap_or(0.0);
+    let candidate_bbox = final_yaw_metric(candidate, "bbox_iou").unwrap_or(baseline_bbox);
+    if candidate_bbox + 0.03 < baseline_bbox {
+        return Err("bbox_iou_regression");
+    }
+    let baseline_mask = final_yaw_metric(baseline, "mask_iou").unwrap_or(0.0);
+    let candidate_mask = final_yaw_metric(candidate, "mask_iou").unwrap_or(baseline_mask);
+    if candidate_mask + 0.05 < baseline_mask {
+        return Err("mask_iou_regression");
+    }
+    let baseline_depth = final_yaw_metric(baseline, "depth_error_m");
+    let candidate_depth = final_yaw_metric(candidate, "depth_error_m");
+    let edge_crop = object
+        .get("source_bbox")
+        .and_then(json_array4)
+        .map(final_yaw_bbox_touches_image_edge)
+        .unwrap_or(false);
+    let large_seating = object
+        .get("label")
+        .and_then(Value::as_str)
+        .map(|label| {
+            let label = label.to_ascii_lowercase();
+            label.contains("sofa") || label.contains("couch") || label.contains("sectional")
+        })
+        .unwrap_or(false);
+    let improved_2d =
+        candidate_bbox > baseline_bbox + 0.04 || candidate_mask > baseline_mask + 0.04;
+    if let (Some(baseline_depth), Some(candidate_depth)) = (baseline_depth, candidate_depth)
+        && candidate_depth > baseline_depth + 0.35
+        && !(edge_crop && large_seating && improved_2d)
+    {
+        return Err("depth_error_regression");
+    }
+    Ok(())
+}
+
+fn final_yaw_candidate_has_render_evidence(candidate: &Value) -> bool {
+    [
+        "rendered_candidate_full_scene",
+        "rendered_candidate_full_frame",
+        "rendered_candidate_object_only_full_frame",
+    ]
+    .iter()
+    .any(|key| {
+        candidate
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+    })
+}
+
+#[derive(Clone, Debug)]
+struct FinalYawPoseApplication {
+    translation: [f32; 3],
+    scale: [f32; 3],
+    reason: &'static str,
+}
+
+fn final_yaw_pose_apply_for_candidate(
+    object: &Value,
+    candidate: &Value,
+) -> Option<FinalYawPoseApplication> {
+    let metrics = candidate
+        .get("geometry_metrics")
+        .filter(|value| value.is_object())
+        .unwrap_or(candidate);
+    let translation = metrics.get("translation").and_then(json_array3)?;
+    let scale = metrics.get("scale").and_then(json_array3)?;
+    let current_translation = object.get("translation").and_then(json_array3)?;
+    let current_scale = object.get("scale").and_then(json_array3)?;
+    if !final_yaw_pose_translation_delta_is_bounded(current_translation, translation) {
+        return None;
+    }
+    if !final_yaw_pose_scale_ratio_is_bounded(current_scale, scale) {
+        return None;
+    }
+    Some(FinalYawPoseApplication {
+        translation,
+        scale,
+        reason: "selected_candidate_pose_metrics",
+    })
+}
+
+fn final_yaw_pose_translation_delta_is_bounded(current: [f32; 3], candidate: [f32; 3]) -> bool {
+    let dx = candidate[0] - current[0];
+    let dz = candidate[2] - current[2];
+    (dx * dx + dz * dz).sqrt() <= FINAL_YAW_POSE_TRANSLATION_MAX_DELTA_M
+}
+
+fn final_yaw_pose_scale_ratio_is_bounded(current: [f32; 3], candidate: [f32; 3]) -> bool {
+    current
+        .iter()
+        .zip(candidate.iter())
+        .all(|(current, candidate)| {
+            let current = current.abs().max(1.0e-5);
+            let ratio = candidate.abs() / current;
+            (FINAL_YAW_POSE_SCALE_RATIO_MIN..=FINAL_YAW_POSE_SCALE_RATIO_MAX).contains(&ratio)
+        })
+}
+
+fn final_yaw_metric(value: &Value, key: &str) -> Option<f32> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| value as f32)
+        .or_else(|| {
+            value
+                .get("geometry_metrics")
+                .and_then(|metrics| metrics.get(key))
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .map(|value| value as f32)
+        })
+}
+
+fn final_yaw_bbox_touches_image_edge(bbox: [f32; 4]) -> bool {
+    bbox[0] <= 0.03 || bbox[1] <= 0.03 || bbox[2] >= 0.97 || bbox[3] >= 0.97
+}
+
+fn final_yaw_refinement_report(
+    config: SceneFinalYawRefinementConfig<'_>,
+    manifest: &SceneObjectManifest,
+    objects: Vec<Value>,
+    applied: Vec<Value>,
+    ignored: Vec<Value>,
+    status: &str,
+) -> Value {
+    let selection_task = final_yaw_refinement_selection_task(&manifest.source_scene_path, &objects);
+    json!({
+        "schema_version": 1,
+        "stage": "final_context_yaw_refinement",
+        "status": status,
+        "mode": config.mode,
+        "object_set": config.object_set,
+        "confidence_threshold": config.confidence_threshold,
+        "max_candidates": config.max_candidates,
+        "source_scene_path": manifest.source_scene_path,
+        "algorithm": "bounded-full-scene-context-measured-pose-candidate-selection",
+        "constraint": "select_one_measured_candidate_no_freeform_transform",
+        "object_count": objects.len(),
+        "applied_count": applied.len(),
+        "ignored_count": ignored.len(),
+        "objects": objects,
+        "applied": applied,
+        "ignored": ignored,
+        "selection_task": selection_task,
+    })
+}
+
+fn final_yaw_refinement_selection_task(source_scene_path: &str, objects: &[Value]) -> Value {
+    let objects = objects
+        .iter()
+        .filter_map(|object| {
+            let rotation_selection = object.get("rotation_selection")?;
+            Some(json!({
+                "index": object.get("index").cloned().unwrap_or(Value::Null),
+                "placement_index": object
+                    .get("placement_index")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "command_index": object.get("command_index").cloned().unwrap_or(Value::Null),
+                "object_id": object.get("object_id").cloned().unwrap_or(Value::Null),
+                "instance_id": object.get("instance_id").cloned().unwrap_or(Value::Null),
+                "label": object.get("label").cloned().unwrap_or(Value::Null),
+                "source_crop": object.get("source_crop").cloned().unwrap_or(Value::Null),
+                "source_mask": object.get("source_mask").cloned().unwrap_or(Value::Null),
+                "source_mask_path": object
+                    .get("source_mask_path")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "source_depth_stats": object
+                    .get("source_depth_stats")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "source_bbox": object.get("source_bbox").cloned().unwrap_or(Value::Null),
+                "current_yaw_degrees": object
+                    .get("current_yaw_degrees")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "rotation_selection": rotation_selection.clone(),
+                "instruction": "Select candidate_index only. Compare source crop and full-scene candidate renders when attached; do not invent transforms outside the listed candidates.",
+            }))
+        })
+        .collect::<Vec<_>>();
+    if objects.is_empty() {
+        return Value::Null;
+    }
+    json!({
+        "purpose": "final-context-object-measured-pose-selection",
+        "source_scene_path": source_scene_path,
+        "instruction": "Choose one listed pose candidate per object. Use the original source scene, source-reference overlay, object source mask, and mask-tight crop as primary contextual evidence, then compare full-scene and target-only full-frame rendered candidates. Rendered cardinal probes without geometry metrics are valid choices when they visibly align object orientation better than the measured metric-best candidate. For large sofas/sectionals, prioritize visible curve direction, open side, and table relation over bbox-only coverage when those disagree. Return candidate_index values only; do not invent positions, scale, or yaw values.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "objects": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": { "type": "integer" },
+                            "candidate_index": { "type": "integer" },
+                            "confidence": { "type": "number" },
+                            "rationale": { "type": "string" }
+                        },
+                        "required": ["index", "candidate_index", "confidence", "rationale"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["objects"],
+            "additionalProperties": false
+        },
+        "objects": objects,
+    })
+}
+
+fn write_final_yaw_refinement_artifacts_if_requested(
+    config: SceneFinalYawRefinementConfig<'_>,
+    report: &Value,
+) -> Result<(), String> {
+    if !config.write_artifacts {
+        return Ok(());
+    }
+    fs::create_dir_all(config.output_dir).map_err(|err| {
+        format!(
+            "failed to create final yaw refinement output dir {}: {err}",
+            config.output_dir.display()
+        )
+    })?;
+    write_json_file(
+        &config.output_dir.join("final_yaw_refinement_report.json"),
+        report,
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(task) = report.get("selection_task")
+        && !task.is_null()
+    {
+        write_json_file(&config.output_dir.join("selection_task.json"), task)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1453,6 +2603,751 @@ fn html_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn final_yaw_test_manifest() -> SceneObjectManifest {
+        SceneObjectManifest {
+            source_scene_path: "scene.jpg".to_string(),
+            scene_calibration: None,
+            objects: Vec::new(),
+        }
+    }
+
+    fn final_yaw_test_layout() -> GroundedSceneLayout {
+        let aabb = crate::SceneAssetAabb {
+            min: [-1.0, 0.0, -0.5],
+            max: [1.0, 1.0, 0.5],
+        };
+        GroundedSceneLayout {
+            bsn: String::new(),
+            placements: vec![GroundedScenePlacement {
+                entity_id: "sofa_entity".to_string(),
+                asset_id: "sofa_asset".to_string(),
+                object_id: "sofa".to_string(),
+                instance_id: None,
+                label: "tan couch".to_string(),
+                source_bbox: [0.02, 0.25, 0.92, 0.78],
+                contact_pixel: [0.45, 0.78],
+                ground_point: [1.0, 0.0, 2.0],
+                translation: [1.0, 0.0, 2.0],
+                rotation_y_degrees: 180.0,
+                asset_yaw_offset_degrees: 0.0,
+                scale: [2.0, 2.0, 2.0],
+                local_aabb: aabb,
+                target_footprint_m: [3.0, 1.5],
+            }],
+            camera: crate::SceneCamera {
+                translation: [0.0, 2.0, -4.0],
+                focus: [0.0, 0.0, 0.0],
+                yaw: None,
+                pitch: None,
+                radius: None,
+                vertical_fov_degrees: Some(55.0),
+            },
+            rug_center: [0.0, 0.0, 0.0],
+            rug_scale: [1.0, 1.0, 1.0],
+            projection_fit: None,
+        }
+    }
+
+    fn final_yaw_test_binding() -> Vec<SceneAssetBinding> {
+        vec![SceneAssetBinding {
+            asset_id: "sofa_asset".to_string(),
+            object_id: "sofa".to_string(),
+            label: "tan couch".to_string(),
+            aliases: Vec::new(),
+            path: Some("sofa.glb".to_string()),
+            cache_key: Some("sofa_cache".to_string()),
+            reusable: true,
+            source_image_path: None,
+            pipeline: None,
+            local_aabb: None,
+            canonical_frame: None,
+            provenance: Some(crate::SceneAssetProvenance {
+                run_id: "test".to_string(),
+                source_scene_path: "scene.jpg".to_string(),
+                source_object_id: "sofa".to_string(),
+                source_crop_path: Some("sofa_crop.png".to_string()),
+                generated_by: "test".to_string(),
+            }),
+        }]
+    }
+
+    fn final_yaw_test_commands() -> Vec<Value> {
+        vec![
+            json!({ "type": "clear_scene" }),
+            json!({
+                "type": "spawn_cached",
+                "cache_key": "sofa_cache",
+                "translation": [1.0, 0.0, 2.0],
+                "rotation": quat_from_y_degrees(180.0),
+                "scale": [2.0, 2.0, 2.0],
+            }),
+            json!({ "type": "set_camera" }),
+        ]
+    }
+
+    fn final_yaw_prior_report() -> Value {
+        json!({
+            "objects": [{
+                "object_id": "sofa",
+                "instance_id": null,
+                "applied": false,
+                "baseline": {
+                    "yaw_degrees": 180.0,
+                    "mask_iou": 0.14,
+                    "bbox_iou": 0.29,
+                    "depth_error_m": 1.23,
+                    "loss": 7.7
+                },
+                "best": {
+                    "yaw_degrees": -6.0,
+                    "mask_iou": 0.38,
+                    "bbox_iou": 0.42,
+                    "depth_error_m": 1.30,
+                    "loss": 6.2
+                },
+                "candidates": [{
+                    "candidate_index": 0,
+                    "yaw_degrees": 180.0,
+                    "mask_iou": 0.14,
+                    "bbox_iou": 0.29,
+                    "depth_error_m": 1.23,
+                    "loss": 7.7
+                }, {
+                    "candidate_index": 1,
+                    "yaw_degrees": -6.0,
+                    "mask_iou": 0.38,
+                    "bbox_iou": 0.42,
+                    "depth_error_m": 1.30,
+                    "loss": 6.2
+                }]
+            }]
+        })
+    }
+
+    fn final_yaw_config(output_dir: &Path) -> SceneFinalYawRefinementConfig<'_> {
+        SceneFinalYawRefinementConfig {
+            mode: SceneFinalYawRefinementMode::GatedGpt,
+            object_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
+            confidence_threshold: 0.70,
+            max_candidates: 12,
+            write_artifacts: false,
+            output_dir,
+            grounding_evidence: None,
+            rendered_selection_task: None,
+        }
+    }
+
+    fn final_yaw_config_with_mode(
+        output_dir: &Path,
+        mode: SceneFinalYawRefinementMode,
+    ) -> SceneFinalYawRefinementConfig<'_> {
+        SceneFinalYawRefinementConfig {
+            mode,
+            ..final_yaw_config(output_dir)
+        }
+    }
+
+    fn final_yaw_test_grounding_evidence() -> SceneGroundingEvidence {
+        SceneGroundingEvidence {
+            source_image_path: "scene.jpg".to_string(),
+            depth: None,
+            segmentation: None,
+            detections: Vec::new(),
+            camera: crate::EstimatedCamera::default(),
+            floor: crate::EstimatedFloorPlane::default(),
+            objects: vec![ObjectGroundingEvidence {
+                object_id: "sofa".to_string(),
+                instance_id: None,
+                reuse_group: None,
+                detection: None,
+                mask: Some(ObjectMaskEvidence {
+                    provider: "sam2".to_string(),
+                    model: "sam2.1-large".to_string(),
+                    bbox: [0.04, 0.24, 0.90, 0.80],
+                    score: 0.94,
+                    area_px: 42_000,
+                    image_size: [1024, 576],
+                    mask_rle: vec![1, 2, 3, 4],
+                    center_pixel: Some([0.46, 0.54]),
+                    contact_pixel: Some([0.45, 0.78]),
+                    coverage: Some(0.31),
+                    artifact_path: Some("masks.json".to_string()),
+                    mask_png_path: Some("sofa_mask.png".to_string()),
+                }),
+                asset_id: Some("sofa_asset".to_string()),
+                contact_pixel: Some([0.45, 0.78]),
+                depth_stats: Some(crate::ObjectDepthStats {
+                    median_m: 2.4,
+                    min_m: 1.5,
+                    max_m: 3.1,
+                    contact_m: Some(2.7),
+                    sample_count: Some(3200),
+                }),
+                candidate_floor_contact_rays: Vec::new(),
+                metric_contact_point_m: None,
+                target_footprint_m: Some([3.0, 1.5]),
+                provenance: vec!["test".to_string()],
+            }],
+        }
+    }
+
+    fn final_yaw_config_with_grounding<'a>(
+        output_dir: &'a Path,
+        grounding_evidence: &'a SceneGroundingEvidence,
+    ) -> SceneFinalYawRefinementConfig<'a> {
+        SceneFinalYawRefinementConfig {
+            grounding_evidence: Some(grounding_evidence),
+            ..final_yaw_config(output_dir)
+        }
+    }
+
+    #[test]
+    fn final_yaw_refinement_applies_yaw_only_from_bounded_selection() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw");
+        let target_candidate = prepared.report["objects"][0]["rotation_selection"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate["candidate_yaw_degrees"]
+                    .as_f64()
+                    .is_some_and(|yaw| (yaw + 6.0).abs() < 0.5)
+            })
+            .and_then(|candidate| candidate["candidate_index"].as_u64())
+            .expect("best yaw candidate") as usize;
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: target_candidate,
+                confidence: 0.92,
+                rationale: "full-scene context aligns the couch better".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply final yaw");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        assert_eq!(
+            applied.commands[1]["translation"],
+            commands[1]["translation"]
+        );
+        assert_eq!(applied.commands[1]["scale"], commands[1]["scale"]);
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees + 6.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn final_yaw_refinement_applies_measured_pose_candidate_atomically() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let mut prior = final_yaw_prior_report();
+        prior["objects"][0]["best"]["translation"] = json!([1.18, 0.25, 1.62]);
+        prior["objects"][0]["best"]["scale"] = json!([2.7, 2.7, 2.7]);
+        prior["objects"][0]["candidates"][1]["translation"] = json!([1.18, 0.25, 1.62]);
+        prior["objects"][0]["candidates"][1]["scale"] = json!([2.7, 2.7, 2.7]);
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final pose");
+        let target_candidate = prepared.report["objects"][0]["rotation_selection"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate["candidate_yaw_degrees"]
+                    .as_f64()
+                    .is_some_and(|yaw| (yaw + 6.0).abs() < 0.5)
+            })
+            .and_then(|candidate| candidate["candidate_index"].as_u64())
+            .expect("measured pose candidate") as usize;
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: target_candidate,
+                confidence: 0.92,
+                rationale: "measured pose candidate best matches source".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply final pose");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        let command_translation = json_array3(&applied.commands[1]["translation"]).unwrap();
+        let command_scale = json_array3(&applied.commands[1]["scale"]).unwrap();
+        assert!(
+            command_translation
+                .iter()
+                .zip([1.18, 0.25, 1.62])
+                .all(|(left, right)| (*left - right).abs() < 1.0e-5)
+        );
+        assert!(
+            command_scale
+                .iter()
+                .zip([2.7, 2.7, 2.7])
+                .all(|(left, right)| (*left - right).abs() < 1.0e-5)
+        );
+        assert_eq!(
+            applied.report["objects"][0]["selected_pose_application"]["applied"],
+            json!(true)
+        );
+        assert_eq!(
+            applied.report["applied"][0]["pose_application"]["reason"],
+            json!("selected_candidate_pose_metrics")
+        );
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees + 6.0).abs() < 0.5);
+        assert_eq!(
+            applied.grounded_layout.placements[0].translation,
+            [1.18, 0.25, 1.62]
+        );
+        assert_eq!(applied.grounded_layout.placements[0].scale, [2.7, 2.7, 2.7]);
+    }
+
+    #[test]
+    fn final_yaw_current_candidate_carries_matching_baseline_metrics() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw");
+
+        let current = &prepared.report["objects"][0]["rotation_selection"]["candidates"][0];
+        assert_eq!(current["source"], json!("current"));
+        assert_eq!(current["metrics_source"], json!("baseline"));
+        assert_eq!(current["bbox_iou"], json!(0.29));
+        assert_eq!(current["loss"], json!(7.7));
+    }
+
+    #[test]
+    fn final_yaw_selection_task_includes_source_mask_evidence() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let grounding = final_yaw_test_grounding_evidence();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config_with_grounding(Path::new("tmp"), &grounding),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw with grounding");
+
+        let object = &prepared.report["objects"][0];
+        assert_eq!(object["source_mask_path"], json!("sofa_mask.png"));
+        let mask_bbox = json_array4(&object["source_mask"]["bbox"]).unwrap();
+        assert!((mask_bbox[0] - 0.04).abs() < 1.0e-5);
+        assert!((mask_bbox[3] - 0.80).abs() < 1.0e-5);
+        assert!(object["source_mask"]["mask_rle"].is_null());
+        assert!((object["source_depth_stats"]["median_m"].as_f64().unwrap() - 2.4).abs() < 1.0e-5);
+
+        let task_object = &prepared.report["selection_task"]["objects"][0];
+        assert_eq!(task_object["source_mask_path"], json!("sofa_mask.png"));
+        assert_eq!(
+            task_object["source_mask"]["mask_png_path"],
+            json!("sofa_mask.png")
+        );
+        assert!(task_object["source_mask"]["mask_rle"].is_null());
+    }
+
+    #[test]
+    fn final_yaw_gated_mode_overrides_worse_gpt_current_selection() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: 0,
+                confidence: 0.99,
+                rationale: "semantic guess incorrectly keeps current".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply final yaw");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees + 6.0).abs() < 0.5);
+        assert_eq!(
+            applied.report["applied"][0]["selection_policy"],
+            json!("gpt_overridden_by_metric_gate")
+        );
+        assert_eq!(
+            applied.report["applied"][0]["gpt_candidate_index"],
+            json!(0)
+        );
+        assert_ne!(
+            applied.report["applied"][0]["accepted_candidate_index"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn final_yaw_gated_mode_keeps_high_confidence_rendered_context_selection() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw");
+        let mut rendered_task = prepared.report["selection_task"].clone();
+        let current_candidate = rendered_task["objects"][0]["rotation_selection"]["candidates"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|candidate| candidate["candidate_index"].as_u64() == Some(0))
+            .unwrap();
+        current_candidate["rendered_candidate_full_scene"] =
+            json!("/tmp/sofa_candidate_current_full_scene.png");
+        current_candidate["rendered_candidate_object_only_full_frame"] =
+            json!("/tmp/sofa_candidate_current_object_only.png");
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: 0,
+                confidence: 0.74,
+                rationale: "rendered context shows the sofa curve is semantically correct"
+                    .to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            SceneFinalYawRefinementConfig {
+                rendered_selection_task: Some(&rendered_task),
+                ..final_yaw_config(Path::new("tmp"))
+            },
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply final yaw");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees - 180.0).abs() < 0.5);
+        assert_eq!(
+            applied.report["applied"][0]["selection_policy"],
+            json!("gpt_rendered_context_selection")
+        );
+        assert_eq!(
+            applied.report["applied"][0]["accepted_candidate_index"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn final_yaw_always_gpt_keeps_explicit_current_selection() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: 0,
+                confidence: 0.99,
+                rationale: "always-gpt intentionally keeps current".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            final_yaw_config_with_mode(Path::new("tmp"), SceneFinalYawRefinementMode::AlwaysGpt),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply final yaw");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees - 180.0).abs() < 0.5);
+        assert_eq!(
+            applied.report["applied"][0]["selection_policy"],
+            json!("gpt_selection")
+        );
+    }
+
+    #[test]
+    fn final_yaw_gated_mode_accepts_rendered_unmeasured_candidate() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw");
+        let unmeasured_candidate = prepared.report["objects"][0]["rotation_selection"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate.get("geometry_metrics").is_none()
+                    && candidate["yaw_delta_degrees"]
+                        .as_f64()
+                        .is_some_and(|delta| (delta - 45.0).abs() < 1.0e-5)
+            })
+            .and_then(|candidate| candidate["candidate_index"].as_u64())
+            .expect("rendered cardinal probe candidate")
+            as usize;
+        let mut rendered_task = prepared.report["selection_task"].clone();
+        let candidates = rendered_task["objects"][0]["rotation_selection"]["candidates"]
+            .as_array_mut()
+            .unwrap();
+        let rendered_candidate = candidates
+            .iter_mut()
+            .find(|candidate| {
+                candidate["candidate_index"].as_u64() == Some(unmeasured_candidate as u64)
+            })
+            .unwrap();
+        rendered_candidate["rendered_candidate_full_scene"] =
+            json!("/tmp/sofa_candidate_45_full_scene.png");
+        rendered_candidate["rendered_candidate_object_only_full_frame"] =
+            json!("/tmp/sofa_candidate_45_object_only.png");
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: unmeasured_candidate,
+                confidence: 0.91,
+                rationale: "rendered cardinal probe matches couch curve direction".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            SceneFinalYawRefinementConfig {
+                rendered_selection_task: Some(&rendered_task),
+                ..final_yaw_config(Path::new("tmp"))
+            },
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply rendered unmeasured final yaw");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        assert_eq!(
+            applied.report["applied"][0]["selection_policy"],
+            json!("gpt_selection_metric_compatible")
+        );
+        assert_eq!(
+            applied.report["applied"][0]["accepted_candidate_index"],
+            json!(unmeasured_candidate)
+        );
+        assert!(applied.report["objects"][0]["selected_pose_application"].is_null());
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees - -135.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn final_yaw_gated_mode_accepts_rendered_fine_candidate_appended_to_task() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw");
+        let mut rendered_task = prepared.report["selection_task"].clone();
+        rendered_task["objects"][0]["rotation_selection"]["candidates"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "candidate_index": 99,
+                "candidate_yaw_degrees": -70.0,
+                "parent_candidate_index": 2,
+                "source": "fine_probe",
+                "rendered_candidate_full_scene": "/tmp/sofa_candidate_fine_full_scene.png",
+                "rendered_candidate_object_only_full_frame": "/tmp/sofa_candidate_fine_object_only.png",
+                "final_yaw_visual_fit": {
+                    "score": 0.91,
+                    "target_silhouette_score": 0.87
+                }
+            }));
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: 99,
+                confidence: 0.88,
+                rationale: "fine probe best matches source sofa silhouette".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            SceneFinalYawRefinementConfig {
+                rendered_selection_task: Some(&rendered_task),
+                ..final_yaw_config(Path::new("tmp"))
+            },
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("apply rendered fine candidate final yaw");
+
+        assert_eq!(applied.report["status"], json!("applied"));
+        assert_eq!(
+            applied.report["applied"][0]["accepted_candidate_index"],
+            json!(99)
+        );
+        assert!((applied.grounded_layout.placements[0].rotation_y_degrees + 70.0).abs() < 0.5);
+        assert!(
+            applied.report["objects"][0]["rotation_selection"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["candidate_index"] == json!(99)
+                    && candidate["selected"] == json!(true))
+        );
+    }
+
+    #[test]
+    fn final_yaw_refinement_rejects_unmeasured_gated_candidate() {
+        let manifest = final_yaw_test_manifest();
+        let bindings = final_yaw_test_binding();
+        let layout = final_yaw_test_layout();
+        let commands = final_yaw_test_commands();
+        let prior = final_yaw_prior_report();
+        let prepared = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            None,
+        )
+        .expect("prepare final yaw");
+        let unmeasured_candidate = prepared.report["objects"][0]["rotation_selection"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                candidate.get("geometry_metrics").is_none()
+                    && candidate["yaw_delta_degrees"]
+                        .as_f64()
+                        .is_some_and(|delta| delta.abs() > 1.0)
+            })
+            .and_then(|candidate| candidate["candidate_index"].as_u64())
+            .expect("unmeasured candidate") as usize;
+        let response = SceneRotationSelectionResponse {
+            objects: vec![crate::SceneRotationSelection {
+                index: 0,
+                candidate_index: unmeasured_candidate,
+                confidence: 0.99,
+                rationale: "bad free candidate".to_string(),
+            }],
+        };
+        let applied = apply_scene_final_yaw_refinement(
+            final_yaw_config(Path::new("tmp")),
+            &manifest,
+            &bindings,
+            &layout,
+            &commands,
+            Some(&prior),
+            Some(&response),
+        )
+        .expect("reject final yaw");
+
+        assert_eq!(
+            applied.report["status"],
+            json!("selection_rejected_or_noop")
+        );
+        assert_eq!(
+            applied.report["ignored"][0]["reason"],
+            json!("candidate_missing_geometry_metrics")
+        );
+        assert_eq!(applied.commands[1]["rotation"], commands[1]["rotation"]);
+    }
 
     #[test]
     fn pose_fit_quality_gate_distinguishes_degraded_from_no_work() {

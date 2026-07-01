@@ -22,11 +22,11 @@ pub use types::{
     InferenceBackend, LocateAnythingBackend, MeshOutputFormat, QualityPreset,
     SceneBuildExecutionKind, SceneBuildProgressEvent, SceneBuildProgressPhase,
     SceneCanonicalPoseMode, SceneCompositionMode, SceneDepthPrecision, SceneDepthProvider,
-    SceneGroundCalibrationMode, SceneInstanceGenerationMode, SceneLocateAnythingPrecision,
-    SceneLocatorProvider, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
-    ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy, SceneSegmentationPrecision,
-    SceneSegmentationProvider, SceneSegmentationQuantization, ServerArgs, ServerConfig,
-    SynthesisModel, TrellisQuality,
+    SceneFinalYawRefinementMode, SceneGroundCalibrationMode, SceneInstanceGenerationMode,
+    SceneLocateAnythingPrecision, SceneLocatorProvider, SceneObjectPoseRefinementMode,
+    SceneObjectPoseRefinementSet, ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy,
+    SceneSegmentationPrecision, SceneSegmentationProvider, SceneSegmentationQuantization,
+    ServerArgs, ServerConfig, SynthesisModel, TrellisQuality,
 };
 
 pub fn run_scene_build_from_image(

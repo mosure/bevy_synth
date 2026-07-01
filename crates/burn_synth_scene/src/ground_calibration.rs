@@ -201,7 +201,10 @@ pub fn apply_ground_calibration_response(
             .vertical_fov_degrees
             .or(Some(vertical_fov_degrees));
         calibration.camera_yaw_degrees = None;
-        calibration.camera_pitch_degrees = None;
+        calibration.camera_pitch_degrees = calibration
+            .camera_pitch_degrees
+            .filter(|value| value.is_finite())
+            .map(|value| value.abs().clamp(5.0, 80.0));
         calibration.camera_radius_m = None;
         next_manifest.scene_calibration = Some(calibration);
     } else {
@@ -220,6 +223,10 @@ pub fn apply_ground_calibration_response(
     }
 
     let mut next_evidence = evidence.clone();
+    let raw_intrinsics = evidence
+        .camera
+        .intrinsics
+        .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.intrinsics));
     let image_size = next_evidence
         .camera
         .image_size
@@ -235,6 +242,7 @@ pub fn apply_ground_calibration_response(
                 .map(|(w, h)| [w, h])
         });
     next_evidence.camera.image_size = image_size;
+    next_evidence.camera.intrinsics = raw_intrinsics;
     next_evidence.camera.vertical_fov_degrees = Some(vertical_fov_degrees);
     next_evidence.camera.confidence = Some(floor_confidence);
     if let Some([width, height]) = image_size {
@@ -247,15 +255,20 @@ pub fn apply_ground_calibration_response(
                 / (vertical_fov_degrees.to_radians() * 0.5).tan().max(1.0e-5),
         );
     }
-    next_evidence.floor = EstimatedFloorPlane {
-        normal: [0.0, 1.0, 0.0],
-        distance_m: -camera_height_m,
-        residual_m: Some(floor_residual_m),
-        confidence: Some(floor_confidence),
-    };
+    next_evidence.floor = estimated_floor_from_camera_pitch(
+        camera_height_m,
+        next_manifest
+            .scene_calibration
+            .and_then(|calibration| calibration.camera_pitch_degrees),
+        floor_confidence,
+        floor_residual_m,
+    );
     if let Some(depth) = next_evidence.depth.as_mut() {
-        depth.vertical_fov_degrees = Some(vertical_fov_degrees);
-        depth.focal_length_px = next_evidence.camera.focal_length_px;
+        if raw_intrinsics.is_none() {
+            depth.vertical_fov_degrees = Some(vertical_fov_degrees);
+            depth.focal_length_px = next_evidence.camera.focal_length_px;
+        }
+        depth.intrinsics = depth.intrinsics.or(raw_intrinsics);
         depth.image_size = depth.image_size.or(image_size);
     }
 
@@ -269,6 +282,28 @@ pub fn apply_ground_calibration_response(
         applied_floor: next_evidence.floor,
     };
     Ok((next_manifest, next_evidence, report))
+}
+
+pub(crate) fn estimated_floor_from_camera_pitch(
+    camera_height_m: f32,
+    camera_pitch_degrees: Option<f32>,
+    confidence: f32,
+    residual_m: f32,
+) -> EstimatedFloorPlane {
+    EstimatedFloorPlane {
+        normal: camera_space_floor_normal_from_pitch(camera_pitch_degrees),
+        distance_m: -camera_height_m,
+        residual_m: Some(residual_m),
+        confidence: Some(confidence),
+    }
+}
+
+pub(crate) fn camera_space_floor_normal_from_pitch(camera_pitch_degrees: Option<f32>) -> [f32; 3] {
+    let Some(pitch_degrees) = camera_pitch_degrees.filter(|value| value.is_finite()) else {
+        return [0.0, 1.0, 0.0];
+    };
+    let pitch = pitch_degrees.abs().clamp(0.0, 85.0).to_radians();
+    [0.0, pitch.cos(), pitch.sin()]
 }
 
 fn finite_range(value: f32, min: f32, max: f32, name: &str) -> SceneResult<f32> {
@@ -297,4 +332,78 @@ fn bounded_ground_calibration_camera_height(
 
     let max_delta_m = (prior_height_m * 0.12).clamp(0.15, 0.35);
     requested_camera_height_m.clamp(prior_height_m - max_delta_m, prior_height_m + max_delta_m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ground_calibration_preserves_raw_depthpro_intrinsics() {
+        let raw_intrinsics =
+            SceneCameraIntrinsics::from_fx_fy(1794.9255, 1794.9255, 1919.0, 1078.0, 3839, 2157)
+                .unwrap();
+        let manifest = SceneObjectManifest {
+            source_scene_path: "curry.jpg".to_string(),
+            scene_calibration: None,
+            objects: Vec::new(),
+        };
+        let evidence = SceneGroundingEvidence {
+            source_image_path: "curry.jpg".to_string(),
+            depth: Some(DepthEvidenceRef {
+                provider: "depth-pro".to_string(),
+                model: Some("depth-pro".to_string()),
+                precision: Some("f16".to_string()),
+                artifact_path: None,
+                intrinsics: Some(raw_intrinsics),
+                focal_length_px: Some(raw_intrinsics.fy),
+                vertical_fov_degrees: Some(raw_intrinsics.fov_y_degrees),
+                image_size: Some([3839, 2157]),
+                depth_map_size: Some([3839, 2157]),
+                floor_sample_count: Some(674),
+            }),
+            segmentation: None,
+            detections: Vec::new(),
+            camera: EstimatedCamera {
+                intrinsics: Some(raw_intrinsics),
+                focal_length_px: Some(raw_intrinsics.fy),
+                principal_point: Some([raw_intrinsics.cx, raw_intrinsics.cy]),
+                image_size: Some([3839, 2157]),
+                vertical_fov_degrees: Some(raw_intrinsics.fov_y_degrees),
+                confidence: Some(0.8),
+            },
+            floor: EstimatedFloorPlane {
+                normal: [0.0, 1.0, 0.0],
+                distance_m: -1.66,
+                residual_m: Some(0.08),
+                confidence: Some(0.78),
+            },
+            objects: Vec::new(),
+        };
+        let response = SceneGroundCalibrationResponse {
+            camera_height_m: 2.4,
+            vertical_fov_degrees: 78.0,
+            floor_confidence: 0.9,
+            floor_residual_m: 0.03,
+            rationale: "viewer camera should be wider".to_string(),
+            scene_calibration: None,
+        };
+
+        let (_, calibrated, _) =
+            apply_ground_calibration_response(&manifest, &evidence, &response).unwrap();
+
+        assert_eq!(calibrated.camera.intrinsics, Some(raw_intrinsics));
+        assert_eq!(
+            calibrated.depth.as_ref().and_then(|depth| depth.intrinsics),
+            Some(raw_intrinsics)
+        );
+        assert_eq!(
+            calibrated
+                .depth
+                .as_ref()
+                .and_then(|depth| depth.vertical_fov_degrees),
+            Some(raw_intrinsics.fov_y_degrees)
+        );
+        assert_eq!(calibrated.camera.vertical_fov_degrees, Some(78.0));
+    }
 }

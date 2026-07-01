@@ -5,6 +5,7 @@ mod cli;
 mod depth_sidecar;
 mod error;
 mod ground_calibration;
+mod intrinsics;
 mod layout;
 mod object_images;
 mod openai;
@@ -37,6 +38,7 @@ pub use ground_calibration::{
     apply_ground_calibration_response, ground_calibration_schema,
     prepare_ground_calibration_request,
 };
+pub use intrinsics::source_camera_intrinsics_from_evidence;
 pub use layout::{
     GroundedSceneLayout, GroundedSceneLayoutConfig, GroundedScenePlacement, grounded_scene_bsn,
     grounded_scene_layout, grounded_scene_layout_for_manifest, grounded_scene_layout_with_evidence,
@@ -56,9 +58,10 @@ pub use pipeline::{
     select_object_image_candidates, select_object_image_candidates_with_exclusions,
 };
 pub use pose_fit::{
-    SceneObjectPoseRefinementConfig, ScenePoseFitObjectFilter, SceneRotationFitConfig,
-    SceneRotationFitOutcome, SceneVisibleSurfacePoseFitConfig, apply_scene_object_pose_refinement,
-    apply_scene_rotation_fit, apply_scene_visible_surface_pose_fit,
+    SceneFinalYawRefinementConfig, SceneObjectPoseRefinementConfig, ScenePoseFitObjectFilter,
+    SceneRotationFitConfig, SceneRotationFitOutcome, SceneVisibleSurfacePoseFitConfig,
+    apply_scene_final_yaw_refinement, apply_scene_object_pose_refinement, apply_scene_rotation_fit,
+    apply_scene_visible_surface_pose_fit,
 };
 pub use projection_fit::{
     ProjectionFitCameraReport, ProjectionFitCandidateReport, ProjectionFitObjectReport,

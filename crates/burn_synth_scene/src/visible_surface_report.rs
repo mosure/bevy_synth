@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::pose_fit_prelude::normalized_bbox_iou;
 use crate::{
     GroundedScenePlacement, ObjectGroundingEvidence, SceneAssetBinding, SceneGroundingEvidence,
-    write_json_file,
+    source_camera_intrinsics_from_evidence, write_json_file,
 };
 
 pub fn write_visible_surface_fit_artifacts(
@@ -215,47 +215,14 @@ struct MeshSurfaceProjection {
 }
 
 fn visible_source_intrinsics(evidence: &SceneGroundingEvidence) -> Option<VisibleSourceIntrinsics> {
-    let [width, height] = evidence
-        .camera
-        .image_size
-        .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.image_size))?;
-    let width = width.max(1) as f32;
-    let height = height.max(1) as f32;
-    let vertical_fov_degrees = evidence
-        .camera
-        .vertical_fov_degrees
-        .or_else(|| {
-            evidence
-                .depth
-                .as_ref()
-                .and_then(|depth| depth.vertical_fov_degrees)
-        })
-        .filter(|value| value.is_finite() && *value > 1.0)
-        .unwrap_or(72.0);
-    let fy = evidence
-        .camera
-        .focal_length_px
-        .or_else(|| {
-            evidence
-                .depth
-                .as_ref()
-                .and_then(|depth| depth.focal_length_px)
-        })
-        .filter(|value| value.is_finite() && *value > 1.0)
-        .unwrap_or_else(|| {
-            (height * 0.5) / (vertical_fov_degrees.to_radians() * 0.5).tan().max(1.0e-5)
-        });
-    let principal = evidence
-        .camera
-        .principal_point
-        .unwrap_or([(width - 1.0) * 0.5, (height - 1.0) * 0.5]);
+    let intrinsics = source_camera_intrinsics_from_evidence(evidence)?;
     Some(VisibleSourceIntrinsics {
-        fx: fy,
-        fy,
-        cx: principal[0],
-        cy: principal[1],
-        width,
-        height,
+        fx: intrinsics.fx,
+        fy: intrinsics.fy,
+        cx: intrinsics.cx,
+        cy: intrinsics.cy,
+        width: intrinsics.width.max(1) as f32,
+        height: intrinsics.height.max(1) as f32,
     })
 }
 

@@ -920,6 +920,7 @@ fn depth_grounding_uses_table_bbox_center_as_scene_origin() {
     ];
     let mut evidence = manifest_grounding_evidence(&manifest);
     evidence.camera = EstimatedCamera {
+        intrinsics: None,
         focal_length_px: Some(100.0),
         principal_point: Some([50.0, 50.0]),
         image_size: Some([101, 101]),
@@ -1036,6 +1037,7 @@ fn depth_grounding_preserves_source_camera_frame_with_yaw_hint() {
         model: None,
         precision: None,
         artifact_path: None,
+        intrinsics: None,
         focal_length_px: Some(100.0),
         vertical_fov_degrees: Some(60.0),
         image_size: Some([101, 101]),
@@ -1043,6 +1045,7 @@ fn depth_grounding_preserves_source_camera_frame_with_yaw_hint() {
         floor_sample_count: Some(32),
     });
     evidence.camera = EstimatedCamera {
+        intrinsics: None,
         focal_length_px: Some(100.0),
         principal_point: Some([50.0, 50.0]),
         image_size: Some([101, 101]),
@@ -1082,17 +1085,22 @@ fn depth_grounding_preserves_source_camera_frame_with_yaw_hint() {
         chair.ground_point,
         layout.camera
     );
-    assert_eq!(layout.camera.translation, [-2.0, 1.5, 5.0]);
-    assert!((layout.camera.focus[0] + 2.0).abs() < 1.0e-4);
-    assert!((layout.camera.focus[1] - 0.0).abs() < 1.0e-4);
-    assert!((layout.camera.focus[2] - 6.5).abs() < 1.0e-4);
     assert_eq!(layout.camera.yaw, Some(180.0));
-    assert_eq!(layout.camera.pitch, Some(45.0));
-    assert_eq!(layout.camera.radius, None);
+    assert!((layout.camera.translation[1] - 1.5).abs() < 1.0e-4);
+    assert!((layout.camera.focus[1] - 0.0).abs() < 1.0e-4);
+    assert!((layout.camera.translation[0] - layout.camera.focus[0]).abs() < 1.0e-4);
+    assert!(layout.camera.translation[2] < layout.camera.focus[2]);
+    let horizontal = (layout.camera.translation[2] - layout.camera.focus[2]).abs();
+    let expected_pitch = 1.5_f32.atan2(horizontal).to_degrees();
+    assert!(
+        (layout.camera.pitch.unwrap() - expected_pitch).abs() < 1.0e-3,
+        "camera {:?} expected pitch {expected_pitch}",
+        layout.camera
+    );
+    assert!(layout.camera.radius.is_some_and(|radius| radius > 2.0));
     assert!(layout.bsn.contains("vertical_fov 60"));
     assert!(layout.bsn.contains(" yaw 180"));
-    assert!(layout.bsn.contains(" pitch 45"));
-    assert!(!layout.bsn.contains(" radius "));
+    assert!(layout.bsn.contains(" radius "));
 }
 
 #[test]
@@ -1218,6 +1226,49 @@ fn depth_grounding_ignores_high_residual_floor_ray_intersections() {
     };
 
     assert_eq!(floor_contact_point_from_evidence(&object, &floor), None);
+}
+
+#[test]
+fn pitched_camera_floor_accepts_visible_contact_rays_above_horizontal_horizon() {
+    let object = ObjectGroundingEvidence {
+        object_id: "chair".to_string(),
+        instance_id: None,
+        reuse_group: None,
+        detection: None,
+        mask: None,
+        asset_id: None,
+        contact_pixel: None,
+        depth_stats: None,
+        candidate_floor_contact_rays: vec![[-0.57437325, -0.13754106, 0.8069559]],
+        metric_contact_point_m: None,
+        target_footprint_m: None,
+        provenance: vec!["test".to_string()],
+    };
+    let horizontal_floor = EstimatedFloorPlane {
+        normal: [0.0, 1.0, 0.0],
+        distance_m: -1.6620882,
+        residual_m: Some(0.01),
+        confidence: Some(0.99),
+    };
+    let pitched_floor = crate::ground_calibration::estimated_floor_from_camera_pitch(
+        1.6620882,
+        Some(42.0),
+        0.99,
+        0.01,
+    );
+
+    assert_eq!(
+        floor_contact_point_from_evidence(&object, &horizontal_floor),
+        None,
+        "a horizontal camera-space floor incorrectly rejects upper-image contact rays"
+    );
+    let point = floor_contact_point_from_evidence(&object, &pitched_floor)
+        .expect("pitched camera-space floor should intersect the source contact ray");
+    assert!(point[2].is_finite() && point[2] > 0.0, "point {point:?}");
+    assert!(
+        point[0].is_finite() && point[1].is_finite(),
+        "point {point:?}"
+    );
 }
 
 #[test]
@@ -1985,6 +2036,7 @@ fn grounded_scene_layout_uses_calibrated_table_slots_and_source_camera() {
         model: None,
         precision: None,
         artifact_path: None,
+        intrinsics: None,
         focal_length_px: Some(900.0),
         vertical_fov_degrees: Some(62.0),
         image_size: Some([1600, 900]),
@@ -2081,6 +2133,70 @@ fn asset_preserving_scale_policy_ignores_single_axis_outliers() {
     assert!((scale[0] - 1.03558).abs() < 1.0e-5);
     assert_eq!(scale[0], scale[1]);
     assert_eq!(scale[1], scale[2]);
+}
+
+#[test]
+fn placement_sync_keeps_offcenter_asset_ground_anchor_fixed_across_yaw() {
+    let mut placement = GroundedScenePlacement {
+        entity_id: "offcenter_table".to_string(),
+        asset_id: "offcenter_table_asset".to_string(),
+        object_id: "offcenter_table".to_string(),
+        instance_id: None,
+        label: "offcenter table".to_string(),
+        source_bbox: [0.25, 0.35, 0.65, 0.78],
+        contact_pixel: [0.45, 0.78],
+        ground_point: [3.0, 0.0, -2.0],
+        translation: [0.0; 3],
+        rotation_y_degrees: 0.0,
+        asset_yaw_offset_degrees: 0.0,
+        scale: [1.5, 2.0, 0.75],
+        local_aabb: SceneAssetAabb {
+            min: [0.2, -0.25, -0.4],
+            max: [1.8, 0.75, 1.2],
+        },
+        target_footprint_m: [1.6, 1.2],
+    };
+
+    placement.sync_translation_to_ground_anchor(0.0);
+    let initial_translation = placement.translation;
+    assert!(
+        (initial_translation[0] - placement.ground_point[0]).abs() > 0.25,
+        "off-center assets should not use raw translation as the footprint anchor"
+    );
+    assert_ground_anchor_matches(&placement, [3.0, 0.0, -2.0]);
+    let bottom_y = placement.translation[1] + placement.local_aabb.min[1] * placement.scale[1];
+    assert!(bottom_y.abs() < 1.0e-5);
+
+    placement.rotation_y_degrees = 90.0;
+    placement.sync_translation_to_ground_anchor(0.0);
+    assert_ground_anchor_matches(&placement, [3.0, 0.0, -2.0]);
+    assert!(
+        (placement.translation[0] - initial_translation[0]).abs() > 0.25
+            || (placement.translation[2] - initial_translation[2]).abs() > 0.25,
+        "translation must compensate yaw so the world ground anchor stays fixed"
+    );
+    let bottom_y = placement.translation[1] + placement.local_aabb.min[1] * placement.scale[1];
+    assert!(bottom_y.abs() < 1.0e-5);
+
+    let command_translation = placement.translation;
+    placement.sync_ground_anchor_from_translation(0.0);
+    assert_ground_anchor_matches(&placement, [3.0, 0.0, -2.0]);
+    assert_eq!(placement.translation, command_translation);
+}
+
+fn assert_ground_anchor_matches(placement: &GroundedScenePlacement, expected: [f32; 3]) {
+    let actual = placement.world_ground_anchor();
+    for axis in 0..3 {
+        assert!(
+            (actual[axis] - expected[axis]).abs() < 1.0e-5,
+            "axis {axis}: actual {actual:?} expected {expected:?}"
+        );
+        assert!(
+            (placement.ground_point[axis] - expected[axis]).abs() < 1.0e-5,
+            "axis {axis}: stored ground point {:?} expected {expected:?}",
+            placement.ground_point
+        );
+    }
 }
 
 #[test]
@@ -3125,6 +3241,7 @@ fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
             model: Some("depth-pro".to_string()),
             precision: Some("f16".to_string()),
             artifact_path: None,
+            intrinsics: None,
             focal_length_px: None,
             vertical_fov_degrees: None,
             image_size: Some([1600, 900]),
@@ -3162,7 +3279,9 @@ fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
             .expect("apply ground calibration");
 
     assert!((evidence.floor.distance_m + 2.4).abs() < 1.0e-5);
-    assert_eq!(evidence.floor.normal, [0.0, 1.0, 0.0]);
+    let expected_pitch = 39.0_f32.to_radians();
+    assert!((evidence.floor.normal[1] - expected_pitch.cos()).abs() < 1.0e-5);
+    assert!((evidence.floor.normal[2] - expected_pitch.sin()).abs() < 1.0e-5);
     assert_eq!(evidence.floor.confidence, Some(0.88));
     assert_eq!(evidence.camera.vertical_fov_degrees, Some(62.0));
     let calibration = manifest
@@ -3173,7 +3292,7 @@ fn gpt_ground_calibration_applies_camera_height_to_floor_evidence() {
     assert_eq!(calibration.table_size_m, Some([2.4, 0.9]));
     assert_eq!(calibration.vertical_fov_degrees, Some(62.0));
     assert_eq!(calibration.camera_yaw_degrees, None);
-    assert_eq!(calibration.camera_pitch_degrees, None);
+    assert_eq!(calibration.camera_pitch_degrees, Some(39.0));
     assert_eq!(calibration.camera_radius_m, None);
     assert!(
         evidence
@@ -3211,6 +3330,7 @@ fn gpt_ground_calibration_preserves_high_confidence_depth_floor_height() {
             model: Some("depth-pro".to_string()),
             precision: Some("f16".to_string()),
             artifact_path: None,
+            intrinsics: None,
             focal_length_px: None,
             vertical_fov_degrees: None,
             image_size: Some([3839, 2157]),
@@ -3253,7 +3373,9 @@ fn gpt_ground_calibration_preserves_high_confidence_depth_floor_height() {
             .expect("apply ground calibration");
 
     assert!((evidence.floor.distance_m + 1.6620882).abs() < 1.0e-5);
-    assert_eq!(evidence.floor.normal, [0.0, 1.0, 0.0]);
+    let expected_pitch = 55.0_f32.to_radians();
+    assert!((evidence.floor.normal[1] - expected_pitch.cos()).abs() < 1.0e-5);
+    assert!((evidence.floor.normal[2] - expected_pitch.sin()).abs() < 1.0e-5);
     assert_eq!(report.response.camera_height_m, 2.55);
     assert_eq!(report.applied_floor.distance_m, evidence.floor.distance_m);
     let calibration = manifest
@@ -3261,7 +3383,7 @@ fn gpt_ground_calibration_preserves_high_confidence_depth_floor_height() {
         .expect("non-camera hints should be retained");
     assert_eq!(calibration.table_center, Some([0.39, 0.49]));
     assert_eq!(calibration.table_axis_degrees, Some(-12.0));
-    assert_eq!(calibration.camera_pitch_degrees, None);
+    assert_eq!(calibration.camera_pitch_degrees, Some(55.0));
 }
 
 #[test]

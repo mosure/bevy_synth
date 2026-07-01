@@ -12,7 +12,7 @@ use burn_depth::{
 use burn_segmentation::BinaryMask;
 use burn_synth_scene::{
     DepthEvidenceRef, Detection, EstimatedFloorPlane, ObjectDepthStats, ObjectGroundingEvidence,
-    SceneGroundingEvidence, write_json_file,
+    SceneCameraIntrinsics, SceneGroundingEvidence, write_json_file,
 };
 use image::{Rgba, RgbaImage};
 use serde_json::{Value, json};
@@ -129,12 +129,17 @@ impl SceneGroundingRuntime {
             model: Some("depth-pro".to_string()),
             precision: Some(config.precision.label().to_string()),
             artifact_path: Some(summary_path.display().to_string()),
+            intrinsics: Some(depth_map.scene_intrinsics()),
             focal_length_px: depth_map.focal_length_px,
             vertical_fov_degrees: depth_map.vertical_fov_degrees,
             image_size: Some([depth_map.width, depth_map.height]),
             depth_map_size: Some([depth_map.width, depth_map.height]),
             floor_sample_count: Some(floor_sample_count),
         });
+        evidence.camera.intrinsics = evidence
+            .camera
+            .intrinsics
+            .or(Some(depth_map.scene_intrinsics()));
         evidence.camera.focal_length_px = evidence
             .camera
             .focal_length_px
@@ -238,6 +243,20 @@ fn scene_depth_map_from_prediction<B: Backend>(
             height,
         }
     });
+    let fov_x_degrees = Some(
+        2.0 * ((width as f32 * 0.5) / intrinsics.fx.max(1.0e-5))
+            .atan()
+            .to_degrees(),
+    )
+    .filter(|value| value.is_finite());
+    let vertical_fov_degrees = vertical_fov_degrees.or_else(|| {
+        Some(
+            2.0 * ((height as f32 * 0.5) / intrinsics.fy.max(1.0e-5))
+                .atan()
+                .to_degrees(),
+        )
+        .filter(|value| value.is_finite())
+    });
 
     Ok(SceneDepthMapEvidence {
         depth_m,
@@ -245,8 +264,32 @@ fn scene_depth_map_from_prediction<B: Backend>(
         height,
         intrinsics,
         focal_length_px,
+        fov_x_degrees,
         vertical_fov_degrees,
     })
+}
+
+impl SceneDepthMapEvidence {
+    fn scene_intrinsics(&self) -> SceneCameraIntrinsics {
+        SceneCameraIntrinsics::from_fx_fy(
+            self.intrinsics.fx,
+            self.intrinsics.fy,
+            self.intrinsics.cx,
+            self.intrinsics.cy,
+            self.width,
+            self.height,
+        )
+        .unwrap_or_else(|| {
+            SceneCameraIntrinsics::from_focal_length_px(
+                self.focal_length_px
+                    .unwrap_or_else(|| self.width.max(self.height) as f32),
+                self.width,
+                self.height,
+                Some([self.intrinsics.cx, self.intrinsics.cy]),
+            )
+            .expect("depth map dimensions and fallback focal are valid")
+        })
+    }
 }
 
 fn tensor_to_vec_f32<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Result<Vec<f32>, String> {
@@ -381,6 +424,7 @@ pub fn annotate_grounding_evidence_with_depth_map(
         total_objects: evidence.objects.len(),
         depth_map_size: [depth_map.width, depth_map.height],
         focal_length_px: depth_map.focal_length_px,
+        fov_x_degrees: depth_map.fov_x_degrees,
         vertical_fov_degrees: depth_map.vertical_fov_degrees,
         floor_sample_count: floor_report
             .as_ref()

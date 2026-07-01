@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::layout::{floor_contact_point_from_evidence, normalize_degrees};
 use crate::{
     EstimatedFloorPlane, GroundedScenePlacement, ObjectDepthStats, ObjectGroundingEvidence,
-    SceneAssetAabb, SceneCamera, SceneGroundingEvidence,
+    SceneAssetAabb, SceneCamera, SceneGroundingEvidence, source_camera_intrinsics_from_evidence,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -402,6 +402,9 @@ fn ground_anchor_source(
     if kind == ProjectionObjectKind::Table
         && let Some(point) = source_bbox_center_metric_point(object_evidence, evidence)
     {
+        if let Some(floor_point) = source_floor_point_at_xz(point, floor) {
+            return (GroundAnchorBasis::CameraRayGroundPlane, Some(floor_point));
+        }
         return (GroundAnchorBasis::MetricDepthCenter, Some(point));
     }
     if let Some(point) = floor_contact_point_from_evidence(object_evidence, floor) {
@@ -416,6 +419,12 @@ fn ground_anchor_source(
     }
 }
 
+fn source_floor_point_at_xz(point: [f32; 3], floor: &EstimatedFloorPlane) -> Option<[f32; 3]> {
+    let floor = source_projection_floor(floor)?;
+    let y = source_floor_y_at(floor, point[0], point[2])?;
+    Some([point[0], y, point[2]])
+}
+
 fn source_bbox_center_metric_point(
     object_evidence: &ObjectGroundingEvidence,
     evidence: &SceneGroundingEvidence,
@@ -425,54 +434,17 @@ fn source_bbox_center_metric_point(
         .depth_stats
         .map(|stats| stats.median_m)
         .filter(|value| value.is_finite() && *value > 0.0)?;
-    let (fx, fy, cx, cy, width, height) = source_intrinsics(evidence)?;
+    let intrinsics = source_camera_intrinsics_from_evidence(evidence)?;
+    let width = intrinsics.width.max(1) as f32;
+    let height = intrinsics.height.max(1) as f32;
     let center = bbox_center(normalize_bbox(detection.bbox));
     let pixel_x = center[0] * (width - 1.0).max(1.0);
     let pixel_y = center[1] * (height - 1.0).max(1.0);
     Some([
-        (pixel_x - cx) * depth / fx.max(1.0e-5),
-        (pixel_y - cy) * depth / fy.max(1.0e-5),
+        (pixel_x - intrinsics.cx) * depth / intrinsics.fx.max(1.0e-5),
+        (pixel_y - intrinsics.cy) * depth / intrinsics.fy.max(1.0e-5),
         depth,
     ])
-}
-
-fn source_intrinsics(evidence: &SceneGroundingEvidence) -> Option<(f32, f32, f32, f32, f32, f32)> {
-    let [width, height] = evidence
-        .camera
-        .image_size
-        .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.image_size))?;
-    let width = width.max(1) as f32;
-    let height = height.max(1) as f32;
-    let vertical_fov_degrees = evidence
-        .camera
-        .vertical_fov_degrees
-        .or_else(|| {
-            evidence
-                .depth
-                .as_ref()
-                .and_then(|depth| depth.vertical_fov_degrees)
-        })
-        .filter(|value| value.is_finite() && *value > 1.0)
-        .unwrap_or(72.0);
-    let fy = evidence
-        .camera
-        .focal_length_px
-        .or_else(|| {
-            evidence
-                .depth
-                .as_ref()
-                .and_then(|depth| depth.focal_length_px)
-        })
-        .filter(|value| value.is_finite() && *value > 1.0)
-        .unwrap_or_else(|| {
-            (height * 0.5) / (vertical_fov_degrees.to_radians() * 0.5).tan().max(1.0e-5)
-        });
-    let fx = fy;
-    let principal = evidence
-        .camera
-        .principal_point
-        .unwrap_or([(width - 1.0) * 0.5, (height - 1.0) * 0.5]);
-    Some((fx, fy, principal[0], principal[1], width, height))
 }
 
 impl ProjectionCamera {
@@ -487,49 +459,17 @@ impl ProjectionCamera {
         {
             return None;
         }
-        let [width, height] = evidence
-            .camera
-            .image_size
-            .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.image_size))?;
-        let width = width.max(1) as f32;
-        let height = height.max(1) as f32;
-        let vertical_fov_degrees = evidence
-            .camera
-            .vertical_fov_degrees
-            .or_else(|| {
-                evidence
-                    .depth
-                    .as_ref()
-                    .and_then(|depth| depth.vertical_fov_degrees)
-            })
-            .filter(|value| value.is_finite() && *value > 1.0)
-            .unwrap_or(72.0);
-        let fy = evidence
-            .camera
-            .focal_length_px
-            .or_else(|| {
-                evidence
-                    .depth
-                    .as_ref()
-                    .and_then(|depth| depth.focal_length_px)
-            })
-            .filter(|value| value.is_finite() && *value > 1.0)
-            .unwrap_or_else(|| {
-                (height * 0.5) / (vertical_fov_degrees.to_radians() * 0.5).tan().max(1.0e-5)
-            });
-        let fx = fy;
-        let principal = evidence
-            .camera
-            .principal_point
-            .unwrap_or([(width - 1.0) * 0.5, (height - 1.0) * 0.5]);
+        let intrinsics = source_camera_intrinsics_from_evidence(evidence)?;
+        let width = intrinsics.width.max(1) as f32;
+        let height = intrinsics.height.max(1) as f32;
         Some(Self::Source(SourceProjectionCamera {
-            fx,
-            fy,
-            cx: principal[0],
-            cy: principal[1],
+            fx: intrinsics.fx,
+            fy: intrinsics.fy,
+            cx: intrinsics.cx,
+            cy: intrinsics.cy,
             width,
             height,
-            vertical_fov_degrees,
+            vertical_fov_degrees: intrinsics.fov_y_degrees,
             aspect: width / height.max(1.0),
             floor: source_projection_floor(&evidence.floor),
         }))
@@ -704,6 +644,7 @@ fn yaw_sweep(
         for yaw in yaw_candidates(initial_yaw, target) {
             let mut trial = placements.to_vec();
             trial[index].rotation_y_degrees = normalize_degrees(yaw);
+            trial[index].sync_translation_to_ground_anchor(floor_y);
             enforce_candidate_bounds(
                 &mut trial[index],
                 &placements[index],
@@ -839,19 +780,19 @@ fn apply_candidate_delta(
 ) {
     match delta {
         CandidateDelta::Translate(delta) => {
-            placement.translation[0] += delta[0];
-            placement.translation[2] += delta[2];
             placement.ground_point[0] += delta[0];
             placement.ground_point[2] += delta[2];
+            placement.sync_translation_to_ground_anchor(floor_y);
         }
         CandidateDelta::Scale(multiplier) => {
             for axis in &mut placement.scale {
                 *axis = (*axis * multiplier).clamp(0.05, 20.0);
             }
-            placement.translation[1] = floor_y - placement.local_aabb.min[1] * placement.scale[1];
+            placement.sync_translation_to_ground_anchor(floor_y);
         }
         CandidateDelta::Yaw(delta) => {
             placement.rotation_y_degrees = normalize_degrees(placement.rotation_y_degrees + delta);
+            placement.sync_translation_to_ground_anchor(floor_y);
         }
     }
 }
@@ -891,7 +832,7 @@ fn enforce_candidate_bounds(
     for axis in &mut placement.scale {
         *axis = (*axis * multiplier).clamp(0.05, 20.0);
     }
-    placement.translation[1] = floor_y - placement.local_aabb.min[1] * placement.scale[1];
+    placement.sync_translation_to_ground_anchor(floor_y);
 }
 
 fn clamp_ground_anchor_drift(
@@ -911,8 +852,7 @@ fn clamp_ground_anchor_drift(
     };
     placement.ground_point[0] = next_x;
     placement.ground_point[2] = next_z;
-    placement.translation[0] = next_x;
-    placement.translation[2] = next_z;
+    placement.sync_translation_to_current_ground_anchor();
 }
 
 fn enforce_repeated_asset_scale(placements: &mut [GroundedScenePlacement], floor_y: f32) {
@@ -944,7 +884,7 @@ fn enforce_repeated_asset_scale(placements: &mut [GroundedScenePlacement], floor
             continue;
         };
         placement.scale = scale;
-        placement.translation[1] = floor_y - placement.local_aabb.min[1] * scale[1];
+        placement.sync_translation_to_ground_anchor(floor_y);
     }
 }
 
@@ -1017,7 +957,9 @@ fn evaluate_object(
         let target_center = bbox_center(target.source_bbox);
         let projected_center = bbox_center(projected_bbox);
         center_error = distance2(target_center, projected_center);
-        let target_anchor = if target.kind == ProjectionObjectKind::Table {
+        let target_anchor = if target.kind == ProjectionObjectKind::Table
+            && target.ground_anchor_basis == GroundAnchorBasis::MetricDepthCenter
+        {
             target_center
         } else {
             target.contact_pixel
@@ -1440,6 +1382,7 @@ mod tests {
             ground_point: [x, 0.0, 0.0],
             translation: [x, 0.0, 0.0],
             rotation_y_degrees: 0.0,
+            asset_yaw_offset_degrees: 0.0,
             scale: [1.0, 1.0, 1.0],
             local_aabb: SceneAssetAabb {
                 min: [-0.25, 0.0, -0.25],
@@ -1485,6 +1428,7 @@ mod tests {
                 model: None,
                 precision: None,
                 artifact_path: None,
+                intrinsics: None,
                 focal_length_px: Some(focal_length_px),
                 vertical_fov_degrees: Some(vertical_fov_degrees),
                 image_size: Some([width, height]),
@@ -1570,6 +1514,7 @@ mod tests {
                 model: None,
                 precision: None,
                 artifact_path: None,
+                intrinsics: None,
                 focal_length_px: None,
                 vertical_fov_degrees: Some(70.0),
                 image_size: Some([1600, 900]),
@@ -1618,6 +1563,7 @@ mod tests {
                 model: None,
                 precision: None,
                 artifact_path: None,
+                intrinsics: None,
                 focal_length_px: None,
                 vertical_fov_degrees: Some(70.0),
                 image_size: Some([1600, 900]),
@@ -1740,6 +1686,7 @@ mod tests {
                 model: None,
                 precision: None,
                 artifact_path: None,
+                intrinsics: None,
                 focal_length_px: Some(800.0),
                 vertical_fov_degrees: Some(60.0),
                 image_size: Some([1600, 900]),
@@ -1799,6 +1746,113 @@ mod tests {
     }
 
     #[test]
+    fn table_projection_uses_floor_under_metric_center_when_pitch_is_available() {
+        let mut placement = test_placement("table_001", 0.0);
+        placement.asset_id = "table_asset".to_string();
+        placement.object_id = "coffee_table".to_string();
+        placement.label = "coffee table".to_string();
+        placement.source_bbox = [0.25, 0.31, 0.52, 0.66];
+        placement.contact_pixel = [0.34, 0.66];
+        placement.local_aabb = SceneAssetAabb {
+            min: [-0.5, 0.0, -0.3],
+            max: [0.5, 0.35, 0.3],
+        };
+        placement.target_footprint_m = [1.2, 0.65];
+        placement.scale = [1.1, 1.1, 1.1];
+        placement.sync_translation_to_ground_anchor(0.0);
+        let mut placements = vec![placement.clone()];
+        let pitch = 42.0_f32.to_radians();
+        let evidence = SceneGroundingEvidence {
+            source_image_path: "synthetic.png".to_string(),
+            depth: Some(DepthEvidenceRef {
+                provider: "synthetic".to_string(),
+                model: None,
+                precision: None,
+                artifact_path: None,
+                intrinsics: None,
+                focal_length_px: Some(800.0),
+                vertical_fov_degrees: Some(60.0),
+                image_size: Some([1600, 900]),
+                depth_map_size: Some([1600, 900]),
+                floor_sample_count: Some(64),
+            }),
+            segmentation: None,
+            detections: Vec::new(),
+            camera: EstimatedCamera {
+                focal_length_px: Some(800.0),
+                principal_point: Some([799.5, 449.5]),
+                image_size: Some([1600, 900]),
+                vertical_fov_degrees: Some(60.0),
+                ..EstimatedCamera::default()
+            },
+            floor: EstimatedFloorPlane {
+                normal: [0.0, pitch.cos(), pitch.sin()],
+                distance_m: -1.6,
+                residual_m: Some(0.01),
+                confidence: Some(0.95),
+            },
+            objects: vec![ObjectGroundingEvidence {
+                object_id: placement.object_id.clone(),
+                instance_id: placement.instance_id.clone(),
+                reuse_group: None,
+                detection: Some(crate::Detection {
+                    label: placement.label.clone(),
+                    bbox: placement.source_bbox,
+                    point: Some(placement.contact_pixel),
+                    confidence: Some(0.95),
+                    source_query: "table".to_string(),
+                }),
+                mask: Some(crate::ObjectMaskEvidence {
+                    provider: "synthetic".to_string(),
+                    model: "synthetic-mask".to_string(),
+                    bbox: placement.source_bbox,
+                    score: 0.98,
+                    area_px: 20_000,
+                    image_size: [1600, 900],
+                    mask_rle: Vec::new(),
+                    center_pixel: Some([0.39, 0.48]),
+                    contact_pixel: Some(placement.contact_pixel),
+                    coverage: Some(0.40),
+                    artifact_path: None,
+                    mask_png_path: None,
+                }),
+                asset_id: None,
+                contact_pixel: Some(placement.contact_pixel),
+                depth_stats: Some(ObjectDepthStats {
+                    median_m: 2.2,
+                    min_m: 1.8,
+                    max_m: 3.0,
+                    contact_m: Some(2.1),
+                    sample_count: Some(128),
+                }),
+                candidate_floor_contact_rays: vec![[-0.33, 0.18, 0.93]],
+                metric_contact_point_m: Some([-0.75, 0.40, 2.1]),
+                target_footprint_m: Some(placement.target_footprint_m),
+                provenance: vec!["synthetic_depth".to_string()],
+            }],
+        };
+
+        let report = fit_grounded_scene_projection(
+            &mut placements,
+            &source_frame_test_camera(),
+            &evidence,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(report.camera.basis, "source-depth-intrinsics");
+        assert_eq!(
+            report.objects[0].ground_anchor_basis, "camera-ray-ground-plane",
+            "tables should use the source floor under the metric center instead of treating the visible bbox center as a floor anchor"
+        );
+        let anchor = report.objects[0]
+            .source_camera_anchor
+            .expect("table floor anchor");
+        let floor_y = source_floor_y_at(evidence.floor, anchor[0], anchor[2]).unwrap();
+        assert!((anchor[1] - floor_y).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn metric_depth_anchor_projection_ignores_unrelated_floor_plane() {
         let placement = test_placement("chair_001", 0.0);
         let width = 1600.0f32;
@@ -1822,6 +1876,7 @@ mod tests {
                 model: None,
                 precision: None,
                 artifact_path: None,
+                intrinsics: None,
                 focal_length_px: Some(fy),
                 vertical_fov_degrees: Some(60.0),
                 image_size: Some([width as u32, height as u32]),
@@ -1906,6 +1961,7 @@ mod tests {
                 model: None,
                 precision: None,
                 artifact_path: None,
+                intrinsics: None,
                 focal_length_px: Some(fy),
                 vertical_fov_degrees: Some(60.0),
                 image_size: Some([width as u32, height as u32]),

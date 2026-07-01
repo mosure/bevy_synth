@@ -310,7 +310,11 @@ pub(crate) fn finite_json_f64(value: f64) -> Option<Value> {
     value.is_finite().then_some(Value::from(value))
 }
 
-pub(crate) fn spawn_feedback_viewer(control_path: &Path, log_path: &Path) -> Result<Child, String> {
+pub(crate) fn spawn_feedback_viewer(
+    control_path: &Path,
+    log_path: &Path,
+    window_size: Option<(u32, u32)>,
+) -> Result<Child, String> {
     let exe = feedback_viewer_exe()?;
     ensure_parent_dir(control_path).map_err(|err| err.to_string())?;
     ensure_parent_dir(log_path).map_err(|err| err.to_string())?;
@@ -323,12 +327,21 @@ pub(crate) fn spawn_feedback_viewer(control_path: &Path, log_path: &Path) -> Res
     let err_log = log
         .try_clone()
         .map_err(|err| format!("failed to clone feedback viewer log handle: {err}"))?;
-    Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .arg("--mcp-scene-control-path")
         .arg(control_path)
         .arg("--ui-visible")
         .arg("false")
-        .arg("--read-only")
+        .arg("--read-only");
+    if let Some((width, height)) = window_size {
+        command
+            .arg("--window-width")
+            .arg(width.to_string())
+            .arg("--window-height")
+            .arg(height.to_string());
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err_log))
@@ -2677,11 +2690,18 @@ pub(crate) fn feedback_rotation_selection_prompt(task: &Value) -> String {
         .unwrap_or_else(|_| serde_json::to_string(task).unwrap_or_default());
     format!(
         "You are selecting bounded object yaw corrections for a 3D scene composition feedback loop.\n\
-         Compare each per-object source crop with the full-frame isolated render for that object. \
-         The isolated render uses the same scene camera and contains only the selected object, while \
-         preserving its position in the full frame. This is the primary rendered evidence because \
-         tight rendered crops may be empty when placement is wrong. Also compare any full-frame \
-         isolated rendered yaw-candidate screenshots embedded in rotation_selection.candidates. \
+         The goal is source-camera semantic alignment, not choosing the generated asset's canonical \
+         front view. Compare each per-object source crop with the full-frame isolated render for \
+         that object. The isolated render uses the same scene camera and contains only the selected \
+         object, while preserving its position in the full frame. This is the primary rendered \
+         evidence because tight rendered crops may be empty when placement is wrong. Also compare \
+         any full-frame isolated rendered yaw-candidate screenshots embedded in \
+         rotation_selection.candidates. \
+         Prefer the candidate where the same visible object surfaces appear on the same image side \
+         as the source crop: seats vs backs, fronts vs outer shells, table long edges, curved \
+         returns, and foreground/background ordering. Do not reward a candidate solely because it \
+         fills the crop or appears centered if its semantic front/back or left/right orientation is \
+         flipped relative to the source perspective. \
          For each object, choose exactly one \
          candidate_index from the provided candidates. Do not invent absolute yaw, transforms, \
          positions, scales, or new candidate values. If the crop evidence is ambiguous, choose \

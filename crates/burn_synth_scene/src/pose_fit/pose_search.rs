@@ -44,6 +44,7 @@ pub(super) struct VisibleSurfacePoseCandidate {
     pub(super) semantic_yaw_prior_degrees: Option<f32>,
     pub(super) semantic_yaw_error_degrees: Option<f32>,
     pub(super) semantic_yaw_loss: f32,
+    pub(super) semantic_yaw_passed: bool,
     pub(super) candidate_depth_summary: Option<SurfaceDepthSummary>,
     pub(super) target_depth_summary: Option<SurfaceDepthSummary>,
     pub(super) surface_depth_passed: bool,
@@ -103,6 +104,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
     for (yaw, stage) in rotation_fit_candidate_yaws(baseline.rotation_y_degrees, None) {
         let mut trial = baseline.clone();
         trial.rotation_y_degrees = yaw;
+        trial.sync_translation_to_current_ground_anchor();
         clamp_visible_surface_pose_candidate(&mut trial, baseline, config.scale_policy);
         if let Some(candidate) = visible_surface_pose_candidate(
             mesh,
@@ -128,7 +130,8 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
     }
     if let Some(prior_yaw) = semantic_prior_yaw {
         for delta in [-30.0, -15.0, -8.0, 0.0, 8.0, 15.0, 30.0] {
-            let yaw = normalize_degrees(prior_yaw + delta);
+            let semantic_yaw = normalize_degrees(prior_yaw + delta);
+            let yaw = spawn_yaw_for_semantic_yaw(baseline, semantic_yaw);
             if coarse.iter().any(|candidate| {
                 angular_distance_degrees(candidate.placement.rotation_y_degrees, yaw) <= 0.5
             }) {
@@ -136,6 +139,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
             }
             let mut trial = baseline.clone();
             trial.rotation_y_degrees = yaw;
+            trial.sync_translation_to_current_ground_anchor();
             clamp_visible_surface_pose_candidate(&mut trial, baseline, config.scale_policy);
             if let Some(candidate) = visible_surface_pose_candidate(
                 mesh,
@@ -169,6 +173,7 @@ pub(super) fn evaluate_visible_surface_pose_candidates(
         ) {
             let mut trial = best_placement.clone();
             trial.rotation_y_degrees = yaw;
+            trial.sync_translation_to_current_ground_anchor();
             clamp_visible_surface_pose_candidate(&mut trial, baseline, config.scale_policy);
             if let Some(candidate) = visible_surface_pose_candidate(
                 mesh,
@@ -393,10 +398,19 @@ fn visible_surface_pose_candidate(
     let scale_loss = safe_log2_ratio(scale, target_scale).abs().min(3.0) * 0.08;
     let semantic_yaw_prior_degrees = semantic_yaw_prior_for_placement(placement, scene_placements);
     let semantic_yaw_error_degrees = semantic_yaw_prior_degrees
-        .map(|prior| angular_distance_degrees(placement.rotation_y_degrees, prior));
+        .map(|prior| angular_distance_degrees(semantic_yaw_for_placement(placement), prior));
     let semantic_yaw_loss = semantic_yaw_error_degrees
         .map(semantic_yaw_loss_for_error)
         .unwrap_or(0.0);
+    let semantic_yaw_passed = semantic_yaw_error_degrees
+        .map(semantic_yaw_passes_constraint)
+        .unwrap_or(true);
+    let semantic_bbox_passed = semantic_yaw_prior_degrees.is_some()
+        && semantic_yaw_passed
+        && depth_passed
+        && bbox_iou >= 0.68
+        && center_error <= 0.035
+        && mask_iou >= (config.min_mask_iou * 0.40).clamp(0.16, 0.24);
     let loss = (1.0 - mask_iou) * 2.35
         + (1.0 - bbox_iou) * 0.95
         + center_error * 1.25
@@ -412,8 +426,9 @@ fn visible_surface_pose_candidate(
     let surface_depth_passed = surface_depth_loss.is_none_or(|value| value <= 1.15 || depth_passed);
     let passed = depth_passed
         && surface_depth_passed
+        && semantic_yaw_passed
         && if target.mask_kind == "sam_rle" {
-            mask_iou >= config.min_mask_iou
+            mask_iou >= config.min_mask_iou || semantic_bbox_passed
         } else {
             bbox_iou >= (config.min_mask_iou * 0.55).clamp(0.15, 0.45)
         };
@@ -437,6 +452,7 @@ fn visible_surface_pose_candidate(
         semantic_yaw_prior_degrees,
         semantic_yaw_error_degrees,
         semantic_yaw_loss,
+        semantic_yaw_passed,
         candidate_depth_summary: surface.depth_summary,
         target_depth_summary,
         surface_depth_passed,
@@ -468,7 +484,15 @@ pub(super) fn visible_surface_pose_candidate_passes_target(
     target: &RotationFitTarget,
     config: SceneVisibleSurfacePoseFitConfig<'_>,
 ) -> bool {
-    if best.loss + VISIBLE_SURFACE_POSE_FIT_MIN_APPLY_IMPROVEMENT >= baseline.loss {
+    let repairs_semantic_yaw = !baseline.semantic_yaw_passed && best.semantic_yaw_passed;
+    if repairs_semantic_yaw {
+        if best.loss > baseline.loss + VISIBLE_SURFACE_SEMANTIC_YAW_REPAIR_MAX_LOSS_REGRESSION {
+            return false;
+        }
+    } else if best.loss + VISIBLE_SURFACE_POSE_FIT_MIN_APPLY_IMPROVEMENT >= baseline.loss {
+        return false;
+    }
+    if !best.semantic_yaw_passed {
         return false;
     }
     if config.object_filter.is_refinement()
@@ -484,7 +508,8 @@ pub(super) fn visible_surface_pose_candidate_passes_target(
         return false;
     }
     if target.mask_kind == "sam_rle" {
-        best.mask_iou >= config.min_mask_iou
+        best.passed
+            || best.mask_iou >= config.min_mask_iou
             || best.mask_iou + 0.04 >= baseline.mask_iou && best.bbox_iou > baseline.bbox_iou
     } else {
         best.bbox_iou > baseline.bbox_iou + 0.03 || best.passed
@@ -501,6 +526,10 @@ pub(super) fn visible_surface_pose_candidate_report(
         "ground_point": candidate.placement.ground_point,
         "scale": candidate.placement.scale,
         "yaw_degrees": candidate.placement.rotation_y_degrees,
+        "asset_yaw_offset_degrees": candidate.placement.asset_yaw_offset_degrees,
+        "semantic_yaw_degrees": candidate
+            .semantic_yaw_prior_degrees
+            .map(|_| semantic_yaw_for_placement(&candidate.placement)),
         "mask_iou": candidate.mask_iou,
         "bbox_iou": candidate.bbox_iou,
         "center_error": candidate.center_error,
@@ -515,6 +544,7 @@ pub(super) fn visible_surface_pose_candidate_report(
         "semantic_yaw_prior_degrees": candidate.semantic_yaw_prior_degrees,
         "semantic_yaw_error_degrees": candidate.semantic_yaw_error_degrees,
         "semantic_yaw_loss": candidate.semantic_yaw_loss,
+        "semantic_yaw_passed": candidate.semantic_yaw_passed,
         "candidate_depth_summary": candidate
             .candidate_depth_summary
             .map(surface_depth_summary_report),
@@ -553,9 +583,24 @@ pub(super) fn semantic_yaw_prior_for_placement(
     yaw_toward_point_degrees(from, nearest_table.ground_point)
 }
 
+fn semantic_yaw_for_placement(placement: &GroundedScenePlacement) -> f32 {
+    normalize_degrees(placement.rotation_y_degrees + placement.asset_yaw_offset_degrees)
+}
+
+fn spawn_yaw_for_semantic_yaw(
+    placement: &GroundedScenePlacement,
+    semantic_yaw_degrees: f32,
+) -> f32 {
+    normalize_degrees(semantic_yaw_degrees - placement.asset_yaw_offset_degrees)
+}
+
 pub(super) fn semantic_yaw_loss_for_error(error_degrees: f32) -> f32 {
     let normalized = (error_degrees.abs() / 180.0).clamp(0.0, 1.0);
-    normalized * normalized * 0.16
+    normalized * normalized * 2.4
+}
+
+pub(super) fn semantic_yaw_passes_constraint(error_degrees: f32) -> bool {
+    error_degrees.abs() <= 45.0
 }
 
 fn yaw_toward_point_degrees(from: [f32; 3], target: [f32; 3]) -> Option<f32> {
@@ -624,11 +669,11 @@ pub(super) fn command_placement_for_pose_fit(
     config: SceneVisibleSurfacePoseFitConfig<'_>,
 ) -> GroundedScenePlacement {
     let mut out = placement.clone();
+    let mut has_command_translation = false;
     if let Some(command) = command {
         if let Some(translation) = command.get("translation").and_then(json_array3) {
             out.translation = translation;
-            out.ground_point[0] = translation[0];
-            out.ground_point[2] = translation[2];
+            has_command_translation = true;
         }
         if let Some(scale) = command.get("scale").and_then(json_array3) {
             out.scale = config.scale_policy.apply_to_scale(scale);
@@ -641,7 +686,11 @@ pub(super) fn command_placement_for_pose_fit(
             out.rotation_y_degrees = normalize_degrees(yaw);
         }
     }
-    out.translation[1] = -out.local_aabb.min[1] * out.scale[1];
+    if has_command_translation {
+        out.sync_ground_anchor_from_current_translation();
+    } else {
+        out.sync_translation_to_current_ground_anchor();
+    }
     out
 }
 
@@ -662,10 +711,9 @@ fn apply_visible_surface_pose_delta(
 ) {
     match delta {
         VisibleSurfacePoseDelta::Translate(dx, dz) => {
-            placement.translation[0] += dx;
-            placement.translation[2] += dz;
             placement.ground_point[0] += dx;
             placement.ground_point[2] += dz;
+            placement.sync_translation_to_current_ground_anchor();
         }
         VisibleSurfacePoseDelta::Scale(multiplier) => {
             placement.scale = scale_policy.apply_to_scale([
@@ -673,10 +721,11 @@ fn apply_visible_surface_pose_delta(
                 placement.scale[1] * multiplier,
                 placement.scale[2] * multiplier,
             ]);
-            placement.translation[1] = -placement.local_aabb.min[1] * placement.scale[1];
+            placement.sync_translation_to_current_ground_anchor();
         }
         VisibleSurfacePoseDelta::Yaw(delta) => {
             placement.rotation_y_degrees = normalize_degrees(placement.rotation_y_degrees + delta);
+            placement.sync_translation_to_current_ground_anchor();
         }
     }
 }
@@ -694,8 +743,7 @@ pub(super) fn clamp_visible_surface_pose_candidate(
         let scale = max_drift / drift;
         placement.ground_point[0] = baseline.ground_point[0] + dx * scale;
         placement.ground_point[2] = baseline.ground_point[2] + dz * scale;
-        placement.translation[0] = placement.ground_point[0];
-        placement.translation[2] = placement.ground_point[2];
+        placement.sync_translation_to_current_ground_anchor();
     }
 
     let baseline_scale = representative_pose_scale(baseline.scale);
@@ -712,7 +760,7 @@ pub(super) fn clamp_visible_surface_pose_candidate(
         placement.scale[1] * multiplier,
         placement.scale[2] * multiplier,
     ]);
-    placement.translation[1] = -placement.local_aabb.min[1] * placement.scale[1];
+    placement.sync_translation_to_current_ground_anchor();
 }
 
 fn visible_surface_scale_bounds_for_placement(placement: &GroundedScenePlacement) -> (f32, f32) {
@@ -731,6 +779,190 @@ pub(super) fn representative_pose_scale(scale: [f32; 3]) -> f32 {
     ];
     values.sort_by(f32::total_cmp);
     values[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SceneAssetAabb;
+    use std::path::Path;
+
+    fn test_placement(object_id: &str, yaw: f32) -> GroundedScenePlacement {
+        GroundedScenePlacement {
+            entity_id: format!("{object_id}_entity"),
+            asset_id: format!("{object_id}_asset"),
+            object_id: object_id.to_string(),
+            instance_id: None,
+            label: object_id.to_string(),
+            source_bbox: [0.25, 0.25, 0.55, 0.70],
+            contact_pixel: [0.40, 0.70],
+            ground_point: [0.0, 0.0, 0.0],
+            translation: [0.0, 0.0, 0.0],
+            rotation_y_degrees: yaw,
+            asset_yaw_offset_degrees: 0.0,
+            scale: [1.0, 1.0, 1.0],
+            local_aabb: SceneAssetAabb {
+                min: [-0.5, 0.0, -0.5],
+                max: [0.5, 1.0, 0.5],
+            },
+            target_footprint_m: [1.0, 1.0],
+        }
+    }
+
+    fn test_candidate(loss: f32, yaw_error: Option<f32>) -> VisibleSurfacePoseCandidate {
+        let placement = test_placement("chair", 0.0);
+        let semantic_yaw_loss = yaw_error.map(semantic_yaw_loss_for_error).unwrap_or(0.0);
+        let semantic_yaw_passed = yaw_error
+            .map(semantic_yaw_passes_constraint)
+            .unwrap_or(true);
+        VisibleSurfacePoseCandidate {
+            candidate_index: 0,
+            stage: "test",
+            placement,
+            mask_iou: 0.82,
+            bbox_iou: 0.88,
+            center_error: 0.01,
+            area_log2_error: 0.02,
+            aspect_log2_error: 0.02,
+            depth_error_m: Some(0.02),
+            surface_depth_loss: Some(0.08),
+            dense_depth_loss: Some(0.05),
+            dense_depth_mae_m: Some(0.02),
+            dense_depth_sample_count: 128,
+            point_surface_loss: 0.03,
+            semantic_yaw_prior_degrees: yaw_error.map(|error| -error),
+            semantic_yaw_error_degrees: yaw_error,
+            semantic_yaw_loss,
+            semantic_yaw_passed,
+            candidate_depth_summary: None,
+            target_depth_summary: None,
+            surface_depth_passed: true,
+            depth_passed: true,
+            loss,
+            passed: true,
+            projected_bbox: Some([0.26, 0.26, 0.54, 0.69]),
+            front_facing_face_count: 12,
+            covered_px: 2048,
+            fallback_points: false,
+            artifact_path: None,
+            dense_optimization: None,
+        }
+    }
+
+    fn test_target() -> RotationFitTarget {
+        RotationFitTarget {
+            mask: BinaryMask::from_normalized_bbox(100, 100, [0.25, 0.25, 0.55, 0.70])
+                .expect("test mask"),
+            bbox: [0.25, 0.25, 0.55, 0.70],
+            crop_bbox: [0.20, 0.20, 0.60, 0.75],
+            depth_median_m: Some(1.5),
+            depth_stats: None,
+            dense_depth_crop: None,
+            mask_kind: "sam_rle",
+        }
+    }
+
+    fn test_config() -> SceneVisibleSurfacePoseFitConfig<'static> {
+        SceneVisibleSurfacePoseFitConfig {
+            mode: ScenePoseFitMode::RenderedSilhouette,
+            min_mask_iou: 0.45,
+            max_depth_error_m: 0.35,
+            write_artifacts: false,
+            output_dir: Path::new("tmp"),
+            scale_policy: SceneScalePolicy::AssetPreserving,
+            object_filter: ScenePoseFitObjectFilter::All,
+        }
+    }
+
+    #[test]
+    fn semantic_yaw_loss_penalizes_flipped_chair_candidates() {
+        assert!(semantic_yaw_loss_for_error(120.0) > semantic_yaw_loss_for_error(30.0) * 12.0);
+        assert!(semantic_yaw_passes_constraint(30.0));
+        assert!(!semantic_yaw_passes_constraint(90.0));
+    }
+
+    #[test]
+    fn semantic_yaw_accounts_for_asset_frame_offset() {
+        let mut chair = test_placement("chair", -90.0);
+        chair.asset_yaw_offset_degrees = 90.0;
+        let table = GroundedScenePlacement {
+            entity_id: "table_entity".to_string(),
+            asset_id: "table_asset".to_string(),
+            object_id: "table".to_string(),
+            instance_id: None,
+            label: "table".to_string(),
+            source_bbox: [0.45, 0.45, 0.65, 0.70],
+            contact_pixel: [0.55, 0.70],
+            ground_point: [0.0, 0.0, 2.0],
+            translation: [0.0, 0.0, 2.0],
+            rotation_y_degrees: 0.0,
+            asset_yaw_offset_degrees: 0.0,
+            scale: [1.0, 1.0, 1.0],
+            local_aabb: SceneAssetAabb {
+                min: [-0.5, 0.0, -0.5],
+                max: [0.5, 0.5, 0.5],
+            },
+            target_footprint_m: [1.0, 1.0],
+        };
+        let prior = semantic_yaw_prior_for_placement(&chair, &[chair.clone(), table])
+            .expect("chair should face table");
+
+        assert!(prior.abs() <= 1.0e-5);
+        assert!(semantic_yaw_for_placement(&chair).abs() <= 1.0e-5);
+        assert_eq!(spawn_yaw_for_semantic_yaw(&chair, prior), -90.0);
+
+        chair.rotation_y_degrees = 0.0;
+        assert_eq!(semantic_yaw_for_placement(&chair), 90.0);
+        assert!(!semantic_yaw_passes_constraint(angular_distance_degrees(
+            semantic_yaw_for_placement(&chair),
+            prior
+        )));
+    }
+
+    #[test]
+    fn visible_surface_pose_gate_rejects_large_semantic_yaw_error() {
+        let baseline = test_candidate(1.0, Some(8.0));
+        let flipped = test_candidate(0.10, Some(117.0));
+        let aligned = test_candidate(0.10, Some(24.0));
+        let target = test_target();
+        let config = test_config();
+
+        assert!(!visible_surface_pose_candidate_passes_target(
+            &flipped, &baseline, &target, config
+        ));
+        assert!(visible_surface_pose_candidate_passes_target(
+            &aligned, &baseline, &target, config
+        ));
+    }
+
+    #[test]
+    fn visible_surface_pose_gate_allows_bounded_semantic_yaw_repair() {
+        let baseline = test_candidate(1.0, Some(117.0));
+        let repaired = test_candidate(1.20, Some(24.0));
+        let mut repaired_from_bbox_depth = test_candidate(1.20, Some(24.0));
+        repaired_from_bbox_depth.mask_iou = 0.22;
+        repaired_from_bbox_depth.bbox_iou = 0.82;
+        repaired_from_bbox_depth.passed = true;
+        let too_expensive = test_candidate(1.50, Some(24.0));
+        let target = test_target();
+        let config = test_config();
+
+        assert!(visible_surface_pose_candidate_passes_target(
+            &repaired, &baseline, &target, config
+        ));
+        assert!(visible_surface_pose_candidate_passes_target(
+            &repaired_from_bbox_depth,
+            &baseline,
+            &target,
+            config
+        ));
+        assert!(!visible_surface_pose_candidate_passes_target(
+            &too_expensive,
+            &baseline,
+            &target,
+            config
+        ));
+    }
 }
 
 pub(super) fn normalize_reused_layout_scales(
@@ -765,7 +997,7 @@ pub(super) fn normalize_reused_layout_scales(
             continue;
         };
         placement.scale = scale;
-        placement.translation[1] = -placement.local_aabb.min[1] * scale[1];
+        placement.sync_translation_to_current_ground_anchor();
     }
 }
 
@@ -782,14 +1014,13 @@ pub(super) fn sync_layout_placements_from_commands(
         let Some(placement) = layout.placements.get_mut(placement_index) else {
             break;
         };
+        let mut has_command_translation = false;
         if let Some(translation) = command.get("translation").and_then(json_array3) {
             placement.translation = translation;
-            placement.ground_point[0] = translation[0];
-            placement.ground_point[2] = translation[2];
+            has_command_translation = true;
         }
         if let Some(scale) = command.get("scale").and_then(json_array3) {
             placement.scale = scale;
-            placement.translation[1] = -placement.local_aabb.min[1] * scale[1];
         }
         if let Some(yaw) = command
             .get("rotation")
@@ -797,6 +1028,11 @@ pub(super) fn sync_layout_placements_from_commands(
             .map(quat_y_degrees)
         {
             placement.rotation_y_degrees = normalize_degrees(yaw);
+        }
+        if has_command_translation {
+            placement.sync_ground_anchor_from_current_translation();
+        } else {
+            placement.sync_translation_to_current_ground_anchor();
         }
         placement_index += 1;
     }
@@ -960,47 +1196,14 @@ pub(super) fn rotation_fit_target_crop_mask(target: &RotationFitTarget) -> Vec<u
 pub(super) fn rotation_fit_intrinsics(
     evidence: &SceneGroundingEvidence,
 ) -> Option<RotationFitIntrinsics> {
-    let [width, height] = evidence
-        .camera
-        .image_size
-        .or_else(|| evidence.depth.as_ref().and_then(|depth| depth.image_size))?;
-    let width = width.max(1) as f32;
-    let height = height.max(1) as f32;
-    let vertical_fov_degrees = evidence
-        .camera
-        .vertical_fov_degrees
-        .or_else(|| {
-            evidence
-                .depth
-                .as_ref()
-                .and_then(|depth| depth.vertical_fov_degrees)
-        })
-        .filter(|value| value.is_finite() && *value > 1.0)
-        .unwrap_or(72.0);
-    let fy = evidence
-        .camera
-        .focal_length_px
-        .or_else(|| {
-            evidence
-                .depth
-                .as_ref()
-                .and_then(|depth| depth.focal_length_px)
-        })
-        .filter(|value| value.is_finite() && *value > 1.0)
-        .unwrap_or_else(|| {
-            (height * 0.5) / (vertical_fov_degrees.to_radians() * 0.5).tan().max(1.0e-5)
-        });
-    let principal = evidence
-        .camera
-        .principal_point
-        .unwrap_or([(width - 1.0) * 0.5, (height - 1.0) * 0.5]);
+    let intrinsics = crate::source_camera_intrinsics_from_evidence(evidence)?;
     Some(RotationFitIntrinsics {
-        fx: fy,
-        fy,
-        cx: principal[0],
-        cy: principal[1],
-        width,
-        height,
+        fx: intrinsics.fx,
+        fy: intrinsics.fy,
+        cx: intrinsics.cx,
+        cy: intrinsics.cy,
+        width: intrinsics.width.max(1) as f32,
+        height: intrinsics.height.max(1) as f32,
     })
 }
 
@@ -1044,6 +1247,7 @@ pub(super) fn placement_with_yaw(
 ) -> GroundedScenePlacement {
     let mut out = placement.clone();
     out.rotation_y_degrees = current_yaw;
+    out.sync_translation_to_current_ground_anchor();
     out
 }
 
@@ -1175,6 +1379,7 @@ fn evaluate_rotation_fit_candidate(
 ) -> Option<RotationFitCandidate> {
     let mut candidate_placement = placement.clone();
     candidate_placement.rotation_y_degrees = yaw;
+    candidate_placement.sync_translation_to_current_ground_anchor();
     let surface = project_mesh_visible_surface_mask(
         mesh,
         &candidate_placement,

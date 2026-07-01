@@ -278,7 +278,7 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
             }
         }
 
-        let Some((candidate_vec_index, measured_score, generated_score, source_score, metrics)) =
+        let Some((candidate_vec_index, _measured_score, generated_score, source_score, metrics)) =
             best
         else {
             skipped.push(json!({
@@ -288,7 +288,38 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
             }));
             continue;
         };
-        let candidate = report.candidates[candidate_vec_index].clone();
+        let selected_vec_index = chair_normal_tiebreak_candidate_index(report, candidate_vec_index)
+            .unwrap_or(candidate_vec_index);
+        let selected_by_normal_tiebreak = selected_vec_index != candidate_vec_index;
+        if selected_by_normal_tiebreak {
+            report.candidates[selected_vec_index].metrics["selection_tiebreak"] = json!({
+                "basis": "chair_source_depth_normal_ambiguous_visual_score",
+                "visual_best_candidate_index": report.candidates[candidate_vec_index].candidate_index,
+                "visual_best_yaw_offset_degrees": report.candidates[candidate_vec_index].yaw_offset_degrees,
+                "visual_best_score": report.candidates[candidate_vec_index].score,
+                "selected_normal_score": source_normal_score(&report.candidates[selected_vec_index]),
+                "visual_best_normal_score": source_normal_score(&report.candidates[candidate_vec_index]),
+            });
+        }
+        let candidate = report.candidates[selected_vec_index].clone();
+        let measured_score = candidate.score;
+        let generated_score = candidate
+            .metrics
+            .pointer("/render_similarity/generated_score")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(generated_score);
+        let source_score = candidate
+            .metrics
+            .pointer("/render_similarity/source_score")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(source_score);
+        let selected_rendered_metrics = candidate
+            .metrics
+            .pointer("/render_similarity/rendered")
+            .cloned()
+            .unwrap_or_else(|| json!(metrics));
         let fallback_used = measured_score < 0.38;
         if fallback_used {
             report
@@ -307,7 +338,11 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
                 yaw_offset_degrees: candidate.yaw_offset_degrees,
                 confidence: measured_score.clamp(0.0, 1.0),
                 source: SceneAssetFrameSource::VisualRenderSweep,
-                rationale: "selected from rendered asset thumbnail similarity against source/generated object evidence".to_string(),
+                rationale: if selected_by_normal_tiebreak {
+                    "selected from source depth-normal evidence because chair rendered-thumbnail scores were ambiguous".to_string()
+                } else {
+                    "selected from rendered asset thumbnail similarity against source/generated object evidence".to_string()
+                },
             };
         }
         report.fallback_used = fallback_used;
@@ -321,7 +356,8 @@ pub(crate) fn apply_canonical_pose_rendered_selection(
             "best_measured_yaw_offset_degrees": candidate.yaw_offset_degrees,
             "generated_score": generated_score,
             "source_score": source_score,
-            "rendered_metrics": metrics,
+            "selection_tiebreak": if selected_by_normal_tiebreak { "chair_source_depth_normal" } else { "none" },
+            "rendered_metrics": selected_rendered_metrics,
             "fallback": report.fallback_used,
         }));
     }
@@ -871,6 +907,125 @@ fn combine_rendered_pose_scores_with_normal(
     }
 }
 
+fn chair_normal_tiebreak_candidate_index(
+    report: &CanonicalPoseCalibrationReport,
+    visual_best_index: usize,
+) -> Option<usize> {
+    if !canonical_pose_report_is_chair_like(report) {
+        return None;
+    }
+    let visual_best = report.candidates.get(visual_best_index)?;
+    let visual_best_score = visual_best.score;
+    let visual_best_normal = source_normal_score(visual_best).unwrap_or(0.0);
+    let (normal_index, normal_score) = report
+        .candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            let normal_score = source_normal_score(candidate)?;
+            (candidate.score + 0.025 >= visual_best_score).then_some((index, normal_score))
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))?;
+    if normal_index != visual_best_index && normal_score > visual_best_normal + 0.015 {
+        Some(normal_index)
+    } else {
+        None
+    }
+}
+
+fn source_normal_score(candidate: &CanonicalPoseCandidate) -> Option<f32> {
+    candidate
+        .metrics
+        .pointer("/render_similarity/source_normal_score")
+        .or_else(|| {
+            candidate
+                .metrics
+                .pointer("/normal_evidence/similarity/score")
+        })
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| (value as f32).clamp(0.0, 1.0))
+}
+
+fn canonical_pose_report_is_chair_like(report: &CanonicalPoseCalibrationReport) -> bool {
+    let descriptor =
+        format!("{} {} {}", report.asset_id, report.object_id, report.label).to_ascii_lowercase();
+    descriptor.contains("chair")
+        || descriptor.contains("seat")
+        || descriptor.contains("stool")
+        || descriptor.contains("armchair")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_candidate(
+        index: usize,
+        yaw: f32,
+        score: f32,
+        normal_score: f32,
+    ) -> CanonicalPoseCandidate {
+        CanonicalPoseCandidate {
+            candidate_index: index,
+            yaw_offset_degrees: yaw,
+            candidate_yaw_degrees: yaw,
+            score,
+            source_crop_path: None,
+            rendered_image_path: Some(format!("candidate_{index}.png")),
+            metrics: json!({
+                "render_similarity": {
+                    "source_normal_score": normal_score,
+                }
+            }),
+        }
+    }
+
+    fn test_report(label: &str) -> CanonicalPoseCalibrationReport {
+        CanonicalPoseCalibrationReport {
+            schema_version: 1,
+            mode: "render_sweep".to_string(),
+            asset_id: format!("{label}_asset"),
+            object_id: label.to_string(),
+            label: label.to_string(),
+            source_crop_path: None,
+            generated_image_path: None,
+            selected: CanonicalPoseSelection {
+                candidate_index: 0,
+                yaw_offset_degrees: 0.0,
+                confidence: 0.57,
+                source: SceneAssetFrameSource::VisualRenderSweep,
+                rationale: "test".to_string(),
+            },
+            candidates: vec![
+                test_candidate(0, 0.0, 0.5720, 0.716),
+                test_candidate(1, 90.0, 0.5714, 0.744),
+                test_candidate(2, -90.0, 0.5526, 0.742),
+            ],
+            fallback_used: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chair_normal_tiebreak_prefers_stronger_normal_when_visual_scores_are_ambiguous() {
+        let report = test_report("chair");
+
+        assert_eq!(chair_normal_tiebreak_candidate_index(&report, 0), Some(1));
+    }
+
+    #[test]
+    fn chair_normal_tiebreak_does_not_override_clear_visual_winner_or_non_chair() {
+        let mut report = test_report("chair");
+        report.candidates[1].score = 0.52;
+        report.candidates[2].score = 0.52;
+        assert_eq!(chair_normal_tiebreak_candidate_index(&report, 0), None);
+
+        let report = test_report("table");
+        assert_eq!(chair_normal_tiebreak_candidate_index(&report, 0), None);
+    }
+}
+
 fn safe_log_ratio(left: f32, right: f32) -> f32 {
     (left.max(1.0e-4) / right.max(1.0e-4)).log2()
 }
@@ -940,10 +1095,13 @@ fn canonical_pose_report_for_asset(
     let selected = match context.mode {
         SceneCanonicalPoseMode::Off => CanonicalPoseSelection {
             candidate_index: 0,
-            yaw_offset_degrees: 0.0,
-            confidence: 1.0,
-            source: SceneAssetFrameSource::Explicit,
-            rationale: "canonical pose correction disabled".to_string(),
+            yaw_offset_degrees: heuristic_frame.yaw_offset_degrees,
+            confidence: heuristic_frame.confidence.unwrap_or(1.0),
+            source: heuristic_frame
+                .source
+                .unwrap_or(SceneAssetFrameSource::Explicit),
+            rationale: "canonical pose correction disabled; preserving existing asset frame"
+                .to_string(),
         },
         SceneCanonicalPoseMode::Heuristic => CanonicalPoseSelection {
             candidate_index: 0,
@@ -1020,12 +1178,12 @@ fn canonical_pose_candidates_for_asset(
     if mode == SceneCanonicalPoseMode::Off {
         return vec![CanonicalPoseCandidate {
             candidate_index: 0,
-            yaw_offset_degrees: 0.0,
-            candidate_yaw_degrees: 0.0,
-            score: 1.0,
+            yaw_offset_degrees: heuristic_frame.yaw_offset_degrees,
+            candidate_yaw_degrees: heuristic_frame.yaw_offset_degrees,
+            score: heuristic_frame.confidence.unwrap_or(1.0),
             source_crop_path: source_crop_path.map(str::to_string),
             rendered_image_path: None,
-            metrics: json!({ "basis": "disabled" }),
+            metrics: json!({ "basis": "disabled_preserve_existing_frame" }),
         }];
     }
     let mut offsets = Vec::new();

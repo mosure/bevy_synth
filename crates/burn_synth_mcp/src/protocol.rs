@@ -279,6 +279,10 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
                     "object_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Object-set pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting on the selected object set; gated-gpt additionally marks failed or ambiguous fits for bounded GPT candidate selection; always-gpt marks every selected object." },
                     "object_pose_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by object_pose_refinement. Defaults to tables-and-large-seating." },
+                    "final_yaw_refinement": { "type": "string", "enum": ["off", "gated-gpt", "always-gpt"], "description": "Final full-scene contextual yaw selector. It renders all scene objects while sweeping only one target object's Y-axis yaw, then applies candidate_index selections without changing translation or scale." },
+                    "final_yaw_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by final_yaw_refinement." },
+                    "final_yaw_confidence_threshold": { "type": "number", "description": "Minimum bounded GPT confidence required before a final yaw candidate may apply." },
+                    "final_yaw_max_candidates": { "type": "integer", "description": "Maximum final contextual yaw candidates per target object." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path"],
@@ -319,6 +323,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "feedback_iters": { "type": "integer" },
                     "feedback_keep_viewer": { "type": "boolean" },
                     "feedback_capture_dir": { "type": "string" },
+                    "promote_to_catalog": { "type": "boolean", "description": "Add the recomposed scene snapshot to the shared Bevy scene catalog/cache. Defaults to true so composition-only reruns appear in the scene catalog." },
                     "feedback_threshold_profile": { "type": "string", "enum": ["loose", "standard", "strict"] },
                     "feedback_rotation_selector": { "type": "string", "enum": ["deterministic", "rendered-sweep", "openai"], "description": "Rotation candidate selector. deterministic uses geometry feedback; rendered-sweep renders per-object yaw candidates; openai asks the reasoning model to pick candidate_index values from source/render/candidate crops." },
                     "rotation_fit": { "type": "string", "enum": ["off", "depth-mask-ransac", "gpt-refine"], "description": "Extra pre-feedback object yaw fitting strategy. Defaults to off; rendered-silhouette pose fit is the normal geometric yaw/position/scale solver." },
@@ -328,6 +333,10 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
                     "object_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Object-set pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting on the selected object set; gated-gpt additionally marks failed or ambiguous fits for bounded GPT candidate selection; always-gpt marks every selected object." },
                     "object_pose_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by object_pose_refinement. Defaults to tables-and-large-seating." },
+                    "final_yaw_refinement": { "type": "string", "enum": ["off", "gated-gpt", "always-gpt"], "description": "Final full-scene contextual yaw selector. It renders all scene objects while sweeping only one target object's Y-axis yaw, then applies candidate_index selections without changing translation or scale." },
+                    "final_yaw_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by final_yaw_refinement." },
+                    "final_yaw_confidence_threshold": { "type": "number", "description": "Minimum bounded GPT confidence required before a final yaw candidate may apply." },
+                    "final_yaw_max_candidates": { "type": "integer", "description": "Maximum final contextual yaw candidates per target object." },
                     "feedback_rubric_scorer": { "type": "string", "enum": ["off", "openai"], "description": "Optional scene-level source-vs-render rubric scorer. openai writes strict JSON diagnostics and contributes to feedback candidate selection." }
                 },
                 "required": ["source_scene_path", "manifest", "asset_bindings"],
@@ -869,6 +878,14 @@ pub struct SceneBuildFromImageArgs {
     pub object_pose_refinement: SceneObjectPoseRefinementMode,
     #[serde(default = "default_scene_object_pose_refinement_set")]
     pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
+    #[serde(default = "default_scene_final_yaw_refinement")]
+    pub final_yaw_refinement: SceneFinalYawRefinementMode,
+    #[serde(default = "default_scene_final_yaw_refinement_set")]
+    pub final_yaw_refinement_set: SceneObjectPoseRefinementSet,
+    #[serde(default = "default_scene_final_yaw_confidence_threshold")]
+    pub final_yaw_confidence_threshold: f32,
+    #[serde(default = "default_scene_final_yaw_max_candidates")]
+    pub final_yaw_max_candidates: usize,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }
@@ -920,6 +937,8 @@ pub(crate) struct SceneGroundToolArgs {
     pub feedback_keep_viewer: bool,
     #[serde(default)]
     pub feedback_capture_dir: Option<PathBuf>,
+    #[serde(default = "default_scene_promote_to_catalog")]
+    pub promote_to_catalog: bool,
     #[serde(default = "default_scene_feedback_threshold_profile")]
     pub feedback_threshold_profile: FeedbackThresholdProfile,
     #[serde(default = "default_feedback_rotation_selector")]
@@ -938,6 +957,14 @@ pub(crate) struct SceneGroundToolArgs {
     pub object_pose_refinement: SceneObjectPoseRefinementMode,
     #[serde(default = "default_scene_object_pose_refinement_set")]
     pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
+    #[serde(default = "default_scene_final_yaw_refinement")]
+    pub final_yaw_refinement: SceneFinalYawRefinementMode,
+    #[serde(default = "default_scene_final_yaw_refinement_set")]
+    pub final_yaw_refinement_set: SceneObjectPoseRefinementSet,
+    #[serde(default = "default_scene_final_yaw_confidence_threshold")]
+    pub final_yaw_confidence_threshold: f32,
+    #[serde(default = "default_scene_final_yaw_max_candidates")]
+    pub final_yaw_max_candidates: usize,
     #[serde(default = "default_feedback_rubric_scorer")]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
 }

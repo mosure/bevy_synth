@@ -18,8 +18,10 @@ use bevy::asset::io::web::WebAssetPlugin;
 #[cfg(target_arch = "wasm32")]
 use bevy::asset::{AssetMetaCheck, AssetMode};
 use bevy::asset::{AssetPlugin, RenderAssetUsages, UnapprovedPathMode};
+use bevy::camera::Exposure;
 use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::message::MessageWriter;
 use bevy::ecs::system::SystemParam;
 use bevy::light::{
@@ -169,6 +171,64 @@ use crate::panorbit::{
 };
 
 const BUILTIN_CUBE_SOURCE_IMAGE: &str = "builtin/cube";
+const VIEWER_CAMERA_EV100: f32 = 10.0;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ViewerFillLightProfile {
+    pub(crate) color: [f32; 3],
+    pub(crate) intensity: f32,
+    pub(crate) range: f32,
+    pub(crate) radius: f32,
+    pub(crate) translation: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ViewerLightingProfile {
+    pub(crate) ambient_color: [f32; 3],
+    pub(crate) ambient_brightness: f32,
+    pub(crate) key_color: [f32; 3],
+    pub(crate) key_illuminance: f32,
+    pub(crate) key_translation: [f32; 3],
+    pub(crate) key_target: [f32; 3],
+    pub(crate) fill_lights: [ViewerFillLightProfile; 2],
+}
+
+pub(crate) fn viewer_lighting_profile() -> ViewerLightingProfile {
+    ViewerLightingProfile {
+        ambient_color: [0.78, 0.82, 0.88],
+        ambient_brightness: 118.0,
+        key_color: [1.0, 0.97, 0.92],
+        key_illuminance: 9_200.0,
+        key_translation: [-5.5, 8.0, 6.5],
+        key_target: [0.0, 0.6, 0.0],
+        fill_lights: [
+            ViewerFillLightProfile {
+                color: [0.72, 0.82, 1.0],
+                intensity: 5_800.0,
+                range: 20.0,
+                radius: 2.2,
+                translation: [-5.5, 4.0, -4.5],
+            },
+            ViewerFillLightProfile {
+                color: [1.0, 0.91, 0.80],
+                intensity: 4_200.0,
+                range: 18.0,
+                radius: 2.4,
+                translation: [5.0, 3.6, 4.5],
+            },
+        ],
+    }
+}
+
+pub(crate) fn viewer_camera_exposure() -> Exposure {
+    Exposure {
+        ev100: VIEWER_CAMERA_EV100,
+    }
+}
+
+pub(crate) fn viewer_camera_tonemapping() -> Tonemapping {
+    Tonemapping::KhronosPbrNeutral
+}
 
 #[derive(Component)]
 struct EditorCamera;
@@ -865,6 +925,7 @@ pub(crate) fn run() {
     } else {
         "initializing viewer…".to_string()
     };
+    let window_resolution = app_window_resolution(&app_args);
 
     let mut app = App::new();
     app.insert_resource(app_args)
@@ -900,7 +961,7 @@ pub(crate) fn run() {
     app.insert_resource(mcp_scene_control);
     #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(PendingSceneBuild::default());
-    add_default_plugins(&mut app);
+    add_default_plugins(&mut app, window_resolution);
     #[cfg(all(not(target_arch = "wasm32"), feature = "wgpu"))]
     app.add_plugins(SharedWgpuInferenceDevicePlugin);
     if !app.is_plugin_added::<PointerInputPlugin>() {
@@ -1236,18 +1297,38 @@ fn configure_mesh_picking(mut settings: ResMut<MeshPickingSettings>) {
     settings.require_markers = true;
 }
 
+fn app_window_resolution(args: &AppArgs) -> Option<(u32, u32)> {
+    let width = args.window_width?;
+    let height = args.window_height?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-fn add_default_plugins(app: &mut App) {
-    app.add_plugins(DefaultPlugins.set(AssetPlugin {
-        // Native users and MCP agents spawn generated assets from tmp/run dirs,
-        // desktop file pickers, and cache paths outside Bevy's asset root.
-        unapproved_path_mode: UnapprovedPathMode::Allow,
+fn add_default_plugins(app: &mut App, window_resolution: Option<(u32, u32)>) {
+    let mut window = Window {
+        fit_canvas_to_parent: true,
         ..default()
-    }));
+    };
+    if let Some((width, height)) = window_resolution {
+        window.resolution = (width, height).into();
+    }
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(window),
+                ..default()
+            })
+            .set(AssetPlugin {
+                // Native users and MCP agents spawn generated assets from tmp/run dirs,
+                // desktop file pickers, and cache paths outside Bevy's asset root.
+                unapproved_path_mode: UnapprovedPathMode::Allow,
+                ..default()
+            }),
+    );
 }
 
 #[cfg(target_arch = "wasm32")]
-fn add_default_plugins(app: &mut App) {
+fn add_default_plugins(app: &mut App, _window_resolution: Option<(u32, u32)>) {
     let asset_root = web_asset_root();
     let asset_plugin = AssetPlugin {
         file_path: asset_root,
@@ -1569,6 +1650,8 @@ fn initialize_interactive_scene(
 
     commands.spawn((
         Camera3d::default(),
+        viewer_camera_tonemapping(),
+        viewer_camera_exposure(),
         GaussianCamera::default(),
         camera_transform,
         camera_orbit,
@@ -1581,6 +1664,8 @@ fn initialize_interactive_scene(
     ));
     commands.spawn((
         Camera3d::default(),
+        viewer_camera_tonemapping(),
+        viewer_camera_exposure(),
         Camera {
             is_active: false,
             // bevy_gaussian_splatting extracts inactive GaussianCamera entities too and
@@ -1825,22 +1910,31 @@ fn finish_wasm_startup_when_models_ready(
 }
 
 fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut GlobalAmbientLight) {
-    // Keep a modest ambient base and drive shape with a single sun + soft point fills.
-    // Web targets commonly support only one directional light in forward mode.
-    ambient_light.color = Color::srgb(0.86, 0.9, 0.96);
-    ambient_light.brightness = 260.0;
+    let profile = viewer_lighting_profile();
+    // Keep defaults portable across native and wasm: one shadow-casting key light plus
+    // two soft non-shadow fills. Avoid HDR environment-map assets in the baseline viewer.
+    ambient_light.color = Color::srgb(
+        profile.ambient_color[0],
+        profile.ambient_color[1],
+        profile.ambient_color[2],
+    );
+    ambient_light.brightness = profile.ambient_brightness;
 
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.98, 0.95),
-            illuminance: 24_000.0,
+            color: Color::srgb(
+                profile.key_color[0],
+                profile.key_color[1],
+                profile.key_color[2],
+            ),
+            illuminance: profile.key_illuminance,
             shadow_maps_enabled: true,
-            // Slightly higher bias to reduce self-shadow acne on simple hard-edge meshes (e.g. cube).
-            shadow_depth_bias: 0.24,
-            shadow_normal_bias: 1.8,
+            shadow_depth_bias: 0.18,
+            shadow_normal_bias: 1.2,
             ..default()
         },
-        Transform::from_xyz(7.5, 11.0, 8.5).looking_at(Vec3::new(0.0, 0.4, 0.0), Vec3::Y),
+        Transform::from_translation(Vec3::from_array(profile.key_translation))
+            .looking_at(Vec3::from_array(profile.key_target), Vec3::Y),
         CascadeShadowConfigBuilder {
             first_cascade_far_bound: 12.0,
             maximum_distance: 56.0,
@@ -1850,41 +1944,20 @@ fn spawn_default_lighting(commands: &mut Commands, ambient_light: &mut GlobalAmb
         preview_light_layers(),
     ));
 
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(0.76, 0.86, 1.0),
-            intensity: 90_000.0,
-            range: 34.0,
-            radius: 0.45,
-            ..default()
-        },
-        Transform::from_xyz(-9.0, 5.5, -7.0),
-        preview_light_layers(),
-    ));
-
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(1.0, 0.94, 0.87),
-            intensity: 65_000.0,
-            range: 30.0,
-            radius: 0.4,
-            ..default()
-        },
-        Transform::from_xyz(8.5, 4.5, -6.5),
-        preview_light_layers(),
-    ));
-
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(0.94, 0.97, 1.0),
-            intensity: 38_000.0,
-            range: 22.0,
-            radius: 0.35,
-            ..default()
-        },
-        Transform::from_xyz(0.0, 9.0, 0.0),
-        preview_light_layers(),
-    ));
+    for fill in profile.fill_lights {
+        commands.spawn((
+            PointLight {
+                color: Color::srgb(fill.color[0], fill.color[1], fill.color[2]),
+                intensity: fill.intensity,
+                range: fill.range,
+                radius: fill.radius,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(Vec3::from_array(fill.translation)),
+            preview_light_layers(),
+        ));
+    }
 }
 
 #[derive(Clone)]
@@ -3508,7 +3581,7 @@ pub(crate) fn scene_build_args_from_ui_settings(
         } else {
             ScenePoseFitMode::ProjectedAabb
         },
-        canonical_pose: SceneCanonicalPoseMode::Off,
+        canonical_pose: SceneCanonicalPoseMode::Auto,
         scale_policy: SceneScalePolicy::AssetPreserving,
         max_pose_candidates: 32,
         save_pose_debug: settings.write_artifacts,
@@ -3579,6 +3652,10 @@ pub(crate) fn scene_build_args_from_ui_settings(
             }
         },
         object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
+        final_yaw_refinement: burn_synth_mcp::SceneFinalYawRefinementMode::GatedGpt,
+        final_yaw_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
+        final_yaw_confidence_threshold: 0.70,
+        final_yaw_max_candidates: 12,
         feedback_rubric_scorer: FeedbackRubricScorer::Off,
     }
 }

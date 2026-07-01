@@ -222,6 +222,14 @@ pub struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     pub read_only: bool,
 
+    /// Initial native window width in physical pixels. Use with --window-height for capture viewers.
+    #[arg(long)]
+    pub window_width: Option<u32>,
+
+    /// Initial native window height in physical pixels. Use with --window-width for capture viewers.
+    #[arg(long)]
+    pub window_height: Option<u32>,
+
     /// Maximum number of queued images to batch per inference dispatch.
     #[arg(long, default_value_t = 1)]
     pub max_batch_size: usize,
@@ -420,6 +428,8 @@ pub struct AppArgs {
     pub pause_render_during_inference: bool,
     pub ui_visible: bool,
     pub read_only: bool,
+    pub window_width: Option<u32>,
+    pub window_height: Option<u32>,
     pub max_batch_size: usize,
     pub mcp_scene_control_path: Option<PathBuf>,
     pub scene_bsn: Option<PathBuf>,
@@ -527,6 +537,8 @@ pub fn build_app_args(args: Args) -> AppArgs {
         pause_render_during_inference: args.pause_render_during_inference,
         ui_visible: args.ui_visible,
         read_only: args.read_only,
+        window_width: args.window_width.filter(|value| *value > 0),
+        window_height: args.window_height.filter(|value| *value > 0),
         max_batch_size: args.max_batch_size.max(1),
         mcp_scene_control_path: args.mcp_scene_control_path,
         scene_bsn: args.scene_bsn,
@@ -662,6 +674,10 @@ mod tests {
             "--ui-visible",
             "false",
             "--read-only",
+            "--window-width",
+            "1600",
+            "--window-height",
+            "720",
         ]);
         let app_args = build_app_args(args);
         assert_eq!(
@@ -675,6 +691,8 @@ mod tests {
         assert!(!app_args.scene_bsn_clear_existing);
         assert!(!app_args.ui_visible);
         assert!(app_args.read_only);
+        assert_eq!(app_args.window_width, Some(1600));
+        assert_eq!(app_args.window_height, Some(720));
     }
 
     #[test]

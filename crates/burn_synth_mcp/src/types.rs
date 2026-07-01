@@ -11,8 +11,8 @@ use burn_synth_grounding::{
 };
 use burn_synth_scene::SceneQualityProfile;
 pub use burn_synth_scene::{
-    SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet, ScenePoseFitMode,
-    SceneRotationFitMode, SceneScalePolicy,
+    SceneFinalYawRefinementMode, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
+    ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy,
 };
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -604,7 +604,7 @@ pub(crate) struct SceneBuildCliArgs {
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
-    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Off)]
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Auto)]
     pub canonical_pose: SceneCanonicalPoseMode,
 
     /// Generated asset scale policy used by layout and feedback.
@@ -727,6 +727,22 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementSet::TablesAndLargeSeating)]
     pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
 
+    /// Final full-scene contextual yaw selector for high-risk object classes.
+    #[arg(long, value_enum, default_value_t = SceneFinalYawRefinementMode::GatedGpt)]
+    pub final_yaw_refinement: SceneFinalYawRefinementMode,
+
+    /// Object set targeted by --final-yaw-refinement.
+    #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementSet::TablesAndLargeSeating)]
+    pub final_yaw_refinement_set: SceneObjectPoseRefinementSet,
+
+    /// Minimum GPT confidence before final yaw correction may apply.
+    #[arg(long, default_value_t = 0.70)]
+    pub final_yaw_confidence_threshold: f32,
+
+    /// Maximum final yaw candidates per target object.
+    #[arg(long, default_value_t = 12)]
+    pub final_yaw_max_candidates: usize,
+
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]
     pub feedback_rubric_scorer: FeedbackRubricScorer,
@@ -763,7 +779,7 @@ pub(crate) struct SceneGroundCliArgs {
     pub pose_fit: ScenePoseFitMode,
 
     /// Canonical asset orientation strategy.
-    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Off)]
+    #[arg(long, value_enum, default_value_t = SceneCanonicalPoseMode::Auto)]
     pub canonical_pose: SceneCanonicalPoseMode,
 
     /// Generated asset scale policy used by layout and feedback.
@@ -830,6 +846,10 @@ pub(crate) struct SceneGroundCliArgs {
     #[arg(long)]
     pub feedback_capture_dir: Option<PathBuf>,
 
+    /// Add the recomposed scene snapshot to the shared Bevy scene catalog/cache.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub promote_to_catalog: bool,
+
     /// Geometry-first feedback pass/fail threshold profile.
     #[arg(long, value_enum, default_value_t = FeedbackThresholdProfile::Standard)]
     pub feedback_threshold_profile: FeedbackThresholdProfile,
@@ -865,6 +885,22 @@ pub(crate) struct SceneGroundCliArgs {
     /// Object set targeted by --object-pose-refinement.
     #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementSet::TablesAndLargeSeating)]
     pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
+
+    /// Final full-scene contextual yaw selector for high-risk object classes.
+    #[arg(long, value_enum, default_value_t = SceneFinalYawRefinementMode::GatedGpt)]
+    pub final_yaw_refinement: SceneFinalYawRefinementMode,
+
+    /// Object set targeted by --final-yaw-refinement.
+    #[arg(long, value_enum, default_value_t = SceneObjectPoseRefinementSet::TablesAndLargeSeating)]
+    pub final_yaw_refinement_set: SceneObjectPoseRefinementSet,
+
+    /// Minimum GPT confidence before final yaw correction may apply.
+    #[arg(long, default_value_t = 0.70)]
+    pub final_yaw_confidence_threshold: f32,
+
+    /// Maximum final yaw candidates per target object.
+    #[arg(long, default_value_t = 12)]
+    pub final_yaw_max_candidates: usize,
 
     /// Optional source-vs-render scene quality rubric scorer.
     #[arg(long, value_enum, default_value_t = FeedbackRubricScorer::Off)]

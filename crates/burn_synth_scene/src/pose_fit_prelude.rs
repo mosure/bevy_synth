@@ -17,9 +17,10 @@ pub(crate) use crate::depth_sidecar::{
     resample_dense_depth_crop,
 };
 pub(crate) use crate::{
-    GroundedSceneLayout, GroundedScenePlacement, SceneAssetBinding, SceneGroundingEvidence,
-    SceneObjectManifest, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
-    ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy, write_json_file,
+    GroundedSceneLayout, GroundedScenePlacement, ObjectGroundingEvidence, ObjectMaskEvidence,
+    SceneAssetBinding, SceneFinalYawRefinementMode, SceneGroundingEvidence, SceneObjectManifest,
+    SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet, ScenePoseFitMode,
+    SceneRotationFitMode, SceneRotationSelectionResponse, SceneScalePolicy, write_json_file,
 };
 
 pub(crate) fn json_array3(value: &Value) -> Option<[f32; 3]> {

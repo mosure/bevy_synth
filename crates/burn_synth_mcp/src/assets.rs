@@ -463,6 +463,22 @@ pub(crate) fn default_scene_object_pose_refinement_set() -> SceneObjectPoseRefin
     SceneObjectPoseRefinementSet::TablesAndLargeSeating
 }
 
+pub(crate) fn default_scene_final_yaw_refinement() -> SceneFinalYawRefinementMode {
+    SceneFinalYawRefinementMode::GatedGpt
+}
+
+pub(crate) fn default_scene_final_yaw_refinement_set() -> SceneObjectPoseRefinementSet {
+    SceneObjectPoseRefinementSet::TablesAndLargeSeating
+}
+
+pub(crate) fn default_scene_final_yaw_confidence_threshold() -> f32 {
+    0.70
+}
+
+pub(crate) fn default_scene_final_yaw_max_candidates() -> usize {
+    12
+}
+
 pub(crate) fn default_scene_composition_mode() -> SceneCompositionMode {
     SceneCompositionMode::CvGrounded
 }
@@ -472,7 +488,7 @@ pub(crate) fn default_scene_pose_fit_mode() -> ScenePoseFitMode {
 }
 
 pub(crate) fn default_scene_canonical_pose_mode() -> SceneCanonicalPoseMode {
-    SceneCanonicalPoseMode::Off
+    SceneCanonicalPoseMode::Auto
 }
 
 pub(crate) fn default_scene_scale_policy() -> SceneScalePolicy {
@@ -1550,12 +1566,21 @@ pub(crate) fn promote_scene_build_scene_to_catalog(
             source_scene_path.display()
         )
     })?;
+    let asset_bindings = promote_scene_asset_paths_to_catalog(catalog_cache, asset_bindings)?;
+    let bsn = if asset_bindings
+        .iter()
+        .any(|binding| binding.cache_key.is_some())
+    {
+        scene_catalog_bsn_from_layout(&asset_bindings, grounded_layout)
+    } else {
+        bsn.to_string()
+    };
     let payload = CachedScenePayload {
-        world_items: scene_world_items_from_layout(asset_bindings, grounded_layout),
+        world_items: scene_world_items_from_layout(&asset_bindings, grounded_layout),
         camera: Some(cached_camera_from_scene_camera(&grounded_layout.camera)),
-        bsn: Some(bsn.to_string()),
+        bsn: Some(bsn),
         asset_bindings: Some(
-            serde_json::to_value(asset_bindings)
+            serde_json::to_value(&asset_bindings)
                 .map_err(|err| format!("serialize scene asset bindings: {err}"))?,
         ),
         e2e_summary: response.get("e2e_summary").cloned(),
@@ -1578,6 +1603,50 @@ pub(crate) fn promote_scene_build_scene_to_catalog(
         )
         .map_err(|err| format!("failed to promote scene to shared catalog: {err}"))?;
     serde_json::to_value(metadata).map_err(|err| format!("serialize scene catalog metadata: {err}"))
+}
+
+fn promote_scene_asset_paths_to_catalog(
+    catalog_cache: &mut MeshCache,
+    asset_bindings: &[SceneAssetBinding],
+) -> Result<Vec<SceneAssetBinding>, String> {
+    let mut promoted = Vec::with_capacity(asset_bindings.len());
+    for asset in asset_bindings {
+        let mut asset = asset.clone();
+        if asset.cache_key.is_none()
+            && let Some(path) = asset.path.as_deref()
+            && is_glb_path(Path::new(path))
+        {
+            let bytes = fs::read(path)
+                .map_err(|err| format!("failed to read scene asset GLB {path}: {err}"))?;
+            let mesh = bevy_synth_runtime::io::mesh_from_glb_bytes(bytes.as_slice())
+                .map_err(|err| format!("failed to parse scene asset GLB {path}: {err}"))?;
+            let source_image_path = asset
+                .source_image_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(path));
+            let metadata = catalog_cache
+                .upsert_mesh_for_image(source_image_path.as_path(), &mesh)
+                .map_err(|err| {
+                    format!(
+                        "failed to promote scene asset {} to shared catalog: {err}",
+                        asset.asset_id
+                    )
+                })?;
+            asset.cache_key = Some(metadata.cache_key);
+            if asset.local_aabb.is_none() {
+                asset.local_aabb = metadata.local_aabb.map(cached_aabb_to_scene);
+            }
+        }
+        promoted.push(asset);
+    }
+    Ok(promoted)
+}
+
+fn is_glb_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("glb"))
 }
 
 fn scene_world_items_from_layout(
@@ -1606,6 +1675,66 @@ fn scene_world_items_from_layout(
             })
         })
         .collect()
+}
+
+fn scene_catalog_bsn_from_layout(
+    asset_bindings: &[SceneAssetBinding],
+    grounded_layout: &GroundedSceneLayout,
+) -> String {
+    let mut out = String::from("synth_scene_v1 {\n");
+    for asset in asset_bindings {
+        out.push_str(&scene_asset_declaration_for_bsn(asset));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "environment rug translation [{}] scale [{}] color [0.62,0.02,0.26];\n",
+        fmt_scene_vec3(grounded_layout.rug_center),
+        fmt_scene_vec3(grounded_layout.rug_scale)
+    ));
+    for placement in &grounded_layout.placements {
+        out.push_str(&format!(
+            "spawn {} uses {} translation [{}] rotation_y {} scale [{}];\n",
+            placement.entity_id,
+            placement.asset_id,
+            fmt_scene_vec3(placement.translation),
+            fmt_scene_f32(placement.rotation_y_degrees),
+            fmt_scene_vec3(placement.scale)
+        ));
+    }
+    let camera = &grounded_layout.camera;
+    out.push_str(&format!(
+        "camera translation [{}] focus [{}] yaw {} pitch {} radius {} vertical_fov {};\n",
+        fmt_scene_vec3(camera.translation),
+        fmt_scene_vec3(camera.focus),
+        fmt_scene_f32(camera.yaw.unwrap_or(0.0)),
+        fmt_scene_f32(camera.pitch.unwrap_or(0.0)),
+        fmt_scene_f32(camera.radius.unwrap_or(0.0)),
+        fmt_scene_f32(camera.vertical_fov_degrees.unwrap_or(70.0))
+    ));
+    out.push_str("}\n");
+    out
+}
+
+fn fmt_scene_vec3(value: [f32; 3]) -> String {
+    value
+        .into_iter()
+        .map(fmt_scene_f32)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn fmt_scene_f32(value: f32) -> String {
+    if !value.is_finite() {
+        return "0.0".to_string();
+    }
+    let mut text = format!("{value:.4}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.push('0');
+    }
+    text
 }
 
 fn cached_camera_from_scene_camera(camera: &burn_synth_scene::SceneCamera) -> CachedCameraState {
