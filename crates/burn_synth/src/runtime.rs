@@ -214,7 +214,7 @@ impl Default for RuntimeConfig {
             trellis_max_sparse_coords: None,
             trellis_pbr_texture_size: Some(DEFAULT_TRELLIS_PBR_TEXTURE_SIZE),
             trellis_pbr_enabled: true,
-            trellis_quality: TrellisQuality::Low,
+            trellis_quality: TrellisQuality::Medium,
             trellis_compute_profile: TrellisComputeProfile::default(),
             bg_weights_root: None,
             num_steps: DEFAULT_NUM_STEPS,

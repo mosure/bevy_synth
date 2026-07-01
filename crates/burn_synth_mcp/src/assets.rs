@@ -464,7 +464,7 @@ pub(crate) fn default_scene_object_pose_refinement_set() -> SceneObjectPoseRefin
 }
 
 pub(crate) fn default_scene_final_yaw_refinement() -> SceneFinalYawRefinementMode {
-    SceneFinalYawRefinementMode::GatedGpt
+    SceneFinalYawRefinementMode::MetricBest
 }
 
 pub(crate) fn default_scene_final_yaw_refinement_set() -> SceneObjectPoseRefinementSet {
@@ -500,11 +500,11 @@ pub(crate) fn default_scene_max_pose_candidates() -> usize {
 }
 
 pub(crate) fn default_scene_ground_calibration_mode() -> SceneGroundCalibrationMode {
-    SceneGroundCalibrationMode::Gpt
+    SceneGroundCalibrationMode::DepthFirst
 }
 
 pub(crate) fn default_scene_instance_generation_mode() -> SceneInstanceGenerationMode {
-    SceneInstanceGenerationMode::CategoryRepresentative
+    SceneInstanceGenerationMode::TypeAwareReuse
 }
 
 pub(crate) fn default_scene_depth_provider() -> SceneDepthProvider {
@@ -714,6 +714,115 @@ pub(crate) fn attach_scene_token_usage(response: &mut Value) -> Value {
         scene_token_usage_summary(response.get("provider_metadata").unwrap_or(&Value::Null));
     response["token_usage"] = summary.clone();
     summary
+}
+
+pub(crate) fn scene_cost_report(response: &Value) -> Value {
+    let provider_requests = response
+        .get("provider_metadata")
+        .and_then(|metadata| metadata.get("requests"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let generated_image_candidates = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let selected_image_candidates = response
+        .get("selected_candidates")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    json!({
+        "schema_version": 1,
+        "token_usage": response.get("token_usage").cloned().unwrap_or_else(|| {
+            scene_token_usage_summary(response.get("provider_metadata").unwrap_or(&Value::Null))
+        }),
+        "provider_request_count": provider_requests,
+        "generated_image_candidate_count": generated_image_candidates,
+        "selected_image_candidate_count": selected_image_candidates,
+        "stage_report": response.get("stage_report").cloned().unwrap_or(Value::Null),
+    })
+}
+
+pub(crate) fn scene_cache_report(response: &Value) -> Value {
+    let mut entries = Vec::new();
+    for (stage, key) in [
+        (
+            "pre_generation_locate_anything",
+            "pre_generation_locate_anything_report",
+        ),
+        (
+            "pre_generation_segmentation",
+            "pre_generation_segmentation_report",
+        ),
+        ("pre_generation_depth", "pre_generation_depth_report"),
+        ("segmentation", "segmentation_grounding"),
+        ("depth", "depth_grounding"),
+    ] {
+        if let Some(report) = response.get(key) {
+            entries.push(scene_cache_report_entry(stage, report));
+        }
+    }
+    if let Some(final_yaw) = response.get("final_yaw_refinement") {
+        entries.push(json!({
+            "stage": "final_yaw_refinement",
+            "cache_kind": "candidate_render_reuse",
+            "rendered": final_yaw.pointer("/candidate_render_report/coarse/rendered")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "reused": final_yaw.pointer("/candidate_render_report/coarse/reused")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "target_only_rendered": final_yaw.pointer("/candidate_render_report/coarse/target_only_rendered")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "target_only_reused": final_yaw.pointer("/candidate_render_report/coarse/target_only_reused")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "selection_status": final_yaw.get("selection_status").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    let runtime_entries = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("runtime_cache_hit")
+                .and_then(Value::as_bool)
+                .is_some()
+        })
+        .count();
+    let hits = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("runtime_cache_hit")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    json!({
+        "schema_version": 1,
+        "entry_count": entries.len(),
+        "runtime_cache_hits": hits,
+        "runtime_cache_misses": runtime_entries.saturating_sub(hits),
+        "entries": entries,
+    })
+}
+
+fn scene_cache_report_entry(stage: &str, report: &Value) -> Value {
+    json!({
+        "stage": stage,
+        "runtime_cache_hit": report.get("runtime_cache_hit").cloned().unwrap_or(Value::Null),
+        "elapsed_ms": report.get("elapsed_ms").cloned().unwrap_or(Value::Null),
+        "load_ms": report.get("load_ms").cloned().unwrap_or(Value::Null),
+        "infer_ms": report.get("infer_ms").cloned().unwrap_or(Value::Null),
+        "artifact_path": report.get("artifact_path")
+            .or_else(|| report.get("metadata_path"))
+            .or_else(|| report.get("detections_path"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
 }
 
 fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
@@ -1991,6 +2100,8 @@ pub(crate) fn write_scene_build_artifacts(
     for (key, file_name) in [
         ("preparation", "preparation.json"),
         ("manifest_initial", "manifest_initial.json"),
+        ("category_filter", "category_filter.json"),
+        ("category_filter_reports", "category_filter_reports.json"),
         ("manifest", "manifest.json"),
         (
             "manifest_grounded_for_crops",
@@ -2067,6 +2178,7 @@ pub(crate) fn write_scene_build_artifacts(
         })?;
     }
     write_pose_fit_artifacts(output_dir, response)?;
+    write_scene_observability_artifacts(output_dir, response)?;
     write_json_file(
         &output_dir.join("scene_build_response_structured.json"),
         response,
@@ -2152,12 +2264,14 @@ impl McpServer {
         manifest: &SceneObjectManifest,
         source_scene_path: &Path,
         output_dir: &Path,
+        category_filter: &SceneCategoryFilterConfig,
     ) -> Result<SceneGroundingEvidence, String> {
         self.locate_anything_grounding_evidence_with_report(
             backend,
             manifest,
             source_scene_path,
             output_dir,
+            category_filter,
         )
         .map(|(evidence, _report)| evidence)
     }
@@ -2168,9 +2282,15 @@ impl McpServer {
         manifest: &SceneObjectManifest,
         source_scene_path: &Path,
         output_dir: &Path,
+        category_filter: &SceneCategoryFilterConfig,
     ) -> Result<(SceneGroundingEvidence, LocateAnythingGroundingReport), String> {
         let LocateAnythingBackend::BurnNative = backend;
-        self.locate_anything_burn_native_grounding_evidence(manifest, source_scene_path, output_dir)
+        self.locate_anything_burn_native_grounding_evidence(
+            manifest,
+            source_scene_path,
+            output_dir,
+            category_filter,
+        )
     }
 
     pub(crate) fn locate_anything_burn_native_grounding_evidence(
@@ -2178,6 +2298,7 @@ impl McpServer {
         manifest: &SceneObjectManifest,
         source_scene_path: &Path,
         output_dir: &Path,
+        category_filter: &SceneCategoryFilterConfig,
     ) -> Result<(SceneGroundingEvidence, LocateAnythingGroundingReport), String> {
         let config = LocateAnythingGroundingConfig {
             model_root: self.config.locate_anything_model_root.clone(),
@@ -2186,6 +2307,7 @@ impl McpServer {
             allow_download: self.config.locate_anything_allow_download,
             precision: self.config.locate_anything_precision.into(),
             in_token_limit: self.config.locate_anything_in_token_limit,
+            allowed_categories: category_filter.allow.clone(),
             ..LocateAnythingGroundingConfig::default()
         };
         self.grounding
@@ -2210,6 +2332,8 @@ pub(crate) fn write_scene_ground_artifacts(
     })?;
     for (key, file_name) in [
         ("manifest", "manifest.json"),
+        ("category_filter", "category_filter.json"),
+        ("category_filter_report", "category_filter_report.json"),
         ("asset_bindings_initial", "asset_bindings_initial.json"),
         ("asset_bindings", "asset_bindings.json"),
         (
@@ -2252,6 +2376,21 @@ pub(crate) fn write_scene_ground_artifacts(
         })?;
     }
     write_pose_fit_artifacts(output_dir, response)?;
+    write_scene_observability_artifacts(output_dir, response)?;
+    Ok(())
+}
+
+fn write_scene_observability_artifacts(output_dir: &Path, response: &Value) -> Result<(), String> {
+    write_json_file(
+        &output_dir.join("cost_report.json"),
+        &scene_cost_report(response),
+    )
+    .map_err(|err| err.to_string())?;
+    write_json_file(
+        &output_dir.join("cache_report.json"),
+        &scene_cache_report(response),
+    )
+    .map_err(|err| err.to_string())?;
     Ok(())
 }
 

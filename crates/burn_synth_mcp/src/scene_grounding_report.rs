@@ -66,6 +66,7 @@ impl McpServer {
 
             let mut stage_report = Vec::new();
             let stage_started = Instant::now();
+            let category_filter = self.config.scene_category_filter.clone();
             let (mut evidence, locate_report) =
                 if args.locator == SceneLocatorProvider::LocateAnything {
                     self.locate_anything_grounding_evidence_with_report(
@@ -74,6 +75,7 @@ impl McpServer {
                         &manifest,
                         &args.source_scene_path,
                         &pass_dir,
+                        &category_filter,
                     )?
                 } else {
                     (

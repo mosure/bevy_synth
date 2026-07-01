@@ -1562,6 +1562,56 @@ fn apply_gpt_ground_calibration<P: SceneAiProvider>(
     Ok(report)
 }
 
+fn deterministic_ground_calibration_report(
+    manifest: &SceneObjectManifest,
+    evidence: &SceneGroundingEvidence,
+    mode: SceneGroundCalibrationMode,
+) -> SceneGroundCalibrationReport {
+    let vertical_fov_degrees = evidence
+        .camera
+        .vertical_fov_degrees
+        .or_else(|| {
+            evidence
+                .depth
+                .as_ref()
+                .and_then(|depth| depth.vertical_fov_degrees)
+        })
+        .or_else(|| {
+            manifest
+                .scene_calibration
+                .and_then(|calibration| calibration.vertical_fov_degrees)
+        })
+        .unwrap_or(60.0);
+    let floor_confidence = evidence.floor.confidence.unwrap_or(0.0);
+    let floor_residual_m = evidence.floor.residual_m.unwrap_or(0.0);
+    let camera_height_m = (-evidence.floor.distance_m).max(0.0);
+    let rationale = match mode {
+        SceneGroundCalibrationMode::DepthFirst => {
+            "depth-first deterministic calibration: retained DepthPro intrinsics/floor evidence without GPT"
+        }
+        SceneGroundCalibrationMode::DepthHeuristic => {
+            "depth-heuristic calibration: retained existing depth/floor heuristic evidence without GPT"
+        }
+        SceneGroundCalibrationMode::Gpt => "GPT calibration disabled for deterministic report path",
+    };
+    SceneGroundCalibrationReport {
+        schema_version: 1,
+        source_scene_path: evidence.source_image_path.clone(),
+        previous_camera: evidence.camera,
+        previous_floor: evidence.floor,
+        response: burn_synth_scene::SceneGroundCalibrationResponse {
+            camera_height_m,
+            vertical_fov_degrees,
+            floor_confidence,
+            floor_residual_m,
+            scene_calibration: manifest.scene_calibration,
+            rationale: rationale.to_string(),
+        },
+        applied_camera: evidence.camera,
+        applied_floor: evidence.floor,
+    }
+}
+
 fn mark_canonical_pose_verification_failure(response: &mut Value, verification: &Value) {
     let requires_attention = verification
         .get("requires_attention")
@@ -1779,6 +1829,38 @@ pub(crate) fn scene_build_requires_mesh_assets(args: &SceneBuildFromImageArgs) -
         && (args.pose_fit == ScenePoseFitMode::RenderedSilhouette
             || args.rotation_fit != SceneRotationFitMode::Off
             || args.object_pose_refinement.geometry_enabled())
+}
+
+fn scene_instance_generation_type_aware(mode: SceneInstanceGenerationMode) -> bool {
+    matches!(
+        mode,
+        SceneInstanceGenerationMode::TypeAwareReuse | SceneInstanceGenerationMode::FineGrainedTypes
+    )
+}
+
+fn scene_type_aware_categories(
+    mode: SceneInstanceGenerationMode,
+    requested: Option<&[String]>,
+) -> Vec<SceneObjectCategory> {
+    if !scene_instance_generation_type_aware(mode) {
+        return Vec::new();
+    }
+    let values = requested
+        .map(|values| values.to_vec())
+        .unwrap_or_else(|| vec!["chair".to_string()]);
+    values
+        .iter()
+        .filter_map(|value| parse_scene_category(value))
+        .filter(|category| {
+            matches!(category, SceneObjectCategory::Chair)
+                || mode == SceneInstanceGenerationMode::FineGrainedTypes
+        })
+        .fold(Vec::new(), |mut out, category| {
+            if !out.contains(&category) {
+                out.push(category);
+            }
+            out
+        })
 }
 
 fn scene_synthesis_model_outputs_mesh(model: SynthesisModel) -> bool {
@@ -3014,6 +3096,8 @@ impl McpServer {
             candidate_count: args.candidate_count,
             quality_profile: args.quality_profile,
             allow_catalog_reuse: false,
+            allowed_categories: None,
+            denied_categories: None,
         };
         let config = self.scene_build_config(prepare_args)?;
         let provider = self.openai_provider()?;
@@ -3080,6 +3164,8 @@ impl McpServer {
             candidate_count: args.candidate_count,
             quality_profile: args.quality_profile,
             allow_catalog_reuse: args.allow_catalog_reuse,
+            allowed_categories: args.allowed_categories.clone(),
+            denied_categories: args.denied_categories.clone(),
         };
         let stage_started = Instant::now();
         progress.emit(
@@ -3097,6 +3183,7 @@ impl McpServer {
             }),
         );
         let config = self.scene_build_config(prepare_args)?;
+        let category_filter = config.category_filter.clone();
         let output_dir = config.output_dir.clone();
         progress.set_output_dir(output_dir.clone());
         let candidate_policy = scene_object_image_generation_policy(&args, config.candidate_count);
@@ -3128,7 +3215,16 @@ impl McpServer {
             }),
         );
         let manifest_initial = pipeline.plan_objects().map_err(|err| err.to_string())?;
-        let mut manifest = manifest_initial.clone();
+        let (filtered_manifest, _, category_filter_report) =
+            apply_scene_category_filter(&manifest_initial, None, &category_filter);
+        if filtered_manifest.objects.is_empty() {
+            return Err(format!(
+                "scene category filter removed all planned objects; allowed={:?} denied={:?}",
+                category_filter.allow, category_filter.deny
+            ));
+        }
+        let mut category_filter_reports = vec![category_filter_report.clone()];
+        let mut manifest = filtered_manifest;
         record_stage(&mut stage_report, "plan_objects", stage_started);
         progress.emit_with_items(
             "plan_objects",
@@ -3143,6 +3239,11 @@ impl McpServer {
         if args.write_artifacts {
             write_json_file(&output_dir.join("manifest_initial.json"), &manifest_initial)
                 .map_err(|err| err.to_string())?;
+            write_json_file(
+                &output_dir.join("category_filter_report.json"),
+                &category_filter_report,
+            )
+            .map_err(|err| err.to_string())?;
             write_json_file(&output_dir.join("manifest.json"), &manifest)
                 .map_err(|err| err.to_string())?;
         }
@@ -3185,6 +3286,7 @@ impl McpServer {
                     &manifest,
                     &args.source_scene_path,
                     &output_dir,
+                    &category_filter,
                 )?;
                 let source = "locate_anything_burn_native_pre_generation".to_string();
                 pre_generation_locate_anything_report = Some(report);
@@ -3220,8 +3322,13 @@ impl McpServer {
                 )
             };
 
+            let type_aware_categories = scene_type_aware_categories(
+                args.instance_generation,
+                args.type_aware_categories.as_deref(),
+            );
             if args.locator == SceneLocatorProvider::LocateAnything
-                && args.instance_generation == SceneInstanceGenerationMode::FineGrainedTypes
+                && scene_instance_generation_type_aware(args.instance_generation)
+                && type_aware_categories.contains(&SceneObjectCategory::Chair)
             {
                 match pipeline.prepare_chair_type_grouping_request(&manifest, &evidence) {
                     Ok(Some(request)) => {
@@ -3354,13 +3461,36 @@ impl McpServer {
                     "chair_type_grouping",
                     SceneBuildProgressPhase::Completed,
                     SceneBuildExecutionKind::Cpu,
-                    "same-category instances will share category representative assets",
+                    "same-category instances will share representative assets",
                     json!({
                         "instance_generation": args.instance_generation,
-                        "reason": "fine_grained_types_not_selected",
+                        "type_aware_categories": type_aware_categories
+                            .iter()
+                            .map(|category| category.as_str())
+                            .collect::<Vec<_>>(),
+                        "reason": "chair_type_grouping_not_selected",
                     }),
                 );
             }
+
+            let (filtered_manifest, filtered_evidence, post_grounding_filter_report) =
+                apply_scene_category_filter(&manifest, Some(&evidence), &category_filter);
+            if filtered_manifest.objects.is_empty() {
+                return Err(format!(
+                    "scene category filter removed all objects after grounding; allowed={:?} denied={:?}",
+                    category_filter.allow, category_filter.deny
+                ));
+            }
+            manifest = filtered_manifest;
+            evidence = filtered_evidence.unwrap_or(evidence);
+            if args.write_artifacts {
+                write_json_file(
+                    &output_dir.join("category_filter_after_grounding_report.json"),
+                    &post_grounding_filter_report,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            category_filter_reports.push(post_grounding_filter_report);
 
             if segmentation_provider != SceneSegmentationProvider::None
                 && evidence.segmentation.is_none()
@@ -3516,16 +3646,42 @@ impl McpServer {
                 );
                 pre_generation_ground_calibration_report = Some(report);
             } else {
+                let stage_started = Instant::now();
+                let report = deterministic_ground_calibration_report(
+                    &manifest,
+                    &evidence,
+                    args.ground_calibration,
+                );
+                let stage_name = match args.ground_calibration {
+                    SceneGroundCalibrationMode::DepthFirst => "ground_calibration_depth_first",
+                    SceneGroundCalibrationMode::DepthHeuristic => {
+                        "ground_calibration_depth_heuristic"
+                    }
+                    SceneGroundCalibrationMode::Gpt => "ground_calibration_gpt",
+                };
+                if args.write_artifacts {
+                    write_json_file(
+                        &output_dir.join(format!("{stage_name}_report.json")),
+                        &report,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+                record_stage(&mut stage_report, stage_name, stage_started);
                 progress.emit(
                     "ground_calibration",
                     SceneBuildProgressPhase::Completed,
                     SceneBuildExecutionKind::Cpu,
-                    "using DepthPro floor/camera heuristic",
+                    "using deterministic depth floor/camera calibration",
                     json!({
                         "ground_calibration": args.ground_calibration,
                         "has_depth": evidence.depth.is_some(),
+                        "camera_height_m": -report.applied_floor.distance_m,
+                        "vertical_fov_degrees": report.applied_camera.vertical_fov_degrees,
+                        "floor_confidence": report.applied_floor.confidence,
+                        "floor_residual_m": report.applied_floor.residual_m,
                     }),
                 );
+                pre_generation_ground_calibration_report = Some(report);
             }
 
             manifest = manifest_with_grounding_evidence(&manifest, &evidence);
@@ -3691,6 +3847,8 @@ impl McpServer {
             "preparation": preparation,
             "provider_metadata": pipeline.provider_metadata(),
             "manifest_initial": manifest_initial.clone(),
+            "category_filter": category_filter.clone(),
+            "category_filter_reports": category_filter_reports.clone(),
             "manifest_grounded_for_crops": manifest.clone(),
             "pre_generation_grounding_source": pre_generation_grounding_source.clone(),
             "pre_generation_grounding_evidence": pre_generation_grounding_evidence.clone(),
@@ -4029,6 +4187,7 @@ impl McpServer {
                         &manifest,
                         &args.source_scene_path,
                         &output_dir,
+                        &category_filter,
                     )?;
                     let LocateAnythingBackend::BurnNative = backend;
                     ("locate_anything_burn_native".to_string(), evidence)
@@ -4846,6 +5005,10 @@ impl McpServer {
         })?;
         let mut stage_report = Vec::new();
         let stage_started = Instant::now();
+        let category_filter = self.scene_category_filter(
+            args.allowed_categories.clone(),
+            args.denied_categories.clone(),
+        );
         let mut manifest = args.manifest;
         manifest.source_scene_path = args.source_scene_path.display().to_string();
         let mut asset_bindings = args.asset_bindings;
@@ -4860,6 +5023,7 @@ impl McpServer {
                 &manifest,
                 &args.source_scene_path,
                 &output_dir,
+                &category_filter,
             )?;
             let LocateAnythingBackend::BurnNative = backend;
             let source = "locate_anything_burn_native";
@@ -4867,6 +5031,27 @@ impl McpServer {
         } else {
             ("manifest_fallback", manifest_grounding_evidence(&manifest))
         };
+        let (filtered_manifest, filtered_evidence, category_filter_report) =
+            apply_scene_category_filter(&manifest, Some(&evidence), &category_filter);
+        if filtered_manifest.objects.is_empty() {
+            return Err(format!(
+                "scene category filter removed all scene-ground objects; allowed={:?} denied={:?}",
+                category_filter.allow, category_filter.deny
+            ));
+        }
+        manifest = filtered_manifest;
+        evidence = filtered_evidence.unwrap_or(evidence);
+        let allowed_object_ids = manifest
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<HashSet<_>>();
+        asset_bindings.retain(|binding| allowed_object_ids.contains(binding.object_id.as_str()));
+        write_json_file(
+            &output_dir.join("category_filter_report.json"),
+            &category_filter_report,
+        )
+        .map_err(|err| err.to_string())?;
         record_stage(&mut stage_report, "load_grounding_evidence", stage_started);
         let segmentation_provider = args
             .segmentation_provider
@@ -4926,6 +5111,7 @@ impl McpServer {
                 reasoning_model: self.config.openai_reasoning_model.clone(),
                 image_model: self.config.openai_image_model.clone(),
                 allow_catalog_reuse: false,
+                category_filter: self.config.scene_category_filter.clone(),
             };
             let provider = self.openai_provider()?;
             let pipeline = ScenePipeline::new(config, provider);
@@ -4938,6 +5124,25 @@ impl McpServer {
                 &[],
             )?);
             record_stage(&mut stage_report, "ground_calibration_gpt", stage_started);
+        } else if args.composition_mode == SceneCompositionMode::CvGrounded {
+            let stage_started = Instant::now();
+            let report = deterministic_ground_calibration_report(
+                &manifest,
+                &evidence,
+                args.ground_calibration,
+            );
+            let stage_name = match args.ground_calibration {
+                SceneGroundCalibrationMode::DepthFirst => "ground_calibration_depth_first",
+                SceneGroundCalibrationMode::DepthHeuristic => "ground_calibration_depth_heuristic",
+                SceneGroundCalibrationMode::Gpt => "ground_calibration_gpt",
+            };
+            write_json_file(
+                &output_dir.join(format!("{stage_name}_report.json")),
+                &report,
+            )
+            .map_err(|err| err.to_string())?;
+            record_stage(&mut stage_report, stage_name, stage_started);
+            ground_calibration_report = Some(report);
         }
 
         let initial_asset_bindings = asset_bindings.clone();
@@ -5019,6 +5224,8 @@ impl McpServer {
             "ground_calibration": args.ground_calibration,
             "depth_provider": args.depth_provider,
             "locator": args.locator,
+            "category_filter": category_filter,
+            "category_filter_report": category_filter_report,
             "segmentation_provider": segmentation_provider,
             "segmentation_precision": segmentation_precision,
             "segmentation_quantization": segmentation_quantization,
@@ -5283,6 +5490,8 @@ impl McpServer {
     }
 
     fn scene_build_config(&self, args: ScenePrepareBuildArgs) -> Result<SceneBuildConfig, String> {
+        let category_filter =
+            self.scene_category_filter(args.allowed_categories, args.denied_categories);
         Ok(SceneBuildConfig {
             source_scene_path: args.source_scene_path,
             object_reference_image_path: args
@@ -5294,7 +5503,21 @@ impl McpServer {
             reasoning_model: self.config.openai_reasoning_model.clone(),
             image_model: self.config.openai_image_model.clone(),
             allow_catalog_reuse: args.allow_catalog_reuse,
+            category_filter,
         })
+    }
+
+    fn scene_category_filter(
+        &self,
+        allowed_categories: Option<Vec<String>>,
+        denied_categories: Option<Vec<String>>,
+    ) -> SceneCategoryFilterConfig {
+        SceneCategoryFilterConfig {
+            allow: allowed_categories
+                .unwrap_or_else(|| self.config.scene_category_filter.allow.clone()),
+            deny: denied_categories
+                .unwrap_or_else(|| self.config.scene_category_filter.deny.clone()),
+        }
     }
 
     fn openai_provider(&self) -> Result<OpenAiSceneProvider, String> {
@@ -6779,15 +7002,58 @@ impl McpServer {
             prior_pose_report,
             None,
         )?;
-        if !mode.requires_selection() {
-            return Ok(prepared);
-        }
         let task = prepared
             .report
             .get("selection_task")
             .cloned()
             .unwrap_or(Value::Null);
         if task.is_null() {
+            return Ok(prepared);
+        }
+        if mode == SceneFinalYawRefinementMode::MetricBest {
+            if let Some(response) = final_yaw_metric_best_response(&task) {
+                let mut applied = apply_scene_final_yaw_refinement(
+                    SceneFinalYawRefinementConfig {
+                        rendered_selection_task: None,
+                        ..config
+                    },
+                    manifest,
+                    asset_bindings,
+                    grounded_layout,
+                    commands,
+                    prior_pose_report,
+                    Some(&response),
+                )?;
+                applied.report["selection_task"] = task;
+                applied.report["selection_status"] = json!("metric_best_applied_without_rendering");
+                applied.report["selection_response"] =
+                    serde_json::to_value(response).map_err(|err| err.to_string())?;
+                if write_artifacts {
+                    write_json_file(
+                        &output_dir.join("selection_response.metric_best.json"),
+                        &applied.report["selection_response"],
+                    )
+                    .map_err(|err| err.to_string())?;
+                    write_json_file(
+                        &output_dir.join("final_yaw_refinement_report.json"),
+                        &applied.report,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+                return Ok(applied);
+            }
+            prepared.report["selection_status"] =
+                json!("metric_best_unavailable_or_not_safe_without_rendering");
+            if write_artifacts {
+                write_json_file(
+                    &output_dir.join("final_yaw_refinement_report.json"),
+                    &prepared.report,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            return Ok(prepared);
+        }
+        if !mode.requires_selection() {
             return Ok(prepared);
         }
         let original_control_path = self.config.scene_control_path.clone();

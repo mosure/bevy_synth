@@ -499,7 +499,7 @@ pub(super) fn spawn_trellis_settings(panel: &mut ChildSpawnerCommands) {
                         });
                     }
                     row.spawn((
-                        Text::new(trellis_quality_value_text(TrellisQuality::Low)),
+                        Text::new(trellis_quality_value_text(TrellisQuality::Medium)),
                         TextFont::from_font_size(12.0),
                         TextColor(Color::srgb(0.72, 0.76, 0.84)),
                         TrellisQualityValueLabel,

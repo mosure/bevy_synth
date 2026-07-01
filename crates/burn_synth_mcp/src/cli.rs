@@ -51,7 +51,31 @@ fn configure_cubecl_runtime(args: &ServerArgs) -> Result<(), String> {
     })
 }
 
-fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Result<(), String> {
+fn run_scene_build_command(
+    config: ServerConfig,
+    mut args: SceneBuildCliArgs,
+) -> Result<(), String> {
+    if let Some(path) = args.write_default_scene_config.as_ref() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "create scene config template parent {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(path, scene_pipeline_toml_template())
+            .map_err(|err| format!("write scene config template {}: {err}", path.display()))?;
+        println!("{}", path.display());
+        return Ok(());
+    }
+    if let Some(scene_config) = args.scene_config.clone() {
+        let config = load_scene_pipeline_toml(&scene_config)?;
+        apply_scene_pipeline_toml_to_cli_args(&mut args, config)?;
+    }
     let mut server = McpServer::new(config);
     let response = server.call_scene_build_from_image(SceneBuildFromImageArgs {
         source_scene_path: args.source_scene_path,
@@ -79,9 +103,12 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
         save_pose_debug: args.save_pose_debug,
         ground_calibration: args.ground_calibration,
         instance_generation: args.instance_generation,
+        type_aware_categories: args.type_aware_categories,
         depth_provider: args.depth_provider,
         locator: args.locator,
         locate_anything_backend: args.locate_anything_backend,
+        allowed_categories: args.allowed_categories,
+        denied_categories: args.denied_categories,
         segmentation_provider: args.segmentation_provider,
         segmentation_precision: args.segmentation_precision,
         segmentation_quantization: args.segmentation_quantization,
@@ -115,6 +142,89 @@ fn run_scene_build_command(config: ServerConfig, args: SceneBuildCliArgs) -> Res
     Ok(())
 }
 
+fn apply_scene_pipeline_toml_to_cli_args(
+    args: &mut SceneBuildCliArgs,
+    config: ScenePipelineTomlConfig,
+) -> Result<(), String> {
+    let scene = config.scene;
+    if let Some(categories) = scene.categories {
+        args.allowed_categories = Some(categories.allow);
+        args.denied_categories = Some(categories.deny);
+    }
+    if let Some(instances) = scene.instances {
+        if let Some(mode) = instances.mode.as_deref() {
+            args.instance_generation = parse_scene_instance_generation_mode(mode)?;
+        }
+        if let Some(categories) = instances.type_aware_categories {
+            args.type_aware_categories = Some(categories);
+        }
+    }
+    if let Some(models) = scene.models
+        && let Some(model) = models.image_to_3d.as_deref()
+    {
+        args.synthesis_models = Some(vec![parse_scene_synthesis_model(model)?]);
+    }
+    if let Some(grounding) = scene.grounding {
+        if grounding.locate_anything == Some(false) {
+            args.locator = SceneLocatorProvider::Manifest;
+        }
+        if grounding.depth == Some(false) {
+            args.depth_provider = SceneDepthProvider::None;
+        }
+        if grounding.segmentation == Some(false) {
+            args.segmentation_provider = Some(SceneSegmentationProvider::None);
+        }
+    }
+    if let Some(output) = scene.output {
+        if let Some(pbr) = output.pbr {
+            args.trellis_pbr = pbr;
+        }
+        if let Some(target_faces) = output.target_faces {
+            args.target_faces = Some(target_faces);
+        }
+    }
+    Ok(())
+}
+
+fn parse_scene_instance_generation_mode(
+    value: &str,
+) -> Result<SceneInstanceGenerationMode, String> {
+    match normalized_config_key(value).as_str() {
+        "categoryrepresentative" | "percategory" | "category" => {
+            Ok(SceneInstanceGenerationMode::CategoryRepresentative)
+        }
+        "typeawarereuse" | "typeaware" | "subtypes" => {
+            Ok(SceneInstanceGenerationMode::TypeAwareReuse)
+        }
+        "finegrainedtypes" | "finetypes" | "finegrained" => {
+            Ok(SceneInstanceGenerationMode::FineGrainedTypes)
+        }
+        _ => Err(format!("unsupported scene.instances.mode `{value}`")),
+    }
+}
+
+fn parse_scene_synthesis_model(value: &str) -> Result<SynthesisModel, String> {
+    match normalized_config_key(value).as_str() {
+        "triposg" | "tripo" => Ok(SynthesisModel::Triposg),
+        "trellis" | "trellis2" => Ok(SynthesisModel::Trellis),
+        "triposplat" => Ok(SynthesisModel::Triposplat),
+        _ => Err(format!("unsupported scene.models.image_to_3d `{value}`")),
+    }
+}
+
+fn normalized_config_key(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> Result<(), String> {
     let mut server = McpServer::new(config);
     let response = server.call_scene_ground(SceneGroundToolArgs {
@@ -137,6 +247,8 @@ fn run_scene_ground_command(config: ServerConfig, args: SceneGroundCliArgs) -> R
         depth_provider: args.depth_provider,
         locator: args.locator,
         locate_anything_backend: args.locate_anything_backend,
+        allowed_categories: args.allowed_categories,
+        denied_categories: args.denied_categories,
         segmentation_provider: args.segmentation_provider,
         segmentation_precision: args.segmentation_precision,
         segmentation_quantization: args.segmentation_quantization,

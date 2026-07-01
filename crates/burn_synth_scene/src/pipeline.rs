@@ -219,6 +219,7 @@ impl<P: SceneAiProvider> ScenePipeline<P> {
                 &self.config.source_scene_path,
                 &self.config.object_reference_image_path,
                 self.config.allow_catalog_reuse,
+                &self.config.category_filter,
             ),
         })
     }

@@ -85,6 +85,7 @@ pub fn run_cli(cli: Cli) -> SceneResult<()> {
                 reasoning_model: args.reasoning_model,
                 image_model: args.image_model,
                 allow_catalog_reuse: false,
+                category_filter: SceneCategoryFilterConfig::default(),
             };
             let provider = OpenAiSceneProvider::from_env(OpenAiProviderConfig {
                 reasoning_model: config.reasoning_model.clone(),

@@ -294,6 +294,8 @@ pub struct ScenePipelineUiSettings {
     pub allow_catalog_reuse: bool,
     pub lift_assets: bool,
     pub locate_anything_enabled: bool,
+    pub allowed_categories: Vec<String>,
+    pub denied_categories: Vec<String>,
     pub depth_enabled: bool,
     pub segmentation_enabled: bool,
     pub pose_fit_enabled: bool,
@@ -554,8 +556,8 @@ impl Default for ScenePipelineUiSettings {
             pipeline: ScenePipelineKind::Explicit,
             image_to_3d_model: SynthesisModel::Trellis,
             quality_profile: SceneQualityProfileSetting::Fast,
-            ground_calibration: SceneGroundCalibrationSetting::Gpt,
-            instance_generation: SceneInstanceGenerationSetting::CategoryRepresentative,
+            ground_calibration: SceneGroundCalibrationSetting::DepthFirst,
+            instance_generation: SceneInstanceGenerationSetting::TypeAwareReuse,
             object_pose_refinement: SceneObjectPoseRefinementSetting::GatedGpt,
             candidate_count: 1,
             feedback_iterations: 0,
@@ -565,6 +567,25 @@ impl Default for ScenePipelineUiSettings {
             allow_catalog_reuse: false,
             lift_assets: true,
             locate_anything_enabled: true,
+            allowed_categories: ["chair", "table", "sofa", "plant"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            denied_categories: [
+                "tabletop_accessory",
+                "display",
+                "controller",
+                "monitor",
+                "light",
+                "ceiling_light",
+                "wall",
+                "window",
+                "floor",
+                "rug",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             depth_enabled: true,
             segmentation_enabled: true,
             pose_fit_enabled: true,
@@ -595,14 +616,16 @@ impl SceneQualityProfileSetting {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SceneGroundCalibrationSetting {
-    DepthHeuristic,
     #[default]
+    DepthFirst,
+    DepthHeuristic,
     Gpt,
 }
 
 impl SceneGroundCalibrationSetting {
     fn label(self) -> &'static str {
         match self {
+            Self::DepthFirst => "depth first",
             Self::DepthHeuristic => "depth heuristic",
             Self::Gpt => "gpt",
         }
@@ -610,16 +633,18 @@ impl SceneGroundCalibrationSetting {
 
     fn cycle(self, delta: isize) -> Self {
         match (self, delta >= 0) {
-            (Self::DepthHeuristic, true) | (Self::Gpt, false) => Self::Gpt,
-            (Self::Gpt, true) | (Self::DepthHeuristic, false) => Self::DepthHeuristic,
+            (Self::DepthFirst, true) | (Self::Gpt, false) => Self::DepthHeuristic,
+            (Self::DepthHeuristic, true) | (Self::DepthFirst, false) => Self::Gpt,
+            (Self::Gpt, true) | (Self::DepthHeuristic, false) => Self::DepthFirst,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SceneInstanceGenerationSetting {
-    #[default]
     CategoryRepresentative,
+    #[default]
+    TypeAwareReuse,
     FineGrainedTypes,
 }
 
@@ -627,19 +652,23 @@ impl SceneInstanceGenerationSetting {
     fn label(self) -> &'static str {
         match self {
             Self::CategoryRepresentative => "per category",
+            Self::TypeAwareReuse => "type aware",
             Self::FineGrainedTypes => "fine types",
         }
     }
 
     fn cycle(self, delta: isize) -> Self {
-        match (self, delta >= 0) {
-            (Self::CategoryRepresentative, true) | (Self::FineGrainedTypes, false) => {
-                Self::FineGrainedTypes
-            }
-            (Self::FineGrainedTypes, true) | (Self::CategoryRepresentative, false) => {
-                Self::CategoryRepresentative
-            }
-        }
+        const OPTIONS: [SceneInstanceGenerationSetting; 3] = [
+            SceneInstanceGenerationSetting::CategoryRepresentative,
+            SceneInstanceGenerationSetting::TypeAwareReuse,
+            SceneInstanceGenerationSetting::FineGrainedTypes,
+        ];
+        let index = OPTIONS
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(1);
+        let next = (index as isize + delta).rem_euclid(OPTIONS.len() as isize) as usize;
+        OPTIONS[next]
     }
 }
 

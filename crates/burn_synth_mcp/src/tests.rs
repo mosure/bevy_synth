@@ -228,6 +228,10 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
     assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::Auto);
     assert_eq!(command.scale_policy, SceneScalePolicy::AssetPreserving);
     assert_eq!(command.max_pose_candidates, 32);
+    assert_eq!(
+        command.ground_calibration,
+        SceneGroundCalibrationMode::DepthFirst
+    );
     assert_eq!(command.depth_provider, SceneDepthProvider::DepthPro);
     assert_eq!(command.locator, SceneLocatorProvider::LocateAnything);
     assert_eq!(command.locate_anything_backend, None);
@@ -238,6 +242,10 @@ fn server_args_scene_build_defaults_to_cv_grounded_locate_anything() {
     assert!(!command.feedback);
     assert_eq!(command.feedback_iters, DEFAULT_SCENE_FEEDBACK_ITERS);
     assert_eq!(command.rotation_fit, SceneRotationFitMode::Off);
+    assert_eq!(
+        command.final_yaw_refinement,
+        SceneFinalYawRefinementMode::MetricBest
+    );
     assert_eq!(command.rotation_fit_max_gpt_rounds, 0);
     assert!((command.rotation_fit_min_mask_iou - 0.45).abs() < 1.0e-6);
     assert!((command.rotation_fit_max_depth_error_m - 0.35).abs() < 1.0e-6);
@@ -264,10 +272,18 @@ fn server_args_scene_ground_defaults_to_bare_bones_geometric_flow() {
     assert_eq!(command.pose_fit, ScenePoseFitMode::RenderedSilhouette);
     assert_eq!(command.canonical_pose, SceneCanonicalPoseMode::Auto);
     assert_eq!(command.scale_policy, SceneScalePolicy::AssetPreserving);
+    assert_eq!(
+        command.ground_calibration,
+        SceneGroundCalibrationMode::DepthFirst
+    );
     assert_eq!(command.depth_provider, SceneDepthProvider::DepthPro);
     assert_eq!(command.locator, SceneLocatorProvider::LocateAnything);
     assert!(!command.feedback);
     assert_eq!(command.rotation_fit, SceneRotationFitMode::Off);
+    assert_eq!(
+        command.final_yaw_refinement,
+        SceneFinalYawRefinementMode::MetricBest
+    );
     assert_eq!(command.rotation_fit_max_gpt_rounds, 0);
     assert_eq!(command.feedback_rubric_scorer, FeedbackRubricScorer::Off);
 }
@@ -1156,6 +1172,8 @@ fn scene_ground_accepts_rendered_silhouette_pose_fit_mode() {
             depth_provider: SceneDepthProvider::None,
             locator: SceneLocatorProvider::Manifest,
             locate_anything_backend: None,
+            allowed_categories: None,
+            denied_categories: None,
             segmentation_provider: None,
             segmentation_precision: None,
             segmentation_quantization: None,
@@ -1463,6 +1481,8 @@ fn locate_anything_burn_native_scene_ground_reuses_runtime_when_enabled() {
         depth_provider: SceneDepthProvider::None,
         locator: SceneLocatorProvider::LocateAnything,
         locate_anything_backend: Some(LocateAnythingBackend::BurnNative),
+        allowed_categories: None,
+        denied_categories: None,
         segmentation_provider: None,
         segmentation_precision: None,
         segmentation_quantization: None,
@@ -1589,6 +1609,8 @@ fn depth_pro_scene_ground_reuses_runtime_when_enabled() {
         depth_provider: SceneDepthProvider::DepthPro,
         locator: SceneLocatorProvider::Manifest,
         locate_anything_backend: None,
+        allowed_categories: None,
+        denied_categories: None,
         segmentation_provider: None,
         segmentation_precision: None,
         segmentation_quantization: None,
@@ -1754,7 +1776,7 @@ fn server_args_accept_scene_build_subcommand() {
         "--apply",
     ]);
     assert_eq!(args.backend, InferenceBackend::Wgpu);
-    assert_eq!(args.trellis_quality, TrellisQuality::Low);
+    assert_eq!(args.trellis_quality, TrellisQuality::Medium);
     let Some(ServerCommand::SceneBuild(command)) = args.command else {
         panic!("expected scene-build subcommand");
     };
@@ -1775,7 +1797,7 @@ fn server_args_accept_scene_build_subcommand() {
 }
 
 #[test]
-fn scene_build_defaults_to_fast_mesh_only_trellis() {
+fn scene_build_defaults_to_balanced_mesh_only_trellis() {
     let args = ServerArgs::parse_from([
         "burn_synth_mcp",
         "scene-build",
@@ -1783,7 +1805,7 @@ fn scene_build_defaults_to_fast_mesh_only_trellis() {
         "/tmp/scene.jpg",
     ]);
 
-    assert_eq!(args.trellis_quality, TrellisQuality::Low);
+    assert_eq!(args.trellis_quality, TrellisQuality::Medium);
     let Some(ServerCommand::SceneBuild(command)) = args.command else {
         panic!("expected scene-build subcommand");
     };
@@ -2103,6 +2125,8 @@ fn write_scene_build_artifacts_persists_structured_e2e_outputs() {
     assert!(dir.join("pre_generation_depth_report.json").exists());
     assert!(dir.join("asset_outputs.json").exists());
     assert!(dir.join("stage_report.json").exists());
+    assert!(dir.join("cost_report.json").exists());
+    assert!(dir.join("cache_report.json").exists());
     assert!(dir.join("summary.json").exists());
     assert!(dir.join("grounding_contract.json").exists());
     assert!(dir.join("decision_log.json").exists());
@@ -2461,6 +2485,8 @@ fn scene_ground_promotes_snapshot_to_catalog_by_default() {
             depth_provider: SceneDepthProvider::None,
             locator: SceneLocatorProvider::Manifest,
             locate_anything_backend: None,
+            allowed_categories: None,
+            denied_categories: None,
             segmentation_provider: Some(SceneSegmentationProvider::None),
             segmentation_precision: None,
             segmentation_quantization: None,
@@ -6405,6 +6431,16 @@ fn scene_build_defaults_select_bare_bones_geometric_placement_pipeline() {
             .iter()
             .any(|stage| { stage.stage == "render_capture_feedback" && !stage.enabled })
     );
+    assert_eq!(
+        args.instance_generation,
+        SceneInstanceGenerationMode::TypeAwareReuse
+    );
+    assert!(plan.stages.iter().any(|stage| {
+        stage.stage == "object_instance_generation"
+            && stage.enabled
+            && stage.method == "type_aware_reuse"
+            && stage.gpt_role == "bounded_candidate_selection"
+    }));
     assert_eq!(args.scale_policy, SceneScalePolicy::AssetPreserving);
     assert!(!args.feedback);
     assert_eq!(args.rotation_fit, SceneRotationFitMode::Off);
@@ -6415,6 +6451,49 @@ fn scene_build_defaults_select_bare_bones_geometric_placement_pipeline() {
     assert_eq!(
         args.object_pose_refinement_set,
         SceneObjectPoseRefinementSet::TablesAndLargeSeating
+    );
+}
+
+#[test]
+fn scene_pipeline_toml_template_captures_default_category_and_instance_policy() {
+    let path = env::temp_dir().join(format!(
+        "burn_synth_scene_config_template_{}.toml",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos()
+    ));
+    fs::write(&path, scene_pipeline_toml_template()).expect("write template");
+    let parsed = load_scene_pipeline_toml(path.to_str().expect("template path string"))
+        .expect("template should parse");
+    let _ = fs::remove_file(path);
+    let categories = parsed
+        .scene
+        .categories
+        .expect("template should define categories");
+    assert_eq!(
+        categories.allow,
+        vec![
+            "chair".to_string(),
+            "table".to_string(),
+            "sofa".to_string(),
+            "plant".to_string()
+        ]
+    );
+    assert!(
+        categories
+            .deny
+            .iter()
+            .any(|category| category == "tabletop_accessory")
+    );
+    let instances = parsed
+        .scene
+        .instances
+        .expect("template should define instance policy");
+    assert_eq!(instances.mode.as_deref(), Some("type-aware-reuse"));
+    assert_eq!(
+        instances.type_aware_categories,
+        Some(vec!["chair".to_string()])
     );
 }
 

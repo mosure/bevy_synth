@@ -9,7 +9,10 @@ use burn_synth_grounding::{
     GroundingDepthPrecision, LOCATE_ANYTHING_SAFE_IN_TOKEN_LIMIT, LocateAnythingPrecision,
     SegmentationPrecision, SegmentationQuantization,
 };
-use burn_synth_scene::SceneQualityProfile;
+use burn_synth_scene::{
+    SceneCategoryFilterConfig, SceneQualityProfile, default_scene_category_allowlist,
+    default_scene_category_denylist,
+};
 pub use burn_synth_scene::{
     SceneFinalYawRefinementMode, SceneObjectPoseRefinementMode, SceneObjectPoseRefinementSet,
     ScenePoseFitMode, SceneRotationFitMode, SceneScalePolicy,
@@ -209,6 +212,7 @@ pub enum SceneCanonicalPoseMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SceneGroundCalibrationMode {
+    DepthFirst,
     DepthHeuristic,
     Gpt,
 }
@@ -217,6 +221,7 @@ pub enum SceneGroundCalibrationMode {
 #[serde(rename_all = "kebab-case")]
 pub enum SceneInstanceGenerationMode {
     CategoryRepresentative,
+    TypeAwareReuse,
     FineGrainedTypes,
 }
 
@@ -377,7 +382,7 @@ pub struct ServerArgs {
     #[arg(long)]
     pub trellis_image_large_root: Option<PathBuf>,
 
-    #[arg(long, value_enum, default_value_t = TrellisQuality::Low)]
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     pub trellis_quality: TrellisQuality,
 
     /// Enable TRELLIS PBR UV/material texture baking through the Rust/Burn o_voxel export path.
@@ -439,6 +444,14 @@ pub struct ServerArgs {
     /// Example/reference isolated-object image for OpenAI object generation.
     #[arg(long, default_value = "docs/input_chair.jpg")]
     pub scene_object_reference_image: PathBuf,
+
+    /// Scene object categories allowed through planning, grounding, crops, and asset lifting.
+    #[arg(long, value_delimiter = ',', default_values_t = default_scene_category_allowlist())]
+    pub scene_allowed_categories: Vec<String>,
+
+    /// Scene object categories denied even when a broad allowed category might match.
+    #[arg(long, value_delimiter = ',', default_values_t = default_scene_category_denylist())]
+    pub scene_denied_categories: Vec<String>,
 
     /// Local cache directory for burn_depth CDN model shards and assembled .bpk artifacts.
     #[arg(long)]
@@ -531,6 +544,14 @@ pub(crate) struct SceneBuildCliArgs {
     #[arg(long, visible_alias = "scene")]
     pub source_scene_path: PathBuf,
 
+    /// Scene pipeline TOML file path or URL. Values are applied before explicit CLI overrides.
+    #[arg(long)]
+    pub scene_config: Option<String>,
+
+    /// Write a default scene pipeline TOML template and exit.
+    #[arg(long)]
+    pub write_default_scene_config: Option<PathBuf>,
+
     /// Example/reference isolated-object image. Defaults to --scene-object-reference-image.
     #[arg(long, visible_alias = "object-reference")]
     pub object_reference_image_path: Option<PathBuf>,
@@ -620,12 +641,24 @@ pub(crate) struct SceneBuildCliArgs {
     pub save_pose_debug: bool,
 
     /// Camera/floor calibration source used after DepthPro evidence is available.
-    #[arg(long, value_enum, default_value_t = SceneGroundCalibrationMode::Gpt)]
+    #[arg(long, value_enum, default_value_t = SceneGroundCalibrationMode::DepthFirst)]
     pub ground_calibration: SceneGroundCalibrationMode,
 
     /// Reusable-object instance generation mode. Default generates one asset per category/reuse group.
-    #[arg(long, value_enum, default_value_t = SceneInstanceGenerationMode::CategoryRepresentative)]
+    #[arg(long, value_enum, default_value_t = SceneInstanceGenerationMode::TypeAwareReuse)]
     pub instance_generation: SceneInstanceGenerationMode,
+
+    /// Categories that may be split into visual reusable subtypes when instance generation is type-aware.
+    #[arg(long, value_delimiter = ',')]
+    pub type_aware_categories: Option<Vec<String>>,
+
+    /// Categories allowed through planning, grounding, object crops, and lifting.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_categories: Option<Vec<String>>,
+
+    /// Categories denied even if a broader allowed category might match.
+    #[arg(long, value_delimiter = ',')]
+    pub denied_categories: Option<Vec<String>>,
 
     /// Depth provider used by CV-grounded scene composition.
     #[arg(long, value_enum, default_value_t = SceneDepthProvider::DepthPro)]
@@ -728,7 +761,7 @@ pub(crate) struct SceneBuildCliArgs {
     pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
 
     /// Final full-scene contextual yaw selector for high-risk object classes.
-    #[arg(long, value_enum, default_value_t = SceneFinalYawRefinementMode::GatedGpt)]
+    #[arg(long, value_enum, default_value_t = SceneFinalYawRefinementMode::MetricBest)]
     pub final_yaw_refinement: SceneFinalYawRefinementMode,
 
     /// Object set targeted by --final-yaw-refinement.
@@ -795,7 +828,7 @@ pub(crate) struct SceneGroundCliArgs {
     pub save_pose_debug: bool,
 
     /// Camera/floor calibration source used when grounding evidence is refreshed.
-    #[arg(long, value_enum, default_value_t = SceneGroundCalibrationMode::Gpt)]
+    #[arg(long, value_enum, default_value_t = SceneGroundCalibrationMode::DepthFirst)]
     pub ground_calibration: SceneGroundCalibrationMode,
 
     /// Depth provider identifier for run metadata.
@@ -809,6 +842,14 @@ pub(crate) struct SceneGroundCliArgs {
     /// Override the server LocateAnything backend for this scene-ground run.
     #[arg(long, value_enum)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+
+    /// Categories allowed through grounding and composition for this scene-ground run.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_categories: Option<Vec<String>>,
+
+    /// Categories denied even if a broader allowed category might match.
+    #[arg(long, value_delimiter = ',')]
+    pub denied_categories: Option<Vec<String>>,
 
     /// Override the server scene segmentation provider for this scene-ground run.
     #[arg(long, value_enum)]
@@ -887,7 +928,7 @@ pub(crate) struct SceneGroundCliArgs {
     pub object_pose_refinement_set: SceneObjectPoseRefinementSet,
 
     /// Final full-scene contextual yaw selector for high-risk object classes.
-    #[arg(long, value_enum, default_value_t = SceneFinalYawRefinementMode::GatedGpt)]
+    #[arg(long, value_enum, default_value_t = SceneFinalYawRefinementMode::MetricBest)]
     pub final_yaw_refinement: SceneFinalYawRefinementMode,
 
     /// Object set targeted by --final-yaw-refinement.
@@ -1091,6 +1132,7 @@ pub struct ServerConfig {
     pub scene_segmentation_cache_dir: Option<PathBuf>,
     pub scene_segmentation_cdn_base_url: Option<String>,
     pub scene_segmentation_allow_download: bool,
+    pub scene_category_filter: SceneCategoryFilterConfig,
     pub cubecl_autotune_level: CubeClAutotuneLevelSetting,
     pub cubecl_autotune_cache: CubeClAutotuneCacheSetting,
 }
@@ -1151,6 +1193,10 @@ impl ServerConfig {
             scene_segmentation_cache_dir: args.scene_segmentation_cache_dir,
             scene_segmentation_cdn_base_url: args.scene_segmentation_cdn_base_url,
             scene_segmentation_allow_download: args.scene_segmentation_allow_download,
+            scene_category_filter: SceneCategoryFilterConfig {
+                allow: args.scene_allowed_categories,
+                deny: args.scene_denied_categories,
+            },
             cubecl_autotune_level: args.cubecl_autotune_level,
             cubecl_autotune_cache: args.cubecl_autotune_cache,
         }

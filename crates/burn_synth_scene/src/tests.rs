@@ -18,6 +18,109 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[test]
+fn category_filter_classifies_tabletop_display_before_table() {
+    assert_eq!(
+        canonical_scene_category("small tabletop conference display"),
+        SceneObjectCategory::TabletopAccessory
+    );
+    assert_eq!(
+        canonical_scene_category("long white conference table"),
+        SceneObjectCategory::Table
+    );
+}
+
+#[test]
+fn category_filter_drops_tabletop_accessories_but_keeps_scene_furniture() {
+    let manifest = SceneObjectManifest {
+        source_scene_path: "scene.jpg".to_string(),
+        scene_calibration: None,
+        objects: vec![
+            SceneObjectSpec {
+                id: "obj_table".to_string(),
+                label: "conference table".to_string(),
+                aliases: vec!["table".to_string()],
+                bbox: [0.2, 0.4, 0.8, 0.8],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("table".to_string()),
+                instance_count: 1,
+                object_prompt:
+                    "large white conference table without tabletop accessories or displays"
+                        .to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            },
+            SceneObjectSpec {
+                id: "obj_plant".to_string(),
+                label: "plant".to_string(),
+                aliases: vec!["small indoor plant near window area".to_string()],
+                bbox: [0.05, 0.2, 0.15, 0.5],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("small_indoor_plant".to_string()),
+                instance_count: 1,
+                object_prompt: "small indoor plant by the window".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            },
+            SceneObjectSpec {
+                id: "obj_display".to_string(),
+                label: "small tabletop conference display".to_string(),
+                aliases: vec!["display".to_string()],
+                bbox: [0.45, 0.45, 0.55, 0.55],
+                instances: Vec::new(),
+                representative_instance_id: None,
+                reuse_group: Some("tabletop".to_string()),
+                instance_count: 1,
+                object_prompt: "small tabletop conference display".to_string(),
+                camera_hint: None,
+                rotation_hint_degrees: None,
+                target_footprint_m: None,
+            },
+        ],
+    };
+    let evidence = SceneGroundingEvidence {
+        source_image_path: "scene.jpg".to_string(),
+        depth: None,
+        segmentation: None,
+        detections: vec![
+            Detection {
+                label: "table".to_string(),
+                bbox: [0.2, 0.4, 0.8, 0.8],
+                point: None,
+                confidence: Some(0.9),
+                source_query: "table".to_string(),
+            },
+            Detection {
+                label: "tabletop display".to_string(),
+                bbox: [0.45, 0.45, 0.55, 0.55],
+                point: None,
+                confidence: Some(0.8),
+                source_query: "table".to_string(),
+            },
+        ],
+        camera: EstimatedCamera::default(),
+        floor: EstimatedFloorPlane::default(),
+        objects: manifest_grounding_evidence(&manifest).objects,
+    };
+
+    let (filtered_manifest, filtered_evidence, report) = apply_scene_category_filter(
+        &manifest,
+        Some(&evidence),
+        &SceneCategoryFilterConfig::default(),
+    );
+
+    assert_eq!(filtered_manifest.objects.len(), 2);
+    assert_eq!(filtered_manifest.objects[0].id, "obj_table");
+    assert_eq!(filtered_manifest.objects[1].id, "obj_plant");
+    assert_eq!(filtered_evidence.unwrap().detections.len(), 1);
+    assert_eq!(report.dropped_objects.len(), 1);
+    assert_eq!(report.dropped_objects[0].category, "tabletop_accessory");
+}
+
 struct RetryImageProvider {
     images: RefCell<VecDeque<Vec<u8>>>,
 }
@@ -332,6 +435,7 @@ fn object_image_requests_use_grounded_manifest_bbox_for_crop() {
             reasoning_model: "test-reasoning".to_string(),
             image_model: "test-image".to_string(),
             allow_catalog_reuse: false,
+            category_filter: SceneCategoryFilterConfig::default(),
         },
         RetryImageProvider::new(Vec::new()),
     );
@@ -431,6 +535,7 @@ fn object_image_requests_use_grounded_single_instance_bbox_for_reuse_group_crop(
             reasoning_model: "test-reasoning".to_string(),
             image_model: "test-image".to_string(),
             allow_catalog_reuse: false,
+            category_filter: SceneCategoryFilterConfig::default(),
         },
         RetryImageProvider::new(Vec::new()),
     );
@@ -1408,6 +1513,7 @@ fn preparation_records_configured_openai_models() {
         reasoning_model: "gpt-5.5".to_string(),
         image_model: "gpt-image-2".to_string(),
         allow_catalog_reuse: false,
+        category_filter: SceneCategoryFilterConfig::default(),
     };
     let provider = RetryImageProvider::new(Vec::new());
     let mut pipeline = ScenePipeline::new(config, provider);
@@ -2848,6 +2954,7 @@ fn object_image_generation_policy_retries_until_candidate_passes_guardrail() {
         reasoning_model: "test-reasoning".to_string(),
         image_model: "test-image".to_string(),
         allow_catalog_reuse: false,
+        category_filter: SceneCategoryFilterConfig::default(),
     };
     let pipeline = ScenePipeline::new(config, provider);
     let request = ObjectImageRequest {
@@ -2921,6 +3028,7 @@ fn object_image_generation_policy_stops_after_required_object_rejection() {
         reasoning_model: "test-reasoning".to_string(),
         image_model: "test-image".to_string(),
         allow_catalog_reuse: false,
+        category_filter: SceneCategoryFilterConfig::default(),
     };
     let pipeline = ScenePipeline::new(config, provider);
     let request = |id: &str| ObjectImageRequest {
@@ -2985,6 +3093,7 @@ fn object_image_generation_policy_parallelizes_independent_requests() {
         reasoning_model: "test-reasoning".to_string(),
         image_model: "test-image".to_string(),
         allow_catalog_reuse: false,
+        category_filter: SceneCategoryFilterConfig::default(),
     };
     let pipeline = ScenePipeline::new(config, provider.clone());
     let request = |id: &str| ObjectImageRequest {

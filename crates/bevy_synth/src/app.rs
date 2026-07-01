@@ -3586,6 +3586,9 @@ pub(crate) fn scene_build_args_from_ui_settings(
         max_pose_candidates: 32,
         save_pose_debug: settings.write_artifacts,
         ground_calibration: match settings.ground_calibration {
+            bevy_synth_ui::SceneGroundCalibrationSetting::DepthFirst => {
+                SceneGroundCalibrationMode::DepthFirst
+            }
             bevy_synth_ui::SceneGroundCalibrationSetting::DepthHeuristic => {
                 SceneGroundCalibrationMode::DepthHeuristic
             }
@@ -3595,10 +3598,14 @@ pub(crate) fn scene_build_args_from_ui_settings(
             bevy_synth_ui::SceneInstanceGenerationSetting::CategoryRepresentative => {
                 SceneInstanceGenerationMode::CategoryRepresentative
             }
+            bevy_synth_ui::SceneInstanceGenerationSetting::TypeAwareReuse => {
+                SceneInstanceGenerationMode::TypeAwareReuse
+            }
             bevy_synth_ui::SceneInstanceGenerationSetting::FineGrainedTypes => {
                 SceneInstanceGenerationMode::FineGrainedTypes
             }
         },
+        type_aware_categories: Some(vec!["chair".to_string()]),
         depth_provider: if settings.depth_enabled {
             SceneDepthProvider::DepthPro
         } else {
@@ -3612,6 +3619,8 @@ pub(crate) fn scene_build_args_from_ui_settings(
         locate_anything_backend: settings
             .locate_anything_enabled
             .then_some(LocateAnythingBackend::BurnNative),
+        allowed_categories: Some(settings.allowed_categories.clone()),
+        denied_categories: Some(settings.denied_categories.clone()),
         segmentation_provider: Some(if settings.segmentation_enabled {
             SceneSegmentationProvider::Sam2
         } else {
@@ -3652,7 +3661,7 @@ pub(crate) fn scene_build_args_from_ui_settings(
             }
         },
         object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
-        final_yaw_refinement: burn_synth_mcp::SceneFinalYawRefinementMode::GatedGpt,
+        final_yaw_refinement: burn_synth_mcp::SceneFinalYawRefinementMode::MetricBest,
         final_yaw_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
         final_yaw_confidence_threshold: 0.70,
         final_yaw_max_candidates: 12,

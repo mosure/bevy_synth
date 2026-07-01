@@ -1,5 +1,6 @@
 mod bsn;
 mod canonical_pose;
+mod category_filter;
 mod chair_types;
 mod cli;
 mod depth_sidecar;
@@ -26,6 +27,15 @@ pub use bsn::{
 pub use canonical_pose::{
     canonical_frame_for_asset, canonical_pose_evidence_for_asset,
     canonical_pose_evidence_for_assets, canonical_spawn_yaw_degrees, symmetry_for_descriptor,
+};
+pub use category_filter::{
+    SceneCategoryFilterConfig, SceneCategoryFilterReport, SceneObjectCategory,
+    ScenePipelineTomlConfig, ScenePipelineTomlGrounding, ScenePipelineTomlInstances,
+    ScenePipelineTomlModels, ScenePipelineTomlOutput, ScenePipelineTomlScene,
+    apply_scene_category_filter, canonical_scene_category, default_scene_category_allowlist,
+    default_scene_category_denylist, infer_detection_category, infer_object_category,
+    load_scene_pipeline_toml, parse_scene_category, scene_category_filter_prompt,
+    scene_pipeline_toml_template,
 };
 pub use chair_types::{
     apply_chair_type_groups, chair_type_grouping_report, chair_type_grouping_schema,

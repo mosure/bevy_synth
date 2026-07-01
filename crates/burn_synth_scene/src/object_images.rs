@@ -10,10 +10,12 @@ pub fn object_manifest_prompt(
     scene_path: &Path,
     reference_path: &Path,
     allow_catalog_reuse: bool,
+    category_filter: &SceneCategoryFilterConfig,
 ) -> String {
     format!(
         "Analyze the source scene image at `{}` and produce a strict object manifest for 3D reconstruction. \
 Use the reference image `{}` as the expected clean isolated object-image style: single object, centered, full visible silhouette, neutral background, 3/4 camera. \
+{} \
 For the furniture demo prefer reusable object groups: one tan open sectional sofa, one coffee table, and reusable chair groups split by visually distinct chair type; repeated instances of the same chair type should share one group, but black lounge chairs and light mesh meeting chairs should not. Do not generate cube/proxy furniture. \
 Include scene_calibration when a dominant table or seating arrangement is visible: table_center in normalized image coordinates, table_axis_degrees where 0 means table length points away from the camera in the source image, table_size_m in real meters, and camera yaw/radius plus positive orbit camera pitch degrees above the floor for a source-like viewer camera. Use Bevy/PanOrbit yaw convention: 180 degrees places the camera on the near/source side looking toward positive table depth, 0 degrees places it on the far side. \
 Do not annotate, estimate, or invent object bboxes. LocateAnything and segmentation provide the authoritative boxes/masks after planning. Because the manifest schema still requires bbox fields, set object and instance bbox values to [0.0,0.0,1.0,1.0] placeholders only; they are ignored whenever locator evidence is available. \
@@ -24,6 +26,7 @@ Object prompts must preserve observed scale relationships and plan shape; do not
 For the Curry Up Now style sofa specifically, describe the visible source object as a large low tan crescent or semicircular banquette-like sectional with a continuous curved outer back, open center, tufted cushions, and source-cropped foreground extent. It is not a conventional straight L-sectional product sofa and not a closed circle/ring. allow_catalog_reuse={}.",
         scene_path.display(),
         reference_path.display(),
+        scene_category_filter_prompt(category_filter),
         allow_catalog_reuse
     )
 }

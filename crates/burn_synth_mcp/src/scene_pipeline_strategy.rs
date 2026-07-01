@@ -98,6 +98,8 @@ pub(crate) fn scene_placement_pipeline_plan(
     let has_depth = cv_grounded && selection.depth_provider == SceneDepthProvider::DepthPro;
     let has_gpt_ground_calibration =
         cv_grounded && selection.ground_calibration == SceneGroundCalibrationMode::Gpt;
+    let has_depth_first_ground_calibration =
+        cv_grounded && selection.ground_calibration == SceneGroundCalibrationMode::DepthFirst;
     let has_locator = cv_grounded && selection.locator == SceneLocatorProvider::LocateAnything;
     let has_sam = cv_grounded
         && matches!(
@@ -204,8 +206,9 @@ pub(crate) fn scene_placement_pipeline_plan(
         && selection.object_pose_refinement == SceneObjectPoseRefinementMode::GatedGpt
         && selection.object_pose_refinement_set
             == SceneObjectPoseRefinementSet::TablesAndLargeSeating
-        && selection.final_yaw_refinement == SceneFinalYawRefinementMode::GatedGpt
+        && selection.final_yaw_refinement == SceneFinalYawRefinementMode::MetricBest
         && selection.final_yaw_refinement_set == SceneObjectPoseRefinementSet::TablesAndLargeSeating
+        && has_depth_first_ground_calibration
     {
         "bare_bones_geometric"
     } else if dense_pose_enabled {
@@ -281,12 +284,15 @@ pub(crate) fn scene_placement_pipeline_plan(
         stage: "ground_calibration",
         role: "evidence_refinement",
         method: match selection.ground_calibration {
+            SceneGroundCalibrationMode::DepthFirst => "depth_first_floor_camera",
             SceneGroundCalibrationMode::DepthHeuristic => "depth_floor_heuristic",
             SceneGroundCalibrationMode::Gpt => "gpt_camera_floor",
         },
         enabled: cv_grounded,
         status: if has_gpt_ground_calibration {
             "active"
+        } else if has_depth_first_ground_calibration && has_depth {
+            "depth_first"
         } else if has_depth {
             "heuristic"
         } else {
@@ -307,19 +313,23 @@ pub(crate) fn scene_placement_pipeline_plan(
         role: "asset_input_planning",
         method: match selection.instance_generation {
             SceneInstanceGenerationMode::CategoryRepresentative => "category_representative",
+            SceneInstanceGenerationMode::TypeAwareReuse => "type_aware_reuse",
             SceneInstanceGenerationMode::FineGrainedTypes => "gpt_fine_grained_types",
         },
         enabled: selection.lift_assets,
-        status: if selection.instance_generation == SceneInstanceGenerationMode::FineGrainedTypes {
-            "active"
-        } else {
-            "default"
+        status: match selection.instance_generation {
+            SceneInstanceGenerationMode::CategoryRepresentative => "shared_representative",
+            SceneInstanceGenerationMode::TypeAwareReuse => "default",
+            SceneInstanceGenerationMode::FineGrainedTypes => "expensive",
         },
         mutual_exclusion_group: "instance_generation",
         evidence_inputs: vec!["object_bboxes", "source_object_crops"],
         outputs: vec!["reusable_object_groups"],
         objective: "Control whether repeated same-category instances share one generated asset or split into visual subtypes before expensive image-to-3D lifting.",
-        gpt_role: if selection.instance_generation == SceneInstanceGenerationMode::FineGrainedTypes {
+        gpt_role: if matches!(
+            selection.instance_generation,
+            SceneInstanceGenerationMode::TypeAwareReuse | SceneInstanceGenerationMode::FineGrainedTypes
+        ) {
             "bounded_candidate_selection"
         } else {
             "none"
@@ -504,6 +514,7 @@ pub(crate) fn scene_placement_pipeline_plan(
         role: "bounded_semantic_selection",
         method: match selection.final_yaw_refinement {
             SceneFinalYawRefinementMode::Off => "disabled",
+            SceneFinalYawRefinementMode::MetricBest => "measured_metric_best_yaw_selector",
             SceneFinalYawRefinementMode::GatedGpt => {
                 "full_scene_context_gated_gpt_yaw_selector"
             }
@@ -523,11 +534,11 @@ pub(crate) fn scene_placement_pipeline_plan(
         evidence_inputs: vec![
             "object_pose_candidates",
             "source_object_crops",
-            "full_scene_candidate_renders",
+            "optional_full_scene_candidate_renders",
         ],
         outputs: vec!["yaw_only_scene_commands", "final_yaw_selection_report"],
-        objective: "Use full-scene contextual renders to choose a bounded candidate_index for table/large-seating yaw without changing translation or scale.",
-        gpt_role: if selection.final_yaw_refinement.requires_selection() {
+        objective: "Choose a bounded candidate_index for table/large-seating yaw without changing translation or scale. metric-best uses measured geometry only; GPT modes may render contextual candidates.",
+        gpt_role: if selection.final_yaw_refinement.uses_gpt() {
             "bounded_candidate_selection_yaw_only"
         } else {
             "none"
@@ -673,10 +684,11 @@ pub(crate) fn scene_placement_pipeline_plan(
         ablation_axis(
             "ground_calibration",
             match selection.ground_calibration {
+                SceneGroundCalibrationMode::DepthFirst => "depth_first",
                 SceneGroundCalibrationMode::DepthHeuristic => "depth_heuristic",
                 SceneGroundCalibrationMode::Gpt => "gpt",
             },
-            vec!["depth_heuristic", "gpt"],
+            vec!["depth_first", "depth_heuristic", "gpt"],
             "ground_calibration",
             "High: camera height/FOV/floor errors mirror or translate every object placement.",
         ),
@@ -684,9 +696,14 @@ pub(crate) fn scene_placement_pipeline_plan(
             "instance_generation",
             match selection.instance_generation {
                 SceneInstanceGenerationMode::CategoryRepresentative => "category_representative",
+                SceneInstanceGenerationMode::TypeAwareReuse => "type_aware_reuse",
                 SceneInstanceGenerationMode::FineGrainedTypes => "fine_grained_types",
             },
-            vec!["category_representative", "fine_grained_types"],
+            vec![
+                "category_representative",
+                "type_aware_reuse",
+                "fine_grained_types",
+            ],
             "instance_generation",
             "Medium/high: fine-grained same-category assets can improve semantics but multiplies image generation and lifting cost.",
         ),
@@ -745,10 +762,11 @@ pub(crate) fn scene_placement_pipeline_plan(
             "final_yaw_refinement",
             match selection.final_yaw_refinement {
                 SceneFinalYawRefinementMode::Off => "off",
+                SceneFinalYawRefinementMode::MetricBest => "metric_best",
                 SceneFinalYawRefinementMode::GatedGpt => "gated_gpt",
                 SceneFinalYawRefinementMode::AlwaysGpt => "always_gpt",
             },
-            vec!["off", "gated_gpt", "always_gpt"],
+            vec!["off", "metric_best", "gated_gpt", "always_gpt"],
             "final_yaw_refinement",
             "Medium: bounded full-scene yaw selection can repair table/sofa semantic orientation after geometry has fixed placement.",
         ),
@@ -884,8 +902,8 @@ mod tests {
             pose_fit: ScenePoseFitMode::RenderedSilhouette,
             canonical_pose: SceneCanonicalPoseMode::Off,
             scale_policy: SceneScalePolicy::AssetPreserving,
-            ground_calibration: SceneGroundCalibrationMode::Gpt,
-            instance_generation: SceneInstanceGenerationMode::CategoryRepresentative,
+            ground_calibration: SceneGroundCalibrationMode::DepthFirst,
+            instance_generation: SceneInstanceGenerationMode::TypeAwareReuse,
             depth_provider: SceneDepthProvider::DepthPro,
             locator: SceneLocatorProvider::LocateAnything,
             segmentation_provider: SceneSegmentationProvider::Sam2,
@@ -896,7 +914,7 @@ mod tests {
             rotation_fit: SceneRotationFitMode::Off,
             object_pose_refinement: SceneObjectPoseRefinementMode::GatedGpt,
             object_pose_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
-            final_yaw_refinement: SceneFinalYawRefinementMode::GatedGpt,
+            final_yaw_refinement: SceneFinalYawRefinementMode::MetricBest,
             final_yaw_refinement_set: SceneObjectPoseRefinementSet::TablesAndLargeSeating,
             max_pose_candidates: 32,
         }

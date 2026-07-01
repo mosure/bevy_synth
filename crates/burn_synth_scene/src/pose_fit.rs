@@ -30,9 +30,6 @@ const FINAL_YAW_LOSS_REGRESSION_EPSILON: f32 = 0.25;
 const FINAL_YAW_BBOX_REGRESSION_EPSILON: f32 = 0.08;
 const FINAL_YAW_MASK_REGRESSION_EPSILON: f32 = 0.04;
 const FINAL_YAW_DEPTH_REGRESSION_EPSILON_M: f32 = 0.35;
-const FINAL_YAW_POSE_TRANSLATION_MAX_DELTA_M: f32 = 0.65;
-const FINAL_YAW_POSE_SCALE_RATIO_MIN: f32 = 0.68;
-const FINAL_YAW_POSE_SCALE_RATIO_MAX: f32 = 1.48;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneRotationFitConfig<'a> {
@@ -915,36 +912,16 @@ pub fn apply_scene_final_yaw_refinement(
                 }));
                 continue;
             };
-            let pose_apply = final_yaw_pose_apply_for_candidate(object, &candidate);
             if let Some(command) = out_commands.get_mut(command_index) {
-                if let Some(pose_apply) = &pose_apply {
-                    command["translation"] = json!(pose_apply.translation);
-                    command["scale"] = json!(pose_apply.scale);
-                }
                 command["rotation"] = json!(quat_from_y_degrees(yaw));
             }
             if let Some(placement) = out_layout.placements.get_mut(placement_index) {
-                if let Some(pose_apply) = &pose_apply {
-                    placement.translation = pose_apply.translation;
-                    placement.scale = pose_apply.scale;
-                    placement.rotation_y_degrees = yaw;
-                    placement.sync_ground_anchor_from_current_translation();
-                } else {
-                    placement.rotation_y_degrees = yaw;
-                    placement.sync_translation_to_current_ground_anchor();
-                }
+                placement.rotation_y_degrees = yaw;
+                placement.sync_translation_to_current_ground_anchor();
             }
             object["applied"] = json!(true);
             object["selected_candidate_index"] = json!(accepted_candidate_index);
             object["selected_yaw_degrees"] = json!(yaw);
-            if let Some(pose_apply) = &pose_apply {
-                object["selected_pose_application"] = json!({
-                    "applied": true,
-                    "translation": pose_apply.translation,
-                    "scale": pose_apply.scale,
-                    "reason": pose_apply.reason,
-                });
-            }
             object["selector_result"] = json!({
                 "gpt_candidate_index": selection.candidate_index,
                 "accepted_candidate_index": accepted_candidate_index,
@@ -971,16 +948,10 @@ pub fn apply_scene_final_yaw_refinement(
                 "accepted_candidate_index": accepted_candidate_index,
                 "gpt_candidate_index": selection.candidate_index,
                 "yaw_degrees": yaw,
-                "pose_application": pose_apply
-                    .as_ref()
-                    .map(|pose| {
-                        json!({
-                            "translation": pose.translation,
-                            "scale": pose.scale,
-                            "reason": pose.reason,
-                        })
-                    })
-                    .unwrap_or(Value::Null),
+                "pose_application": {
+                    "applied": false,
+                    "reason": "final_yaw_is_yaw_only",
+                },
                 "confidence": selection.confidence,
                 "selection_policy": selection_policy,
                 "override_reason": override_reason,
@@ -1507,6 +1478,9 @@ fn final_yaw_metric_guarded_candidate(
     confidence: f32,
     confidence_threshold: f32,
 ) -> (Value, &'static str, Option<&'static str>) {
+    if mode == SceneFinalYawRefinementMode::MetricBest {
+        return (candidate, "metric_best_selection", None);
+    }
     if mode != SceneFinalYawRefinementMode::GatedGpt {
         return (candidate, "gpt_selection", None);
     }
@@ -1712,55 +1686,6 @@ fn final_yaw_candidate_has_render_evidence(candidate: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|path| !path.trim().is_empty())
     })
-}
-
-#[derive(Clone, Debug)]
-struct FinalYawPoseApplication {
-    translation: [f32; 3],
-    scale: [f32; 3],
-    reason: &'static str,
-}
-
-fn final_yaw_pose_apply_for_candidate(
-    object: &Value,
-    candidate: &Value,
-) -> Option<FinalYawPoseApplication> {
-    let metrics = candidate
-        .get("geometry_metrics")
-        .filter(|value| value.is_object())
-        .unwrap_or(candidate);
-    let translation = metrics.get("translation").and_then(json_array3)?;
-    let scale = metrics.get("scale").and_then(json_array3)?;
-    let current_translation = object.get("translation").and_then(json_array3)?;
-    let current_scale = object.get("scale").and_then(json_array3)?;
-    if !final_yaw_pose_translation_delta_is_bounded(current_translation, translation) {
-        return None;
-    }
-    if !final_yaw_pose_scale_ratio_is_bounded(current_scale, scale) {
-        return None;
-    }
-    Some(FinalYawPoseApplication {
-        translation,
-        scale,
-        reason: "selected_candidate_pose_metrics",
-    })
-}
-
-fn final_yaw_pose_translation_delta_is_bounded(current: [f32; 3], candidate: [f32; 3]) -> bool {
-    let dx = candidate[0] - current[0];
-    let dz = candidate[2] - current[2];
-    (dx * dx + dz * dz).sqrt() <= FINAL_YAW_POSE_TRANSLATION_MAX_DELTA_M
-}
-
-fn final_yaw_pose_scale_ratio_is_bounded(current: [f32; 3], candidate: [f32; 3]) -> bool {
-    current
-        .iter()
-        .zip(candidate.iter())
-        .all(|(current, candidate)| {
-            let current = current.abs().max(1.0e-5);
-            let ratio = candidate.abs() / current;
-            (FINAL_YAW_POSE_SCALE_RATIO_MIN..=FINAL_YAW_POSE_SCALE_RATIO_MAX).contains(&ratio)
-        })
 }
 
 fn final_yaw_metric(value: &Value, key: &str) -> Option<f32> {
@@ -2859,7 +2784,7 @@ mod tests {
     }
 
     #[test]
-    fn final_yaw_refinement_applies_measured_pose_candidate_atomically() {
+    fn final_yaw_refinement_preserves_pose_when_measured_candidate_has_pose_metrics() {
         let manifest = final_yaw_test_manifest();
         let bindings = final_yaw_test_binding();
         let layout = final_yaw_test_layout();
@@ -2910,34 +2835,24 @@ mod tests {
         .expect("apply final pose");
 
         assert_eq!(applied.report["status"], json!("applied"));
-        let command_translation = json_array3(&applied.commands[1]["translation"]).unwrap();
-        let command_scale = json_array3(&applied.commands[1]["scale"]).unwrap();
-        assert!(
-            command_translation
-                .iter()
-                .zip([1.18, 0.25, 1.62])
-                .all(|(left, right)| (*left - right).abs() < 1.0e-5)
-        );
-        assert!(
-            command_scale
-                .iter()
-                .zip([2.7, 2.7, 2.7])
-                .all(|(left, right)| (*left - right).abs() < 1.0e-5)
-        );
         assert_eq!(
-            applied.report["objects"][0]["selected_pose_application"]["applied"],
-            json!(true)
+            applied.commands[1]["translation"],
+            commands[1]["translation"]
         );
+        assert_eq!(applied.commands[1]["scale"], commands[1]["scale"]);
         assert_eq!(
             applied.report["applied"][0]["pose_application"]["reason"],
-            json!("selected_candidate_pose_metrics")
+            json!("final_yaw_is_yaw_only")
         );
         assert!((applied.grounded_layout.placements[0].rotation_y_degrees + 6.0).abs() < 0.5);
         assert_eq!(
             applied.grounded_layout.placements[0].translation,
-            [1.18, 0.25, 1.62]
+            layout.placements[0].translation
         );
-        assert_eq!(applied.grounded_layout.placements[0].scale, [2.7, 2.7, 2.7]);
+        assert_eq!(
+            applied.grounded_layout.placements[0].scale,
+            layout.placements[0].scale
+        );
     }
 
     #[test]

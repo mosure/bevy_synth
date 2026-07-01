@@ -49,7 +49,7 @@ pub struct Args {
     pub trellis_image_large_root: Option<PathBuf>,
 
     /// Trellis quality preset (low, medium, high).
-    #[arg(long, value_enum, default_value_t = TrellisQuality::Low)]
+    #[arg(long, value_enum, default_value_t = TrellisQuality::Medium)]
     pub trellis_quality: TrellisQuality,
 
     /// Enable Trellis PBR texture baking through the Rust/Burn o_voxel export path.
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn trellis_settings_have_pipeline_specific_defaults_and_overrides() {
         let defaults = build_app_args(Args::parse_from(["bevy_synth"]));
-        assert_eq!(defaults.trellis_quality, TrellisQuality::Low);
+        assert_eq!(defaults.trellis_quality, TrellisQuality::Medium);
         assert!(defaults.trellis_pbr_enabled);
         assert_eq!(
             defaults.trellis_pbr_texture_size,

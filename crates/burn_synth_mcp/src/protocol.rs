@@ -255,7 +255,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "scale_policy": { "type": "string", "enum": ["asset-preserving", "bounded-anisotropic", "free-anisotropic"], "description": "Generated asset scale policy. Defaults to asset-preserving to avoid skinny/distorted lifted tables." },
                     "max_pose_candidates": { "type": "integer", "description": "Maximum deterministic pose candidates per object." },
                     "save_pose_debug": { "type": "boolean", "description": "Write canonical pose, pose-fit candidate, and camera grounding artifacts." },
-                    "ground_calibration": { "type": "string", "enum": ["depth-heuristic", "gpt"], "description": "Camera/floor calibration source after depth evidence is available. gpt asks the reasoning model for camera height/FOV/floor sanity, then writes the same EstimatedCamera/EstimatedFloorPlane evidence consumed by geometry." },
+                    "ground_calibration": { "type": "string", "enum": ["depth-first", "depth-heuristic", "gpt"], "description": "Camera/floor calibration source after depth evidence is available. depth-first uses deterministic DepthPro intrinsics/floor evidence and calls GPT only as an explicit fallback mode." },
                     "instance_generation": { "type": "string", "enum": ["category-representative", "fine-grained-types"], "description": "Reusable-object generation granularity. category-representative generates one reusable asset per semantic category/reuse group; fine-grained-types uses GPT to split repeated same-category chairs into visually distinct asset types before image generation." },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"], "description": "Depth provider for CV-grounded scene composition." },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"], "description": "Object locator for CV-grounded scene composition. Full scene-build defaults to locate-anything." },
@@ -279,7 +279,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
                     "object_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Object-set pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting on the selected object set; gated-gpt additionally marks failed or ambiguous fits for bounded GPT candidate selection; always-gpt marks every selected object." },
                     "object_pose_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by object_pose_refinement. Defaults to tables-and-large-seating." },
-                    "final_yaw_refinement": { "type": "string", "enum": ["off", "gated-gpt", "always-gpt"], "description": "Final full-scene contextual yaw selector. It renders all scene objects while sweeping only one target object's Y-axis yaw, then applies candidate_index selections without changing translation or scale." },
+                    "final_yaw_refinement": { "type": "string", "enum": ["off", "metric-best", "gated-gpt", "always-gpt"], "description": "Final Y-axis yaw selector. metric-best applies the safest measured geometry candidate without network calls; GPT modes are explicit bounded candidate-selection fallbacks." },
                     "final_yaw_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by final_yaw_refinement." },
                     "final_yaw_confidence_threshold": { "type": "number", "description": "Minimum bounded GPT confidence required before a final yaw candidate may apply." },
                     "final_yaw_max_candidates": { "type": "integer", "description": "Maximum final contextual yaw candidates per target object." },
@@ -310,7 +310,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "scale_policy": { "type": "string", "enum": ["asset-preserving", "bounded-anisotropic", "free-anisotropic"], "description": "Generated asset scale policy. Defaults to asset-preserving." },
                     "max_pose_candidates": { "type": "integer" },
                     "save_pose_debug": { "type": "boolean" },
-                    "ground_calibration": { "type": "string", "enum": ["depth-heuristic", "gpt"], "description": "Camera/floor calibration source when grounding evidence is refreshed." },
+                    "ground_calibration": { "type": "string", "enum": ["depth-first", "depth-heuristic", "gpt"], "description": "Camera/floor calibration source when grounding evidence is refreshed." },
                     "depth_provider": { "type": "string", "enum": ["none", "depth-pro"] },
                     "locator": { "type": "string", "enum": ["manifest", "locate-anything"] },
                     "locate_anything_backend": { "type": "string", "enum": ["burn-native"], "description": "Optional backend override when locator is locate-anything. Defaults to the server --locate-anything-backend setting." },
@@ -333,7 +333,7 @@ pub(crate) fn tool_defs() -> Vec<Value> {
                     "rotation_fit_write_artifacts": { "type": "boolean", "description": "Write rotation-fit candidate overlays, report JSON, and HTML review artifacts." },
                     "object_pose_refinement": { "type": "string", "enum": ["off", "geometry", "gated-gpt", "always-gpt"], "description": "Object-set pose refinement after the generic visible-surface fit. geometry reruns deterministic mask/depth fitting on the selected object set; gated-gpt additionally marks failed or ambiguous fits for bounded GPT candidate selection; always-gpt marks every selected object." },
                     "object_pose_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by object_pose_refinement. Defaults to tables-and-large-seating." },
-                    "final_yaw_refinement": { "type": "string", "enum": ["off", "gated-gpt", "always-gpt"], "description": "Final full-scene contextual yaw selector. It renders all scene objects while sweeping only one target object's Y-axis yaw, then applies candidate_index selections without changing translation or scale." },
+                    "final_yaw_refinement": { "type": "string", "enum": ["off", "metric-best", "gated-gpt", "always-gpt"], "description": "Final Y-axis yaw selector. metric-best applies the safest measured geometry candidate without network calls; GPT modes are explicit bounded candidate-selection fallbacks." },
                     "final_yaw_refinement_set": { "type": "string", "enum": ["tables", "large-seating", "tables-and-large-seating", "all-furniture"], "description": "Object set targeted by final_yaw_refinement." },
                     "final_yaw_confidence_threshold": { "type": "number", "description": "Minimum bounded GPT confidence required before a final yaw candidate may apply." },
                     "final_yaw_max_candidates": { "type": "integer", "description": "Maximum final contextual yaw candidates per target object." },
@@ -767,6 +767,10 @@ pub(crate) struct ScenePrepareBuildArgs {
     pub quality_profile: Option<SceneQualityProfile>,
     #[serde(default)]
     pub allow_catalog_reuse: bool,
+    #[serde(default)]
+    pub allowed_categories: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_categories: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -834,12 +838,18 @@ pub struct SceneBuildFromImageArgs {
     pub ground_calibration: SceneGroundCalibrationMode,
     #[serde(default = "default_scene_instance_generation_mode")]
     pub instance_generation: SceneInstanceGenerationMode,
+    #[serde(default)]
+    pub type_aware_categories: Option<Vec<String>>,
     #[serde(default = "default_scene_depth_provider")]
     pub depth_provider: SceneDepthProvider,
     #[serde(default = "default_scene_locator_provider")]
     pub locator: SceneLocatorProvider,
     #[serde(default)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+    #[serde(default)]
+    pub allowed_categories: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_categories: Option<Vec<String>>,
     #[serde(default)]
     pub segmentation_provider: Option<SceneSegmentationProvider>,
     #[serde(default)]
@@ -919,6 +929,10 @@ pub(crate) struct SceneGroundToolArgs {
     pub locator: SceneLocatorProvider,
     #[serde(default)]
     pub locate_anything_backend: Option<LocateAnythingBackend>,
+    #[serde(default)]
+    pub allowed_categories: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_categories: Option<Vec<String>>,
     #[serde(default)]
     pub segmentation_provider: Option<SceneSegmentationProvider>,
     #[serde(default)]

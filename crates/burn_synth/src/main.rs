@@ -61,7 +61,7 @@ struct Cli {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     trellis_pbr: bool,
 
-    #[arg(long, value_enum, default_value_t = CliTrellisQuality::Low)]
+    #[arg(long, value_enum, default_value_t = CliTrellisQuality::Medium)]
     trellis_quality: CliTrellisQuality,
 
     #[arg(long, value_enum, default_value_t = CliTrellisComputeProfile::ReferenceF32)]
@@ -1168,7 +1168,7 @@ mod tests {
             "--input",
             "input.png",
         ]);
-        assert_eq!(cli.trellis_quality, CliTrellisQuality::Low);
+        assert_eq!(cli.trellis_quality, CliTrellisQuality::Medium);
         assert!(cli.trellis_pbr);
         assert_eq!(
             cli.trellis_compute_profile,

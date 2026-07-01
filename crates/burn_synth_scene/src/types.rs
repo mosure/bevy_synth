@@ -4,6 +4,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::category_filter::SceneCategoryFilterConfig;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SceneQualityProfile {
@@ -51,6 +53,7 @@ impl SceneObjectPoseRefinementMode {
 #[serde(rename_all = "kebab-case")]
 pub enum SceneFinalYawRefinementMode {
     Off,
+    MetricBest,
     GatedGpt,
     AlwaysGpt,
 }
@@ -61,6 +64,10 @@ impl SceneFinalYawRefinementMode {
     }
 
     pub fn requires_selection(self) -> bool {
+        matches!(self, Self::GatedGpt | Self::AlwaysGpt)
+    }
+
+    pub fn uses_gpt(self) -> bool {
         matches!(self, Self::GatedGpt | Self::AlwaysGpt)
     }
 }
@@ -172,6 +179,7 @@ pub struct SceneBuildConfig {
     pub reasoning_model: String,
     pub image_model: String,
     pub allow_catalog_reuse: bool,
+    pub category_filter: SceneCategoryFilterConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
